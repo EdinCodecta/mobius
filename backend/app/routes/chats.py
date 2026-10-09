@@ -345,7 +345,11 @@ def _project_ref_for_chat(db: Session, chat) -> dict | None:
 def _chat_create_response(chat: models.Chat, db: Session) -> dict:
   detail = _chat_detail_response(chat, db=db)
   return {
-    **_owner_chat_summary(chat, project_ref=_project_ref_for_chat(db, chat)),
+    **_owner_chat_summary(
+      chat,
+      project_ref=_project_ref_for_chat(db, chat),
+      stranded_helper_followup=detail["stranded_helper_followup"],
+    ),
     "messages": detail["messages"],
     "detail": detail,
   }
@@ -472,6 +476,7 @@ def _owner_chat_summary(
   transient_owner_input_kind: OwnerInputKind | None = None,
   unseen_failure_version: int | None = None,
   project_ref: dict | None = None,
+  stranded_helper_followup: dict | None = None,
 ) -> dict:
   """Canonical owner-list shape for a Chat or its lightweight projection.
 
@@ -497,6 +502,7 @@ def _owner_chat_summary(
     # inactive or overloading the running indicator.
     "waiting": bool(handoff and handoff["kind"] == "automatic"),
     "handoff": handoff or {"kind": "none", "reason": None},
+    "stranded_helper_followup": stranded_helper_followup,
     # A turn parked on the owner's AskUserQuestion answer is `running` but is
     # NOT streaming — nothing to interrupt, and the card is durable — so the
     # shell excludes it from the reload-defer's active-turn test. The durable
@@ -962,10 +968,12 @@ def list_chats(
       goal=deferred_goals.get(chat.id),
       stranded_followup=stranded_chat_ids.get(chat.id),
     )
-    summary = _owner_chat_summary(
+    helper_id = stranded_chat_ids.get(chat.id)
+    result.append(_owner_chat_summary(
       chat,
       durable_running=chat.id in durable_running,
       handoff=handoff,
+      stranded_helper_followup={"helper_id": helper_id} if helper_id else None,
       transient_owner_input_kind=owner_kind,
       unseen_failure_version=unseen_failures.get(chat.id),
       project_ref=(
@@ -977,10 +985,7 @@ def list_chats(
         }
         if chat.project_ref_id is not None else None
       ),
-    )
-    helper_id = stranded_chat_ids.get(chat.id)
-    summary["stranded_helper_followup"] = {"helper_id": helper_id} if helper_id else None
-    result.append(summary)
+    ))
   return result
 
 

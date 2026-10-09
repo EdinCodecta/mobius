@@ -1226,8 +1226,11 @@ def test_stranded_post_goal_followup_is_manual_recovery_on_all_chat_reads(
   from datetime import timedelta
   from app.delegations import stranded_followups
 
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  created = client.post("/api/chats", headers=auth, json={"title": "Original work"})
+  assert created.status_code == 200
   parent_id, _child_id, delegation_id = _seed_delegation(
-    db, suffix="stranded-followup", child_status="failed",
+    db, suffix="stranded-followup", child_status="failed", parent_id=created.json()["id"],
   )
   goal = models.ChatGoal(
     id="stranded-followup-goal", chat_id=parent_id,
@@ -1251,7 +1254,6 @@ def test_stranded_post_goal_followup_is_manual_recovery_on_all_chat_reads(
   assert len(statements) == 1
   assert "transcript" not in statements[0] and "messages" not in statements[0]
   assert background_helper_chat_ids(db, [parent_id]) == set()
-  auth = {"Authorization": f"Bearer {owner_token}"}
   summary = next(row for row in client.get("/api/chats", headers=auth).json()
                  if row["id"] == parent_id)
   detail = client.get(f"/api/chats/{parent_id}", headers=auth).json()
@@ -1261,6 +1263,14 @@ def test_stranded_post_goal_followup_is_manual_recovery_on_all_chat_reads(
                               "helper_id": delegation_id}
     assert row["stranded_helper_followup"] == {"helper_id": delegation_id}
   assert detail["background_helpers"]["count"] == 0
+  retried_create = client.post("/api/chats", headers=auth, json={"id": parent_id})
+  assert retried_create.status_code == 200
+  assert retried_create.json()["stranded_helper_followup"] == {"helper_id": delegation_id}
+  assert retried_create.json()["detail"]["stranded_helper_followup"] == {"helper_id": delegation_id}
+  unrelated_create = client.post("/api/chats", headers=auth, json={"title": "New work"})
+  assert unrelated_create.status_code == 200
+  assert unrelated_create.json()["stranded_helper_followup"] is None
+  assert unrelated_create.json()["detail"]["stranded_helper_followup"] is None
   from app.routes.chats import _chat_detail_response
   embedded = _chat_detail_response(db.get(models.Chat, parent_id), db=db, expose_session=False)
   assert embedded["handoff"] != detail["handoff"]
