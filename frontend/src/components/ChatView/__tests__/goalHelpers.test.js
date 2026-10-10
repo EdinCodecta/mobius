@@ -10,7 +10,6 @@ import { goalContinuationHandoff } from '../chatHandoffPresentation.js'
 const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
 after(() => vite.close())
 const load = async name => (await vite.ssrLoadModule(`/src/components/ChatView/${name}.jsx`)).default
-const Questions = await load('GoalHelperQuestions')
 const Details = await load('GoalPlanDetails')
 const Rail = await load('ProgressRail')
 const Waiting = await load('WaitingChip')
@@ -38,19 +37,57 @@ const goal = {
   },
 }
 
-test('a nested saved question is visible even in the collapsed owning Goal, with task title and no ancestor answer control', () => {
-  const items = progressRailViewModel(goal, []).map(item => ({
-    ...item, details: h(Details, { plan: goal.plan }), notice: h(Questions, { helpers: goalHelpers(goal) }),
-  }))
-  const html = render(h(Rail, { items }))
-  assert.match(html, /aria-expanded="false"/)
-  assert.match(html, /aria-label="Helper questions" tabindex="0"/)
-  assert.match(html, /Verify the migration · Needs an answer/)
-  assert.match(html, /Which release should I verify/)
-  assert.match(html, /Stable/)
-  assert.match(html, /Preview/)
-  assert.match(html, /Waiting for its parent/)
-  assert.doesNotMatch(html, /private\.|Codex|Claude|<input|<textarea|Submit|resumes automatically/)
+test('a helper question is internal coordination: no owner banner, the task names its coordinating agent', () => {
+  const items = progressRailViewModel(goal, []).map(item => ({ ...item, details: h(Details, { plan: goal.plan }) }))
+  const collapsed = render(h(Rail, { items }))
+  assert.match(collapsed, /aria-expanded="false"/)
+  assert.match(collapsed, /Waiting on 1 helper · 1 waiting for coordinating agent · resumes automatically/)
+  assert.doesNotMatch(collapsed, /Needs an answer|Waiting for you|Which release|Helper questions|Stable/)
+
+  const details = render(h(Details, { plan: goal.plan }))
+  const [checklist, history] = details.split('<details class="chat__goal-execution">')
+  assert.match(checklist, /Verify the migration.*Waiting for coordinating agent/)
+  assert.doesNotMatch(checklist, /Which release/)
+  // The exact saved question stays inspectable in closed execution history.
+  assert.match(history, /Waiting for coordinating agent/)
+  assert.match(history, /Asked its coordinating agent/)
+  assert.match(history, /Which release should I verify\?/)
+  assert.match(history, /Options offered: Stable · Preview/)
+  assert.doesNotMatch(details, /private\.|Codex|Claude|<input|<textarea|<button|Submit|Needs an answer/)
+})
+
+test('a saved owner card owns the headline while helper questions stay internal details', () => {
+  const owner = { ...structuredClone(goal), status: 'paused', handoff: { kind: 'owner_input', reason: 'saved_card' } }
+  assert.equal(goalHelperWaitingLabel(owner), null)
+  const [rail] = progressRailViewModel(owner, [])
+  assert.match(rail.label, /^Goal · Waiting for you · 0\/2/)
+  assert.doesNotMatch(rail.label, /coordinating agent|Needs an answer/)
+  assert.match(render(h(Details, { plan: owner.plan })), /Waiting for coordinating agent/)
+})
+
+test('helper questions never invent owner input or an automatic wake', () => {
+  const only = structuredClone(goal)
+  only.plan.delegations = [{ ...child, plan_task: 'check' }]
+  assert.equal(goalHelperWaitingLabel(only), 'Helper waiting for coordinating agent · resumes automatically')
+  // Delivered to an idle parent that ended without answering: no wake is arranged.
+  const idle = { ...only, status: 'paused', handoff: { kind: 'none', reason: null } }
+  assert.equal(goalHelperWaitingLabel(idle), 'On hold · Helper waiting for coordinating agent')
+  const stopped = { ...only, status: 'paused', resumable: true, handoff: { kind: 'owner_hold', reason: 'owner' } }
+  assert.equal(goalHelperWaitingLabel(stopped), 'On hold · Helper waiting for coordinating agent')
+  assert.ok(goalContinuationHandoff(stopped))
+  // While the coordinating agent's turn runs, the rail keeps its ordinary working headline.
+  assert.equal(goalHelperWaitingLabel({ ...only, status: 'active' }, { turnActive: true }), null)
+  const two = structuredClone(only)
+  two.plan.delegations.push({ ...child, id: 'second' })
+  assert.equal(goalHelperWaitingLabel(two), '2 helpers waiting for coordinating agent · resumes automatically')
+})
+
+test('a task with working and asking helpers stays in progress and names the pending question', () => {
+  const plan = structuredClone(goal.plan)
+  plan.delegations[0].children.push({ id: 'sibling', plan_task: 'check', status: 'running', children: [] })
+  const checklist = render(h(Details, { plan })).split('<details')[0]
+  assert.match(checklist, /In progress · helper waiting for coordinating agent/)
+  assert.equal((checklist.match(/role="listitem"/g) || []).length, 2)
 })
 
 test('expanded helpers use plan titles and On hold, never task keys or provider names', () => {

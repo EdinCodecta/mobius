@@ -1,5 +1,4 @@
-import GoalHelperQuestions from './GoalHelperQuestions.jsx'
-import { goalHelpers, helpersOutsideGoal } from './goalHelpers.js'
+import { helpersOutsideGoal } from './goalHelpers.js'
 import { LocalAnswersContext } from './localAnswersContext.js'
 import {
   chatCompactingKind,
@@ -5748,7 +5747,6 @@ export default function ChatView({
     turnActive, hasPendingQuestion, hasPendingResume: !!pendingResumeBlock, chatHandoff,
   })
   const progressGoal = currentProgressGoal(goalPresentation, { turnActive })
-  const goalOwnedHelpers = goalHelpers(progressGoal)
   const separateBackgroundHelpers = helpersOutsideGoal(backgroundHelpers, progressGoal)
   const buildPhaseRail = buildPhaseRailViewModel(buildPhases)
   // Goal ownership comes from authoritative runtime reconciliation, never
@@ -5789,8 +5787,6 @@ export default function ChatView({
         actionDisabled: providerSwitching || goalResumeState.pending || goalResumeState.unavailable,
         actionError: goalResumeState.error,
       } : {}),
-      ...(goalOwnedHelpers.some(node => node.status === 'needs_input' && node.question?.text)
-        ? { notice: <GoalHelperQuestions helpers={goalOwnedHelpers} /> } : {}),
       icon: <Flag width={14} height={14} aria-hidden="true" />,
       ...(goalPresentation?.plan || goalPresentation?.hold_reason || continuationHandoff
         ? { details: <GoalPlanDetails
