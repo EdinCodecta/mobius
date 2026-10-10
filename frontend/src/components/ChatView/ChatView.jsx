@@ -770,7 +770,6 @@ export default function ChatView({
   // run lifecycle reconciliation keep an already-mounted view current.
   const [armedWaits, setArmedWaits] = useState(() => cached?.waits || [])
   const [serverHandoff, setServerHandoff] = useState(() => cached?.handoff || null)
-  const [strandedHelperFollowup, setStrandedHelperFollowup] = useState(() => cached?.stranded_helper_followup || null)
   const [backgroundHelpers, setBackgroundHelpers] = useState(() => (
     normalizeBackgroundHelpers(cached?.background_helpers)
   ))
@@ -831,7 +830,6 @@ export default function ChatView({
     // destination cache so the prior chat's wait never flashes during fetch.
     setArmedWaits(Array.isArray(runtime?.waits) ? runtime.waits : [])
     setServerHandoff(runtime?.handoff || null)
-    setStrandedHelperFollowup(runtime?.stranded_helper_followup || null)
     setBackgroundHelpers(normalizeBackgroundHelpers(runtime?.background_helpers))
   }, [chatId, queryClient, setGoalPresentationLocalState])
 
@@ -1478,7 +1476,6 @@ export default function ChatView({
       setLiveQuestionId(data.pending_question_id || null)
       if (Array.isArray(data.waits)) setArmedWaits(data.waits)
       setServerHandoff(data.handoff || null)
-      setStrandedHelperFollowup(data.stranded_helper_followup || null)
       if (!staleSnapshot) setChatCompacting(chatId, data.compacting || null)
       setBackgroundHelpers(normalizeBackgroundHelpers(data.background_helpers))
       updateChatRuntimeCache(queryClient, chatMessagesQueryKey(chatId), {
@@ -1489,7 +1486,6 @@ export default function ChatView({
         recoveryRunId: data.recovery_run_id || null,
         continuationWait: data.continuation_wait || null,
         handoff: data.handoff || null,
-        stranded_helper_followup: data.stranded_helper_followup || null,
         goal: runtimeGoal,
         pending_messages: data.pending_messages || [],
         pending_question_id: data.pending_question_id || null,
@@ -1678,7 +1674,6 @@ export default function ChatView({
       setLiveQuestionId(pendingQuestionId)
       if (Array.isArray(data.waits)) setArmedWaits(data.waits)
       setServerHandoff(data.handoff || null)
-      setStrandedHelperFollowup(data.stranded_helper_followup || null)
       setChatCompacting(chatId, data.compacting || null)
       setBackgroundHelpers(normalizeBackgroundHelpers(data.background_helpers))
       updateChatRuntimeCache(queryClient, chatMessagesQueryKey(chatId), {
@@ -1689,7 +1684,6 @@ export default function ChatView({
         recoveryRunId: data.recovery_run_id || null,
         continuationWait: data.continuation_wait || null,
         handoff: data.handoff || null,
-        stranded_helper_followup: data.stranded_helper_followup || null,
         goal: runtimeGoal,
         pending_messages: serverPending,
         pending_question_id: pendingQuestionId,
@@ -2580,7 +2574,6 @@ export default function ChatView({
       setLiveQuestionId(runtime.pending_question_id || null)
       setArmedWaits(Array.isArray(runtime.waits) ? runtime.waits : [])
       setServerHandoff(runtime.handoff || null)
-      setStrandedHelperFollowup(runtime.stranded_helper_followup || null)
       setBackgroundHelpers(normalizeBackgroundHelpers(runtime.background_helpers))
       setBridgeMountInputs({
         runningAtMount: running,
@@ -2723,7 +2716,6 @@ export default function ChatView({
           recoveryRunId: runtime.recovery_run_id || null,
           continuationWait: runtime.continuation_wait || null,
           handoff: runtime.handoff || null,
-          stranded_helper_followup: runtime.stranded_helper_followup || null,
           activeAssistantMessageId:
             runtime.active_assistant_message_id || null,
           goal: runtimeGoal,
@@ -5684,7 +5676,6 @@ export default function ChatView({
   // ready, it's waiting on the owner), and a screen-reader user has no visual
   // Resume card to fall back on.
   const resumeStatus = (() => {
-    if (strandedHelperFollowup?.helper_id) return 'Helper follow-up needs review. It will not resume automatically.'
     if (!pendingResumeBlock) return null
     if (serverHandoff?.kind === 'recovery') return 'This chat needs recovery. Review the saved recovery card.'
     if (resourcePause) {
@@ -6186,17 +6177,14 @@ export default function ChatView({
               </li>
             )
           })()}
-          {!hasPendingQuestion && !turnActive && (armedWaits.length > 0 || separateBackgroundHelpers.count > 0 || resourcePause || modelCapacityPause || pendingLimitPark || strandedHelperFollowup?.helper_id) && <li className="chat__handoff-slot" data-key="current-waiting-handoff">
+          {!hasPendingQuestion && !turnActive && (armedWaits.length > 0 || separateBackgroundHelpers.count > 0 || resourcePause || modelCapacityPause || pendingLimitPark) && <li className="chat__handoff-slot" data-key="current-waiting-handoff">
             <WaitingChip
-              chatId={chatId}
-              strandedFollowup={strandedHelperFollowup}
               waits={armedWaits}
               backgroundHelpers={separateBackgroundHelpers}
               resourcePause={resourcePause || (modelCapacityPause || pendingLimitPark ? pendingResumeBlock : null)}
               handoff={serverHandoff}
               onCancel={handleCancelWait}
               onRevealRecovery={resumeCardEl ? () => revealPendingQuestion(resumeCardEl) : undefined}
-              onInternalNav={internalNav}
             />
           </li>}
         </ul>

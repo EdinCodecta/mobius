@@ -644,7 +644,6 @@ def test_create_chat_returns_canonical_owner_drawer_summary(client, auth):
   row = next(item for item in listed.json() if item["id"] == body["id"])
   assert {key: body[key] for key in row} == row
   assert body["messages"] == []
-  assert body["stranded_helper_followup"] is None
 
   detail = client.get(f"/api/chats/{body['id']}", headers=auth)
   assert detail.status_code == 200

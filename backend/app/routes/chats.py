@@ -73,9 +73,7 @@ from app.chat_titles import (
   renamed_event,
 )
 from app.database import get_db
-from app.delegations import (
-  background_helper_chat_ids, serialize_background_helpers, stranded_followups,
-)
+from app.delegations import background_helper_chat_ids, serialize_background_helpers
 from app.goal_plans import presented_goal, presented_deferred_goals
 from app.helper_transcripts import read_helper_conversation
 from app.memory_observability import record_memory_checkpoint_once
@@ -345,11 +343,7 @@ def _project_ref_for_chat(db: Session, chat) -> dict | None:
 def _chat_create_response(chat: models.Chat, db: Session) -> dict:
   detail = _chat_detail_response(chat, db=db)
   return {
-    **_owner_chat_summary(
-      chat,
-      project_ref=_project_ref_for_chat(db, chat),
-      stranded_helper_followup=detail["stranded_helper_followup"],
-    ),
+    **_owner_chat_summary(chat, project_ref=_project_ref_for_chat(db, chat)),
     "messages": detail["messages"],
     "detail": detail,
   }
@@ -476,7 +470,6 @@ def _owner_chat_summary(
   transient_owner_input_kind: OwnerInputKind | None = None,
   unseen_failure_version: int | None = None,
   project_ref: dict | None = None,
-  stranded_helper_followup: dict | None = None,
 ) -> dict:
   """Canonical owner-list shape for a Chat or its lightweight projection.
 
@@ -502,7 +495,6 @@ def _owner_chat_summary(
     # inactive or overloading the running indicator.
     "waiting": bool(handoff and handoff["kind"] == "automatic"),
     "handoff": handoff or {"kind": "none", "reason": None},
-    "stranded_helper_followup": stranded_helper_followup,
     # A turn parked on the owner's AskUserQuestion answer is `running` but is
     # NOT streaming — nothing to interrupt, and the card is durable — so the
     # shell excludes it from the reload-defer's active-turn test. The durable
@@ -823,8 +815,6 @@ def _chat_detail_response(
       if expose_session else {"count": 0, "items": []}
     ),
   }
-  stranded_helper_id = stranded_followups(db, [chat.id]).get(chat.id) if expose_session else None
-  response["stranded_helper_followup"] = {"helper_id": stranded_helper_id} if stranded_helper_id else None
   response["handoff"] = project_handoff(
     owner_input=bool(response["pending_question_id"]) or chat.id in secure_inputs.pending_chat_ids(),
     running=running,
@@ -832,7 +822,6 @@ def _chat_detail_response(
     helper_count=response["background_helpers"]["count"],
     park=continuation_handoff_for_chat(db, chat.id),
     goal=response["goal"],
-    stranded_followup=stranded_helper_id,
   )
   if requested_anchor_found is not None:
     response["requested_anchor_found"] = requested_anchor_found
@@ -933,7 +922,6 @@ def list_chats(
   durable_running = running_chat_ids(db, (chat.id for chat in chats))
   wait_chat_ids = outstanding_wait_chat_ids(db)
   helper_chat_ids = background_helper_chat_ids(db, (chat.id for chat in chats))
-  stranded_chat_ids = stranded_followups(db, (chat.id for chat in chats))
   park_candidates = {
     row[0] for row in db.query(models.ChatRun.chat_id).filter(
       models.ChatRun.chat_id.in_([chat.id for chat in chats]),
@@ -966,14 +954,11 @@ def list_chats(
       helper_count=1 if chat.id in helper_chat_ids else 0,
       park=park,
       goal=deferred_goals.get(chat.id),
-      stranded_followup=stranded_chat_ids.get(chat.id),
     )
-    helper_id = stranded_chat_ids.get(chat.id)
     result.append(_owner_chat_summary(
       chat,
       durable_running=chat.id in durable_running,
       handoff=handoff,
-      stranded_helper_followup={"helper_id": helper_id} if helper_id else None,
       transient_owner_input_kind=owner_kind,
       unseen_failure_version=unseen_failures.get(chat.id),
       project_ref=(
@@ -1889,16 +1874,12 @@ def get_chat_runtime(
       if principal.scope != "chat_embed" else {"count": 0, "items": []}
     ),
   }
-  stranded_helper_id = stranded_followups(db, [chat.id]).get(chat.id) \
-    if principal.scope != "chat_embed" else None
-  response["stranded_helper_followup"] = {"helper_id": stranded_helper_id} if stranded_helper_id else None
   response["handoff"] = project_handoff(
     owner_input=bool(response["pending_question_id"]) or chat.id in secure_inputs.pending_chat_ids(),
     running=running, waits=response["waits"],
     helper_count=response["background_helpers"]["count"],
     park=continuation_handoff_for_chat(db, chat.id),
     goal=response["goal"],
-    stranded_followup=stranded_helper_id,
   )
   return response
 

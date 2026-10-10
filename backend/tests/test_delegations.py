@@ -1220,20 +1220,20 @@ def test_background_helper_projection_owns_waiting_until_parent_wake(
   assert serialize_background_helpers(db, parent_id) == {"count": 0, "items": []}
 
 
-def test_stranded_post_goal_followup_is_manual_recovery_on_all_chat_reads(
+def test_failed_followup_after_closed_goal_never_asks_the_owner(
   client, owner_token, db,
 ):
+  """Helper failures belong to agents, never owner cards. Current work cannot
+  reach this state (follow-ups after a closed Goal are refused, and completion
+  waits for undelivered results); a pre-existing row stays readable history
+  through the helper's own record."""
   from datetime import timedelta
-  from app.delegations import stranded_followups
 
-  auth = {"Authorization": f"Bearer {owner_token}"}
-  created = client.post("/api/chats", headers=auth, json={"title": "Original work"})
-  assert created.status_code == 200
   parent_id, _child_id, delegation_id = _seed_delegation(
-    db, suffix="stranded-followup", child_status="failed", parent_id=created.json()["id"],
+    db, suffix="closed-goal-followup", child_status="failed",
   )
   goal = models.ChatGoal(
-    id="stranded-followup-goal", chat_id=parent_id,
+    id="closed-goal-followup-goal", chat_id=parent_id,
     objective="Original work", status="completed",
     completed_at=now_naive_utc() - timedelta(minutes=1),
   )
@@ -1241,81 +1241,15 @@ def test_stranded_post_goal_followup_is_manual_recovery_on_all_chat_reads(
   db.get(models.Delegation, delegation_id).goal_id = goal.id
   db.commit()
 
-  assert stranded_followups(db, [parent_id]) == {parent_id: delegation_id}
-  from sqlalchemy import event
-  statements = []
-  def capture(_conn, _cursor, statement, _params, _context, _many):
-    statements.append(statement.lower())
-  event.listen(db.get_bind(), "before_cursor_execute", capture)
-  try:
-    assert stranded_followups(db, [parent_id, "other-parent"]) == {parent_id: delegation_id}
-  finally:
-    event.remove(db.get_bind(), "before_cursor_execute", capture)
-  assert len(statements) == 1
-  assert "transcript" not in statements[0] and "messages" not in statements[0]
   assert background_helper_chat_ids(db, [parent_id]) == set()
+  auth = {"Authorization": f"Bearer {owner_token}"}
   summary = next(row for row in client.get("/api/chats", headers=auth).json()
                  if row["id"] == parent_id)
   detail = client.get(f"/api/chats/{parent_id}", headers=auth).json()
   runtime = client.get(f"/api/chats/{parent_id}/runtime", headers=auth).json()
   for row in (summary, detail, runtime):
-    assert row["handoff"] == {"kind": "recovery", "reason": "stranded_helper_followup",
-                              "helper_id": delegation_id}
-    assert row["stranded_helper_followup"] == {"helper_id": delegation_id}
-  assert detail["background_helpers"]["count"] == 0
-  retried_create = client.post("/api/chats", headers=auth, json={"id": parent_id})
-  assert retried_create.status_code == 200
-  assert retried_create.json()["stranded_helper_followup"] == {"helper_id": delegation_id}
-  assert retried_create.json()["detail"]["stranded_helper_followup"] == {"helper_id": delegation_id}
-  unrelated_create = client.post("/api/chats", headers=auth, json={"title": "New work"})
-  assert unrelated_create.status_code == 200
-  assert unrelated_create.json()["stranded_helper_followup"] is None
-  assert unrelated_create.json()["detail"]["stranded_helper_followup"] is None
-  from app.routes.chats import _chat_detail_response
-  embedded = _chat_detail_response(db.get(models.Chat, parent_id), db=db, expose_session=False)
-  assert embedded["handoff"] != detail["handoff"]
-  assert "helper_id" not in embedded["handoff"]
-  assert embedded["stranded_helper_followup"] is None
-
-  _seed_delegation(db, suffix="unrelated-active-helper", parent_id=parent_id,
-                   child_status="running")
-  for row in (
-    next(row for row in client.get("/api/chats", headers=auth).json() if row["id"] == parent_id),
-    client.get(f"/api/chats/{parent_id}", headers=auth).json(),
-    client.get(f"/api/chats/{parent_id}/runtime", headers=auth).json(),
-  ):
-    assert row["handoff"]["kind"] == "automatic"
-    assert row["stranded_helper_followup"] == {"helper_id": delegation_id}
-
-  db.add(models.ChatGoal(
-    id="stranded-followup-held", chat_id=parent_id,
-    objective="Held work", status="stopped", hold_json={"actor": "owner", "cause": "deferred", "reason": "Later"},
-  ))
-  db.commit()
-  assert stranded_followups(db, [parent_id]) == {}
-  db.delete(db.get(models.ChatGoal, "stranded-followup-held"))
-  db.commit()
-
-  # A failure before settlement is history, not an unresolved follow-up.
-  goal.completed_at = now_naive_utc() + timedelta(minutes=1)
-  db.commit()
-  assert stranded_followups(db, [parent_id]) == {}
-  goal.completed_at = now_naive_utc() - timedelta(minutes=1)
-  db.get(models.Delegation, delegation_id).delivered_run_id = "child-run-stranded-followup"
-  db.commit()
-  assert stranded_followups(db, [parent_id]) == {}
-  db.get(models.Delegation, delegation_id).delivered_run_id = None
-  db.add(make_goal_run(db,
-    id="stopped-after-followup", chat_id=parent_id, status="stopped",
-    provider="claude", started_at=now_naive_utc() - timedelta(minutes=2),
-    ended_at=now_naive_utc(),
-  ))
-  db.commit()
-  assert stranded_followups(db, [parent_id]) == {}
-  db.delete(db.get(models.ChatRun, "stopped-after-followup"))
-  db.get(models.Delegation, delegation_id).cancelled_at = now_naive_utc()
-  db.commit()
-  assert stranded_followups(db, [parent_id]) == {}
+    assert row["handoff"] == {"kind": "none", "reason": None}
+    assert "stranded_helper_followup" not in row
 
 
 def test_background_helper_wait_event_is_parent_scoped_and_best_effort(
