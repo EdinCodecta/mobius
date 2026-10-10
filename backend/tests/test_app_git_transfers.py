@@ -1,0 +1,640 @@
+"""App Git transfers run outside every app lock, against a real HTTP server.
+
+``git http-backend`` serves bare repositories over HTTP. Its pack responses can
+be paused, throttled or stalled, so these tests exercise Git's own transport,
+the low-speed limit and the transfer ceiling rather than a mocked subprocess.
+"""
+
+import asyncio
+import collections
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import weakref
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+from app import app_git, fs_locks, install, models
+from app.config import get_settings
+from tests.test_apps_install import (  # noqa: F401 - fixture
+  JSX, _fake_async_client, _fixture_commit, bypass_url_validation,
+)
+
+
+class _GitHandler(BaseHTTPRequestHandler):
+  def log_message(self, *_args):
+    pass
+
+  def do_GET(self):
+    self._serve()
+
+  def do_POST(self):
+    self._serve()
+
+  def _serve(self):
+    server = self.server
+    path, _, query = self.path.partition("?")
+    body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+    out = subprocess.run(["git", "http-backend"], input=body, capture_output=True, env={
+      "PATH": os.environ["PATH"], "HOME": str(server.root), "GIT_CONFIG_NOSYSTEM": "1",
+      "GIT_PROJECT_ROOT": str(server.root), "GIT_HTTP_EXPORT_ALL": "1",
+      "PATH_INFO": path, "QUERY_STRING": query, "REQUEST_METHOD": self.command,
+      "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+      "CONTENT_LENGTH": str(len(body)), "REMOTE_ADDR": "127.0.0.1",
+      "GIT_PROTOCOL": self.headers.get("Git-Protocol", ""),
+      "HTTP_CONTENT_ENCODING": self.headers.get("Content-Encoding", ""),
+    }).stdout
+    head, _, payload = out.partition(b"\r\n\r\n")
+    status, headers = 200, []
+    for line in head.decode().splitlines():
+      key, _, value = line.partition(":")
+      if key.lower() == "status":
+        status = int(value.split()[0])
+      else:
+        headers.append((key, value.strip()))
+    self.send_response(status)
+    for key, value in headers:
+      self.send_header(key, value)
+    self.end_headers()
+    name = path.strip("/").split("/")[0].removesuffix(".git")
+    pack = path.endswith("/git-upload-pack")
+    if pack:
+      with server.lock:
+        server.packs[name] += 1
+        paused = name in server.pause_next
+        server.pause_next.discard(name)
+      if paused:
+        server.waiting.set()
+        server.flowing.wait()
+    for start in range(0, len(payload), 4096):
+      if pack and server.rate:
+        time.sleep(4096 / server.rate)
+      try:
+        self.wfile.write(payload[start:start + 4096])
+        self.wfile.flush()
+      except (BrokenPipeError, ConnectionResetError):
+        return
+
+
+class _GitServer(ThreadingHTTPServer):
+  daemon_threads = True
+
+  def __init__(self, root: Path):
+    super().__init__(("127.0.0.1", 0), _GitHandler)
+    self.root = root
+    self.lock = threading.Lock()
+    self.reset()
+
+  def reset(self):
+    self.flowing = threading.Event()
+    self.flowing.set()
+    self.waiting = threading.Event()
+    self.pause_next: set[str] = set()
+    self.rate = 0
+    self.packs = collections.Counter()
+
+  def pause(self, name: str) -> None:
+    """Hold the next pack response for ``name`` until ``release``."""
+    self.flowing.clear()
+    self.waiting.clear()
+    self.pause_next.add(name)
+
+  def release(self) -> None:
+    self.flowing.set()
+
+  def url(self, name: str) -> str:
+    return f"http://127.0.0.1:{self.server_address[1]}/{name}.git"
+
+  def publish(self, name: str, *, big: bool = False) -> dict:
+    """Serve one app package repository; returns its manifest."""
+    manifest = {
+      "id": name, "name": name.title(), "version": "1.0.0",
+      "description": "Served over HTTP", "entry": "index.jsx",
+    }
+    work = self.root / f"{name}-work"
+    if big:
+      subprocess.run(["git", "clone", "-q", str(self.big), str(work)], check=True)
+    else:
+      subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
+    self.commit(name, manifest, JSX)
+    subprocess.run(
+      ["git", "clone", "-q", "--bare", str(work), str(self.root / f"{name}.git")],
+      check=True,
+    )
+    return manifest
+
+  def commit(self, name: str, manifest: dict, jsx: str, *, push: bool = False) -> str:
+    work = self.root / f"{name}-work"
+    (work / "mobius.json").write_text(json.dumps(manifest))
+    (work / "index.jsx").write_text(jsx)
+    commit = _fixture_commit(work, manifest["version"])
+    if push:
+      subprocess.run(
+        ["git", "-C", str(work), "push", "-q", str(self.root / f"{name}.git"), "HEAD:main"],
+        check=True,
+      )
+    return commit
+
+
+@pytest.fixture(scope="module")
+def _served(tmp_path_factory):
+  root = tmp_path_factory.mktemp("served-git")
+  big = root / "big-base"
+  subprocess.run(["git", "init", "-q", "-b", "main", str(big)], check=True)
+  # About 5 MB that compression cannot shrink, so a transfer takes real time.
+  for index in range(5):
+    (big / f"blob-{index}.bin").write_bytes(os.urandom(1024 * 1024))
+  _fixture_commit(big, "large history")
+  server = _GitServer(root)
+  server.big = big
+  thread = threading.Thread(target=server.serve_forever, daemon=True)
+  thread.start()
+  yield server
+  server.release()
+  server.shutdown()
+
+
+@pytest.fixture
+def git_server(_served, monkeypatch):
+  _served.reset()
+  # Map a catalog URL's GitHub repository onto the served repository.
+  real = install._derive_repo_ref
+
+  def served(url):
+    derived = real(url)
+    if derived is None:
+      return None
+    repo, ref = derived
+    return _served.url(repo.rsplit("/", 1)[1].removesuffix(".git")), ref
+
+  monkeypatch.setattr(install, "_derive_repo_ref", served)
+  # Module-level asyncio locks bind to the first loop that contends them.
+  monkeypatch.setattr(fs_locks, "_lifecycle_lock", asyncio.Lock())
+  monkeypatch.setattr(fs_locks, "_source_locks", weakref.WeakValueDictionary())
+  yield _served
+  _served.release()
+
+
+@pytest.fixture
+def transfers(monkeypatch):
+  """Every network transfer, with the app locks held when it started."""
+  calls = []
+  real = app_git._transfer
+
+  def guarded(stage, url, ref, **kwargs):
+    calls.append((
+      fs_locks._lifecycle_lock.locked(),
+      [key for key, lock in list(fs_locks._source_locks.items()) if lock.locked()],
+    ))
+    return real(stage, url, ref, **kwargs)
+
+  monkeypatch.setattr(app_git, "_transfer", guarded)
+  return calls
+
+
+def _base(name: str) -> str:
+  return f"https://raw.githubusercontent.com/test/{name}/main/"
+
+
+def _responses(name: str, manifest: dict, jsx: str = JSX) -> dict:
+  return {
+    _base(name) + "mobius.json": (200, json.dumps(manifest).encode()),
+    _base(name) + "index.jsx": (200, jsx.encode()),
+  }
+
+
+def _repo(name: str) -> Path:
+  return Path(get_settings().data_dir) / "apps" / name
+
+
+def _no_leftovers() -> bool:
+  root = install.git_transfer_root()
+  return not root.exists() or not any(root.iterdir())
+
+
+def _fsck(repo: Path) -> None:
+  app_git._run(repo, "fsck", "--connectivity-only", "--no-dangling")
+
+
+def _run_async(scenario, *responses):
+  """Run concurrent requests on one event loop, as the server does."""
+  from app.main import app as application
+
+  merged = {}
+  for response in responses:
+    merged.update(response)
+
+  async def main():
+    async with httpx.AsyncClient(
+      transport=httpx.ASGITransport(app=application), base_url="http://test",
+    ) as client:
+      with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(merged)):
+        return await scenario(client)
+
+  return asyncio.run(main())
+
+
+async def _paused(server: _GitServer) -> None:
+  assert await asyncio.to_thread(server.waiting.wait, 30), "transfer never started"
+
+
+def test_no_transfer_runs_under_an_app_lock(
+  client, auth, git_server, transfers, bypass_url_validation,
+):
+  """Fresh, reviewed and URL installs, update-check, preview, resolver, resolve."""
+  manifest = git_server.publish("invariant")
+  responses = _responses("invariant", manifest)
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    fresh = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base("invariant") + "mobius.json",
+    })
+  assert fresh.status_code == 201, fresh.text
+  app_id = fresh.json()["id"]
+  repo = _repo("invariant")
+  assert len(transfers) == 1
+
+  v2 = {**manifest, "version": "2.0.0"}
+  head = git_server.commit("invariant", v2, JSX.replace("ok", "v2"), push=True)
+  checked = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
+  assert checked.status_code == 200 and checked.json()["update_available"] is True
+  preview = client.get(f"/api/apps/{app_id}/update-candidate-preview", headers=auth)
+  assert preview.status_code == 200, preview.text
+  assert preview.json()["upstream_commit"] == head
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(
+    _responses("invariant", v2, JSX.replace("ok", "v2")),
+  )):
+    reviewed = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base("invariant") + "mobius.json",
+      "update_app_id": app_id,
+      "reviewed_upstream_commit": head,
+      "reviewed_source_digest": preview.json()["source_digest"],
+    })
+  assert reviewed.status_code == 201, reviewed.text
+  assert app_git.head_sha(repo, app_git.UPSTREAM_BRANCH) == head
+
+  v3 = {**manifest, "version": "3.0.0"}
+  head = git_server.commit("invariant", v3, JSX.replace("ok", "v3"), push=True)
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(
+    _responses("invariant", v3, JSX.replace("ok", "v3")),
+  )):
+    by_url = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base("invariant") + "mobius.json",
+    })
+  assert by_url.status_code == 201, by_url.text
+  assert app_git.head_sha(repo, app_git.UPSTREAM_BRANCH) == head
+
+  # A legacy shallow repo completes its history before either resolver path
+  # takes a lock. Neither request has a pending update to act on afterwards.
+  for request in (
+    lambda: client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth),
+    lambda: client.post("/api/apps/resolve-update", headers=auth, json={
+      "source_dir": str(repo),
+    }),
+  ):
+    (repo / ".git" / "shallow").write_text(head + "\n")
+    count = len(transfers)
+    assert request().status_code in (200, 404, 409)
+    assert len(transfers) == count + 1
+    assert not (repo / ".git" / "shallow").exists()
+
+  # Install, check, preview, URL update, resolver, resolve; the reviewed
+  # install found the previewed commit already present.
+  assert len(transfers) == 6
+  assert all(call == (False, []) for call in transfers), transfers
+  assert _no_leftovers()
+  _fsck(repo)
+
+
+def test_bootstrap_transfers_before_installing(git_server, transfers, db, monkeypatch):
+  from app import bootstrap
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  git_server.publish("bootstrap-source")
+  monkeypatch.setattr(bootstrap, "_derive_repo_ref", lambda _url: (
+    git_server.url("bootstrap-source"), "main",
+  ))
+  staged = []
+
+  async def install_from_manifest(_db, **kwargs):
+    staged.append(kwargs["staged_clone"])
+    assert kwargs["staged_clone"].path.is_dir()
+    raise RuntimeError("stop after the transfer")
+
+  monkeypatch.setattr(bootstrap, "install_from_manifest", install_from_manifest)
+  asyncio.run(bootstrap.ensure_bootstrap_apps_installed(db))
+  assert staged and len(transfers) == len(staged)
+  assert all(call == (False, []) for call in transfers)
+  assert not any(clone.path.exists() for clone in staged)
+
+
+def test_slow_install_blocks_no_other_app(
+  client, auth, git_server, monkeypatch, bypass_url_validation,
+):
+  """While one large transfer is paused, other lifecycle work completes."""
+  big = git_server.publish("large", big=True)
+  other = git_server.publish("checked")
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(
+    _responses("checked", other),
+  )):
+    checked_app = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base("checked") + "mobius.json",
+    })
+  assert checked_app.status_code == 201, checked_app.text
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client({
+    "https://doomed.test/app/index.jsx": (200, JSX.encode()),
+  })):
+    doomed = client.post("/api/apps/install", headers=auth, json={
+      "manifest": {**other, "id": "doomed", "name": "Doomed"},
+      "raw_base": "https://doomed.test/app/",
+    })
+  assert doomed.status_code == 201, doomed.text
+  git_server.commit("checked", {**other, "version": "2.0.0"}, JSX, push=True)
+
+  # Shrink the local-command ceiling: the transfer is held to its own.
+  local_ceiling = 3
+  real_run = app_git._run
+  monkeypatch.setattr(app_git, "_run", lambda *args, timeout=app_git._GIT_TIMEOUT, **kwargs: real_run(
+    *args, timeout=local_ceiling if timeout == app_git._GIT_TIMEOUT else timeout, **kwargs,
+  ))
+  git_server.pause("large")
+
+  async def scenario(http):
+    started = time.monotonic()
+    large = asyncio.create_task(http.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base("large") + "mobius.json",
+    }))
+    await _paused(git_server)
+    small = await asyncio.wait_for(http.post("/api/apps/install", headers=auth, json={
+      "manifest": {**other, "id": "small", "name": "Small"},
+      "raw_base": "https://small.test/app/",
+    }), 20)
+    removed = await asyncio.wait_for(
+      http.delete(f"/api/apps/{doomed.json()['id']}", headers=auth), 20,
+    )
+    checked = await asyncio.wait_for(
+      http.get(f"/api/apps/{checked_app.json()['id']}/update-check", headers=auth), 20,
+    )
+    assert not large.done(), "the paused transfer must still be running"
+    await asyncio.sleep(max(0, local_ceiling + 1 - (time.monotonic() - started)))
+    git_server.release()
+    return small, removed, checked, await asyncio.wait_for(large, 120), time.monotonic() - started
+
+  small, removed, checked, large, elapsed = _run_async(
+    scenario, _responses("large", big),
+    {"https://small.test/app/index.jsx": (200, JSX.encode())},
+  )
+  assert small.status_code == 201, small.text
+  assert removed.status_code == 204, removed.text
+  assert checked.status_code == 200 and checked.json()["update_available"] is True
+  assert large.status_code == 201, large.text
+  assert elapsed > local_ceiling
+  assert (_repo("large") / "blob-4.bin").stat().st_size == 1024 * 1024
+  assert _no_leftovers()
+
+
+def test_stalled_transfer_fails_fast_and_cleanly(git_server, monkeypatch):
+  git_server.publish("stalled", big=True)
+  monkeypatch.setattr(app_git, "_GIT_LOW_SPEED_TIME", 2)
+  git_server.pause("stalled")
+  started = time.monotonic()
+  with pytest.raises(subprocess.CalledProcessError):
+    asyncio.run(install.stage_app_clone(git_server.url("stalled"), "main"))
+  assert time.monotonic() - started < 30
+  assert _no_leftovers()
+
+
+def test_transfer_ceiling_stops_every_git_process(git_server, monkeypatch):
+  git_server.publish("trickle", big=True)
+  git_server.rate = 8192  # above the low-speed limit, far too slow for 5 MB
+  monkeypatch.setattr(app_git, "_GIT_TRANSFER_TIMEOUT", 2)
+  groups = []
+  real_popen = subprocess.Popen
+
+  class Recording(real_popen):
+    def __init__(self, *args, **kwargs):
+      super().__init__(*args, **kwargs)
+      groups.append(self.pid)
+
+  monkeypatch.setattr(app_git.subprocess, "Popen", Recording)
+  with pytest.raises(app_git.GitTransferTimeout):
+    asyncio.run(install.stage_app_clone(git_server.url("trickle"), "main"))
+  deadline = time.monotonic() + 5
+  for group in groups:
+    while True:
+      try:
+        os.killpg(group, 0)
+      except ProcessLookupError:
+        break
+      assert time.monotonic() < deadline, f"git process group {group} survived"
+      time.sleep(0.05)
+  assert _no_leftovers()
+
+
+def _install_served(client, auth, git_server, name: str) -> tuple[int, dict]:
+  manifest = git_server.publish(name)
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(
+    _responses(name, manifest),
+  )):
+    response = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base(name) + "mobius.json",
+    })
+  assert response.status_code == 201, response.text
+  return response.json()["id"], manifest
+
+
+@pytest.mark.parametrize("change", ["purge", "rename", "origin"])
+def test_source_change_during_transfer_refuses_the_import(
+  client, auth, git_server, bypass_url_validation, change,
+):
+  name = f"moving-{change}"
+  app_id, manifest = _install_served(client, auth, git_server, name)
+  head = git_server.commit(name, {**manifest, "version": "2.0.0"}, JSX, push=True)
+  repo = _repo(name)
+  git_server.pause(name)
+
+  async def scenario(http):
+    preview = asyncio.create_task(
+      http.get(f"/api/apps/{app_id}/update-candidate-preview", headers=auth),
+    )
+    await _paused(git_server)
+    # The same locked mutations uninstall, rename and origin migration make.
+    async with fs_locks.source_dir_lock(str(repo)):
+      if change == "purge":
+        shutil.rmtree(repo)
+      elif change == "rename":
+        repo.rename(repo.with_name(name + "-moved"))
+      else:
+        app_git.set_origin_url(repo, git_server.url("elsewhere"))
+    git_server.release()
+    return await asyncio.wait_for(preview, 60)
+
+  preview = _run_async(scenario)
+  assert preview.status_code == 409, preview.text
+  if change == "origin":
+    assert app_git._resolve_commit(repo, head) is None
+    _fsck(repo)
+  else:
+    assert not repo.exists(), "an import must never recreate a moved repository"
+  assert _no_leftovers()
+
+
+def test_concurrent_update_checks_import_one_commit(
+  client, auth, git_server, bypass_url_validation,
+):
+  app_id, manifest = _install_served(client, auth, git_server, "twice")
+  git_server.commit("twice", {**manifest, "version": "2.0.0"}, JSX.replace("ok", "v2"), push=True)
+
+  async def scenario(http):
+    return await asyncio.gather(*(
+      http.get(f"/api/apps/{app_id}/update-check", headers=auth) for _ in range(2)
+    ))
+
+  first, second = _run_async(scenario)
+  assert first.status_code == second.status_code == 200
+  assert first.json()["update_available"] is second.json()["update_available"] is True
+  assert first.json()["candidate_source_digest"] == second.json()["candidate_source_digest"]
+  assert git_server.packs["twice"] >= 3
+  _fsck(_repo("twice"))
+  assert _no_leftovers()
+
+
+def test_reinstall_at_same_path_during_transfer(
+  client, auth, git_server, bypass_url_validation,
+):
+  app_id, manifest = _install_served(client, auth, git_server, "again")
+  v2 = {**manifest, "version": "2.0.0"}
+  git_server.commit("again", v2, JSX.replace("ok", "v2"), push=True)
+  git_server.pause("again")
+
+  async def scenario(http):
+    checking = asyncio.create_task(http.get(f"/api/apps/{app_id}/update-check", headers=auth))
+    await _paused(git_server)
+    removed = await asyncio.wait_for(http.delete(f"/api/apps/{app_id}", headers=auth), 20)
+    reinstalled = await asyncio.wait_for(http.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base("again") + "mobius.json",
+    }), 30)
+    git_server.release()
+    return removed, reinstalled, await asyncio.wait_for(checking, 60)
+
+  removed, reinstalled, checked = _run_async(scenario, _responses("again", v2, JSX.replace("ok", "v2")))
+  assert removed.status_code == 204, removed.text
+  assert reinstalled.status_code == 201, reinstalled.text
+  assert reinstalled.json()["id"] == app_id
+  assert checked.status_code == 200, checked.text
+  _fsck(_repo("again"))
+  assert _no_leftovers()
+
+
+def test_two_concurrent_fresh_installs_of_one_package(
+  auth, git_server, bypass_url_validation, db,
+):
+  manifest = git_server.publish("racing")
+  git_server.pause("racing")
+
+  async def scenario(http):
+    request = lambda: http.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base("racing") + "mobius.json",
+    })
+    first = asyncio.create_task(request())
+    await _paused(git_server)
+    second = await asyncio.wait_for(request(), 30)
+    git_server.release()
+    return second, await asyncio.wait_for(first, 60)
+
+  second, first = _run_async(scenario, _responses("racing", manifest))
+  assert second.status_code == 201, second.text
+  assert first.status_code == 201, first.text
+  assert {second.json()["mode"], first.json()["mode"]} == {"install", "update"}
+  assert db.query(models.App).filter_by(slug="racing").count() == 1
+  _fsck(_repo("racing"))
+  assert _no_leftovers()
+
+
+def test_process_killed_during_staging_leaves_a_clean_repo(
+  client, auth, git_server, bypass_url_validation, tmp_path,
+):
+  _app_id, manifest = _install_served(client, auth, git_server, "killed")
+  git_server.commit("killed", {**manifest, "version": "2.0.0"}, JSX, push=True)
+  repo = _repo("killed")
+  before = app_git._run(repo, "for-each-ref").stdout
+  git_server.pause("killed")
+  backend = Path(__file__).resolve().parents[1]
+  child = subprocess.Popen([sys.executable, "-c", (
+    "import sys; from pathlib import Path; from app import app_git;"
+    "app_git.stage_fetch(sys.argv[1], sys.argv[2], 'main', Path(sys.argv[3]))"
+  ), str(repo), git_server.url("killed"), str(install.git_transfer_root())], cwd=backend)
+  try:
+    assert git_server.waiting.wait(30)
+    os.kill(child.pid, signal.SIGKILL)
+    child.wait(10)
+    # Its Git child runs in its own session; a dying host would lose it too.
+    subprocess.run(["pkill", "-KILL", "-f", str(install.git_transfer_root())])
+  finally:
+    git_server.release()
+  assert not _no_leftovers(), "a killed process leaves its staging behind"
+  assert app_git._run(repo, "for-each-ref").stdout == before
+  _fsck(repo)
+  from app import startup
+  startup._sweep_git_transfers(None)
+  assert _no_leftovers()
+
+
+def test_killed_import_leaves_the_repo_consistent(tmp_path, monkeypatch, git_server):
+  """SIGKILL the local import mid-pack; refs stay put and a retry completes."""
+  manifest = git_server.publish("import-kill")
+  repo = tmp_path / "live"
+  app_git.adopt_clone(
+    app_git.stage_clone(git_server.url("import-kill"), "main", tmp_path / "t"), repo,
+  )
+  head = git_server.commit("import-kill", {**manifest, "version": "2.0.0"}, JSX, push=True)
+  incoming = app_git.stage_fetch(repo, git_server.url("import-kill"), "main", tmp_path / "t")
+  before = app_git._run(repo, "for-each-ref").stdout
+  # Hold the local upload-pack so the import is still running when killed.
+  hook = tmp_path / "slow-pack"
+  hook.write_text("#!/bin/sh\nsleep 30\nexec \"$@\"\n")
+  hook.chmod(0o755)
+  config = Path(os.environ["GIT_CONFIG_GLOBAL"])
+  original = config.read_text() if config.exists() else ""
+  config.write_text(original + f"[uploadpack]\n\tpackObjectsHook = {hook}\n")
+  fetches = []
+  real_popen = subprocess.Popen
+
+  class Recording(real_popen):
+    def __init__(self, args, *rest, **kwargs):
+      super().__init__(args, *rest, **kwargs)
+      if "fetch" in args:
+        fetches.append(self.pid)
+
+  errors = []
+
+  def run_import():
+    try:
+      app_git.import_staged(repo, incoming)
+    except subprocess.CalledProcessError as exc:
+      errors.append(exc)
+
+  with monkeypatch.context() as patched:
+    patched.setattr(app_git.subprocess, "Popen", Recording)
+    importing = threading.Thread(target=run_import)
+    importing.start()
+    deadline = time.monotonic() + 10
+    while not fetches and time.monotonic() < deadline:
+      time.sleep(0.05)
+    time.sleep(0.5)
+    os.killpg(fetches[0], signal.SIGKILL)
+    importing.join(10)
+  config.write_text(original)
+  assert errors, "the killed import must fail"
+  assert app_git._run(repo, "for-each-ref").stdout == before
+  _fsck(repo)
+  assert app_git.import_staged(repo, incoming) == head
+  _fsck(repo)

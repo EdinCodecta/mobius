@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Protocol
@@ -457,6 +458,13 @@ def _reap_staging_bundles(_context: StartupContext) -> None:
   reap_staging_bundles()
 
 
+def _sweep_git_transfers(_context: StartupContext) -> None:
+  """Discard Git transfers an earlier process left unfinished."""
+  from app.install import git_transfer_root
+
+  shutil.rmtree(git_transfer_root(), ignore_errors=True)
+
+
 async def _reconcile_compiled_bundles(context: StartupContext) -> None:
   from app.compiler import (
     reap_orphaned_bundles,
@@ -716,6 +724,7 @@ DATABASE_STARTUP_TASKS = (
   ),
   StartupTask("reconcile agent lifecycle", _reconcile_agent_lifecycle),
   StartupTask("reap staging bundles", _reap_staging_bundles),
+  StartupTask("sweep app Git transfers", _sweep_git_transfers),
   StartupTask(
     "reconcile compiled bundles",
     _reconcile_compiled_bundles,

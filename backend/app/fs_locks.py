@@ -64,6 +64,10 @@ cannot release these locks while a worker is still writing.
 
 Single-lock holders: ``write_app_file`` / ``delete_app_file`` take only the
 app lock; the install endpoint takes only the lifecycle lock.
+
+No Git network transfer runs while any of these locks is held: app Git
+transfers stage privately first, and only their local import takes the app's
+source lock (``install.fetch_app_commit``).
 """
 
 import asyncio

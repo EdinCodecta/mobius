@@ -22,7 +22,9 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.manifest_identity import canonical_manifest_identity_key
-from app.install import install_from_manifest
+from app.install import (
+  _derive_repo_ref, discard_staged, install_from_manifest, stage_app_clone,
+)
 from app.timeutil import now_naive_utc
 
 log = logging.getLogger("mobius.bootstrap")
@@ -256,13 +258,18 @@ async def ensure_bootstrap_apps_installed(db: Session) -> None:
       "bootstrap: installing %s from %s",
       bootstrap_app.manifest_id, bootstrap_app.manifest_url,
     )
+    staged_clone = None
     try:
+      repo_ref = _derive_repo_ref(bootstrap_app.manifest_url)
+      if repo_ref is not None:
+        staged_clone = await stage_app_clone(*repo_ref)
       result = await install_from_manifest(
         db,
         manifest_url=bootstrap_app.manifest_url,
         manifest=None,
         raw_base=None,
         source="bootstrap",
+        staged_clone=staged_clone,
       )
       app = result.app
       mode = result.mode
@@ -274,6 +281,8 @@ async def ensure_bootstrap_apps_installed(db: Session) -> None:
         "bootstrap: %s install failed — %s", bootstrap_app.manifest_id, exc,
       )
       continue
+    finally:
+      discard_staged(staged_clone)
     log.info(
       "bootstrap: %s install %s (app id=%s, warnings=%s)",
       bootstrap_app.manifest_id, mode, app.id, warnings,

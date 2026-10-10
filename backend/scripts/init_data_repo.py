@@ -46,6 +46,8 @@ backups-external/
 *.bak-*
 apps/*/data/
 apps/*/.git/
+# Private staging for app Git transfers, swept at boot.
+/apps/.git-transfers/
 agent-browser-profiles/
 generated/
 logs/

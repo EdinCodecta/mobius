@@ -2799,42 +2799,72 @@ def git_source_error(
   return HTTPException(409, detail={"code": code, "message": f"{failure} {outcome}".strip()})
 
 
-def _fetch_git_package_commit(source_dir: str | Path, source_url: str) -> str:
-  repo_ref = _derive_repo_ref(source_url)
-  if repo_ref is None:
-    raise ValueError("update source is not a root Git repository package")
-  expected_origin, ref = repo_ref
-  actual_origin = app_git.origin_url(source_dir)
-  normalize = lambda value: value.rstrip("/").removesuffix(".git").lower()
-  if actual_origin is None or normalize(actual_origin) != normalize(expected_origin):
-    raise ValueError("installed Git origin does not match update source")
-  return app_git.fetch_origin_ref(source_dir, ref)
+def git_transfer_root() -> Path:
+  """Private staging for Git transfers; swept at boot, never a live app."""
+  return Path(get_settings().data_dir) / "apps" / ".git-transfers"
 
 
-def fetch_git_install_candidate(
-  source_dir: str | Path,
-  source_url: str,
-  *,
-  source_identity: str | None = None,
-  strict: bool = True,
-) -> GitInstallCandidate:
-  """Fetch one Git ref, then read the complete package from its exact commit."""
-  commit = _fetch_git_package_commit(source_dir, source_url)
-  return read_git_install_candidate(
-    source_dir,
-    commit,
-    source_url,
-    source_identity=source_identity,
-    strict=strict,
+def discard_staged(staged: app_git.Staged | None) -> None:
+  if staged is not None:
+    shutil.rmtree(staged.path, ignore_errors=True)
+
+
+async def stage_app_clone(url: str, ref: str) -> app_git.Staged:
+  """Clone a catalog repository privately before any app lock is taken."""
+  return await asyncio.to_thread(
+    app_git.stage_clone, url, ref, git_transfer_root(),
   )
 
 
-def fetch_git_package_summary(
-  source_dir: str | Path, source_url: str, *, strict: bool = False,
-) -> GitPackageSummary:
-  """Fetch a discovery candidate under the same origin guard as installation."""
-  commit = _fetch_git_package_commit(source_dir, source_url)
-  return read_git_package_summary(source_dir, commit, strict=strict)
+def _same_origin(left: str, right: str) -> bool:
+  normalize = lambda value: value.rstrip("/").removesuffix(".git").lower()
+  return normalize(left) == normalize(right)
+
+
+async def fetch_app_commit(
+  source_dir: str | Path, ref: str, *, expected_origin: str | None = None,
+) -> str:
+  """Make ``ref``'s commit present, with full history, in an app repository.
+
+  Callers hold no app lock: the transfer runs in a private staging repository
+  and only the local import takes this app's source lock, after checking the
+  repository and its origin are still the ones the transfer started from.
+  """
+  repo = Path(source_dir)
+  url = await asyncio.to_thread(app_git.origin_url, repo)
+  if expected_origin is not None and (
+    url is None or not _same_origin(url, expected_origin)
+  ):
+    raise ValueError("installed Git origin does not match update source")
+  present = await asyncio.to_thread(app_git.present_commit, repo, ref)
+  if present is not None:
+    return present
+  if url is None:
+    raise RuntimeError("source repository has no origin")
+  staged = await asyncio.to_thread(
+    app_git.stage_fetch, repo, url, ref, git_transfer_root(),
+  )
+  try:
+    async with fs_locks.source_dir_lock(str(repo)):
+      if await asyncio.to_thread(app_git.origin_url, repo) != url:
+        raise app_git.SourceTreeChanged("app source changed during transfer")
+      return await asyncio.to_thread(app_git.import_staged, repo, staged)
+  finally:
+    await asyncio.to_thread(discard_staged, staged)
+
+
+def _url_update_commit(
+  repo: Path, ref: str, staged_clone: app_git.Staged | None,
+) -> str:
+  """The URL update's commit, imported from its staged clone or already here."""
+  if staged_clone is not None:
+    return app_git.import_staged(repo, staged_clone)
+  present = app_git.present_commit(repo, ref)
+  if present is None:
+    raise HTTPException(
+      409, "The app's Git update must be fetched before it is installed.",
+    )
+  return present
 
 
 def install_candidate_content_digest(candidate: InstallCandidate) -> str:
@@ -4120,6 +4150,7 @@ async def install_from_manifest(
   expected_upstream_commit: str | None = None,
   expected_candidate_digest: str | None = None,
   publication_handoff_app_id: int | None = None,
+  staged_clone: app_git.Staged | None = None,
 ) -> InstallResult:
   """Return a structured durable install/update/conflict outcome.
 
@@ -4144,6 +4175,9 @@ async def install_from_manifest(
 
   The per-app git model is unconditional. Every installed app has a canonical
   source directory and repository; updates never overwrite source blindly.
+  Callers hold the lifecycle lock, so this never touches the network: a root
+  Git package arrives as ``staged_clone`` (from ``stage_app_clone``) or as a
+  commit already made present by ``fetch_app_commit``.
 
   Failure modes:
     - Pre-commit failures (manifest fetch, validation, JSX compile,
@@ -4334,6 +4368,7 @@ async def install_from_manifest(
     reviewed_upstream_commit=reviewed_upstream_commit,
     expected_upstream_commit=expected_upstream_commit,
     publication_handoff_app_id=publication_handoff_app_id,
+    staged_clone=staged_clone,
   )
   try:
     return await install_candidate(python_check=None)
@@ -4353,6 +4388,7 @@ async def _install_candidate(
   reviewed_upstream_commit: str | None,
   expected_upstream_commit: str | None,
   publication_handoff_app_id: int | None,
+  staged_clone: app_git.Staged | None,
   python_check: CheckedPythonTree | None,
 ) -> InstallResult:
   """Reconcile and activate one selected candidate in one transaction.
@@ -4611,8 +4647,21 @@ async def _install_candidate(
           cloned_update = await asyncio.to_thread(
             app_git.has_origin, git_source_dir,
           )
-        elif reviewed_upstream_commit is not None:
+        elif reviewed_upstream_commit is not None or (
+          repo_ref is not None
+          and await asyncio.to_thread(app_git.has_origin, git_source_dir)
+        ):
           try:
+            if reviewed_upstream_commit is not None:
+              upstream_sha = reviewed_upstream_commit
+            else:
+              upstream_sha = await asyncio.to_thread(
+                _url_update_commit, git_source_dir, repo_ref[1], staged_clone,
+              )
+              await asyncio.to_thread(
+                _verify_git_install_candidate,
+                git_source_dir, upstream_sha, candidate,
+              )
             previous_tree = await asyncio.to_thread(
               app_git.read_ref_tree,
               git_source_dir,
@@ -4627,11 +4676,11 @@ async def _install_candidate(
               await asyncio.to_thread(
                 app_git.replace_upstream_ref,
                 git_source_dir,
-                reviewed_upstream_commit,
+                upstream_sha,
                 expected_sha=prev_upstream_commit,
               )
               promoted = app_git.FetchUpstreamResult(
-                sha=reviewed_upstream_commit,
+                sha=upstream_sha,
                 allow_unrelated_histories=True,
               )
               git_merge_base_override = prev_upstream_commit
@@ -4639,14 +4688,14 @@ async def _install_candidate(
               promoted = await asyncio.to_thread(
                 app_git.promote_upstream,
                 git_source_dir,
-                reviewed_upstream_commit,
+                upstream_sha,
                 trusted_origin_adoption=target.trusted_origin,
               )
           except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
             raise git_source_error(
               "The installed version was left unchanged.",
               exc,
-              failure="The reviewed Git update could not be applied.",
+              failure="The app's Git update could not be applied.",
             ) from exc
           app.upstream_commit = promoted.sha
           allow_unrelated_histories = (
@@ -4654,67 +4703,6 @@ async def _install_candidate(
             or promoted.allow_unrelated_histories
           )
           cloned_update = True
-        elif repo_ref is not None and await asyncio.to_thread(
-          app_git.has_origin, git_source_dir,
-        ):
-          _, ref = repo_ref
-          previous_tree = await asyncio.to_thread(
-            app_git.read_ref_tree,
-            git_source_dir,
-            app_git.UPSTREAM_BRANCH,
-          )
-          synthetic_baseline = bool(
-            prev_upstream_commit
-          ) and replaces_migration_bridge(
-            previous_tree, trusted_origin=target.trusted_origin,
-          )
-          if synthetic_baseline:
-            try:
-              fetched_sha = await asyncio.to_thread(
-                app_git.fetch_origin_ref, git_source_dir, ref,
-              )
-              await asyncio.to_thread(
-                _verify_git_install_candidate,
-                git_source_dir, fetched_sha, candidate,
-              )
-            except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-              raise git_source_error(
-                "The installed version was left unchanged.",
-                exc,
-                failure="The app's Git update could not be fetched or verified.",
-              ) from exc
-            await asyncio.to_thread(
-              app_git.replace_upstream_ref,
-              git_source_dir,
-              fetched_sha,
-              expected_sha=prev_upstream_commit,
-            )
-            app.upstream_commit = fetched_sha
-            git_merge_base_override = prev_upstream_commit
-            cloned_update = True
-          else:
-            try:
-              fetched_upstream = await asyncio.to_thread(
-                app_git.fetch_upstream,
-                git_source_dir,
-                ref,
-                trusted_origin_adoption=target.trusted_origin,
-                verify=lambda commit: _verify_git_install_candidate(
-                  git_source_dir, commit, candidate,
-                ),
-              )
-            except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-              raise git_source_error(
-                "The installed version was left unchanged.",
-                exc,
-                failure="The app's Git update could not be fetched or verified.",
-              ) from exc
-            app.upstream_commit = fetched_upstream.sha
-            allow_unrelated_histories = (
-              allow_unrelated_histories
-              or fetched_upstream.allow_unrelated_histories
-            )
-            cloned_update = True
         if expected_upstream_commit is not None:
           new_upstream_paths = await asyncio.to_thread(
             _read_upstream_source_paths, git_source_dir,
@@ -4954,11 +4942,15 @@ async def _install_candidate(
         # URLs without a derivable origin remain supported: their fetched
         # source is imported into a local Git repository below.
         if repo_ref is not None:
-          repo_url, ref = repo_ref
-          try:
-            app.upstream_commit = await asyncio.to_thread(
-              app_git.clone_upstream, git_source_dir, repo_url, ref,
+          if staged_clone is None:
+            raise HTTPException(
+              409, "The app's Git repository must be fetched before install.",
             )
+          try:
+            journal.rollback_actions.append(await asyncio.to_thread(
+              app_git.adopt_clone, staged_clone, git_source_dir,
+            ))
+            app.upstream_commit = staged_clone.sha
             await asyncio.to_thread(
               _verify_git_install_candidate,
               git_source_dir, app.upstream_commit, candidate,
@@ -5192,12 +5184,11 @@ async def _install_candidate(
     db.rollback()
     journal.rollback_materialization()
     raise HTTPException(422, _compile_error_detail(app_name, exc))
-  except app_git.GitTransferTimeout as exc:
+  except app_git.HistoryIncomplete as exc:
     db.rollback()
     journal.rollback_materialization()
     raise git_source_error(
-      "The installed version was left unchanged.",
-      exc,
+      "The installed version was left unchanged.", exc,
     ) from exc
   except (HTTPException, _UncheckedPythonTree):
     db.rollback()
