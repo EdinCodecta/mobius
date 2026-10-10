@@ -764,7 +764,7 @@ async def test_rate_limited_store_is_retried_and_takes_its_default_pin(
   ), patch("app.bootstrap.get_system_broadcast", return_value=broadcast):
     outcome = await ensure_bootstrap_apps_installed(db)
     assert outcome == bootstrap_mod.BootstrapOutcome(
-      ("App Store",), rate_limited=True, retry_after=600,
+      ("store",), rate_limited=True, retry_after=600,
     )
     assert db.query(models.App).filter_by(slug="store").first() is None
     broadcast.reset_mock()
@@ -849,7 +849,7 @@ async def test_retry_tells_the_owner_once_and_stops_after_a_day(
 
   with patch("app.bootstrap.install_from_manifest", store_and_social_limited):
     await bootstrap_mod.retry_bootstrap_apps(bootstrap_mod.BootstrapOutcome(
-      ("App Store", "Social"), rate_limited=True,
+      ("store", "social"), rate_limited=True,
     ))
 
   assert clock[0] <= bootstrap_mod._RETRY_WINDOW_SECS
@@ -888,7 +888,9 @@ async def test_retry_waits_for_owner_lifecycle_work_and_respects_its_uninstall(
     await lock.acquire()
     try:
       retry = asyncio.create_task(bootstrap_mod.retry_bootstrap_apps(
-        bootstrap_mod.BootstrapOutcome(("Social",), rate_limited=True),
+        bootstrap_mod.BootstrapOutcome(
+          ("store", "social"), rate_limited=True,
+        ),
       ))
       for _ in range(20):
         await real_sleep(0)
@@ -933,7 +935,7 @@ async def test_runtime_supervisors_own_the_retry_until_shutdown(monkeypatch):
     restart_authorization=None,
     restart_fallback_chats=[],
   )
-  supervisors.retry_bootstrap_apps(bootstrap_mod.BootstrapOutcome(("Social",)))
+  supervisors.retry_bootstrap_apps(bootstrap_mod.BootstrapOutcome(("social",)))
   await asyncio.wait_for(started.wait(), timeout=5)
   task = supervisors._tasks["bootstrap-apps-retry"]
 
@@ -941,3 +943,37 @@ async def test_runtime_supervisors_own_the_retry_until_shutdown(monkeypatch):
 
   assert task.cancelled()
   assert supervisors._tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_retry_installs_only_pending_apps_and_respects_a_store_uninstall(
+  db, monkeypatch,
+):
+  """Startup reinstalls an uninstalled Store; a mid-session retry must not."""
+  from app import bootstrap as bootstrap_mod
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  db.add_all([
+    row for row in _installed_default_rows(
+      datetime.now(timezone.utc), deleted=("store",),
+    )
+    if row.slug != "social"
+  ])
+  db.commit()
+
+  async def no_wait(_seconds):
+    pass
+
+  monkeypatch.setattr(bootstrap_mod.asyncio, "sleep", no_wait)
+  install = AsyncMock(side_effect=_installing_rows(db))
+  with patch("app.bootstrap.install_from_manifest", install):
+    await bootstrap_mod.retry_bootstrap_apps(
+      bootstrap_mod.BootstrapOutcome(("social",), rate_limited=True),
+    )
+
+  assert [call.kwargs["manifest_url"] for call in install.await_args_list] == [
+    BOOTSTRAP_SOCIAL_MANIFEST_URL,
+  ]
+  db.expire_all()
+  assert db.query(models.App).filter_by(slug="store").one().deleted_at
+  assert db.query(models.App).filter_by(slug="social").one().deleted_at is None

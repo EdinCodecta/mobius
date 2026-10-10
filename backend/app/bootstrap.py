@@ -126,7 +126,7 @@ _RETRY_WINDOW_SECS = 24 * 60 * 60
 
 @dataclass(frozen=True)
 class BootstrapOutcome:
-  """Default apps whose install failed for a reason that passes with time."""
+  """Default apps (manifest ids) whose install failed only transiently."""
 
   pending: tuple[str, ...] = ()
   rate_limited: bool = False
@@ -209,7 +209,7 @@ def _mark_default_store_pinned(db: Session, app_id: int) -> bool:
 
 
 async def ensure_bootstrap_apps_installed(
-  db: Session, *, serving: bool = False,
+  db: Session, *, retry: tuple[str, ...] | None = None,
 ) -> BootstrapOutcome:
   """Idempotently install the configured bootstrap apps when absent.
 
@@ -223,10 +223,12 @@ async def ensure_bootstrap_apps_installed(
        assigned slug differs from the catalog slug.
 
   Caller is the FastAPI lifespan/startup handler, before anything is
-  serving, or `retry_bootstrap_apps` with `serving=True`. Owns no transaction
-  state — `install_from_manifest` commits its own work on success and
-  rolls back on failure. We just decide whether to call it. Returns the apps
-  that failed transiently, for `retry_bootstrap_apps`.
+  serving, or `retry_bootstrap_apps` with `retry` naming the manifest ids that
+  failed. A retry installs only those, so an app the owner uninstalled during
+  the session stays uninstalled, and still settles an owed Store pin. Owns no
+  transaction state — `install_from_manifest` commits its own work on success
+  and rolls back on failure. We just decide whether to call it. Returns the
+  apps that failed transiently, for `retry_bootstrap_apps`.
   """
   if os.environ.get(_SKIP_ENV) == "1":
     log.info("bootstrap: %s=1, skipping bootstrap app installs", _SKIP_ENV)
@@ -252,7 +254,7 @@ async def ensure_bootstrap_apps_installed(
     # purge and schedule convergence run too; take the lifecycle lock per app,
     # as the install route does, so one slow transfer never blocks them all.
     async with (
-      fs_locks.install_uninstall_lock() if serving
+      fs_locks.install_uninstall_lock() if retry is not None
       else contextlib.nullcontext()
     ):
       # Use the installer's identity resolver here too: bootstrap and an
@@ -316,6 +318,8 @@ async def ensure_bootstrap_apps_installed(
           default_pin_pending = False
           _publish_app_updated(existing.id)
         continue
+      if retry is not None and bootstrap_app.manifest_id not in retry:
+        continue
       log.info(
         "bootstrap: installing %s from %s",
         bootstrap_app.manifest_id, bootstrap_app.manifest_url,
@@ -339,7 +343,7 @@ async def ensure_bootstrap_apps_installed(
         )
         transient, wait = _transient_failure(exc)
         if transient:
-          pending.append(bootstrap_app.name)
+          pending.append(bootstrap_app.manifest_id)
           rate_limited = rate_limited or (
             isinstance(exc, HTTPException) and exc.status_code == 429
           )
@@ -370,9 +374,10 @@ async def retry_bootstrap_apps(outcome: BootstrapOutcome) -> None:
   """Repeat the bootstrap with capped backoff until nothing transient is left.
 
   Runs as a runtime supervisor once the server is serving. Each attempt
-  reruns the whole idempotent bootstrap under the lifecycle lock, so apps that
-  installed meanwhile are skipped and a still-owed default Store pin settles
-  with the Store. The owner is told once per retry run, only when the first
+  reruns the idempotent bootstrap for the pending apps only, under the
+  lifecycle lock, so apps that installed meanwhile are skipped, an owner's
+  uninstall during the session is respected, and a still-owed default Store
+  pin settles with the Store. The owner is told once per retry run, only when the first
   retry has also failed and an owner exists.
   """
   from app.database import SessionLocal
@@ -399,7 +404,9 @@ async def retry_bootstrap_apps(outcome: BootstrapOutcome) -> None:
     attempt += 1
     try:
       with SessionLocal() as db:
-        outcome = await ensure_bootstrap_apps_installed(db, serving=True)
+        outcome = await ensure_bootstrap_apps_installed(
+          db, retry=outcome.pending,
+        )
     except Exception:
       # The previous outcome stays owed; the next step tries again.
       log.exception("bootstrap: retry attempt failed")
@@ -413,7 +420,10 @@ async def _notify_owner_pending(
   from app import push
   from app.database import SessionLocal
 
-  names = list(outcome.pending)
+  names = [
+    app.name for app in _CORE_BOOTSTRAP_APPS
+    if app.manifest_id in outcome.pending
+  ]
   listed = (
     names[0] if len(names) == 1
     else ", ".join(names[:-1]) + " and " + names[-1]
