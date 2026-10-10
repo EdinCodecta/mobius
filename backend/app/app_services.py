@@ -33,7 +33,10 @@ from app import app_python_env, auth, models, service_preload
 from app.applied_app_runtime import AppliedRuntimeUnavailable, hold_runtime, runtime_root
 from app.browser_access import BrowserLineage, require_live
 from app.config import get_settings
-from app.manifest_contract import SERVICE_REQUEST_MAX_BYTES, SERVICE_TRANSFER_MAX_BYTES
+from app.manifest_contract import (
+  SERVICE_REQUEST_MAX_BYTES, SERVICE_ROUTE_LIMITS_MAX, SERVICE_ROUTE_METHODS,
+  SERVICE_TRANSFER_MAX_BYTES, is_service_route_path, service_route_key,
+)
 
 
 log = logging.getLogger(__name__)
@@ -291,7 +294,7 @@ def service_contract(app, *, access: str) -> dict:
   entry = service.get("entry")
   if not isinstance(entry, str) or not entry.endswith(".py"):
     raise HTTPException(503, "Accepted app service declaration is invalid.")
-  service_max_bytes(service)
+  _accepted_transfer_limits(service)
   return service
 
 
@@ -306,6 +309,53 @@ def service_max_bytes(service: dict) -> int:
   ):
     raise HTTPException(503, "Accepted app service transfer limit is invalid.")
   return request_limit
+
+
+def _accepted_transfer_limits(service: dict) -> tuple[int, dict[tuple[str, str], int]]:
+  """The accepted whole ceiling and its per-route ceilings by (method, canonical path).
+
+  An accepted contract is not trusted to be well formed: one the manifest
+  contract could not have produced disables the service rather than silently
+  falling back to its wider whole grant.
+  """
+  ceiling = service_max_bytes(service)
+  limits = service.get("route_limits", [])
+  routes: dict[tuple[str, str], int] = {}
+  if not isinstance(limits, list) or len(limits) > SERVICE_ROUTE_LIMITS_MAX:
+    raise HTTPException(503, "Accepted app service route limits are invalid.")
+  for limit in limits:
+    if not isinstance(limit, dict) or set(limit) != {
+      "method", "path", "max_request_bytes", "max_response_bytes",
+    }:
+      raise HTTPException(503, "Accepted app service route limits are invalid.")
+    method, path = limit["method"], limit["path"]
+    request_limit, response_limit = limit["max_request_bytes"], limit["max_response_bytes"]
+    if (
+      not isinstance(method, str) or method not in SERVICE_ROUTE_METHODS
+      or not is_service_route_path(path)
+      or type(request_limit) is not int or type(response_limit) is not int
+      or request_limit != response_limit
+      or not 1 <= request_limit <= ceiling
+      or (method, path) in routes
+    ):
+      raise HTTPException(503, "Accepted app service route limits are invalid.")
+    routes[(method, path)] = request_limit
+  return ceiling, routes
+
+
+def exchange_max_bytes(service: dict, method, path) -> int:
+  """The serialized per-direction ceiling for one exchange with an accepted service.
+
+  The single route-selection seam for HTTP, tool and policy exchanges. An
+  exact reviewed (method, canonical path) ceiling narrows the service's whole
+  grant; any other exchange, including one whose envelope names no route,
+  keeps the whole accepted ceiling. There is no prefix matching and no further
+  decoding: `service_route_key` is the only normalization.
+  """
+  ceiling, routes = _accepted_transfer_limits(service)
+  if not isinstance(method, str) or not isinstance(path, str):
+    return ceiling
+  return routes.get((method, service_route_key(path)), ceiling)
 
 
 def _reject_oversize_json_strings(value, max_bytes: int) -> None:
@@ -577,9 +627,12 @@ async def invoke_service(
   admission: ServiceExchangeAdmission | None = None,
 ) -> tuple[int, object, dict[str, str], str | None]:
   service = service_contract(app, access="public" if request_envelope.get("public") is True else "self")
+  # HTTP callers admit with the same route ceiling before reading a body.
   boundary = (
     contextlib.nullcontext(admission) if admission is not None
-    else ServiceExchangeAdmission(service_max_bytes(service))
+    else ServiceExchangeAdmission(exchange_max_bytes(
+      service, request_envelope.get("method"), request_envelope.get("path"),
+    ))
   )
   browser = _actor_browser(request_envelope.get("actor") or {})
   grant_id = browser.grant_id if browser is not None else None
@@ -611,7 +664,12 @@ async def _invoke_admitted_service(
 ) -> tuple[int, object, dict[str, str], str | None]:
   public = request_envelope.get("public") is True
   service = service_contract(app, access="public" if public else "self")
-  max_bytes = service_max_bytes(service)
+  # One ceiling bounds both directions: request serialization, the stdout of
+  # either execution backend, and the decoded binary response. It never
+  # exceeds what admission reserved for.
+  max_bytes = min(admission.max_bytes, exchange_max_bytes(
+    service, request_envelope.get("method"), request_envelope.get("path"),
+  ))
   try:
     _reject_oversize_json_strings(request_envelope, max_bytes)
     # Tool calls bypass HTTP body admission. Bound their serialization too,

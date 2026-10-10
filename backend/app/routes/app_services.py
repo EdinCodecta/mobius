@@ -139,10 +139,10 @@ async def authenticated_app_service(
   if principal.app_id is not None and principal.app_id != app.id:
     raise HTTPException(403, "An app can invoke only its own service.")
   service = app_services.service_contract(app, access="self")
-  with app_services.ServiceExchangeAdmission(app_services.service_max_bytes(service)) as admission:
+  max_bytes = app_services.exchange_max_bytes(service, request.method, path)
+  with app_services.ServiceExchangeAdmission(max_bytes) as admission:
     envelope = await _envelope(
-      request, path, public=False,
-      max_bytes=app_services.service_max_bytes(service), admission=admission,
+      request, path, public=False, max_bytes=max_bytes, admission=admission,
       actor=app_services.request_actor(
         db, principal, app if principal.app_id is not None else None,
       ),
@@ -178,10 +178,10 @@ async def shared_app_service(
     raise HTTPException(403, "Calling app is unavailable.")
   required = "self" if principal.app_id in {None, target.id} else "apps"
   service = app_services.service_contract(target, access=required)
-  with app_services.ServiceExchangeAdmission(app_services.service_max_bytes(service)) as admission:
+  max_bytes = app_services.exchange_max_bytes(service, request.method, path)
+  with app_services.ServiceExchangeAdmission(max_bytes) as admission:
     envelope = await _envelope(
-      request, path, public=False,
-      max_bytes=app_services.service_max_bytes(service), admission=admission,
+      request, path, public=False, max_bytes=max_bytes, admission=admission,
       actor=app_services.request_actor(db, principal, caller),
     )
     db.expunge(target)
@@ -211,12 +211,11 @@ async def public_app_service(
   owner = db.query(models.Owner).first()
   if owner is None:
     raise HTTPException(503, "Owner setup is incomplete.")
-  with app_services.ServiceExchangeAdmission(
-    app_services.service_max_bytes(service), public_ingress=True,
-  ) as admission:
+  max_bytes = app_services.exchange_max_bytes(service, request.method, path)
+  with app_services.ServiceExchangeAdmission(max_bytes, public_ingress=True) as admission:
     envelope = await _envelope(
       request, path, public=True, actor={"scope": "public"},
-      max_bytes=app_services.service_max_bytes(service), admission=admission,
+      max_bytes=max_bytes, admission=admission,
     )
     db.expunge(app)
     db.expunge(owner)

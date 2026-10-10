@@ -178,6 +178,46 @@ Storage reads outside service routes do not inherit this deadline. Near-ceiling
 The shared streaming body reader accumulates bytes rather than retaining a
 list entry and source allocation for every transport fragment.
 
+A service can narrow that ceiling for exact small routes with
+`service.route_limits`, so control requests do not reserve a media-sized
+allowance:
+
+```json
+{
+  "service": {
+    "entry": "service.py",
+    "access": "public",
+    "max_bytes": 62914560,
+    "route_limits": [
+      { "method": "GET", "path": "/actor", "max_bytes": 1048576 },
+      { "method": "POST", "path": "/activity", "max_bytes": 1048576 }
+    ]
+  }
+}
+```
+
+At most 16 entries, each exactly `method` (`GET`, `POST`, `PUT`, `PATCH` or
+`DELETE`, uppercase), `path` and `max_bytes` (an integer from 1 byte to the
+service's `max_bytes`), unique per method and path. A path is already
+canonical: it starts with `/`, has only non-empty segments, no trailing slash,
+no `.` or `..` segment, no `%`, `?`, `#`, whitespace or control characters,
+and at most 512 characters. The reviewed contract records each entry as equal
+`max_request_bytes` and `max_response_bytes`, sorted by path then method, and
+omits the list when it is empty. Matching is exact and case-sensitive on the
+method and on the path the route already received once-decoded, written as `/`
+plus its non-empty segments; the query string is ignored. Same-app, shared and
+public HTTP routes, agent tools (`POST /tools/<name>`) and platform policies
+(`POST /<policy path>`) use that one match. There is no prefix match and no
+further decoding: the app owns its route identity, so a route it reaches only
+by decoding again is not matched. An unmatched route or method keeps the
+whole `max_bytes` grant. A matched route's ceiling bounds the request body
+read (before buffering), the serialized request, the service's stdout and a
+decoded binary response, and the exchange reserves three times that smaller
+ceiling. The ceiling governs admission accounting only; it promises no
+execution priority, queue position, availability under load or process RSS.
+Adding or lowering a route ceiling narrows the service in update review;
+removing, renaming or raising one widens it.
+
 Service exchange admission also bounds decoded resources independently of
 serialized bytes, in both directions: at most 262,144 structural marks (string
 openings, container openings, commas and colons outside strings), nesting

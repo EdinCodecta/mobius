@@ -595,6 +595,23 @@ def contract_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     aliases = list(service.get("aliases") or [])
     if aliases:
       accepted_service["aliases"] = aliases
+    # Omitted when empty so services without route ceilings keep their
+    # existing review digest. A sorted list, not a path-keyed object, so
+    # update review compares it as one value instead of splitting slashes.
+    route_limits = sorted(
+      (
+        {
+          "method": limit["method"],
+          "path": limit["path"],
+          "max_request_bytes": limit["max_bytes"],
+          "max_response_bytes": limit["max_bytes"],
+        }
+        for limit in service.get("route_limits") or []
+      ),
+      key=lambda limit: (limit["path"], limit["method"]),
+    )
+    if route_limits:
+      accepted_service["route_limits"] = route_limits
     contract["service"] = accepted_service
   return contract
 
@@ -696,6 +713,7 @@ def contract_from_app_state(
     "public_access": public_access,
     "tools": tools,
   }
+  preserved_service: dict[str, Any] = {}
   if service is _PRESERVE_ACCEPTED and isinstance(
     getattr(app, "capability_contract", None), dict,
   ):
@@ -711,6 +729,11 @@ def contract_from_app_state(
       accepted_limit = accepted_service.get("max_request_bytes", SERVICE_REQUEST_MAX_BYTES)
       if accepted_limit != SERVICE_REQUEST_MAX_BYTES:
         service["max_bytes"] = accepted_limit
+      # Dropping a reviewed route ceiling would widen that route back to the
+      # whole grant. Keep the accepted list verbatim (the runtime rejects a
+      # malformed one) rather than re-deriving it through manifest form.
+      if "route_limits" in accepted_service:
+        preserved_service["route_limits"] = deepcopy(accepted_service["route_limits"])
   if isinstance(service, dict):
     manifest["service"] = service
   if model_provider is _PRESERVE_ACCEPTED:
@@ -718,7 +741,10 @@ def contract_from_app_state(
     model_provider = accepted.get("model_provider") if isinstance(accepted, dict) else None
   if isinstance(model_provider, dict):
     manifest["model_provider"] = model_provider
-  return contract_from_manifest(manifest)
+  contract = contract_from_manifest(manifest)
+  if preserved_service:
+    contract["service"].update(preserved_service)
+  return contract
 
 
 def contract_with_chat_log_access(
@@ -900,6 +926,38 @@ _LIST_GRANTS = {
 }
 
 
+def _route_ceilings(value: Any) -> dict[tuple[Any, Any], int] | None:
+  """Accepted route ceilings by (method, path), or None when malformed."""
+  if value is None:
+    return {}
+  if not isinstance(value, list):
+    return None
+  ceilings: dict[tuple[Any, Any], int] = {}
+  for limit in value:
+    if not isinstance(limit, dict):
+      return None
+    key = (limit.get("method"), limit.get("path"))
+    request, response = limit.get("max_request_bytes"), limit.get("max_response_bytes")
+    if type(request) is not int or request != response or key in ceilings:
+      return None
+    ceilings[key] = request
+  return ceilings
+
+
+def _route_limits_widen(before: Any, after: Any) -> bool:
+  """Whether a service that stays granted loses or raises a route ceiling.
+
+  A route ceiling only narrows its service's whole grant, so introducing or
+  lowering one narrows. Removing or renaming one returns that route to the
+  whole grant and raising one enlarges it; both need review, as does any
+  shape this cannot read.
+  """
+  old, new = _route_ceilings(before), _route_ceilings(after)
+  if old is None or new is None:
+    return True
+  return any(key not in new or new[key] > ceiling for key, ceiling in old.items())
+
+
 def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
   """Whether one semantic leaf change grants the app more than it had.
 
@@ -931,6 +989,10 @@ def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
     old = SERVICE_REQUEST_MAX_BYTES if before is None else before
     new = SERVICE_REQUEST_MAX_BYTES if after is None else after
     return type(old) is not int or type(new) is not int or new > old
+  if path == "service.route_limits":
+    if not any(key.startswith("service.") for key in after_leaves):
+      return False  # Complete revocation cannot restore a route allowance.
+    return _route_limits_widen(before, after)
   for capability_id, definition in RUNTIME_CAPABILITY_DEFINITIONS.items():
     prefix = f"runtime.{capability_id}."
     if not path.startswith(prefix):

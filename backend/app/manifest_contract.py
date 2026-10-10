@@ -44,6 +44,13 @@ AGENT_ACTIVITIES_COUNT_MAX = 16
 SERVICE_REQUEST_MAX_BYTES = 8 * 1024 * 1024
 SERVICE_TRANSFER_MAX_BYTES = 60 * 1024 * 1024
 SERVICE_ALIASES_MAX = 4
+SERVICE_ROUTE_LIMITS_MAX = 16
+SERVICE_ROUTE_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+SERVICE_ROUTE_PATH_MAX = 512
+# A declared route is already in its one matched form: never percent-encoded
+# (exchanges match the once-decoded path), never a query or fragment, and no
+# whitespace or control characters that render ambiguously in review.
+_SERVICE_ROUTE_PATH_FORBIDDEN = re.compile(r"[%?#\s\x00-\x1f\x7f-\x9f]")
 AGENT_TOOLS_MAX = 16
 AGENT_TOOL_DESCRIPTION_MAX = 2000
 AGENT_TOOL_SCHEMA_MAX_BYTES = 8 * 1024
@@ -415,6 +422,62 @@ def package_limit_message(declared: int) -> str:
     f"This app declares {declared} bytes of files, more than the "
     f"{PACKAGE_MAX_BYTES // (1024 * 1024)} MiB app package limit."
   )
+
+
+def service_route_key(path: str) -> str:
+  """The canonical route an exchange path is matched by: `/` plus its non-empty segments.
+
+  HTTP routes deliver the once-decoded path without a leading slash, tool calls
+  use `/tools/<name>` and platform policies a bare relative path; all three
+  name the same route through this one form. It never decodes again, resolves
+  dot segments, or folds case: the app owns its route identity.
+  """
+  return "/" + "/".join(segment for segment in path.split("/") if segment)
+
+
+def is_service_route_path(path) -> bool:
+  """Whether a declared route-limit path is already exactly its canonical key."""
+  return (
+    isinstance(path, str)
+    and 1 < len(path) <= SERVICE_ROUTE_PATH_MAX
+    and service_route_key(path) == path
+    and not any(segment in (".", "..") for segment in path.split("/"))
+    and _SERVICE_ROUTE_PATH_FORBIDDEN.search(path) is None
+  )
+
+
+def validate_service_route_limits(route_limits, max_bytes: int) -> None:
+  """Validate the reviewed per-route ceilings that narrow a service's grant."""
+  if not isinstance(route_limits, list) or len(route_limits) > SERVICE_ROUTE_LIMITS_MAX:
+    _fail(
+      "Manifest `service.route_limits` must be an array with at most "
+      f"{SERVICE_ROUTE_LIMITS_MAX} entries."
+    )
+  seen: set[tuple[str, str]] = set()
+  for index, limit in enumerate(route_limits):
+    field = f"service.route_limits[{index}]"
+    if not isinstance(limit, Mapping) or set(limit) != {"method", "path", "max_bytes"}:
+      _fail(f"Manifest `{field}` must contain exactly `method`, `path`, and `max_bytes`.")
+    method = limit["method"]
+    if not isinstance(method, str) or method not in SERVICE_ROUTE_METHODS:
+      _fail(f"Manifest `{field}.method` must be one of GET, POST, PUT, PATCH, or DELETE.")
+    path = limit["path"]
+    if not is_service_route_path(path):
+      _fail(
+        f"Manifest `{field}.path` must be an absolute canonical path of non-empty "
+        f"segments, at most {SERVICE_ROUTE_PATH_MAX} characters, without a "
+        "trailing slash, dot segments, percent-encoding, query, fragment, "
+        "whitespace, or control characters."
+      )
+    route_bytes = limit["max_bytes"]
+    if type(route_bytes) is not int or not 1 <= route_bytes <= max_bytes:
+      _fail(
+        f"Manifest `{field}.max_bytes` must be an integer from 1 byte to the "
+        "service's `max_bytes`."
+      )
+    if (method, path) in seen:
+      _fail(f"Manifest `service.route_limits` repeats {method} {path}.")
+    seen.add((method, path))
 
 
 def _validate_running_label(running_label, field: str) -> None:
@@ -965,11 +1028,11 @@ def validate_manifest_contract(manifest) -> None:
   service = manifest.get("service")
   if service is not None:
     if not isinstance(service, Mapping) or set(service) - {
-      "id", "aliases", "entry", "access", "max_bytes",
+      "id", "aliases", "entry", "access", "max_bytes", "route_limits",
     }:
       _fail(
         "Manifest `service` must contain only `id`, `aliases`, `entry`, "
-        "`access`, and `max_bytes`."
+        "`access`, `max_bytes`, and `route_limits`."
       )
     if package_id is not None and "id" not in service:
       _fail("Manifest `service.id` is required when `package_id` is declared.")
@@ -1011,6 +1074,7 @@ def validate_manifest_contract(manifest) -> None:
       _fail(
         "Manifest `service.max_bytes` must be an integer from 1 byte to 60 MiB."
       )
+    validate_service_route_limits(service.get("route_limits", []), max_bytes)
 
   # The app's own Python environment (app_python_env). Apply and install
   # check that the listed file exists in the accepted tree.

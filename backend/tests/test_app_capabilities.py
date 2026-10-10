@@ -873,3 +873,163 @@ def test_job_secret_permission_is_reviewed_normalized_and_omission_revokes():
   assert contract_from_app_state(app)['data']['job_secret_read'] == ['tg-1', 'tg-2']
   revoked = contract_from_app_state(app, contract_permissions={})
   assert 'job_secret_read' not in revoked['data']
+
+
+MIB = 1024 * 1024
+
+
+def _routed(route_limits, *, max_bytes=60 * MIB, **service):
+  declared = {"entry": "service.py", "access": "public", "max_bytes": max_bytes, **service}
+  if route_limits is not None:
+    declared["route_limits"] = route_limits
+  return _manifest(source_files=["memory-core.md", "service.py"], service=declared)
+
+
+def _limit(method, path, max_bytes=MIB):
+  return {"method": method, "path": path, "max_bytes": max_bytes}
+
+
+def test_service_route_limits_accept_exact_bounded_canonical_routes():
+  limits = [
+    _limit("POST", "/activity"), _limit("GET", "/actor"), _limit("DELETE", "/actor"),
+    _limit("PATCH", "/a/b-c_d.e~f/" + "x" * 499, 1),  # exactly 512 characters
+    *(_limit("PUT", f"/r{index}") for index in range(12)),
+  ]
+  validate_manifest_contract(_routed(limits))
+  # The default 8 MiB grant bounds a route ceiling when max_bytes is omitted.
+  default = _manifest(source_files=["memory-core.md", "service.py"], service={
+    "entry": "service.py", "route_limits": [_limit("GET", "/actor", 8 * MIB)],
+  })
+  validate_manifest_contract(default)
+
+
+@pytest.mark.parametrize("route_limits", [
+  {"GET /actor": MIB},
+  [_limit("GET", f"/r{index}") for index in range(17)],
+  ["GET /actor"],
+  [{"method": "GET", "path": "/actor"}],
+  [{**_limit("GET", "/actor"), "max_response_bytes": MIB}],
+  [_limit("get", "/actor")],
+  [_limit("HEAD", "/actor")],
+  [_limit(None, "/actor")],
+  [_limit("GET", "actor")],
+  [_limit("GET", "/")],
+  [_limit("GET", "/actor/")],
+  [_limit("GET", "//actor")],
+  [_limit("GET", "/a//b")],
+  [_limit("GET", "/a/./b")],
+  [_limit("GET", "/a/../b")],
+  [_limit("GET", "/a/%2e%2e")],
+  [_limit("GET", "/a%2Fb")],
+  [_limit("GET", "/actor?x=1")],
+  [_limit("GET", "/actor#x")],
+  [_limit("GET", "/act or")],
+  [_limit("GET", "/act\tor")],
+  [_limit("GET", "/act or")],
+  [_limit("GET", "/act\x00or")],
+  [_limit("GET", "/act\x7for")],
+  [_limit("GET", "/" + "x" * 512)],
+  [_limit("GET", 7)],
+  [_limit("GET", "/actor", True)],
+  [_limit("GET", "/actor", 0)],
+  [_limit("GET", "/actor", 1.5)],
+  [_limit("GET", "/actor", "1024")],
+  [_limit("GET", "/actor", 60 * MIB + 1)],
+  [_limit("GET", "/actor"), _limit("GET", "/actor", 512)],
+], ids=lambda value: json.dumps(value)[:40])
+def test_malformed_service_route_limits_fail_manifest_review(route_limits):
+  with pytest.raises(ManifestContractError, match="service.route_limits"):
+    validate_manifest_contract(_routed(route_limits))
+
+
+def test_route_limit_cannot_exceed_its_own_service_grant():
+  with pytest.raises(ManifestContractError, match="service.route_limits"):
+    validate_manifest_contract(_routed([_limit("GET", "/actor", 2048)], max_bytes=1024))
+  with pytest.raises(ManifestContractError, match="service.route_limits"):
+    validate_manifest_contract(_manifest(source_files=["memory-core.md", "service.py"], service={
+      "entry": "service.py", "route_limits": [_limit("GET", "/actor", 8 * MIB + 1)],
+    }))
+
+
+def test_route_limits_contract_is_sorted_stable_and_absent_when_empty():
+  shuffled = [_limit("POST", "/b"), _limit("GET", "/b", 2048), _limit("POST", "/a", 4096)]
+  contract, digest = contract_and_digest(_routed(shuffled))
+  assert contract["service"]["route_limits"] == [
+    {"method": "POST", "path": "/a", "max_request_bytes": 4096, "max_response_bytes": 4096},
+    {"method": "GET", "path": "/b", "max_request_bytes": 2048, "max_response_bytes": 2048},
+    {"method": "POST", "path": "/b", "max_request_bytes": MIB, "max_response_bytes": MIB},
+  ]
+  _again, reordered_digest = contract_and_digest(_routed(list(reversed(shuffled))))
+  assert reordered_digest == digest
+
+  # A service without ceilings keeps its pre-existing review digest exactly.
+  legacy, legacy_digest = contract_and_digest(_routed(None))
+  empty, empty_digest = contract_and_digest(_routed([]))
+  assert "route_limits" not in legacy["service"] and "route_limits" not in empty["service"]
+  assert empty_digest == legacy_digest
+  assert set(legacy["service"]) == {
+    "id", "entry", "access", "protocol", "max_request_bytes", "max_response_bytes",
+  }
+  assert diff_contracts(legacy, empty) == {
+    "unknown_previous": False, "widens": False, "added": [], "removed": [], "changed": [],
+  }
+
+
+def test_unrelated_row_projection_preserves_accepted_route_limits():
+  from types import SimpleNamespace
+  from app.app_capabilities import contract_from_app_state
+
+  accepted, _digest = contract_and_digest(_routed([_limit("GET", "/actor"), _limit("POST", "/activity")]))
+  app = SimpleNamespace(capability_contract=accepted)
+  assert contract_from_app_state(app)["service"] == accepted["service"]
+
+  # A malformed accepted list stays exactly as accepted, so the runtime keeps
+  # refusing it; an unrelated metadata write must not silently widen routes.
+  malformed = json.loads(json.dumps(accepted))
+  malformed["service"]["route_limits"] = [{"method": "GET", "path": "actor"}]
+  assert contract_from_app_state(SimpleNamespace(capability_contract=malformed))["service"][
+    "route_limits"
+  ] == [{"method": "GET", "path": "actor"}]
+
+  # An explicit local manifest owns the service: its ceilings replace the
+  # accepted ones, and an explicit service removal removes them with it.
+  local = contract_from_app_state(app, service={
+    "id": "memory", "entry": "service.py", "access": "public", "max_bytes": 60 * MIB,
+    "route_limits": [_limit("GET", "/actor", 1024)],
+  })
+  assert local["service"]["route_limits"] == [
+    {"method": "GET", "path": "/actor", "max_request_bytes": 1024, "max_response_bytes": 1024},
+  ]
+  assert "service" not in contract_from_app_state(app, service=None)
+
+
+def test_route_limit_review_narrows_on_add_or_lower_and_widens_on_loss_or_raise():
+  def contract(limits, **service):
+    return contract_and_digest(_routed(limits, **service))[0]
+
+  none = contract(None)
+  actor = contract([_limit("GET", "/actor")])
+  both = contract([_limit("GET", "/actor"), _limit("POST", "/activity")])
+  lower = contract([_limit("GET", "/actor", 1024)])
+
+  assert diff_contracts(none, actor)["widens"] is False  # introduce
+  assert diff_contracts(actor, both)["widens"] is False  # introduce another
+  assert diff_contracts(actor, lower)["widens"] is False  # lower
+  assert diff_contracts(lower, actor)["widens"] is True  # raise
+  assert diff_contracts(both, actor)["widens"] is True  # remove one
+  assert diff_contracts(actor, none)["widens"] is True  # remove all; service stays
+  assert diff_contracts(actor, contract([_limit("GET", "/actors")]))["widens"] is True  # rename
+  assert diff_contracts(actor, contract([_limit("POST", "/actor")]))["widens"] is True  # method
+
+  revoked = {key: value for key, value in actor.items() if key != "service"}
+  assert diff_contracts(actor, revoked)["widens"] is False  # complete revocation
+
+  # The whole-grant increase is still classified on its own.
+  small = contract([_limit("GET", "/actor", 1024)], max_bytes=8 * MIB)
+  assert diff_contracts(small, lower)["widens"] is True
+
+  for malformed in ("1024", [{"method": "GET", "path": "/actor", "max_request_bytes": 1}], [None]):
+    broken = json.loads(json.dumps(actor))
+    broken["service"]["route_limits"] = malformed
+    assert diff_contracts(actor, broken)["widens"] is True
+    assert diff_contracts(broken, actor)["widens"] is True

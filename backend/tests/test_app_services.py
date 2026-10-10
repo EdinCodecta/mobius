@@ -207,26 +207,26 @@ print(json.dumps({
 
 def _service_app(
   db, *, access="self", slug="service-test", service_id=None, aliases=(),
-  service_bytes=SERVICE, max_bytes=8 * 1024 * 1024,
+  service_bytes=SERVICE, max_bytes=8 * 1024 * 1024, route_limits=None,
 ):
   source = Path(get_settings().data_dir) / "apps" / slug
   source.mkdir(parents=True)
+  service = {
+    "entry": "service.py",
+    "access": access,
+    "protocol": "json-v1",
+    "max_request_bytes": max_bytes,
+    "max_response_bytes": max_bytes,
+  }
+  if route_limits is not None:
+    service["route_limits"] = route_limits
   app = models.App(
     name="Service test",
     slug=slug,
     description="",
     source_dir=str(source),
     jsx_source="export default () => null",
-    capability_contract={
-      "schema": 6,
-      "service": {
-        "entry": "service.py",
-        "access": access,
-        "protocol": "json-v1",
-        "max_request_bytes": max_bytes,
-        "max_response_bytes": max_bytes,
-      },
-    },
+    capability_contract={"schema": 6, "service": service},
     service_id=service_id,
   )
   db.add(app)
@@ -1693,6 +1693,405 @@ sys.stdout.write('{"body":"' + '\\\\n' * 100_000 + '"}')
     await asyncio.wait_for(scanned.wait(), 3)
     assert app_services.browser_grant_has_active_calls(grant_id)
     assert not task.done()
+    await app_services.cancel_browser_grant_calls(grant_id)
+    assert task.cancelled()
+  finally:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+  assert grant_id not in app_services._browser_calls
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
+MIB = 1024 * 1024
+
+
+def _route_limit(method, path, max_bytes):
+  return {
+    "method": method, "path": path,
+    "max_request_bytes": max_bytes, "max_response_bytes": max_bytes,
+  }
+
+
+def test_route_ceiling_matches_one_canonical_once_decoded_path():
+  service = {
+    "max_request_bytes": 60 * MIB, "max_response_bytes": 60 * MIB,
+    "route_limits": [
+      _route_limit("GET", "/actor", MIB),
+      _route_limit("POST", "/tools/log", 2048),
+      _route_limit("POST", "/reviewer/manual-plan", 4096),
+    ],
+  }
+  # HTTP delivers no leading slash, tools a leading slash, policies none.
+  for path in ("actor", "/actor", "actor/", "//actor"):
+    assert app_services.exchange_max_bytes(service, "GET", path) == MIB
+  assert app_services.exchange_max_bytes(service, "POST", "/tools/log") == 2048
+  assert app_services.exchange_max_bytes(service, "POST", "reviewer/manual-plan") == 4096
+  # Wrong method, case, prefix, extension, an undecoded form, or a missing
+  # selector all keep the whole reviewed grant: no broad or repeated matching.
+  for method, path in (
+    ("POST", "actor"), ("get", "actor"), ("GET", "Actor"), ("GET", "actor/x"),
+    ("GET", "act"), ("GET", "a%63tor"), ("GET", "actor?x=1"),
+    ("GET", "x/../actor"), (None, "actor"), ("GET", None),
+  ):
+    assert app_services.exchange_max_bytes(service, method, path) == 60 * MIB
+  assert app_services.exchange_max_bytes({}, None, None) == 8 * MIB
+
+
+@pytest.mark.parametrize("route_limits", [
+  {"GET /actor": 1024},
+  [["GET", "/actor", 1024]],
+  [{"method": "GET", "path": "/actor", "max_request_bytes": 1024}],
+  [{**_route_limit("GET", "/actor", 1024), "extra": True}],
+  [{**_route_limit("GET", "/actor", 1024), "max_response_bytes": 2048}],
+  [_route_limit("GET", "/actor", 0)],
+  [_route_limit("GET", "/actor", True)],
+  [_route_limit("GET", "/actor", 1024.0)],
+  [_route_limit("GET", "/actor", 8 * MIB + 1)],
+  [_route_limit("get", "/actor", 1024)],
+  [_route_limit("HEAD", "/actor", 1024)],
+  [_route_limit("GET", "actor", 1024)],
+  [_route_limit("GET", "/actor/", 1024)],
+  [_route_limit("GET", "/a%2Fb", 1024)],
+  [_route_limit("GET", "/", 1024)],
+  [_route_limit("GET", "/actor", 1024), _route_limit("GET", "/actor", 512)],
+  [_route_limit("GET", f"/r{index}", 1024) for index in range(17)],
+], ids=lambda value: json.dumps(value)[:40])
+def test_malformed_accepted_route_limits_disable_the_service_instead_of_widening(
+  client, auth, db, monkeypatch, route_limits,
+):
+  from app.routes import app_services as routes
+
+  app = _service_app(db, slug="malformed-routes", route_limits=route_limits)
+
+  async def forbidden_read(*_args, **_kwargs):
+    pytest.fail("a malformed accepted contract reached the body read")
+
+  monkeypatch.setattr(routes, "read_capped_body", forbidden_read)
+  response = client.post(f"/api/apps/{app.id}/service/echo", headers=auth, json={})
+  assert response.status_code == 503
+  assert response.json()["detail"] == "Accepted app service route limits are invalid."
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["self", "shared", "public"])
+@pytest.mark.parametrize("framing", ["chunked", "understated-length"])
+async def test_http_route_ceiling_is_reserved_and_enforced_before_body_decode(
+  db, auth, monkeypatch, route, framing,
+):
+  import httpx
+  from app.main import app as application
+  from app.routes import app_services as routes
+
+  cap = 4096
+  app = _service_app(
+    db, access="public", max_bytes=60 * MIB,
+    route_limits=[_route_limit("POST", "/activity", cap)],
+  )
+  reads = []
+  decoded = []
+  real_read = routes.read_capped_body
+  real_decode = app_services.ServiceExchangeAdmission.decode
+
+  async def tracked_read(request, limit, **kwargs):
+    reads.append((
+      limit, app_services._admitted_exchange_cost,
+      app_services._public_ingress_cost, request.headers.get("content-length"),
+    ))
+    return await real_read(request, limit, **kwargs)
+
+  async def tracked_decode(self, raw):
+    decoded.append(len(raw))
+    return await real_decode(self, raw)
+
+  monkeypatch.setattr(routes, "read_capped_body", tracked_read)
+  monkeypatch.setattr(app_services.ServiceExchangeAdmission, "decode", tracked_decode)
+  url = {
+    "self": f"/api/apps/{app.id}/service/activity",
+    "shared": f"/api/services/{app.slug}/activity",
+    "public": f"/api/app-services/{app.slug}/activity",
+  }[route]
+  headers = dict(auth)
+  if framing == "understated-length":
+    headers["content-length"] = "2"
+
+  def body(size):
+    payload = b'"' + b"x" * (size - 2) + b'"'
+
+    async def chunks():
+      for start in range(0, len(payload), 1000):
+        yield payload[start:start + 1000]
+
+    return chunks()
+
+  async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as http:
+    over = await http.post(url, headers=headers, content=body(cap + 1))
+    exact = await http.post(url, headers=headers, content=body(cap))
+    small = await http.post(url, headers=auth, json={})
+  assert over.status_code == 413
+  assert over.json()["detail"] == "App service request is too large."
+  # cap+1 bytes never reach the decoder; exactly cap bytes pass the read (its
+  # envelope then exceeds the same ceiling at serialization, also 413).
+  assert decoded == [cap, 2]
+  assert exact.status_code == 413
+  assert small.status_code == 201
+  assert [read[0] for read in reads] == [cap, cap, cap]
+  assert all(read[1] == 3 * cap for read in reads), "admission did not reserve the route ceiling"
+  assert all(read[2] == (3 * cap if route == "public" else 0) for read in reads)
+  if framing == "understated-length":
+    assert [read[3] for read in reads[:2]] == ["2", "2"]
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_tool_and_policy_requests_use_their_route_ceiling_before_execution(
+  db, auth, monkeypatch,
+):
+  from app import service_preload
+
+  cap = 2048
+  app = _service_app(db, max_bytes=60 * MIB, route_limits=[
+    _route_limit("POST", "/tools/log", cap),
+    _route_limit("POST", "/reviewer/validate-comment", cap),
+  ])
+  owner = db.query(models.Owner).first()
+  executed = []
+
+  async def reply(_python, _entry, _environment, request, _timeout, max_stdout):
+    executed.append((json.loads(request)["path"], max_stdout, app_services._admitted_exchange_cost))
+    return b'{"body":{"ok":true}}', b"", 0
+
+  monkeypatch.setattr(service_preload, "ready_host", lambda *_: None)
+  monkeypatch.setattr(app_services, "_run_spawned", reply)
+
+  def tool(path, text):
+    return {
+      "schema": 1, "method": "POST", "path": path, "query": {}, "headers": {},
+      "body": {"arguments": {"text": text}, "call": {}}, "public": False, "actor": {},
+    }
+
+  with pytest.raises(HTTPException) as caught:
+    await app_services.invoke_service(app, owner, tool("/tools/log", "x" * cap), lane="tools")
+  assert caught.value.status_code == 413
+  with pytest.raises(HTTPException) as caught:
+    await app_services.invoke_policy(app, owner, "reviewer/validate-comment", {"body": "x" * cap})
+  assert caught.value.status_code == 413
+  assert executed == []
+
+  await app_services.invoke_service(app, owner, tool("/tools/log", "ok"), lane="tools")
+  await app_services.invoke_policy(app, owner, "reviewer/validate-comment", {"body": "ok"})
+  await app_services.invoke_service(app, owner, tool("/tools/other", "x" * cap), lane="tools")
+  assert [(path, limit) for path, limit, _cost in executed] == [
+    ("/tools/log", cap), ("reviewer/validate-comment", cap), ("/tools/other", 60 * MIB),
+  ]
+  for _path, limit, cost in executed:
+    # Three serialized copies of the selected ceiling plus the small envelope.
+    assert 3 * limit <= cost < 3 * limit + 64 * 1024
+  assert app_services._admitted_exchange_cost == 0
+
+
+ROUTE_OUTPUT_SERVICE = b'''import base64, json, sys
+MOBIUS_PRELOAD = True
+if __name__ == "__main__":
+  body = json.load(sys.stdin)["body"]
+  if body["binary"]:
+    print(json.dumps({"body_base64": base64.b64encode(b"x" * body["size"]).decode(), "media_type": "image/gif"}))
+  else:
+    print(json.dumps({"body": "x" * body["size"]}))
+'''
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["spawn", "preload"])
+@pytest.mark.parametrize("binary", [False, True], ids=["json", "binary"])
+async def test_route_ceiling_bounds_actual_service_output_on_both_backends(
+  db, auth, monkeypatch, backend, binary,
+):
+  import sys
+  from app import service_preload
+
+  cap = 64 * 1024
+  app = _service_app(
+    db, service_bytes=ROUTE_OUTPUT_SERVICE, max_bytes=60 * MIB,
+    route_limits=[_route_limit("POST", "/tools/thumbnail", cap)],
+  )
+  owner = db.query(models.Owner).first()
+  service = app_services.service_contract(app, access="self")
+  limits = []
+  if backend == "preload":
+    host = await service_preload.start(
+      (app.id, app.runtime_revision), app.slug, sys.executable,
+      app_services.service_entry(app, service),
+      app_services.service_environment(app, owner, service, public=False),
+    )
+    assert host is not None
+    monkeypatch.setattr(service_preload, "ready_host", lambda *_: host)
+    real_run = service_preload.run
+
+    async def run(*args, **kwargs):
+      limits.append(kwargs["max_stdout"])
+      return await real_run(*args, **kwargs)
+
+    monkeypatch.setattr(service_preload, "run", run)
+  else:
+    monkeypatch.setattr(service_preload, "ready_host", lambda *_: None)
+    real_spawned = app_services._run_spawned
+
+    async def spawned(*args):
+      limits.append(args[5])
+      return await real_spawned(*args)
+
+    monkeypatch.setattr(app_services, "_run_spawned", spawned)
+
+  def envelope(path):
+    return {
+      "schema": 1, "method": "POST", "path": path, "query": {}, "headers": {},
+      "body": {"size": cap, "binary": binary}, "public": False, "actor": {},
+    }
+
+  try:
+    with pytest.raises(HTTPException) as caught:
+      await app_services.invoke_service(app, owner, envelope("/tools/thumbnail"), lane="tools")
+    # The existing serialized-output limit outcome, now at the route ceiling.
+    assert caught.value.status_code == 503
+    assert caught.value.detail == "App service exceeded its execution limits."
+    status, body, _headers, media = await app_services.invoke_service(
+      app, owner, envelope("/tools/original"), lane="tools",
+    )
+  finally:
+    await service_preload.shutdown()
+  assert status == 200
+  assert len(body) == cap
+  assert media == ("image/gif" if binary else None)
+  assert limits == [cap, 60 * MIB]
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_route_ceiling_bounds_decoded_binary_response(db, auth, monkeypatch):
+  import base64
+  from app import service_preload
+
+  cap = 1024
+  app = _service_app(db, max_bytes=60 * MIB, route_limits=[_route_limit("GET", "/thumb", cap)])
+  owner = db.query(models.Owner).first()
+  # A compact envelope with a decoded body one byte over the route ceiling.
+  raw = json.dumps({"body_base64": base64.b64encode(b"x" * (cap + 1)).decode(), "media_type": "image/gif"}).encode()
+
+  async def reply(*_args):
+    return raw, b"", 0
+
+  monkeypatch.setattr(service_preload, "ready_host", lambda *_: None)
+  monkeypatch.setattr(app_services, "_run_spawned", reply)
+  with pytest.raises(HTTPException) as caught:
+    await app_services.invoke_service(app, owner, {"method": "GET", "path": "thumb", "actor": {}})
+  assert caught.value.status_code == 502
+  assert caught.value.detail == "App service returned too much binary data."
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_declared_control_routes_coexist_with_a_stalled_undeclared_public_read(
+  db, auth, monkeypatch,
+):
+  import httpx
+  from app.main import app as application
+  from app.routes import app_services as routes
+
+  app = _service_app(db, access="public", max_bytes=60 * MIB, route_limits=[
+    _route_limit("GET", "/actor", MIB),
+    _route_limit("POST", "/activity", MIB),
+  ])
+  monkeypatch.setattr(routes, "SERVICE_BODY_TIMEOUT_SECONDS", 5)
+  started = asyncio.Event()
+  cancelled = asyncio.Event()
+  public_peaks = []
+  real_reserve = app_services.ServiceExchangeAdmission._reserve
+
+  def measured_reserve(self, cost, **kwargs):
+    real_reserve(self, cost, **kwargs)
+    public_peaks.append(app_services._public_ingress_cost)
+
+  monkeypatch.setattr(app_services.ServiceExchangeAdmission, "_reserve", measured_reserve)
+
+  async def stalled():
+    try:
+      started.set()
+      yield b'"'
+      await asyncio.Event().wait()
+    finally:
+      cancelled.set()
+
+  held = 3 * 60 * MIB
+  async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as http:
+    first = asyncio.create_task(http.post(f"/api/app-services/{app.slug}/echo", content=stalled()))
+    try:
+      await asyncio.wait_for(started.wait(), 2)
+      assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == held
+      actor = await asyncio.wait_for(http.get(f"/api/app-services/{app.slug}/actor"), 3)
+      activity = await asyncio.wait_for(
+        http.post(f"/api/app-services/{app.slug}/activity", json={"type": "Like"}), 3,
+      )
+      assert (actor.status_code, actor.json()["method"], actor.json()["path"]) == (201, "GET", "actor")
+      assert (activity.status_code, activity.json()["body"]) == (201, {"type": "Like"})
+      assert held + 3 * MIB in public_peaks, "a declared control route reserved more than its ceiling"
+      # The route ceiling is enforced, not just reserved.
+      oversize = await http.post(
+        f"/api/app-services/{app.slug}/activity", content=b'"' + b"x" * MIB + b'"',
+      )
+      assert oversize.status_code == 413
+      assert oversize.json()["detail"] == "App service request is too large."
+      # Wrong method and unmatched routes keep the whole 60 MiB grant, which
+      # the stalled read's share still excludes.
+      for method, path in (("GET", "activity"), ("POST", "actor"), ("POST", "inbox")):
+        denied = await http.request(method, f"/api/app-services/{app.slug}/{path}", content=b"{}")
+        assert denied.status_code == 413
+        assert "public ingress budget" in denied.json()["detail"]
+      assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == held
+    finally:
+      first.cancel()
+      await asyncio.gather(first, return_exceptions=True)
+  assert cancelled.is_set()
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_revocation_cancels_a_route_capped_exchange_and_releases_its_reservation(
+  db, auth, monkeypatch,
+):
+  from app import service_preload
+
+  service = b'''import json, sys
+json.load(sys.stdin)
+sys.stdout.write('{"body":"' + '\\\\n' * 100_000 + '"}')
+'''
+  cap = 512 * 1024
+  app = _service_app(
+    db, service_bytes=service, max_bytes=60 * MIB,
+    route_limits=[_route_limit("POST", "/tools/feed", cap)],
+  )
+  owner = db.query(models.Owner).first()
+  grant_id = "b" * 32
+  monkeypatch.setattr(app_services, "_validate_browser_call", lambda *_: None)
+  monkeypatch.setattr(service_preload, "ready_host", lambda *_: None)
+  scanned = asyncio.Event()
+  matcher = app_services._JSON_STRING_CONTENT
+  reserved = []
+
+  class ObservedMatcher:
+    def match(self, *args):
+      reserved.append(app_services._admitted_exchange_cost)
+      scanned.set()
+      return matcher.match(*args)
+
+  monkeypatch.setattr(app_services, "_JSON_STRING_CONTENT", ObservedMatcher())
+  task = asyncio.create_task(app_services.invoke_service(app, owner, {
+    "method": "POST", "path": "/tools/feed", "actor": {"browser_grant_id": grant_id},
+  }, lane="tools"))
+  try:
+    await asyncio.wait_for(scanned.wait(), 3)
+    assert 3 * cap <= reserved[0] < 3 * MIB
+    assert app_services.browser_grant_has_active_calls(grant_id)
     await app_services.cancel_browser_grant_calls(grant_id)
     assert task.cancelled()
   finally:
