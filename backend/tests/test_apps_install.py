@@ -7403,11 +7403,11 @@ def test_catalog_app_rebinds_equal_local_tree_from_synthetic_history(
   canonical_origin = (
     "https://github.com/mobius-os/app-catalog-rebind.git"
   )
-  with patch(
+  with _serve_github_from(bare, canonical_origin), patch(
     "app.install.httpx.AsyncClient",
     side_effect=_fake_async_client(responses_v2),
   ), patch(
-    "app.install._derive_repo_ref", return_value=(bare.as_uri(), "main"),
+    "app.install._derive_repo_ref", return_value=(canonical_origin, "main"),
   ), patch(
     "app.install.app_git.origin_url", return_value=canonical_origin,
   ):

@@ -292,15 +292,18 @@ def test_no_transfer_runs_under_an_app_lock(
   assert by_url.status_code == 201, by_url.text
   assert app_git.head_sha(repo, app_git.UPSTREAM_BRANCH) == head
 
-  # A legacy shallow repo completes its history before either resolver path
-  # takes a lock. Neither request has a pending update to act on afterwards.
+  # A legacy depth-one fetch left upstream grafted, hiding its merge base. Both
+  # resolver paths complete the history before they take a lock; neither has a
+  # pending update to act on afterwards.
+  v4 = git_server.commit("invariant", {**manifest, "version": "4.0.0"}, JSX, push=True)
+  app_git._run(repo, "fetch", "-q", "origin", f"+main:refs/heads/{app_git.UPSTREAM_BRANCH}")
   for request in (
     lambda: client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth),
     lambda: client.post("/api/apps/resolve-update", headers=auth, json={
       "source_dir": str(repo),
     }),
   ):
-    (repo / ".git" / "shallow").write_text(head + "\n")
+    (repo / ".git" / "shallow").write_text(v4 + "\n")
     count = len(transfers)
     assert request().status_code in (200, 404, 409)
     assert len(transfers) == count + 1
@@ -638,3 +641,83 @@ def test_killed_import_leaves_the_repo_consistent(tmp_path, monkeypatch, git_ser
   _fsck(repo)
   assert app_git.import_staged(repo, incoming) == head
   _fsck(repo)
+
+
+def test_visible_merge_base_needs_no_transfer_in_a_shallow_repo(
+  client, auth, git_server, transfers, bypass_url_validation,
+):
+  """Resolver preparation stays offline when the shallow boundary hides nothing."""
+  from app.routes import apps as apps_routes
+
+  _app_id, _manifest = _install_served(client, auth, git_server, "visible-base")
+  repo = _repo("visible-base")
+  (repo / ".git" / "shallow").write_text(app_git.head_sha(repo, "main") + "\n")
+  git_server.release()
+  shutil.rmtree(git_server.root / "visible-base.git")  # no network to reach
+  count = len(transfers)
+  asyncio.run(apps_routes._complete_history(repo))
+  assert len(transfers) == count
+  assert (repo / ".git" / "shallow").exists()
+
+
+@pytest.mark.parametrize("stage", ["clone", "fetch"])
+def test_cancelled_transfer_still_discards_its_staging(
+  client, auth, git_server, bypass_url_validation, stage,
+):
+  name = f"cancelled-{stage}"
+  if stage == "clone":
+    git_server.publish(name, big=True)
+    start = lambda: install.stage_app_clone(git_server.url(name), "main")
+  else:
+    _app_id, manifest = _install_served(client, auth, git_server, name)
+    git_server.commit(name, {**manifest, "version": "2.0.0"}, JSX, push=True)
+    start = lambda: install.fetch_app_commit(_repo(name), "main")
+  git_server.pause(name)
+
+  async def scenario():
+    task = asyncio.create_task(start())
+    await _paused(git_server)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+    assert not _no_leftovers(), "the transfer thread is still running"
+    git_server.release()
+    deadline = time.monotonic() + 60
+    while not _no_leftovers() and time.monotonic() < deadline:
+      await asyncio.sleep(0.1)
+
+  asyncio.run(scenario())
+  assert _no_leftovers()
+
+
+def test_cancelled_import_keeps_the_source_lock_until_it_finishes(
+  client, auth, git_server, bypass_url_validation, monkeypatch,
+):
+  _app_id, manifest = _install_served(client, auth, git_server, "cancel-import")
+  head = git_server.commit("cancel-import", {**manifest, "version": "2.0.0"}, JSX, push=True)
+  repo = _repo("cancel-import")
+  entered, finish = threading.Event(), threading.Event()
+  real_import = app_git.import_staged
+
+  def slow_import(*args):
+    entered.set()
+    finish.wait(30)
+    return real_import(*args)
+
+  monkeypatch.setattr(app_git, "import_staged", slow_import)
+
+  async def scenario():
+    task = asyncio.create_task(install.fetch_app_commit(repo, "main"))
+    assert await asyncio.to_thread(entered.wait, 30)
+    task.cancel()
+    await asyncio.sleep(0.2)
+    assert not task.done()
+    assert fs_locks.source_dir_lock(str(repo)).locked()
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+    assert not fs_locks.source_dir_lock(str(repo)).locked()
+
+  asyncio.run(scenario())
+  assert app_git._resolve_commit(repo, head) == head
+  assert _no_leftovers()

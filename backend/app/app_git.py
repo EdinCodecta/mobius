@@ -2605,10 +2605,22 @@ def has_origin(source_dir: str | Path) -> bool:
 
 @dataclass(frozen=True)
 class Staged:
-  """A private repository holding one transferred commit on ``FETCHED_REF``."""
+  """A private repository holding one commit transferred from ``url``."""
 
   path: Path
   sha: str
+  url: str
+
+
+# Neither the transfer nor the import may start background maintenance that
+# outlives the staging directory or the app's source lock.
+_NO_AUTO_GC = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
+
+
+def same_origin(left: str | None, right: str | None) -> bool:
+  """Whether two Git remote URLs name the same repository."""
+  normalize = lambda value: value.rstrip("/").removesuffix(".git").lower()
+  return bool(left and right) and normalize(left) == normalize(right)
 
 
 def _is_shallow(repo: Path) -> bool:
@@ -2622,7 +2634,8 @@ def _transfer(stage: Path, url: str, ref: str, *, unshallow: bool) -> str:
 
   ``stage`` is always a private staging repository, never a live app
   repository, and no app lock is held: a slow transfer delays only its own
-  request. A branch, a tag or a full commit id use the same refspec.
+  request. A full commit id is fetched exactly; a name prefers the branch and
+  falls back to the tag, as ``git clone --branch`` did.
   """
   requested = str(ref or "")
   immutable = requested.lower() if _HEX_OID.fullmatch(requested.lower()) else None
@@ -2635,20 +2648,29 @@ def _transfer(stage: Path, url: str, ref: str, *, unshallow: bool) -> str:
     ).returncode != 0
   ):
     raise ValueError("invalid origin ref")
-  try:
-    _run(
-      stage,
-      "-c", f"http.lowSpeedLimit={_GIT_LOW_SPEED_LIMIT}",
-      "-c", f"http.lowSpeedTime={_GIT_LOW_SPEED_TIME}",
-      "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-      *(["--unshallow"] if unshallow else []),
-      url, f"+{immutable or requested}:{FETCHED_REF}",
-      timeout=_GIT_TRANSFER_TIMEOUT,
-    )
-  except subprocess.TimeoutExpired as exc:
-    raise GitTransferTimeout(
-      f"it ran longer than {_GIT_TRANSFER_TIMEOUT} seconds"
-    ) from exc
+  sources = (
+    [immutable] if immutable
+    else [f"refs/heads/{requested}", f"refs/tags/{requested}"]
+  )
+  for source in sources:
+    try:
+      _run(
+        stage, *_NO_AUTO_GC,
+        "-c", f"http.lowSpeedLimit={_GIT_LOW_SPEED_LIMIT}",
+        "-c", f"http.lowSpeedTime={_GIT_LOW_SPEED_TIME}",
+        "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+        *(["--unshallow"] if unshallow else []),
+        "--end-of-options", url, f"+{source}:{FETCHED_REF}",
+        timeout=_GIT_TRANSFER_TIMEOUT,
+      )
+      break
+    except subprocess.TimeoutExpired as exc:
+      raise GitTransferTimeout(
+        f"it ran longer than {_GIT_TRANSFER_TIMEOUT} seconds"
+      ) from exc
+    except subprocess.CalledProcessError as exc:
+      if source == sources[-1] or "couldn't find remote ref" not in exc.stderr:
+        raise
   fetched = _resolve_commit(stage, FETCHED_REF)
   if fetched is None:
     raise RuntimeError("origin ref did not resolve to a commit")
@@ -2687,7 +2709,7 @@ def stage_fetch(source_dir: str | Path, url: str, ref: str, root: Path) -> Stage
     unshallow = (git_dir / "shallow").is_file()
     if unshallow:
       shutil.copyfile(git_dir / "shallow", stage / "shallow")
-    return Staged(stage, _transfer(stage, url, ref, unshallow=unshallow))
+    return Staged(stage, _transfer(stage, url, ref, unshallow=unshallow), url)
   except BaseException:
     shutil.rmtree(stage, ignore_errors=True)
     raise
@@ -2696,13 +2718,16 @@ def stage_fetch(source_dir: str | Path, url: str, ref: str, root: Path) -> Stage
 def import_staged(source_dir: str | Path, staged: Staged) -> str:
   """Copy one staged commit into the app repo; local only, under its lock.
 
-  Only objects, ``FETCHED_REF`` and the shallow marker change. The import is
+  The repository must still have the origin the transfer came from. Only
+  objects, ``FETCHED_REF`` and the shallow marker change. The import is
   proportional to the download, so it shares the transfer ceiling.
   """
   repo = Path(source_dir)
+  if not same_origin(origin_url(repo), staged.url):
+    raise SourceTreeChanged("app origin changed during transfer")
   try:
     _run(
-      repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+      repo, *_NO_AUTO_GC, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
       *(["--unshallow"] if _is_shallow(repo) else []),
       str(staged.path), f"+{FETCHED_REF}:{FETCHED_REF}",
       timeout=_GIT_TRANSFER_TIMEOUT,
@@ -2749,7 +2774,7 @@ def stage_clone(url: str, ref: str, root: Path) -> Staged:
     # Möbius's managed-artifact ignores locally via .git/info/exclude so a
     # later `git add -A` never tracks generated per-install files.
     _refresh_ignore_rules(stage)
-    return Staged(stage, sha)
+    return Staged(stage, sha, url)
   except BaseException:
     shutil.rmtree(stage, ignore_errors=True)
     raise

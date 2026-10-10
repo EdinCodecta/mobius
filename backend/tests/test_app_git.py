@@ -47,7 +47,7 @@ def _fetch(repo: Path, ref: str) -> str:
     shutil.rmtree(staged.path, ignore_errors=True)
 
 
-def _fetch_upstream(repo: Path, ref: str, **kwargs) -> app_git.FetchUpstreamResult:
+def _fetch_and_promote(repo: Path, ref: str, **kwargs) -> app_git.FetchUpstreamResult:
   return app_git.promote_upstream(repo, _fetch(repo, ref), **kwargs)
 
 
@@ -246,8 +246,8 @@ def test_ref_is_ancestor_distinguishes_false_from_git_errors(tmp_path):
   assert app_git.ref_is_ancestor(repo, "missing-ref", local) is None
 
 
-def test_clone_upstream_uses_real_origin_and_app_gitignore(tmp_path):
-  """clone_upstream checks out main at a real origin/<ref> commit."""
+def test_stage_clone_uses_real_origin_and_app_gitignore(tmp_path):
+  """A staged clone checks out main and upstream at the real origin commit."""
   fixture = tmp_path / "fixture"
   bare = tmp_path / "fixture.git"
   subprocess.run(["git", "init", "-q", "-b", "main", str(fixture)], check=True)
@@ -333,7 +333,7 @@ def test_clone_upstream_uses_real_origin_and_app_gitignore(tmp_path):
 
 
 @pytest.mark.parametrize("object_format", ["sha1", "sha256"])
-def test_clone_upstream_accepts_an_immutable_commit_ref(
+def test_stage_clone_accepts_an_immutable_commit_ref(
   tmp_path, object_format,
 ):
   """A pinned install keeps real Git ancestry instead of synthesizing it."""
@@ -400,7 +400,7 @@ def test_clone_upstream_accepts_an_immutable_commit_ref(
   ).returncode == 0
 
 
-def test_clone_upstream_neutralizes_symlinks_and_layers_managed_ignore(tmp_path):
+def test_stage_clone_neutralizes_symlinks_and_layers_managed_ignore(tmp_path):
   """A tracked symlink in an (untrusted) catalog repo must NOT check out as a
   real filesystem symlink — that would escape the app dir. And the Möbius
   managed-artifact ignores are layered via .git/info/exclude, leaving the
@@ -589,8 +589,8 @@ def test_has_origin_distinguishes_clone_from_synthetic_repo(tmp_path):
   assert app_git.has_origin(synthetic) is False
 
 
-def test_fetch_upstream_advances_real_origin_and_reads_full_tree(tmp_path):
-  """fetch_upstream moves upstream to origin/<ref>; read_ref_tree returns
+def test_fetch_and_promote_advances_real_origin_and_reads_full_tree(tmp_path):
+  """Fetching and promoting moves upstream to the origin tip; read_ref_tree returns
   every file at that commit, including sibling modules."""
   fixture = tmp_path / "fixture"
   bare = tmp_path / "fixture.git"
@@ -617,7 +617,7 @@ def test_fetch_upstream_advances_real_origin_and_reads_full_tree(tmp_path):
     env=app_git._git_env(fixture),
   )
 
-  fetched = _fetch_upstream(source_dir, "main")
+  fetched = _fetch_and_promote(source_dir, "main")
   tree = app_git.read_ref_tree(source_dir, app_git.UPSTREAM_BRANCH)
 
   assert fetched.sha == new_head
@@ -628,7 +628,7 @@ def test_fetch_upstream_advances_real_origin_and_reads_full_tree(tmp_path):
   assert tree["cards.js"] == b"export const label = 'v2'\n"
 
 
-def test_fetch_upstream_accepts_an_immutable_commit_ref(tmp_path):
+def test_fetch_and_promote_accepts_an_immutable_commit_ref(tmp_path):
   """A commit-pinned raw manifest fetch resolves to that exact commit.
 
   The installer needs the real origin commit so an existing cloned app keeps
@@ -655,7 +655,7 @@ def test_fetch_upstream_accepts_an_immutable_commit_ref(tmp_path):
     check=True, env=app_git._git_env(fixture),
   )
 
-  fetched = _fetch_upstream(source_dir, new_head)
+  fetched = _fetch_and_promote(source_dir, new_head)
 
   assert fetched.sha == new_head
   assert app_git.head_sha(source_dir, app_git.UPSTREAM_BRANCH) == new_head
@@ -664,7 +664,7 @@ def test_fetch_upstream_accepts_an_immutable_commit_ref(tmp_path):
   ] == b"export default () => 'v2'\n"
 
 
-def test_fetch_upstream_rejects_non_fast_forward_trusted_related_origin(
+def test_fetch_and_promote_rejects_non_fast_forward_trusted_related_origin(
   tmp_path,
 ):
   """Shared history cannot disguise a real trusted-origin rollback.
@@ -699,7 +699,7 @@ def test_fetch_upstream_rejects_non_fast_forward_trusted_related_origin(
 
   # First accept the real fast-forward so the recorded upstream is certainly
   # remote provenance rather than an installer-created synthetic commit.
-  fetched = _fetch_upstream(source_dir, new_head)
+  fetched = _fetch_and_promote(source_dir, new_head)
   assert fetched.sha == new_head
   app_git.align_local_to_upstream(source_dir)
   (source_dir / "local.js").write_text("export const local = true\n")
@@ -715,7 +715,7 @@ def test_fetch_upstream_rejects_non_fast_forward_trusted_related_origin(
   )
 
   with pytest.raises(RuntimeError, match="unrelated to recorded upstream"):
-    _fetch_upstream(
+    _fetch_and_promote(
       source_dir, old_upstream, trusted_origin_adoption=True,
     )
   assert app_git.head_sha(source_dir, app_git.UPSTREAM_BRANCH) == new_head
@@ -758,7 +758,7 @@ def _store_release_fixture(tmp_path):
   return bare, proof_v1, proof_v2
 
 
-def test_fetch_upstream_follows_store_release_proofs_forward(tmp_path):
+def test_fetch_and_promote_follows_store_release_proofs_forward(tmp_path):
   """Each Store release pins a side-branch proof commit, so the next release
   never descends from the installed proof — only from its parent. That
   content-free leaf must not make an ordinary update look unrelated."""
@@ -769,7 +769,7 @@ def test_fetch_upstream_follows_store_release_proofs_forward(tmp_path):
   app_git.align_local_to_upstream(source_dir)
   assert app_git.head_sha(source_dir, app_git.UPSTREAM_BRANCH) == proof_v1
 
-  fetched = _fetch_upstream(source_dir, proof_v2)
+  fetched = _fetch_and_promote(source_dir, proof_v2)
 
   assert fetched.sha == proof_v2
   assert fetched.allow_unrelated_histories is False
@@ -778,7 +778,7 @@ def test_fetch_upstream_follows_store_release_proofs_forward(tmp_path):
   ] == b"export default () => 'v2'\n"
 
 
-def test_fetch_upstream_rejects_store_release_proof_rollback(tmp_path):
+def test_fetch_and_promote_rejects_store_release_proof_rollback(tmp_path):
   """Seeing through a proof leaf never admits moving to an older release."""
   bare, proof_v1, proof_v2 = _store_release_fixture(tmp_path)
   source_dir = tmp_path / "source"
@@ -787,11 +787,11 @@ def test_fetch_upstream_rejects_store_release_proof_rollback(tmp_path):
   app_git.align_local_to_upstream(source_dir)
 
   with pytest.raises(RuntimeError, match="unrelated to recorded upstream"):
-    _fetch_upstream(source_dir, proof_v1)
+    _fetch_and_promote(source_dir, proof_v1)
   assert app_git.head_sha(source_dir, app_git.UPSTREAM_BRANCH) == proof_v2
 
 
-def test_fetch_upstream_rejects_unrelated_origin_without_moving_ref(tmp_path):
+def test_fetch_and_promote_rejects_unrelated_origin_without_moving_ref(tmp_path):
   """A synthetic app that accidentally has an origin remote must not have its
   installer-owned upstream branch moved onto unrelated real-repo history."""
   source_dir = tmp_path / "synthetic"
@@ -817,7 +817,7 @@ def test_fetch_upstream_rejects_unrelated_origin_without_moving_ref(tmp_path):
   app_git._run(source_dir, "remote", "add", "origin", bare.as_uri())
 
   with pytest.raises(RuntimeError, match="unrelated"):
-    _fetch_upstream(source_dir, "main")
+    _fetch_and_promote(source_dir, "main")
 
   assert app_git.head_sha(source_dir, app_git.UPSTREAM_BRANCH) == old_upstream
 
@@ -2863,7 +2863,7 @@ def test_merge_entry_points_require_history_without_network(
     assert (repo / ".git" / "MERGE_HEAD").exists()
 
 
-def test_fetch_upstream_repairs_same_tip_depth_one_regraft(tmp_path):
+def test_fetch_and_promote_repairs_same_tip_depth_one_regraft(tmp_path):
   """Retrying the same SHA must repair a merge base hidden by depth=1."""
   fixture = tmp_path / "same-tip-fixture"
   bare = tmp_path / "same-tip-fixture.git"
@@ -2892,7 +2892,7 @@ def test_fetch_upstream_repairs_same_tip_depth_one_regraft(tmp_path):
     check=False,
   ).returncode != 0
 
-  fetched = _fetch_upstream(repo, "main")
+  fetched = _fetch_and_promote(repo, "main")
   assert fetched.sha == poisoned_tip
   assert fetched.allow_unrelated_histories is False
   assert app_git._run(
@@ -4779,7 +4779,7 @@ def test_only_the_transfer_uses_the_network_ceiling(tmp_path, monkeypatch):
   monkeypatch.setattr(app_git.subprocess, "Popen", RecordingProcess)
   source = tmp_path / "source"
   _clone(source, bare.as_uri(), "main")
-  _fetch_upstream(source, "main")
+  _fetch_and_promote(source, "main")
 
   transfers = [
     (cmd, timeout) for cmd, timeout in seen
@@ -4847,7 +4847,7 @@ def test_timed_out_transfer_stops_git_and_leaves_no_staging(tmp_path, monkeypatc
   assert _fetch(source, "main") == app_git.head_sha(source, "main")
 
 
-def test_clone_upstream_places_relative_source_in_requested_directory(tmp_path, monkeypatch):
+def test_stage_clone_places_relative_source_in_requested_directory(tmp_path, monkeypatch):
   bare = _bare_origin(tmp_path)
   monkeypatch.chdir(tmp_path)
   source = Path("apps/source")
@@ -4946,6 +4946,19 @@ def test_transfer_accepts_branch_tag_and_commit_refs(tmp_path):
   assert _fetch(source, first) == first
   assert app_git.present_commit(source, second) == second
   assert app_git.present_commit(source, "main") is None
+  # A name that is both a branch and a tag resolves to the branch.
+  subprocess.run(["git", "-C", str(bare), "tag", "main", first], check=True)
+  assert _fetch(source, "main") == second
+
+
+def test_transfer_never_reads_an_origin_url_as_an_option(tmp_path):
+  stage = tmp_path / "stage"
+  stage.mkdir()
+  app_git._run(stage, "init", "-q", "--bare")
+  marker = tmp_path / "ran"
+  with pytest.raises(subprocess.CalledProcessError):
+    app_git._transfer(stage, f"--upload-pack=touch {marker}", "main", unshallow=False)
+  assert not marker.exists()
 
 
 @pytest.mark.parametrize("ref", ["-x", "--upload-pack=touch", "main\nother", "a:b", ""])

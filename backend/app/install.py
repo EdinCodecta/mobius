@@ -2809,16 +2809,44 @@ def discard_staged(staged: app_git.Staged | None) -> None:
     shutil.rmtree(staged.path, ignore_errors=True)
 
 
+async def _stage(stage: Callable[..., app_git.Staged], *args) -> app_git.Staged:
+  """Run a staging transfer; a cancelled caller still discards its result.
+
+  The transfer thread cannot be interrupted, so cancellation hands its
+  eventual staging directory to a callback instead of leaking it on disk.
+  """
+  loop = asyncio.get_running_loop()
+  transfer = asyncio.ensure_future(asyncio.to_thread(stage, *args))
+  try:
+    return await asyncio.shield(transfer)
+  except asyncio.CancelledError:
+    transfer.add_done_callback(
+      lambda done: not done.cancelled() and done.exception() is None
+      and loop.run_in_executor(None, discard_staged, done.result())
+    )
+    raise
+
+
+async def _to_completion(function: Callable, *args):
+  """Run a thread that must finish before its caller releases a lock.
+
+  A cancelled caller still waits for the thread, then re-raises.
+  """
+  work = asyncio.ensure_future(asyncio.to_thread(function, *args))
+  cancelled = False
+  while not work.done():
+    try:
+      await asyncio.wait({work})
+    except asyncio.CancelledError:
+      cancelled = True
+  if cancelled:
+    raise asyncio.CancelledError
+  return work.result()
+
+
 async def stage_app_clone(url: str, ref: str) -> app_git.Staged:
   """Clone a catalog repository privately before any app lock is taken."""
-  return await asyncio.to_thread(
-    app_git.stage_clone, url, ref, git_transfer_root(),
-  )
-
-
-def _same_origin(left: str, right: str) -> bool:
-  normalize = lambda value: value.rstrip("/").removesuffix(".git").lower()
-  return normalize(left) == normalize(right)
+  return await _stage(app_git.stage_clone, url, ref, git_transfer_root())
 
 
 async def fetch_app_commit(
@@ -2832,25 +2860,19 @@ async def fetch_app_commit(
   """
   repo = Path(source_dir)
   url = await asyncio.to_thread(app_git.origin_url, repo)
-  if expected_origin is not None and (
-    url is None or not _same_origin(url, expected_origin)
-  ):
+  if expected_origin is not None and not app_git.same_origin(url, expected_origin):
     raise ValueError("installed Git origin does not match update source")
   present = await asyncio.to_thread(app_git.present_commit, repo, ref)
   if present is not None:
     return present
   if url is None:
     raise RuntimeError("source repository has no origin")
-  staged = await asyncio.to_thread(
-    app_git.stage_fetch, repo, url, ref, git_transfer_root(),
-  )
+  staged = await _stage(app_git.stage_fetch, repo, url, ref, git_transfer_root())
   try:
     async with fs_locks.source_dir_lock(str(repo)):
-      if await asyncio.to_thread(app_git.origin_url, repo) != url:
-        raise app_git.SourceTreeChanged("app source changed during transfer")
-      return await asyncio.to_thread(app_git.import_staged, repo, staged)
+      return await _to_completion(app_git.import_staged, repo, staged)
   finally:
-    await asyncio.to_thread(discard_staged, staged)
+    await _to_completion(discard_staged, staged)
 
 
 def _url_update_commit(

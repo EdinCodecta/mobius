@@ -1321,15 +1321,29 @@ async def _fetch_update_commit(repo: Path, manifest_url: str) -> str:
   return await install.fetch_app_commit(repo, ref, expected_origin=origin)
 
 
+def _hidden_merge_upstream(repo: Path) -> str | None:
+  """The upstream commit whose merge base a shallow boundary hides, if any.
+
+  An unreadable repository is left to the locked validation to report.
+  """
+  try:
+    app_git._require_merge_history(repo)
+  except app_git.HistoryIncomplete:
+    return app_git.head_sha(repo, app_git.UPSTREAM_BRANCH)
+  except (OSError, subprocess.SubprocessError):
+    pass
+  return None
+
+
 async def _complete_history(source_dir: str | Path) -> None:
-  """Give a legacy shallow app repo its history before a merge needs it."""
+  """Give a legacy shallow app repo the history its merge needs.
+
+  Only a merge base the shallow boundary actually hides needs the network.
+  """
   from app import install
 
   repo = Path(source_dir)
-  upstream = await asyncio.to_thread(
-    lambda: app_git.head_sha(repo, app_git.UPSTREAM_BRANCH)
-    if app_git.ref_exists(repo, app_git.UPSTREAM_BRANCH) else None
-  )
+  upstream = await asyncio.to_thread(_hidden_merge_upstream, repo)
   if upstream is None:
     return
   try:
