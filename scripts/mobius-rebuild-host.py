@@ -1144,6 +1144,11 @@ def retire_attempt(config_value: dict, transaction: dict, gate, role: str, recor
         # and its tombstone; a later creation boundary removes it exactly.
         gate.fenced(role, token, None)
         return True
+    if attempt["cid"] is None and not admitted:
+        # A crash can leave the root journal ahead of gate.bind. Complete that
+        # exact identity on the CLOSED attempt before fencing it, including
+        # replay after its container was already removed. Never reopen it.
+        gate.bind(role, token, cid)
     item = observe_exact(cid)
     if item is not None:
         verify_attempt_item(item, cid, journaled_expected(record))

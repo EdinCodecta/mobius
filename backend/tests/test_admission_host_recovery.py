@@ -361,6 +361,85 @@ def test_docker_submission_and_response_crashes_reconcile(incident, boundary):
                for attempt in rollback_attempts(c)[:-1])
 
 
+def target_replacement(case):
+    transaction = case.host.read_transaction()
+    transaction.update(phase="replacement_started", drain_confirmed=True, source_token=None)
+    case.host.write_transaction(transaction)
+    case.host.prepare_admission(case.config, transaction)
+    return transaction
+
+
+def assert_target_interruption_recovers_once(case):
+    # Unlike rollback, a created target is retired through quiesce_target, not
+    # resumed through prepare_attempt. Both paths must replay journal-leading
+    # gate transitions without stranding the only service or repeating Start.
+    for _ in range(3):
+        case.host.reconcile()
+    status = case.host.read_json(case.host.STATUS)
+    assert status["state"] in {"rolled_back", "succeeded"}, status
+    assert not case.host.TRANSACTION.exists()
+    running = [c for c in case.docker.containers.values() if c["State"]["Status"] == "running"]
+    assert len(running) == 1 and running[0]["State"]["Health"]["Status"] == "healthy"
+    assert len([e for e in case.docker.entries if e[1] == "continuation"]) == 1
+    starts = list(case.docker.starts)
+    assert len(starts) == len(set(starts))
+    case.host.reconcile()
+    assert case.docker.starts == starts
+
+
+@pytest.mark.parametrize("method", ["allocate", "bind", "open", "issue_start"])
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_target_gate_transition_crash_retires_or_settles_without_stranding_service(
+        incident, monkeypatch, method, when):
+    case = incident
+    transaction = target_replacement(case)
+    original = getattr(case.gate, method)
+    def interrupt(*args, **kwargs):
+        if when == "after":
+            original(*args, **kwargs)
+        raise PowerLoss(method)
+    monkeypatch.setattr(case.gate, method, interrupt)
+    with pytest.raises(PowerLoss):
+        case.host.prepare_attempt(case.config, transaction, "target")
+    monkeypatch.setattr(case.gate, method, original)
+    assert_target_interruption_recovers_once(case)
+
+
+@pytest.mark.parametrize("boundary", ["create-before", "create-after", "start-before", "start-after"])
+def test_target_docker_interruption_retires_or_settles_without_stranding_service(incident, boundary):
+    case = incident
+    transaction = target_replacement(case)
+    case.docker.fault = boundary
+    with pytest.raises(PowerLoss):
+        case.host.prepare_attempt(case.config, transaction, "target")
+    assert_target_interruption_recovers_once(case)
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_recovery_binding_of_closed_target_replays_after_another_crash(incident, monkeypatch, when):
+    case = incident
+    transaction = target_replacement(case)
+    bind = case.gate.bind
+    def before_bind(*_args):
+        raise PowerLoss("before bind")
+    monkeypatch.setattr(case.gate, "bind", before_bind)
+    with pytest.raises(PowerLoss):
+        case.host.prepare_attempt(case.config, transaction, "target")
+    target = transaction["attempts"][0]["cid"]
+    def recovery_bind(role, token, cid):
+        attempt = case.gate.observe()["slots"][role]["attempts"][-1]
+        assert (role, cid, attempt["state"], attempt["issued"]) == ("target", target, "closed", False)
+        if when == "after":
+            bind(role, token, cid)
+        raise PowerLoss("recovery bind")
+    monkeypatch.setattr(case.gate, "bind", recovery_bind)
+    with pytest.raises(PowerLoss):
+        case.host.quiesce_target(case.config, case.host.read_transaction())
+    assert target in case.docker.containers and not case.docker.starts
+    monkeypatch.setattr(case.gate, "bind", bind)
+    assert_target_interruption_recovers_once(case)
+
+
 @pytest.mark.parametrize("age,continued", [(601, True), (3601, False)])
 def test_actual_wrapper_entry_refreshes_or_serves_without_continuation(incident, age, continued):
     c = incident
