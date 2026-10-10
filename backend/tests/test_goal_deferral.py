@@ -1,4 +1,5 @@
 """Deferral is deliberate unfinished work, not abandonment or a false failure."""
+from datetime import UTC, datetime
 from copy import deepcopy
 
 import pytest
@@ -285,3 +286,34 @@ def test_claim_settlement_refusal_rolls_back_hold_and_tasks_together(client, own
   goal = db.get(models.ChatGoal, "goal-1")
   assert goal.status == "open" and goal.hold_json is None
   assert goal.plan_json["tasks"][0]["status"] == "pending"
+
+
+def test_completion_waits_for_a_failed_helper_result_its_agent_has_not_received(db, chat):
+  """A helper failure that lands just before settlement stays the agent's to
+  handle: completion is refused until the agent reads it, so the failure can
+  never be stranded behind a closed Goal or turned into owner work."""
+  from app.delegations import record_result_read_by_parent
+  from app.goal_plans import GoalPlanError
+  goal, run = seed(db, chat)
+  child = create_chat(id="failed-helper-chat", title="Helper", messages=[])
+  db.add(child)
+  db.flush()
+  db.add(models.ChatRun(id="failed-helper-run", chat_id=child.id, status="failed",
+                       provider="claude", ended_at=datetime.now(UTC)))
+  db.add(models.Delegation(id="failed-helper", parent_chat_id=chat.id,
+    parent_root_run_id=run.id, goal_id=goal.id, child_chat_id=child.id,
+    task_key="cleanup", provider="claude", scope="write", cwd="/data",
+    prompt_sha256="0" * 64, notify_parent_on_complete=True))
+  db.commit()
+
+  with pytest.raises(GoalPlanError, match="helper:failed-helper") as refused:
+    update_goal_record(db, run, goal, goal.revision, complete=True)
+  assert "list_agents" in str(refused.value)
+  db.expire_all()
+  assert goal.status == "open"
+
+  assert record_result_read_by_parent(db, db.get(models.Delegation, "failed-helper"))
+  db.commit()
+  update_goal_record(db, run, goal, goal.revision, complete=True)
+  db.expire_all()
+  assert goal.status == "completed"
