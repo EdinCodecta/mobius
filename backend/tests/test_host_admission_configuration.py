@@ -636,3 +636,33 @@ def test_worker_refuses_generated_name_that_cannot_fence_original_compose(tmp_pa
     config.update(deployment_name=name, name_source='generated')
     with pytest.raises(ValueError, match='generated'):
         host.validate_config(config, trusted_uid=os.getuid())
+
+
+@pytest.mark.parametrize('stalled', [False, True])
+def test_managed_health_discovery_respects_remaining_wait_budget(case, monkeypatch, stalled):
+    c = case
+    cid = issued_target(c, enter=True)
+    assert c.docker.complete_start(cid)
+    original = c.host.docker_command
+    started = c.clock[0]
+    budgets = []
+
+    def inspect(args, **kwargs):
+        assert args == ['docker', 'container', 'inspect', '--format', '{{json .}}',
+                        c.config['deployment_name']]
+        budget = kwargs.get('timeout', 10)
+        budgets.append((c.clock[0] - started, budget))
+        if stalled:
+            c.clock[0] += budget
+            raise subprocess.TimeoutExpired(args, budget)
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(c.host, 'docker_command', inspect)
+    if stalled:
+        with pytest.raises(subprocess.TimeoutExpired):
+            c.host.wait_healthy(c.config, timeout=1)
+    else:
+        assert c.host.wait_healthy(c.config, timeout=1)
+    assert budgets
+    assert all(0 < budget <= min(.5, 1 - elapsed) for elapsed, budget in budgets)
+    assert c.clock[0] - started <= 1

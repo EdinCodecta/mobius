@@ -575,6 +575,33 @@ ensure_edge_network() {
   docker network create edge-mobius >/dev/null
 }
 
+# A helper-managed deploy replaces only the admission-managed app, through the
+# installed controller, so no full-project `up` applies a changed bundled-Caddy
+# image or environment (DOMAIN, gateway routing). Reconcile that one service
+# explicitly. --no-deps keeps Compose from creating, recreating, starting or
+# waiting on app, whose identity the controller owns. A Caddy service that the
+# rendered model has disabled (an override profile beside another proxy) is
+# left alone: naming it would activate it. The shared edge uses step 2b instead.
+reconcile_bundled_proxy() {
+  local services
+  [ "$TARGET" = "prod" ] && [ "$HELPER_MANAGED" = 1 ] || return 0
+  external_prod_caddy_running && return 0
+  if ! services=$(docker compose "${COMPOSE_ARGS[@]}" config --services); then
+    fail "could not render the services to reconcile the bundled proxy"
+    return 1
+  fi
+  if ! grep -qx caddy <<<"$services"; then
+    info "no active bundled proxy service; leaving the proxy unchanged"
+    return 0
+  fi
+  intent "docker compose ${COMPOSE_ARGS[*]} up -d --no-deps caddy"
+  if ! docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps caddy; then
+    fail "could not reconcile the bundled proxy"
+    return 1
+  fi
+  ok "bundled proxy reconciled without touching the app"
+}
+
 valid_gateway_origin() {
   python3 "$DEPLOY_SUPPORT" \
     validate-gateway-origin "$1"
@@ -1787,6 +1814,13 @@ if [ "$HELPER_MANAGED" = 1 ]; then
   unset _manual_result
   rm -f -- "$MANUAL_TOPOLOGY"; MANUAL_TOPOLOGY=""
   ok "controller verified the exact admitted container ${CONTAINER:0:12}"
+  # The app outcome is durable and served now. A proxy failure must not roll
+  # it back, re-arm its consumed handoff or reach the app through Compose.
+  if ! reconcile_bundled_proxy; then
+    fail "the verified app replacement ${CONTAINER:0:12} stays live; public routing may still use the previous proxy"
+    fail "repair only the proxy: docker compose ${COMPOSE_ARGS[*]} up -d --no-deps caddy (from ${REPO_ROOT}), then rerun with --check"
+    exit 1
+  fi
 else
 if [ "$TARGET" = "prod" ] && [ -n "$TARGET_IMAGE" ] && \
    compose_recreation_needed "$TARGET_IMAGE"; then

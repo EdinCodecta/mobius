@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -854,3 +855,127 @@ def test_source_watchdog_restart_pending_at_removal_admits_target_service_only(i
     assert_one_service_without_handoff(c, "target")
     assert c.docker.removes == [SOURCE]
     assert c.gate.observe()["slots"]["rollback"]["attempts"] == []
+
+
+# The disposable Docker proof's synchronization (scripts/test-rebuild-recovery-
+# docker.py) must wait out exactly the real wrapper's causal order: gate
+# consumption is durable BEFORE the legacy exec writes ack.json and boot-id.
+NONCE = "original-nonce-12345678"
+
+
+def proof_harness():
+    return load(ROOT / "scripts/test-rebuild-recovery-docker.py", "recovery_docker_harness")
+
+
+def admitted_target_before_legacy(case, monkeypatch, *, enter=True):
+    """A real target attempt whose gate entry (optionally) consumed, legacy not yet run."""
+    transaction = target_replacement(case)
+    case.docker.auto_enter = False
+    cid = case.host.prepare_attempt(case.config, transaction, "target")
+    if enter:
+        assert case.docker.complete_start(cid, before_legacy=True)
+        assert case.docker.entries == [(cid, "continuation", False)]
+    sleeps = []
+    def sleep(seconds):  # deterministic fixture clock; schedules hook here
+        sleeps.append(seconds)
+        case.clock[0] += seconds
+    monkeypatch.setattr(time, "sleep", sleep)
+    return transaction, cid, sleeps
+
+
+def wait_for_target(case, harness, *, nonce=NONCE, seconds=5):
+    return harness.await_admitted_boot(case.host, case.config, case.gate, "target", OPERATION,
+                                       SOURCE_BOOT, nonce, seconds=seconds)
+
+
+@pytest.mark.parametrize("consumed_first", [True, False])
+def test_docker_proof_waits_for_exact_legacy_ack_after_gate_consumption(
+        incident, monkeypatch, consumed_first):
+    c, harness = incident, proof_harness()
+    _, cid, sleeps = admitted_target_before_legacy(c, monkeypatch, enter=consumed_first)
+    if consumed_first:
+        # The old harness asserted ACK here, right after consumption: invalid.
+        consumed = c.gate.observe()["slots"]["target"]["consumed"]
+        assert consumed is not None and not c.legacy.ACK_PATH.exists()
+        assert c.legacy.BOOT_PATH.read_text().strip() == SOURCE_BOOT
+        assert not c.host.cutover_boot_consumed(c.config, OPERATION, expected_boot_id=consumed["boot_id"])
+    pacing = sleeps.copy()
+    def scheduled(seconds):
+        pacing.append(seconds)
+        c.clock[0] += seconds
+        if len(pacing) == 2 and not consumed_first:
+            assert c.docker.complete_start(cid, before_legacy=True)
+        if len(pacing) == 4:  # the exec'd legacy entrypoint runs late
+            boot = c.gate.observe()["slots"]["target"]["consumed"]["boot_id"]
+            assert c.legacy.begin_boot(boot, now=c.clock[0])
+    monkeypatch.setattr(time, "sleep", scheduled)
+    consumed = wait_for_target(c, harness)
+    assert len(pacing) == 4
+    assert consumed == c.gate.observe()["slots"]["target"]["consumed"]
+    assert c.legacy.BOOT_PATH.read_text().strip() == consumed["boot_id"]
+    ack = json.loads(c.legacy.ACK_PATH.read_text())
+    assert (ack["target_boot_id"], ack["source_boot_id"], ack["nonce"]) == (
+        consumed["boot_id"], SOURCE_BOOT, NONCE)
+    assert not c.legacy.ACCEPTED_PATH.exists()
+    # Observation only: no second Start, entry or authorization.
+    assert c.docker.starts == [cid] and len(c.docker.entries) == 1
+    assert not c.legacy.begin_boot("unrelated-later-boot-12345678", now=c.clock[0])
+
+
+@pytest.mark.parametrize("damage", ["foreign-boot", "unadmitted-boot", "wrong-operation",
+                                    "accepted-left", "other-nonce", "changed-consumption",
+                                    "boot-id-missing"])
+def test_docker_proof_refuses_mismatched_ledger_at_once(incident, monkeypatch, damage):
+    c, harness = incident, proof_harness()
+    _, cid, sleeps = admitted_target_before_legacy(c, monkeypatch,
+                                                   enter=damage != "unadmitted-boot")
+    consumed = c.gate.observe()["slots"]["target"]["consumed"]
+    nonce, error = NONCE, AssertionError
+    if damage in {"foreign-boot", "unadmitted-boot"}:
+        c.legacy.begin_boot("foreign-boot-12345678", now=c.clock[0])
+    elif damage != "changed-consumption":  # that one stays mid-wait
+        assert c.legacy.begin_boot(consumed["boot_id"], now=c.clock[0])
+    if damage == "wrong-operation":
+        ack = json.loads(c.legacy.ACK_PATH.read_text())
+        c.legacy.ACK_PATH.unlink()
+        c.legacy._write_json(c.legacy.ACK_PATH, {**ack, "cutover_id": "b" * 32}, 0o444)
+    elif damage == "accepted-left":
+        receipt = json.loads(c.legacy.CUTOVER_RECEIPT_PATH.read_text())
+        c.legacy._write_json(c.legacy.ACCEPTED_PATH, receipt, 0o600)
+    elif damage == "other-nonce":
+        nonce = "another-nonce-12345678"
+    elif damage == "changed-consumption":
+        observe, views = c.gate.observe, []
+        def drifting():
+            state = observe()
+            views.append(state)
+            if len(views) == 2:
+                state["slots"]["target"]["consumed"] = {**consumed, "boot_id": "other-boot-12345678"}
+            return state
+        monkeypatch.setattr(c.gate, "observe", drifting)
+    elif damage == "boot-id-missing":
+        c.legacy.BOOT_PATH.unlink()
+        error = FileNotFoundError
+    reason = {"foreign-boot": "other than the admitted", "unadmitted-boot": "other than the admitted",
+              "wrong-operation": "exact cutover acknowledgement",
+              "accepted-left": "exact cutover acknowledgement", "other-nonce": "another handoff",
+              "changed-consumption": "consumed admission changed"}.get(damage)
+    with pytest.raises(error, match=reason):
+        wait_for_target(c, harness, nonce=nonce)
+    # Fails on the first contradictory observation, not by exhausting retries.
+    assert len(sleeps) == (1 if damage == "changed-consumption" else 0)
+    assert c.docker.starts == [cid]
+
+
+@pytest.mark.parametrize("enter", [True, False])
+def test_docker_proof_times_out_when_admitted_boot_never_commits(incident, monkeypatch, enter):
+    c, harness = incident, proof_harness()
+    _, cid, sleeps = admitted_target_before_legacy(c, monkeypatch, enter=enter)
+    before = c.clock[0]
+    with pytest.raises(AssertionError, match="not consumed and committed"):
+        wait_for_target(c, harness, seconds=3)
+    assert 3 <= c.clock[0] - before < 3.5
+    assert not c.legacy.ACK_PATH.exists() and c.legacy.ACCEPTED_PATH.exists()
+    assert c.legacy.BOOT_PATH.read_text().strip() == SOURCE_BOOT
+    assert (c.gate.observe()["slots"]["target"]["consumed"] is not None) is enter
+    assert c.docker.starts == [cid]

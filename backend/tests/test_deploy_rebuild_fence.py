@@ -287,3 +287,230 @@ echo LOCKED
                              capture_output=True, check=False)
   assert blocked.returncode != 0
   assert "LOCKED" not in blocked.stdout
+
+
+# ── helper-managed bundled proxy reconcile ─────────────────────────────
+# The controller replaces only `app`; the region below is the real cutover
+# text from the script, driven with a fake Compose that models one rule:
+# `up` may name only the bundled proxy with --no-deps, anything else touches
+# the admission-managed app.
+OLD_CID = "a" * 64
+NEW_CID = "b" * 64
+TARGET_ID = "sha256:" + "c" * 64
+BUILT_SHA = "d" * 40
+
+
+def _cutover_region() -> str:
+  start = SCRIPT.index("\nTARGET_IMAGE=$(docker image inspect") + 1
+  end = SCRIPT.index("run_deploy_canary\n", start) + len("run_deploy_canary\n")
+  return SCRIPT[start:end]
+
+
+@pytest.fixture
+def cutover(tmp_path):
+  state_dir = tmp_path / "rebuild-state"
+  state_dir.mkdir(mode=0o700)
+  events = tmp_path / "events"
+  caddy_state = tmp_path / "caddy-state"
+  region = _cutover_region().replace("/var/lib/mobius-rebuild", str(state_dir))
+  functions = (_function("external_prod_caddy_running")
+               + _function("reconcile_bundled_proxy")
+               + _function("manual_controller_id"))
+
+  def run(*, helper=1, edge=False, services="caddy app", up_rc=0,
+          services_rc=0, controller_rc=0):
+    caddy_state.write_text("image=caddy:old domain=old.example "
+                           "gateway=https://old-services.example\n")
+    compose_args = ("(-p mobius -f docker-compose.yml -f docker-compose.prod.yml)"
+                    if edge else "(-p mobius)")
+    script = f"""set -euo pipefail
+EVENTS={str(events)!r}; CADDY_STATE={str(caddy_state)!r}
+record() {{ printf '%s\\n' "$*" >> "$EVENTS"; }}
+info() {{ :; }}; ok() {{ :; }}; warn() {{ :; }}; intent() {{ :; }}
+fail() {{ printf 'FAIL %s\\n' "$*" >&2; }}
+for name in attempt_rollback rearm_chat_cutover finalize_chat_cutover \\
+    prepare_chat_cutover wait_for_cutover ensure_edge_network; do
+  eval "$name() {{ record CALLED $name; }}"
+done
+compose_recreation_needed() {{ return 1; }}
+cutover_supported() {{ return 0; }}
+served_sha() {{ echo {BUILT_SHA}; }}
+run_deploy_canary() {{ record "canary $CONTAINER"; }}
+# Values the deploy resolved for this release; Compose renders Caddy from them.
+export DOMAIN=new.example MOBIUS_SERVICE_GATEWAY_ORIGIN=https://new-services.example
+RENDERED_CADDY_IMAGE=caddy:new
+docker() {{
+  record "docker $*"
+  case "$*" in
+    "image inspect -f {{{{.Id}}}} mobius:prod") echo {TARGET_ID} ;;
+    *" config --format json") echo '{{}}' ;;
+    *" config --services")
+      [ {services_rc} = 0 ] || return 1
+      printf '%s\\n' {services} ;;
+    *" up "*|*" up")
+      [ {up_rc} = 0 ] || return 1
+      local argv="$*"
+      if [ "${{argv##* up }}" != "-d --no-deps caddy" ]; then record APP_TOUCHED; return 0; fi
+      printf 'image=%s domain=%s gateway=%s\\n' "$RENDERED_CADDY_IMAGE" \\
+        "$DOMAIN" "$MOBIUS_SERVICE_GATEWAY_ORIGIN" > "$CADDY_STATE" ;;
+  esac
+}}
+MANUAL_CONTROLLER=/fixture/mobius-manual-cutover.py
+python3() {{
+  if [ "${{3:-}}" = "$MANUAL_CONTROLLER" ]; then
+    record "controller $4 --source-cid $6 --target-image ${{10}}"
+    [ {controller_rc} = 0 ] || return 1
+    printf '{{"container_id":"%s","state":"succeeded"}}' {NEW_CID}
+    return 0
+  fi
+  command python3 "$@"
+}}
+TARGET=prod; HELPER_MANAGED={helper}; EDGE_TOPOLOGY={'edge' if edge else 'self-hosted'}
+COMPOSE_ARGS={compose_args}; REPO_ROOT=/fixture/checkout
+CONTAINER=mobius; RUNNING_CID={OLD_CID}; PREV_IMAGE=sha256:{'e' * 64}
+IMAGE_TAG=mobius:prod; BUILT_THIS_RUN=1; BUILD_SHA={BUILT_SHA}
+CUTOVER_WAIT_SECONDS=1; INTERNAL_BASE=http://localhost:8000
+{functions}
+{region}
+record "final $CONTAINER"
+"""
+    result = subprocess.run(["bash", "-c", script], text=True,
+                            capture_output=True, check=False)
+    lines = events.read_text().splitlines() if events.exists() else []
+    events.unlink(missing_ok=True)
+    return result, lines, caddy_state.read_text()
+
+  return run
+
+
+def test_compose_model_requires_no_deps_to_spare_the_app():
+  compose = (Path(__file__).parents[2] / "docker-compose.yml").read_text()
+  caddy = compose.split("\n  caddy:\n", 1)[1].split("\n  app:\n", 1)[0]
+  # Caddy's routing environment changes with a deploy, and its dependency
+  # on app would otherwise let Compose converge (or wait on) the app.
+  assert "DOMAIN=${DOMAIN}" in caddy
+  assert "MOBIUS_SERVICE_GATEWAY_ORIGIN=" in caddy
+  assert "condition: service_healthy" in caddy
+
+
+def test_helper_managed_self_hosted_applies_changed_proxy_without_app(cutover):
+  result, events, caddy = cutover()
+  assert result.returncode == 0, result.stderr
+  assert events == [
+    "docker image inspect -f {{.Id}} mobius:prod",
+    "docker compose -p mobius config --format json",
+    f"controller cutover --source-cid {OLD_CID} --target-image {TARGET_ID}",
+    "docker compose -p mobius config --services",
+    "docker compose -p mobius up -d --no-deps caddy",
+    f"canary {NEW_CID}",
+    f"final {NEW_CID}",
+  ]
+  assert caddy == ("image=caddy:new domain=new.example "
+                   "gateway=https://new-services.example\n")
+
+
+def test_proxy_reconcile_failure_is_honest_and_never_reaches_the_app(cutover):
+  result, events, caddy = cutover(up_rc=1)
+  assert result.returncode != 0
+  assert "APP_TOUCHED" not in events
+  assert not [line for line in events if line.startswith("CALLED ")]
+  assert [line for line in events if line.startswith("controller ")] == [
+    f"controller cutover --source-cid {OLD_CID} --target-image {TARGET_ID}",
+  ]
+  assert [line for line in events if " up " in line] == [
+    "docker compose -p mobius up -d --no-deps caddy",
+  ]
+  assert not [line for line in events if line.startswith(("canary", "final"))]
+  assert "domain=old.example" in caddy
+  assert f"verified app replacement {NEW_CID[:12]} stays live" in result.stderr
+  assert "docker compose -p mobius up -d --no-deps caddy" in result.stderr
+
+
+def test_unrenderable_service_list_fails_before_any_compose_up(cutover):
+  result, events, _ = cutover(services_rc=1)
+  assert result.returncode != 0
+  assert not [line for line in events if " up" in line]
+  assert not [line for line in events if line.startswith(("CALLED ", "canary"))]
+  assert "could not render the services" in result.stderr
+
+
+def test_profile_disabled_bundled_proxy_is_not_activated(cutover):
+  result, events, caddy = cutover(services="app")
+  assert result.returncode == 0, result.stderr
+  assert not [line for line in events if " up" in line]
+  assert events[-2:] == [f"canary {NEW_CID}", f"final {NEW_CID}"]
+  assert "domain=old.example" in caddy
+
+
+def test_helper_managed_edge_topology_keeps_its_fragment_path(cutover):
+  result, events, _ = cutover(edge=True)
+  assert result.returncode == 0, result.stderr
+  assert not [line for line in events if "config --services" in line or " up" in line]
+  assert not [line for line in events if line.startswith("CALLED ")]
+  assert events[-2:] == [f"canary {NEW_CID}", f"final {NEW_CID}"]
+  # Edge routing is installed once, by step 2b after the canary.
+  assert SCRIPT.index("run_deploy_canary\n") < SCRIPT.index(
+    "if external_prod_caddy_running; then\n  step \"[2b/4] install edge fragment\"")
+
+
+def test_controller_failure_never_falls_back_to_compose(cutover):
+  result, events, _ = cutover(controller_rc=1)
+  assert result.returncode != 0
+  assert not [line for line in events if " up" in line or "--services" in line]
+  assert not [line for line in events if line.startswith(("CALLED ", "canary"))]
+
+
+def test_unmanaged_self_hosted_keeps_single_full_project_up(cutover):
+  result, events, _ = cutover(helper=0)
+  assert result.returncode == 0, result.stderr
+  assert [line for line in events if " up" in line] == [
+    "docker compose -p mobius up -d",
+  ]
+  assert not [line for line in events if "--services" in line or "controller" in line]
+  assert "CALLED wait_for_cutover" in events
+  assert events[-2:] == ["canary mobius", "final mobius"]
+
+
+@pytest.mark.parametrize("target,helper,edge", [
+  ("test", 1, "self-hosted"), ("prod", 0, "self-hosted"), ("prod", 1, "edge"),
+])
+def test_proxy_reconcile_is_scoped_to_helper_managed_self_hosted_prod(
+    target, helper, edge,
+):
+  script = f"""set -euo pipefail
+docker() {{ echo "docker $*"; }}
+info() {{ :; }}; ok() {{ :; }}; intent() {{ :; }}; fail() {{ :; }}
+TARGET={target}; HELPER_MANAGED={helper}; EDGE_TOPOLOGY={edge}
+COMPOSE_ARGS=(-p mobius)
+{_function("external_prod_caddy_running")}
+{_function("reconcile_bundled_proxy")}
+reconcile_bundled_proxy
+"""
+  result = subprocess.run(["bash", "-c", script], text=True,
+                          capture_output=True, check=False)
+  assert result.returncode == 0, result.stderr
+  assert result.stdout == ""
+
+
+@pytest.mark.parametrize('profile_enabled', [False, True])
+def test_real_compose_service_selection_does_not_enable_disabled_proxy(tmp_path, profile_enabled):
+  executable = os.environ.get('MOBIUS_TEST_COMPOSE')
+  compose = [executable] if executable else ['docker', 'compose']
+  if not shutil.which(compose[0]):
+    pytest.skip('Compose parser unavailable; hosted proof exercises proxy reconciliation')
+  path = tmp_path / 'compose.yml'
+  path.write_text('''services:
+  app:
+    image: app-fixture
+  caddy:
+    image: caddy-fixture
+    profiles: [disabled]
+    depends_on: [app]
+''')
+  args = [*compose, '-p', 'proxy-profile-proof', '-f', str(path)]
+  if profile_enabled:
+    args += ['--profile', 'disabled']
+  result = subprocess.run([*args, 'config', '--services'],
+                          env={k: v for k, v in os.environ.items() if k != 'COMPOSE_PROFILES'},
+                          check=True, capture_output=True, text=True, timeout=15)
+  assert set(result.stdout.split()) == ({'app', 'caddy'} if profile_enabled else {'app'})

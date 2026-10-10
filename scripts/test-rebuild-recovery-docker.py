@@ -64,6 +64,40 @@ def eventually(predicate, seconds=20):
     raise AssertionError("disposable Docker condition did not become true")
 
 
+def await_admitted_boot(host, config, gate, role, operation, source_boot, nonce, seconds=30):
+    """Wait for the admitted boot's legacy begin-boot, then prove its handoff once.
+
+    The gate durably consumes its slot BEFORE exec'ing the legacy entrypoint,
+    whose begin-boot retires accepted.json, writes ack.json and replaces
+    boot-id LAST. Only those causal gaps are waited out: boot-id still naming
+    the source boot. Any other boot, a changed consumption, a missing/unreadable
+    ledger file or a proof mismatch fails at once instead of being retried.
+    """
+    boot_path = Path(config["data_dir"]) / ".restart-ledger" / "boot-id"
+    deadline, seen = time.monotonic() + seconds, None
+    while True:
+        # boot-id before the gate: a committed boot implies a prior consumption.
+        current = boot_path.read_text().strip()
+        consumed = gate.observe()["slots"][role]["consumed"]
+        if seen is not None and consumed != seen:
+            raise AssertionError("the gate's consumed admission changed")
+        seen = consumed
+        if consumed is not None and current == consumed["boot_id"]:
+            break
+        if current != source_boot:
+            raise AssertionError("the ledger committed a boot other than the admitted one")
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"the {role} admission was not consumed and committed "
+                                 f"by legacy begin-boot within {seconds}s")
+        time.sleep(.2)
+    if not host.cutover_boot_consumed(config, operation, expected_boot_id=consumed["boot_id"]):
+        raise AssertionError("the admitted boot did not prove the exact cutover acknowledgement")
+    ack = json.loads((boot_path.parent / "ack.json").read_bytes())
+    if (ack.get("nonce"), ack.get("source_boot_id")) != (nonce, source_boot):
+        raise AssertionError("the acknowledgement names another handoff")
+    return consumed
+
+
 def http_message(buffer, *, eof=False):
     """One complete HTTP/1.x message at the start of buffer, else None.
 
@@ -574,11 +608,11 @@ HEALTHCHECK --interval=1s --timeout=1s --retries=2 CMD test -f /data/ready
                         assert gate.observe()["slots"]["target"]["consumed"] is None
                         assert ledger.ACCEPTED_PATH.read_bytes() == accepted
                         host.prepare_attempt(config, tx, "target")
-                        eventually(lambda: gate.observe()["slots"]["target"]["consumed"] is not None)
-                        assert ledger.ACK_PATH.exists()
-                    else:
-                        eventually(lambda: gate.observe()["slots"]["target"]["consumed"] is not None)
-                        assert ledger.ACK_PATH.exists()
+                    # Gate consumption is durable before the legacy exec, so
+                    # wait for that exact boot's ACK and boot-id, not just it.
+                    await_admitted_boot(host, config, gate, "target", operation,
+                                        source_boot, nonce)
+                    assert ledger.ACK_PATH.exists()
                 elif kind in {"delayed-create", "wrong-holder"}:
                     # Schedule: (1) the real host journals, allocates and asks
                     # Compose to Create the target under the stable name; the

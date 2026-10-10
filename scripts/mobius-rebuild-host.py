@@ -605,10 +605,10 @@ def current_attempt(config_value: dict) -> dict | None:
     return expected
 
 
-def name_holder(name: str) -> tuple[str, dict] | None:
+def name_holder(name: str, *, timeout: float = 10) -> tuple[str, dict] | None:
     """Exact Docker name lookup; only Docker's own not-found response is absence."""
     result = docker_command(["docker", "container", "inspect", "--format", "{{json .}}", name],
-                            check=False)
+                            check=False, timeout=timeout)
     if result.returncode:
         if result.returncode == 1 and result.stderr.strip().lower() in {
                 f"error response from daemon: no such container: {name}",
@@ -705,7 +705,7 @@ def container_health(config_value: dict, timeout: float = 10) -> tuple[str, str,
                 raise subprocess.TimeoutExpired("Docker container observation", 2 * timeout)
             current = current_attempt(config_value)
             if current:
-                held = name_holder(config_value["deployment_name"])
+                held = name_holder(config_value["deployment_name"], timeout=budget)
                 if held is None:
                     return "", "", "missing"
                 cid, item = held

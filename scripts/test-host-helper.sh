@@ -17,7 +17,9 @@
 # uvicorn process's working directory):
 #   3. the worker swaps in the prepared target: it converts and writes;
 #   4. the previous image keeps serving the target source (a restart-loadable
-#      release): every transcript stays exact;
+#      release): every transcript stays exact; beside that admitted app, raw
+#      Compose conflicts and the target's own helper-managed deploy reconciles
+#      the bundled proxy without touching the app, its gate or its ledger;
 #   5. a committed served tree that fails the import probe makes the
 #      entrypoint serve the previous image's baked code, which reads every
 #      transcript exactly and writes;
@@ -129,6 +131,18 @@ replaced_with() {  # <sha>: the container runs that image (not necessarily its s
     || fail "the container's image does not report sha-$1"
 }
 
+single_data_writer() {  # <owner CID>: no other container mounts its /data writable
+  # Inspect mounts too: label-only discovery could miss an unwrapped writer.
+  docker inspect $(docker ps --no-trunc -q) | python3 -c '
+import json, sys
+items = json.load(sys.stdin)
+owner = next(c for c in items if c["Id"] == sys.argv[1])
+data = next(m["Source"] for m in owner["Mounts"] if m["Destination"] == "/data")
+writers = [c["Id"] for c in items if any(m["Source"] == data and m.get("RW") for m in c["Mounts"])]
+assert writers == [owner["Id"]], writers
+' "$1"
+}
+
 prove_compose_name_fence() {
   local cid started current_name output status mode
   cid=$(app_container) || fail "cannot identify managed app for Compose proof"
@@ -157,17 +171,212 @@ prove_compose_name_fence() {
     [[ $(app_container) == "$cid" ]] || fail "raw Compose $mode changed app ownership"
     [[ $(docker inspect -f '{{.State.StartedAt}}' "$cid") == "$started" ]] \
       || fail "raw Compose $mode restarted the managed app"
-    # Inspect mounts too: label-only discovery could miss an unwrapped writer.
-    docker inspect $(docker ps --no-trunc -q) | python3 -c '
-import json, sys
-items = json.load(sys.stdin)
-owner = next(c for c in items if c["Id"] == sys.argv[1])
-data = next(m["Source"] for m in owner["Mounts"] if m["Destination"] == "/data")
-writers = [c["Id"] for c in items if any(m["Source"] == data and m.get("RW") for m in c["Mounts"])]
-assert writers == [owner["Id"]], writers
-' "$cid" || fail "raw Compose $mode created a second writer on the app data"
+    single_data_writer "$cid" || fail "raw Compose $mode created a second writer on the app data"
   done
   echo "   unchanged raw Compose commands conflict without a second app or restart"
+}
+
+# A helper-managed deploy replaces only the admitted app, then reconciles the
+# bundled Caddy by itself. Run the target's own deploy-prod.sh functions,
+# extracted verbatim from a checkout of <target> (never a copy in this file or
+# the previous release's script), against this real daemon. Caddy must be
+# created, then recreated for a changed routing environment and a changed image
+# reference, while the admitted app's identity, start, gate and ledger stay
+# exactly as they were. Synthetic *.localhost names keep Caddy on its internal
+# CA (no ACME or DNS); the disposable owner override drops host port bindings,
+# which are not under test and would collide with this runner's registry.
+PROXY_CANDIDATE=""
+PROXY_FUNCTIONS=""
+proxy_env() {  # <domain> <gateway> <command...>: the deploy's exported prod environment
+  local domain=$1 gateway=$2; shift 2
+  (cd "$PROXY_CANDIDATE" && env -u COMPOSE_FILE -u COMPOSE_PROFILES \
+    SECRET_KEY=host-helper-regression-key-0123456789abcdef MOBIUS_IMAGE="$IMAGE:sha-$PREVIOUS" \
+    DOMAIN="$domain" MOBIUS_SERVICE_GATEWAY_ORIGIN="$gateway" "$@")
+}
+proxy_override() {  # <active|disabled> [image]: the owner override for this step
+  local extra=""
+  if [[ $1 == disabled ]]; then extra+=$'    profiles: ["disabled"]\n'; fi
+  if [[ -n ${2:-} ]]; then extra+="    image: $2"$'\n'; fi
+  printf 'services:\n  caddy:\n    ports: !reset []\n%s' "$extra" \
+    >"$PROXY_CANDIDATE/docker-compose.override.yml"
+}
+proxy_containers() {  # every bundled proxy container of the project, running or not
+  docker ps -a --no-trunc -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+    --filter label=com.docker.compose.service=caddy
+}
+run_proxy_reconcile() {  # <domain> <gateway> <log>: the target's function, as its prod self-hosted helper path calls it
+  proxy_env "$1" "$2" timeout 180 bash -c '
+    set -euo pipefail
+    C_RED="" C_GREEN="" C_DIM="" C_YELLOW="" C_RESET=""
+    source "$1"
+    TARGET=prod HELPER_MANAGED=1 EDGE_TOPOLOGY=self-hosted
+    COMPOSE_ARGS=(-p mobius)
+    reconcile_bundled_proxy' reconcile "$PROXY_FUNCTIONS" >"$3" 2>&1 \
+    || { cat "$3" >&2; fail "the target's reconcile_bundled_proxy failed"; }
+}
+proxy_authority() {  # <app CID>: identity, gate and ledger state the proxy must never change
+  local data
+  data=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$1")
+  docker inspect -f '{{.Id}} {{.State.StartedAt}} {{.RestartCount}} {{.Image}} {{index .Config.Labels "io.mobius.admission.token"}}' "$1"
+  python3 - "$data" <<'PROXY_AUTHORITY'
+import hashlib, sys
+from pathlib import Path
+gate = Path("/var/lib/mobius-rebuild/admission")
+assert any(p.is_file() for p in gate.rglob("*")), "the admitted app has no gate state"
+for root in (gate, Path(sys.argv[1]) / ".restart-ledger"):
+    if not root.is_dir():
+        print(root, "absent")
+        continue
+    for path in sorted(root.rglob("*")):
+        st = path.lstat()
+        regular = path.is_file() and not path.is_symlink()
+        print(path, oct(st.st_mode), st.st_uid, st.st_size,
+              hashlib.sha256(path.read_bytes()).hexdigest() if regular else "-")
+print("transaction", Path("/var/lib/mobius-rebuild/transaction.json").exists())
+PROXY_AUTHORITY
+}
+proxy_serves() {  # <proxy CID> <domain> <gateway> <stale domain> <stale gateway> <image>
+  local cid=$1 config=""
+  for _ in $(seq 1 30); do
+    if [[ $(docker inspect -f '{{.State.Running}}' "$cid") == true ]] &&
+       config=$(docker exec "$cid" wget -qO- http://127.0.0.1:2019/config/ 2>/dev/null) &&
+       [[ -n $config ]]; then
+      break
+    fi
+    config=""
+    sleep 2
+  done
+  [[ -n $config ]] || { docker logs --tail 40 "$cid" >&2 || true; fail "the bundled proxy never loaded its configuration"; }
+  python3 - "$(docker inspect "$cid")" "$config" "${@:2}" <<'PROXY_CONFIG' \
+    || fail "the bundled proxy does not run the reconciled environment"
+import json, sys
+item = json.loads(sys.argv[1])[0]
+config = json.loads(sys.argv[2])
+domain, gateway, stale_domain, stale_gateway, image = sys.argv[3:]
+env = item["Config"]["Env"]
+for value in (f"DOMAIN={domain}", f"FRONTEND_ORIGIN=https://{domain}",
+              f"MOBIUS_SERVICE_GATEWAY_ORIGIN={gateway}"):
+    assert value in env, (value, env)
+assert item["Config"]["Image"] == image, item["Config"]["Image"]
+assert item["State"]["Restarting"] is False and item["RestartCount"] == 0, item["State"]
+assert not item["HostConfig"].get("PortBindings"), item["HostConfig"]["PortBindings"]
+# What Caddy actually adapted from the Caddyfile, not only the container env.
+hosts = {host for server in config["apps"]["http"]["servers"].values()
+         for route in server.get("routes", []) for match in route.get("match", [])
+         for host in match.get("host", [])}
+gateway_host = gateway.split("://", 1)[1]
+assert {domain, gateway_host} <= hosts, hosts
+assert not {stale_domain, stale_gateway.split("://", 1)[-1]} & hosts, hosts
+PROXY_CONFIG
+}
+
+prove_bundled_proxy_reconcile() {
+  local app app_state authority log proxy previous_proxy started rendered tag volumes
+  local old_domain=proxy-old.localhost old_gateway=https://services-old.localhost
+  local new_domain=proxy-new.localhost new_gateway=https://services-new.localhost
+  app=$(app_container) || fail "cannot identify managed app for the proxy proof"
+  [[ $(docker inspect -f '{{index .Config.Labels "io.mobius.admission.token"}}' "$app") =~ ^[0-9a-f]{32}$ ]] \
+    || fail "the proxy proof requires an admitted app"
+  app_state=$(docker inspect -f '{{.State.StartedAt}} {{.RestartCount}}' "$app")
+  authority=$(proxy_authority "$app") || fail "cannot record the app's gate and ledger"
+  # The raw Compose refusals above must not have left a proxy behind: this
+  # proof starts without one, so its first reconcile really creates it.
+  [[ -z $(proxy_containers) ]] || fail "raw Compose left a bundled proxy container"
+
+  PROXY_CANDIDATE=$(mktemp -d /tmp/mobius-proxy-candidate.XXXXXX)/checkout
+  git -C "$ROOT" worktree add --detach -q "$PROXY_CANDIDATE" "$TARGET" \
+    || fail "cannot check out the target for the proxy proof"
+  [[ $(git -C "$PROXY_CANDIDATE" rev-parse HEAD) == "$TARGET" ]] || fail "the proxy candidate is not the target"
+  git -C "$ROOT" show "$TARGET:scripts/deploy-prod.sh" | cmp -s - "$PROXY_CANDIDATE/scripts/deploy-prod.sh" \
+    || fail "the proxy candidate's deploy script is not the target's"
+  PROXY_FUNCTIONS="$TPROOF/target-deploy-proxy.sh"
+  python3 - "$PROXY_CANDIDATE/scripts/deploy-prod.sh" >"$PROXY_FUNCTIONS" <<'PROXY_EXTRACT' \
+    || fail "the target's deploy-prod.sh has no single bundled proxy reconcile"
+import re, sys
+text = open(sys.argv[1]).read()
+for name in ("info", "ok", "fail", "intent", "external_prod_caddy_running", "reconcile_bundled_proxy"):
+    # One-line logger, or a block that ends at its first column-0 brace.
+    found = [m.group(0) for m in re.finditer(
+        r"^%s\(\) +\{(?: [^\n]*\}|\n.*?\n\})$" % re.escape(name), text, re.M | re.S)]
+    assert len(found) == 1, (name, len(found))
+    print(found[0])
+PROXY_EXTRACT
+  echo "   target deploy functions: $(sha256sum <"$PROXY_FUNCTIONS" | cut -c1-12)"
+
+  # Never bind host ports, even for a moment: check the rendered model first.
+  proxy_override active
+  rendered=$(proxy_env "$old_domain" "$old_gateway" docker compose -p mobius config --format json) \
+    || fail "cannot render the target's Compose model"
+  python3 -c '
+import json, sys
+caddy = json.loads(sys.argv[1])["services"]["caddy"]
+assert not caddy.get("ports"), caddy.get("ports")
+print(caddy["image"])' "$rendered" >"$TPROOF/proxy-image" || fail "the proxy override still publishes ports"
+  # Fetch the image first: a registry failure must not look like a reconcile failure.
+  proxy_env "$old_domain" "$old_gateway" docker compose -p mobius pull caddy \
+    || fail "could not prepare Caddy for the proxy proof"
+
+  echo "   a profile-disabled bundled proxy stays absent"
+  log="$TPROOF/proxy-disabled.log"
+  proxy_override disabled
+  run_proxy_reconcile "$old_domain" "$old_gateway" "$log"
+  grep -Fq "no active bundled proxy service; leaving the proxy unchanged" "$log" \
+    || { cat "$log" >&2; fail "a disabled proxy was not left alone"; }
+  ! grep -Fq -- "up -d" "$log" || fail "a disabled proxy was named to Compose"
+  [[ -z $(proxy_containers) ]] || fail "the reconcile activated a disabled proxy"
+
+  local step domain gateway stale_domain stale_gateway image
+  tag=mobius-proxy-proof/caddy:changed
+  docker tag "$(cat "$TPROOF/proxy-image")" "$tag" || fail "cannot tag the changed proxy image"
+  previous_proxy=""
+  for step in create environment image unchanged; do
+    domain=$new_domain gateway=$new_gateway stale_domain=$old_domain stale_gateway=$old_gateway
+    image=$tag
+    case $step in
+      create) domain=$old_domain gateway=$old_gateway stale_domain=$new_domain
+              stale_gateway=$new_gateway image=$(cat "$TPROOF/proxy-image") ;;
+      environment) image=$(cat "$TPROOF/proxy-image") ;;
+    esac
+    if [[ $image == "$tag" ]]; then proxy_override active "$tag"; else proxy_override active; fi
+    log="$TPROOF/proxy-$step.log"
+    run_proxy_reconcile "$domain" "$gateway" "$log"
+    grep -Fq "docker compose -p mobius up -d --no-deps caddy" "$log" \
+      && grep -Fq "bundled proxy reconciled without touching the app" "$log" \
+      || { cat "$log" >&2; fail "the $step reconcile did not run the bundled proxy path"; }
+    proxy=$(proxy_containers)
+    [[ $proxy =~ ^[0-9a-f]{64}$ ]] || fail "the $step reconcile left proxies: $proxy"
+    proxy_serves "$proxy" "$domain" "$gateway" "$stale_domain" "$stale_gateway" "$image"
+    case $step in
+      create) ;;
+      unchanged)
+        [[ $proxy == "$previous_proxy" &&
+           $(docker inspect -f '{{.State.StartedAt}}' "$proxy") == "$started" ]] \
+          || fail "an unchanged reconcile recreated or restarted the proxy" ;;
+      *) [[ $proxy != "$previous_proxy" ]] || fail "the changed $step was not applied to the proxy" ;;
+    esac
+    [[ $(app_container) == "$app" ]] || fail "the $step reconcile changed app ownership"
+    [[ $(docker inspect -f '{{.State.StartedAt}} {{.RestartCount}}' "$app") == "$app_state" ]] \
+      || fail "the $step reconcile restarted the app"
+    single_data_writer "$app" || fail "the $step reconcile created a second writer on the app data"
+    previous_proxy=$proxy
+    started=$(docker inspect -f '{{.State.StartedAt}}' "$proxy")
+  done
+  [[ $(docker inspect -f '{{.Image}}' "$proxy") == $(docker image inspect -f '{{.Id}}' "$(cat "$TPROOF/proxy-image")") ]] \
+    || fail "the changed image reference is not the pulled proxy image"
+  [[ $(proxy_authority "$app") == "$authority" ]] || fail "the proxy reconcile changed app identity, gate or ledger"
+
+  # Leave later phases the host they had: no proxy, image tag or checkout.
+  volumes=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}} {{end}}{{end}}' "$proxy")
+  docker rm -f "$proxy" >/dev/null || fail "cannot remove the proof proxy"
+  # Intentionally split: these are the proxy's own named volumes.
+  # shellcheck disable=SC2086
+  [[ -z $volumes ]] || docker volume rm $volumes >/dev/null || fail "cannot remove the proof proxy volumes"
+  docker image rm "$tag" >/dev/null || fail "cannot remove the changed proxy tag"
+  git -C "$ROOT" worktree remove --force "$PROXY_CANDIDATE" || fail "cannot remove the proxy candidate"
+  [[ -z $(proxy_containers) ]] || fail "a bundled proxy outlived its proof"
+  [[ $(app_container) == "$app" ]] && single_data_writer "$app" \
+    || fail "the proxy cleanup disturbed the app"
+  echo "   the target's deploy reconciled the bundled proxy; the admitted app, gate and ledger never changed"
 }
 
 served() {  # prints "<source> <sha>": what the entrypoint selected for uvicorn
@@ -548,6 +757,8 @@ fi
 if [[ $TRANSCRIPTS == 1 ]]; then
   if (( target_helper >= 5 )); then
     prove_compose_name_fence
+    # After the raw Compose refusals, so no proxy can mask their app conflict.
+    prove_bundled_proxy_reconcile
   fi
   # What the product serves here: normally the target source, because this
   # release is restart-loadable and an image replacement never reverts it;
