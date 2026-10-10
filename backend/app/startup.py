@@ -593,12 +593,16 @@ async def _reconcile_unstarted_delegations(context: StartupContext) -> None:
 
 
 async def _install_bootstrap_apps(context: StartupContext) -> None:
-  from app.bootstrap import ensure_bootstrap_apps_installed
+  from app.bootstrap import (
+    ensure_bootstrap_apps_installed,
+    schedule_bootstrap_retry,
+  )
 
   with SessionLocal() as db:
-    await ensure_bootstrap_apps_installed(db)
-
-
+    outcome = await ensure_bootstrap_apps_installed(db)
+  # A rate limit or slow transfer must not leave the instance without its
+  # default apps until the next restart.
+  schedule_bootstrap_retry(outcome)
 
 
 def _reconcile_app_cron(context: StartupContext) -> None:

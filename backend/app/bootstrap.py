@@ -9,18 +9,26 @@ external callers we don't need to traverse here.
 
 Failure is non-fatal and isolated per app: a network blip fetching one
 manifest must not crash uvicorn or prevent the remaining bootstrap apps
-from installing. We log each failure and continue.
+from installing. We log each failure and continue. When a failure is only a
+wait (a GitHub rate limit, a gateway error, a slow Git transfer), one
+background retry repeats the idempotent bootstrap with capped backoff and the
+owner is told once, so a new deployment is never left without its Store until
+the next restart.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import time
+import uuid
 from dataclasses import dataclass
 
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app import models
+from app import app_git, models
 from app.manifest_identity import canonical_manifest_identity_key
 from app.install import install_from_manifest
 from app.timeutil import now_naive_utc
@@ -52,6 +60,7 @@ BOOTSTRAP_SOCIAL_MANIFEST_URL = _MANIFEST_URL.format(repo="app-social")
 @dataclass(frozen=True)
 class _BootstrapApp:
   manifest_id: str
+  name: str
   manifest_url: str
   reinstall_after_uninstall: bool
   predecessor_manifest_id: str | None = None
@@ -64,20 +73,21 @@ class _BootstrapApp:
 _CORE_BOOTSTRAP_APPS = (
   # The Store is how a new owner finds everything else, so it starts pinned.
   _BootstrapApp(
-    "store", BOOTSTRAP_STORE_MANIFEST_URL, True, pin_on_first_install=True,
+    "store", "App Store", BOOTSTRAP_STORE_MANIFEST_URL, True,
+    pin_on_first_install=True,
   ),
   # Skills is NOT the recovery surface — an owner uninstall is respected, and
   # the Store remains the way back.
-  _BootstrapApp("skills", BOOTSTRAP_SKILLS_MANIFEST_URL, False),
-  _BootstrapApp("memory", BOOTSTRAP_MEMORY_MANIFEST_URL, False),
+  _BootstrapApp("skills", "Skills", BOOTSTRAP_SKILLS_MANIFEST_URL, False),
+  _BootstrapApp("memory", "Memory", BOOTSTRAP_MEMORY_MANIFEST_URL, False),
   _BootstrapApp(
-    "reflection", BOOTSTRAP_REFLECTION_MANIFEST_URL, False,
+    "reflection", "Reflection", BOOTSTRAP_REFLECTION_MANIFEST_URL, False,
   ),
   # Integrations is the only management surface for owner MCP integrations
   # since the Settings section moved into the app. Its explicit predecessor
   # lets active installs migrate while an owner uninstall remains respected.
   _BootstrapApp(
-    "integrations", BOOTSTRAP_INTEGRATIONS_MANIFEST_URL, False,
+    "integrations", "Integrations", BOOTSTRAP_INTEGRATIONS_MANIFEST_URL, False,
     predecessor_manifest_id="connections",
     predecessor_manifest_url=(
       BOOTSTRAP_INTEGRATIONS_PREDECESSOR_MANIFEST_URL
@@ -86,13 +96,13 @@ _CORE_BOOTSTRAP_APPS = (
   # Möbius · You is useful on every new deployment. Managed owners arrive
   # signed in; local owners see the same app with account linking optional.
   _BootstrapApp(
-    "identity", BOOTSTRAP_IDENTITY_MANIFEST_URL, False,
+    "identity", "Möbius · You", BOOTSTRAP_IDENTITY_MANIFEST_URL, False,
   ),
   # Social (federated community board + direct messages) ships on every
   # deployment. Installing it does NOT join the public community: browsing is
   # open, and the owner explicitly opts in to join before they can post.
   _BootstrapApp(
-    "social", BOOTSTRAP_SOCIAL_MANIFEST_URL, False,
+    "social", "Social", BOOTSTRAP_SOCIAL_MANIFEST_URL, False,
   ),
 )
 
@@ -103,6 +113,40 @@ _SKIP_ENV = "MOEBIUS_SKIP_BOOTSTRAP"
 
 # Fixed sentinel key for the single DefaultPinInitialization row.
 _DEFAULT_PINS_MARKER_ID = "default_pins"
+
+# Waits between retries of a bootstrap that failed only transiently; the last
+# repeats. An upstream wait hint (Retry-After) lengthens a step up to that cap.
+# Retrying stops after a day; the next process start tries again.
+_RETRY_DELAYS_SECS = (60, 5 * 60, 15 * 60, 60 * 60)
+_RETRY_WINDOW_SECS = 24 * 60 * 60
+_retry_tasks: set[asyncio.Task] = set()
+
+
+@dataclass(frozen=True)
+class BootstrapOutcome:
+  """Default apps whose install failed for a reason that passes with time."""
+
+  pending: tuple[str, ...] = ()
+  rate_limited: bool = False
+  retry_after: int | None = None
+
+
+def _transient_failure(exc: Exception) -> tuple[bool, int | None]:
+  """Whether an install failure is worth retrying, and any upstream wait."""
+  if isinstance(exc, app_git.GitTransferTimeout):
+    return True, None
+  if not isinstance(exc, HTTPException):
+    return False, None
+  detail = exc.detail
+  if exc.status_code not in (429, 502, 504) and not (
+    isinstance(detail, dict) and detail.get("code") == "git_transfer_timeout"
+  ):
+    return False, None
+  try:
+    wait = int((exc.headers or {}).get("Retry-After") or 0)
+  except ValueError:
+    wait = 0
+  return True, wait or None
 
 
 def _default_store_pin_pending(db: Session) -> bool:
@@ -159,7 +203,7 @@ def _mark_default_store_pinned(db: Session, app_id: int) -> bool:
     return False
 
 
-async def ensure_bootstrap_apps_installed(db: Session) -> None:
+async def ensure_bootstrap_apps_installed(db: Session) -> BootstrapOutcome:
   """Idempotently install the configured bootstrap apps when absent.
 
   Identity is keyed on `manifest_url`, not slug. This means:
@@ -173,11 +217,12 @@ async def ensure_bootstrap_apps_installed(db: Session) -> None:
 
   Caller is the FastAPI lifespan/startup handler. Owns no transaction
   state — `install_from_manifest` commits its own work on success and
-  rolls back on failure. We just decide whether to call it.
+  rolls back on failure. We just decide whether to call it. Returns the apps
+  that failed transiently, for `schedule_bootstrap_retry`.
   """
   if os.environ.get(_SKIP_ENV) == "1":
     log.info("bootstrap: %s=1, skipping bootstrap app installs", _SKIP_ENV)
-    return
+    return BootstrapOutcome()
 
   # Bootstrap uses the same resolver as preview and install so all three paths
   # agree on persisted identities, moved refs, and proven legacy origins.
@@ -191,6 +236,9 @@ async def ensure_bootstrap_apps_installed(db: Session) -> None:
     log.exception("bootstrap: could not decide default pins; pinning nothing")
     default_pin_pending = False
 
+  pending: list[str] = []
+  rate_limited = False
+  retry_after: int | None = None
   for bootstrap_app in _CORE_BOOTSTRAP_APPS:
     # Use the installer's identity resolver here too: bootstrap and an explicit
     # Store action must agree across ref moves and legacy rows whose matching
@@ -273,6 +321,14 @@ async def ensure_bootstrap_apps_installed(db: Session) -> None:
       log.exception(
         "bootstrap: %s install failed — %s", bootstrap_app.manifest_id, exc,
       )
+      transient, wait = _transient_failure(exc)
+      if transient:
+        pending.append(bootstrap_app.name)
+        rate_limited = rate_limited or (
+          isinstance(exc, HTTPException) and exc.status_code == 429
+        )
+        if wait is not None:
+          retry_after = max(retry_after or 0, wait)
       continue
     log.info(
       "bootstrap: %s install %s (app id=%s, warnings=%s)",
@@ -284,3 +340,87 @@ async def ensure_bootstrap_apps_installed(db: Session) -> None:
       and _mark_default_store_pinned(db, app.id)
     ):
       default_pin_pending = False
+  return BootstrapOutcome(tuple(pending), rate_limited, retry_after)
+
+
+def schedule_bootstrap_retry(outcome: BootstrapOutcome) -> None:
+  """Start the one background retry for apps that failed transiently."""
+  if not outcome.pending or _retry_tasks:
+    return
+  task = asyncio.create_task(
+    retry_bootstrap_apps(outcome), name="mobius:bootstrap-apps-retry",
+  )
+  _retry_tasks.add(task)
+  task.add_done_callback(_retry_tasks.discard)
+
+
+async def retry_bootstrap_apps(outcome: BootstrapOutcome) -> None:
+  """Repeat the bootstrap with capped backoff until nothing transient is left.
+
+  Each attempt reruns the whole idempotent bootstrap, so apps that installed
+  meanwhile are skipped and a still-owed default Store pin settles with the
+  Store. The owner is told once per retry run, as soon as an owner exists.
+  """
+  from app.database import SessionLocal
+
+  deadline = time.monotonic() + _RETRY_WINDOW_SECS
+  notification_id = str(uuid.uuid4())
+  notified = False
+  attempt = 0
+  while outcome.pending:
+    if not notified:
+      notified = await _notify_owner_pending(outcome, notification_id)
+    step = _RETRY_DELAYS_SECS[min(attempt, len(_RETRY_DELAYS_SECS) - 1)]
+    delay = max(step, min(outcome.retry_after or 0, _RETRY_DELAYS_SECS[-1]))
+    if time.monotonic() + delay > deadline:
+      log.warning(
+        "bootstrap: still could not install %s; retrying at next start",
+        ", ".join(outcome.pending),
+      )
+      return
+    log.info(
+      "bootstrap: retrying %s in %d seconds", ", ".join(outcome.pending), delay,
+    )
+    await asyncio.sleep(delay)
+    attempt += 1
+    try:
+      with SessionLocal() as db:
+        outcome = await ensure_bootstrap_apps_installed(db)
+    except Exception:
+      # The previous outcome stays owed; the next step tries again.
+      log.exception("bootstrap: retry attempt failed")
+  log.info("bootstrap: retry finished the default apps")
+
+
+async def _notify_owner_pending(
+  outcome: BootstrapOutcome, notification_id: str,
+) -> bool:
+  """Tell the owner once which default apps are still on their way."""
+  from app import push
+  from app.database import SessionLocal
+
+  names = list(outcome.pending)
+  listed = (
+    names[0] if len(names) == 1
+    else ", ".join(names[:-1]) + " and " + names[-1]
+  )
+  cause = "GitHub rate limit" if outcome.rate_limited else "network problem"
+  try:
+    with SessionLocal() as db:
+      owner = db.query(models.Owner.id).first()
+      if owner is None:
+        return False
+      await push.notify_owner_async(
+        db,
+        owner[0],
+        title="Some apps are still installing",
+        body=(
+          f"{listed} couldn't be installed yet ({cause}); "
+          "retrying automatically."
+        ),
+        notification_id=notification_id,
+      )
+  except Exception:
+    log.warning("bootstrap: could not notify the owner", exc_info=True)
+    return False
+  return True

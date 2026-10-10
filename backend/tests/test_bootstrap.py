@@ -723,3 +723,115 @@ async def test_undecidable_default_pins_never_stop_bootstrap(db, monkeypatch):
   apps = db.query(models.App).all()
   assert len(apps) == len(_bootstrap_urls())
   assert not any(app.pinned_at for app in apps)
+
+
+def _store_failing_once(db, exc):
+  """Install stand-in whose first Store attempt fails with `exc`."""
+  install = _installing_rows(db)
+  failures = [exc]
+
+  async def flaky(db_, *, manifest_url, **kwargs):
+    if manifest_url == BOOTSTRAP_STORE_MANIFEST_URL and failures:
+      raise failures.pop()
+    return await install(db_, manifest_url=manifest_url, **kwargs)
+
+  return flaky
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_store_is_retried_and_takes_its_default_pin(
+  db, monkeypatch,
+):
+  """A GitHub rate limit on first boot is a wait, not a stranded instance."""
+  from app import bootstrap as bootstrap_mod
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  rate_limited = HTTPException(
+    429, "GitHub rate-limited this app request.",
+    headers={"Retry-After": "600"},
+  )
+  delays = []
+
+  async def no_wait(seconds):
+    delays.append(seconds)
+
+  monkeypatch.setattr(bootstrap_mod.asyncio, "sleep", no_wait)
+  with patch(
+    "app.bootstrap.install_from_manifest", _store_failing_once(db, rate_limited),
+  ):
+    outcome = await ensure_bootstrap_apps_installed(db)
+    assert outcome == bootstrap_mod.BootstrapOutcome(
+      ("App Store",), rate_limited=True, retry_after=600,
+    )
+    assert db.query(models.App).filter_by(slug="store").first() is None
+
+    await bootstrap_mod.retry_bootstrap_apps(outcome)
+
+  # The upstream hint lengthened the first one-minute step.
+  assert delays == [600]
+  db.expire_all()
+  pinned = {app.slug for app in db.query(models.App).all() if app.pinned_at}
+  assert pinned == {"store"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", [
+  HTTPException(422, "App failed to compile."),
+  HTTPException(404, "Not found"),
+  ValueError("unexpected"),
+])
+async def test_non_transient_failure_schedules_no_retry(db, monkeypatch, exc):
+  from app import bootstrap as bootstrap_mod
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  with patch(
+    "app.bootstrap.install_from_manifest", _store_failing_once(db, exc),
+  ):
+    outcome = await ensure_bootstrap_apps_installed(db)
+
+  assert outcome == bootstrap_mod.BootstrapOutcome()
+  bootstrap_mod.schedule_bootstrap_retry(outcome)
+  assert not bootstrap_mod._retry_tasks
+
+
+@pytest.mark.parametrize("exc", [
+  HTTPException(502, "Upstream 500"),
+  HTTPException(504, "Timeout"),
+  HTTPException(409, {"code": "git_transfer_timeout", "message": "slow"}),
+  app_git.GitTransferTimeout("clone exceeded its ceiling"),
+])
+def test_gateway_and_transfer_timeouts_are_transient(exc):
+  from app.bootstrap import _transient_failure
+
+  assert _transient_failure(exc) == (True, None)
+
+
+@pytest.mark.asyncio
+async def test_retry_tells_the_owner_once_and_stops_after_a_day(
+  db, monkeypatch,
+):
+  from app import bootstrap as bootstrap_mod
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  db.add(models.Owner(username="owner", hashed_password="unused"))
+  db.commit()
+  clock = [0.0]
+
+  async def advance(seconds):
+    clock[0] += seconds
+
+  monkeypatch.setattr(bootstrap_mod.asyncio, "sleep", advance)
+  monkeypatch.setattr(bootstrap_mod.time, "monotonic", lambda: clock[0])
+  still_limited = AsyncMock(side_effect=HTTPException(429, "rate limited"))
+  with patch("app.bootstrap.install_from_manifest", still_limited):
+    await bootstrap_mod.retry_bootstrap_apps(bootstrap_mod.BootstrapOutcome(
+      ("App Store", "Social"), rate_limited=True,
+    ))
+
+  assert clock[0] <= bootstrap_mod._RETRY_WINDOW_SECS
+  assert clock[0] > bootstrap_mod._RETRY_WINDOW_SECS - 2 * 60 * 60
+  notes = db.query(models.Notification).all()
+  assert [note.body for note in notes] == [
+    "App Store and Social couldn't be installed yet (GitHub rate limit); "
+    "retrying automatically.",
+  ]
