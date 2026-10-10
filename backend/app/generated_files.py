@@ -247,6 +247,12 @@ def _settle_capture(
       os.close(stored_fd)
     return True
 
+  return _consume_inbox_capture(data_dir, chat_id, captured)
+
+
+def _consume_inbox_capture(data_dir: str, chat_id: str, captured: dict) -> bool:
+  """Remove only the original inbox inode, never a subsequent replacement."""
+  root = _chat_root(data_dir, chat_id)
   try:
     inbox_fd = _open_directory(root / "inbox", create=False)
   except OSError:
@@ -361,15 +367,24 @@ def _open_deliverable_file(
     os.close(directory_fd)
 
 
-async def publish_inbox_files(sink, *, data_dir: str, chat_id: str) -> dict[str, str]:
+async def publish_inbox_files(
+  sink, *, data_dir: str, chat_id: str, discard_if_full: dict | None = None,
+) -> dict[str, str]:
   """Freeze, persist, and consume a batch; return original->recorded names.
 
-  Native provider artifacts use the receipt to distinguish actual delivery
-  from capacity limits, rejected writes, or an uncertain acknowledgement.
+  Native provider artifacts use the receipt to distinguish actual delivery.
+  Only an explicitly owned new capture may be discarded on acknowledged full
+  capacity; owner inbox files and uncertain publications remain recoverable.
   """
   published: dict[str, str] = {}
   capacity = await sink.generated_file_capacity()
+  if capacity is None:
+    return published
   if capacity <= 0:
+    if discard_if_full is not None:
+      await asyncio.to_thread(
+        _consume_inbox_capture, data_dir, chat_id, discard_if_full,
+      )
     return published
   names = (await asyncio.to_thread(_inbox_names, data_dir, chat_id))[:capacity]
   for name in names:
@@ -395,4 +410,11 @@ async def publish_inbox_files(sink, *, data_dir: str, chat_id: str) -> dict[str,
     )
     if isinstance(outcome, str) and outcome:
       published[name] = outcome
+  if discard_if_full is not None and discard_if_full["name"] not in published:
+    # Capacity can disappear after the initial check (or be used by older inbox
+    # entries). Recheck only after every attempted publication is settled.
+    if await sink.generated_file_capacity() == 0:
+      await asyncio.to_thread(
+        _consume_inbox_capture, data_dir, chat_id, discard_if_full,
+      )
   return published

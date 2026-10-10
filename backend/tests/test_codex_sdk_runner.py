@@ -5495,7 +5495,7 @@ def test_generated_image_preserves_bounded_apng_bytes_at_limit(tmp_path, monkeyp
     monkeypatch.setattr(codex_sdk_runner, 'MAX_GENERATED_IMAGE_PIXELS', 4 * image.n_frames)
   name = codex_sdk_runner._stage_codex_generated_image(
     str(tmp_path), 'chat', base64.b64encode(content).decode(),
-  )
+  )['name']
   inbox = generated_files.output_dir(str(tmp_path), 'chat')
   assert (inbox / name).read_bytes() == content
   assert [path.name for path in inbox.iterdir()] == [name]
@@ -5507,7 +5507,7 @@ def test_generated_image_preserves_bytes_and_uses_unique_names(tmp_path):
 
   names = [codex_sdk_runner._stage_codex_generated_image(
     str(tmp_path), 'chat', _IMAGE_RESULT,
-  ) for _ in range(2)]
+  )['name'] for _ in range(2)]
   inbox = generated_files.output_dir(str(tmp_path), 'chat')
   assert names[0] != names[1]
   assert all((inbox / name).read_bytes() == base64.b64decode(_IMAGE_RESULT) for name in names)
@@ -5573,7 +5573,7 @@ def test_generated_image_crash_residue_stays_outside_publication(tmp_path):
   assert len(residue) == 1
   assert residue[0].read_bytes() == base64.b64decode(_IMAGE_RESULT)[:8]
   # A complete capture still recovers, and owner-named hidden files stay valid.
-  name = codex_sdk_runner._stage_codex_generated_image(str(tmp_path), 'chat', _IMAGE_RESULT)
+  name = codex_sdk_runner._stage_codex_generated_image(str(tmp_path), 'chat', _IMAGE_RESULT)['name']
   inbox = generated_files.output_dir(str(tmp_path), 'chat')
   (inbox / '.owner-notes.txt').write_bytes(b'finished owner deliverable')
   receipt = asyncio.run(generated_files.publish_inbox_files(
@@ -5604,6 +5604,9 @@ def test_generated_image_cancelled_capture_never_publishes_partial_bytes(tmp_pat
 
     def __exit__(self, *args):
       return self.stream.__exit__(*args)
+
+    def flush(self):
+      self.stream.flush()
 
     def write(self, content):
       self.stream.write(content[:8])
@@ -5653,6 +5656,48 @@ def test_generated_image_cancelled_capture_never_publishes_partial_bytes(tmp_pat
   asyncio.run(cancel_and_publish())
 
 
+@pytest.mark.parametrize('capacity', [0, None, 500])
+def test_native_capture_cancellation_joins_worker_and_settlement(tmp_path, monkeypatch, capacity):
+  import threading
+  from app import generated_files
+
+  entered, release = threading.Event(), threading.Event()
+  stage = codex_sdk_runner._stage_codex_generated_image
+
+  def blocked_stage(*args):
+    entered.set()
+    assert release.wait(5)
+    return stage(*args)
+
+  class Sink(_ImagePublicationSink):
+    async def generated_file_capacity(self):
+      return capacity
+
+  async def scenario():
+    sink = Sink()
+    task = asyncio.create_task(codex_sdk_runner._capture_codex_generated_image(
+      sink, str(tmp_path), 'chat', _IMAGE_RESULT, set(), 'image-call',
+    ))
+    try:
+      assert await asyncio.to_thread(entered.wait, 5)
+      task.cancel()
+      await asyncio.sleep(0)
+      assert not task.done()  # ownership cannot end while its worker can rename
+      task.cancel()  # repeated cancellation must not abandon the owned task
+    finally:
+      release.set()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+    pending = generated_files._inbox_names(str(tmp_path), 'chat')
+    assert len(pending) == (1 if capacity is None else 0)
+    assert len(sink.events) == (1 if capacity == 500 else 0)
+    stored = list(generated_files.stored_dir(str(tmp_path), 'chat').iterdir())
+    assert len(stored) == (1 if capacity == 500 else 0)
+
+  monkeypatch.setattr(codex_sdk_runner, '_stage_codex_generated_image', blocked_stage)
+  asyncio.run(scenario())
+
+
 def test_generated_image_obeys_existing_deliverable_size_limit(tmp_path, monkeypatch):
   from app import generated_files
 
@@ -5668,6 +5713,9 @@ def test_generated_image_obeys_existing_deliverable_size_limit(tmp_path, monkeyp
   ('completed', '', 0, 500, 'accepted'),
   ('failed', _IMAGE_RESULT, 0, 500, 'accepted'),
   ('completed', _IMAGE_RESULT, 0, 0, 'accepted'),
+  ('completed', _IMAGE_RESULT, 0, None, 'accepted'),
+  ('completed', _IMAGE_RESULT, 0, 499, 'capacity_race'),
+  ('completed', _IMAGE_RESULT, 0, 500, 'raises'),
   ('completed', _IMAGE_RESULT, 0, 500, 'uncertain'),
   ('completed', _IMAGE_RESULT, 1, 500, 'committed_uncertain'),
 ])
@@ -5704,6 +5752,19 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
     *_goal_completion_notifications(),
   ]
   notifications.insert(2, notifications[1])  # Replay even without a delivery receipt.
+  if capacity == 0:
+    for index in range(8):
+      another = v.ImageGenerationThreadItem(
+        id=f'image-call-{index}', type='imageGeneration', status='completed', result=result,
+      )
+      event = SimpleNamespace(method='item/completed', payload=v.ItemCompletedNotification(
+        item=another, threadId='thread-1', turnId='turn-1', completedAtMs=3 + index,
+      ))
+      notifications[3:3] = [
+        SimpleNamespace(method='item/started', payload=v.ItemStartedNotification(
+          item=another, threadId='thread-1', turnId='turn-1', startedAtMs=2 + index,
+        )), event, event,
+      ]
   thread = _FakeThread('thread-1', _FakeTurnHandle(notifications))
 
   class FakeAsyncCodex:
@@ -5731,13 +5792,28 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
     agent_activity_binding=EMPTY_AGENT_ACTIVITY_BINDING,
   )
   generated_file_capacity = sink.generated_file_capacity
-  if capacity == 0:
-    async def no_capacity():
-      return 0
-    monkeypatch.setattr(sink, 'generated_file_capacity', no_capacity)
+  if capacity in (0, 499):
+    db.add_all([models.GeneratedFile(
+      chat_id=chat.id, name=f'existing-{index}.png', path=f'existing-{index}',
+      size=1, mime_type='image/png',
+    ) for index in range(500 if capacity == 0 else 499)])
+    db.commit()
+  if capacity is None:
+    async def unavailable_capacity():
+      return None
+    monkeypatch.setattr(sink, 'generated_file_capacity', unavailable_capacity)
   publish_generated_file = sink.publish_generated_file
   if publication != 'accepted':
     async def uncertain_publication(event):
+      if publication == 'raises':
+        raise OSError('simulated post-stage settlement failure')
+      if publication == 'capacity_race':
+        db.add(models.GeneratedFile(
+          chat_id=chat.id, name='last-slot.png', path='last-slot',
+          size=1, mime_type='image/png',
+        ))
+        db.commit()
+        return await publish_generated_file(event)
       if publication == 'committed_uncertain':
         await publish_generated_file(event)
         # Model late commit settlement after its acknowledgement was lost.
@@ -5752,18 +5828,18 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
   ))
   assert outcome['error'] is None
   tools = [block for block in sink.assistant_blocks if block.get('tool') == 'ImageGen']
-  assert len(tools) == 1
+  assert len(tools) == (9 if capacity == 0 else 1)
   assert tools[0]['tool_use_id'] == 'image-call'
   attached = expected_files and publication == 'accepted'
-  assert tools[0]['output_exit_code'] == (0 if attached else 1)
+  assert all(tool['output_exit_code'] == (0 if attached else 1) for tool in tools)
   assert private_path.read_bytes() == b'do not read this'
   rows = db.query(models.GeneratedFile).filter_by(chat_id=chat.id).all()
-  assert len(rows) == expected_files
+  assert len(rows) == expected_files + (500 if capacity in (0, 499) else 0)
   serialized = json.dumps(sink.assistant_blocks)
   assert str(private_path) not in serialized
   assert _IMAGE_RESULT not in serialized
   pending = generated_files._inbox_names(get_settings().data_dir, chat.id)
-  recoverable = capacity == 0 or publication == 'uncertain'
+  recoverable = capacity is None or publication in ('uncertain', 'raises')
   assert len(pending) == (1 if recoverable else 0)
   if recoverable:
     assert 'could not attach' in tools[0]['output']
@@ -5795,14 +5871,14 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
     assert attachment_blocks[0]['files'][0]['name'] == row.name
 
 
-def test_image_delivery_limit_has_no_false_success(tmp_path):
+def test_inbox_recovery_retains_image_without_owned_capture_receipt(tmp_path):
   from app import generated_files
 
   class FullSink:
     async def generated_file_capacity(self):
       return 0
 
-  name = codex_sdk_runner._stage_codex_generated_image(str(tmp_path), 'chat', _IMAGE_RESULT)
+  name = codex_sdk_runner._stage_codex_generated_image(str(tmp_path), 'chat', _IMAGE_RESULT)['name']
   receipt = asyncio.run(generated_files.publish_inbox_files(
     FullSink(), data_dir=str(tmp_path), chat_id='chat',
   ))

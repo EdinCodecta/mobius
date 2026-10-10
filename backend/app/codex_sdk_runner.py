@@ -132,7 +132,7 @@ def _ensure_codex_home(env: dict[str, str], data_dir: str) -> None:
   env.setdefault("CODEX_HOME", str(Path(data_dir) / "cli-auth" / "codex"))
 
 
-def _stage_codex_generated_image(data_dir: str, chat_id: str, result: str) -> str:
+def _stage_codex_generated_image(data_dir: str, chat_id: str, result: str) -> dict:
   """Stage the native PNG result, never read a provider-supplied saved path.
 
   Use the existing deliverable inbox/publication lifecycle for confinement,
@@ -189,8 +189,13 @@ def _stage_codex_generated_image(data_dir: str, chat_id: str, result: str) -> st
     )
     with os.fdopen(fd, "wb") as stream:
       stream.write(content)
+      stream.flush()
+      info = os.fstat(fd)
     os.rename(temporary, name, src_dir_fd=stored_fd, dst_dir_fd=directory_fd)
-    return name
+    return {
+      "name": name,
+      "_source_identity": (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size),
+    }
   finally:
     if stored_fd is not None:
       try:
@@ -199,6 +204,41 @@ def _stage_codex_generated_image(data_dir: str, chat_id: str, result: str) -> st
         pass
       os.close(stored_fd)
     os.close(directory_fd)
+
+
+async def _capture_codex_generated_image(
+  sink, data_dir: str, chat_id: str, result: str, captured_ids: set[str], item_id: str,
+) -> bool:
+  """Join capture and settlement before propagating caller cancellation."""
+  async def capture_and_publish():
+    capture = await asyncio.to_thread(_stage_codex_generated_image, data_dir, chat_id, result)
+    # Successful staging owns replay identity even if settlement later fails.
+    captured_ids.add(item_id)
+    published = await generated_files.publish_inbox_files(
+      sink, data_dir=data_dir, chat_id=chat_id, discard_if_full=capture,
+    )
+    return capture["name"] in published
+
+  task = asyncio.create_task(capture_and_publish())
+  deferred_cancel: asyncio.CancelledError | None = None
+  while not task.done():
+    try:
+      await asyncio.shield(task)
+    except asyncio.CancelledError as exc:
+      if task.cancelled():
+        break
+      deferred_cancel = deferred_cancel or exc
+    except Exception:
+      break
+  try:
+    attached = task.result()
+  except BaseException:
+    if deferred_cancel is not None:
+      raise deferred_cancel
+    raise
+  if deferred_cancel is not None:
+    raise deferred_cancel
+  return attached
 
 
 def _process_group_capture_delay(elapsed: float) -> float:
@@ -2207,16 +2247,10 @@ async def _run_codex_sdk_turn(
             and getattr(item, "failure", None) is None
           ):
             try:
-              image_name = await asyncio.to_thread(
-                _stage_codex_generated_image, runtime_data_dir, chat_id, item.result,
+              attached = await _capture_codex_generated_image(
+                bc, runtime_data_dir, chat_id, item.result, captured_image_ids, item.id,
               )
-              # Capture owns replay identity even if publication cannot yet
-              # acknowledge delivery. The inbox retains the artifact for recovery.
-              captured_image_ids.add(item.id)
-              published = await generated_files.publish_inbox_files(
-                bc, data_dir=runtime_data_dir, chat_id=chat_id,
-              )
-              if image_name not in published:
+              if not attached:
                 image_delivery_error = "The image was generated, but Möbius could not attach it."
             except (OSError, ValueError):
               log.warning("Codex generated-image capture failed chat_id=%s", chat_id, exc_info=True)
