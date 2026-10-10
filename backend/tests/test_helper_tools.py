@@ -339,6 +339,25 @@ def test_reading_a_helper_that_is_still_working_leaves_its_result_owed(
   assert row.delivered_run_id is None and row.incorporated_run_id is None
 
 
+def test_reading_a_failed_helper_with_no_report_counts_as_receiving_it(
+  client, owner_token, db,
+):
+  """The failure itself is the result: an agent that read it must be able to
+  settle its Goal even though the helper wrote nothing."""
+  parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix="read-empty-failure", child_status="failed",
+  )
+  response = client.post(
+    f"/api/delegations/{delegation_id}/result-read", json={},
+    headers={"Authorization": f"Bearer {owner_token}"},
+  )
+  assert response.status_code == 200, response.text
+  db.expire_all()
+  row = db.get(models.Delegation, delegation_id)
+  assert row.delivered_run_id is not None
+  assert delegations_mod.available_delegation_results(db, parent_id) == []
+
+
 # ----------------------------------------------------------------- live delivery
 
 

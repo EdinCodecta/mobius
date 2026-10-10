@@ -474,9 +474,10 @@ def read_delegation_result(
       status_code=403, detail="Only the helper's parent chat may read its result.",
     )
   payload = serialize_delegation(db, row)
+  # A settled outcome is received even without report text (a failure that
+  # wrote nothing); a truncated report and still-working helpers stay owed.
   if (
-    payload.get("result")
-    and not payload.get("result_truncated")
+    not payload.get("result_truncated")
     and record_result_read_by_parent(db, row)
   ):
     db.commit()

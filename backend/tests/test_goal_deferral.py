@@ -146,7 +146,8 @@ def test_deferral_does_not_drop_an_owed_helper_result_from_an_earlier_attempt(db
                        goal_id=goal.id, status="completed"))
   db.commit()
   monkeypatch.setattr(delegations, "_self_resuming_helper_rows", lambda *args: [
-    (SimpleNamespace(id="owed-result", parent_root_run_id="earlier-root", goal_id=goal.id), "completed"),
+    (SimpleNamespace(id="owed-result", parent_root_run_id="earlier-root", goal_id=goal.id,
+                     app_id=None, parent_chat_id=chat.id), "completed"),
   ])
   with pytest.raises(GoalPlanError, match="helper:owed-result"):
     update_goal_record(db, run, goal, goal.revision, defer=REASON)
@@ -313,6 +314,50 @@ def test_completion_waits_for_a_failed_helper_result_its_agent_has_not_received(
   assert goal.status == "open"
 
   assert record_result_read_by_parent(db, db.get(models.Delegation, "failed-helper"))
+  db.commit()
+  update_goal_record(db, run, goal, goal.revision, complete=True)
+  db.expire_all()
+  assert goal.status == "completed"
+
+
+def _helper(db, *, id, parent_chat_id, goal, run, status, app_id=None, delivered=False):
+  child = create_chat(id=id + "-chat", title=id, messages=[])
+  db.add(child)
+  db.flush()
+  db.add(models.ChatRun(id=id + "-run", chat_id=child.id, status=status,
+                       provider="claude", ended_at=datetime.now(UTC)))
+  db.add(models.Delegation(id=id, parent_chat_id=parent_chat_id, app_id=app_id,
+    parent_root_run_id=run.id, goal_id=goal.id, child_chat_id=child.id,
+    task_key=id, provider="claude", scope="write", cwd="/data",
+    prompt_sha256="0" * 64, notify_parent_on_complete=True,
+    delivered_run_id=id + "-run" if delivered else None))
+  db.flush()
+  return child
+
+
+def test_completion_waits_for_a_nested_failure_owed_to_a_finished_mid_level_helper(db, chat):
+  """A sub-helper that fails after its own parent helper finished still owes
+  that helper a wake; closing the Goal first would strand it."""
+  from app.goal_plans import GoalPlanError
+  goal, run = seed(db, chat)
+  middle = _helper(db, id="middle", parent_chat_id=chat.id, goal=goal, run=run,
+                   status="completed", delivered=True)
+  _helper(db, id="nested", parent_chat_id=middle.id, goal=goal, run=run, status="failed")
+  db.commit()
+  with pytest.raises(GoalPlanError, match="helper:nested"):
+    update_goal_record(db, run, goal, goal.revision, complete=True)
+  db.expire_all()
+  assert goal.status == "open"
+
+
+def test_app_owned_helper_results_never_hold_a_chat_goal_open(db, chat):
+  goal, run = seed(db, chat)
+  app = models.App(slug="owned-helper-app", source_dir="/tmp/mobius-tests/owned-helper-app",
+                   name="Owner app", description="", jsx_source="")
+  db.add(app)
+  db.flush()
+  _helper(db, id="app-helper", parent_chat_id=chat.id, goal=goal, run=run,
+          status="failed", app_id=app.id)
   db.commit()
   update_goal_record(db, run, goal, goal.revision, complete=True)
   db.expire_all()

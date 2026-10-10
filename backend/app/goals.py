@@ -327,19 +327,34 @@ def cannot_complete_result(details: dict[str, str]) -> str:
 
 
 def _helper_blockers(db, run, goal) -> list[str]:
-  """Helpers a Goal cannot settle past: still working, or owed to its agent.
+  """Helpers a Goal cannot settle past: still working, or owed to an agent.
 
-  A helper result that has not reached the coordinator yet (for example a
-  failure that landed just before settlement) would otherwise be stranded:
-  a closed Goal cannot wake its agent. Reading it with list_agents records
-  receipt and clears it, so the agent always owns the remedy.
+  A helper result that has not reached its parent agent yet (for example a
+  failure that landed just before settlement, at any depth of the Goal's
+  helper tree) would otherwise be stranded: a closed Goal cannot wake that
+  agent. The owning agent reads it with list_agents, or its pending wake
+  delivers it; either records receipt and clears the blocker. App-owned
+  helpers report to their app and never hold a chat Goal open.
   """
   from app.delegations import _self_resuming_helper_rows
-  from app.goal_plans import active_goal_helpers
+  from app.goal_plans import _delegation_tree, active_goal_helpers
+
+  tree_ids, owners, frontier = set(), {goal.chat_id}, _delegation_tree(
+    db, run, goal, all_attempts=True,
+  )
+  while frontier:
+    node = frontier.pop()
+    tree_ids.add(node["id"])
+    frontier.extend(node.get("children") or [])
+  owners |= {row.child_chat_id for row in db.query(models.Delegation.child_chat_id)
+             .filter(models.Delegation.id.in_(tree_ids))} if tree_ids else set()
   return active_goal_helpers(db, run, goal) + [
     "helper:" + row.id
-    for row, _status in _self_resuming_helper_rows(db, {goal.chat_id})
-    if row.goal_id == goal.id
+    for row, _status in _self_resuming_helper_rows(db, owners)
+    if row.app_id is None and (
+      row.id in tree_ids
+      or (row.parent_chat_id == goal.chat_id and row.goal_id == goal.id)
+    )
   ]
 
 
