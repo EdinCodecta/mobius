@@ -1818,7 +1818,9 @@ if [ "$HELPER_MANAGED" = 1 ]; then
   # it back, re-arm its consumed handoff or reach the app through Compose.
   if ! reconcile_bundled_proxy; then
     fail "the verified app replacement ${CONTAINER:0:12} stays live; public routing may still use the previous proxy"
-    fail "repair only the proxy: docker compose ${COMPOSE_ARGS[*]} up -d --no-deps caddy (from ${REPO_ROOT}), then rerun with --check"
+    fail "repair only the proxy: docker compose ${COMPOSE_ARGS[*]} up -d --no-deps caddy (from ${REPO_ROOT})"
+    fail "then complete the skipped frontend rebuild: docker exec -u mobius ${CONTAINER} bash /app/scripts/rebuild_shell.sh"
+    fail "finally rerun with --check; that mode verifies only and does not rebuild the frontend"
     exit 1
   fi
 else

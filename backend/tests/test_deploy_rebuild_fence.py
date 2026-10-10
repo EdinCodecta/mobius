@@ -424,6 +424,10 @@ def test_proxy_reconcile_failure_is_honest_and_never_reaches_the_app(cutover):
   assert "domain=old.example" in caddy
   assert f"verified app replacement {NEW_CID[:12]} stays live" in result.stderr
   assert "docker compose -p mobius up -d --no-deps caddy" in result.stderr
+  rebuild = f"docker exec -u mobius {NEW_CID} bash /app/scripts/rebuild_shell.sh"
+  assert rebuild in result.stderr
+  assert result.stderr.index(rebuild) < result.stderr.index("finally rerun with --check")
+  assert "verifies only and does not rebuild the frontend" in result.stderr
 
 
 def test_unrenderable_service_list_fails_before_any_compose_up(cutover):
