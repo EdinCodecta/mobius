@@ -488,6 +488,29 @@ def test_a_view_raises_for_a_position_that_has_since_vanished():
     assert [m["content"] for m in view] == ["0"]
 
 
+def test_opening_an_unconverted_chat_decodes_its_legacy_value_once(client, auth, monkeypatch):
+  """The page, its coordinates and the live overlay share one decoded value."""
+  with SessionLocal() as db:
+    db.add(create_chat(id="opened", title="Opened", messages=[], live_assistant={
+      "role": "assistant", "id": "live-1", "blocks": [{"type": "text", "content": "streaming"}],
+    }))
+    db.commit()
+  previous_release_writes("opened", [
+    {"role": "user", "content": "question", "ts": 1},
+    {"role": "assistant", "id": "live-1", "content": "older", "ts": 2},
+  ])
+  decodes = []
+  real = rows._parse_legacy
+  monkeypatch.setattr(rows, "_parse_legacy", lambda raw: decodes.append(1) or real(raw))
+
+  response = client.get("/api/chats/opened", headers=auth)
+
+  assert response.status_code == 200, response.text
+  assert [m.get("content") for m in response.json()["messages"]][0] == "question"
+  assert len(decodes) == 1
+  assert not converted("opened")
+
+
 def test_cid_lookup_and_timestamp_helpers_never_decode_history(monkeypatch):
   chat_id = seed(messages=[{"role": "user", "content": "x" * 1000, "ts": i, "cid": f"c{i}"}
                            for i in range(50)])
