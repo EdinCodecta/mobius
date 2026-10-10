@@ -128,6 +128,7 @@ def test_every_default_package_identity_is_in_the_trusted_table():
         f"https://api.github.com/repos/{owner}/{repo}", headers=headers,
       )
       metadata.raise_for_status()
+      assert metadata.json()["full_name"].lower() == f"{owner}/{repo}"
       expected[(owner, repo)] = metadata.json()["id"]
 
   assert expected

@@ -4,9 +4,11 @@ Validates the boot-time invariants: ordered installs, canonical manifest
 identity, per-app uninstall policy, and failure isolation.
 """
 
+import asyncio
 from datetime import datetime, timezone
 import re
-from unittest.mock import AsyncMock, patch
+import socket
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -756,22 +758,31 @@ async def test_rate_limited_store_is_retried_and_takes_its_default_pin(
     delays.append(seconds)
 
   monkeypatch.setattr(bootstrap_mod.asyncio, "sleep", no_wait)
+  broadcast = MagicMock()
   with patch(
     "app.bootstrap.install_from_manifest", _store_failing_once(db, rate_limited),
-  ):
+  ), patch("app.bootstrap.get_system_broadcast", return_value=broadcast):
     outcome = await ensure_bootstrap_apps_installed(db)
     assert outcome == bootstrap_mod.BootstrapOutcome(
       ("App Store",), rate_limited=True, retry_after=600,
     )
     assert db.query(models.App).filter_by(slug="store").first() is None
+    broadcast.reset_mock()
 
     await bootstrap_mod.retry_bootstrap_apps(outcome)
 
   # The upstream hint lengthened the first one-minute step.
   assert delays == [600]
   db.expire_all()
+  store = db.query(models.App).filter_by(slug="store").one()
   pinned = {app.slug for app in db.query(models.App).all() if app.pinned_at}
   assert pinned == {"store"}
+  # The Shell hears about the Store the retry installed.
+  assert {"type": "app_updated", "appId": str(store.id)} in [
+    call.args[0] for call in broadcast.publish.call_args_list
+  ]
+  # One quick successful retry never bothers the owner.
+  assert db.query(models.Notification).count() == 0
 
 
 @pytest.mark.asyncio
@@ -790,8 +801,12 @@ async def test_non_transient_failure_schedules_no_retry(db, monkeypatch, exc):
     outcome = await ensure_bootstrap_apps_installed(db)
 
   assert outcome == bootstrap_mod.BootstrapOutcome()
-  bootstrap_mod.schedule_bootstrap_retry(outcome)
-  assert not bootstrap_mod._retry_tasks
+
+
+def _unresolvable_host():
+  exc = HTTPException(400, "Cannot resolve host 'api.github.com'")
+  exc.__cause__ = socket.gaierror(-3, "Temporary failure in name resolution")
+  return exc
 
 
 @pytest.mark.parametrize("exc", [
@@ -799,6 +814,7 @@ async def test_non_transient_failure_schedules_no_retry(db, monkeypatch, exc):
   HTTPException(504, "Timeout"),
   HTTPException(409, {"code": "git_transfer_timeout", "message": "slow"}),
   app_git.GitTransferTimeout("clone exceeded its ceiling"),
+  _unresolvable_host(),
 ])
 def test_gateway_and_transfer_timeouts_are_transient(exc):
   from app.bootstrap import _transient_failure
@@ -822,8 +838,16 @@ async def test_retry_tells_the_owner_once_and_stops_after_a_day(
 
   monkeypatch.setattr(bootstrap_mod.asyncio, "sleep", advance)
   monkeypatch.setattr(bootstrap_mod.time, "monotonic", lambda: clock[0])
-  still_limited = AsyncMock(side_effect=HTTPException(429, "rate limited"))
-  with patch("app.bootstrap.install_from_manifest", still_limited):
+  install = _installing_rows(db)
+
+  async def store_and_social_limited(db_, *, manifest_url, **kwargs):
+    if manifest_url in (
+      BOOTSTRAP_STORE_MANIFEST_URL, BOOTSTRAP_SOCIAL_MANIFEST_URL,
+    ):
+      raise HTTPException(429, "rate limited")
+    return await install(db_, manifest_url=manifest_url, **kwargs)
+
+  with patch("app.bootstrap.install_from_manifest", store_and_social_limited):
     await bootstrap_mod.retry_bootstrap_apps(bootstrap_mod.BootstrapOutcome(
       ("App Store", "Social"), rate_limited=True,
     ))
@@ -835,3 +859,85 @@ async def test_retry_tells_the_owner_once_and_stops_after_a_day(
     "App Store and Social couldn't be installed yet (GitHub rate limit); "
     "retrying automatically.",
   ]
+
+
+@pytest.mark.asyncio
+async def test_retry_waits_for_owner_lifecycle_work_and_respects_its_uninstall(
+  db, monkeypatch,
+):
+  """The serving-time retry takes the install/uninstall lock per app.
+
+  An owner installs and then uninstalls Social while the retry is due; the
+  retry must wait for that work and then honor the owner's tombstone instead
+  of reinstalling from an identity check made before it.
+  """
+  from app import bootstrap as bootstrap_mod
+  from app import fs_locks
+  from app.install import _canonical_identity_key
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  real_sleep = asyncio.sleep
+
+  async def no_wait(_seconds):
+    await real_sleep(0)
+
+  monkeypatch.setattr(bootstrap_mod.asyncio, "sleep", no_wait)
+  install = AsyncMock(side_effect=_installing_rows(db))
+  lock = fs_locks.install_uninstall_lock()
+  with patch("app.bootstrap.install_from_manifest", install):
+    await lock.acquire()
+    try:
+      retry = asyncio.create_task(bootstrap_mod.retry_bootstrap_apps(
+        bootstrap_mod.BootstrapOutcome(("Social",), rate_limited=True),
+      ))
+      for _ in range(20):
+        await real_sleep(0)
+      assert not retry.done()
+      install.assert_not_awaited()
+      db.add(models.App(
+        source_dir="/tmp/mobius-tests/social",
+        name="Social", description="", jsx_source="", slug="social",
+        manifest_url=_canonical_identity_key(
+          BOOTSTRAP_SOCIAL_MANIFEST_URL, "social",
+        ),
+        deleted_at=datetime.now(timezone.utc),
+      ))
+      db.commit()
+    finally:
+      lock.release()
+    await asyncio.wait_for(retry, timeout=10)
+
+  urls = [call.kwargs["manifest_url"] for call in install.await_args_list]
+  assert BOOTSTRAP_STORE_MANIFEST_URL in urls
+  assert BOOTSTRAP_SOCIAL_MANIFEST_URL not in urls
+  assert not lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_runtime_supervisors_own_the_retry_until_shutdown(monkeypatch):
+  import logging
+
+  from app import bootstrap as bootstrap_mod
+  from app.runtime_supervisors import RuntimeSupervisors
+
+  started = asyncio.Event()
+
+  async def retry_forever(_outcome):
+    started.set()
+    await asyncio.Event().wait()
+
+  monkeypatch.setattr(bootstrap_mod, "retry_bootstrap_apps", retry_forever)
+  supervisors = RuntimeSupervisors(
+    settings=MagicMock(data_dir="/tmp"),
+    logger=logging.getLogger("test"),
+    restart_authorization=None,
+    restart_fallback_chats=[],
+  )
+  supervisors.retry_bootstrap_apps(bootstrap_mod.BootstrapOutcome(("Social",)))
+  await asyncio.wait_for(started.wait(), timeout=5)
+  task = supervisors._tasks["bootstrap-apps-retry"]
+
+  await supervisors.stop()
+
+  assert task.cancelled()
+  assert supervisors._tasks == {}

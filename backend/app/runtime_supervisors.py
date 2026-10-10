@@ -132,6 +132,11 @@ class RuntimeSupervisors:
 
     self._spawn("boot-file-cache-reclaim", reclaim())
 
+  def retry_bootstrap_apps(self, outcome) -> None:
+    """Keep retrying default apps that failed only transiently at boot."""
+    from app.bootstrap import retry_bootstrap_apps
+    self._spawn("bootstrap-apps-retry", retry_bootstrap_apps(outcome))
+
   async def start_process_services(self) -> None:
     """Start services that are safe without a serviceable database."""
     await self._start_frontend_watcher()

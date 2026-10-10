@@ -19,8 +19,10 @@ the next restart.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import socket
 import time
 import uuid
 from dataclasses import dataclass
@@ -28,7 +30,8 @@ from dataclasses import dataclass
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app import app_git, models
+from app import app_git, fs_locks, models
+from app.broadcast import get_system_broadcast
 from app.manifest_identity import canonical_manifest_identity_key
 from app.install import install_from_manifest
 from app.timeutil import now_naive_utc
@@ -119,7 +122,6 @@ _DEFAULT_PINS_MARKER_ID = "default_pins"
 # Retrying stops after a day; the next process start tries again.
 _RETRY_DELAYS_SECS = (60, 5 * 60, 15 * 60, 60 * 60)
 _RETRY_WINDOW_SECS = 24 * 60 * 60
-_retry_tasks: set[asyncio.Task] = set()
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,9 @@ def _transient_failure(exc: Exception) -> tuple[bool, int | None]:
     return True, None
   if not isinstance(exc, HTTPException):
     return False, None
+  if isinstance(exc.__cause__, socket.gaierror):
+    # The catalog hosts are fixed, so failing to resolve one is the network.
+    return True, None
   detail = exc.detail
   if exc.status_code not in (429, 502, 504) and not (
     isinstance(detail, dict) and detail.get("code") == "git_transfer_timeout"
@@ -203,7 +208,9 @@ def _mark_default_store_pinned(db: Session, app_id: int) -> bool:
     return False
 
 
-async def ensure_bootstrap_apps_installed(db: Session) -> BootstrapOutcome:
+async def ensure_bootstrap_apps_installed(
+  db: Session, *, serving: bool = False,
+) -> BootstrapOutcome:
   """Idempotently install the configured bootstrap apps when absent.
 
   Identity is keyed on `manifest_url`, not slug. This means:
@@ -215,10 +222,11 @@ async def ensure_bootstrap_apps_installed(db: Session) -> BootstrapOutcome:
     2. Every bootstrap app retains its canonical identity even if its
        assigned slug differs from the catalog slug.
 
-  Caller is the FastAPI lifespan/startup handler. Owns no transaction
+  Caller is the FastAPI lifespan/startup handler, before anything is
+  serving, or `retry_bootstrap_apps` with `serving=True`. Owns no transaction
   state — `install_from_manifest` commits its own work on success and
   rolls back on failure. We just decide whether to call it. Returns the apps
-  that failed transiently, for `schedule_bootstrap_retry`.
+  that failed transiently, for `retry_bootstrap_apps`.
   """
   if os.environ.get(_SKIP_ENV) == "1":
     log.info("bootstrap: %s=1, skipping bootstrap app installs", _SKIP_ENV)
@@ -240,126 +248,132 @@ async def ensure_bootstrap_apps_installed(db: Session) -> BootstrapOutcome:
   rate_limited = False
   retry_after: int | None = None
   for bootstrap_app in _CORE_BOOTSTRAP_APPS:
-    # Use the installer's identity resolver here too: bootstrap and an explicit
-    # Store action must agree across ref moves and legacy rows whose matching
-    # catalog origin predates persisted manifest identity.
-    existing = _find_install_identity_row(
-      db,
-      source_url=bootstrap_app.manifest_url,
-      manifest_id=bootstrap_app.manifest_id,
-    )
-    predecessor = None
-    if (
-      existing is None
-      and bootstrap_app.predecessor_manifest_id
-      and bootstrap_app.predecessor_manifest_url
+    # Once the server is serving, owner installs and uninstalls, the tombstone
+    # purge and schedule convergence run too; take the lifecycle lock per app,
+    # as the install route does, so one slow transfer never blocks them all.
+    async with (
+      fs_locks.install_uninstall_lock() if serving
+      else contextlib.nullcontext()
     ):
-      predecessor = _find_install_identity_row(
+      # Use the installer's identity resolver here too: bootstrap and an
+      # explicit Store action must agree across ref moves and legacy rows whose
+      # matching catalog origin predates persisted manifest identity.
+      existing = _find_install_identity_row(
         db,
-        source_url=bootstrap_app.predecessor_manifest_url,
-        manifest_id=bootstrap_app.predecessor_manifest_id,
+        source_url=bootstrap_app.manifest_url,
+        manifest_id=bootstrap_app.manifest_id,
       )
-    if predecessor is not None and predecessor.deleted_at is not None:
-      # Preserve an owner's uninstall after this one-release predecessor
-      # checkpoint is deleted. The tombstone keeps its source and storage, but
-      # its durable package identity becomes current; a later explicit Store
-      # install can therefore revive/update the same row without boot needing
-      # to remember the old package forever.
-      predecessor.manifest_url = canonical_manifest_identity_key(
-        bootstrap_app.manifest_url, bootstrap_app.manifest_id,
+      predecessor = None
+      if (
+        existing is None
+        and bootstrap_app.predecessor_manifest_id
+        and bootstrap_app.predecessor_manifest_url
+      ):
+        predecessor = _find_install_identity_row(
+          db,
+          source_url=bootstrap_app.predecessor_manifest_url,
+          manifest_id=bootstrap_app.predecessor_manifest_id,
+        )
+      if predecessor is not None and predecessor.deleted_at is not None:
+        # Preserve an owner's uninstall after this one-release predecessor
+        # checkpoint is deleted. The tombstone keeps its source and storage, but
+        # its durable package identity becomes current; a later explicit Store
+        # install can therefore revive/update the same row without boot needing
+        # to remember the old package forever.
+        predecessor.manifest_url = canonical_manifest_identity_key(
+          bootstrap_app.manifest_url, bootstrap_app.manifest_id,
+        )
+        db.commit()
+        existing = predecessor
+      existing_id = existing.id if existing is not None else None
+      already_installed = (
+        existing is not None
+        and (
+          existing.deleted_at is None
+          or not bootstrap_app.reinstall_after_uninstall
+        )
       )
-      db.commit()
-      existing = predecessor
-    existing_id = existing.id if existing is not None else None
-    already_installed = (
-      existing is not None
-      and (
-        existing.deleted_at is None
-        or not bootstrap_app.reinstall_after_uninstall
-      )
-    )
-    # The identity query autobegins a read transaction. Do not retain its
-    # connection while the installer performs serial network fetches and
-    # compilation; install_from_manifest starts and owns the next transaction.
-    db.rollback()
-    if already_installed:
+      # The identity query autobegins a read transaction. Do not retain its
+      # connection while the installer performs serial network fetches and
+      # compilation; install_from_manifest starts and owns the next transaction.
+      db.rollback()
+      if already_installed:
+        log.info(
+          "bootstrap: %s already installed (app id=%s)",
+          bootstrap_app.manifest_id, existing_id,
+        )
+        # A new deployment whose earlier Store-pin transaction failed still owes
+        # the pin even though the Store is already installed this boot. The live
+        # row (deleted_at is None whenever a reinstall-policy app reads as already
+        # installed) is the one to pin.
+        if (
+          default_pin_pending
+          and bootstrap_app.pin_on_first_install
+          and existing is not None
+          and existing.deleted_at is None
+          and _mark_default_store_pinned(db, existing.id)
+        ):
+          default_pin_pending = False
+          _publish_app_updated(existing.id)
+        continue
       log.info(
-        "bootstrap: %s already installed (app id=%s)",
-        bootstrap_app.manifest_id, existing_id,
+        "bootstrap: installing %s from %s",
+        bootstrap_app.manifest_id, bootstrap_app.manifest_url,
       )
-      # A new deployment whose earlier Store-pin transaction failed still owes
-      # the pin even though the Store is already installed this boot. The live
-      # row (deleted_at is None whenever a reinstall-policy app reads as already
-      # installed) is the one to pin.
+      try:
+        result = await install_from_manifest(
+          db,
+          manifest_url=bootstrap_app.manifest_url,
+          manifest=None,
+          raw_base=None,
+          source="bootstrap",
+        )
+        app = result.app
+        mode = result.mode
+        warnings = result.warnings
+      except Exception as exc:
+        # Catch-all on purpose: no manifest failure should crash lifespan or
+        # prevent the remaining bootstrap apps from installing.
+        log.exception(
+          "bootstrap: %s install failed — %s", bootstrap_app.manifest_id, exc,
+        )
+        transient, wait = _transient_failure(exc)
+        if transient:
+          pending.append(bootstrap_app.name)
+          rate_limited = rate_limited or (
+            isinstance(exc, HTTPException) and exc.status_code == 429
+          )
+          if wait is not None:
+            retry_after = max(retry_after or 0, wait)
+        continue
+      log.info(
+        "bootstrap: %s install %s (app id=%s, warnings=%s)",
+        bootstrap_app.manifest_id, mode, app.id, warnings,
+      )
       if (
         default_pin_pending
         and bootstrap_app.pin_on_first_install
-        and existing is not None
-        and existing.deleted_at is None
-        and _mark_default_store_pinned(db, existing.id)
+        and _mark_default_store_pinned(db, app.id)
       ):
         default_pin_pending = False
-      continue
-    log.info(
-      "bootstrap: installing %s from %s",
-      bootstrap_app.manifest_id, bootstrap_app.manifest_url,
-    )
-    try:
-      result = await install_from_manifest(
-        db,
-        manifest_url=bootstrap_app.manifest_url,
-        manifest=None,
-        raw_base=None,
-        source="bootstrap",
-      )
-      app = result.app
-      mode = result.mode
-      warnings = result.warnings
-    except Exception as exc:
-      # Catch-all on purpose: no manifest failure should crash lifespan or
-      # prevent the remaining bootstrap apps from installing.
-      log.exception(
-        "bootstrap: %s install failed — %s", bootstrap_app.manifest_id, exc,
-      )
-      transient, wait = _transient_failure(exc)
-      if transient:
-        pending.append(bootstrap_app.name)
-        rate_limited = rate_limited or (
-          isinstance(exc, HTTPException) and exc.status_code == 429
-        )
-        if wait is not None:
-          retry_after = max(retry_after or 0, wait)
-      continue
-    log.info(
-      "bootstrap: %s install %s (app id=%s, warnings=%s)",
-      bootstrap_app.manifest_id, mode, app.id, warnings,
-    )
-    if (
-      default_pin_pending
-      and bootstrap_app.pin_on_first_install
-      and _mark_default_store_pinned(db, app.id)
-    ):
-      default_pin_pending = False
+    # Like the install route: the Shell refetches its apps, so an app (and its
+    # pin) installed after the page loaded appears without a reload.
+    _publish_app_updated(app.id)
   return BootstrapOutcome(tuple(pending), rate_limited, retry_after)
 
 
-def schedule_bootstrap_retry(outcome: BootstrapOutcome) -> None:
-  """Start the one background retry for apps that failed transiently."""
-  if not outcome.pending or _retry_tasks:
-    return
-  task = asyncio.create_task(
-    retry_bootstrap_apps(outcome), name="mobius:bootstrap-apps-retry",
-  )
-  _retry_tasks.add(task)
-  task.add_done_callback(_retry_tasks.discard)
+def _publish_app_updated(app_id: int) -> None:
+  get_system_broadcast().publish({"type": "app_updated", "appId": str(app_id)})
 
 
 async def retry_bootstrap_apps(outcome: BootstrapOutcome) -> None:
   """Repeat the bootstrap with capped backoff until nothing transient is left.
 
-  Each attempt reruns the whole idempotent bootstrap, so apps that installed
-  meanwhile are skipped and a still-owed default Store pin settles with the
-  Store. The owner is told once per retry run, as soon as an owner exists.
+  Runs as a runtime supervisor once the server is serving. Each attempt
+  reruns the whole idempotent bootstrap under the lifecycle lock, so apps that
+  installed meanwhile are skipped and a still-owed default Store pin settles
+  with the Store. The owner is told once per retry run, only when the first
+  retry has also failed and an owner exists.
   """
   from app.database import SessionLocal
 
@@ -368,7 +382,7 @@ async def retry_bootstrap_apps(outcome: BootstrapOutcome) -> None:
   notified = False
   attempt = 0
   while outcome.pending:
-    if not notified:
+    if attempt and not notified:
       notified = await _notify_owner_pending(outcome, notification_id)
     step = _RETRY_DELAYS_SECS[min(attempt, len(_RETRY_DELAYS_SECS) - 1)]
     delay = max(step, min(outcome.retry_after or 0, _RETRY_DELAYS_SECS[-1]))
@@ -385,7 +399,7 @@ async def retry_bootstrap_apps(outcome: BootstrapOutcome) -> None:
     attempt += 1
     try:
       with SessionLocal() as db:
-        outcome = await ensure_bootstrap_apps_installed(db)
+        outcome = await ensure_bootstrap_apps_installed(db, serving=True)
     except Exception:
       # The previous outcome stays owed; the next step tries again.
       log.exception("bootstrap: retry attempt failed")
