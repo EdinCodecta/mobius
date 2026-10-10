@@ -585,6 +585,11 @@ def _find_install_identity_row(
   existing = (
     db.query(models.App)
     .filter(models.App.manifest_url == canonical)
+    # Rows can share an address; choose deterministically, as below.
+    .order_by(
+      case((models.App.deleted_at.is_(None), 0), else_=1),
+      models.App.id.asc(),
+    )
     .first()
   )
   if existing is None:

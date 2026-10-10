@@ -9831,6 +9831,44 @@ def test_stored_address_binding_does_not_borrow_another_installed_package(
   assert result.status_code == 409, result.text
 
 
+@pytest.mark.parametrize("operation", ["preview", "install"])
+def test_live_row_wins_a_stored_address_shared_with_a_tombstone(
+  client, auth, db, bypass_url_validation, operation,
+):
+  """The live app binds an address it shares with an earlier tombstone."""
+  manifest = {**_simple_manifest("duplicate-proof"), "package_id": "app.example.duplicate"}
+  base = "https://duplicate-proof.test/repo/"
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  shared = base.rstrip("/") + "#manifest-id=duplicate-proof"
+  # The tombstone gets the lower id, so an unordered lookup could return it.
+  old = models.App(
+    name="Old duplicate", slug="old-duplicate",
+    source_dir="/tmp/unused-duplicate-proof",
+    manifest_url="https://elsewhere.test/repo#manifest-id=old-duplicate",
+    deleted_at=datetime(2026, 1, 1, tzinfo=UTC),
+  )
+  db.add(old)
+  db.commit()
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    live = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert live.status_code == 201, live.text
+  assert live.json()["manifest_url"] == shared and live.json()["id"] > old.id
+  old.manifest_url = shared
+  db.commit()
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    result = client.post(f"/api/apps/{operation}", headers=auth, json={
+      "manifest_url": shared,
+    })
+  assert result.status_code in (200, 201), result.text
+  if operation == "install":
+    assert result.json()["id"] == live.json()["id"]
+
+
 @pytest.mark.asyncio
 async def test_ancillary_bundle_comparison_uses_same_root_and_upstream_deletions(tmp_path):
   manifest = _simple_manifest("compare-bundle")
