@@ -131,7 +131,8 @@ def deployment(tmp_path, monkeypatch):
   for name, path in paths.items():
     monkeypatch.setattr(host, name, path)
   host.ADMISSION_ROOT.mkdir(mode=0o700)
-  config = {"version": 3, "project": "original", "data_dir": data, "control_dir": control}
+  config = {"version": 4, "project": "original", "data_dir": data, "control_dir": control,
+            "deployment_name": "original-app", "name_source": "explicit"}
   topology = {"name": "original", "services": {"app": {
     "image": OLD_IMAGE, "container_name": "original-app", "networks": {"default": {}},
     "volumes": [{"type": "bind", "source": str(data), "target": "/data"}],

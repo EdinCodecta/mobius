@@ -76,7 +76,8 @@ def _frozen(tmp_path: Path, monkeypatch) -> tuple[dict, Path]:
   monkeypatch.setattr(host, "CONFIG", config_path)
   monkeypatch.setattr(host, "COMPOSE", compose)
   monkeypatch.setattr(host, "OVERRIDE", override)
-  value = {"version": 3, "project": "mobius", "data_dir": str(data)}
+  value = {"version": 4, "project": "mobius", "data_dir": str(data),
+           "deployment_name": "mobius", "name_source": "explicit"}
   return value, control
 
 
@@ -87,7 +88,7 @@ def test_frozen_config_accepts_minimal_root_owned_boundary(tmp_path, monkeypatch
 
   assert result["project"] == "mobius"
   assert result["control_dir"] == control
-  assert set(value) == {"version", "project", "data_dir"}
+  assert set(value) == {"version", "project", "data_dir", "deployment_name", "name_source"}
 
 
 def test_frozen_config_rejects_group_writable_input(tmp_path, monkeypatch):
@@ -216,7 +217,8 @@ def _worker_paths(tmp_path: Path, monkeypatch):
   data = tmp_path / "data"
   data.mkdir()
   config = {
-    "project": "mobius", "control_dir": inbox.parent, "data_dir": data,
+    "version": 4, "project": "mobius", "control_dir": inbox.parent, "data_dir": data,
+    "deployment_name": "mobius", "name_source": "explicit",
   }
   monkeypatch.setattr(host, "config", lambda: config)
   return config, inbox
@@ -542,6 +544,8 @@ def test_healthy_rollback_reports_degraded_chat_handoff(
   c = admitted_incident
   cid = prepare_admitted(c)
   assert c.docker.complete_start(cid)
+  # Preserve the host-private identities appended during preparation.
+  c.tx = c.host.read_transaction()
   c.tx.update(failure_code="health_check_failed", failure_detail="new image unhealthy")
   c.host.write_transaction(c.tx)
   if not boot_confirmed:

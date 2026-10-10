@@ -69,6 +69,10 @@ ROLLBACK_HEALTH_SECONDS = 600
 FAILED_TARGET_LOG = STATE_DIR / "failed-target.json"
 FAILED_TARGET_LOG_BYTES = 32 * 1024
 FAILED_TARGET_LOG_SECONDS = 5
+DEPLOYMENT_NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{1,127}")
+TOKEN_RE = re.compile(r"[0-9a-f]{32}")
+FULL_CID_RE = re.compile(r"[0-9a-f]{64}")
+ATTEMPT_PROJECT_PREFIX = "mobius-admission-"
 _REVISION_LINE = re.compile(rb"^WORKER_REVISION\s*=.*$", re.MULTILINE)
 _REVISION_EXACT = re.compile(rb"^WORKER_REVISION = ([1-9][0-9]{0,5})$")
 
@@ -112,10 +116,22 @@ def _atomic_json(path: Path, value: dict, mode: int = 0o600) -> None:
 
 
 def validate_config(value: dict, *, trusted_uid: int = 0) -> dict:
-    if set(value) != {"version", "project", "data_dir"} or value["version"] != 3:
-        raise ValueError("invalid fixed deployment configuration")
+    # Version 4 freezes the live app's exact Docker name, proven by the
+    # installer from its Compose labels. Every attempt reuses it so a raw
+    # Compose invocation of the original project conflicts instead of starting
+    # a second unwrapped app. Generated names keep their separator and index 1.
+    if (set(value) != {"version", "project", "data_dir", "deployment_name", "name_source"}
+            or value["version"] != 4):
+        raise ValueError("invalid fixed deployment configuration; reinstall the host helper")
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", str(value["project"])):
         raise ValueError("invalid Compose project")
+    if (not isinstance(value["deployment_name"], str)
+            or not DEPLOYMENT_NAME_RE.fullmatch(value["deployment_name"])
+            or value["name_source"] not in {"explicit", "generated"}):
+        raise ValueError("invalid frozen deployment container name")
+    if (value["name_source"] == "generated" and value["deployment_name"] not in {
+            value["project"] + "-app-1", value["project"] + "_app_1"}):
+        raise ValueError("generated deployment name must preserve the original project at index 1")
     data_dir = Path(str(value["data_dir"]))
     control = data_dir / "mobius-rebuild"
     for path in (CONFIG.parent, CONFIG, COMPOSE, OVERRIDE, control):
@@ -376,6 +392,15 @@ def wrapped_configuration(config_value: dict, transaction: dict, role: str,
     # mapping keys. Recover literal values before adding raw image argv.
     resolved = json.loads(json.dumps(resolved).replace("$$", "$"))
     service = resolved["services"]["app"]
+    # The Docker name is deployment identity, frozen from the proven live app.
+    # A topology may not silently rename it: an old checkout's raw Compose
+    # would otherwise create its unwrapped app under the vacated old name.
+    deployment_name = config_value["deployment_name"]
+    declared = service.get("container_name")
+    if (declared != deployment_name if config_value["name_source"] == "explicit"
+            else declared is not None or resolved.get("name") != config_value["project"]):
+        raise RuntimeError("the app container name differs from the frozen deployment; "
+                           "renaming requires an explicit host migration")
     entrypoint = service.get("entrypoint")
     command = service.get("command")
     if command is None:
@@ -409,7 +434,7 @@ def wrapped_configuration(config_value: dict, transaction: dict, role: str,
               "--token", token, "--"]
     app = {**service,
         "image": image,
-        "container_name": "mobius-admission-" + token,
+        "container_name": deployment_name,
         "entrypoint": prefix + entrypoint,
         "command": command,
         "labels": {**service.get("labels", {}),
@@ -445,7 +470,7 @@ def wrapped_configuration(config_value: dict, transaction: dict, role: str,
             if not name or name not in resolved.get("volumes", {}):
                 raise RuntimeError("anonymous app volumes cannot be preserved across recovery")
             volumes[name] = {"name": resolved["volumes"][name]["name"], "external": True}
-    result = {"name": app["container_name"], "services": {"app": app},
+    result = {"name": ATTEMPT_PROJECT_PREFIX + token, "services": {"app": app},
               "networks": networks, "volumes": volumes}
     if app.get("configs") or app.get("secrets"):
         raise RuntimeError("app configs/secrets require an explicit preserved-resource topology")
@@ -455,15 +480,24 @@ def wrapped_configuration(config_value: dict, transaction: dict, role: str,
 def verify_wrapped_container(cid: str, expected: dict) -> dict:
     """Bind admission only to the exact created container and frozen wrapper."""
     result = docker_command(["docker", "container", "inspect", "--format", "{{json .}}", cid])
-    item = json.loads(result.stdout)
-    config_value = item.get("Config") or {}
+    return verify_attempt_item(json.loads(result.stdout), cid, expected)
+
+
+def verify_attempt_item(item: dict, cid: str, expected: dict) -> dict:
+    """Docker-owned metadata only; nothing here is read from container-writable state.
+
+    Compose sets its project label itself and it overrides service labels, so
+    the per-attempt project proves which immutable attempt file created it.
+    """
+    config_value = item.get("Config") or {} if isinstance(item, dict) else {}
+    labels = config_value.get("Labels") or {}
     app = expected["services"]["app"]
-    if (not re.fullmatch(r"[0-9a-f]{64}", cid) or item.get("Id") != cid
+    if (not isinstance(item, dict) or not FULL_CID_RE.fullmatch(cid) or item.get("Id") != cid
             or item.get("Image") != app["image"]
             or config_value.get("Entrypoint") != app["entrypoint"]
             or (config_value.get("Cmd") if config_value.get("Cmd") is not None else []) != app["command"]
-            or any((config_value.get("Labels") or {}).get(k) != v
-                   for k, v in app["labels"].items())
+            or any(labels.get(k) != v for k, v in app["labels"].items())
+            or labels.get("com.docker.compose.project") != expected["name"]
             or item.get("Name") != "/" + app["container_name"]):
         raise RuntimeError("container identity or pre-entrypoint admission coverage is unconfirmed")
     mounts = {mount.get("Destination"): mount for mount in item.get("Mounts", [])}
@@ -506,39 +540,152 @@ def inspect_image(image: str, template: str) -> str:
     return result.stdout.strip()
 
 
-def current_attempt_name() -> str | None:
+class AttemptIdentityMismatch(RuntimeError):
+    """Docker or gate identity disagrees with root-private host records.
+
+    Never resolved by mutation: no Docker call is made on a foreign or tampered
+    identity. Recovery stays journaled for explicit Host inspection.
+    """
+
+
+def literal_document(value):
+    """Exact inverse of compose_file_document for one frozen attempt file."""
+    if isinstance(value, str):
+        return value.replace("$$", "$")
+    if isinstance(value, list):
+        return [literal_document(item) for item in value]
+    if isinstance(value, dict):
+        return {key: literal_document(item) for key, item in value.items()}
+    return value
+
+
+def attempt_path(token: str) -> Path:
+    if not TOKEN_RE.fullmatch(str(token)):
+        raise AttemptIdentityMismatch("invalid admission attempt token")
+    return CONFIG.parent / "attempts" / (token + ".json")
+
+
+def read_attempt_file(token: str) -> tuple[bytes, dict]:
+    """Root-owned immutable attempt config: (exact bytes, literal expected)."""
+    path = attempt_path(token)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        value = read_json(OVERRIDE)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 1024 * 1024):
+            raise AttemptIdentityMismatch("untrusted admission attempt configuration")
+        raw = os.read(fd, 1024 * 1024 + 1)
+    finally:
+        os.close(fd)
+    expected = literal_document(json.loads(raw))
+    app = expected.get("services", {}).get("app", {})
+    if (expected.get("name") != ATTEMPT_PROJECT_PREFIX + token
+            or app.get("labels", {}).get("io.mobius.admission.token") != token):
+        raise AttemptIdentityMismatch("admission attempt configuration names another token")
+    return raw, expected
+
+
+def current_attempt(config_value: dict) -> dict | None:
+    """The live attempt pointer, from root-private files only (never the gate)."""
+    try:
+        raw = OVERRIDE.read_bytes()
+        value = json.loads(raw)
     except (OSError, ValueError):
+        return None  # the installer's legacy YAML override: original project
+    if not isinstance(value, dict):
         return None
-    app = value.get("services", {}).get("app", {})
-    token = app.get("labels", {}).get("io.mobius.admission.token")
+    labels = value.get("services", {}).get("app", {}).get("labels", {})
+    token = labels.get("io.mobius.admission.token") if isinstance(labels, dict) else None
     if token is None:
         return None
-    name = app.get("container_name")
-    if not re.fullmatch(r"[0-9a-f]{32}", str(token)) or name != "mobius-admission-" + token:
-        raise ValueError("invalid current admission identity")
-    return name
+    attempt_raw, expected = read_attempt_file(str(token))
+    if (attempt_raw != raw
+            or expected["services"]["app"].get("container_name") != config_value["deployment_name"]):
+        raise AttemptIdentityMismatch("current admission identity is not the frozen attempt")
+    return expected
+
+
+def name_holder(name: str) -> tuple[str, dict] | None:
+    """Exact Docker name lookup; only Docker's own not-found response is absence."""
+    result = docker_command(["docker", "container", "inspect", "--format", "{{json .}}", name],
+                            check=False)
+    if result.returncode:
+        if result.returncode == 1 and result.stderr.strip().lower() in {
+                f"error response from daemon: no such container: {name}",
+                f"error response from daemon: no such object: {name}"}:
+            return None
+        result.check_returncode()
+    item = json.loads(result.stdout)
+    if not isinstance(item, dict) or item.get("Name") != "/" + name:
+        return None  # Docker matched an ID prefix: nothing holds this exact name
+    cid = item.get("Id")
+    if not isinstance(cid, str) or not FULL_CID_RE.fullmatch(cid):
+        raise AttemptIdentityMismatch("Docker returned an invalid container identity")
+    return cid, item
+
+
+def observe_exact(cid: str) -> dict | None:
+    """One immutable container ID: inspected item, or None only when Docker says absent."""
+    if not FULL_CID_RE.fullmatch(str(cid)):
+        raise AttemptIdentityMismatch("exact container observation requires a full ID")
+    result = docker_command(["docker", "container", "inspect", "--format", "{{json .}}", cid],
+                            check=False)
+    if result.returncode:
+        if result.returncode == 1 and result.stderr.strip().lower() in {
+                f"error response from daemon: no such container: {cid}",
+                f"error response from daemon: no such object: {cid}"}:
+            return None
+        result.check_returncode()
+    item = json.loads(result.stdout)
+    if not isinstance(item, dict) or item.get("Id") != cid:
+        raise AttemptIdentityMismatch("Docker returned a different container identity")
+    return item
+
+
+def tombstoned(token: str) -> str | None:
+    """The retired attempt file digest, if this exact token was ever retired."""
+    return read_tombstones()["tokens"].get(token)
+
+
+def classify_holder(item: dict, cid: str, current: dict | None) -> str:
+    """current | retired | foreign. Retired needs the frozen config to match exactly."""
+    labels = (item.get("Config") or {}).get("Labels") or {}
+    token = labels.get("io.mobius.admission.token")
+    # Retirement wins: the live pointer can still name a token whose exact
+    # container was removed, and its late duplicate Create is never current.
+    if isinstance(token, str) and TOKEN_RE.fullmatch(token):
+        digest = tombstoned(token)
+        if digest is not None:
+            raw, expected = read_attempt_file(token)
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise AttemptIdentityMismatch("retired attempt configuration changed")
+            verify_attempt_item(item, cid, expected)
+            return "retired"
+    if current is not None and token == current["services"]["app"]["labels"]["io.mobius.admission.token"]:
+        verify_attempt_item(item, cid, current)
+        return "current"
+    return "foreign"
 
 
 def app_container(config_value: dict) -> tuple[str, str]:
-    name = current_attempt_name()
-    if name:
-        result = docker_command(["docker", "container", "inspect", "--format", "{{.Id}}", name])
-    else:
-        result = compose(config_value, "ps", "-q", "app")
+    current = current_attempt(config_value)
+    if current:
+        held = name_holder(config_value["deployment_name"])
+        if held is None:
+            raise RuntimeError("the recorded Möbius app container is not running")
+        cid, item = held
+        if classify_holder(item, cid, current) != "current":
+            raise AttemptIdentityMismatch("another container holds the deployment name")
+        return cid, item["Image"]
+    result = compose(config_value, "ps", "-q", "app")
     cid = result.stdout.strip()
-    if not re.fullmatch(r"[0-9a-f]{64}", cid):
+    if not FULL_CID_RE.fullmatch(cid):
         raise RuntimeError("the app container identity is missing or ambiguous")
-    if not cid:
-        raise RuntimeError("the recorded Möbius app container is not running")
     inspected = docker_command(
         ["docker", "container", "inspect", "--format", "{{.Image}}", cid],
         timeout=30,
     )
     return cid, inspected.stdout.strip()
-
-
 
 
 def container_health(config_value: dict, timeout: float = 10) -> tuple[str, str, str]:
@@ -547,6 +694,8 @@ def container_health(config_value: dict, timeout: float = 10) -> tuple[str, str,
     Compose can delete/rename containers between discovery and inspect. Retry
     the whole observation, within the same two-query budget, not the old ID.
     Multiple candidates are ambiguous until Compose finishes its mutation.
+    A retired attempt holding the stable name is not the current app; any
+    other foreign holder raises AttemptIdentityMismatch without retry.
     """
     deadline = time.monotonic() + 2 * timeout
     for attempt in range(3):
@@ -554,18 +703,22 @@ def container_health(config_value: dict, timeout: float = 10) -> tuple[str, str,
             budget = min(timeout, max(0, deadline - time.monotonic()) / 2)
             if budget <= 0:
                 raise subprocess.TimeoutExpired("Docker container observation", 2 * timeout)
-            name = current_attempt_name()
-            if name:
-                result = docker_command(["docker", "container", "inspect", "--format", "{{.Id}}", name],
-                                        timeout=budget, check=False)
-                if result.returncode:
-                    if result.returncode == 1 and result.stderr.strip().lower() in {
-                            f"error response from daemon: no such container: {name}",
-                            f"error response from daemon: no such object: {name}"}:
-                        return "", "", "missing"
-                    result.check_returncode()
-            else:
-                result = compose(config_value, "ps", "-a", "-q", "app", timeout=budget)
+            current = current_attempt(config_value)
+            if current:
+                held = name_holder(config_value["deployment_name"])
+                if held is None:
+                    return "", "", "missing"
+                cid, item = held
+                kind = classify_holder(item, cid, current)
+                if kind == "retired":
+                    return "", "", "missing"
+                if kind != "current":
+                    raise AttemptIdentityMismatch("another container holds the deployment name")
+                state = item.get("State") or {}
+                health = (state.get("Health") or {}).get("Status")
+                status = state.get("Status")
+                return cid, item["Image"], (health if status == "running" and health else status)
+            result = compose(config_value, "ps", "-a", "-q", "app", timeout=budget)
             ids = result.stdout.split()
             if not ids:
                 return "", "", "missing"
@@ -779,128 +932,313 @@ def never_started(cid: str, image: str) -> bool:
             and item.get("RestartCount") == 0)
 
 
-def discover_attempt(expected: dict) -> str:
-    """A generation's unique Docker name makes no-start creation idempotent."""
-    name = expected["services"]["app"]["container_name"]
-    result = docker_command(["docker", "container", "inspect", "--format", "{{.Id}}", name],
-                            check=False)
-    if result.returncode:
-        message = result.stderr.strip().lower()
-        if result.returncode == 1 and message in {
-                f"error response from daemon: no such container: {name}",
-                f"error response from daemon: no such object: {name}"}:
-            return ""
-        result.check_returncode()
-    cid = result.stdout.strip()
-    verify_wrapped_container(cid, expected)
-    return cid
+def tombstone_path() -> Path:
+    return STATE_DIR / "admission-tombstones.json"
 
 
-def create_attempt(config_value: dict, expected: dict) -> str:
+def read_tombstones() -> dict:
+    """Root-private retired-attempt history: {"version": 1, "tokens": {token: sha256}}.
+
+    Entries are never removed: several timed-out no-start Creates for one
+    token can each land later. Malformed history fails closed (no removal).
+    """
+    path = tombstone_path()
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {"version": 1, "tokens": {}}
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+            or info.st_mode & 0o077 or info.st_nlink != 1):
+        raise AttemptIdentityMismatch("untrusted retired-attempt history")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    tokens = value.get("tokens") if isinstance(value, dict) else None
+    if (set(value) != {"version", "tokens"} or value["version"] != 1 or not isinstance(tokens, dict)
+            or any(not TOKEN_RE.fullmatch(str(k)) or not isinstance(v, str)
+                   or not re.fullmatch(r"[0-9a-f]{64}", v) for k, v in tokens.items())):
+        raise AttemptIdentityMismatch("malformed retired-attempt history")
+    return value
+
+
+def retire_token(token: str) -> None:
+    """Durably record that this exact attempt config may only ever be an orphan."""
+    raw, _ = read_attempt_file(token)
+    digest = hashlib.sha256(raw).hexdigest()
+    history = read_tombstones()
+    recorded = history["tokens"].get(token)
+    if recorded is not None:
+        if recorded != digest:
+            raise AttemptIdentityMismatch("retired attempt configuration changed")
+        return
+    history["tokens"][token] = digest
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _durable_write(tombstone_path(), json.dumps(history, sort_keys=True,
+                                                separators=(",", ":")).encode(), 0o600)
+
+
+JOURNAL_ATTEMPT_KEYS = {"role", "generation", "token", "image", "attempt_sha256", "cid"}
+
+
+def journal_attempts(transaction: dict, role: str | None = None) -> list[dict]:
+    """Root-private attempt identities, appended before the gate learns them.
+
+    Schema: {"role", "generation" (1-based per role), "token" (32 hex),
+    "image" (the role's journaled image), "attempt_sha256" (exact immutable
+    attempt file bytes), "cid" (null until Create/discovery, before bind)}.
+    """
+    records = transaction.get("attempts", [])
+    if not isinstance(records, list):
+        raise AttemptIdentityMismatch("invalid journaled attempts")
+    counts, tokens, selected = {"target": 0, "rollback": 0}, set(), []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != JOURNAL_ATTEMPT_KEYS:
+            raise AttemptIdentityMismatch("invalid journaled attempt")
+        kind = record["role"]
+        if kind not in counts:
+            raise AttemptIdentityMismatch("invalid journaled attempt role")
+        counts[kind] += 1
+        image = transaction["target_image" if kind == "target" else "previous_image"]
+        if (type(record["generation"]) is not int or record["generation"] != counts[kind]
+                or not TOKEN_RE.fullmatch(str(record["token"])) or record["token"] in tokens
+                or record["image"] != image
+                or not re.fullmatch(r"[0-9a-f]{64}", str(record["attempt_sha256"]))
+                or (record["cid"] is not None and not FULL_CID_RE.fullmatch(str(record["cid"])))):
+            raise AttemptIdentityMismatch("invalid journaled attempt")
+        tokens.add(record["token"])
+        if role is None or kind == role:
+            selected.append(record)
+    return selected
+
+
+def checked_gate(gate, transaction: dict) -> dict:
+    """Observe the container-writable gate and refuse any disagreement with the
+    root journal BEFORE a Docker mutation. Gate quiescence flags are never
+    used to choose or skip a host action."""
+    state = gate.observe()
+    journal_attempts(transaction)
+    if (state["operation"] != transaction["operation_id"]
+            or state["source"]["cid"] != transaction["source_container"]
+            or state["source"]["image"] != transaction["previous_image"]):
+        raise AttemptIdentityMismatch("admission and replacement journals disagree")
+    for role in ("target", "rollback"):
+        records = journal_attempts(transaction, role)
+        slot = state["slots"][role]
+        attempts = slot["attempts"]
+        if len(attempts) > len(records) or len(records) > len(attempts) + 1:
+            raise AttemptIdentityMismatch("admission attempts disagree with the root journal")
+        for record, attempt in zip(records, attempts):
+            if ((attempt["generation"], attempt["token"], attempt["image"])
+                    != (record["generation"], record["token"], record["image"])
+                    or (attempt["cid"] is not None and attempt["cid"] != record["cid"])):
+                raise AttemptIdentityMismatch("admission attempt identity disagrees with the root journal")
+        if len(records) > len(attempts) and records[-1]["cid"] is not None:
+            raise AttemptIdentityMismatch("journaled attempt was bound before allocation")
+        if slot["consumed"] is not None and slot["consumed"]["generation"] != len(attempts):
+            raise AttemptIdentityMismatch("admission consumed an unexpected generation")
+    return state
+
+
+def journaled_attempt(record: dict) -> tuple[bytes, dict]:
+    raw, expected = read_attempt_file(record["token"])
+    if hashlib.sha256(raw).hexdigest() != record["attempt_sha256"]:
+        raise AttemptIdentityMismatch("journaled attempt configuration changed")
+    return raw, expected
+
+
+def journaled_expected(record: dict) -> dict:
+    return journaled_attempt(record)[1]
+
+
+def write_attempt_file(expected: dict) -> bytes:
+    """Create (or re-verify) one immutable root-private attempt file."""
     directory = CONFIG.parent / "attempts"
     directory.mkdir(mode=0o700, exist_ok=True)
     info = directory.lstat()
     if directory.is_symlink() or info.st_uid != os.geteuid() or info.st_mode & 0o022:
         raise RuntimeError("untrusted attempt configuration directory")
     token = expected["services"]["app"]["labels"]["io.mobius.admission.token"]
-    path = directory / (token + ".json")
-    document = compose_file_document(expected)
+    path = attempt_path(token)
+    raw = json.dumps(compose_file_document(expected)).encode()
     if path.exists() or path.is_symlink():
-        info = path.lstat()
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-                or info.st_mode & 0o077 or info.st_nlink != 1 or read_json(path) != document):
+        existing, _ = read_attempt_file(token)
+        if existing != raw:
             raise RuntimeError("immutable attempt configuration changed")
     else:
-        _durable_write(path, json.dumps(document).encode(), 0o600)
-    _durable_write(OVERRIDE, json.dumps(compose_file_document(expected)).encode(), 0o600)
+        _durable_write(path, raw, 0o600)
+    return raw
+
+
+def discover_attempt(expected: dict) -> str:
+    """This attempt's container under the stable name, or '' when vacant.
+
+    Called only at a creation boundary. A retired attempt's late Create that
+    holds the vacant name is removed by its exact verified ID; any other
+    holder is foreign and refused without mutation.
+    """
+    held = name_holder(expected["services"]["app"]["container_name"])
+    if held is None:
+        return ""
+    cid, item = held
+    kind = classify_holder(item, cid, expected)
+    if kind == "current":
+        return cid
+    if kind == "retired":
+        remove_exact_container(cid)
+        return ""
+    raise AttemptIdentityMismatch("another container holds the deployment name")
+
+
+def create_attempt(config_value: dict, expected: dict) -> str:
+    raw = write_attempt_file(expected)
+    _durable_write(OVERRIDE, raw, 0o600)
+    path = attempt_path(expected["services"]["app"]["labels"]["io.mobius.admission.token"])
     cid = discover_attempt(expected)
     if not cid:
-        docker_command(["docker", "compose", "-p", expected["name"], "-f", str(path),
-                        "up", "--no-start", "--no-recreate", "--no-build", "--no-deps", "app"],
-                       cwd=CONFIG.parent, timeout=COMPOSE_MUTATION_SECONDS)
+        try:
+            docker_command(["docker", "compose", "-p", expected["name"], "-f", str(path),
+                            "up", "--no-start", "--no-recreate", "--no-build", "--no-deps", "app"],
+                           cwd=CONFIG.parent, timeout=COMPOSE_MUTATION_SECONDS)
+        except subprocess.CalledProcessError:
+            # A name conflict can be a retired attempt's late Create. Classify
+            # (and exactly remove) it once; recovery, not a loop here, retries.
+            discover_attempt(expected)
+            raise
         cid = discover_attempt(expected)
     if not cid:
         raise RuntimeError("created container identity is not yet observable")
     return cid
 
 
+def require_absent(cids: list[str]) -> None:
+    """Independent Docker proof that predecessors are gone (not gate flags)."""
+    for cid in cids:
+        if observe_exact(cid) is not None:
+            raise RuntimeError("a predecessor container still exists; the next boot cannot open")
+
+
+def predecessors(transaction: dict, role: str) -> list[str]:
+    cids = [transaction["source_container"]]
+    if role == "rollback":
+        cids += [r["cid"] for r in journal_attempts(transaction, "target") if r["cid"]]
+    return cids
+
+
+def retire_attempt(config_value: dict, transaction: dict, gate, role: str, record: dict,
+                   attempt: dict, *, remove_admitted: bool) -> bool:
+    """Cancel (or, during rollback, remove) one journaled attempt.
+
+    Returns False when the wrapper already admitted it and the caller must
+    observe rather than cancel. CLOSE is durable before the tombstone, and
+    the tombstone before any exact removal or nil-container fence.
+    """
+    token = record["token"]
+    admitted = attempt["state"] == "admitted" or not gate.close_pending(role, token)
+    if admitted and not remove_admitted:
+        return False
+    retire_token(token)
+    cid = record["cid"]
+    if cid is None:
+        if admitted:
+            raise AttemptIdentityMismatch("admitted attempt has no journaled container")
+        # Never issued (issue requires a bound container): no Start exists.
+        # A still-pending no-start Create stays inert behind this CLOSED gate
+        # and its tombstone; a later creation boundary removes it exactly.
+        gate.fenced(role, token, None)
+        return True
+    item = observe_exact(cid)
+    if item is not None:
+        verify_attempt_item(item, cid, journaled_expected(record))
+        if role == "target":
+            evidence = capture_failed_target(transaction["operation_id"], cid, record["image"])
+            try:
+                write_status(config_value, evidence_capture=evidence)
+            except OSError:
+                pass  # diagnostics cannot hold service recovery hostage
+        remove_exact_container(cid)
+    if admitted:
+        gate.quiesce(cid)
+    else:
+        gate.fenced(role, token, cid)
+    return True
+
+
+def new_attempt(config_value: dict, transaction: dict, gate, role: str) -> dict:
+    """Immutable attempt file, then root journal, then gate allocation."""
+    records = journal_attempts(transaction, role)
+    image = transaction["target_image" if role == "target" else "previous_image"]
+    token = uuid.uuid4().hex
+    raw = write_attempt_file(wrapped_configuration(config_value, transaction, role, token, image))
+    record = {"role": role, "generation": len(records) + 1, "token": token, "image": image,
+              "attempt_sha256": hashlib.sha256(raw).hexdigest(), "cid": None}
+    transaction.setdefault("attempts", []).append(record)
+    write_transaction(transaction)
+    gate.allocate(role, token, image)
+    return record
+
+
 def prepare_attempt(config_value: dict, transaction: dict, role: str) -> str:
     """Allocate/create/bind/start once; never repeat an ambiguous start.
 
-    Creation uses one immutable name and --no-recreate, without starting. An
-    interrupted create can therefore be discovered or repeated for that same
-    generation. Only a durably CLOSED and exact-ID-fenced attempt can be
-    replaced. Admission winning that race permanently changes this to observe.
+    Identities come from the root journal; the container-writable gate is
+    cross-checked first and only arbitrates admission versus cancellation.
+    Only a durably CLOSED attempt is removed, by its journaled exact ID.
     """
     gate = admission_store(config_value, transaction)
-    state = gate.observe()
+    state = checked_gate(gate, transaction)
+    records = journal_attempts(transaction, role)
+    record = records[-1] if records else None
+    if record is not None and len(state["slots"][role]["attempts"]) < record["generation"]:
+        gate.allocate(role, record["token"], record["image"])  # journal led the gate
+        state = checked_gate(gate, transaction)
     slot = state["slots"][role]
     if slot["consumed"]:
-        return slot["attempts"][-1]["cid"]
-    attempt = slot["attempts"][-1] if slot["attempts"] else None
+        return record["cid"]
     image = transaction["target_image" if role == "target" else "previous_image"]
-    if attempt and (attempt["issued"] or attempt["state"] == "closed"):
-        if not gate.close_pending(role, attempt["token"]):
-            return attempt["cid"]  # the wrapper won admission; do not touch it
-        if not attempt["cid"]:
-            raise RuntimeError("closed creation has no confirmed container identity")
-        remove_exact_container(attempt["cid"])
-        gate.fenced(role, attempt["token"], attempt["cid"])
-        attempt = None
-    if attempt is None:
-        attempt = gate.allocate(role, uuid.uuid4().hex, image)
-    expected = wrapped_configuration(config_value, transaction, role, attempt["token"], image)
-    _durable_write(OVERRIDE, json.dumps(compose_file_document(expected)).encode(), 0o600)
-    cid = attempt["cid"]
+    if record is not None:
+        attempt = slot["attempts"][-1]
+        if attempt["issued"] or attempt["state"] == "closed":
+            if not retire_attempt(config_value, transaction, gate, role, record, attempt,
+                                  remove_admitted=False):
+                return record["cid"]  # the wrapper won admission; do not touch it
+            record = None
+    if record is None:
+        record = new_attempt(config_value, transaction, gate, role)
+    # Docker, not gate flags, proves every predecessor is gone before this
+    # generation may take the stable name or open.
+    require_absent(predecessors(transaction, role))
+    raw, expected = journaled_attempt(record)
+    _durable_write(OVERRIDE, raw, 0o600)  # live pointer: exact immutable attempt bytes
+    cid = record["cid"]
     if cid is None:
         cid = create_attempt(config_value, expected)
-        gate.bind(role, attempt["token"], cid)
+        record["cid"] = cid
+        write_transaction(transaction)
     else:
         verify_wrapped_container(cid, expected)
+    gate.bind(role, record["token"], cid)
     if not never_started(cid, image):
         # A wrapper invocation before OPEN was denied. Do not infer admission
         # or reuse that process; only explicit closed cancellation may retry.
-        if gate.close_pending(role, attempt["token"]):
-            remove_exact_container(cid)
-            gate.fenced(role, attempt["token"], cid)
+        attempt = checked_gate(gate, transaction)["slots"][role]["attempts"][-1]
+        retire_attempt(config_value, transaction, gate, role, record, attempt, remove_admitted=False)
         raise RuntimeError("pre-admission container already ran; cancellation recorded")
-    gate.open(role, attempt["token"])
-    if not gate.issue_start(role, attempt["token"]):
+    gate.open(role, record["token"])
+    if not gate.issue_start(role, record["token"]):
         raise RuntimeError("start was already issued; reconcile its admission")
     docker_command(["docker", "start", cid], timeout=COMPOSE_MUTATION_SECONDS)
     return cid
 
 
 def quiesce_target(config_value: dict, transaction: dict) -> None:
-    """Fence every known target before granting the separate rollback slot."""
+    """Retire every journaled target before granting the separate rollback slot."""
     gate = admission_store(config_value, transaction)
-    state = gate.observe()
-    for attempt in state["slots"]["target"]["attempts"]:
-        if attempt["cid"] in state["quiesced"]:
-            continue
-        if attempt["state"] != "admitted":
-            # Persist revocation before any removal; a crash releases locks,
-            # but cannot let a delayed target wrapper enter the legacy ledger.
-            if not gate.close_pending("target", attempt["token"]):
-                attempt = gate.observe()["slots"]["target"]["attempts"][-1]
-        cid = attempt["cid"]
-        if cid is None:
-            expected = wrapped_configuration(config_value, transaction, "target",
-                                             attempt["token"], attempt["image"])
-            # Complete/reobserve the same named no-start creation while its
-            # gate is CLOSED. Even a delayed old daemon Create stays denied.
-            cid = create_attempt(config_value, expected)
-            gate.bind("target", attempt["token"], cid)
-        evidence = capture_failed_target(transaction["operation_id"], cid, attempt["image"])
-        try:
-            write_status(config_value, evidence_capture=evidence)
-        except OSError:
-            pass  # diagnostics cannot hold service recovery hostage
-        remove_exact_container(cid)
-        if attempt["state"] == "admitted":
-            gate.quiesce(cid)
-        else:
-            gate.fenced("target", attempt["token"], cid)
+    state = checked_gate(gate, transaction)
+    records = journal_attempts(transaction, "target")
+    if records and len(state["slots"]["target"]["attempts"]) < records[-1]["generation"]:
+        gate.allocate("target", records[-1]["token"], records[-1]["image"])
+        state = checked_gate(gate, transaction)
+    for record, attempt in zip(records, state["slots"]["target"]["attempts"]):
+        retire_attempt(config_value, transaction, gate, "target", record, attempt,
+                       remove_admitted=True)
 
 
 def prepare_admission(config_value: dict, transaction: dict):
@@ -924,13 +1262,24 @@ def prepare_admission(config_value: dict, transaction: dict):
                     f"error response from daemon: no such object: {cid}"}
         except (OSError, ValueError, subprocess.SubprocessError):
             pass  # Unknown source state never grants service-only cutover.
-    state = gate.prepare_for_recovery(transaction["operation_id"], transaction["source_container"],
-                                      transaction["previous_image"], allow_service_only=service_only)
-    if state["operation"] != transaction["operation_id"] or state["source"]["cid"] != transaction["source_container"]:
-        raise RuntimeError("admission and replacement journals disagree")
-    if state["source"]["cid"] not in state["quiesced"]:
-        remove_exact_container(state["source"]["cid"])
-        gate.quiesce(state["source"]["cid"])
+    gate.prepare_for_recovery(transaction["operation_id"], transaction["source_container"],
+                              transaction["previous_image"], allow_service_only=service_only)
+    state = checked_gate(gate, transaction)
+    source = transaction["source_container"]
+    source_token = transaction.get("source_token")
+    expected = None
+    if source_token is not None:
+        retire_token(source_token)  # the previous live attempt; never current again
+        _, expected = read_attempt_file(source_token)
+    item = observe_exact(source)
+    if item is not None:
+        if expected is not None:
+            verify_attempt_item(item, source, expected)
+        elif item.get("Image") != transaction["previous_image"]:
+            raise AttemptIdentityMismatch("the journaled source changed identity")
+        remove_exact_container(source)
+    if source not in state["quiesced"]:
+        gate.quiesce(source)
     return gate
 
 
@@ -1475,6 +1824,17 @@ def execute_replacement(config_value: dict, transaction: dict) -> int:
     admission_store(config_value, transaction)
     for role, image in (("target", target), ("rollback", previous)):
         wrapped_configuration(config_value, transaction, role, uuid.uuid4().hex, image)
+    # Bind a wrapped source to its root-private attempt record before drain;
+    # its token is retired at removal so a late duplicate Create stays inert.
+    transaction.setdefault("attempts", [])
+    transaction["source_token"] = None
+    current = current_attempt(config_value)
+    if current is not None:
+        held = name_holder(config_value["deployment_name"])
+        if held is None or held[0] != cid or classify_holder(held[1], cid, current) != "current":
+            raise RuntimeError("the source is not the recorded current admission attempt")
+        transaction["source_token"] = current["services"]["app"]["labels"]["io.mobius.admission.token"]
+    journal_attempts(transaction)
     write_transaction(transaction)
     try:
         request_drain(config_value, operation, cid)
@@ -1612,10 +1972,12 @@ def finish_verified(config_value: dict, transaction: dict, cid: str, image: str,
     """
     expected_boot_id = None
     if transaction.get("admission_version") == 1:
-        gate_state = admission_store(config_value, transaction).observe()
+        gate_state = checked_gate(admission_store(config_value, transaction), transaction)
         role = "target" if state == "succeeded" else "rollback"
         slot = gate_state["slots"][role]
-        if not slot["consumed"] or slot["attempts"][-1]["cid"] != cid:
+        records = journal_attempts(transaction, role)
+        if (not slot["consumed"] or len(records) != len(slot["attempts"])
+                or records[-1]["cid"] != cid):
             raise RuntimeError("healthy container has no matching admission")
         expected_boot_id = slot["consumed"]["boot_id"]
     if not cutover_boot_consumed(config_value, transaction["operation_id"],

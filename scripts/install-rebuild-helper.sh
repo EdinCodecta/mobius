@@ -91,7 +91,9 @@ if [[ $ADMISSION_MANAGED == 1 ]] || [[ $WORKING_DIR == /etc/mobius-rebuild \
 import json, sys
 with open("/etc/mobius-rebuild/config.json") as handle:
     configuration = json.load(handle)
-if configuration.get("version") != 3 or configuration.get("project") != sys.argv[1]:
+# Version 3 is the released legacy layout migrated here; version 4 adds the
+# frozen deployment container name. Helper-managed apps require version 4.
+if configuration.get("version") not in (3, 4) or configuration.get("project") != sys.argv[1]:
     raise SystemExit("Frozen helper configuration belongs to a different project")
 PY_OWNER
   FROZEN_SOURCE=/etc/mobius-rebuild/compose.yml
@@ -138,7 +140,10 @@ labels = app.get("labels", {})
 token = labels.get("io.mobius.admission.token", "")
 operation = labels.get("io.mobius.admission.operation", "")
 role = labels.get("io.mobius.admission.role")
-name = "mobius-admission-" + token
+# Each attempt has its own Compose project but reuses the frozen original
+# deployment container name, so raw Compose cannot create a second writer.
+attempt_project = "mobius-admission-" + token
+deployment = configuration.get("deployment_name")
 prefix = ["python3", "-I", "-S", "/run/mobius-boot-admission.py", "enter",
           "--state-dir", "/run/mobius-admission", "--data-dir", "/data",
           "--token", token, "--"]
@@ -147,11 +152,14 @@ def require(condition):
     if not condition:
         raise SystemExit("Running admission container does not match the root-frozen owning identity")
 
-require(configuration.get("version") == 3 and configuration.get("project") == project)
+require(configuration.get("version") == 4 and configuration.get("project") == project)
+require(configuration.get("name_source") in {"explicit", "generated"})
+require(isinstance(deployment, str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{1,127}", deployment))
 require(re.fullmatch(r"[0-9a-f]{64}", cid) and actual.get("Id") == cid)
 require(re.fullmatch(r"[0-9a-f]{32}", token) and re.fullmatch(r"[0-9a-f]{32}", operation))
 require(role in {"target", "rollback"} and labels.get("io.mobius.admission.project") == project)
-require(expected.get("name") == name and app.get("container_name") == name and actual.get("Name") == "/" + name)
+require(expected.get("name") == attempt_project and app.get("container_name") == deployment
+        and actual.get("Name") == "/" + deployment)
 require(isinstance(app.get("entrypoint"), list) and app["entrypoint"][:len(prefix)] == prefix)
 require(isinstance(app.get("command"), list) and bool(app["entrypoint"][len(prefix):] + app["command"]))
 require(actual.get("Entrypoint") == app["entrypoint"] and (actual.get("Cmd") if actual.get("Cmd") is not None else []) == app["command"])
@@ -160,7 +168,7 @@ require(actual.get("Image") == app["image"])
 observed_labels = actual.get("Labels") or {}
 for key in ("project", "operation", "role", "token"):
     require(observed_labels.get("io.mobius.admission." + key) == labels["io.mobius.admission." + key])
-require(observed_labels.get("com.docker.compose.project") == name)
+require(observed_labels.get("com.docker.compose.project") == attempt_project)
 require(observed_labels.get("com.docker.compose.service") == "app")
 require(observed_labels.get("com.docker.compose.project.working_dir") == "/etc/mobius-rebuild")
 attempt_path = Path("/etc/mobius-rebuild/attempts") / (token + ".json")
@@ -271,6 +279,74 @@ if any(value in serialized for value in (
     raise SystemExit("Base Compose topology contains boot-admission state; restore the unwrapped base before migration.")
 PY_BASE
 
+# Every admission attempt reuses the ORIGINAL deployment container name. While
+# that name is held, raw Compose from an unchanged checkout collides instead of
+# creating a second /data writer. Derive it only from unrenamed live identity:
+# an explicit container_name must be the live name; otherwise the live name is
+# exactly Compose's first generated <project>-app-1 (or underscore form), the
+# name raw Compose would recreate. Other indexes need an explicit stable name:
+# multi-replica app layouts are not managed. Managed apps keep frozen fields.
+deployment_identity() {
+  local inspected
+  inspected=$(docker inspect "$CID" --format \
+    '{"Name":{{json .Name}},"Labels":{{json .Config.Labels}}}') || return 1
+  python3 - "$PROJECT" "$ADMISSION_MANAGED" "$RESOLVED" "$inspected" <<'PY_IDENTITY'
+import json, re, sys
+from pathlib import Path
+
+project, managed, resolved, raw = sys.argv[1:]
+NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{1,127}")
+GENERATED = re.compile(re.escape(project) + r"(?:-app-|_app_)1")
+actual = json.loads(raw)
+labels = actual.get("Labels") or {}
+explicit = json.loads(Path(resolved).read_text())["services"]["app"].get("container_name")
+observed = actual.get("Name")
+
+def refuse(reason):
+    raise SystemExit("Refusing to freeze the deployment container name: " + reason)
+
+if explicit is not None and not (isinstance(explicit, str) and NAME.fullmatch(explicit)):
+    refuse("the resolved container_name is invalid")
+if not (isinstance(observed, str) and observed[:1] == "/" and NAME.fullmatch(observed[1:])):
+    refuse("the live container name is invalid")
+observed = observed[1:]
+if managed == "1":
+    configuration = json.loads(Path("/etc/mobius-rebuild/config.json").read_text())
+    name, source = configuration.get("deployment_name"), configuration.get("name_source")
+    if configuration.get("version") != 4 or configuration.get("project") != project:
+        refuse("a helper-managed app requires its frozen version 4 identity")
+    if not (isinstance(name, str) and NAME.fullmatch(name)):
+        refuse("the frozen deployment name is invalid")
+    if not ((source == "explicit" and explicit == name)
+            or (source == "generated" and explicit is None and GENERATED.fullmatch(name))):
+        refuse("the frozen name source disagrees with the frozen base topology")
+    if observed != name:
+        refuse("the live app does not hold the frozen deployment name")
+else:
+    number = labels.get("com.docker.compose.container-number")
+    if (labels.get("com.docker.compose.project") != project
+            or labels.get("com.docker.compose.service") != "app"
+            or labels.get("com.docker.compose.oneoff") != "False"
+            or not (isinstance(number, str) and re.fullmatch(r"[1-9][0-9]*", number))):
+        refuse("the live app lacks its original Compose project/service/number labels")
+    if explicit is not None:
+        if observed != explicit:
+            refuse("the explicit container_name is not the live name")
+        name, source = explicit, "explicit"
+    elif number == "1" and GENERATED.fullmatch(observed):
+        name, source = observed, "generated"
+    elif observed in (f"{project}-app-{number}", f"{project}_app_{number}"):
+        refuse(f"generated app index {number} is not the index raw Compose would recreate, so the "
+               "shared name could not prevent a second writer. Migrate to a stable explicit name: "
+               f"set the app's container_name to {observed!r} in the reviewed Compose input "
+               "that created it, then rerun this installer")
+    else:
+        refuse("the live name is not Compose's generated name; renamed apps are not adopted")
+print(json.dumps({"deployment_name": name, "name_source": source}, separators=(",", ":")))
+PY_IDENTITY
+}
+IDENTITY=$(deployment_identity)
+
 umask 077
 # BEGIN MIGRATION DISPATCH QUIESCENCE
 # Launcher 1 does not hold candidate.lock while selecting a worker. A selected
@@ -352,6 +428,8 @@ refuse_unresolved_transaction
 if [[ $ADMISSION_MANAGED == 1 ]]; then
   verify_admission_identity
 fi
+[[ $(deployment_identity) == "$IDENTITY" ]] \
+  || { echo "The running app's deployment name changed during preflight; retry helper migration." >&2; exit 1; }
 
 # BEGIN PINNED BOOT ADMISSION INSTALL
 # Publish the prerequisite before adopting a worker that can use it. Existing
@@ -460,9 +538,14 @@ EOF
 chmod 0600 "$OVERRIDE_NEW"
 mv -f "$OVERRIDE_NEW" /etc/mobius-rebuild/image.override.yml
 fi
-python3 - "$PROJECT" "$DATA_SOURCE" <<'PY'
+# Existing root-owned controller state under /var/lib/mobius-rebuild, including
+# any host-owned removal tombstones, is preserved: never deleted or reset here.
+python3 - "$PROJECT" "$DATA_SOURCE" "$IDENTITY" <<'PY'
 import json, os, sys, tempfile
-value = {"version": 3, "project": sys.argv[1], "data_dir": sys.argv[2]}
+identity = json.loads(sys.argv[3])
+if set(identity) != {"deployment_name", "name_source"}:
+    raise SystemExit("invalid frozen deployment identity")
+value = {"version": 4, "project": sys.argv[1], "data_dir": sys.argv[2], **identity}
 fd, name = tempfile.mkstemp(dir="/etc/mobius-rebuild", text=True)
 with os.fdopen(fd, "w") as handle: json.dump(value, handle, separators=(",", ":"))
 os.chmod(name, 0o600)

@@ -31,6 +31,7 @@ STATUS = STATE / 'status.json'
 IMAGE = re.compile(r'sha256:[0-9a-f]{64}\Z')
 CID = re.compile(r'[0-9a-f]{64}\Z')
 SHA = re.compile(r'[0-9a-f]{40}\Z')
+DOCKER_NAME = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{1,127}\Z')
 TRUSTED_UID = 0
 TRUSTED_GID = 0
 
@@ -114,9 +115,31 @@ def data_volume(topology: dict) -> tuple[str, str]:
     return 'volume', definition.get('name') or name
 
 
-def check_topology(source: dict, target: dict, project: str) -> None:
+def deployment_name(config_value: dict) -> tuple[str, str]:
+    """The frozen original container name every attempt reuses, and its source."""
+    name, source = config_value.get('deployment_name'), config_value.get('name_source')
+    if not isinstance(name, str) or not DOCKER_NAME.fullmatch(name):
+        raise ValueError('frozen deployment container name is missing')
+    generated = re.fullmatch(re.escape(str(config_value.get('project'))) + r'(?:-app-|_app_)1', name)
+    if not (source == 'explicit' or (source == 'generated' and generated)):
+        raise ValueError('frozen deployment name source is invalid')
+    return name, source
+
+
+def check_topology(source: dict, target: dict, config_value: dict) -> None:
+    project = config_value['project']
     if source.get('name') != project or target.get('name') != project:
         raise ValueError('Compose project changed')
+    # Every attempt is created under the frozen deployment name. A manual build
+    # may not rename it: an explicit name stays that exact name, and a
+    # generated name stays generated (no container_name) in the same project.
+    name, origin = deployment_name(config_value)
+    expected = name if origin == 'explicit' else None
+    for topology in (source, target):
+        services = topology.get('services')
+        app = services.get('app') if isinstance(services, dict) else None
+        if not isinstance(app, dict) or app.get('container_name') != expected:
+            raise ValueError('deployment container name changed; reinstall the helper for a rename')
     if data_volume(source) != data_volume(target):
         raise ValueError('persistent /data volume changed')
     # A manual release may add/remove the edge network, but every retained
@@ -174,7 +197,7 @@ def run(args) -> dict:
             raise ValueError('source or target identity changed')
         prior_topology = source_topology(worker, config_value, source_image)
         target_topology = read_json(Path(args.resolved_compose))
-        check_topology(prior_topology, target_topology, config_value['project'])
+        check_topology(prior_topology, target_topology, config_value)
         # Image IDs are immutable; never let a moving tag in the shell input
         # select the runtime image after validation.
         if worker.inspect_image(args.target_image, '{{.Id}}') != args.target_image:

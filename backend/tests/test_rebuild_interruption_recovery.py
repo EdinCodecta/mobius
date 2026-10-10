@@ -129,6 +129,12 @@ def test_slow_rollback_observes_entire_203_second_health_window(incident, monkey
 
 
 def test_legacy_authorization_corruption_does_not_become_new_permission(incident):
+    """A same-operation acceptance under another nonce is not this handoff.
+
+    The exact quiesced rollback restores service, but the stray acceptance is
+    retired before legacy bootstrap: it never becomes an ACK, a refreshed
+    continuation, or a reason to clear the journal.
+    """
     c = incident
     path = c.legacy.ACCEPTED_PATH
     value = json.loads(path.read_text())
@@ -136,15 +142,19 @@ def test_legacy_authorization_corruption_does_not_become_new_permission(incident
     path.chmod(0o644)
     path.write_text(json.dumps(value))
     cid = prepare(c)
-    assert not c.docker.complete_start(cid)
-    assert c.docker.entries[-1] == (cid, "denied", False)
-    recover(c)
-    assert c.docker.starts[0] == cid
+    assert c.docker.complete_start(cid)
+    assert c.docker.entries == [(cid, "service_only", False)]
+    assert not path.exists()
+    for _ in range(3):
+        recover(c)
+    assert c.docker.starts == [cid] and len(c.docker.creates) == 1
+    assert cid not in c.docker.removes
     assert all(not continuation for _cid, _result, continuation in c.docker.entries)
     assert all(entry[1] != "continuation" for entry in c.docker.entries)
-    assert not c.legacy.ACK_PATH.exists()
+    assert not c.legacy.ACK_PATH.exists() and not path.exists()
     assert c.host.TRANSACTION.exists()
     assert status(c)["state"] == "needs_recovery"
+    assert status(c)["code"] == "handoff_boot_unconfirmed"
 
 
 @pytest.mark.parametrize("initial", ["running", "restarting"])

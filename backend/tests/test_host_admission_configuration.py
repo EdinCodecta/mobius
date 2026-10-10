@@ -2,16 +2,53 @@
 import copy
 import json
 import os
+from pathlib import Path
 import subprocess
 
 import pytest
 
 from tests.test_mobius_rebuild_host import host
-from tests.test_admission_host_recovery import incident
+from tests.test_admission_host_recovery import PowerLoss, incident  # noqa: F401 (fixture)
 
 
-def test_prepared_gate_survives_retirement_of_original_ledger_receipt(incident):
+@pytest.fixture
+def case(incident, monkeypatch):
+    """The shared real-gate incident, with version-4 frozen naming and the
+    Docker semantics that matter for a stable name across attempt projects:
+    Compose owns its project label, and Create conflicts on a held name."""
     c = incident
+    c.config.update(deployment_name="original-app", name_source="explicit")
+    base = c.docker.command
+
+    def command(args, **kwargs):
+        args = list(args)
+        if args[1] == "compose" and "up" in args:
+            project = args[args.index("-p") + 1]
+            path = [args[i + 1] for i, part in enumerate(args) if part == "-f"][0]
+            name = json.loads(Path(path).read_text())["services"]["app"]["container_name"]
+            holder = [v for v in c.docker.containers.values() if v["Name"] == "/" + name]
+            if holder and (holder[0]["Config"].get("Labels") or {}).get(
+                    "com.docker.compose.project") != project:
+                c.docker.calls.append((args, kwargs))
+                return c.docker._reply(args, code=1, check=kwargs.get("check", True), error=(
+                    f'Error response from daemon: Conflict. The container name "/{name}" is already in use'))
+            before = set(c.docker.containers)
+            result = base(args, **kwargs)
+            for cid in set(c.docker.containers) - before:
+                labels = {**c.docker.containers[cid]["Config"]["Labels"],
+                          "com.docker.compose.project": project, "com.docker.compose.service": "app"}
+                c.docker.containers[cid]["Config"]["Labels"] = labels
+                c.docker.history[cid]["Config"]["Labels"] = dict(labels)
+            return result
+        return base(args, **kwargs)
+
+    c.docker.command = command
+    monkeypatch.setattr(c.host, "docker_command", command)
+    return c
+
+
+def test_prepared_gate_survives_retirement_of_original_ledger_receipt(case):
+    c = case
     c.host.prepare_admission(c.config, c.tx)
     before = c.gate.observe()
     c.legacy.CUTOVER_RECEIPT_PATH.unlink()
@@ -25,8 +62,8 @@ def test_prepared_gate_survives_retirement_of_original_ledger_receipt(incident):
     ('exited', False, True), ('restarting', False, True), ('missing', False, True),
 ])
 def test_missing_initial_receipt_never_removes_undrained_serviceable_source(
-        incident, source_status, drain_confirmed, allowed):
-    c = incident
+        case, source_status, drain_confirmed, allowed):
+    c = case
     c.legacy.CUTOVER_RECEIPT_PATH.unlink()
     c.tx['drain_confirmed'] = drain_confirmed
     source = c.tx['source_container']
@@ -46,8 +83,8 @@ def test_missing_initial_receipt_never_removes_undrained_serviceable_source(
     assert source in state['quiesced']
 
 
-def test_settlement_requires_gate_boot_not_only_a_matching_legacy_pair(incident):
-    c = incident
+def test_settlement_requires_gate_boot_not_only_a_matching_legacy_pair(case):
+    c = case
     cid = c.host.prepare_rollback(c.config, c.tx)
     assert c.docker.complete_start(cid)
     ack = json.loads(c.legacy.ACK_PATH.read_text())
@@ -63,8 +100,8 @@ def test_settlement_requires_gate_boot_not_only_a_matching_legacy_pair(incident)
     assert c.host.TRANSACTION.exists()
 
 
-def test_new_proven_rejection_supersedes_old_unknown_observation(incident, monkeypatch):
-    c = incident
+def test_new_proven_rejection_supersedes_old_unknown_observation(case, monkeypatch):
+    c = case
     c.tx['phase'] = 'replacement_started'
     c.host.write_transaction(c.tx)
     c.host.prepare_admission(c.config, c.tx)
@@ -84,10 +121,11 @@ def test_new_proven_rejection_supersedes_old_unknown_observation(incident, monke
 def topology(tmp_path, monkeypatch):
     data = tmp_path / 'data'
     data.mkdir()
-    config = {'project': 'mobius', 'data_dir': data, 'control_dir': tmp_path / 'control'}
+    config = {'project': 'mobius', 'data_dir': data, 'control_dir': tmp_path / 'control',
+              'deployment_name': 'mobius-app-1', 'name_source': 'generated'}
     config['control_dir'].mkdir()
     tx = {'operation_id': 'a' * 32}
-    resolved = {'services': {'app': {'image': 'old', 'volumes': [
+    resolved = {'name': 'mobius', 'services': {'app': {'image': 'old', 'volumes': [
         {'type': 'bind', 'source': str(data), 'target': '/data'}],
         'networks': {'edge': {'aliases': ['app', 'mobius']}},
         'environment': {'KEEP': 'value'}, 'restart': 'unless-stopped',
@@ -104,7 +142,8 @@ def test_attempt_scope_preserves_argv_and_shared_resources_without_reconciliatio
     config, tx, _ = topology(tmp_path, monkeypatch)
     result = host.wrapped_configuration(config, tx, 'target', 'b' * 32, 'sha256:' + 'c' * 64)
     app = result['services']['app']
-    assert result['name'] == app['container_name'] == 'mobius-admission-' + 'b' * 32
+    assert result['name'] == 'mobius-admission-' + 'b' * 32
+    assert app['container_name'] == 'mobius-app-1'  # the frozen generated name, not per attempt
     assert app['entrypoint'][-3:] == ['--', '/usr/bin/tini', '--']
     assert app['command'] == ['/app/start']
     assert app['environment'] == {'KEEP': 'value'}
@@ -191,8 +230,8 @@ def test_wrapper_preserves_compose_entrypoint_command_overrides(tmp_path, monkey
     assert original == expected
 
 
-def test_same_image_cutover_recovery_does_not_mistake_source_for_target(incident):
-    c = incident
+def test_same_image_cutover_recovery_does_not_mistake_source_for_target(case):
+    c = case
     c.tx.update(target_image=c.tx['previous_image'], phase='replacement_started')
     c.host.write_transaction(c.tx)
     c.host.recover(c.config, c.tx)
@@ -204,8 +243,8 @@ def test_same_image_cutover_recovery_does_not_mistake_source_for_target(incident
 
 
 @pytest.mark.parametrize('observed', [None, [], ['unexpected'], '', False])
-def test_docker_null_command_is_only_equivalent_to_an_empty_argv(incident, monkeypatch, observed):
-    c = incident
+def test_docker_null_command_is_only_equivalent_to_an_empty_argv(case, monkeypatch, observed):
+    c = case
     c.host.prepare_admission(c.config, c.tx)
     attempt = c.gate.allocate('target', 'd' * 32, c.tx['target_image'])
     expected = c.host.wrapped_configuration(c.config, c.tx, 'target', attempt['token'], c.tx['target_image'])
@@ -258,3 +297,342 @@ def test_real_compose_parse_cannot_reinterpret_frozen_runtime_values(tmp_path, m
     actual = json.loads(result.stdout.replace('$$', '$'))['services']['app']
     for key in ('entrypoint', 'command', 'environment', 'labels'):
         assert actual[key] == expected['services']['app'][key]
+
+
+# --- Host identity boundary: root-private journal, stable name, tombstones ---
+
+FOREIGN = 'f' * 64
+
+
+def mutations(c):
+    return (len(c.docker.removes), len(c.docker.starts), len(c.docker.creates))
+
+
+def edit_gate(c, change):
+    path = c.gate.state_dir / 'state.json'
+    state = json.loads(path.read_text())
+    change(state)
+    path.write_text(json.dumps(state))
+
+
+def issued_target(c, *, enter=False):
+    c.docker.auto_enter = enter
+    c.host.prepare_admission(c.config, c.tx)
+    cid = c.host.prepare_attempt(c.config, c.tx, 'target')
+    return cid
+
+
+def add_foreign(c, name='/unrelated-service', labels=None, image='sha256:' + 'f' * 64):
+    c.docker.containers[FOREIGN] = {
+        'Id': FOREIGN, 'Image': image, 'Name': name, 'Config': {'Labels': labels or {}},
+        'Mounts': [], 'RestartCount': 0, 'State': {'Status': 'running'}}
+
+
+def orphan_of(c, cid, new_cid):
+    """A delayed accepted no-start Create of the same immutable attempt file."""
+    item = copy.deepcopy(c.docker.history[cid])
+    item.update(Id=new_cid, State={'Status': 'created', 'StartedAt': '0001-01-01T00:00:00Z'})
+    c.docker.containers[new_cid] = item
+    return new_cid
+
+
+def test_stable_name_and_unique_project_come_from_frozen_deployment(case):
+    c = case
+    cid = issued_target(c)
+    item = c.docker.containers[cid]
+    token = item['Config']['Labels']['io.mobius.admission.token']
+    assert item['Name'] == '/original-app'
+    assert item['Config']['Labels']['com.docker.compose.project'] == 'mobius-admission-' + token
+    record = c.host.read_transaction()['attempts'][0]
+    assert record == {'role': 'target', 'generation': 1, 'token': token,
+                      'image': c.tx['target_image'], 'cid': cid,
+                      'attempt_sha256': record['attempt_sha256']}
+    assert c.host.OVERRIDE.read_bytes() == c.host.attempt_path(token).read_bytes()
+
+
+@pytest.mark.parametrize('declared,generated_name,refused', [
+    ('renamed-app', None, True), (None, None, True), ('original-app', None, False)])
+def test_topology_cannot_silently_rename_the_frozen_app(case, declared, generated_name, refused):
+    c = case
+    tx = dict(c.tx, target_topology=copy.deepcopy(c.docker.topology))
+    app = tx['target_topology']['services']['app']
+    if declared is None:
+        app.pop('container_name')
+    else:
+        app['container_name'] = declared
+    if refused:
+        with pytest.raises(RuntimeError, match='frozen deployment'):
+            c.host.wrapped_configuration(c.config, tx, 'target', 'b' * 32, c.tx['target_image'])
+    else:
+        c.host.wrapped_configuration(c.config, tx, 'target', 'b' * 32, c.tx['target_image'])
+
+
+def test_generated_name_requires_the_original_project_and_no_declared_name(case):
+    c = case
+    c.config.update(deployment_name='original-app-1', name_source='generated')
+    tx = dict(c.tx, target_topology=copy.deepcopy(c.docker.topology))
+    with pytest.raises(RuntimeError, match='frozen deployment'):
+        c.host.wrapped_configuration(c.config, tx, 'target', 'b' * 32, c.tx['target_image'])
+    tx['target_topology']['services']['app'].pop('container_name')
+    wrapped = c.host.wrapped_configuration(c.config, tx, 'target', 'b' * 32, c.tx['target_image'])
+    assert wrapped['services']['app']['container_name'] == 'original-app-1'
+    tx['target_topology']['name'] = 'other-project'
+    with pytest.raises(RuntimeError, match='frozen deployment'):
+        c.host.wrapped_configuration(c.config, tx, 'target', 'b' * 32, c.tx['target_image'])
+
+
+def test_container_writable_gate_cannot_select_foreign_container_for_removal(case):
+    c = case
+    issued_target(c)
+    add_foreign(c)
+    edit_gate(c, lambda s: s['slots']['target']['attempts'][-1].update(cid=FOREIGN))
+    before = mutations(c)
+    with pytest.raises(c.host.AttemptIdentityMismatch):
+        c.host.prepare_attempt(c.config, c.host.read_transaction(), 'target')
+    with pytest.raises(c.host.AttemptIdentityMismatch):
+        c.host.quiesce_target(c.config, c.host.read_transaction())
+    assert FOREIGN in c.docker.containers and mutations(c) == before
+    c.host.reconcile()
+    assert FOREIGN in c.docker.containers and mutations(c) == before
+    assert c.host.read_json(c.host.STATUS)['state'] == 'needs_recovery'
+
+
+@pytest.mark.parametrize('tamper', ['token', 'image', 'extra', 'consumed'])
+def test_gate_identity_tamper_refuses_before_any_docker_mutation(case, tamper):
+    c = case
+    cid = issued_target(c)
+
+    def change(state):
+        slot = state['slots']['target']
+        attempt = slot['attempts'][-1]
+        if tamper == 'token':
+            attempt['token'] = 'e' * 32
+        elif tamper == 'image':
+            attempt['image'] = 'sha256:' + 'e' * 64
+        elif tamper == 'extra':
+            attempt.update(state='closed', fenced=True)
+            state['quiesced'].append(cid)
+            slot['attempts'].append({'generation': 2, 'token': 'e' * 32, 'image': attempt['image'],
+                                     'cid': None, 'state': 'allocated', 'issued': False, 'fenced': False})
+        else:
+            attempt.update(state='admitted', boot_id='forged-boot-12345678', continuation=False)
+            slot['consumed'] = {'generation': 2, 'boot_id': 'forged-boot-12345678'}
+    edit_gate(c, change)
+    before = mutations(c)
+    for operation in (c.host.prepare_attempt, c.host.prepare_rollback):
+        args = (c.config, c.host.read_transaction()) + (('target',) if operation is c.host.prepare_attempt else ())
+        with pytest.raises(RuntimeError):
+            operation(*args)
+    assert mutations(c) == before and cid in c.docker.containers
+
+
+def test_forged_quiescence_flags_never_skip_exact_removal_before_rollback(case):
+    c = case
+    cid = issued_target(c)
+    c.docker.containers[cid]['State'] = {'Status': 'running', 'Health': {'Status': 'unhealthy'}}
+    # Container root marks its own target closed, fenced and removed.
+    edit_gate(c, lambda s: (s['slots']['target']['attempts'][-1].update(state='closed', fenced=True),
+                            s['quiesced'].append(cid)))
+    c.docker.auto_enter = True
+    rollback = c.host.prepare_rollback(c.config, c.host.read_transaction())
+    assert cid in c.docker.removes and cid not in c.docker.containers
+    calls = [args for args, _ in c.docker.calls]
+    removed = calls.index(['docker', 'container', 'rm', '--force', cid])
+    assert removed < calls.index(['docker', 'start', rollback])
+    assert c.docker.starts == [cid, rollback]
+    assert c.host.read_tombstones()['tokens'].keys() >= {
+        c.docker.history[cid]['Config']['Labels']['io.mobius.admission.token']}
+
+
+def test_rollback_does_not_open_while_a_journaled_target_still_exists(case, monkeypatch):
+    c = case
+    cid = issued_target(c)
+    original = c.host.remove_exact_container
+    # Docker reports success but the exact container is still observable.
+    monkeypatch.setattr(c.host, 'remove_exact_container', lambda target: None if target == cid else original(target))
+    with pytest.raises(RuntimeError, match='predecessor container still exists'):
+        c.host.prepare_rollback(c.config, c.host.read_transaction())
+    rollback = c.gate.observe()['slots']['rollback']['attempts']
+    assert all(not attempt['issued'] for attempt in rollback)
+    assert c.docker.starts == [cid]
+
+
+def test_foreign_holder_of_vacant_name_is_refused_not_removed(case):
+    c = case
+    c.host.prepare_admission(c.config, c.tx)
+    add_foreign(c, name='/original-app', labels={'com.docker.compose.project': 'original'})
+    before = mutations(c)
+    with pytest.raises(c.host.AttemptIdentityMismatch):
+        c.host.prepare_attempt(c.config, c.tx, 'target')
+    assert FOREIGN in c.docker.containers and mutations(c) == before
+
+
+def test_foreign_holder_never_becomes_the_current_app(case):
+    c = case
+    cid = issued_target(c, enter=True)
+    del c.docker.containers[cid]
+    add_foreign(c, name='/original-app', labels={'com.docker.compose.project': 'original'})
+    with pytest.raises(c.host.AttemptIdentityMismatch):
+        c.host.container_health(c.config)
+    with pytest.raises(c.host.AttemptIdentityMismatch):
+        c.host.app_container(c.config)
+
+
+def test_repeated_late_creates_of_one_retired_token_are_removed_exactly(case):
+    c = case
+    target = issued_target(c)
+    token = c.docker.history[target]['Config']['Labels']['io.mobius.admission.token']
+    c.host.quiesce_target(c.config, c.host.read_transaction())
+    assert token in c.host.read_tombstones()['tokens'] and target in c.docker.removes
+    first = orphan_of(c, target, 'a1' * 32)
+    rollback1 = c.host.prepare_attempt(c.config, c.host.read_transaction(), 'rollback')
+    assert first in c.docker.removes and rollback1 != first
+    # Gen-1 rollback start is lost; a second late Create of the SAME target
+    # token lands while the name is vacant again.
+    second = orphan_of(c, target, 'a2' * 32)
+    c.docker.pending.clear()
+    c.docker.auto_enter = True
+    rollback2 = c.host.prepare_attempt(c.config, c.host.read_transaction(), 'rollback')
+    assert second in c.docker.removes and rollback2 not in (rollback1, second)
+    assert token in c.host.read_tombstones()['tokens']  # history is never dropped
+    assert len(c.host.read_tombstones()['tokens']) == 2
+
+
+def test_retired_token_with_different_configuration_is_foreign(case):
+    c = case
+    target = issued_target(c)
+    c.host.quiesce_target(c.config, c.host.read_transaction())
+    orphan = orphan_of(c, target, 'a1' * 32)
+    c.docker.containers[orphan]['Image'] = 'sha256:' + 'e' * 64
+    before = mutations(c)
+    with pytest.raises(RuntimeError):
+        c.host.prepare_attempt(c.config, c.host.read_transaction(), 'rollback')
+    assert orphan in c.docker.containers and mutations(c) == before
+
+
+def test_retired_holder_reads_as_missing_so_recovery_reaches_the_creation_boundary(case):
+    c = case
+    target = issued_target(c)
+    c.host.quiesce_target(c.config, c.host.read_transaction())
+    orphan_of(c, target, 'a1' * 32)
+    assert c.host.container_health(c.config) == ('', '', 'missing')
+
+
+@pytest.mark.parametrize('method', ['allocate', 'bind'])
+def test_journal_leads_gate_and_replay_reuses_the_same_identity(case, monkeypatch, method):
+    c = case
+    c.host.prepare_admission(c.config, c.tx)
+    original = getattr(c.gate, method)
+    def crash(*_args, **_kwargs):
+        raise PowerLoss(method)
+    monkeypatch.setattr(c.gate, method, crash)
+    with pytest.raises(PowerLoss):
+        c.host.prepare_attempt(c.config, c.tx, 'target')
+    monkeypatch.setattr(c.gate, method, original)
+    journal = c.host.read_transaction()
+    (record,) = journal['attempts']
+    assert (record['cid'] is None) == (method == 'allocate')
+    c.docker.auto_enter = False
+    cid = c.host.prepare_attempt(c.config, journal, 'target')
+    (attempt,) = c.gate.observe()['slots']['target']['attempts']
+    assert attempt['token'] == record['token'] and attempt['cid'] == cid
+    assert len(c.docker.creates) == 1 and c.docker.starts == [cid]
+
+
+def test_existing_journaled_source_attempt_is_retired_before_removal(case):
+    c = case
+    c.host.prepare_admission(c.config, c.tx)
+    cid = c.host.prepare_attempt(c.config, c.tx, 'target')
+    token = c.docker.containers[cid]['Config']['Labels']['io.mobius.admission.token']
+    assert c.host.current_attempt(c.config)['services']['app']['labels'][
+        'io.mobius.admission.token'] == token
+    assert c.host.app_container(c.config) == (cid, c.tx['target_image'])
+
+
+# --- Nil-container cancellation (gate API: fenced(role, token, None)) ---
+
+def failed_creation(c):
+    c.host.prepare_admission(c.config, c.tx)
+    c.docker.fault = 'create-before'
+    with pytest.raises(PowerLoss):
+        c.host.prepare_attempt(c.config, c.tx, 'target')
+    (record,) = c.host.read_transaction()['attempts']
+    assert record['cid'] is None and not c.docker.creates
+    return record
+
+
+def test_never_created_attempt_is_cancelled_without_recreating_it(case):
+    c = case
+    record = failed_creation(c)
+    c.host.quiesce_target(c.config, c.host.read_transaction())
+    (attempt,) = c.gate.observe()['slots']['target']['attempts']
+    assert (attempt['state'], attempt['fenced'], attempt['cid']) == ('closed', True, None)
+    assert not c.docker.creates and not c.docker.starts
+    assert record['token'] in c.host.read_tombstones()['tokens']
+    c.docker.auto_enter = True
+    rollback = c.host.prepare_attempt(c.config, c.host.read_transaction(), 'rollback')
+    assert c.docker.starts == [rollback]
+
+
+@pytest.mark.parametrize('crash', ['close_pending', 'retire_token', 'fenced'])
+def test_nil_cancellation_crashes_converge_once(case, monkeypatch, crash):
+    c = case
+    record = failed_creation(c)
+    owner = c.host if crash == 'retire_token' else c.gate
+    original = getattr(owner, crash)
+    fired = []
+    def interrupt(*args, **kwargs):
+        if not fired:
+            fired.append(True)
+            original(*args, **kwargs)
+            raise PowerLoss(crash)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(owner, crash, interrupt)
+    with pytest.raises(PowerLoss):
+        c.host.quiesce_target(c.config, c.host.read_transaction())
+    c.host.quiesce_target(c.config, c.host.read_transaction())
+    (attempt,) = c.gate.observe()['slots']['target']['attempts']
+    assert (attempt['state'], attempt['fenced'], attempt['cid']) == ('closed', True, None)
+    assert record['token'] in c.host.read_tombstones()['tokens']
+    assert not c.docker.creates and not c.docker.removes[1:]
+
+
+@pytest.mark.parametrize('point', ['remove-before', 'remove-after'])
+def test_bound_cancellation_crash_keeps_tombstone_before_exact_removal(case, point):
+    c = case
+    target = issued_target(c)
+    token = c.docker.containers[target]['Config']['Labels']['io.mobius.admission.token']
+    c.docker.fault = point
+    with pytest.raises(PowerLoss):
+        c.host.quiesce_target(c.config, c.host.read_transaction())
+    assert token in c.host.read_tombstones()['tokens']
+    assert c.gate.observe()['slots']['target']['attempts'][0]['state'] == 'closed'
+    c.host.quiesce_target(c.config, c.host.read_transaction())
+    assert target not in c.docker.containers
+    assert c.gate.observe()['slots']['target']['attempts'][0]['fenced'] is True
+
+
+def test_named_data_volume_does_not_replace_frozen_container_name(tmp_path, monkeypatch):
+    config, tx, resolved = topology(tmp_path, monkeypatch)
+    resolved['services']['app']['volumes'] = [
+        {'type': 'volume', 'source': 'app_data', 'target': '/data'}]
+    resolved['volumes'] = {'app_data': {'name': 'persistent_app_data'}}
+    def execute(args, **kwargs):
+        if args[1:3] == ['volume', 'inspect']:
+            assert args[-1] == 'persistent_app_data'
+            return subprocess.CompletedProcess(args, 0, str(config['data_dir']), '')
+        assert 'config' in args
+        return subprocess.CompletedProcess(args, 0, json.dumps(resolved), '')
+    monkeypatch.setattr(host, 'docker_command', execute)
+    expected = host.wrapped_configuration(config, tx, 'target', 'b' * 32, 'sha256:' + 'c' * 64)
+    assert expected['services']['app']['container_name'] == config['deployment_name']
+    assert expected['volumes'] == {'app_data': {'name': 'persistent_app_data', 'external': True}}
+
+
+@pytest.mark.parametrize('name', ['mobius-app-2', 'mobius_app_2', 'foreign-app-1'])
+def test_worker_refuses_generated_name_that_cannot_fence_original_compose(tmp_path, monkeypatch, name):
+    from tests.test_mobius_rebuild_host import _frozen
+    config, _ = _frozen(tmp_path, monkeypatch)
+    config.update(deployment_name=name, name_source='generated')
+    with pytest.raises(ValueError, match='generated'):
+        host.validate_config(config, trusted_uid=os.getuid())

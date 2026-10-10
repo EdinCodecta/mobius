@@ -223,8 +223,9 @@ class AdmissionStore:
                     _require(_token(attempt.get("boot_id")) and attempt["issued"]
                              and type(attempt.get("continuation")) is bool, "invalid claimed boot")
                     admitted.append({"generation": generation, "boot_id": attempt["boot_id"]})
-                _require(not attempt["fenced"] or (attempt["state"] == "closed"
-                         and cid is not None and cid in value["quiesced"]), "invalid fence")
+                _require(not attempt["fenced"] or (attempt["state"] == "closed" and (
+                         (cid is not None and cid in value["quiesced"])
+                         or (cid is None and attempt["issued"] is False))), "invalid fence")
                 if generation < len(slot["attempts"]):
                     _require(attempt["state"] == "closed" and attempt["fenced"], "unfenced predecessor")
             consumed = slot.get("consumed")
@@ -342,7 +343,12 @@ class AdmissionStore:
     def _quiescent(state, role):
         _require(state["source"]["cid"] in state["quiesced"], "source not quiesced")
         if role == "rollback":
-            _require(all(a["cid"] is not None and a["cid"] in state["quiesced"]
+            # A target is quiesced only by exact removal of its CID, or by the
+            # explicit never-created cancellation: CLOSED, never issued, never
+            # bound, and fenced. Unknown/missing identity is never enough.
+            _require(all((a["cid"] is not None and a["cid"] in state["quiesced"])
+                         or (a["cid"] is None and a["state"] == "closed" and a["fenced"]
+                             and a["issued"] is False)
                          for a in state["slots"]["target"]["attempts"]), "target not quiesced")
 
     def quiesce(self, cid):
@@ -408,7 +414,10 @@ class AdmissionStore:
             _require(attempt["cid"] in (None, cid), "container already bound differently")
             if attempt["cid"] == cid:
                 return
-            _require(attempt["state"] in {"allocated", "closed"} and cid != state["source"]["cid"]
+            # A fenced attempt's lineage is final: binding a discovered CID to
+            # a never-created cancellation would rewrite it after the fact.
+            _require(attempt["state"] in {"allocated", "closed"} and not attempt["fenced"]
+                     and cid != state["source"]["cid"]
                      and not any(a["cid"] == cid for slot in state["slots"].values()
                                  for a in slot["attempts"]), "container identity already used")
             attempt["cid"] = cid
@@ -449,9 +458,24 @@ class AdmissionStore:
             return True
 
     def fenced(self, role, token, cid):
+        """Host assertion: the exact closed container is removed, or (cid=None)
+        the closed attempt was never bound, so the host never issued a Start.
+
+        The None form is the host's never-created cancellation. Any bound or
+        issued attempt still requires exact-CID removal; nothing is inferred
+        from a missing container.
+        """
         with self._locked() as directory:
             state = self._state(directory)
             attempt = self._attempt(state, role, token)
+            if cid is None:
+                _require(attempt["state"] == "closed" and attempt["cid"] is None
+                         and attempt["issued"] is False, "only a closed unbound unissued attempt "
+                         "may be fenced without a container")
+                if not attempt["fenced"]:
+                    attempt["fenced"] = True
+                    self._save(directory, state)
+                return
             _require(attempt["state"] == "closed" and _cid(cid) and attempt["cid"] == cid,
                      "only exact closed container may be fenced")
             attempt["fenced"] = True
@@ -496,9 +520,19 @@ class AdmissionStore:
                         and (not cls._matches(ack, state) or exact_ack))
         return bool(exact_ack)
 
-    def _retire_matching(self, ledger, state, *, all_external_acceptance=False):
+    def _retire_matching(self, ledger, state, *, all_external_acceptance=False, predecessor=False):
+        """Unlink and sync stale authority before legacy bootstrap can bind it.
+
+        predecessor=True is only for a slot's first admission: no wrapped boot
+        of this container has run legacy code yet, so ANY pending acceptance
+        (ordinary, foreign or this cutover's) belongs to a removed predecessor.
+        """
         for name in ("accepted.json", "ack.json"):
             value = self._read(ledger, name)
+            if predecessor and name == "accepted.json" and value is not None:
+                os.unlink(name, dir_fd=ledger)
+                os.fsync(ledger)
+                continue
             foreign_cutover = (all_external_acceptance and name == "accepted.json"
                                and isinstance(value, dict) and value.get("version") == 1
                                and value.get("action") == "external_cutover")
@@ -720,21 +754,24 @@ class AdmissionStore:
                 _require(state["slots"][role]["consumed"] is None, "slot consumed")
                 receipt = state["receipt"]
                 if state.get("ledger_degraded"):
-                    self._retire_matching(ledger, state, all_external_acceptance=True)
+                    self._retire_matching(ledger, state, predecessor=True)
                     attempt.update(state="admitted", boot_id=boot_id, continuation=False)
                     state["slots"][role]["consumed"] = {"generation": attempt["generation"], "boot_id": boot_id}
                     self._save(directory, state)
                     return "service_only"
+                # Lost or replaced cutover evidence costs continuation, never
+                # service: the exact quiescence/attempt checks above already
+                # passed. Only a malformed acceptance of THIS cutover refuses.
                 original = self._read(ledger, "cutover-receipt.json")
-                _require(original == receipt, "original receipt changed or missing")
                 existing = self._read(ledger, "accepted.json")
-                _require(existing is None or self._matches(existing, state), "unrelated acceptance pending")
+                related = existing is None or self._matches(existing, state)
                 prior_boot = self._read(ledger, "boot-id", text=True)
                 ack = self._read(ledger, "ack.json")
-                if existing is not None:
+                if existing is not None and related:
                     _require(_token(existing.get("source_boot_id")), "invalid acceptance source")
                     self._receipt(existing, state["operation"], existing["source_boot_id"])
-                eligible = bool(_token(prior_boot) and prior_boot != boot_id
+                eligible = bool(original == receipt and related
+                                and _token(prior_boot) and prior_boot != boot_id
                                 and receipt["accepted_at"] <= current + 5
                                 and current - receipt["accepted_at"] <= 3600
                                 and self._handoff_evidence(state, role, existing, ack, prior_boot))
@@ -742,7 +779,10 @@ class AdmissionStore:
                     self._write(ledger, "accepted.json", {**receipt, "source_boot_id": prior_boot,
                                                           "accepted_at": current})
                 else:
-                    self._retire_matching(ledger, state)
+                    # Durable BEFORE the admitted save and legacy exec: an
+                    # ordinary/foreign acceptance left by the removed
+                    # predecessor must not be bound to this boot as an ACK.
+                    self._retire_matching(ledger, state, predecessor=True)
                 attempt.update(state="admitted", boot_id=boot_id, continuation=eligible)
                 state["slots"][role]["consumed"] = {"generation": attempt["generation"], "boot_id": boot_id}
                 self._save(directory, state)

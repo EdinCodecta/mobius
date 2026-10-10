@@ -320,28 +320,32 @@ def test_discovery_does_not_treat_failed_query_as_empty_project():
     assert result.returncode == 1
 
 
-def _wrapped_identity(tmp_path):
+def _wrapped_identity(tmp_path, *, deployment="original-app-1", source="generated"):
     frozen = tmp_path / "etc/mobius-rebuild"
     attempts = frozen / "attempts"
     attempts.mkdir(parents=True)
     cid, token, operation = "a" * 64, "b" * 32, "c" * 32
     image = "sha256:" + "d" * 64
-    name = "mobius-admission-" + token
+    # The attempt has its own Compose project but the frozen deployment name.
+    attempt_project = "mobius-admission-" + token
     labels = {"io.mobius.admission.project": "original", "io.mobius.admission.operation": operation,
               "io.mobius.admission.role": "rollback", "io.mobius.admission.token": token}
     entrypoint = ["python3", "-I", "-S", "/run/mobius-boot-admission.py", "enter",
                   "--state-dir", "/run/mobius-admission", "--data-dir", "/data",
                   "--token", token, "--", "/usr/bin/tini", "-s", "--"]
-    app = {"image": image, "container_name": name, "labels": labels,
+    app = {"image": image, "container_name": deployment, "labels": labels,
            "entrypoint": entrypoint, "command": ["./scripts/entrypoint.sh"]}
-    expected = {"name": name, "services": {"app": app}}
-    (frozen / "config.json").write_text(json.dumps({"version": 3, "project": "original", "data_dir": "/host/data"}))
+    expected = {"name": attempt_project, "services": {"app": app}}
+    (frozen / "config.json").write_text(json.dumps({
+        "version": 4, "project": "original", "data_dir": "/host/data",
+        "deployment_name": deployment, "name_source": source}))
     (frozen / "image.override.yml").write_text(json.dumps(expected))
     attempt = attempts / (token + ".json")
     attempt.write_text(json.dumps(expected))
-    actual = {"Id": cid, "Image": image, "Name": "/" + name, "Entrypoint": entrypoint,
+    actual = {"Id": cid, "Image": image, "Name": "/" + deployment, "Entrypoint": entrypoint,
               "Cmd": app["command"], "Labels": {**labels,
-              "com.docker.compose.project": name, "com.docker.compose.service": "app",
+              "com.docker.compose.project": attempt_project, "com.docker.compose.service": "app",
+              "com.docker.compose.container-number": "1", "com.docker.compose.oneoff": "False",
               "com.docker.compose.project.working_dir": str(frozen),
               "com.docker.compose.project.config_files": str(attempt)},
               "Mounts": [
@@ -350,18 +354,45 @@ def _wrapped_identity(tmp_path):
                   {"Destination": "/data", "Source": "/host/data", "Type": "volume", "RW": True},
               ]}
     code = _heredoc("PY_ADMISSION").replace("/etc/mobius-rebuild", str(frozen))
+    if os.geteuid() != 0:
+        # Unprivileged runs substitute only the trusted owner; root runs keep 0.
+        assert code.count("info.st_uid == 0") == 1
+        code = code.replace("info.st_uid == 0", f"info.st_uid == {os.geteuid()}")
     return frozen, attempt, actual, code, cid
 
 
-@pytest.mark.skipif(os.geteuid() != 0, reason="validates root-owned immutable attempt files")
 @pytest.mark.parametrize("mutation", [None, "owner", "compose_project", "token", "entrypoint", "command",
                                      "image", "code_writable", "state_readonly", "state_source", "data_source",
                                      "duplicate_mount", "config_files", "immutable_changed", "immutable_symlink",
-                                     "immutable_writable", "immutable_directory_symlink"])
+                                     "immutable_writable", "immutable_directory_symlink", "config_v3",
+                                     "name_source", "live_renamed", "token_derived_name",
+                                     "attempt_shares_original_project", "frozen_name_changed"])
 def test_wrapped_reinstall_requires_frozen_identity_and_immutable_attempt(tmp_path, mutation):
     frozen, attempt, actual, code, cid = _wrapped_identity(tmp_path)
+    configuration = json.loads((frozen / "config.json").read_text())
     if mutation == "owner":
-        (frozen / "config.json").write_text(json.dumps({"version": 3, "project": "wrong", "data_dir": "/host/data"}))
+        (frozen / "config.json").write_text(json.dumps({**configuration, "project": "wrong"}))
+    elif mutation == "config_v3":
+        # Admission-managed apps exist only with frozen v4 identity: no shim.
+        (frozen / "config.json").write_text(json.dumps({"version": 3, "project": "original", "data_dir": "/host/data"}))
+    elif mutation == "name_source":
+        (frozen / "config.json").write_text(json.dumps({**configuration, "name_source": "renamed"}))
+    elif mutation == "frozen_name_changed":
+        (frozen / "config.json").write_text(json.dumps({**configuration, "deployment_name": "original-app-2"}))
+    elif mutation == "live_renamed":
+        actual["Name"] = "/renamed-app"
+    elif mutation in ("token_derived_name", "attempt_shares_original_project"):
+        document = json.loads(attempt.read_text())
+        if mutation == "token_derived_name":
+            # The superseded per-attempt name would let raw Compose add a writer.
+            name = "mobius-admission-" + "b" * 32
+            document["services"]["app"]["container_name"] = name
+            actual["Name"] = "/" + name
+        else:
+            document["name"] = "original"
+            actual["Labels"]["com.docker.compose.project"] = "original"
+        attempt.write_text(json.dumps(document))
+        (frozen / "image.override.yml").write_text(json.dumps(document))
     elif mutation == "compose_project":
         actual["Labels"]["com.docker.compose.project"] = "original"
     elif mutation == "token":
@@ -617,7 +648,6 @@ MIGRATION_COMPLETE=1
         assert (tmp_path / (unit + '.state')).read_text() == 'active'
 
 
-@pytest.mark.skipif(os.geteuid() != 0, reason="validates root-owned immutable attempt files")
 @pytest.mark.parametrize("observed_command", [None, [], ["unexpected"], False])
 def test_wrapped_reinstall_preserves_literal_argv_and_empty_command(tmp_path, observed_command):
     frozen, attempt, actual, code, cid = _wrapped_identity(tmp_path)
@@ -633,3 +663,185 @@ def test_wrapped_reinstall_preserves_literal_argv_and_empty_command(tmp_path, ob
     result = subprocess.run([sys.executable, "-c", code, "original", cid, json.dumps(actual)],
                             capture_output=True, text=True)
     assert (result.returncode == 0) is (observed_command is None or observed_command == []), result.stderr
+
+
+def _identity(tmp_path, *, managed=False, name="/original-app-1", explicit=None, labels=None,
+              config=None):
+    """Run the real deployment-name freeze against isolated JSON fixtures."""
+    frozen = tmp_path / "etc/mobius-rebuild"
+    frozen.mkdir(parents=True, exist_ok=True)
+    if config is not None:
+        (frozen / "config.json").write_text(json.dumps(config))
+    app = {"image": "original"}
+    if explicit is not None:
+        app["container_name"] = explicit
+    resolved = tmp_path / "resolved.json"
+    resolved.write_text(json.dumps({"services": {"app": app}}))
+    observed = {"com.docker.compose.project": "original", "com.docker.compose.service": "app",
+                "com.docker.compose.container-number": "1", "com.docker.compose.oneoff": "False"}
+    observed.update(labels or {})
+    observed = {key: value for key, value in observed.items() if value is not None}
+    code = _heredoc("PY_IDENTITY").replace("/etc/mobius-rebuild", str(frozen))
+    result = subprocess.run(
+        [sys.executable, "-c", code, "original", "1" if managed else "0", str(resolved),
+         json.dumps({"Name": name, "Labels": observed})],
+        capture_output=True, text=True,
+    )
+    return result, (json.loads(result.stdout) if result.returncode == 0 else None)
+
+
+@pytest.mark.parametrize("name,explicit,labels,frozen", [
+    ("/mobius-prod", "mobius-prod", {}, ("mobius-prod", "explicit")),
+    # An explicit name need not follow the Compose pattern or the label number.
+    ("/mobius-prod", "mobius-prod", {"com.docker.compose.container-number": "3"}, ("mobius-prod", "explicit")),
+    ("/original-app-1", None, {}, ("original-app-1", "generated")),
+    ("/original_app_1", None, {}, ("original_app_1", "generated")),
+    # A non-first replica index is preserved only as an explicit stable name.
+    ("/original-app-2", "original-app-2", {"com.docker.compose.container-number": "2"},
+     ("original-app-2", "explicit")),
+])
+def test_legacy_app_freezes_its_unrenamed_original_name(tmp_path, name, explicit, labels, frozen):
+    result, identity = _identity(tmp_path, name=name, explicit=explicit, labels=labels)
+    assert result.returncode == 0, result.stderr
+    assert identity == {"deployment_name": frozen[0], "name_source": frozen[1]}
+
+
+@pytest.mark.parametrize("name,explicit,labels", [
+    ("/renamed", None, {}),                                       # docker rename of a generated app
+    ("/original-app-2", None, {}),                                # name disagrees with its label number
+    ("/original-app-1-x", None, {}),
+    ("/other-app-1", None, {}),                                   # another project's generated name
+    ("/original-app-run-0123abcd", None, {}),                     # compose run one-off
+    ("/original-app-1", None, {"com.docker.compose.oneoff": "True"}),
+    ("/original-app-1", None, {"com.docker.compose.service": "caddy"}),
+    ("/original-app-1", None, {"com.docker.compose.project": "other"}),
+    ("/original-app-1", None, {"com.docker.compose.container-number": None}),
+    ("/original-app-01", None, {"com.docker.compose.container-number": "01"}),
+    ("/original-app-1", "mobius-prod", {}),                       # explicit name not the live name
+    ("/mobius-prod", "mobius-renamed", {}),                       # renamed explicit source
+    ("/original-app-1", "original-app-1/x", {}),                  # invalid explicit name
+    ("original-app-1", None, {}),                                 # not Docker's absolute name form
+    ("/original-app-1", "", {}),
+    ("/" + "m" * 129, "m" * 129, {}),                             # beyond the host's name bound
+])
+def test_legacy_app_with_renamed_or_unproven_name_is_refused(tmp_path, name, explicit, labels):
+    result, _ = _identity(tmp_path, name=name, explicit=explicit, labels=labels)
+    assert result.returncode != 0
+    assert "Refusing to freeze the deployment container name" in result.stderr
+
+
+@pytest.mark.parametrize("name,number", [
+    ("/original-app-2", "2"), ("/original_app_2", "2"), ("/original-app-10", "10"),
+])
+def test_generated_index_other_than_one_requires_explicit_stable_name(tmp_path, name, number):
+    # Raw Compose on an emptied original project recreates index 1, so a frozen
+    # index-2 name could never collide with it: refuse, never install that hole.
+    result, _ = _identity(tmp_path, name=name, labels={"com.docker.compose.container-number": number})
+    assert result.returncode != 0
+    assert f"generated app index {number}" in result.stderr
+    assert f"set the app's container_name to {name[1:]!r}" in result.stderr
+    assert "rerun this installer" in result.stderr
+    # The documented migration path is then accepted as an explicit name.
+    result, identity = _identity(tmp_path, name=name, explicit=name[1:],
+                                 labels={"com.docker.compose.container-number": number})
+    assert result.returncode == 0, result.stderr
+    assert identity == {"deployment_name": name[1:], "name_source": "explicit"}
+
+
+def _v4(**changes):
+    return {"version": 4, "project": "original", "data_dir": "/host/data",
+            "deployment_name": "original-app-1", "name_source": "generated", **changes}
+
+
+@pytest.mark.parametrize("config,name,explicit", [
+    (_v4(), "/original-app-1", None),
+    (_v4(deployment_name="original_app_1"), "/original_app_1", None),
+    (_v4(deployment_name="mobius-prod", name_source="explicit"), "/mobius-prod", "mobius-prod"),
+])
+def test_managed_reinstall_preserves_frozen_name_exactly(tmp_path, config, name, explicit):
+    # Attempt labels replace the original project/number labels; frozen fields win.
+    labels = {"com.docker.compose.project": "mobius-admission-" + "b" * 32}
+    result, identity = _identity(tmp_path, managed=True, name=name, explicit=explicit,
+                                 labels=labels, config=config)
+    assert result.returncode == 0, result.stderr
+    assert identity == {"deployment_name": config["deployment_name"],
+                        "name_source": config["name_source"]}
+
+
+@pytest.mark.parametrize("config,name,explicit", [
+    ({"version": 3, "project": "original", "data_dir": "/host/data"}, "/original-app-1", None),
+    (_v4(project="other"), "/original-app-1", None),
+    (_v4(), "/original-app-2", None),                             # live name differs from frozen
+    (_v4(), "/mobius-admission-" + "b" * 32, None),               # superseded per-attempt name
+    (_v4(), "/original-app-1", "original-app-1"),                 # base gained an explicit name
+    (_v4(deployment_name="renamed"), "/renamed", None),           # generated source must match pattern
+    (_v4(deployment_name="original-app-2"), "/original-app-2", None),  # generated index must be 1
+    (_v4(deployment_name="original_app_2"), "/original_app_2", None),
+    (_v4(deployment_name="mobius-prod", name_source="explicit"), "/mobius-prod", None),
+    (_v4(deployment_name="mobius-prod", name_source="explicit"), "/mobius-prod", "mobius-renamed"),
+    (_v4(name_source="observed"), "/original-app-1", None),
+    (_v4(deployment_name=None), "/original-app-1", None),
+])
+def test_managed_reinstall_refuses_inconsistent_or_renamed_identity(tmp_path, config, name, explicit):
+    result, _ = _identity(tmp_path, managed=True, name=name, explicit=explicit, config=config)
+    assert result.returncode != 0
+    assert "Refusing to freeze the deployment container name" in result.stderr
+
+
+def test_config_v4_freezes_only_the_validated_identity(tmp_path):
+    frozen = tmp_path / "etc/mobius-rebuild"
+    frozen.mkdir(parents=True)
+    code = _heredoc("PY").replace("/etc/mobius-rebuild", str(frozen))
+    identity = {"deployment_name": "original_app_1", "name_source": "generated"}
+    result = subprocess.run([sys.executable, "-c", code, "original", "/host/data", json.dumps(identity)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((frozen / "config.json").read_text()) == {
+        "version": 4, "project": "original", "data_dir": "/host/data", **identity}
+    assert stat.S_IMODE((frozen / "config.json").stat().st_mode) == 0o600
+    before = (frozen / "config.json").read_bytes()
+    result = subprocess.run([sys.executable, "-c", code, "original", "/host/data",
+                             json.dumps({**identity, "extra": True})], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert (frozen / "config.json").read_bytes() == before
+
+
+def test_deployment_name_is_frozen_before_mutation_and_rechecked_under_locks():
+    preflight = SOURCE.index("\nIDENTITY=$(deployment_identity)\n")
+    assert SOURCE.index("expected-networks") < preflight < SOURCE.index("umask 077")
+    assert preflight < SOURCE.index("systemctl stop")
+    locked = SOURCE.split("flock -w 30 9", 1)[1]
+    recheck = locked.index('[[ $(deployment_identity) == "$IDENTITY" ]]')
+    assert locked.index('[[ $(discover_app) == "$CID" ]]') < recheck < locked.index("# BEGIN PINNED")
+    assert locked.index("verify_admission_identity") < recheck
+    assert 'python3 - "$PROJECT" "$DATA_SOURCE" "$IDENTITY" <<\'PY\'' in SOURCE
+    # Frozen v3 is the only migration source; helper-managed apps need v4.
+    assert 'configuration.get("version") not in (3, 4)' in _heredoc("PY_OWNER")
+    assert 'configuration.get("version") == 4' in _heredoc("PY_ADMISSION")
+
+
+def test_identity_recheck_refuses_a_rename_during_preflight(tmp_path):
+    line = SOURCE.split('[[ $(deployment_identity) == "$IDENTITY" ]]', 1)[1].split("\n\n", 1)[0]
+    code = ('deployment_identity() { printf \'{"deployment_name":"renamed","name_source":"generated"}\'; }\n'
+            'IDENTITY=\'{"deployment_name":"original-app-1","name_source":"generated"}\'\n'
+            '[[ $(deployment_identity) == "$IDENTITY" ]]' + line + '\ntouch "$PUBLISHED"\n')
+    published = tmp_path / "published"
+    result = subprocess.run(["bash", "-eu", "-c", code], capture_output=True, text=True,
+                            env={**os.environ, "PUBLISHED": str(published)})
+    assert result.returncode == 1
+    assert "deployment name changed" in result.stderr
+    assert not published.exists()
+
+
+def test_installer_preserves_existing_root_controller_state():
+    # Host-owned removal tombstones and other records under the private state
+    # directory are never deleted or reset; the only removal is its temp file.
+    shell = SOURCE
+    for tag in ("EOF", "PY", "PY_GATE", "PY_BASE", "PY_IDENTITY", "PY_ADMISSION", "PY_OWNER", "PY_DATA"):
+        shell = re.sub(r"<<'?" + tag + r"'?\n.*?\n" + tag + r"\n", "\n", shell, flags=re.S)
+    removals = re.findall(r"\b(?:rm|unlink|rmdir|truncate|shred)\b[^\n]*", shell)
+    assert removals and all(item == 'rm -f "$RESOLVED"' or item.startswith('rm -f "$RESOLVED"\'')
+                            for item in removals), removals
+    assert not re.search(r">\s*/var/lib/mobius-rebuild/(?!candidate\.lock|replace\.lock)", shell)
+    for tag in ("PY_GATE", "PY_IDENTITY", "PY"):
+        assert not re.search(r"rmtree|\.unlink\((?!missing_ok)|os\.remove|os\.rmdir", _heredoc(tag)), tag

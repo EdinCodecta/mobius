@@ -79,6 +79,44 @@ def rollback_open(store):
     assert store.issue_start("rollback", TOKEN)
 
 
+def source_watchdog_restart(legacy, at=NOW + 90):
+    """The source app's abandoned-cutover watchdog requests an ORDINARY restart
+    for the same drained runs; the real root poller accepts it."""
+    request = {"version": 1, "nonce": "nonce-original-12345678", "source_boot_id": SOURCE_BOOT,
+               "created_at": at, "runs": []}
+    legacy.INTENT_PATH.write_text(json.dumps(request))
+    legacy.REQUEST_PATH.write_text(json.dumps({"nonce": request["nonce"], "source_boot_id": SOURCE_BOOT}))
+    assert legacy.accept(SOURCE_BOOT, now=at)
+    accepted = json.loads(legacy.ACCEPTED_PATH.read_text())
+    assert accepted.get("action") is None
+    return accepted
+
+
+def first_attempt_open(store, role):
+    token, image, cid = ((TOKEN, IMAGE, ROLLBACK) if role == "rollback"
+                         else ("target-token-12345678", NEW_IMAGE, TARGET))
+    store.allocate(role, token, image)
+    store.bind(role, token, cid)
+    store.open(role, token)
+    assert store.issue_start(role, token)
+    return token
+
+
+def assert_service_without_handoff(store, legacy, role, token, boot, now):
+    """Admitted exactly once, no continuation, nothing for legacy to bind."""
+    assert not legacy.ACCEPTED_PATH.exists()
+    assert not legacy.begin_boot(boot, now=now)
+    assert not legacy.ACK_PATH.exists()
+    slot = store.observe()["slots"][role]
+    assert slot["consumed"] == {"generation": 1, "boot_id": boot}
+    assert slot["attempts"][0]["continuation"] is False
+    # A Docker restart-policy boot of the same admitted CID stays service-only.
+    assert store.enter(token, "same-cid-restart-12345678", now=now + 1) == "service_only"
+    assert not legacy.begin_boot("same-cid-restart-12345678", now=now + 1)
+    assert not legacy.ACK_PATH.exists()
+    assert store.observe()["slots"][role]["consumed"] == {"generation": 1, "boot_id": boot}
+
+
 def test_first_claim_preserves_exact_legacy_handoff(setup):
     _, store, legacy, receipt = setup
     rollback_open(store)
@@ -138,8 +176,11 @@ def test_unrelated_fresh_ordinary_restart_survives_cleanup(setup):
     assert json.loads(legacy.ACK_PATH.read_text())["nonce"] == request["nonce"]
 
 
-def test_closed_unknown_and_quiesced_tokens_do_not_touch_legacy_ledger(setup):
+@pytest.mark.parametrize("pending", ["cutover", "source-watchdog"])
+def test_closed_unknown_and_quiesced_tokens_do_not_touch_legacy_ledger(setup, pending):
     module, store, legacy, _ = setup
+    if pending == "source-watchdog":
+        source_watchdog_restart(legacy)
     rollback_open(store)
     assert store.close_pending("rollback", TOKEN)
     before = {p.name: p.read_bytes() for p in legacy.LEDGER_DIR.iterdir()}
@@ -514,10 +555,13 @@ def test_wrapper_main_preserves_argv_and_overrides_persisted_boot_id(setup, monk
     assert legacy.begin_boot(seen[0][2], now=NOW)
 
 
+@pytest.mark.parametrize("receipt", ["present", "missing"])
 @pytest.mark.parametrize("field,value", [("accepted_at", "invalid"), ("created_at", -1)])
-def test_malformed_matching_acceptance_is_not_repaired_by_refresh(setup, field, value):
+def test_malformed_matching_acceptance_is_not_repaired_by_refresh(setup, field, value, receipt):
     module, store, legacy, _ = setup
     rollback_open(store)
+    if receipt == "missing":  # lost receipt is not permission to discard corrupt own authority
+        legacy.CUTOVER_RECEIPT_PATH.unlink()
     acceptance = json.loads(legacy.ACCEPTED_PATH.read_text())
     acceptance[field] = value
     legacy.ACCEPTED_PATH.write_text(json.dumps(acceptance))
@@ -1057,3 +1101,411 @@ def test_closed_reset_owner_never_enters_but_fenced_successor_resumes_service_on
     assert not legacy.begin_boot("successor-boot-12345678", now=NOW + 1)
     assert store.observe()["slots"]["rollback"]["consumed"] == {
         "generation": 2, "boot_id": "successor-boot-12345678"}
+
+
+# Lost or replaced cutover evidence costs continuation, never service. The
+# exact quiescence/attempt checks still precede any ledger mutation, and any
+# authority a removed predecessor left pending is durably retired BEFORE the
+# admission is published or legacy bootstrap can bind it to this boot.
+def _pending_predecessor_authority(legacy, receipt, pending):
+    if pending == "source-watchdog":
+        return source_watchdog_restart(legacy)
+    value = ({**receipt, "nonce": "foreign-nonce-12345678"} if pending == "foreign-nonce"
+             else {**receipt, "cutover_id": "foreign-operation-12345678"})
+    legacy._write_json(legacy.ACCEPTED_PATH, value, 0o600)
+    return value
+
+
+@pytest.mark.parametrize("role", ["target", "rollback"])
+@pytest.mark.parametrize("timing", ["before-removal", "after-removal"])
+@pytest.mark.parametrize("pending", ["source-watchdog", "foreign-nonce", "foreign-operation"])
+def test_predecessor_pending_authority_costs_continuation_not_service(setup, role, timing, pending):
+    _, store, legacy, receipt = setup
+    receipt_bytes = legacy.CUTOVER_RECEIPT_PATH.read_bytes()
+    if timing == "after-removal":
+        store.quiesce(SOURCE)
+        assert store.observe()["source_handoff_valid"] is True
+    _pending_predecessor_authority(legacy, receipt, pending)
+    if timing == "before-removal":
+        store.quiesce(SOURCE)
+        assert store.observe()["source_handoff_valid"] is False
+    token = first_attempt_open(store, role)
+    boot = f"{role}-boot-12345678"
+    assert store.enter(token, boot, now=NOW + 91) == "service_only"
+    assert legacy.CUTOVER_RECEIPT_PATH.read_bytes() == receipt_bytes
+    assert_service_without_handoff(store, legacy, role, token, boot, NOW + 91)
+    assert store.observe()["receipt"] == receipt
+
+
+@pytest.mark.parametrize("role", ["target", "rollback"])
+@pytest.mark.parametrize("damage", ["missing", "reaccepted", "other-operation"])
+def test_receipt_lost_or_replaced_after_prepare_restores_service_only(setup, role, damage):
+    _, store, legacy, receipt = setup
+    store.quiesce(SOURCE)
+    assert store.observe()["source_handoff_valid"] is True
+    path = legacy.CUTOVER_RECEIPT_PATH
+    path.unlink()
+    if damage == "reaccepted":  # same operation re-accepted under a new nonce
+        replacement = {**receipt, "nonce": "reaccepted-nonce-12345678"}
+        legacy._write_json(legacy.ACCEPTED_PATH, replacement, 0o600)
+        legacy._write_json(path, replacement, 0o444)
+    elif damage == "other-operation":  # the still-matching acceptance stays
+        legacy._write_json(path, {**receipt, "cutover_id": "other-operation-12345678"}, 0o444)
+    after = path.read_bytes() if path.exists() else None
+    token = first_attempt_open(store, role)
+    boot = f"{role}-boot-12345678"
+    assert store.enter(token, boot, now=NOW) == "service_only"
+    assert (path.read_bytes() if path.exists() else None) == after  # receipt is never rewritten
+    assert_service_without_handoff(store, legacy, role, token, boot, NOW)
+    assert store.observe()["receipt"] == receipt
+
+
+def test_admitted_target_ordinary_restart_does_not_follow_into_rollback(setup):
+    _, store, legacy, _ = setup
+    store.quiesce(SOURCE)
+    target = first_attempt_open(store, "target")
+    assert store.enter(target, "target-boot-12345678", now=NOW) == "continuation"
+    assert legacy.begin_boot("target-boot-12345678", now=NOW)
+    request = {"version": 1, "nonce": "target-ordinary-12345678",
+               "source_boot_id": "target-boot-12345678", "created_at": NOW + 1}
+    legacy.INTENT_PATH.write_text(json.dumps(request))
+    legacy.REQUEST_PATH.write_text(json.dumps(request))
+    assert legacy.accept("target-boot-12345678", now=NOW + 1)
+    store.quiesce(TARGET)  # host removed the target with its ordinary restart pending
+    token = first_attempt_open(store, "rollback")
+    assert store.enter(token, "rollback-boot-12345678", now=NOW + 2) == "service_only"
+    assert_service_without_handoff(store, legacy, "rollback", token, "rollback-boot-12345678", NOW + 2)
+    assert store.observe()["slots"]["target"]["consumed"]["boot_id"] == "target-boot-12345678"
+
+
+@pytest.mark.parametrize("degraded", ["prepared-service-only", "reset"])
+def test_degraded_first_admission_retires_predecessor_ordinary_restart(setup, tmp_path, degraded):
+    module, prepared, legacy, _ = setup
+    source_watchdog_restart(legacy)
+    if degraded == "prepared-service-only":
+        legacy.CUTOVER_RECEIPT_PATH.unlink()
+        store = module.AdmissionStore(tmp_path / "service-gate", prepared.data_dir, os.getuid(), os.getgid())
+        store.prepare_for_recovery(OP, SOURCE, IMAGE, allow_service_only=True)
+    else:
+        # Partial ownership sweep: acceptance, boot and directory stay trusted,
+        # so the reset carries the fresh ordinary acceptance into a new ledger.
+        store = prepared
+        legacy.CUTOVER_RECEIPT_PATH.chmod(0o666)
+    store.quiesce(SOURCE)
+    token = first_attempt_open(store, "target")
+    assert store.enter(token, "target-boot-12345678", now=NOW + 91) == "service_only"
+    assert store.observe()["ledger_degraded"] is True
+    assert_service_without_handoff(store, legacy, "target", token, "target-boot-12345678", NOW + 91)
+
+
+def test_predecessor_retirement_is_durable_before_admission_is_published(setup, monkeypatch):
+    module, store, legacy, _ = setup
+    source_watchdog_restart(legacy)
+    store.quiesce(SOURCE)
+    token = first_attempt_open(store, "target")
+    ledger = legacy.LEDGER_DIR.stat()
+    events = []
+    unlink, fsync, replace = module.os.unlink, module.os.fsync, module.os.replace
+    def traced_unlink(name, **kwargs):
+        unlink(name, **kwargs)
+        events.append(("unlink", name))
+    def traced_fsync(fd):
+        fsync(fd)
+        info = os.fstat(fd)
+        events.append(("fsync", "ledger" if (info.st_dev, info.st_ino) == (ledger.st_dev, ledger.st_ino)
+                       else "other"))
+    def traced_replace(source, target, **kwargs):
+        replace(source, target, **kwargs)
+        events.append(("replace", target))
+    monkeypatch.setattr(module.os, "unlink", traced_unlink)
+    monkeypatch.setattr(module.os, "fsync", traced_fsync)
+    monkeypatch.setattr(module.os, "replace", traced_replace)
+    assert store.enter(token, "target-boot-12345678", now=NOW + 91) == "service_only"
+    retired = events.index(("unlink", "accepted.json"))
+    synced = events.index(("fsync", "ledger"), retired)
+    published = events.index(("replace", "state.json"))
+    assert retired < synced < published
+    assert ("replace", "accepted.json") not in events
+
+
+@pytest.mark.parametrize("boundary", ["before", "after"])
+def test_interrupted_predecessor_retirement_resumes_service_only(setup, monkeypatch, boundary):
+    module, store, legacy, _ = setup
+    source_watchdog_restart(legacy)
+    store.quiesce(SOURCE)
+    token = first_attempt_open(store, "rollback")
+    unlink = module.os.unlink
+    def interrupted(name, **kwargs):
+        if name == "accepted.json" and boundary == "before":
+            raise PowerLoss()
+        unlink(name, **kwargs)
+        if name == "accepted.json":
+            raise PowerLoss()
+    monkeypatch.setattr(module.os, "unlink", interrupted)
+    with pytest.raises(PowerLoss):
+        store.enter(token, "interrupted-boot-12345678", now=NOW + 91)
+    monkeypatch.setattr(module.os, "unlink", unlink)
+    assert store.observe()["slots"]["rollback"]["consumed"] is None
+    assert legacy.ACCEPTED_PATH.exists() is (boundary == "before")
+    assert store.enter(token, "rollback-boot-12345678", now=NOW + 92) == "service_only"
+    assert_service_without_handoff(store, legacy, "rollback", token, "rollback-boot-12345678", NOW + 92)
+
+
+@pytest.mark.parametrize("role", ["target", "rollback"])
+def test_process_death_around_every_predecessor_retirement_fsync(setup, tmp_path, role):
+    """os._exit/injected EIO at each fsync of a first, service-only admission."""
+    import shutil
+    _, store, legacy, _ = setup
+    source_watchdog_restart(legacy)
+    store.quiesce(SOURCE)
+    token = first_attempt_open(store, role)
+    child = '''import importlib.util,os,sys
+s=importlib.util.spec_from_file_location("gate",sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+g=m.AdmissionStore(sys.argv[2],sys.argv[3],os.getuid(),os.getgid())
+original=os.fsync; count=0; stop=int(sys.argv[4]); phase=sys.argv[5]
+def sync(fd):
+ global count
+ count+=1
+ if count==stop and phase=="before": os._exit(91)
+ if count==stop and phase=="error": raise OSError(5,"injected fsync failure")
+ original(fd)
+ if count==stop and phase=="after": os._exit(91)
+os.fsync=sync
+print(g.enter(sys.argv[6],"interrupted-boot-12345678",now=float(sys.argv[7])))
+print(count)
+'''
+    def copied(name):
+        root = tmp_path / name
+        root.mkdir()
+        shutil.copytree(store.state_dir, root / "gate")
+        shutil.copytree(store.data_dir, root / "data")
+        return root
+    def invoke(root, stop, phase):
+        return subprocess.run([sys.executable, "-c", child, str(GATE_PATH), str(root / "gate"),
+            str(root / "data"), str(stop), phase, token, str(NOW + 91)],
+            capture_output=True, text=True, timeout=10)
+    count = invoke(copied("count"), 0, "after")
+    assert count.returncode == 0, count.stderr
+    result, boundaries = count.stdout.split()
+    assert result == "service_only"
+    boundaries = int(boundaries)
+    assert boundaries >= 4
+    for phase in ("before", "after", "error"):
+        for stop in range(1, boundaries + 1):
+            root = copied(f"{phase}-{stop}")
+            outcome = invoke(root, stop, phase)
+            assert outcome.returncode == (1 if phase == "error" else 91), (phase, stop, outcome.stderr)
+            if phase == "error":
+                assert "injected fsync failure" in outcome.stderr
+            resumed = load(GATE_PATH, "resumed_gate").AdmissionStore(
+                root / "gate", root / "data", os.getuid(), os.getgid())
+            frozen = legacy_at(root / "data")
+            crashed = resumed.observe()["slots"][role]["consumed"]
+            if crashed is not None:  # publication never precedes retirement
+                assert not frozen.ACCEPTED_PATH.exists(), (phase, stop)
+            assert resumed.enter(token, "resumed-boot-12345678", now=NOW + 92) == "service_only"
+            assert not frozen.begin_boot("resumed-boot-12345678", now=NOW + 92), (phase, stop)
+            assert not frozen.ACK_PATH.exists()
+            final = resumed.observe()["slots"][role]
+            assert final["attempts"][0]["continuation"] is False
+            assert final["consumed"] == (crashed or {"generation": 1, "boot_id": "resumed-boot-12345678"})
+
+
+def test_wrapper_retires_source_watchdog_restart_before_legacy_exec(setup, monkeypatch):
+    module, store, legacy, _ = setup
+    source_watchdog_restart(legacy)
+    store.quiesce(SOURCE)
+    token = first_attempt_open(store, "target")
+    monkeypatch.setattr(module, "AdmissionStore", lambda *_args: store)
+    monkeypatch.setattr(module.time, "time", lambda: NOW + 91)
+    monkeypatch.setenv("MOBIUS_BOOT_ID", "persisted-boot-must-not-recur")
+    seen = []
+    def execute(_program, _argv):
+        # The original entrypoint's first act: the untouched legacy bootstrap.
+        seen.append((legacy.ACCEPTED_PATH.exists(),
+                     legacy.begin_boot(os.environ["MOBIUS_BOOT_ID"], now=NOW + 91)))
+        raise PowerLoss()
+    monkeypatch.setattr(module.os, "execvp", execute)
+    with pytest.raises(PowerLoss):
+        module.main(["enter", "--state-dir", str(store.state_dir), "--data-dir", str(store.data_dir),
+                     "--token", token, "--", "/original/entrypoint"])
+    assert seen == [(False, False)]
+    assert not legacy.ACK_PATH.exists()
+    assert store.observe()["slots"]["target"]["attempts"][0]["continuation"] is False
+
+
+# Never-created cancellation: fenced(role, token, None) is the host's explicit
+# assertion for a CLOSED attempt that was never bound and never issued, so no
+# Start could exist. Bound or issued attempts still need exact-CID removal.
+TARGET_TOKEN = "target-token-12345678"
+
+
+def _ledger_bytes(legacy):
+    return {p.name: p.read_bytes() for p in legacy.LEDGER_DIR.iterdir()}
+
+
+def test_never_created_target_cancellation_unblocks_rollback_handoff(setup):
+    module, store, legacy, _ = setup
+    store.quiesce(SOURCE)
+    store.allocate("target", TARGET_TOKEN, NEW_IMAGE)
+    with pytest.raises(module.AdmissionError):
+        store.fenced("target", TARGET_TOKEN, None)  # not closed yet
+    with pytest.raises(module.AdmissionError, match="target not quiesced"):
+        store.allocate("rollback", TOKEN, IMAGE)
+    assert store.close_pending("target", TARGET_TOKEN)
+    with pytest.raises(module.AdmissionError, match="target not quiesced"):
+        store.allocate("rollback", TOKEN, IMAGE)  # closed alone is not a fence
+    quiesced = store.observe()["quiesced"]
+    store.fenced("target", TARGET_TOKEN, None)
+    store.fenced("target", TARGET_TOKEN, None)  # idempotent replay
+    attempt = store.observe()["slots"]["target"]["attempts"][0]
+    assert (attempt["state"], attempt["cid"], attempt["issued"], attempt["fenced"]) == (
+        "closed", None, False, True)
+    assert store.observe()["quiesced"] == quiesced
+    # The lineage is final: no later CID, exact fence, reopen or start.
+    for action in (lambda: store.bind("target", TARGET_TOKEN, TARGET),
+                   lambda: store.fenced("target", TARGET_TOKEN, TARGET),
+                   lambda: store.open("target", TARGET_TOKEN),
+                   lambda: store.issue_start("target", TARGET_TOKEN)):
+        with pytest.raises(module.AdmissionError):
+            action()
+    # A delayed stray no-start Create with this token never reaches legacy.
+    before = _ledger_bytes(legacy)
+    with pytest.raises(module.AdmissionError):
+        store.enter(TARGET_TOKEN, "stray-target-boot-12345678", now=NOW)
+    assert _ledger_bytes(legacy) == before
+    store.allocate("rollback", TOKEN, IMAGE)
+    store.bind("rollback", TOKEN, ROLLBACK)
+    store.open("rollback", TOKEN)
+    assert store.issue_start("rollback", TOKEN)
+    assert store.enter(TOKEN, "rollback-boot-12345678", now=NOW) == "continuation"
+    assert legacy.begin_boot("rollback-boot-12345678", now=NOW)
+    assert json.loads(legacy.ACK_PATH.read_text())["source_boot_id"] == SOURCE_BOOT
+
+
+def test_never_created_cancellation_allows_next_target_generation(setup):
+    _, store, legacy, _ = setup
+    store.quiesce(SOURCE)
+    store.allocate("target", TARGET_TOKEN, NEW_IMAGE)
+    store.close_pending("target", TARGET_TOKEN)
+    store.fenced("target", TARGET_TOKEN, None)
+    successor = "target-next-token-12345678"
+    assert store.allocate("target", successor, NEW_IMAGE)["generation"] == 2
+    store.bind("target", successor, TARGET)
+    store.open("target", successor)
+    store.issue_start("target", successor)
+    assert store.enter(successor, "target-boot-12345678", now=NOW) == "continuation"
+    assert legacy.begin_boot("target-boot-12345678", now=NOW)
+
+
+@pytest.mark.parametrize("stage", ["bound-closed", "issued-closed", "open", "allocated", "rollback-closed"])
+def test_null_fence_rejects_bound_issued_or_unclosed_attempt(setup, stage):
+    module, store, legacy, _ = setup
+    store.quiesce(SOURCE)
+    role, token = ("rollback", TOKEN) if stage == "rollback-closed" else ("target", TARGET_TOKEN)
+    store.allocate(role, token, IMAGE if role == "rollback" else NEW_IMAGE)
+    if stage != "allocated":
+        store.bind(role, token, ROLLBACK if role == "rollback" else TARGET)
+    if stage in {"issued-closed", "open", "rollback-closed"}:
+        store.open(role, token)
+    if stage in {"issued-closed", "rollback-closed"}:
+        assert store.issue_start(role, token)
+    if stage.endswith("-closed"):
+        assert store.close_pending(role, token)
+    state_bytes = (store.state_dir / "state.json").read_bytes()
+    with pytest.raises(module.AdmissionError, match="without a container"):
+        store.fenced(role, token, None)
+    assert (store.state_dir / "state.json").read_bytes() == state_bytes
+    if role == "target":
+        with pytest.raises(module.AdmissionError, match="target not quiesced"):
+            store.allocate("rollback", TOKEN, IMAGE)
+    if stage == "issued-closed":  # a possibly started target still fences only by exact removal
+        store.fenced("target", TARGET_TOKEN, TARGET)
+        store.allocate("rollback", TOKEN, IMAGE)
+
+
+@pytest.mark.parametrize("mutation", ["issued", "bound-unquiesced", "unclosed"])
+def test_persisted_null_fence_history_is_validated(setup, mutation):
+    module, store, legacy, _ = setup
+    store.quiesce(SOURCE)
+    store.allocate("target", TARGET_TOKEN, NEW_IMAGE)
+    store.close_pending("target", TARGET_TOKEN)
+    store.fenced("target", TARGET_TOKEN, None)
+    path = store.state_dir / "state.json"
+    state = json.loads(path.read_text())
+    attempt = state["slots"]["target"]["attempts"][0]
+    if mutation == "issued":
+        attempt["issued"] = True
+    elif mutation == "bound-unquiesced":
+        attempt["cid"] = TARGET
+    else:
+        attempt["state"] = "allocated"
+    path.write_text(json.dumps(state))
+    with pytest.raises(module.AdmissionError):
+        store.observe()
+    with pytest.raises(module.AdmissionError):
+        store.allocate("rollback", TOKEN, IMAGE)
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_null_fence_publication_crash_replays_idempotently(setup, monkeypatch, when):
+    _, store, legacy, _ = setup
+    store.quiesce(SOURCE)
+    store.allocate("target", TARGET_TOKEN, NEW_IMAGE)
+    store.close_pending("target", TARGET_TOKEN)
+    save = store._save
+    def interrupted(directory, value):
+        if when == "after":
+            save(directory, value)
+        raise PowerLoss()
+    monkeypatch.setattr(store, "_save", interrupted)
+    with pytest.raises(PowerLoss):
+        store.fenced("target", TARGET_TOKEN, None)
+    monkeypatch.setattr(store, "_save", save)
+    assert store.observe()["slots"]["target"]["attempts"][0]["fenced"] is (when == "after")
+    store.fenced("target", TARGET_TOKEN, None)
+    assert store.observe()["slots"]["target"]["attempts"][0]["fenced"] is True
+    store.allocate("rollback", TOKEN, IMAGE)
+    store.bind("rollback", TOKEN, ROLLBACK)
+    store.open("rollback", TOKEN)
+    store.issue_start("rollback", TOKEN)
+    assert store.enter(TOKEN, "rollback-boot-12345678", now=NOW) == "continuation"
+    assert legacy.begin_boot("rollback-boot-12345678", now=NOW)
+
+
+def test_null_fence_every_fsync_failure_propagates_and_replays(setup, monkeypatch):
+    module, store, _, _ = setup
+    store.quiesce(SOURCE)
+    store.allocate("target", TARGET_TOKEN, NEW_IMAGE)
+    store.close_pending("target", TARGET_TOKEN)
+    fsync = module.os.fsync
+    count = [0]
+    def counting(fd):
+        count[0] += 1
+        return fsync(fd)
+    probe = module.AdmissionStore(store.state_dir.parent / "probe", store.data_dir, os.getuid(), os.getgid())
+    import shutil
+    shutil.copytree(store.state_dir, probe.state_dir)
+    monkeypatch.setattr(module.os, "fsync", counting)
+    probe.fenced("target", TARGET_TOKEN, None)
+    boundaries = count[0]
+    assert boundaries >= 3
+    for failure in range(1, boundaries + 1):
+        copy = module.AdmissionStore(store.state_dir.parent / f"copy-{failure}", store.data_dir,
+                                     os.getuid(), os.getgid())
+        shutil.copytree(store.state_dir, copy.state_dir)
+        count[0] = 0
+        def failing(fd, failure=failure):
+            count[0] += 1
+            if count[0] == failure:
+                raise OSError(5, "injected fsync failure")
+            return fsync(fd)
+        monkeypatch.setattr(module.os, "fsync", failing)
+        with pytest.raises(OSError, match="injected fsync failure"):
+            copy.fenced("target", TARGET_TOKEN, None)
+        monkeypatch.setattr(module.os, "fsync", fsync)
+        copy.fenced("target", TARGET_TOKEN, None)
+        attempt = copy.observe()["slots"]["target"]["attempts"][0]
+        assert (attempt["state"], attempt["cid"], attempt["issued"], attempt["fenced"]) == (
+            "closed", None, False, True)
+        copy.allocate("rollback", TOKEN, IMAGE)

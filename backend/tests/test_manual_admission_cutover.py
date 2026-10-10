@@ -20,12 +20,28 @@ TARGET = 'sha256:' + 'c' * 64
 SHA = 'd' * 40
 
 
-def topology(*, project='mobius', volume='mobius_app_data', network='mobius_default'):
+GENERATED = {'project': 'mobius', 'deployment_name': 'mobius-app-1', 'name_source': 'generated'}
+EXPLICIT = {'project': 'mobius', 'deployment_name': 'mobius', 'name_source': 'explicit'}
+
+
+def topology(*, project='mobius', volume='mobius_app_data', network='mobius_default',
+             container_name=None):
+    app = {'volumes': [{'type': 'volume', 'source': 'app_data', 'target': '/data'}]}
+    if container_name is not None:
+        app['container_name'] = container_name
     return {'name': project,
-            'services': {'app': {'volumes': [{'type': 'volume', 'source': 'app_data',
-                                             'target': '/data'}]}},
+            'services': {'app': app},
             'volumes': {'app_data': {'name': volume}},
             'networks': {'default': {'name': network}}}
+
+
+class _Fixture(tuple):
+    """The original 4-tuple plus mutable frozen config and frozen-base handles."""
+
+    def __new__(cls, items, *, frozen, source):
+        value = super().__new__(cls, items)
+        value.frozen, value.source = frozen, source
+        return value
 
 
 @pytest.fixture
@@ -49,11 +65,13 @@ def fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(adapter, 'TRUSTED_UID', os.geteuid())
     monkeypatch.setattr(adapter, 'TRUSTED_GID', os.getegid())
     calls = []
+    frozen = dict(GENERATED)
+    source = {'topology': topology()}
 
     class Worker:
         @staticmethod
         def config():
-            return {'project': 'mobius'}
+            return dict(frozen)
 
         @staticmethod
         def container_health(_):
@@ -66,7 +84,7 @@ def fixture(tmp_path, monkeypatch):
         @staticmethod
         def docker_command(command, **_):
             assert command[-3:] == ['config', '--format', 'json']
-            return SimpleNamespace(stdout=json.dumps(topology()))
+            return SimpleNamespace(stdout=json.dumps(source['topology']))
 
         @staticmethod
         def execute_replacement(_, transaction):
@@ -80,7 +98,7 @@ def fixture(tmp_path, monkeypatch):
     args = SimpleNamespace(command='cutover', source_cid=CID, source_image=IMAGE,
                            target_image=TARGET, expected_sha=SHA,
                            resolved_compose=str(desired))
-    return state, desired, args, calls
+    return _Fixture((state, desired, args, calls), frozen=frozen, source=source)
 
 
 def test_exact_success_returns_verified_new_cid_and_journaling_inputs(fixture):
@@ -129,10 +147,10 @@ def test_bind_data_source_is_supported_but_cannot_change():
         item['services']['app']['volumes'] = [
             {'type': 'bind', 'source': '/srv/mobius-data', 'target': '/data'}]
         item['volumes'] = {}
-    adapter.check_topology(old, new, 'mobius')
+    adapter.check_topology(old, new, GENERATED)
     new['services']['app']['volumes'][0]['source'] = '/srv/other-data'
     with pytest.raises(ValueError, match='/data volume changed'):
-        adapter.check_topology(old, new, 'mobius')
+        adapter.check_topology(old, new, GENERATED)
 
 
 def test_root_input_read_rejects_symlink_and_group_writable_file(fixture):
@@ -174,3 +192,66 @@ def test_shell_releases_shared_lock_then_calls_controller_and_switches_identity(
 def test_next_deploy_discovers_unique_current_id_before_fixed_name_guard():
     assert SHELL.index('"$MANUAL_CONTROLLER" discover') < SHELL.index('step "[0/4] checking')
     assert 'if ! CONTAINER=$(printf' in SHELL
+
+
+def _desire(desired, value):
+    desired.write_text(json.dumps(value))
+    desired.chmod(0o600)
+
+
+@pytest.mark.parametrize('frozen,prior,target', [
+    (GENERATED, None, None),
+    ({**GENERATED, 'deployment_name': 'mobius_app_1'}, None, None),
+    (EXPLICIT, 'mobius', 'mobius'),
+    ({**EXPLICIT, 'deployment_name': 'mobius-app-2'}, 'mobius-app-2', 'mobius-app-2'),
+])
+def test_manual_release_keeps_frozen_deployment_name(fixture, frozen, prior, target):
+    _, desired, args, calls = fixture
+    fixture.frozen.clear()
+    fixture.frozen.update(frozen)
+    fixture.source['topology'] = topology(container_name=prior)
+    _desire(desired, topology(container_name=target))
+    assert adapter.run(args)['state'] == 'succeeded'
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('frozen,prior,target', [
+    (GENERATED, None, 'mobius-app-1'),       # generated may not become explicit
+    (GENERATED, None, 'renamed'),
+    (GENERATED, 'mobius-app-1', None),       # frozen base disagrees with frozen source
+    (EXPLICIT, 'mobius', 'renamed'),         # explicit rename
+    (EXPLICIT, 'mobius', None),              # explicit name dropped -> generated name
+    (EXPLICIT, None, 'mobius'),
+    (EXPLICIT, 'renamed', 'renamed'),        # both moved away from the frozen name
+])
+def test_manual_rename_is_refused_before_journal_or_mutation(fixture, frozen, prior, target):
+    state, desired, args, calls = fixture
+    fixture.frozen.clear()
+    fixture.frozen.update(frozen)
+    fixture.source['topology'] = topology(container_name=prior)
+    _desire(desired, topology(container_name=target))
+    with pytest.raises(ValueError, match='container name changed'):
+        adapter.run(args)
+    assert not calls
+    assert not (state / 'transaction.json').exists()
+    assert not (state / 'status.json').exists()
+
+
+@pytest.mark.parametrize('change', [
+    {'deployment_name': None},
+    {'name_source': None},
+    {'name_source': 'observed'},
+    {'deployment_name': 'renamed'},               # generated source must be Compose's pattern
+    {'deployment_name': 'other-app-1'},
+    {'deployment_name': 'mobius-app-run-1'},
+    {'deployment_name': 'mobius-app-2'},          # generated index must be 1
+    {'deployment_name': 'mobius_app_2'},
+    {'deployment_name': '/mobius-app-1'},
+    {'deployment_name': 'm' * 129, 'name_source': 'explicit'},
+])
+def test_missing_or_invalid_frozen_identity_refuses_manual_cutover(fixture, change):
+    _, _, args, calls = fixture
+    fixture.frozen.update(change)
+    with pytest.raises(ValueError, match='frozen deployment'):
+        adapter.run(args)
+    assert not calls

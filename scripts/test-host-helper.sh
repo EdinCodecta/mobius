@@ -129,6 +129,47 @@ replaced_with() {  # <sha>: the container runs that image (not necessarily its s
     || fail "the container's image does not report sha-$1"
 }
 
+prove_compose_name_fence() {
+  local cid started current_name output status mode
+  cid=$(app_container) || fail "cannot identify managed app for Compose proof"
+  started=$(docker inspect -f '{{.State.StartedAt}}' "$cid")
+  current_name=$(docker inspect -f '{{.Name}}' "$cid")
+  [[ $current_name == "$original_app_name" ]] || fail "managed replacement changed deployment name"
+  [[ $(docker inspect -f '{{index .Config.Labels "io.mobius.admission.token"}}' "$cid") =~ ^[0-9a-f]{32}$ ]] \
+    || fail "Compose fence proof requires an admitted app"
+  # Fetch dependencies before the negative assertions: registry failure must
+  # never masquerade as the intended daemon name conflict.
+  MOBIUS_IMAGE="$IMAGE:sha-$PREVIOUS" docker compose --env-file "$ENV_FILE" pull caddy \
+    || fail "could not prepare Caddy for the raw Compose proof"
+  output="$TPROOF/compose-name-conflict.log"
+  for mode in all caddy force; do
+    local -a selection=()
+    case $mode in caddy) selection=(caddy);; force) selection=(--force-recreate app);; esac
+    if MOBIUS_IMAGE="$IMAGE:sha-$PREVIOUS" timeout 90 docker compose --env-file "$ENV_FILE" \
+        up -d --no-build --pull never "${selection[@]}" >"$output" 2>&1; then
+      fail "raw Compose $mode unexpectedly succeeded beside a managed app"
+    else
+      status=$?
+    fi
+    [[ $status != 124 && $status != 137 ]] || fail "raw Compose $mode timed out instead of reporting a name conflict"
+    grep -Eiq 'container name.*already in use|name.*is already in use' "$output" \
+      || { cat "$output" >&2; fail "raw Compose $mode failed for a reason other than the name fence"; }
+    [[ $(app_container) == "$cid" ]] || fail "raw Compose $mode changed app ownership"
+    [[ $(docker inspect -f '{{.State.StartedAt}}' "$cid") == "$started" ]] \
+      || fail "raw Compose $mode restarted the managed app"
+    # Inspect mounts too: label-only discovery could miss an unwrapped writer.
+    docker inspect $(docker ps --no-trunc -q) | python3 -c '
+import json, sys
+items = json.load(sys.stdin)
+owner = next(c for c in items if c["Id"] == sys.argv[1])
+data = next(m["Source"] for m in owner["Mounts"] if m["Destination"] == "/data")
+writers = [c["Id"] for c in items if any(m["Source"] == data and m.get("RW") for m in c["Mounts"])]
+assert writers == [owner["Id"]], writers
+' "$cid" || fail "raw Compose $mode created a second writer on the app data"
+  done
+  echo "   unchanged raw Compose commands conflict without a second app or restart"
+}
+
 served() {  # prints "<source> <sha>": what the entrypoint selected for uvicorn
   docker exec "$(app_container)" sh -c 'printf "%s %s\n" "$(cat /tmp/serving-source)" "$(cat /tmp/serving-sha)"'
 }
@@ -254,6 +295,7 @@ for _ in $(seq 1 60); do
 done
 [[ $(docker inspect -f '{{.State.Health.Status}}' "$(app_container)") == healthy ]] \
   || fail "the previous release did not become healthy"
+original_app_name=$(docker inspect -f '{{.Name}}' "$(app_container)")
 # The worker's chat drain authenticates with the owner's service token.
 docker exec "$(app_container)" curl -fsS -o /dev/null -X POST -H 'Content-Type: application/json' \
   -d '{"username":"owner","password":"host-helper-owner-password"}' \
@@ -504,6 +546,9 @@ print("release replay: active worker bytes match the published target source")
 WORKER_VERIFY
 fi
 if [[ $TRANSCRIPTS == 1 ]]; then
+  if (( target_helper >= 5 )); then
+    prove_compose_name_fence
+  fi
   # What the product serves here: normally the target source, because this
   # release is restart-loadable and an image replacement never reverts it;
   # the image's baked floor if that source cannot import on it.

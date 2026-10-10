@@ -110,22 +110,70 @@ to resolve the root-owned frozen model. This preserves both the bundled-Caddy
 and shared `edge-caddy` topologies. Rerun the installer after an intentional
 topology or configuration change.
 
-Each admission attempt uses a unique Compose project and `container_name`,
-while `io.mobius.admission.project` records the fixed original deployment
-project. Shared named networks and volumes remain external resources with their
-original names; app aliases and the persistent data mount are preserved.
-No-start creation has no service dependencies to start or another attempt to
-scale down. Each attempt reads an immutable root-owned
-`/etc/mobius-rebuild/attempts/<token>.json`, not a changing shared override.
+Each admission attempt uses a unique Compose project, while
+`io.mobius.admission.project` records the fixed original deployment project.
+Every attempt reuses the **original deployment container name** frozen at
+installation, so Docker's global name uniqueness makes the live app and any
+other container claiming that name mutually exclusive. Shared named networks and
+volumes remain external resources with their original names; app aliases and the
+persistent data mount are preserved. No-start creation has no service
+dependencies to start or another attempt to scale down. Each attempt reads an
+immutable root-owned `/etc/mobius-rebuild/attempts/<token>.json`, not a changing
+shared override.
+
+The root-owned `/etc/mobius-rebuild/config.json` is **version 4**: the original
+`project`, `data_dir`, `deployment_name`, and `name_source` (`explicit` or
+`generated`). The installer derives the name only from an unrenamed live app,
+under its locks, and refuses before changing controller state otherwise:
+
+- An explicit resolved `container_name` must equal the live name exactly.
+- Without one, the live name must be exactly Compose's first generated name
+  `<project>-app-1` or its underscore form `<project>_app_1`, matching the
+  container's own `com.docker.compose.container-number` label of `1`. The
+  container must also carry the original project, `app` service, and non-one-off
+  labels. The separator is frozen as part of `deployment_name`. A renamed app
+  (`docker rename`) is never adopted.
+- A generated index other than `1` is refused: raw Compose on the emptied
+  original project would recreate index `1`, so that name could not collide.
+  Migrate to a stable explicit name by setting `container_name` to the live
+  name in the reviewed Compose input that created the app, then rerun the
+  installer. Multi-replica app layouts are not managed.
+
+Version 3 is accepted only as the released legacy layout being migrated.
+Reinstalling over a helper-managed app requires version 4, preserves its frozen
+fields exactly, and requires the live app to hold that name. Root-owned
+controller state under `/var/lib/mobius-rebuild`, including any host-owned
+removal tombstones, is preserved; installation never deletes or resets it.
+
+The manual-deploy adapter refuses a rename before any journal or mutation: an
+explicit name must stay that exact `container_name`, and a generated name must
+stay generated (no `container_name`) in the same project. Renaming the
+deployment requires an explicit helper reinstall.
 
 On reinstall, discovery unions running containers with that fixed owner label
 and legacy containers with the original Compose project plus app-service labels.
 Exactly one full CID must remain after deduplication; two containers are an
 ambiguity, not permission to prefer one. Labels alone grant no trust: the
-installer verifies the root-frozen original project, exact current override,
-immutable attempt file derived from the validated token, image/startup argv,
-read-only code mount, private state mount, and original data source. It rechecks
-live identity under the installation locks.
+installer verifies the root-frozen original project and deployment name, exact
+current override, immutable attempt file derived from the validated token,
+image/startup argv, read-only code mount, private state mount, and original data
+source. It rechecks live identity and name under the installation locks.
+
+#### What the shared name does and does not protect
+
+While the helper-managed app holds the frozen name, raw `docker compose up -d`,
+`docker compose up -d --force-recreate`, or `docker compose up -d caddy` from
+the unchanged checkout cannot create a second app: Compose sees no app in the
+original project and its create collides on the name. Reload Caddy without
+touching the app using `docker compose up -d --no-deps caddy`.
+
+This is a collision guard, not an authorization fence. It does **not** protect
+against a deliberate `docker rm` of the live app, a different Compose project
+(`-p` or a renamed checkout directory), Compose compatibility/underscore naming
+differing from the frozen separator, an edited `container_name`, or raw Compose
+run during the empty window of a replacement after the old app is removed and before
+its successor holds the name. Keep raw Compose out of helper-managed hosts and
+use the reviewed deploy path.
 
 For helper-owned containers, the installer copies only the unwrapped root-owned
 `compose.yml` as the reusable base. It **preserves** a validated wrapped current
@@ -364,14 +412,32 @@ Every worker transition below holds `replace.lock`. A transaction is removed
 only after publishing its durable outcome. Reconciliation repeats observations,
 not an already-consumed chat handoff.
 
+Destructive host actions use identities from the root-private transaction,
+never container IDs supplied only by the container-writable admission gate.
+The transaction records each attempt's token, generation, image, immutable
+configuration digest and exact container ID before publishing them to the gate.
+Disagreement stops recovery without Docker mutation. Docker must independently
+confirm predecessor removal; a gate flag claiming removal is not enough.
+
+Cancellation closes the attempt before recording its configuration digest in
+`/var/lib/mobius-rebuild/admission-tombstones.json`. An unbound, never-issued
+attempt can then be fenced without creating a container merely to remove it.
+A delayed no-start Create may still take the vacant deployment name. At a
+creation boundary, the worker removes that orphan by exact ID only when its
+Docker identity matches a tombstoned immutable configuration; a foreign holder
+is retained for operator inspection. There is no background sweep. Tombstones
+and their attempt files are retained across transactions and reinstallations:
+multiple delayed Creates can materialize for the same retired token, so settling
+one orphan does not make its history safe to prune.
+
 | Durable state | Evidence required | Permitted next action |
 | --- | --- | --- |
 | Prepared replacement | Exact previous image, source CID and durable drain receipt | Journal replacement intent before removing the exact source |
-| Replacement started | Gate-owned source identity and fresh whole-container observation | Observe an exact bound target; after source quiescence, restore only the recorded previous image if needed |
+| Replacement started | Root-journaled source identity and fresh whole-container observation | Observe an exact bound target; after source quiescence, restore only the recorded previous image if needed |
 | Attempt allocated | Unconsumed slot, frozen configuration and fenced predecessor | Create without starting, verify and bind the exact container |
 | Attempt open | Bound wrapped container and quiesced source/target | Persist `issued` before one Start; only the wrapper may prepare acceptance and admit a boot |
 | Start issued | Authoritative admission slot under its shared lock | If admitted, observe only; otherwise durably CLOSE and fence the exact CID before a new generation, never retry ambiguous Start |
-| Attempt closed and fenced | Durable revocation plus confirmed exact-CID removal | Allocate the next generation of the same unconsumed slot |
+| Attempt closed and fenced | Durable revocation plus confirmed exact-CID removal, or explicit never-bound/never-issued cancellation | Allocate the next generation of the same unconsumed slot |
 | Rollback running/restarting | Exact previous image | Observe readiness; never recreate a boot that is making progress |
 | Healthy with missing handoff proof | No exact consumed receipt | Keep service running and retain `needs_recovery`; do not manufacture an ACK |
 | Durable outcome | Exact outcome already recorded | Republish status and clear the journal, without another boot |

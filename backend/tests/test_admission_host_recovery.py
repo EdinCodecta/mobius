@@ -70,7 +70,9 @@ class Docker:
         self.inspect_hook = None
         self.counter = 10
         self.containers[SOURCE] = {
-            "Id": SOURCE, "Image": OLD_IMAGE, "Name": "/original-app", "Config": {}, "Mounts": [],
+            "Id": SOURCE, "Image": OLD_IMAGE, "Name": "/original-app", "Config": {"Labels": {
+                "com.docker.compose.project": "original", "com.docker.compose.service": "app",
+                "com.docker.compose.container-number": "1", "com.docker.compose.oneoff": "False"}}, "Mounts": [],
             "RestartCount": 0, "State": {"Status": "running", "StartedAt": "2026-10-09T00:00:00Z",
                                          "Health": {"Status": "healthy"}},
         }
@@ -143,12 +145,19 @@ class Docker:
             assert expected["networks"]["default"] == {"name": "original_default", "external": True}
             self.hit("create-before")
             existing = [c for c in self.containers.values() if c["Name"] == "/" + app["container_name"]]
+            if existing and any(c["Config"].get("Labels", {}).get("com.docker.compose.project") != expected["name"]
+                                for c in existing):
+                return self._reply(args, code=1, error="Conflict: container name already in use", check=check)
             if not existing:
                 self.counter += 1
                 cid = f"{self.counter:064x}"
                 item = {
                     "Id": cid, "Image": app["image"], "Name": "/" + app["container_name"],
-                    "Config": {"Entrypoint": app["entrypoint"], "Cmd": app["command"], "Labels": app["labels"]},
+                    "Config": {"Entrypoint": app["entrypoint"], "Cmd": app["command"], "Labels": {**app["labels"],
+                               "com.docker.compose.project": expected["name"],
+                               "com.docker.compose.service": "app",
+                               "com.docker.compose.container-number": "1",
+                               "com.docker.compose.oneoff": "False"}},
                     "Mounts": [{"Type": volume["type"], "Source": volume["source"],
                                 "Destination": volume["target"], "RW": not volume.get("read_only", False)}
                                for volume in app["volumes"]],
@@ -179,6 +188,8 @@ class Docker:
                     output += "\n" + "f" * 64
             elif template == "{{json .}}":
                 output = json.dumps(item)
+                if self.duplicate_discovery:
+                    output += "\n" + json.dumps({**item, "Id": "f" * 64})
             elif template == "{{.Image}}":
                 output = item["Image"]
             else:
@@ -239,7 +250,8 @@ def incident(tmp_path, monkeypatch):
     for name, path in paths.items():
         monkeypatch.setattr(host, name, path)
     host.ADMISSION_ROOT.mkdir(mode=0o700)
-    config = {"version": 3, "project": "original", "data_dir": data, "control_dir": control}
+    config = {"version": 4, "project": "original", "data_dir": data, "control_dir": control,
+              "deployment_name": "original-app", "name_source": "explicit"}
     topology = {"name": "original", "services": {"app": {
         "image": OLD_IMAGE, "container_name": "original-app", "networks": {"default": {}},
         "volumes": [{"type": "bind", "source": str(data), "target": "/data"}],
@@ -502,7 +514,7 @@ def test_duplicate_identity_response_is_not_arbitrarily_adopted(incident):
     with pytest.raises(PowerLoss):
         prepare(c)
     c.docker.duplicate_discovery = True
-    with pytest.raises((RuntimeError, subprocess.SubprocessError)):
+    with pytest.raises((RuntimeError, ValueError, subprocess.SubprocessError)):
         prepare(c)
     assert not c.docker.starts
 
@@ -617,15 +629,20 @@ def test_prepare_interrupted_after_directory_before_state_is_recoverable(inciden
     assert c.host.read_json(c.host.STATUS)["state"] == "rolled_back"
 
 
-def test_stale_health_id_is_reobserved_without_mutation(incident, monkeypatch):
+def test_missing_name_observation_is_rechecked_without_mutation(incident, monkeypatch):
     c = incident
     cid = prepare(c)
     c.docker.complete_start(cid)
     command, stale = c.docker.command, [True]
     def stale_once(args, **kwargs):
-        if (stale[0] and args[1:3] == ["container", "inspect"] and args[-2] == "{{.Id}}"):
+        if (stale[0] and args[1:3] == ["container", "inspect"]
+                and args[-1] == c.config["deployment_name"]):
+            # Managed discovery now inspects name, identity and state together,
+            # not an ID followed by a second health lookup. A transient absent
+            # observation still cannot authorize a repeated boot or removal.
             stale[0] = False
-            return subprocess.CompletedProcess(args, 0, stdout="f" * 64, stderr="")
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr=
+                f"Error response from daemon: No such container: {args[-1]}")
         return command(args, **kwargs)
     monkeypatch.setattr(c.host, "docker_command", stale_once)
     recover(c)
@@ -686,3 +703,75 @@ def test_admission_then_prelegacy_death_cannot_be_host_rearmed(incident):
     assert not c.legacy.ACCEPTED_PATH.exists()
     recover(c)
     assert c.host.TRANSACTION.exists() and c.docker.starts == [cid]
+
+
+# Lost cutover evidence costs continuation, never service: repeated
+# reconciliation restores exactly one healthy service-only generation, never a
+# continuation, journal clear, rearm or new-generation loop.
+def source_watchdog_restart(case):
+    """Source abandoned-cutover watchdog: ORDINARY restart for the drained runs,
+    accepted by the real root poller just before the host's exact removal."""
+    request = {"version": 1, "nonce": "original-nonce-12345678", "source_boot_id": SOURCE_BOOT,
+               "created_at": NOW + 90, "runs": []}
+    case.legacy.INTENT_PATH.write_text(json.dumps(request))
+    case.legacy.REQUEST_PATH.write_text(json.dumps({"nonce": request["nonce"], "source_boot_id": SOURCE_BOOT}))
+    assert case.legacy.accept(SOURCE_BOOT, now=NOW + 90)
+    case.clock[0] = NOW + 91
+
+
+def assert_one_service_without_handoff(case, role):
+    c = case
+    for _ in range(4):
+        c.host.reconcile()
+    slot = c.gate.observe()["slots"][role]
+    assert len(slot["attempts"]) == 1 and slot["consumed"]["generation"] == 1
+    assert slot["attempts"][0]["continuation"] is False
+    cid = slot["attempts"][0]["cid"]
+    assert c.docker.starts == [cid] and len(c.docker.creates) == 1
+    assert cid not in c.docker.removes
+    assert c.docker.entries == [(cid, "service_only", False)]
+    assert c.docker.containers[cid]["State"]["Health"]["Status"] == "healthy"
+    assert not c.legacy.ACCEPTED_PATH.exists() and not c.legacy.ACK_PATH.exists()
+    assert c.host.TRANSACTION.exists()
+    status = c.host.read_json(c.host.STATUS)
+    assert (status["state"], status["code"]) == ("needs_recovery", "handoff_boot_unconfirmed")
+    snapshot = c.gate.observe()
+    c.host.reconcile()
+    assert c.gate.observe() == snapshot and c.docker.starts == [cid]
+
+
+def test_source_watchdog_restart_pending_at_removal_restores_one_rollback(incident):
+    c = incident
+    source_watchdog_restart(c)
+    assert_one_service_without_handoff(c, "rollback")
+    assert c.gate.observe()["source_handoff_valid"] is False
+
+
+@pytest.mark.parametrize("damage", ["missing", "reaccepted"])
+def test_receipt_lost_after_gate_prepare_restores_one_rollback(incident, damage):
+    c = incident
+    c.host.prepare_admission(c.config, c.host.read_transaction())
+    assert c.gate.observe()["source_handoff_valid"] is True
+    receipt = json.loads(c.legacy.CUTOVER_RECEIPT_PATH.read_text())
+    c.legacy.CUTOVER_RECEIPT_PATH.unlink()
+    if damage == "reaccepted":
+        replacement = {**receipt, "nonce": "reaccepted-nonce-12345678"}
+        c.legacy._write_json(c.legacy.ACCEPTED_PATH, replacement, 0o600)
+        c.legacy._write_json(c.legacy.CUTOVER_RECEIPT_PATH, replacement, 0o444)
+    assert_one_service_without_handoff(c, "rollback")
+
+
+def test_source_watchdog_restart_pending_at_removal_admits_target_service_only(incident):
+    c = incident
+    source_watchdog_restart(c)
+    c.host.prepare_admission(c.config, c.tx)
+    target = c.host.prepare_attempt(c.config, c.tx, "target")
+    assert c.docker.complete_start(target)
+    assert c.docker.entries == [(target, "service_only", False)]
+    assert not c.legacy.ACCEPTED_PATH.exists() and not c.legacy.ACK_PATH.exists()
+    c.tx["phase"] = "replacement_started"
+    c.host.write_transaction(c.tx)
+    # The healthy service-only target keeps serving: no rollback, no rearm.
+    assert_one_service_without_handoff(c, "target")
+    assert c.docker.removes == [SOURCE]
+    assert c.gate.observe()["slots"]["rollback"]["attempts"] == []
