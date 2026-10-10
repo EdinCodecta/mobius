@@ -99,7 +99,7 @@ import ProgressRail from './ProgressRail.jsx'
 import GoalPlanDetails from './GoalPlanDetails.jsx'
 import GoalDraftChip from './GoalDraftChip.jsx'
 import WaitingChip from './WaitingChip.jsx'
-import { currentChatAnnouncement, currentProgressGoal, goalContinuationHandoff } from './chatHandoffPresentation.js'
+import { currentChatAnnouncement, currentProgressGoal, goalAwaitsChanges, goalContinuationHandoff } from './chatHandoffPresentation.js'
 import AssistantReply from './AssistantReply.jsx'
 import ArchivedChatNotice from './ArchivedChatNotice.jsx'
 import QueuedMessages from './QueuedMessages.jsx'
@@ -5534,12 +5534,12 @@ export default function ChatView({
     ))
   }, [])
   // Embedded chats do not have Shell's process stream. Subscribe only while
-  // a Goal or enabled limit park is waiting (and through its observed run), rather
-  // than holding one permanent SSE connection per retained app iframe.
+  // an open Goal or enabled limit park is waiting (and through its observed run),
+  // rather than holding one permanent SSE connection per retained app iframe.
   useSystemEventStream(handleEmbeddedRunEvent, {
     enabled: !!(
       embedded
-      && (goalPresentation?.id || (autoResumeEnabled && pendingLimitPark && pendingLimitCheckAt) || embeddedRunActive)
+      && (goalAwaitsChanges(goalPresentation) || (autoResumeEnabled && pendingLimitPark && pendingLimitCheckAt) || embeddedRunActive)
     ),
     onOpen: handleEmbeddedStreamOpen,
   })

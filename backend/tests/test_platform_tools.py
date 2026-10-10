@@ -1438,3 +1438,42 @@ def test_helper_checklist_tool_is_task_only_and_returns_a_compact_receipt(monkey
   assert calls == [('POST', '/api/chats/helper-chat/goal/tasks', patch)]
   with pytest.raises(ValueError, match='only tasks'):
     control._call_update_goal_tasks({**patch, 'complete': True})
+
+
+def test_helper_checklist_edits_use_the_calling_turn_identity_on_a_shared_host(
+  monkeypatch, tmp_path,
+):
+  # A shared helper host's process environment is the host's; the scoped
+  # /goal/tasks route requires the URL chat to be the bearer's own chat.
+  control = _control_module()
+  for name in ('MOBIUS_RUN_TOKEN', control.CALLER_ENV_FILE_ENV):
+    monkeypatch.delenv(name, raising=False)
+  monkeypatch.setenv('API_BASE_URL', 'http://api.test')
+  monkeypatch.setenv('CHAT_ID', 'host-chat')
+  monkeypatch.setenv('AGENT_TOKEN', 'host-token')
+  monkeypatch.setenv(control.HELPER_HOST_ENV, 'host-digest')
+  turn_env = tmp_path / 'turn.env'
+  turn_env.write_text('export CHAT_ID=turn-chat\nexport AGENT_TOKEN=turn-token\n')
+  sent = []
+
+  class Response:
+    def __enter__(self):
+      return self
+    def __exit__(self, *_exc):
+      return False
+    def read(self):
+      return b'{"goal_id": "g", "revision": 2, "tasks": []}'
+
+  def urlopen(request, timeout):
+    sent.append((request.full_url, request.get_header('Authorization')))
+    return Response()
+
+  monkeypatch.setattr(control, 'urlopen', urlopen)
+  patch = {'tasks': [{'id': 'branch-check', 'status': 'running'}]}
+  result = control._call_tool({'name': 'update_goal_tasks', 'arguments': {
+    **patch, control.CALLER_ENV_ARGUMENT: str(turn_env),
+  }})
+
+  assert not result.get('isError'), result
+  assert sent == [('http://api.test/api/chats/turn-chat/goal/tasks', 'Bearer turn-token')]
+  assert os.environ['CHAT_ID'] == 'host-chat'

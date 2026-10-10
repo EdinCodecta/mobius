@@ -3,6 +3,14 @@ import { canResumeGoal, goalStatusLabel } from './goalProgress.js'
 
 const TERMINAL_GOALS = new Set(['completed', 'cannot_complete', 'cancelled'])
 
+/** Only an open Goal (active or held) still receives helper, Wait and run changes.
+ * A settled Goal has no live helpers or deliverable Goal Waits, so it stays as
+ * retained history without holding an embedded chat's event stream open.
+ */
+export function goalAwaitsChanges(goal) {
+  return !!goal?.id && !TERMINAL_GOALS.has(goal.status)
+}
+
 export function currentProgressGoal(goal, { turnActive = false, continuingGoalId = null } = {}) {
   if (!goal || TERMINAL_GOALS.has(goal.status)) return null
   // A retained hold is history while an unrelated owner request is running.
