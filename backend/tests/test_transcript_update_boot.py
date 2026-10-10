@@ -24,6 +24,9 @@ from app.config import get_settings
 from app.database import SessionLocal, engine
 from tests.test_drain_for_restart import _live_turn, _run, _seed
 
+# Boot starts background conversion, which must not depend on the host's disk.
+pytestmark = pytest.mark.usefixtures("healthy_data_disk")
+
 
 def _unconvert(*chat_ids):
   with engine.begin() as conn:

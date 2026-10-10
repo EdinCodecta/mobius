@@ -23,8 +23,9 @@ from app.chat_writer import create_chat
 from app.database import SessionLocal, engine
 
 
-# Conversion mechanics pin the converted state themselves.
-pytestmark = pytest.mark.converted_chats
+# Conversion mechanics pin the converted state themselves, and background
+# conversion never depends on the test host's free disk.
+pytestmark = [pytest.mark.converted_chats, pytest.mark.usefixtures("healthy_data_disk")]
 
 
 TYPED = [
