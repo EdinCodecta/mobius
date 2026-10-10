@@ -344,6 +344,22 @@ def admission_store(config_value: dict, transaction: dict):
     )
 
 
+def compose_file_document(value):
+    """Encode frozen literal values for one subsequent Compose parse.
+
+    This is a file-format boundary, not a second environment resolution.
+    Image argv is literal; resolved Compose output is decoded before mixing
+    it with image metadata. Keys are not interpolated by Compose.
+    """
+    if isinstance(value, str):
+        return value.replace("$", "$$")
+    if isinstance(value, list):
+        return [compose_file_document(item) for item in value]
+    if isinstance(value, dict):
+        return {key: compose_file_document(item) for key, item in value.items()}
+    return value
+
+
 def wrapped_configuration(config_value: dict, transaction: dict, role: str,
                           token: str, image: str) -> dict:
     """Preserve the resolved command and PID-1 chain behind a root boot gate."""
@@ -356,6 +372,9 @@ def wrapped_configuration(config_value: dict, transaction: dict, role: str,
              "config", "--format", "json"], env=env, cwd=CONFIG.parent,
         )
         resolved = json.loads(result.stdout)
+    # `compose config` escapes every dollar in its rendered JSON, including
+    # mapping keys. Recover literal values before adding raw image argv.
+    resolved = json.loads(json.dumps(resolved).replace("$$", "$"))
     service = resolved["services"]["app"]
     entrypoint = service.get("entrypoint")
     command = service.get("command")
@@ -442,7 +461,7 @@ def verify_wrapped_container(cid: str, expected: dict) -> dict:
     if (not re.fullmatch(r"[0-9a-f]{64}", cid) or item.get("Id") != cid
             or item.get("Image") != app["image"]
             or config_value.get("Entrypoint") != app["entrypoint"]
-            or config_value.get("Cmd") != app["command"]
+            or (config_value.get("Cmd") if config_value.get("Cmd") is not None else []) != app["command"]
             or any((config_value.get("Labels") or {}).get(k) != v
                    for k, v in app["labels"].items())
             or item.get("Name") != "/" + app["container_name"]):
@@ -785,14 +804,15 @@ def create_attempt(config_value: dict, expected: dict) -> str:
         raise RuntimeError("untrusted attempt configuration directory")
     token = expected["services"]["app"]["labels"]["io.mobius.admission.token"]
     path = directory / (token + ".json")
+    document = compose_file_document(expected)
     if path.exists() or path.is_symlink():
         info = path.lstat()
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-                or info.st_mode & 0o077 or info.st_nlink != 1 or read_json(path) != expected):
+                or info.st_mode & 0o077 or info.st_nlink != 1 or read_json(path) != document):
             raise RuntimeError("immutable attempt configuration changed")
     else:
-        _durable_write(path, json.dumps(expected).encode(), 0o600)
-    _durable_write(OVERRIDE, json.dumps(expected).encode(), 0o600)
+        _durable_write(path, json.dumps(document).encode(), 0o600)
+    _durable_write(OVERRIDE, json.dumps(compose_file_document(expected)).encode(), 0o600)
     cid = discover_attempt(expected)
     if not cid:
         docker_command(["docker", "compose", "-p", expected["name"], "-f", str(path),
@@ -830,7 +850,7 @@ def prepare_attempt(config_value: dict, transaction: dict, role: str) -> str:
     if attempt is None:
         attempt = gate.allocate(role, uuid.uuid4().hex, image)
     expected = wrapped_configuration(config_value, transaction, role, attempt["token"], image)
-    _durable_write(OVERRIDE, json.dumps(expected).encode(), 0o600)
+    _durable_write(OVERRIDE, json.dumps(compose_file_document(expected)).encode(), 0o600)
     cid = attempt["cid"]
     if cid is None:
         cid = create_attempt(config_value, expected)

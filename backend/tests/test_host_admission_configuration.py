@@ -201,3 +201,60 @@ def test_same_image_cutover_recovery_does_not_mistake_source_for_target(incident
     assert not c.host.TRANSACTION.exists()
     assert c.tx['source_container'] in c.docker.removes
     assert len(c.docker.starts) == 1
+
+
+@pytest.mark.parametrize('observed', [None, [], ['unexpected'], '', False])
+def test_docker_null_command_is_only_equivalent_to_an_empty_argv(incident, monkeypatch, observed):
+    c = incident
+    c.host.prepare_admission(c.config, c.tx)
+    attempt = c.gate.allocate('target', 'd' * 32, c.tx['target_image'])
+    expected = c.host.wrapped_configuration(c.config, c.tx, 'target', attempt['token'], c.tx['target_image'])
+    expected['services']['app']['command'] = []
+    cid = c.host.create_attempt(c.config, expected)
+    c.docker.containers[cid]['Config']['Cmd'] = observed
+    if observed is None or observed == []:
+        assert c.host.verify_wrapped_container(cid, expected)['Id'] == cid
+    else:
+        with pytest.raises(RuntimeError, match='identity or pre-entrypoint'):
+            c.host.verify_wrapped_container(cid, expected)
+
+
+def test_compose_file_boundary_keeps_image_argv_and_resolved_values_literal(tmp_path, monkeypatch):
+    config, tx, resolved = topology(tmp_path, monkeypatch)
+    original = ['/bin/sh', '-c', 'echo ${MOBIUS_BOOT_ID:-fallback} $ordinary $$pid']
+    monkeypatch.setattr(host, 'inspect_image', lambda *_: json.dumps({'Entrypoint': original, 'Cmd': None}))
+    resolved['services']['app']['environment'] = {'VALUE': '$$LITERAL', '$$KEY': '$$$$two'}
+    resolved['services']['app']['labels'] = {'literal': '$${LABEL:-not-a-default}'}
+    expected = host.wrapped_configuration(config, tx, 'target', 'b' * 32, 'sha256:' + 'c' * 64)
+    app = expected['services']['app']
+    assert app['entrypoint'][-3:] == original
+    assert app['command'] == []
+    assert app['environment'] == {'VALUE': '$LITERAL', '$KEY': '$$two'}
+    document = host.compose_file_document(expected)
+    assert document['services']['app']['entrypoint'][-1] == original[-1].replace('$', '$$')
+    assert document['services']['app']['environment'] == {'VALUE': '$$LITERAL', '$KEY': '$$$$two'}
+    assert document['services']['app']['labels']['literal'] == '$${LABEL:-not-a-default}'
+    assert host.compose_file_document(expected) == document  # pure; no repeated escaping
+
+
+def test_real_compose_parse_cannot_reinterpret_frozen_runtime_values(tmp_path, monkeypatch):
+    import shutil
+    executable = os.environ.get('MOBIUS_TEST_COMPOSE')
+    compose = [executable] if executable else ['docker', 'compose']
+    if not shutil.which(compose[0]):
+        pytest.skip('Compose parser unavailable; hosted recovery runs the daemon proof')
+    config, tx, resolved = topology(tmp_path, monkeypatch)
+    original = ['/bin/sh', '-c', 'echo ${MOBIUS_TEST_FROZEN:-fallback} $ordinary $$pid']
+    monkeypatch.setattr(host, 'inspect_image', lambda *_: json.dumps({'Entrypoint': original, 'Cmd': None}))
+    resolved['services']['app']['environment'] = {'VALUE': '$$MOBIUS_TEST_FROZEN', 'DOUBLE': '$$$$pid'}
+    resolved['services']['app']['labels'] = {'literal': '$${MOBIUS_TEST_FROZEN:-fallback}'}
+    expected = host.wrapped_configuration(config, tx, 'target', 'b' * 32, 'sha256:' + 'c' * 64)
+    path = tmp_path / 'attempt.json'
+    path.write_text(json.dumps(host.compose_file_document(expected)))
+    result = subprocess.run([*compose, '-f', str(path), 'config', '--format', 'json'],
+                            env={**os.environ, 'MOBIUS_TEST_FROZEN': 'MUST_NOT_SUBSTITUTE'},
+                            check=True, capture_output=True, text=True, timeout=15)
+    # `config` emits a re-readable, escaped document, not raw Docker argv.
+    actual = json.loads(result.stdout.replace('$$', '$'))['services']['app']
+    for key in ('entrypoint', 'command', 'environment', 'labels'):
+        assert actual[key] == expected['services']['app'][key]

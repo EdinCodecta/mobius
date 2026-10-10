@@ -123,7 +123,17 @@ project, cid, raw = sys.argv[1:]
 configuration = json.loads(Path("/etc/mobius-rebuild/config.json").read_text())
 expected = json.loads(Path("/etc/mobius-rebuild/image.override.yml").read_text())
 actual = json.loads(raw)
-app = expected["services"]["app"]
+# Frozen files escape only values for Compose; inspection returns literals.
+def literal_values(value):
+    if isinstance(value, str):
+        return value.replace("$$", "$")
+    if isinstance(value, list):
+        return [literal_values(item) for item in value]
+    if isinstance(value, dict):
+        return {key: literal_values(item) for key, item in value.items()}
+    return value
+
+app = literal_values(expected["services"]["app"])
 labels = app.get("labels", {})
 token = labels.get("io.mobius.admission.token", "")
 operation = labels.get("io.mobius.admission.operation", "")
@@ -144,7 +154,7 @@ require(role in {"target", "rollback"} and labels.get("io.mobius.admission.proje
 require(expected.get("name") == name and app.get("container_name") == name and actual.get("Name") == "/" + name)
 require(isinstance(app.get("entrypoint"), list) and app["entrypoint"][:len(prefix)] == prefix)
 require(isinstance(app.get("command"), list) and bool(app["entrypoint"][len(prefix):] + app["command"]))
-require(actual.get("Entrypoint") == app["entrypoint"] and actual.get("Cmd") == app["command"])
+require(actual.get("Entrypoint") == app["entrypoint"] and (actual.get("Cmd") if actual.get("Cmd") is not None else []) == app["command"])
 require(isinstance(app.get("image"), str) and re.fullmatch(r"sha256:[0-9a-f]{64}", app["image"]))
 require(actual.get("Image") == app["image"])
 observed_labels = actual.get("Labels") or {}

@@ -615,3 +615,21 @@ MIGRATION_COMPLETE=1
     assert result.returncode == 0, result.stderr
     for unit in ('mobius-rebuild.path', 'mobius-rebuild-reconcile.timer'):
         assert (tmp_path / (unit + '.state')).read_text() == 'active'
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="validates root-owned immutable attempt files")
+@pytest.mark.parametrize("observed_command", [None, [], ["unexpected"], False])
+def test_wrapped_reinstall_preserves_literal_argv_and_empty_command(tmp_path, observed_command):
+    frozen, attempt, actual, code, cid = _wrapped_identity(tmp_path)
+    document = json.loads(attempt.read_text())
+    app = document["services"]["app"]
+    literal = "echo ${MOBIUS_BOOT_ID:-fallback}; echo $$pid"
+    app["entrypoint"].extend(["/bin/sh", "-c", literal.replace("$", "$$")])
+    app["command"] = []
+    actual["Entrypoint"] = app["entrypoint"][:-1] + [literal]
+    actual["Cmd"] = observed_command
+    attempt.write_text(json.dumps(document))
+    (frozen / "image.override.yml").write_text(json.dumps(document))
+    result = subprocess.run([sys.executable, "-c", code, "original", cid, json.dumps(actual)],
+                            capture_output=True, text=True)
+    assert (result.returncode == 0) is (observed_command is None or observed_command == []), result.stderr

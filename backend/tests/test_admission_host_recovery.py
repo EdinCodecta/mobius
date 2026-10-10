@@ -134,7 +134,8 @@ class Docker:
             assert "--force-recreate" not in args and "--remove-orphans" not in args
             paths = [args[i + 1] for i, part in enumerate(args) if part == "-f"]
             assert len(paths) == 1 and Path(paths[0]) != self.host.OVERRIDE
-            expected = json.loads(Path(paths[0]).read_text())
+            # Compose resolves one level of escaped literal dollars at Create.
+            expected = json.loads(Path(paths[0]).read_text().replace("$$", "$"))
             app = expected["services"]["app"]
             token = app["labels"]["io.mobius.admission.token"]
             assert args[args.index("-p") + 1] == expected["name"] == "mobius-admission-" + token
