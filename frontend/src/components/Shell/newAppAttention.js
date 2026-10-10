@@ -85,24 +85,31 @@ export function withAppActivitySeen(apps, appId, seenThroughVersion = Infinity, 
   const id = Number(appId)
   const seenThrough = Number(seenThroughVersion)
   if (!Array.isArray(apps) || Number.isNaN(id)) return apps
+  return mapAppActivitySeen(apps, app => (
+    Number(app?.id) === id &&
+    (appCreatedAt === undefined || app.created_at === appCreatedAt)
+      ? seenThrough : undefined
+  ))
+}
+
+function mapAppActivitySeen(apps, seenThroughFor) {
   let changed = false
   const next = apps.map(app => {
-    if (Number(app?.id) !== id || !app?.has_unseen_activity ||
-        (appCreatedAt !== undefined && app.created_at !== appCreatedAt)) return app
+    const seenThrough = seenThroughFor(app)
+    if (seenThrough === undefined || !app?.has_unseen_activity) return app
     const rowVersion = Number(app.unseen_activity_version)
-    if (
-      Number.isFinite(seenThrough) &&
-      Number.isFinite(rowVersion) &&
-      rowVersion > seenThrough
-    ) return app
+    if (Number.isFinite(seenThrough) && Number.isFinite(rowVersion) && rowVersion > seenThrough) return app
     changed = true
-    return {
-      ...app,
-      has_unseen_activity: false,
-      unseen_activity_version: null,
-    }
+    return { ...app, has_unseen_activity: false, unseen_activity_version: null }
   })
   return changed ? next : apps
+}
+
+// A list read may predate a confirmed receipt. Reconcile at query completion
+// so that stale snapshot cannot restore already-seen activity, even offline.
+export function reconcileSeenAppActivity(apps, seen) {
+  if (!Array.isArray(apps)) return apps
+  return mapAppActivitySeen(apps, app => seenAppActivityVersion(seen, app?.id, app?.created_at))
 }
 
 // Apply one live app_activity marker to the cached list, so the drawer dot

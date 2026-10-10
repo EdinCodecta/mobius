@@ -7,6 +7,7 @@ import {
   freshChatBuiltApps,
   freshAppIds,
   rememberSeenAppActivity,
+  reconcileSeenAppActivity,
   seenAppActivityVersion,
   withAppActivity,
   withAppActivitySeen,
@@ -267,4 +268,16 @@ test('two app lifetimes with the same id and marker version do not share an ackn
   releases.forEach(resolve => resolve({ ok: true }))
   assert.equal(await old, true)
   assert.equal(await current, true)
+})
+
+test('list reconciliation preserves newer activity and reused app lifetimes', () => {
+  const seen = new Map()
+  rememberSeenAppActivity(seen, 7, 'current', 5)
+  const rows = [
+    { id: 7, created_at: 'current', has_unseen_activity: true, unseen_activity_version: 6 },
+    { id: 7, created_at: 'recreated', has_unseen_activity: true, unseen_activity_version: 1 },
+    { id: 8, created_at: 'other', has_unseen_activity: true, unseen_activity_version: 2 },
+  ]
+  assert.equal(reconcileSeenAppActivity(rows, seen), rows)
+  assert.equal(reconcileSeenAppActivity(undefined, seen), undefined)
 })

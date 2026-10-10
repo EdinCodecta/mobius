@@ -98,6 +98,7 @@ import {
   seenAppActivityVersion,
   withAppActivity,
   withAppActivitySeen,
+  reconcileSeenAppActivity,
   withAppsFlagged,
   withoutAppFlagged,
 } from './newAppAttention.js'
@@ -696,8 +697,14 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // pre-delete NetworkFirst fallback) until a recovery succeeds.
   const deletedChatIdsRef = useRef(new Set())
   const deletedAppIdsRef = useRef(new Set())
+  // Highest acknowledged version per app lifetime. Retain old lifetimes for
+  // this mounted session so delayed receipts/events cannot cross ID reuse.
+  const appActivitySeenThroughRef = useRef(new Map())
   const reconcileApps = useCallback(
-    rows => withoutConfirmedDeletions(rows, deletedAppIdsRef.current),
+    rows => reconcileSeenAppActivity(
+      withoutConfirmedDeletions(rows, deletedAppIdsRef.current),
+      appActivitySeenThroughRef.current,
+    ),
     [],
   )
   const appsQuery = appQueries.list.useQuery({ reconcile: reconcileApps })
@@ -2302,9 +2309,6 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // duplicate renders share one request, while genuinely newer activity can
   // be acknowledged independently without waiting for an older request.
   const appActivityAckRef = useRef(new Set())
-  // Highest acknowledged version per app lifetime. Retain old lifetimes for
-  // this mounted session so delayed receipts/events cannot cross ID reuse.
-  const appActivitySeenThroughRef = useRef(new Map())
   useEffect(() => {
     for (const rawId of visibleAppIds) {
       const appId = Number(rawId)

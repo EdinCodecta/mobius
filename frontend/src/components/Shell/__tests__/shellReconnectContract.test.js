@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { QueryClient } from '@tanstack/react-query'
 import { api } from '../../../api/client.js'
 import { fetchFreshShellList } from '../shellListReconciliation.js'
+import { reconcileSeenAppActivity, rememberSeenAppActivity, withAppActivitySeen } from '../newAppAttention.js'
 import { chatQueries, appQueries } from '../../../hooks/queries.js'
 
 function freshReader(t, queryClient, fetch, kind = 'chats') {
@@ -89,3 +90,22 @@ for (const kind of ['chats', 'apps']) {
     } finally { client.clear() }
   })
 }
+
+test('a stale apps-list response resolving after another tab seen receipt cannot restore unread activity', async t => {
+  const client = new QueryClient()
+  const seen = new Map()
+  const rows = [{ id: 7, created_at: 'current', has_unseen_activity: true, unseen_activity_version: 5 }]
+  client.setQueryData(appQueries.keys.all, rows)
+  let release
+  const fresh = freshReader(t, client, () => new Promise(resolve => { release = resolve }), 'apps')
+  try {
+    const pending = fresh({ reconcile: data => reconcileSeenAppActivity(data, seen) })
+    while (!release) await Promise.resolve()
+    rememberSeenAppActivity(seen, 7, 'current', 5)
+    client.setQueryData(appQueries.keys.all, data => withAppActivitySeen(data, 7, 5, 'current'))
+    release(rows)
+    await pending
+    assert.equal(client.getQueryData(appQueries.keys.all)[0].has_unseen_activity, false)
+    assert.equal(client.getQueryData(appQueries.keys.all)[0].unseen_activity_version, null)
+  } finally { client.clear() }
+})
