@@ -922,7 +922,9 @@ def _lifecycle_values(row: models.Delegation, status: str) -> dict | None:
     "agent_type": "delegation",
     "summary": row.task_key,
     "source": "delegation",
-    "source_event_id": f"delegation:{row.id}:{'terminal:' + status if terminal else 'started'}",
+    # A helper starts once and finishes once; the finish is keyed on finishing,
+    # not on the status a later projection happens to derive for it.
+    "source_event_id": f"delegation:{row.id}:{'terminal' if terminal else 'started'}",
   }
   return normalize_chat_event(
     chat_id=row.parent_chat_id,
@@ -935,22 +937,52 @@ def _lifecycle_values(row: models.Delegation, status: str) -> dict | None:
 
 
 def _record_missing_lifecycles(db: Session, values: list[dict]) -> None:
-  """Append the lifecycle facts not yet recorded, checking them in one read."""
+  """Append the lifecycle facts not yet recorded, checking them in one read.
+
+  A helper's first terminal fact is its only one. Later reads may derive
+  another terminal status for the same finish (a result-less read says
+  ``failed`` where a full read says ``needs_review``; a cancel can follow a
+  failure), and a finish recorded under an earlier release's per-status key
+  counts as recorded too.
+  """
   if not values:
     return
+  from sqlalchemy import and_, or_
+  from sqlalchemy.exc import IntegrityError
+
   from app.agent_lifecycle import record_event
 
-  recorded = {
-    key for (key,) in db.query(models.AgentLifecycleEvent.event_key).filter(
-      models.AgentLifecycleEvent.event_key.in_(
-        {item["event_key"] for item in values}
-      ),
-    )
+  events = models.AgentLifecycleEvent
+  finishing = {
+    item["activation_id"] for item in values
+    if item["event_type"] == "agent_terminal"
   }
+  recorded: set[str] = set()
+  finished: set[str] = set()
+  for key, activation_id, event_type in db.query(
+    events.event_key, events.activation_id, events.event_type,
+  ).filter(or_(
+    events.event_key.in_({item["event_key"] for item in values}),
+    and_(events.activation_id.in_(finishing), events.event_type == "agent_terminal"),
+  )):
+    recorded.add(key)
+    if event_type == "agent_terminal":
+      finished.add(activation_id)
   for item in values:
-    if item["event_key"] not in recorded:
+    terminal = item["event_type"] == "agent_terminal"
+    if item["event_key"] in recorded or (terminal and item["activation_id"] in finished):
+      continue
+    try:
       record_event(db, item)
-      recorded.add(item["event_key"])
+    except IntegrityError:
+      # A concurrent reader recorded this finish first, with another status.
+      if not terminal or db.query(events.id).filter(
+        events.event_key == item["event_key"],
+      ).first() is None:
+        raise
+    recorded.add(item["event_key"])
+    if terminal:
+      finished.add(item["activation_id"])
 
 
 def _record_lifecycle(

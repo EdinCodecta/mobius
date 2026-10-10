@@ -989,11 +989,75 @@ def test_child_policy_is_integrity_checked_and_session_loss_needs_review(db):
   lifecycle = db.query(models.AgentLifecycleEvent).filter(
     models.AgentLifecycleEvent.provider_agent_id == row.id,
     models.AgentLifecycleEvent.source_event_id
-      == f"delegation:{row.id}:terminal:cancelled",
+      == f"delegation:{row.id}:terminal",
   ).all()
   assert len(lifecycle) == 1
   assert lifecycle[0].event_type == "agent_terminal"
   assert lifecycle[0].state == "stopped"
+
+
+def _source_work_needing_review(db, delegation_id):
+  parent = create_chat(id=f"{delegation_id}-parent", title="Parent", messages=[])
+  child = create_chat(id=f"{delegation_id}-child", title="Child", provider="claude", messages=[
+    {"role": "user", "content": "Make the bounded edit."},
+    {"role": "assistant", "blocks": [{
+      "type": "error", "message": "DELEGATION_WRITE_REVIEW_REQUIRED: Review before replaying.",
+    }]},
+  ])
+  db.add_all((parent, child))
+  db.flush()
+  row = models.Delegation(
+    id=delegation_id, parent_chat_id=parent.id, parent_root_run_id=f"{delegation_id}-root",
+    task_key="bounded-edit", child_chat_id=child.id, provider="claude", scope="write",
+    cwd="/data/platform", prompt_sha256=hashlib.sha256(b"edit").hexdigest(),
+    source_work_id=f"{delegation_id}-work", source_work_active_chat_id=parent.id,
+  )
+  db.add(row)
+  db.add(models.ChatRun(id=f"{delegation_id}-run", root_run_id=f"{delegation_id}-run",
+                        chat_id=child.id, status="failed", provider="claude"))
+  db.commit()
+  return row
+
+
+def _terminal_lifecycle_events(db, row):
+  db.expire_all()
+  return db.query(models.AgentLifecycleEvent).filter(
+    models.AgentLifecycleEvent.provider_agent_id == row.id,
+    models.AgentLifecycleEvent.event_type == "agent_terminal",
+  ).all()
+
+
+def test_a_helper_finish_is_recorded_once_whatever_status_later_reads_derive(db):
+  """The settle wake reads no result (failed); the source-work card reads it
+  (needs_review). Both describe one finish, so one terminal fact is logged."""
+  from app.delegations import serialize_source_work, wake_parent_after_child_settled
+
+  row = _source_work_needing_review(db, "finish-once")
+  asyncio.run(wake_parent_after_child_settled(row.child_chat_id))
+  assert serialize_source_work(db, db.get(models.Delegation, row.id))["status"] == "needs_review"
+  mark_cancelled(db, db.get(models.Delegation, row.id))
+
+  events = _terminal_lifecycle_events(db, row)
+  assert [(event.source_event_id, event.state) for event in events] == [
+    (f"delegation:{row.id}:terminal", "failed"),
+  ]
+
+
+def test_a_finish_recorded_under_a_per_status_key_is_not_recorded_again(db):
+  from app.agent_lifecycle import record_event
+  from app.delegations import _lifecycle_values, serialize_source_work
+
+  row = _source_work_needing_review(db, "finish-earlier-key")
+  earlier = _lifecycle_values(row, "failed")
+  earlier["source_event_id"] = f"delegation:{row.id}:terminal:failed"
+  earlier["event_key"] = "earlier-release-terminal-failed"
+  record_event(db, earlier)
+
+  serialize_source_work(db, db.get(models.Delegation, row.id))
+
+  assert [event.event_key for event in _terminal_lifecycle_events(db, row)] == [
+    "earlier-release-terminal-failed",
+  ]
 
 
 def test_continuation_physical_runs_inherit_one_logical_root(db):
