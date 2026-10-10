@@ -13,6 +13,7 @@ import json
 import os
 import math
 import threading
+from datetime import datetime
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -697,6 +698,32 @@ def test_a_writes_conversion_is_never_refused_by_the_background_disk_floor(monke
                       lambda _dir: {"pressure": {"disk": {"state": "critical"}}})
   convert_now(chat_id)
   assert converted(chat_id)
+
+
+def test_the_search_note_counts_only_drawer_chats_awaiting_conversion(client, auth):
+  """Deleted, hidden helper and app chats never appear in search; a chat whose
+  conversion failed is not waiting for it (diagnostics names it instead)."""
+  chats = {
+    "waiting": {},
+    "app-shown": {"created_by_app_id": 7, "agent_settings_json": {"owner_visible": True}},
+    "deleted": {"deleted_at": datetime(2026, 1, 1)},
+    "helper": {"agent_settings_json": {"drawer_hidden": True, "owner_visible": False}},
+    "app-panel": {"created_by_app_id": 7},
+    "failed": {},
+    "converted": {},
+  }
+  with SessionLocal() as db:
+    for chat_id, fields in chats.items():
+      db.add(create_chat(id=chat_id, title=chat_id, messages=[], **fields))
+    db.commit()
+  for chat_id in chats:
+    if chat_id != "converted":
+      previous_release_writes(chat_id, [{"role": "user", "content": "older prose"}])
+  chat_writer.transcript_conversion_status["failed"]["failed"] = "RuntimeError: projection bug"
+
+  response = client.get("/api/chats/search?q=older", headers=auth)
+  assert response.status_code == 200
+  assert response.headers["X-Search-Unindexed-Chats"] == "2"  # waiting, app-shown
 
 
 def test_a_chat_that_cannot_convert_never_blocks_a_route(client, auth, monkeypatch):
