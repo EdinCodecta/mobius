@@ -5018,6 +5018,10 @@ def test_boot_sweep_removes_unfinished_transfers(tmp_path, monkeypatch):
   monkeypatch.setattr(install, "get_settings", lambda: type("S", (), {"data_dir": str(tmp_path)})())
   root = install.git_transfer_root()
   assert root == tmp_path / "apps" / ".git-transfers"
+  from app import source_dirs
+  # Staging can never be claimed as an app's source, which the sweep would delete.
+  assert source_dirs.source_dir_kind(root, tmp_path) is None
+  assert source_dirs.source_dir_kind(tmp_path / "apps" / "notes", tmp_path) == "app"
   (root / "fetch-leftover" / "objects").mkdir(parents=True)
   startup._sweep_git_transfers(None)
   assert not root.exists()

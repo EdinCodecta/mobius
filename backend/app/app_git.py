@@ -44,8 +44,12 @@ primitive that makes the no-clobber verdict possible — is a porcelain we
 get for free without a libgit2 binding to pin and maintain.
 
 CONCURRENCY: callers MUST hold `fs_locks.source_dir_lock(<source_dir>)`
-around every entry point here, so explicit apply cannot race the installer's
-merge on the same repo. This module does not take the
+around every entry point that reads or writes an app repository, so explicit
+apply cannot race the installer's merge on the same repo. The exceptions are
+the staging functions (`stage_fetch`, `stage_clone`), which write only a
+private staging repository and must run with no app lock held; their local
+counterparts (`import_staged`, `adopt_clone`) need the lock. This module does
+not take the
 lock itself — the lock is keyed on the source dir, which only the caller
 knows, and nesting lock acquisition inside would hide the ordering the
 rest of install.py reasons about.
@@ -415,6 +419,7 @@ def _run(
   check: bool = True,
   read_only: bool = False,
   timeout: int = _GIT_TIMEOUT,
+  env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
   """Runs `git -C <repo> <args>` with the fixed Mobius identity.
 
@@ -434,7 +439,8 @@ def _run(
   ]
   with subprocess.Popen(
     cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    start_new_session=True, env=_git_env(repo, read_only=read_only),
+    start_new_session=True,
+    env={**_git_env(repo, read_only=read_only), **(env or {})},
   ) as process:
     try:
       stdout, stderr = process.communicate(timeout=timeout)
@@ -2661,7 +2667,8 @@ def _transfer(stage: Path, url: str, ref: str, *, unshallow: bool) -> str:
         "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
         *(["--unshallow"] if unshallow else []),
         "--end-of-options", url, f"+{source}:{FETCHED_REF}",
-        timeout=_GIT_TRANSFER_TIMEOUT,
+        # The tag fallback below reads Git's untranslated error text.
+        timeout=_GIT_TRANSFER_TIMEOUT, env={"LC_ALL": "C"},
       )
       break
     except subprocess.TimeoutExpired as exc:
@@ -2724,7 +2731,9 @@ def import_staged(source_dir: str | Path, staged: Staged) -> str:
   """
   repo = Path(source_dir)
   if not same_origin(origin_url(repo), staged.url):
-    raise SourceTreeChanged("app origin changed during transfer")
+    raise SourceTreeChanged(
+      "the app's Git origin is not the repository this update came from"
+    )
   try:
     _run(
       repo, *_NO_AUTO_GC, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
@@ -2847,7 +2856,7 @@ def promote_upstream(
     repo, "rev-parse", "--verify", UPSTREAM_BRANCH, check=False,
   )
   previous_sha = previous.stdout.strip() if previous.returncode == 0 else ""
-  _require_merge_history(repo, LOCAL_BRANCH, fetched_ref)
+  require_merge_history(repo, LOCAL_BRANCH, fetched_ref)
   equal_local_adoption = (
     trusted_origin_adoption
     and ref_trees_equal(repo, LOCAL_BRANCH, fetched_ref)
@@ -3321,7 +3330,7 @@ def local_diverged_from(source_dir: str | Path, base_commit: str) -> bool:
   return proc.returncode != 0
 
 
-def _require_merge_history(
+def require_merge_history(
   source_dir: str | Path,
   left: str = LOCAL_BRANCH,
   right: str = UPSTREAM_BRANCH,
@@ -3370,7 +3379,7 @@ def merge_upstream(
   """
   repo = Path(source_dir)
   ensure_repo(repo)
-  _require_merge_history(repo)
+  require_merge_history(repo)
   ordinary_base = _run(
     repo, "merge-base", LOCAL_BRANCH, UPSTREAM_BRANCH, check=False,
   ).stdout.strip()
@@ -3653,7 +3662,7 @@ def start_conflict_merge(
   repo = Path(source_dir)
   ensure_repo(repo)
   if merge_base is None:
-    _require_merge_history(repo, local_branch, upstream_branch)
+    require_merge_history(repo, local_branch, upstream_branch)
   local_sha = head_sha(repo, local_branch)
   upstream_sha = head_sha(repo, upstream_branch)
   if _run(repo, "status", "--porcelain").stdout.strip():

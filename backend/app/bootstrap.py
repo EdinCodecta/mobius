@@ -14,6 +14,7 @@ from installing. We log each failure and continue.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass
@@ -282,7 +283,7 @@ async def ensure_bootstrap_apps_installed(db: Session) -> None:
       )
       continue
     finally:
-      discard_staged(staged_clone)
+      await asyncio.to_thread(discard_staged, staged_clone)
     log.info(
       "bootstrap: %s install %s (app id=%s, warnings=%s)",
       bootstrap_app.manifest_id, mode, app.id, warnings,

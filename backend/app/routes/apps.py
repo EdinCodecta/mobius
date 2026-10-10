@@ -895,7 +895,7 @@ async def install_app(
         staged_clone=staged_clone,
       )
   finally:
-    install.discard_staged(staged_clone)
+    await asyncio.to_thread(install.discard_staged, staged_clone)
   app = result.app
   mode = result.mode
   warnings = result.warnings
@@ -1327,7 +1327,7 @@ def _hidden_merge_upstream(repo: Path) -> str | None:
   An unreadable repository is left to the locked validation to report.
   """
   try:
-    app_git._require_merge_history(repo)
+    app_git.require_merge_history(repo)
   except app_git.HistoryIncomplete:
     return app_git.head_sha(repo, app_git.UPSTREAM_BRANCH)
   except (OSError, subprocess.SubprocessError):
@@ -1931,13 +1931,18 @@ async def _create_conflict_resolver_chat(
   from app import background_agents
 
   prepared = []
+  sources = []
   for app_id in sorted(set(app_ids)):
     app = db.get(models.App, app_id)
     if app is not None and app.deleted_at is None and app_git.is_repo(app.source_dir):
-      try:
-        await _complete_history(app.source_dir)
-      except HTTPException as exc:
-        raise _resolver_app_error(exc, app_id) from exc
+      sources.append((app_id, app.source_dir))
+  # Release the request's connection before a possible download.
+  db.rollback()
+  for app_id, source_dir in sources:
+    try:
+      await _complete_history(source_dir)
+    except HTTPException as exc:
+      raise _resolver_app_error(exc, app_id) from exc
   async with fs_locks.install_uninstall_lock(), AsyncExitStack() as locks:
     # All storage locks precede every source lock, including when publication
     # holds an unselected app's storage and needs one of these sources.
