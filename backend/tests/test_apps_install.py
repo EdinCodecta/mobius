@@ -1211,7 +1211,7 @@ def test_fresh_clone_cannot_replace_owner_reviewed_source(
 
 
 def test_cancelled_install_rolls_back_only_after_its_git_worker_exits(
-  db, tmp_path, monkeypatch, bypass_url_validation,
+  db, tmp_path, monkeypatch, bypass_url_validation, caplog,
 ):
   from app import install
 
@@ -1252,6 +1252,8 @@ def test_cancelled_install_rolls_back_only_after_its_git_worker_exits(
   db.expire_all()
   assert db.query(models.App).filter_by(slug="cancelled").first() is None
   assert not source_dir.exists()
+  # The pass's own failure is not lost behind the caller's cancellation.
+  assert "failed after its caller was cancelled" in caplog.text
 
 
 def test_update_dropping_schedule_unregisters_orphan_cron(
@@ -4530,30 +4532,6 @@ def test_cancelled_pending_cleanup_drains_worktree_removal_before_releasing_sour
   assert app.conflict_resolver_upstream_commit is None
 
 
-@pytest.mark.parametrize("candidate_package_id, matches", [
-  ("pkg-installed", True),
-  (None, False),
-  ("pkg-other", False),
-])
-def test_update_candidate_for_a_packaged_app_matches_only_its_package(
-  candidate_package_id, matches,
-):
-  """Update check must not offer what install refuses for a packaged row."""
-  from app.routes import apps as routes
-
-  url = "https://raw.githubusercontent.com/acme/packaged/main/mobius.json"
-  manifest = {"id": "packaged", "name": "Packaged", "version": "2.0.0"}
-  if candidate_package_id:
-    manifest["package_id"] = candidate_package_id
-  installed = install._canonical_identity_key(url, "packaged")
-
-  assert routes._update_candidate_matches_installed(
-    installed, url, manifest, "pkg-installed",
-  ) is matches
-  manifest.pop("package_id", None)
-  assert routes._update_candidate_matches_installed(installed, url, manifest, None)
-
-
 def test_incomplete_history_tells_the_owner_why(tmp_path, monkeypatch):
   from fastapi import HTTPException
   from app.routes import apps as routes
@@ -4563,14 +4541,20 @@ def test_incomplete_history_tells_the_owner_why(tmp_path, monkeypatch):
   monkeypatch.setattr(install, "pending_update_worktree", lambda repo: tmp_path / "none")
 
   def hidden_base(repo):
-    raise app_git.HistoryIncomplete("The app's Git history is incomplete")
+    raise app_git.HistoryIncomplete(
+      "the app's Git history is incomplete (no merge base between main and upstream)",
+    )
 
   monkeypatch.setattr(routes.app_git, "merge_upstream", hidden_base)
   with pytest.raises(HTTPException) as caught:
     routes._validate_pending_update(tmp_path, {"upstream_commit": "upstream"})
-  assert caught.value.detail["message"] == (
-    "The app's Git history is incomplete. The installed version was left unchanged."
-  )
+  assert caught.value.detail == {
+    "code": "git_update_unavailable",
+    "message": "The app's Git history is incomplete, so the update can't be "
+    "merged safely; retry when its source is reachable. The installed version "
+    "was left unchanged.",
+    "retryable": True,
+  }
 
 
 def test_conflict_resolver_batch_deduplicates_and_sorts_canonical_sources(
@@ -9863,6 +9847,40 @@ def test_update_discovery_explicit_stored_address_follows_package_id(
     assert response.json()["upstream_commit"]
 
 
+@pytest.mark.parametrize("route", ["update-check", "update-candidate-preview"])
+@pytest.mark.parametrize("candidate_package_id", [None, "urn:uuid:another-package"])
+def test_update_discovery_fallback_never_offers_what_install_refuses(
+  client, auth, tmp_path, bypass_url_validation, route, candidate_package_id,
+):
+  """Without a catalog address, the stored one applies install's package rule."""
+  manifest = {
+    "id": "pkg-strict", "name": "Package strict", "version": "1.0.0",
+    "description": "Binding", "entry": "index.jsx", "source_files": ["cards.js"],
+    "package_id": "urn:uuid:7a1c3e5f-2b4d-5f6a-8c9e-0d1f2a3b4c5d",
+  }
+  base = "https://pkg-strict.test/repo/"
+  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(manifest)})
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
+    include_source_file=True,
+  )
+  assert installed.status_code == 201, installed.text
+  republished = {**manifest, "version": "2.0.0"}
+  republished.pop("package_id")
+  if candidate_package_id:
+    republished["package_id"] = candidate_package_id
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(republished)})
+  with patch("app.install._derive_repo_ref", return_value=(bare.as_uri(), "main")):
+    response = client.get(f"/api/apps/{installed.json()['id']}/{route}", headers=auth)
+  if route == "update-check":
+    assert response.status_code == 200, response.text
+    assert response.json()["update_available"] is None
+  else:
+    assert response.status_code == 409, response.text
+    assert "permanent package identity" in response.json()["detail"].lower()
+
+
 def test_reviewed_update_applies_package_id_rename_through_stored_address(
   client, auth, db, tmp_path, bypass_url_validation,
 ):
@@ -9925,8 +9943,10 @@ def test_stored_address_binding_accepts_the_rows_package_id():
 
   manifest = {"id": "renamed", "package_id": "urn:uuid:p"}
   require_bound_manifest(manifest, "current", "urn:uuid:p")
-  with pytest.raises(ValueError, match="no longer"):
+  with pytest.raises(ValueError, match="identity changed"):
     require_bound_manifest(manifest, "current", "urn:uuid:other")
+  with pytest.raises(ValueError, match="requires its permanent package"):
+    require_bound_manifest({"id": "current"}, "current", "urn:uuid:p")
   with pytest.raises(ValueError, match="no longer"):
     require_bound_manifest(manifest, "current")
 

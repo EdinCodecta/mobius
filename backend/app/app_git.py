@@ -3388,7 +3388,7 @@ def require_merge_history(
   ):
     return
   raise HistoryIncomplete(
-    f"The app's Git history is incomplete (no merge base between {left} and "
+    f"the app's Git history is incomplete (no merge base between {left} and "
     f"{right}); retry when the app's source is reachable"
   )
 

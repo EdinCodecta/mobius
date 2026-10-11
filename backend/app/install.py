@@ -79,6 +79,7 @@ from app.manifest_identity import (
   canonical_manifest_identity_key as _canonical_identity_key,
   requested_manifest_source,
   require_bound_manifest as _require_bound_manifest,
+  require_permanent_package,
   stored_manifest_fetch_url,
 )
 from app.manifest_contract import (
@@ -2431,9 +2432,7 @@ def validate_manifest_address(
   if manifest_url is None:
     return
   _, bound_id = requested_manifest_source(manifest_url)
-  if bound_id is None:
-    return
-  if db is not None:
+  if db is not None and bound_id is not None:
     existing = _find_install_identity_row(
       db, source_url=manifest_url, manifest_id=bound_id,
     )
@@ -2845,6 +2844,13 @@ def git_source_error(
     failure = f"The app's Git transfer timed out: {exc}."
     outcome = f"{outcome} Retrying on a steadier connection may help."
     retryable = True
+  elif isinstance(exc, app_git.HistoryIncomplete):
+    log.warning("install: %s", exc)  # Names the refs; the owner text does not.
+    failure = (
+      "The app's Git history is incomplete, so the update can't be merged "
+      "safely; retry when its source is reachable."
+    )
+    retryable = True
   return HTTPException(409, detail={
     "code": code, "message": f"{failure} {outcome}".strip(), "retryable": retryable,
   })
@@ -2908,8 +2914,12 @@ async def _settle_before_cancel(work: Awaitable):
     except asyncio.CancelledError:
       cancelled = True
   if cancelled:
-    if not work.cancelled():
-      work.exception()  # Retrieved: the caller's outcome is its cancellation.
+    if not work.cancelled() and work.exception() is not None:
+      # The caller's outcome is its cancellation; keep the failure visible.
+      log.error(
+        "install: work failed after its caller was cancelled",
+        exc_info=work.exception(),
+      )
     raise asyncio.CancelledError
   return work.result()
 
@@ -3359,13 +3369,11 @@ def _select_install_target(
       db, source_url=previous_source, manifest_id=manifest_id,
     )
 
-  if existing is not None and existing.package_id is not None:
-    if package_id is None:
-      raise HTTPException(
-        409, "This installed app requires its permanent package identity.",
-      )
-    if existing.package_id != package_id:
-      raise HTTPException(409, "Permanent package identity changed.")
+  if existing is not None:
+    try:
+      require_permanent_package(manifest, existing.package_id)
+    except ValueError as exc:
+      raise HTTPException(409, str(exc)) from exc
 
   adopting_previous_id = False
   origin_migration = None
@@ -5317,7 +5325,7 @@ async def _install_candidate(
     db.rollback()
     journal.rollback_materialization()
     raise git_source_error(
-      "The installed version was left unchanged.", exc, failure=f"{exc}.",
+      "The installed version was left unchanged.", exc,
     ) from exc
   except (HTTPException, _UncheckedPythonTree):
     db.rollback()

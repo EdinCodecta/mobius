@@ -39,16 +39,31 @@ def same_permanent_package(manifest: dict, package_id: str | None) -> bool:
   return bool(package_id) and manifest.get("package_id") == package_id
 
 
+def require_permanent_package(manifest: dict, package_id: str | None) -> None:
+  """An installed row's permanent `package_id` is its whole identity.
+
+  Install, update discovery and update preview all apply this one rule, so
+  discovery never offers a candidate that install would refuse.
+  """
+  if not package_id:
+    return
+  if manifest.get("package_id") is None:
+    raise ValueError("This installed app requires its permanent package identity.")
+  if manifest.get("package_id") != package_id:
+    raise ValueError("Permanent package identity changed.")
+
+
 def require_bound_manifest(
   manifest: dict, bound_id: str | None, package_id: str | None = None,
 ) -> None:
   """A stored address names this package or its declared predecessor only.
 
-  When the caller knows the installed row's permanent `package_id`, a manifest
-  carrying that same `package_id` is the same package even if its manifest id
-  changed without `previous_id`, as the installer's identity rules allow.
+  When the caller knows the installed row's permanent `package_id`, only a
+  manifest carrying that same `package_id` is the package, even if its
+  manifest id changed without `previous_id`, as the installer's rules require.
   """
-  if same_permanent_package(manifest, package_id):
+  if package_id:
+    require_permanent_package(manifest, package_id)
     return
   if bound_id is not None and bound_id not in (
     manifest.get("id"), manifest.get("previous_id"),

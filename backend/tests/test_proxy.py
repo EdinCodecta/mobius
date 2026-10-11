@@ -462,6 +462,31 @@ def test_proxy_get_follows_redirects_like_install(client, owner_token, monkeypat
   assert sent[1].extensions["sni_hostname"] == "cdn.example"
 
 
+def test_pinned_client_never_follows_redirects_or_keeps_cookies():
+  """Every pinned-request client shares this; one jar entry would cross hosts."""
+  from app.net_utils import pinned_client
+
+  seen = []
+
+  def handler(request):
+    seen.append((request.headers["host"], request.headers.get("cookie")))
+    return httpx.Response(302, headers={
+      "location": "https://victim.example/",
+      "set-cookie": "session=planted; Path=/",
+    })
+
+  async def run():
+    async with pinned_client(transport=httpx.MockTransport(handler)) as client:
+      for host in ("attacker.example", "victim.example"):
+        response = await client.get("https://93.184.216.34/", headers={"host": host})
+        assert response.status_code == 302
+      assert client.follow_redirects is False
+      assert not list(client.cookies.jar)
+
+  asyncio.run(run())
+  assert seen == [("attacker.example", None), ("victim.example", None)]
+
+
 @pytest.mark.parametrize("victim_ip", ["93.184.216.34", "93.184.216.35"])
 def test_proxy_redirect_never_replays_upstream_cookies(
   client, owner_token, monkeypatch, victim_ip,
