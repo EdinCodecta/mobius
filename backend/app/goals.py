@@ -334,7 +334,10 @@ def _helper_blockers(db, run, goal) -> list[str]:
   helper tree) would otherwise be stranded: a closed Goal cannot wake that
   agent. The owning agent reads it with list_agents, or its pending wake
   delivers it; either records receipt and clears the blocker. App-owned
-  helpers report to their app and never hold a chat Goal open.
+  helpers report to their app and never hold a chat Goal open. A result
+  owed to a helper that itself failed or stopped is not counted: that helper
+  is never woken again, only it may read the result, and its own outcome is
+  what reaches the coordinator, so blocking would be uncleared forever.
   """
   from app.delegations import _self_resuming_helper_rows
   from app.goal_plans import _delegation_tree, active_goal_helpers

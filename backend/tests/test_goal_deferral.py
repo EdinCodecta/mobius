@@ -362,3 +362,18 @@ def test_app_owned_helper_results_never_hold_a_chat_goal_open(db, chat):
   update_goal_record(db, run, goal, goal.revision, complete=True)
   db.expire_all()
   assert goal.status == "completed"
+
+
+def test_a_failed_mid_level_helper_does_not_trap_its_coordinator(db, chat):
+  """Only a helper may read its own children's results, and a failed helper
+  is never woken again. Its failure already reached the coordinator, so a
+  child result it can no longer receive must not block completion forever."""
+  goal, run = seed(db, chat)
+  middle = _helper(db, id="failed-middle", parent_chat_id=chat.id, goal=goal, run=run,
+                   status="failed", delivered=True)
+  _helper(db, id="orphaned-nested", parent_chat_id=middle.id, goal=goal, run=run,
+          status="failed")
+  db.commit()
+  update_goal_record(db, run, goal, goal.revision, complete=True)
+  db.expire_all()
+  assert goal.status == "completed"
