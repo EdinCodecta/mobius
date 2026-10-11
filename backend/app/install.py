@@ -2844,9 +2844,38 @@ async def _to_completion(function: Callable, *args):
   return work.result()
 
 
-async def stage_app_clone(url: str, ref: str) -> app_git.Staged:
-  """Clone a catalog repository privately before any app lock is taken."""
-  return await _stage(app_git.stage_clone, url, ref, git_transfer_root())
+async def stage_package_clone(
+  manifest_url: str, *, db: Session | None = None,
+) -> app_git.Staged | None:
+  """The pre-lock Git step of a URL install: clone the package's repository.
+
+  Returns None for a package that is not a root Git repository. An owner
+  request passes ``db``: the manifest is validated first, with the stored
+  address checks the preview uses, so a missing or invalid package is reported
+  before any history is transferred, and the connection is released before
+  the transfer.
+  """
+  repo_ref = _derive_repo_ref(manifest_url)
+  if repo_ref is None:
+    return None
+  if db is not None:
+    await preview_manifest_capabilities(
+      manifest_url=manifest_url, manifest=None, raw_base=None, db=db,
+    )
+    db.rollback()
+  return await _stage(app_git.stage_clone, *repo_ref, git_transfer_root())
+
+
+# One transfer per (repository, origin, ref) at a time; concurrent requests,
+# such as parallel Store update checks, share it instead of repeating it.
+_FETCHES: dict[tuple[str, str, str], asyncio.Future] = {}
+
+
+def _forget_fetch(key: tuple[str, str, str], done: asyncio.Future) -> None:
+  if _FETCHES.get(key) is done:
+    del _FETCHES[key]
+  if not done.cancelled():
+    done.exception()  # Retrieved even when every waiting request has gone.
 
 
 async def fetch_app_commit(
@@ -2867,6 +2896,17 @@ async def fetch_app_commit(
     return present
   if url is None:
     raise RuntimeError("source repository has no origin")
+  key = (str(repo.resolve()), url, ref)
+  shared = _FETCHES.get(key)
+  if shared is None or shared.get_loop() is not asyncio.get_running_loop():
+    shared = asyncio.ensure_future(_fetch_and_import(repo, url, ref))
+    _FETCHES[key] = shared
+    shared.add_done_callback(lambda done: _forget_fetch(key, done))
+  # A request that goes away leaves the shared transfer running for the rest.
+  return await asyncio.shield(shared)
+
+
+async def _fetch_and_import(repo: Path, url: str, ref: str) -> str:
   staged = await _stage(app_git.stage_fetch, repo, url, ref, git_transfer_root())
   try:
     async with fs_locks.source_dir_lock(str(repo)):
@@ -4198,7 +4238,7 @@ async def install_from_manifest(
   The per-app git model is unconditional. Every installed app has a canonical
   source directory and repository; updates never overwrite source blindly.
   Callers hold the lifecycle lock, so this never touches the network: a root
-  Git package arrives as ``staged_clone`` (from ``stage_app_clone``) or as a
+  Git package arrives as ``staged_clone`` (from ``stage_package_clone``) or as a
   commit already made present by ``fetch_app_commit``.
 
   Failure modes:
@@ -4677,7 +4717,7 @@ async def _install_candidate(
             if reviewed_upstream_commit is not None:
               upstream_sha = reviewed_upstream_commit
             else:
-              upstream_sha = await asyncio.to_thread(
+              upstream_sha = await _to_completion(
                 _url_update_commit, git_source_dir, repo_ref[1], staged_clone,
               )
               await asyncio.to_thread(
@@ -4969,7 +5009,7 @@ async def _install_candidate(
               409, "The app's Git repository must be fetched before install.",
             )
           try:
-            journal.rollback_actions.append(await asyncio.to_thread(
+            journal.rollback_actions.append(await _to_completion(
               app_git.adopt_clone, staged_clone, git_source_dir,
             ))
             app.upstream_commit = staged_clone.sha

@@ -838,37 +838,26 @@ async def install_app(
   # never holds up other apps' installs, updates or uninstalls.
   staged_clone = None
   try:
-    reviewed = (
-      db.get(models.App, body.update_app_id)
-      if body.update_app_id is not None
-      and body.reviewed_upstream_commit is not None else None
-    )
-    reviewed_source = reviewed.source_dir if reviewed is not None else None
-    repo_ref = (
-      install._derive_repo_ref(body.manifest_url)
-      if body.manifest_url is not None and body.update_app_id is None else None
-    )
-    # Release the request's connection for the transfer, as update-check does.
-    db.rollback()
-    if reviewed_source is not None and app_git.is_repo(reviewed_source):
+    if body.update_app_id is not None and body.reviewed_upstream_commit is not None:
+      reviewed = db.get(models.App, body.update_app_id)
+      reviewed_source = reviewed.source_dir if reviewed is not None else None
+      # Release the request's connection for the transfer, as update-check does.
+      db.rollback()
+      if reviewed_source is not None and app_git.is_repo(reviewed_source):
+        try:
+          await install.fetch_app_commit(
+            reviewed_source, body.reviewed_upstream_commit,
+          )
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+          raise install.git_source_error(
+            "Refresh the update and try again.",
+            exc,
+            code="update_changed",
+            failure="The reviewed Git update is no longer available.",
+          ) from exc
+    elif body.update_app_id is None and body.manifest_url is not None:
       try:
-        await install.fetch_app_commit(
-          reviewed_source, body.reviewed_upstream_commit,
-        )
-      except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-        raise install.git_source_error(
-          "Refresh the update and try again.",
-          exc,
-          code="update_changed",
-          failure="The reviewed Git update is no longer available.",
-        ) from exc
-    elif repo_ref is not None:
-      # Report a missing or invalid package before transferring its history.
-      await install.preview_manifest_capabilities(
-        manifest_url=body.manifest_url, manifest=None, raw_base=None,
-      )
-      try:
-        staged_clone = await install.stage_app_clone(*repo_ref)
+        staged_clone = await install.stage_package_clone(body.manifest_url, db=db)
       except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
         raise install.git_source_error(
           "Nothing was installed.",

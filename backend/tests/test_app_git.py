@@ -4900,7 +4900,11 @@ def test_staging_transfers_only_new_objects_and_leaves_live_repo_alone(tmp_path)
   refs, status, head, shallow = _live_state(source)
   assert (status, head, shallow) == before[1:]
   changed = set(refs.splitlines()) ^ set(before[0].splitlines())
-  assert {line.split()[0] for line in changed} == {app_git.FETCHED_REF}
+  # Only the private candidate ref and the last-fetched origin branch move.
+  assert {line.split()[0] for line in changed} == {
+    app_git.FETCHED_REF, "refs/remotes/origin/main",
+  }
+  assert app_git.head_sha(source, "origin/main") == new_head
   assert app_git.head_sha(source, app_git.FETCHED_REF) == new_head
   assert not (source / ".git" / "FETCH_HEAD").exists()
 

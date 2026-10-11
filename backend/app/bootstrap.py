@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 from app import models
 from app.manifest_identity import canonical_manifest_identity_key
 from app.install import (
-  _derive_repo_ref, discard_staged, install_from_manifest, stage_app_clone,
+  discard_staged, install_from_manifest, stage_package_clone,
 )
 from app.timeutil import now_naive_utc
 
@@ -261,9 +261,7 @@ async def ensure_bootstrap_apps_installed(db: Session) -> None:
     )
     staged_clone = None
     try:
-      repo_ref = _derive_repo_ref(bootstrap_app.manifest_url)
-      if repo_ref is not None:
-        staged_clone = await stage_app_clone(*repo_ref)
+      staged_clone = await stage_package_clone(bootstrap_app.manifest_url)
       result = await install_from_manifest(
         db,
         manifest_url=bootstrap_app.manifest_url,

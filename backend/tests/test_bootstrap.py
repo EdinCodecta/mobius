@@ -28,7 +28,7 @@ from app.bootstrap import (
 @pytest.fixture(autouse=True)
 def _no_git_transfer(monkeypatch):
   """These tests replace the installer, so nothing needs a staged clone."""
-  monkeypatch.setattr("app.bootstrap.stage_app_clone", AsyncMock(return_value=None))
+  monkeypatch.setattr("app.bootstrap.stage_package_clone", AsyncMock(return_value=None))
 
 
 def _install_result(name="App", slug="app", app_id=1, mode="install"):

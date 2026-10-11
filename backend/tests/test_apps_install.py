@@ -7014,6 +7014,8 @@ def test_clone_update_fast_forward_uses_full_origin_tree(
   assert (src / "cards.js").read_text() == cards_v2
   assert app_git.head_sha(src, app_git.UPSTREAM_BRANCH) == new_head
   assert app_git.head_sha(src, app_git.FETCHED_REF) == new_head
+  origin_head = app_git._run(src, "rev-parse", "origin/main").stdout.strip()
+  assert origin_head == new_head
   assert app_git.local_diverged_from(src, new_head) is False
 
 

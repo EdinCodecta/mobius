@@ -243,6 +243,10 @@ def _run_async(scenario, *responses):
   return asyncio.run(main())
 
 
+def _stage_clone(url: str, ref: str = "main"):
+  return install._stage(app_git.stage_clone, url, ref, install.git_transfer_root())
+
+
 async def _paused(server: _GitServer) -> None:
   assert await asyncio.to_thread(server.waiting.wait, 30), "transfer never started"
 
@@ -322,7 +326,7 @@ def test_bootstrap_transfers_before_installing(git_server, transfers, db, monkey
 
   monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
   git_server.publish("bootstrap-source")
-  monkeypatch.setattr(bootstrap, "_derive_repo_ref", lambda _url: (
+  monkeypatch.setattr(install, "_derive_repo_ref", lambda _url: (
     git_server.url("bootstrap-source"), "main",
   ))
   staged = []
@@ -410,7 +414,7 @@ def test_stalled_transfer_fails_fast_and_cleanly(git_server, monkeypatch):
   git_server.pause("stalled")
   started = time.monotonic()
   with pytest.raises(subprocess.CalledProcessError):
-    asyncio.run(install.stage_app_clone(git_server.url("stalled"), "main"))
+    asyncio.run(_stage_clone(git_server.url("stalled"), "main"))
   assert time.monotonic() - started < 30
   assert _no_leftovers()
 
@@ -429,7 +433,7 @@ def test_transfer_ceiling_stops_every_git_process(git_server, monkeypatch):
 
   monkeypatch.setattr(app_git.subprocess, "Popen", Recording)
   with pytest.raises(app_git.GitTransferTimeout):
-    asyncio.run(install.stage_app_clone(git_server.url("trickle"), "main"))
+    asyncio.run(_stage_clone(git_server.url("trickle"), "main"))
   deadline = time.monotonic() + 5
   for group in groups:
     while True:
@@ -667,7 +671,7 @@ def test_cancelled_transfer_still_discards_its_staging(
   name = f"cancelled-{stage}"
   if stage == "clone":
     git_server.publish(name, big=True)
-    start = lambda: install.stage_app_clone(git_server.url(name), "main")
+    start = lambda: _stage_clone(git_server.url(name), "main")
   else:
     _app_id, manifest = _install_served(client, auth, git_server, name)
     git_server.commit(name, {**manifest, "version": "2.0.0"}, JSX, push=True)
@@ -710,14 +714,113 @@ def test_cancelled_import_keeps_the_source_lock_until_it_finishes(
     task = asyncio.create_task(install.fetch_app_commit(repo, "main"))
     assert await asyncio.to_thread(entered.wait, 30)
     task.cancel()
-    await asyncio.sleep(0.2)
-    assert not task.done()
-    assert fs_locks.source_dir_lock(str(repo)).locked()
-    finish.set()
     with pytest.raises(asyncio.CancelledError):
       await task
+    # The request is gone; its shared import still holds the source lock.
+    await asyncio.sleep(0.2)
+    assert fs_locks.source_dir_lock(str(repo)).locked()
+    finish.set()
+    deadline = time.monotonic() + 30
+    while fs_locks.source_dir_lock(str(repo)).locked() and time.monotonic() < deadline:
+      await asyncio.sleep(0.05)
     assert not fs_locks.source_dir_lock(str(repo)).locked()
+    while install._FETCHES and time.monotonic() < deadline:
+      await asyncio.sleep(0.05)
 
   asyncio.run(scenario())
   assert app_git._resolve_commit(repo, head) == head
   assert _no_leftovers()
+
+
+def _status(repo: Path) -> dict:
+  from app import source_status
+  return source_status.build_app_status({"id": 1, "source_dir": str(repo), "slug": repo.name})
+
+
+def test_transfers_keep_origin_branch_for_source_status(
+  client, auth, git_server, bypass_url_validation,
+):
+  """Source status compares an app with its last-fetched origin branch."""
+  app_id, manifest = _install_served(client, auth, git_server, "status")
+  repo = _repo("status")
+  installed = _status(repo)
+  first = app_git.head_sha(repo, app_git.UPSTREAM_BRANCH)
+  assert installed["origin"]["ref"] == "origin/main"
+  assert installed["origin"]["sha"] == installed["base_sha"] == first
+  assert installed["state"] == "aligned"
+
+  v2 = {**manifest, "version": "2.0.0"}
+  head = git_server.commit("status", v2, JSX.replace("ok", "v2"), push=True)
+  checked = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
+  assert checked.status_code == 200 and checked.json()["update_available"] is True
+  fetched = _status(repo)
+  assert fetched["origin"]["sha"] == head
+  assert fetched["base_sha"] == first
+
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(
+    _responses("status", v2, JSX.replace("ok", "v2")),
+  )):
+    updated = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base("status") + "mobius.json",
+    })
+  assert updated.status_code == 201, updated.text
+  current = _status(repo)
+  assert current["origin"]["sha"] == current["base_sha"] == head
+  assert current["state"] == "aligned"
+
+
+def test_concurrent_fetches_share_one_transfer(
+  client, auth, git_server, transfers, bypass_url_validation,
+):
+  _app_id, manifest = _install_served(client, auth, git_server, "shared")
+  head = git_server.commit("shared", {**manifest, "version": "2.0.0"}, JSX, push=True)
+  repo = _repo("shared")
+  count = len(transfers)
+  git_server.pause("shared")
+
+  async def scenario():
+    first = asyncio.create_task(install.fetch_app_commit(repo, "main"))
+    await _paused(git_server)
+    second = asyncio.create_task(install.fetch_app_commit(repo, "main"))
+    await asyncio.sleep(0.2)
+    git_server.release()
+    return await asyncio.gather(first, second)
+
+  assert asyncio.run(scenario()) == [head, head]
+  assert len(transfers) == count + 1
+  assert not install._FETCHES
+  assert _no_leftovers()
+
+
+def test_stored_address_installs_a_renamed_git_package(
+  client, auth, git_server, bypass_url_validation,
+):
+  """The pre-clone check sees the installed app's permanent package identity."""
+  name = "rename-pkg"
+  git_server.publish(name)
+  manifest = {
+    "id": "before-rename", "name": "Rename", "version": "1.0.0",
+    "description": "Renamed package", "entry": "index.jsx",
+    "package_id": "urn:uuid:9e136d55-9631-585a-aa75-a745a5dc8f2e",
+  }
+  git_server.commit(name, manifest, JSX, push=True)
+  base = _base(name)
+  responses = {
+    **_responses(name, manifest),
+    f"https://api.github.com/repos/test/{name}": (
+      200, json.dumps({"id": 101, "full_name": f"test/{name}"}).encode(),
+    ),
+  }
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    first = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+    assert first.status_code == 201, first.text
+    renamed = {**manifest, "id": "after-rename", "version": "2.0.0"}
+    git_server.commit(name, renamed, JSX, push=True)
+    responses[base + "mobius.json"] = (200, json.dumps(renamed).encode())
+    result = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base.rstrip("/") + "#manifest-id=before-rename",
+    })
+  assert result.status_code == 201, result.text
+  assert result.json()["id"] == first.json()["id"]

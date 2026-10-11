@@ -2616,6 +2616,8 @@ class Staged:
   path: Path
   sha: str
   url: str
+  # The origin branch the commit came from, when the ref named a branch.
+  branch: str | None = None
 
 
 # Neither the transfer nor the import may start background maintenance that
@@ -2635,13 +2637,16 @@ def _is_shallow(repo: Path) -> bool:
   ).stdout.strip() == "true"
 
 
-def _transfer(stage: Path, url: str, ref: str, *, unshallow: bool) -> str:
+def _transfer(
+  stage: Path, url: str, ref: str, *, unshallow: bool,
+) -> tuple[str, str | None]:
   """Fetch ``ref`` from ``url`` into ``stage``; Git's only network command.
 
   ``stage`` is always a private staging repository, never a live app
   repository, and no app lock is held: a slow transfer delays only its own
   request. A full commit id is fetched exactly; a name prefers the branch and
-  falls back to the tag, as ``git clone --branch`` did.
+  falls back to the tag, as ``git clone --branch`` did. Returns the commit and
+  the branch it came from, if any.
   """
   requested = str(ref or "")
   immutable = requested.lower() if _HEX_OID.fullmatch(requested.lower()) else None
@@ -2683,7 +2688,16 @@ def _transfer(stage: Path, url: str, ref: str, *, unshallow: bool) -> str:
     raise RuntimeError("origin ref did not resolve to a commit")
   if immutable is not None and fetched != immutable:
     raise RuntimeError("origin returned a different commit")
-  return fetched
+  return fetched, requested if source == f"refs/heads/{requested}" else None
+
+
+def _record_origin_branch(repo: Path, staged: Staged) -> None:
+  """Keep ``origin/<branch>`` where ``git fetch origin`` would have left it.
+
+  Source status and Contribute compare an app with its last-fetched origin.
+  """
+  if staged.branch:
+    _run(repo, "update-ref", f"refs/remotes/origin/{staged.branch}", staged.sha)
 
 
 def _staging_dir(root: Path, prefix: str) -> Path:
@@ -2716,7 +2730,8 @@ def stage_fetch(source_dir: str | Path, url: str, ref: str, root: Path) -> Stage
     unshallow = (git_dir / "shallow").is_file()
     if unshallow:
       shutil.copyfile(git_dir / "shallow", stage / "shallow")
-    return Staged(stage, _transfer(stage, url, ref, unshallow=unshallow), url)
+    sha, branch = _transfer(stage, url, ref, unshallow=unshallow)
+    return Staged(stage, sha, url, branch)
   except BaseException:
     shutil.rmtree(stage, ignore_errors=True)
     raise
@@ -2747,6 +2762,7 @@ def import_staged(source_dir: str | Path, staged: Staged) -> str:
     ) from exc
   if _resolve_commit(repo, staged.sha) != staged.sha:
     raise RuntimeError("staged commit did not import")
+  _record_origin_branch(repo, staged)
   return staged.sha
 
 
@@ -2776,14 +2792,16 @@ def stage_clone(url: str, ref: str, root: Path) -> Staged:
     # plain file holding the link text, never a real filesystem symlink that
     # could point outside the app directory. Set before the first checkout.
     _run(stage, "config", "core.symlinks", "false")
-    sha = _transfer(stage, url, ref, unshallow=False)
+    sha, branch = _transfer(stage, url, ref, unshallow=False)
+    staged = Staged(stage, sha, url, branch)
+    _record_origin_branch(stage, staged)
     _run(stage, "branch", "-f", UPSTREAM_BRANCH, sha)
     _run(stage, "checkout", "-q", "-B", LOCAL_BRANCH, sha)
     # Keep the app's OWN .gitignore committed (it travels upstream), but layer
     # Möbius's managed-artifact ignores locally via .git/info/exclude so a
     # later `git add -A` never tracks generated per-install files.
     _refresh_ignore_rules(stage)
-    return Staged(stage, sha, url)
+    return staged
   except BaseException:
     shutil.rmtree(stage, ignore_errors=True)
     raise
