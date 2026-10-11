@@ -1,5 +1,7 @@
 /* Goal-owned helper presentation comes only from the embedded plan tree. */
-const UNSETTLED = new Set(['accepted', 'retrying', 'starting', 'running', 'resuming', 'paused', 'needs_input'])
+import { isHelperAwaitingParent, isWorkingHelperStatus } from './workingHelper.js'
+
+const helperCount = count => `${count} ${count === 1 ? 'helper' : 'helpers'}`
 
 export function goalHelpers(goal) {
   const helpers = []
@@ -26,12 +28,25 @@ export function helpersOutsideGoal(backgroundHelpers, goal) {
   }
 }
 
+/**
+ * The Goal headline's helper clause: who acts next, never who merely exists.
+ * A helper question is owed by its coordinating agent, so it never reads as
+ * owner input; a saved owner card (`owner_input` handoff) outranks helper
+ * work, which stays visible in the Goal details.
+ */
 export function goalHelperWaitingLabel(goal, { turnActive = false } = {}) {
   if (turnActive || !['active', 'paused'].includes(goal?.status)) return null
-  const helpers = goalHelpers(goal).filter(node => UNSETTLED.has(node.status))
-  if (!helpers.length) return null
-  const waiting = `Waiting on ${helpers.length} ${helpers.length === 1 ? 'helper' : 'helpers'}`
-  if (helpers.some(node => node.status === 'needs_input')) return `${waiting} · Needs an answer`
+  if (goal.handoff?.kind === 'owner_input') return null
+  const helpers = goalHelpers(goal)
+  const working = helpers.filter(node => isWorkingHelperStatus(node.status)).length
+  const asking = helpers.filter(isHelperAwaitingParent).length
+  if (!working && !asking) return null
+  const waiting = [
+    working ? `Waiting on ${helperCount(working)}` : null,
+    asking
+      ? `${working ? asking : asking === 1 ? 'Helper' : helperCount(asking)} waiting for coordinating agent`
+      : null,
+  ].filter(Boolean).join(' · ')
   if (goal.status === 'paused' && goal.handoff?.kind !== 'automatic') return `On hold · ${waiting}`
   return goal.handoff?.kind === 'automatic'
     ? `${waiting} · resumes automatically`
