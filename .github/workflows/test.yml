@@ -14,6 +14,10 @@ on:
         description: Prove per-message transcripts survive a real Host worker round trip to the previous release (disposable hosted runner)
         type: boolean
         default: false
+      mixed_upgrade_proof:
+        description: Prove Settings refuses a pinned image plus helper upgrade and the operator path cuts it over (disposable hosted runner)
+        type: boolean
+        default: false
   pull_request:
     # True PR stacks target the upstream branch directly beneath them. Run the
     # same suite for every layer so the chain is reviewable in parallel; main's
@@ -57,6 +61,35 @@ jobs:
           # No image build, publication, live-host credentials, or remote Docker.
           sudo git config --global --add safe.directory '*'
           sudo env MOBIUS_RELEASE_REPLAY=1 scripts/test-host-helper.sh "$PREVIOUS" "$TARGET"
+
+  mixed-upgrade-proof:
+    # Installs root-owned units, builds an image and replaces containers:
+    # never on PR/merge events or a self-hosted runner, never with live-host
+    # credentials.
+    if: github.event_name == 'workflow_dispatch' && inputs.mixed_upgrade_proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Make room for the target image build
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Settings refuses an image plus helper span; the operator path cuts it over
+        env:
+          PREVIOUS: f6e61ae4240c10daf7ece40a74bb14eca4d43f87
+          TARGET: 6bac85f6834ad0507eae8dc12b2dcbdbcbe65193
+        run: |
+          # The proof requires an exact root-owned checkout, never broad Git trust.
+          sudo cp -a "$GITHUB_WORKSPACE" /root/mixed-upgrade-proof
+          sudo chown -R root:root /root/mixed-upgrade-proof
+          sudo chmod -R go-w /root/mixed-upgrade-proof
+          sudo /root/mixed-upgrade-proof/scripts/test-mixed-host-upgrade.sh "$PREVIOUS" "$TARGET"
 
   transcript-host-proof:
     # Installs root-owned units and replaces containers: never on PR/merge
