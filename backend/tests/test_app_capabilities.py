@@ -1086,3 +1086,57 @@ def test_route_limit_review_uses_the_runtime_reading_of_accepted_ceilings():
   assert accepted_service_route_limits(limits, MIB) == {("GET", "/a"): 2048, ("POST", "/b"): MIB}
   assert accepted_service_route_limits(limits, MIB - 1) is None
   assert accepted_service_route_limits([]) == {}
+
+
+@pytest.mark.parametrize(("request_bytes", "response_bytes"), [
+  (1, True), (1, 1.0), (True, True), (1.0, 1.0), (True, 1), (1.0, 1),
+], ids=["response-bool", "response-float", "both-bool", "both-float", "request-bool", "request-float"])
+def test_equal_looking_bool_or_float_ceiling_is_a_reviewed_change(request_bytes, response_bytes):
+  # Python equates 1, True and 1.0, so a value-equality diff would report no
+  # change at all against a valid integer ceiling of 1.
+  valid, _digest = contract_and_digest(_routed([_limit("GET", "/actor", 1)]))
+  lookalike = json.loads(json.dumps(valid))
+  lookalike["service"]["route_limits"][0].update(
+    max_request_bytes=request_bytes, max_response_bytes=response_bytes,
+  )
+  for installed, candidate in ((valid, lookalike), (lookalike, valid)):
+    report = diff_contracts(installed, candidate)
+    assert report["changed"] == ["service.route_limits"]
+    assert report["widens"] is True
+  assert diff_contracts(lookalike, lookalike) == {
+    "unknown_previous": False, "widens": True, "added": [], "removed": [], "changed": [],
+  }
+  revoked = {key: value for key, value in lookalike.items() if key != "service"}
+  assert diff_contracts(lookalike, revoked)["widens"] is False
+
+
+@pytest.mark.parametrize("stored", [
+  None, False, {}, {"GET /actor": 1}, "1024",
+  [_accepted(path=[])], [_accepted(response=True)],
+], ids=lambda value: json.dumps(value)[:40])
+def test_unreadable_route_limits_need_review_even_when_unchanged_or_pruned(stored):
+  # null, false and {} are pruned like an absent grant, but the runtime
+  # refuses them; only absence and [] mean "no route ceilings".
+  plain, _digest = contract_and_digest(_routed(None))
+  unreadable = json.loads(json.dumps(plain))
+  unreadable["service"]["route_limits"] = stored
+  assert diff_contracts(unreadable, unreadable)["widens"] is True
+  assert diff_contracts(plain, unreadable)["widens"] is True
+  assert diff_contracts(unreadable, plain)["widens"] is True
+  revoked = {key: value for key, value in unreadable.items() if key != "service"}
+  assert diff_contracts(unreadable, revoked)["widens"] is False
+
+
+def test_readable_identical_absent_or_empty_route_limits_need_no_review():
+  plain, plain_digest = contract_and_digest(_routed(None))
+  capped, _digest = contract_and_digest(_routed([_limit("GET", "/actor", 1)]))
+  empty = json.loads(json.dumps(plain))
+  empty["service"]["route_limits"] = []
+  unchanged = {
+    "unknown_previous": False, "widens": False, "added": [], "removed": [], "changed": [],
+  }
+  assert diff_contracts(plain, plain) == unchanged
+  assert diff_contracts(capped, json.loads(json.dumps(capped))) == unchanged
+  assert diff_contracts(plain, empty) == unchanged
+  assert diff_contracts(empty, plain) == unchanged
+  assert contract_and_digest(_routed([]))[1] == plain_digest

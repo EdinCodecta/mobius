@@ -889,10 +889,22 @@ def diff_contracts(
   after = leaves(_semantic_contract(candidate))
   added = sorted(k for k in after.keys() - before.keys())
   removed = sorted(k for k in before.keys() - after.keys())
-  changed = sorted(k for k in before.keys() & after.keys() if before[k] != after[k])
+  changed = sorted(
+    k for k in before.keys() & after.keys()
+    if before[k] != after[k] or (
+      # Python equates 1, True and 1.0; only the integer is a valid ceiling.
+      k == _ROUTE_LIMITS_PATH and _exact_json(before[k]) != _exact_json(after[k])
+    )
+  )
   widens = any(
     _widens(path, before.get(path), after.get(path), after)
     for path in [*added, *removed, *changed]
+  ) or (
+    # Route ceilings the runtime refuses cannot be ranked against anything,
+    # even when they compare equal or pruning made them look absent. While
+    # the service stays granted, either side being unreadable needs review.
+    isinstance(candidate.get("service"), dict)
+    and (_unreadable_route_limits(installed) or _unreadable_route_limits(candidate))
   )
   return {
     "unknown_previous": False,
@@ -924,6 +936,26 @@ _LIST_GRANTS = {
   "agent.skills", "agent.tools", "data.job_secret_read",
   "public.network",
 }
+
+
+_ROUTE_LIMITS_PATH = "service.route_limits"
+
+
+def _exact_json(value: Any) -> str:
+  return json.dumps(value, sort_keys=True, separators=(",", ":"), default=repr)
+
+
+def _unreadable_route_limits(contract: dict[str, Any]) -> bool:
+  """Whether a stored contract carries route ceilings the runtime would refuse.
+
+  Absence and an empty list mean no ceilings, exactly as the runtime reads
+  them; any other value must pass the shared strict parser.
+  """
+  service = contract.get("service")
+  return (
+    isinstance(service, dict) and "route_limits" in service
+    and accepted_service_route_limits(service["route_limits"]) is None
+  )
 
 
 def _route_ceilings(value: Any) -> dict[tuple[str, str], int] | None:
@@ -981,7 +1013,7 @@ def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
     old = SERVICE_REQUEST_MAX_BYTES if before is None else before
     new = SERVICE_REQUEST_MAX_BYTES if after is None else after
     return type(old) is not int or type(new) is not int or new > old
-  if path == "service.route_limits":
+  if path == _ROUTE_LIMITS_PATH:
     if not any(key.startswith("service.") for key in after_leaves):
       return False  # Complete revocation cannot restore a route allowance.
     return _route_limits_widen(before, after)
