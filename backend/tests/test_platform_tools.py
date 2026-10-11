@@ -1238,6 +1238,33 @@ def test_open_item_places_beside_this_chat_in_the_background_by_default(monkeypa
   })]
 
 
+def test_open_item_settings_only_navigates_to_the_named_section(monkeypatch):
+  control = _control_module()
+  sent = _recording_api(monkeypatch, control)
+
+  receipt = control._call_open_item({"kind": "settings", "id": "ai-providers"})
+  control._call_open_item({"kind": "settings"})
+
+  assert sent == [
+    ("POST", "/api/notify", {
+      "type": "open_item", "itemKind": "settings", "itemId": "ai-providers",
+    }),
+    ("POST", "/api/notify", {"type": "open_item", "itemKind": "settings"}),
+  ]
+  assert "they still make any change there themselves" in receipt
+
+
+def test_open_item_settings_refuses_a_background_open(monkeypatch):
+  control = _control_module()
+  sent = _recording_api(monkeypatch, control)
+
+  with pytest.raises(ValueError, match="foreground only"):
+    control._call_open_item({"kind": "settings", "id": "github", "activation": "background"})
+  with pytest.raises(ValueError, match="needs: id"):
+    control._call_open_item({"kind": "app"})
+  assert sent == []
+
+
 def test_request_secret_saves_a_sealed_card_and_never_offers_reveal(monkeypatch):
   control = _control_module()
   saved = []

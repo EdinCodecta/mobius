@@ -1057,6 +1057,8 @@ def _call_notify_owner(arguments: dict[str, Any]) -> str:
 
 
 def _call_open_item(arguments: dict[str, Any]) -> str:
+  if arguments.get("kind") == "settings":
+    return _open_settings(arguments)
   _require_args(OPEN_ITEM_TOOL, arguments, {"kind", "id", "activation"}, ("kind", "id"))
   activation = arguments.get("activation", "background")
   _agent_api_call("POST", "/api/notify", {
@@ -1071,6 +1073,27 @@ def _call_open_item(arguments: dict[str, Any]) -> str:
   return (
     f"Opened {arguments['kind']} {arguments['id']} in the owner's workspace "
     f"({activation}). It is live-only; add notify_owner if they may be away."
+  )
+
+
+def _open_settings(arguments: dict[str, Any]) -> str:
+  """Navigate the owner's shell to Settings, optionally one section.
+
+  Opening is navigation only: Settings is never placed beside this chat, and
+  nothing inside it (sign-in, credentials, deletion) happens until the owner
+  taps it, so a background open has no meaning here.
+  """
+  _require_args(OPEN_ITEM_TOOL, arguments, {"kind", "id", "activation"}, ("kind",))
+  if arguments.get("activation", "foreground") != "foreground":
+    raise ValueError("Settings opens in the foreground only; open it when the owner asked to see it")
+  event = {"type": "open_item", "itemKind": "settings"}
+  if arguments.get("id"):
+    event["itemId"] = str(arguments["id"])
+  _agent_api_call("POST", "/api/notify", event)
+  where = f"Settings ({event['itemId']})" if "itemId" in event else "Settings"
+  return (
+    f"Opened {where} on the owner's screen. Only navigation happened: they "
+    "still make any change there themselves."
   )
 
 
@@ -1461,7 +1484,8 @@ _TOOL_DEFINITIONS = {
       "to be told. Not for routine confirmations, and not for a saved "
       "question, approval, restart or secure-input card: the card sends its "
       "own notification. target defaults to this chat's "
-      "in-app link; use /shell/?app=ID for an app. tag groups pushes about one "
+      "in-app link; use /shell/?app=ID for an app or /shell/?settings=SECTION "
+      "for a Settings section. tag groups pushes about one "
       "thing so a newer one replaces the older. The push is skipped while the "
       "owner is viewing this chat. Never fire one from a script under test."
     ),
@@ -1492,16 +1516,25 @@ _TOOL_DEFINITIONS = {
     "description": (
       "Open an app (numeric id) or a chat in the owner's live workspace beside "
       "this chat. activation defaults to background; use foreground only when "
-      "the owner just asked to open that exact item. It is live-only and never "
-      "stored, so pair it with notify_owner when they may be away. Say it is "
-      "open in their workspace; never describe the layout."
+      "the owner just asked to open that exact item. kind settings is always "
+      "foreground and instead takes the owner to Settings, focused on section "
+      "id ai-providers, "
+      "background-agents, github or models (omit id for Settings itself); use "
+      "it when they asked to see it or accepted your offer to open it. It only "
+      "navigates: signing in, entering credentials and every other change "
+      "there stay their own taps. It is live-only and never stored, so pair "
+      "it with notify_owner when they may be away. Say it is open in their "
+      "workspace; never describe the layout."
     ),
     "inputSchema": {
       "type": "object", "additionalProperties": False,
-      "required": ["kind", "id"],
+      "required": ["kind"],
       "properties": {
-        "kind": {"type": "string", "enum": ["app", "chat"]},
-        "id": {"type": ["string", "integer"]},
+        "kind": {"type": "string", "enum": ["app", "chat", "settings"]},
+        "id": {
+          "type": ["string", "integer"],
+          "description": "App id, chat id, or Settings section id; required for app and chat.",
+        },
         "activation": {"type": "string", "enum": ["background", "foreground"]},
       },
     },
