@@ -988,97 +988,12 @@ def test_child_policy_is_integrity_checked_and_session_loss_needs_review(db):
   assert db.get(models.Chat, child.id).auto_resume_on_limit is False
   lifecycle = db.query(models.AgentLifecycleEvent).filter(
     models.AgentLifecycleEvent.provider_agent_id == row.id,
-    models.AgentLifecycleEvent.source_event_id.like(f"delegation:{row.id}:terminal:%"),
+    models.AgentLifecycleEvent.source_event_id
+      == f"delegation:{row.id}:terminal:cancelled",
   ).all()
   assert len(lifecycle) == 1
   assert lifecycle[0].event_type == "agent_terminal"
   assert lifecycle[0].state == "stopped"
-
-
-def _source_work_needing_review(db, delegation_id):
-  parent = create_chat(id=f"{delegation_id}-parent", title="Parent", messages=[])
-  child = create_chat(id=f"{delegation_id}-child", title="Child", provider="claude", messages=[
-    {"role": "user", "content": "Make the bounded edit."},
-    {"role": "assistant", "blocks": [{
-      "type": "error", "message": "DELEGATION_WRITE_REVIEW_REQUIRED: Review before replaying.",
-    }]},
-  ])
-  db.add_all((parent, child))
-  db.flush()
-  row = models.Delegation(
-    id=delegation_id, parent_chat_id=parent.id, parent_root_run_id=f"{delegation_id}-root",
-    task_key="bounded-edit", child_chat_id=child.id, provider="claude", scope="write",
-    cwd="/data/platform", prompt_sha256=hashlib.sha256(b"edit").hexdigest(),
-    source_work_id=f"{delegation_id}-work", source_work_active_chat_id=parent.id,
-  )
-  db.add(row)
-  db.add(models.ChatRun(id=f"{delegation_id}-run", root_run_id=f"{delegation_id}-run",
-                        chat_id=child.id, status="failed", provider="claude"))
-  db.commit()
-  return row
-
-
-def _terminal_lifecycle_events(db, row):
-  db.expire_all()
-  return db.query(models.AgentLifecycleEvent).filter(
-    models.AgentLifecycleEvent.provider_agent_id == row.id,
-    models.AgentLifecycleEvent.event_type == "agent_terminal",
-  ).all()
-
-
-def test_a_helper_finish_is_recorded_once_whatever_status_later_reads_derive(db):
-  """The settle wake reads no result (failed); the source-work card reads it
-  (needs_review). Both describe one finish, so one terminal fact is logged."""
-  from app.delegations import serialize_source_work, wake_parent_after_child_settled
-
-  row = _source_work_needing_review(db, "finish-once")
-  asyncio.run(wake_parent_after_child_settled(row.child_chat_id))
-  assert serialize_source_work(db, db.get(models.Delegation, row.id))["status"] == "needs_review"
-  mark_cancelled(db, db.get(models.Delegation, row.id))
-
-  events = _terminal_lifecycle_events(db, row)
-  assert [(event.source_event_id, event.state) for event in events] == [
-    (f"delegation:{row.id}:terminal:{row.id}-run", "failed"),
-  ]
-
-
-def test_a_follow_up_run_records_its_own_finish(db):
-  """A message_agent follow-up reuses the helper but starts a new child run,
-  which owes its own finish: the latest terminal fact must be the latest run's."""
-  from datetime import timedelta
-  from app.delegations import serialize_delegation
-
-  parent = create_chat(id="follow-up-parent", title="Parent", messages=[])
-  child = create_chat(id="follow-up-child", title="Child", provider="claude", messages=[
-    {"role": "user", "content": "First attempt."},
-    {"role": "assistant", "content": "Done."},
-  ])
-  db.add_all((parent, child))
-  db.flush()
-  row = models.Delegation(
-    id="follow-up", parent_chat_id=parent.id, parent_root_run_id="follow-up-root",
-    task_key="bounded-task", child_chat_id=child.id, provider="claude", scope="read",
-    cwd="/data", prompt_sha256=hashlib.sha256(b"task").hexdigest(),
-  )
-  db.add(row)
-  first = now_naive_utc()
-  db.add(models.ChatRun(id="follow-up-run-1", root_run_id="follow-up-run-1", chat_id=child.id,
-                        status="failed", provider="claude", started_at=first))
-  db.commit()
-  serialize_delegation(db, db.get(models.Delegation, row.id), include_result=False)
-
-  db.add(models.ChatRun(id="follow-up-run-2", root_run_id="follow-up-run-2", chat_id=child.id,
-                        status="completed", provider="claude",
-                        started_at=first + timedelta(seconds=5)))
-  db.commit()
-  serialize_delegation(db, db.get(models.Delegation, row.id), include_result=False)
-  serialize_delegation(db, db.get(models.Delegation, row.id), include_result=False)
-
-  events = _terminal_lifecycle_events(db, row)
-  assert [(event.source_event_id, event.state) for event in events] == [
-    ("delegation:follow-up:terminal:follow-up-run-1", "failed"),
-    ("delegation:follow-up:terminal:follow-up-run-2", "done"),
-  ]
 
 
 def test_continuation_physical_runs_inherit_one_logical_root(db):

@@ -902,9 +902,7 @@ def limit_resume_successor_delegation(
   return delegation
 
 
-def _lifecycle_values(
-  row: models.Delegation, status: str, run_id: str | None,
-) -> dict | None:
+def _lifecycle_values(row: models.Delegation, status: str) -> dict | None:
   from app.agent_lifecycle import normalize_chat_event
 
   terminal = status in TERMINAL_DELEGATION_STATUSES
@@ -924,14 +922,7 @@ def _lifecycle_values(
     "agent_type": "delegation",
     "summary": row.task_key,
     "source": "delegation",
-    # A helper finishes once per child run: a message_agent follow-up starts a
-    # new run and owes its own finish. Key the finish on that run, never on
-    # the status a later read derives for it (a result-less read says
-    # ``failed`` where a full read says ``needs_review``).
-    "source_event_id": (
-      f"delegation:{row.id}:terminal:{run_id or 'none'}" if terminal
-      else f"delegation:{row.id}:started"
-    ),
+    "source_event_id": f"delegation:{row.id}:{'terminal:' + status if terminal else 'started'}",
   }
   return normalize_chat_event(
     chat_id=row.parent_chat_id,
@@ -963,9 +954,9 @@ def _record_missing_lifecycles(db: Session, values: list[dict]) -> None:
 
 
 def _record_lifecycle(
-  db: Session, row: models.Delegation, status: str, run: models.ChatRun | None,
+  db: Session, row: models.Delegation, status: str,
 ) -> None:
-  values = _lifecycle_values(row, status, run.id if run is not None else None)
+  values = _lifecycle_values(row, status)
   _record_missing_lifecycles(db, [values] if values is not None else [])
 
 
@@ -975,7 +966,7 @@ def serialize_delegation(
   status, run, result = derived_status(
     db, row, load_result=include_result,
   )
-  _record_lifecycle(db, row, status, run)
+  _record_lifecycle(db, row, status)
   parent_chat_title = (
     db.query(models.Chat.title)
     .filter(models.Chat.id == row.parent_chat_id)
@@ -1015,7 +1006,7 @@ def serialize_delegation_list(
     payloads.append(_delegation_payload(
       row, status, run, result, titles.get(row.parent_chat_id),
     ))
-    values = _lifecycle_values(row, status, run.id if run is not None else None)
+    values = _lifecycle_values(row, status)
     if values is not None:
       lifecycle.append(values)
   # Payloads are built first: recording commits, which would expire every row.
@@ -1075,7 +1066,7 @@ def serialize_source_work(db: Session, row: models.Delegation) -> dict:
   """Small durable projection for Changes and the source-chat action card."""
   if row.source_work_id is None:
     raise ValueError("delegation is not source-attached work")
-  status, run, result = derived_status(db, row)
+  status, _run, result = derived_status(db, row)
   usage = summarize_chat_run_tokens(
     db.query(
       *[getattr(models.ChatRun, field) for field in (
@@ -1097,7 +1088,7 @@ def serialize_source_work(db: Session, row: models.Delegation) -> dict:
   ):
     row.source_work_active_chat_id = None
     db.commit()
-  _record_lifecycle(db, row, status, run)
+  _record_lifecycle(db, row, status)
   result = result or ""
   truncated = len(result) > _SOURCE_WORK_RESULT_MAX
   return {
@@ -1148,11 +1139,11 @@ def release_finished_source_work_slots(
   released = 0
   settled: list[tuple[models.Delegation, str]] = []
   for row in query.all():
-    status, run, _result = derived_status(db, row, load_result=False)
+    status, _run, _result = derived_status(db, row, load_result=False)
     if status not in TERMINAL_DELEGATION_STATUSES:
       continue
     row.source_work_active_chat_id = None
-    _record_lifecycle(db, row, status, run)
+    _record_lifecycle(db, row, status)
     settled.append((row, status))
     released += 1
   if released:
@@ -1333,7 +1324,7 @@ def mark_cancelled(db: Session, row: models.Delegation) -> None:
   # Stage cancellation before recording the terminal lifecycle fact.
   # ``record_event`` commits both when the event is new; the explicit commit
   # covers an idempotent replay where that deterministic event already exists.
-  _record_lifecycle(db, row, "cancelled", latest_run(db, row.child_chat_id))
+  _record_lifecycle(db, row, "cancelled")
   db.commit()
 
 
@@ -1358,7 +1349,7 @@ def interrupt_legacy_read_helpers(
         continue
       row.interrupted_at = now_naive_utc()
       row.source_work_active_chat_id = None
-      _record_lifecycle(db, row, "interrupted", run)
+      _record_lifecycle(db, row, "interrupted")
       interrupted.append(row.parent_chat_id)
     child = db.get(models.Chat, row.child_chat_id)
     if child is not None:
@@ -2971,10 +2962,10 @@ async def wake_parent_after_child_settled(child_chat_id: str) -> None:
         .first()
       )
       if row is not None and row.source_work_id is not None:
-        status, run, _ = derived_status(db, row, load_result=False)
+        status, _, _ = derived_status(db, row, load_result=False)
         if status in TERMINAL_DELEGATION_STATUSES:
           row.source_work_active_chat_id = None
-        _record_lifecycle(db, row, status, run)
+        _record_lifecycle(db, row, status)
         db.commit()
         publish_chat_activity_changed(row.parent_chat_id)
         publish_source_work_changed(row, status)
