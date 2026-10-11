@@ -3665,3 +3665,75 @@ def test_legacy_goal_root_resolves_its_completion_run_after_rebind(db):
   assert delegations_mod.parent_wake_blocker(
     db, parent_id, "goal-A", "physical-A-then-B",
   )[0] == "goal_closed"
+
+
+# Helper results resume their source even when several helpers share it.
+# Regression: the shared resolver once demanded exactly one delegation per
+# source and crashed as soon as a parent had two helpers.
+
+def _shared_root_chat(db, chat_id):
+  db.add(models.Chat(id=chat_id, title=chat_id, legacy_messages=[]))
+
+
+def _shared_root_helper(db, helper_id, parent, root, goal=None):
+  from datetime import datetime
+  child = f"child-{helper_id}"
+  _shared_root_chat(db, child)
+  db.add(models.Delegation(id=helper_id, parent_chat_id=parent, parent_root_run_id=root,
+    goal_id=goal, task_key=helper_id, child_chat_id=child, provider="claude", scope="write",
+    cwd="/data", prompt_sha256="x" * 64, notify_parent_on_complete=True,
+    created_at=datetime(2026, 1, 1)))
+
+
+def test_helper_results_resume_a_plain_root_shared_by_several_helpers(db):
+  from datetime import datetime
+  from app.run_state import helper_result_continuation_root
+  _shared_root_chat(db, "p")
+  db.add(models.ChatRun(id="r1", chat_id="p", status="completed", provider="claude",
+    started_at=datetime(2026, 1, 1)))
+  _shared_root_helper(db, "d1", "p", "r1")
+  _shared_root_helper(db, "d2", "p", "r1")
+  db.commit()
+  assert helper_result_continuation_root(db, "p", "r1") == "r1"
+
+
+def test_helper_results_resume_an_inherited_goal_root_shared_by_several_helpers(db):
+  from datetime import datetime
+  from app.run_state import helper_result_continuation_root
+  _shared_root_chat(db, "h")
+  db.add(models.ChatRun(id="hr1", chat_id="h", status="completed", provider="claude",
+    started_at=datetime(2026, 1, 1)))
+  _shared_root_helper(db, "n1", "h", "hr1", goal="G")
+  _shared_root_helper(db, "n2", "h", "hr1", goal="G")
+  db.commit()
+  assert helper_result_continuation_root(db, "h", "G") == "hr1"
+
+
+def test_parent_wake_plans_for_several_settled_goalless_helpers(db):
+  from datetime import datetime
+  from app.delegations import _plan_parent_wake
+  _shared_root_chat(db, "p2")
+  db.add(models.ChatRun(id="pr1", chat_id="p2", status="completed", provider="claude",
+    started_at=datetime(2026, 1, 1)))
+  for helper_id in ("e1", "e2"):
+    _shared_root_helper(db, helper_id, "p2", "pr1")
+    db.add(models.ChatRun(id=f"run-{helper_id}", chat_id=f"child-{helper_id}",
+      status="completed", provider="claude", started_at=datetime(2026, 1, 2)))
+  db.commit()
+  plan = _plan_parent_wake("p2", "pr1")
+  assert plan is not None and plan.root_run_id == "pr1"
+
+
+def test_queued_helper_result_resolves_a_root_shared_by_several_helpers(db):
+  from datetime import datetime
+  from app.continuations import DELEGATION_RESULT_MESSAGE_KIND
+  from app.run_state import queued_continuation_root
+  _shared_root_chat(db, "p3")
+  db.add(models.ChatRun(id="q1", chat_id="p3", status="running", provider="claude",
+    started_at=datetime(2026, 1, 1)))
+  _shared_root_helper(db, "f1", "p3", "q1")
+  _shared_root_helper(db, "f2", "p3", "q1")
+  db.commit()
+  queued = {"role": "user", "hidden": True, "kind": DELEGATION_RESULT_MESSAGE_KIND,
+            "source_work_id": "q1", "cid": "delegation-result:x", "content": "r"}
+  assert queued_continuation_root(db, "p3", queued) == "q1"

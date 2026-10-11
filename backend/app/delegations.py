@@ -224,9 +224,9 @@ def create_or_attach_delegation(
     (delegation_source_work_filter(intent.goal_id or intent.parent_root_run_id)
      if intent.source_work_id is None else
      models.Delegation.parent_root_run_id == intent.parent_root_run_id),
-    (delegation_source_work_filter(intent.goal_id)
-     if intent.goal_id and intent.source_work_id is None else
-     models.Delegation.parent_root_run_id == intent.parent_root_run_id),
+    # A Goal's helpers attach across its attempts; plain work stays per root.
+    *(() if intent.goal_id and intent.source_work_id is None else
+      (models.Delegation.parent_root_run_id == intent.parent_root_run_id,)),
   ).first()
   if row is not None:
     return _attach_existing_delegation(db, row, resolved_intent)
