@@ -1509,3 +1509,203 @@ def test_redirected_proxy_get_deadline_closes_body_and_releases_host_lease(
       pass
 
   asyncio.run(asyncio.wait_for(exercise(), timeout=2))
+
+
+# httpx.Limits(max_connections=16) on each pooled (Host, SNI) client.
+_HOST_CONNECTION_LIMIT = 16
+
+
+class _HeldUpstream:
+  """A real local upstream whose responses keep their connection busy.
+
+  Each response drips a byte well inside the pool's read timeout until
+  ``release`` is set, so a request queued behind it can only be waiting for a
+  free connection, never on a slow read.
+  """
+
+  def __init__(self, drip: float = 0.05):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    self.release = threading.Event()
+    self.arrived = 0
+    lock = threading.Lock()
+    upstream = self
+
+    class Handler(BaseHTTPRequestHandler):
+      protocol_version = "HTTP/1.1"
+
+      def _respond(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        with lock:
+          upstream.arrived += 1
+        size = 4096
+        self.send_response(200)
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        sent = 0
+        try:
+          while not upstream.release.wait(drip) and sent < size - 1:
+            self.wfile.write(b"x")
+            self.wfile.flush()
+            sent += 1
+          self.wfile.write(b"x" * (size - sent))
+          self.wfile.flush()
+        except OSError:
+          pass
+
+      do_GET = do_POST = _respond
+
+      def log_message(self, *args):
+        pass
+
+    class Server(ThreadingHTTPServer):
+      daemon_threads = True
+      # The default backlog of 5 drops connects in a burst, which a short
+      # connect timeout would misreport as the pool's failure.
+      request_queue_size = 64
+
+    self._server = Server(("127.0.0.1", 0), Handler)
+    self.port = self._server.server_address[1]
+    threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+  def close(self):
+    self.release.set()
+    self._server.shutdown()
+    self._server.server_close()
+
+
+def _pin_to_local_upstream(monkeypatch, port):
+  def fake_validate(url):
+    parsed = urlparse(url)
+    return (
+      f"http://127.0.0.1:{port}{parsed.path or '/'}",
+      parsed.hostname, parsed.hostname,
+    )
+
+  monkeypatch.setattr("app.routes.proxy.validate_url_safe", fake_validate)
+  monkeypatch.setattr("app.public_app_transport.validate_url_safe", fake_validate)
+
+
+# Every caller of a PinnedHostClientPool: the owner proxy's GET and POST, and
+# anonymous public-app fetches, which have a pool of their own.
+_POOL_CONSUMERS = ["get", "post", "public"]
+_BURST_URL = "https://tiles.example/t"
+
+
+def _consumer_pool(monkeypatch, consumer, **options):
+  from app.pinned_http_clients import PinnedHostClientPool
+
+  pool = PinnedHostClientPool(**options)
+  monkeypatch.setattr(
+    "app.public_app_transport._fetch_clients" if consumer == "public"
+    else "app.routes.proxy._proxy_clients",
+    pool,
+  )
+  return pool
+
+
+async def _proxy_status(consumer: str, url: str) -> int:
+  from app.public_app_transport import fetch_public_url
+  from app.routes.proxy import ProxyPostRequest, proxy_get, proxy_post
+
+  try:
+    if consumer == "get":
+      response = await proxy_get(url, Request({"type": "http", "headers": []}))
+    elif consumer == "post":
+      response = await proxy_post(ProxyPostRequest(url=url, body="q=1"))
+    else:
+      response = await fetch_public_url(
+        0, url, [{"origin": "https://tiles.example", "path_prefix": "/"}],
+      )
+  except HTTPException as exc:
+    return exc.status_code
+  return response.status_code
+
+
+async def _until(condition, timeout: float = 5):
+  async with asyncio.timeout(timeout):
+    while not condition():
+      await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("consumer", _POOL_CONSUMERS)
+def test_admitted_same_host_burst_waits_for_a_connection_instead_of_timing_out(
+  monkeypatch, consumer,
+):
+  """A host gets 16 connections while the pool admits 64 requests. A request
+  queued behind the 16th must be served once a connection frees, within its
+  exchange deadline, instead of failing early with a pool-timeout 504."""
+  upstream = _HeldUpstream()
+  _pin_to_local_upstream(monkeypatch, upstream.port)
+  pool = _consumer_pool(monkeypatch, consumer, io_timeout=0.3)
+  burst = _HOST_CONNECTION_LIMIT + 1
+
+  async def exercise():
+    try:
+      calls = [
+        asyncio.create_task(_proxy_status(consumer, _BURST_URL))
+        for _ in range(burst)
+      ]
+      await _until(lambda: upstream.arrived == _HOST_CONNECTION_LIMIT)
+      # Keep the extra request queued far longer than any one network phase.
+      await asyncio.sleep(1)
+      assert [call.result() for call in calls if call.done()] == []
+      # The per-host connection limit still holds while the extra one waits.
+      assert upstream.arrived == _HOST_CONNECTION_LIMIT
+      assert pool.metrics()["active_requests"] == burst
+      upstream.release.set()
+      return await asyncio.gather(*calls)
+    finally:
+      await pool.close()
+
+  try:
+    statuses = asyncio.run(asyncio.wait_for(exercise(), timeout=10))
+  finally:
+    upstream.close()
+  assert statuses == [200] * burst
+  assert upstream.arrived == burst
+
+
+@pytest.mark.parametrize("consumer", _POOL_CONSUMERS)
+def test_exchange_deadline_bounds_a_request_queued_for_a_host_connection(
+  monkeypatch, consumer,
+):
+  """With no pool timeout, the exchange deadline bounds the connection wait.
+  Expiry answers 504 without sending, frees the slot, and leaves the host's
+  queue usable for the requests that follow."""
+  from time import monotonic
+
+  from app.routes import proxy
+
+  upstream = _HeldUpstream()
+  _pin_to_local_upstream(monkeypatch, upstream.port)
+  pool = _consumer_pool(monkeypatch, consumer)
+  url = _BURST_URL
+  deadline = proxy._EXCHANGE_DEADLINE
+
+  async def exercise():
+    try:
+      holders = [
+        asyncio.create_task(_proxy_status(consumer, url))
+        for _ in range(_HOST_CONNECTION_LIMIT)
+      ]
+      await _until(lambda: upstream.arrived == _HOST_CONNECTION_LIMIT)
+      monkeypatch.setattr(proxy, "_EXCHANGE_DEADLINE", 0.3)
+      started = monotonic()
+      assert await _proxy_status(consumer, url) == 504
+      assert 0.25 <= monotonic() - started < 5
+      assert upstream.arrived == _HOST_CONNECTION_LIMIT
+      assert pool.metrics()["active_requests"] == _HOST_CONNECTION_LIMIT
+      monkeypatch.setattr(proxy, "_EXCHANGE_DEADLINE", deadline)
+      upstream.release.set()
+      assert await asyncio.gather(*holders) == [200] * _HOST_CONNECTION_LIMIT
+      assert await _proxy_status(consumer, url) == 200
+      assert pool.metrics()["active_requests"] == 0
+    finally:
+      await pool.close()
+
+  try:
+    asyncio.run(asyncio.wait_for(exercise(), timeout=10))
+  finally:
+    upstream.close()

@@ -47,16 +47,22 @@ class PinnedHostClientPool:
 
   A caller waits at most ``slot_wait`` seconds for one of the ``max_active``
   slots and then gets a 503, so a saturated pool sheds load instead of queueing
-  requests without limit. How long a caller holds a slot is bounded by its
-  exchange deadline (``_capped_response`` in app.routes.proxy).
+  requests without limit. An admitted caller may then queue for one of its
+  host's connections. That wait, like the rest of the exchange, is bounded by
+  the caller's exchange deadline (``proxy_get`` and ``_capped_response`` in
+  app.routes.proxy), never by a shorter pool timeout: a same-host burst the
+  pool already admitted (map tiles) must not fail while its deadline remains.
+  Connect, read and write each still time out after ``io_timeout`` seconds.
   """
 
   def __init__(
     self, max_clients: int = 64, max_active: int = 64, slot_wait: float = 10,
+    io_timeout: float = 15,
   ):
     self.max_clients = max_clients
     self.max_active = max_active
     self.slot_wait = slot_wait
+    self.io_timeout = io_timeout
     self._lock = asyncio.Lock()
     self._capacity = asyncio.BoundedSemaphore(max_active)
     self._clients: OrderedDict[tuple[str, str], _PooledClient] = OrderedDict()
@@ -119,7 +125,9 @@ class PinnedHostClientPool:
             # otherwise ride along on the next caller's request.
             cookies=_refuse_all_cookies(),
             follow_redirects=False,
-            timeout=15,
+            # No pool timeout: see the class docstring for what bounds the
+            # wait for one of this host's connections.
+            timeout=httpx.Timeout(self.io_timeout, pool=None),
             limits=httpx.Limits(
               max_connections=16,
               max_keepalive_connections=4,
