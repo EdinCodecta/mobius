@@ -6321,6 +6321,9 @@ def _repair_transcript_derived_rows(eng) -> None:
         f"DELETE FROM {table} WHERE chat_id NOT IN (SELECT id FROM chats)"
       )
     conn.exec_driver_sql("DELETE FROM chat_search_entries WHERE seq = -1")
+    # 0087's own title rebuild, kept as a copy: the ledger hashes 0087's code
+    # and everything it references, so the two cannot share one definition.
+    # Rebuilding in this transaction keeps the DELETE and the INSERT atomic.
     conn.exec_driver_sql(
       "INSERT INTO chat_search_entries (chat_id, seq, text) "
       f"SELECT id, -1, trim(title, {whitespace}) FROM chats "
@@ -6532,6 +6535,22 @@ def _goal_execution_identity(eng) -> None:
       if foreign_keys is not None:
         conn.exec_driver_sql(f"PRAGMA foreign_keys={int(foreign_keys)}")
         conn.commit()
+def _add_chat_compaction_drafts(eng) -> None:
+  """Keep explicit recovery progress separate from the live chat and session."""
+  with eng.begin() as conn:
+    conn.exec_driver_sql("""
+      CREATE TABLE IF NOT EXISTS chat_compaction_drafts (
+        id VARCHAR(64) PRIMARY KEY,
+        chat_id VARCHAR(64) NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        state JSON NOT NULL,
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL
+      )
+    """)
+    conn.exec_driver_sql(
+      "CREATE INDEX IF NOT EXISTS ix_chat_compaction_drafts_chat_id "
+      "ON chat_compaction_drafts(chat_id)"
+    )
 
 
 _SCHEMA_MIGRATIONS = (
@@ -6640,6 +6659,9 @@ _SCHEMA_MIGRATIONS = (
   ("0083_swap_chat_note_sections", _swap_chat_note_sections),
   ("0086_drop_chat_note_backup", _drop_chat_note_backup),
   ("0087_transcript_rows", _add_transcript_rows),
+  ("0088_chat_compaction_drafts", _add_chat_compaction_drafts),
+  # Released to instances under this id; kept unique and appended after
+  # main's ledger so it runs once wherever it has not run.
   ("0086_goal_execution_identity", _goal_execution_identity),
 )
 

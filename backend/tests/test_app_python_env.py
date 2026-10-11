@@ -1347,3 +1347,36 @@ def test_env_gc_follows_kept_runtimes_and_waits_for_pins(db):
   app_python_env.remove_app_envs(_data_dir(), row.id)
   assert not app_python_env.envs_parent(_data_dir(), row.id).exists()
   assert list(builds.iterdir()) == []
+
+
+@pytest.mark.usefixtures("store")
+def test_two_pass_git_install_readopts_its_one_transfer(
+  client, auth, monkeypatch, tmp_path,
+):
+  """The rolled-back first pass returns the clone for the second to adopt."""
+  _fake_builds(monkeypatch)
+  bare, files, (first,) = _git_origin_versions(tmp_path, [b"VALUE = 1\n"])
+  real_transfer = app_git._transfer
+  transfers = []
+
+  def counted(*args, **kwargs):
+    transfers.append(args)
+    return real_transfer(*args, **kwargs)
+
+  from app import install
+  real_check = install._check_reconciled_python
+  checks = []
+
+  async def checked(pending):
+    checks.append(pending)
+    return await real_check(pending)
+
+  monkeypatch.setattr(app_git, "_transfer", counted)
+  monkeypatch.setattr(install, "_check_reconciled_python", checked)
+  installed = _install_from_origin(client, auth, bare, files, first)
+  assert installed.status_code == 201, installed.text
+  assert len(checks) == 1, "the install must have taken two passes"
+  assert len(transfers) == 1
+  source = Path(get_settings().data_dir) / "apps" / json.loads(files["mobius.json"])["id"]
+  assert app_git.head_sha(source, app_git.UPSTREAM_BRANCH) == first
+  assert not list((Path(get_settings().data_dir) / "apps" / ".git-transfers").iterdir())
