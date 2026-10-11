@@ -132,20 +132,46 @@ class DelegationIntent:
   browser_grant_id: str | None = None
 
 
+def delegation_ownership_match(
+  parent_chat_id: str, parent_root_run_id: str, goal_id: str | None,
+  task_key: str, source_work_id: str | None = None,
+  *, row: models.Delegation | None = None,
+):
+  """Match one task owner in SQL or against a persisted row.
+
+  Goal tasks span physical attempts. Plain tasks remain rooted in one run;
+  historical Goal tasks may store the Goal id in parent_root_run_id.
+  """
+  if row is not None:
+    return all((
+      row.parent_chat_id == parent_chat_id,
+      row.task_key == task_key,
+      row.source_work_id == source_work_id,
+      ((row.goal_id == goal_id or
+        (row.goal_id is None and row.parent_root_run_id == goal_id))
+       if goal_id is not None and source_work_id is None else
+       row.parent_root_run_id == parent_root_run_id),
+    ))
+  return and_(
+    models.Delegation.parent_chat_id == parent_chat_id,
+    models.Delegation.task_key == task_key,
+    (models.Delegation.source_work_id == source_work_id if source_work_id is not None
+     else models.Delegation.source_work_id.is_(None)),
+    (delegation_source_work_filter(goal_id) if goal_id is not None and source_work_id is None
+     else models.Delegation.parent_root_run_id == parent_root_run_id),
+  )
+
+
 def same_delegation_intent(
   row: models.Delegation, intent: DelegationIntent,
 ) -> bool:
   """Whether a durable row is the exact immutable task being retried."""
   return all((
     row.app_id == intent.app_id,
-    row.parent_chat_id == intent.parent_chat_id,
-    (row.parent_root_run_id == intent.parent_root_run_id or
-     (intent.goal_id is not None and row.goal_id == intent.goal_id
-      and intent.source_work_id is None) or
-     (row.goal_id is None and row.parent_root_run_id == intent.goal_id)),
-    (row.goal_id == intent.goal_id or
-     (row.goal_id is None and row.parent_root_run_id == intent.goal_id)),
-    row.task_key == intent.task_key,
+    delegation_ownership_match(
+      intent.parent_chat_id, intent.parent_root_run_id, intent.goal_id,
+      intent.task_key, intent.source_work_id, row=row,
+    ),
     row.provider == intent.provider,
     row.model == intent.model,
     row.effort == intent.effort,
@@ -216,18 +242,10 @@ def create_or_attach_delegation(
   # Attachment must carry the same authority as the existing child. The
   # authenticated guest wins over an owner-authored parent physical run.
   resolved_intent = replace(intent, browser_grant_id=grant_id)
-  row = db.query(models.Delegation).filter(
-    models.Delegation.parent_chat_id == intent.parent_chat_id,
-    models.Delegation.task_key == intent.task_key,
-    (models.Delegation.source_work_id == intent.source_work_id if intent.source_work_id is not None
-     else models.Delegation.source_work_id.is_(None)),
-    (delegation_source_work_filter(intent.goal_id or intent.parent_root_run_id)
-     if intent.source_work_id is None else
-     models.Delegation.parent_root_run_id == intent.parent_root_run_id),
-    # A Goal's helpers attach across its attempts; plain work stays per root.
-    *(() if intent.goal_id and intent.source_work_id is None else
-      (models.Delegation.parent_root_run_id == intent.parent_root_run_id,)),
-  ).first()
+  row = db.query(models.Delegation).filter(delegation_ownership_match(
+    intent.parent_chat_id, intent.parent_root_run_id, intent.goal_id,
+    intent.task_key, intent.source_work_id,
+  )).first()
   if row is not None:
     return _attach_existing_delegation(db, row, resolved_intent)
   child_id = str(uuid.uuid4())
@@ -280,18 +298,10 @@ def create_or_attach_delegation(
     db.commit()
   except IntegrityError:
     db.rollback()
-    row = db.query(models.Delegation).filter(
-      models.Delegation.parent_chat_id == intent.parent_chat_id,
-      models.Delegation.task_key == intent.task_key,
-      (models.Delegation.source_work_id == intent.source_work_id if intent.source_work_id is not None
-       else models.Delegation.source_work_id.is_(None)),
-      (delegation_source_work_filter(intent.goal_id or intent.parent_root_run_id)
-       if intent.source_work_id is None else
-       models.Delegation.parent_root_run_id == intent.parent_root_run_id),
-      or_(models.Delegation.parent_root_run_id == intent.parent_root_run_id,
-          and_(models.Delegation.goal_id.is_(None),
-               models.Delegation.parent_root_run_id == intent.goal_id)),
-    ).first()
+    row = db.query(models.Delegation).filter(delegation_ownership_match(
+      intent.parent_chat_id, intent.parent_root_run_id, intent.goal_id,
+      intent.task_key, intent.source_work_id,
+    )).first()
     if row is None:
       raise ValueError("different delegation claimed the task key")
     return _attach_existing_delegation(db, row, resolved_intent)

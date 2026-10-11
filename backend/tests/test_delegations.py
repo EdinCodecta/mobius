@@ -551,6 +551,43 @@ def test_physical_root_is_the_delegation_parent(db, chat):
   assert parent_root_run_id(db, chat.id, require_active=True) == "logical-before-restart"
 
 
+def test_goal_submit_reattaches_across_attempts_with_omitted_cwd(
+  client, owner_token, db, monkeypatch,
+):
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  parent_id = _parent_with_run(client, owner_token, db)
+  first_run = db.get(models.ChatRun, "parent-physical")
+  first_run.goal_id = "goal-cwd"
+  db.commit()
+
+  async def fake_start(**kwargs):
+    return True
+
+  monkeypatch.setattr(
+    "app.routes.delegations.start_programmatic_chat_turn", fake_start,
+  )
+  body = {
+    "parent_chat_id": parent_id, "task_key": "same-goal-task",
+    "prompt": "Do the work.", "provider": "codex", "cwd": "/data/platform",
+  }
+  first = client.post("/api/delegations", json=body, headers=auth)
+  assert first.status_code == 201, first.text
+  first_run.status = "completed"
+  db.add(make_goal_run(db, id="goal-attempt-2", root_run_id="goal-attempt-2",
+    chat_id=parent_id, status="running", provider="codex", goal_id="goal-cwd",
+    started_at=datetime(2026, 1, 2)))
+  db.commit()
+
+  retry = client.post("/api/delegations", json={
+    key: value for key, value in body.items() if key != "cwd"
+  }, headers=auth)
+  assert retry.status_code == 201, retry.text
+  assert retry.json()["attached"] is True
+  assert retry.json()["id"] == first.json()["id"]
+  assert retry.json()["cwd"] == "/data/platform"
+  assert db.query(models.Delegation).count() == 1
+
+
 def test_submit_records_the_plan_task_and_refuses_an_unknown_one(
   client, owner_token, db, monkeypatch,
 ):
@@ -3707,6 +3744,21 @@ def test_helper_results_resume_an_inherited_goal_root_shared_by_several_helpers(
   _shared_root_helper(db, "n2", "h", "hr1", goal="G")
   db.commit()
   assert helper_result_continuation_root(db, "h", "G") == "hr1"
+
+
+def test_inherited_goal_helper_result_uses_latest_attempt_with_multiple_helpers(db):
+  from app.run_state import helper_result_continuation_root
+  _shared_root_chat(db, "nested")
+  db.add(models.ChatRun(id="nested-old", chat_id="nested", status="completed",
+    provider="claude", started_at=datetime(2026, 1, 1)))
+  db.add(models.ChatRun(id="nested-new", chat_id="nested", status="completed",
+    provider="claude", started_at=datetime(2026, 1, 2)))
+  _shared_root_helper(db, "old-1", "nested", "nested-old", goal="G")
+  _shared_root_helper(db, "old-2", "nested", "nested-old", goal="G")
+  _shared_root_helper(db, "new-1", "nested", "nested-new", goal="G")
+  _shared_root_helper(db, "new-2", "nested", "nested-new", goal="G")
+  db.commit()
+  assert helper_result_continuation_root(db, "nested", "G") == "nested-new"
 
 
 def test_parent_wake_plans_for_several_settled_goalless_helpers(db):

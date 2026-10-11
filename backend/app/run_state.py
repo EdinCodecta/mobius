@@ -204,17 +204,20 @@ def helper_result_continuation_root(
     # Plain work names its own physical root.
     source = query.filter(models.ChatRun.id == source_work_id).first()
   if source is None:
-    # Nested helpers can inherit an ancestor's Goal without a ChatGoal row in
-    # their own parent chat. Their persisted spawning root remains authoritative;
-    # every helper under that source shares it, so the first one is enough.
-    owner_root = db.query(models.Delegation.parent_root_run_id).filter(
+    # Nested helpers inherit an ancestor Goal without a ChatGoal in this chat.
+    # Resolve the newest spawning attempt, not the first helper inserted for
+    # this source. Multiple helpers may share an attempt.
+    source = query.join(
+      models.Delegation,
+      models.Delegation.parent_root_run_id == models.ChatRun.id,
+    ).filter(
       models.Delegation.parent_chat_id == chat_id,
       (models.Delegation.goal_id == source_work_id) |
       ((models.Delegation.goal_id.is_(None)) &
        (models.Delegation.parent_root_run_id == source_work_id)),
-    ).order_by(models.Delegation.created_at.asc(), models.Delegation.id.asc()).limit(1).scalar()
-    if owner_root:
-      source = query.filter(models.ChatRun.id == owner_root).first()
+    ).order_by(
+      models.ChatRun.started_at.desc(), models.ChatRun.id.desc(),
+    ).first()
   if source is None:
     return None
   root = source.root_run_id or source.id
