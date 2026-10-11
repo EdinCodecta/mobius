@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import re
 
-from sqlalchemy.orm import object_session
-
 from app import transcript_rows
 from app.events import tool_output_exit_code
 from app.memory_recall import (
@@ -121,7 +119,7 @@ class MaterializedHistory:
     live = chat.live_assistant
     self.live = live if (isinstance(live, dict) and live.get("role") == "assistant"
                          and isinstance(live.get("blocks"), list) and live["blocks"]) else None
-    self.live_index = (transcript_rows.assistant_index(self.history.db, chat, self.live)
+    self.live_index = (self.history.assistant_index(self.live)
                        if self.live is not None else -1)
 
   def __len__(self):
@@ -166,8 +164,8 @@ def materialized_messages(chat):
 
 def materialized_metadata(chat, view=None):
   """Cheap stable coordinates for Goal, Wait and recovery placement."""
-  rows = transcript_rows.metadata(object_session(chat), chat)
   view = view if view is not None else materialized_messages(chat)
+  rows = view.history.metadata()
   if view.live is not None:
     if view.live_index < 0:
       rows.append(view.live)
