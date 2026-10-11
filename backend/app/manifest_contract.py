@@ -446,6 +446,44 @@ def is_service_route_path(path) -> bool:
   )
 
 
+def accepted_service_route_limits(
+  route_limits, max_bytes: int | None = None,
+) -> dict[tuple[str, str], int] | None:
+  """Accepted route ceilings by (method, path), or None when not exactly well formed.
+
+  The one reading of a stored contract's `service.route_limits`, shared by
+  runtime enforcement and update review so neither can accept a shape the
+  other refuses. An accepted contract is not trusted: every entry must be
+  exactly what `contract_from_manifest` emits. `max_bytes` additionally
+  bounds each ceiling by the service's whole grant.
+  """
+  if not isinstance(route_limits, list) or len(route_limits) > SERVICE_ROUTE_LIMITS_MAX:
+    return None
+  routes: dict[tuple[str, str], int] = {}
+  for limit in route_limits:
+    if not isinstance(limit, dict) or set(limit) != {
+      "method", "path", "max_request_bytes", "max_response_bytes",
+    }:
+      return None
+    method, path = limit["method"], limit["path"]
+    request_bytes, response_bytes = limit["max_request_bytes"], limit["max_response_bytes"]
+    # Validate both selectors before using them as a key: an unhashable or
+    # non-canonical stored value is malformed, never an exception.
+    if not isinstance(method, str) or method not in SERVICE_ROUTE_METHODS:
+      return None
+    if not is_service_route_path(path):
+      return None
+    if (
+      type(request_bytes) is not int or type(response_bytes) is not int
+      or request_bytes != response_bytes or request_bytes < 1
+      or (max_bytes is not None and request_bytes > max_bytes)
+      or (method, path) in routes
+    ):
+      return None
+    routes[(method, path)] = request_bytes
+  return routes
+
+
 def validate_service_route_limits(route_limits, max_bytes: int) -> None:
   """Validate the reviewed per-route ceilings that narrow a service's grant."""
   if not isinstance(route_limits, list) or len(route_limits) > SERVICE_ROUTE_LIMITS_MAX:

@@ -34,8 +34,8 @@ from app.applied_app_runtime import AppliedRuntimeUnavailable, hold_runtime, run
 from app.browser_access import BrowserLineage, require_live
 from app.config import get_settings
 from app.manifest_contract import (
-  SERVICE_REQUEST_MAX_BYTES, SERVICE_ROUTE_LIMITS_MAX, SERVICE_ROUTE_METHODS,
-  SERVICE_TRANSFER_MAX_BYTES, is_service_route_path, service_route_key,
+  SERVICE_REQUEST_MAX_BYTES, SERVICE_TRANSFER_MAX_BYTES,
+  accepted_service_route_limits, service_route_key,
 )
 
 
@@ -319,27 +319,9 @@ def _accepted_transfer_limits(service: dict) -> tuple[int, dict[tuple[str, str],
   falling back to its wider whole grant.
   """
   ceiling = service_max_bytes(service)
-  limits = service.get("route_limits", [])
-  routes: dict[tuple[str, str], int] = {}
-  if not isinstance(limits, list) or len(limits) > SERVICE_ROUTE_LIMITS_MAX:
+  routes = accepted_service_route_limits(service.get("route_limits", []), ceiling)
+  if routes is None:
     raise HTTPException(503, "Accepted app service route limits are invalid.")
-  for limit in limits:
-    if not isinstance(limit, dict) or set(limit) != {
-      "method", "path", "max_request_bytes", "max_response_bytes",
-    }:
-      raise HTTPException(503, "Accepted app service route limits are invalid.")
-    method, path = limit["method"], limit["path"]
-    request_limit, response_limit = limit["max_request_bytes"], limit["max_response_bytes"]
-    if (
-      not isinstance(method, str) or method not in SERVICE_ROUTE_METHODS
-      or not is_service_route_path(path)
-      or type(request_limit) is not int or type(response_limit) is not int
-      or request_limit != response_limit
-      or not 1 <= request_limit <= ceiling
-      or (method, path) in routes
-    ):
-      raise HTTPException(503, "Accepted app service route limits are invalid.")
-    routes[(method, path)] = request_limit
   return ceiling, routes
 
 

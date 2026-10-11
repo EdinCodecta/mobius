@@ -15,7 +15,7 @@ from copy import deepcopy
 from typing import Any
 from urllib.parse import urlsplit
 
-from app.manifest_contract import SERVICE_REQUEST_MAX_BYTES
+from app.manifest_contract import SERVICE_REQUEST_MAX_BYTES, accepted_service_route_limits
 
 
 CONTRACT_SCHEMA = 6
@@ -926,22 +926,14 @@ _LIST_GRANTS = {
 }
 
 
-def _route_ceilings(value: Any) -> dict[tuple[Any, Any], int] | None:
-  """Accepted route ceilings by (method, path), or None when malformed."""
-  if value is None:
-    return {}
-  if not isinstance(value, list):
-    return None
-  ceilings: dict[tuple[Any, Any], int] = {}
-  for limit in value:
-    if not isinstance(limit, dict):
-      return None
-    key = (limit.get("method"), limit.get("path"))
-    request, response = limit.get("max_request_bytes"), limit.get("max_response_bytes")
-    if type(request) is not int or request != response or key in ceilings:
-      return None
-    ceilings[key] = request
-  return ceilings
+def _route_ceilings(value: Any) -> dict[tuple[str, str], int] | None:
+  """Accepted route ceilings by (method, path), or None when malformed.
+
+  A pruned (absent or empty) list has no ceilings. Everything else must pass
+  the same reading the runtime enforces, so a shape it would refuse is never
+  ranked as a narrower grant.
+  """
+  return {} if value is None else accepted_service_route_limits(value)
 
 
 def _route_limits_widen(before: Any, after: Any) -> bool:

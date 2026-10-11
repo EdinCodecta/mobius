@@ -1028,8 +1028,61 @@ def test_route_limit_review_narrows_on_add_or_lower_and_widens_on_loss_or_raise(
   small = contract([_limit("GET", "/actor", 1024)], max_bytes=8 * MIB)
   assert diff_contracts(small, lower)["widens"] is True
 
-  for malformed in ("1024", [{"method": "GET", "path": "/actor", "max_request_bytes": 1}], [None]):
-    broken = json.loads(json.dumps(actor))
-    broken["service"]["route_limits"] = malformed
-    assert diff_contracts(actor, broken)["widens"] is True
-    assert diff_contracts(broken, actor)["widens"] is True
+
+
+def _accepted(method="GET", path="/actor", request=1, response=1, **extra):
+  return {"method": method, "path": path, "max_request_bytes": request,
+          "max_response_bytes": response, **extra}
+
+
+@pytest.mark.parametrize("malformed", [
+  "1024",
+  {"GET /actor": 1},
+  [None],
+  [_accepted(path=[])],
+  [_accepted(method={})],
+  [_accepted(method={}, path=[])],
+  [_accepted(response=True)],
+  [_accepted(response=1.0)],
+  [_accepted(request=True, response=True)],
+  [_accepted(request=1.0, response=1.0)],
+  [_accepted(request=0, response=0)],
+  [_accepted(request=-1, response=-1)],
+  [_accepted(request=1, response=2)],
+  [{"method": "GET", "path": "/actor", "max_request_bytes": 1}],
+  [_accepted(extra=True)],
+  [_accepted(method=None)],
+  [_accepted(method="get")],
+  [_accepted(method="HEAD")],
+  [_accepted(path="actor")],
+  [_accepted(path="/actor/")],
+  [_accepted(path="/a//b")],
+  [_accepted(path="/a/../b")],
+  [_accepted(path="/a%2Fb")],
+  [_accepted(path="/act or")],
+  [_accepted(), _accepted(request=2, response=2)],
+  [_accepted(path=f"/r{index}") for index in range(17)],
+], ids=lambda value: json.dumps(value)[:48])
+def test_malformed_accepted_route_limits_widen_in_both_directions_without_error(malformed):
+  # Each malformed list carries a ceiling no larger than the valid one, so
+  # only strict shape reading (not a size comparison) can classify it.
+  actor, _digest = contract_and_digest(_routed([_limit("GET", "/actor", 1024)]))
+  broken = json.loads(json.dumps(actor))
+  broken["service"]["route_limits"] = malformed
+  assert diff_contracts(actor, broken)["widens"] is True
+  assert diff_contracts(broken, actor)["widens"] is True
+  # Complete revocation still never widens, whatever was stored before.
+  revoked = {key: value for key, value in broken.items() if key != "service"}
+  assert diff_contracts(broken, revoked)["widens"] is False
+
+
+def test_route_limit_review_uses_the_runtime_reading_of_accepted_ceilings():
+  from app.manifest_contract import accepted_service_route_limits
+
+  accepted, _digest = contract_and_digest(_routed([_limit("POST", "/b"), _limit("GET", "/a", 2048)]))
+  limits = accepted["service"]["route_limits"]
+  assert accepted_service_route_limits(limits) == {("GET", "/a"): 2048, ("POST", "/b"): MIB}
+  # The runtime additionally bounds each ceiling by the service's own grant.
+  assert accepted_service_route_limits(limits, MIB) == {("GET", "/a"): 2048, ("POST", "/b"): MIB}
+  assert accepted_service_route_limits(limits, MIB - 1) is None
+  assert accepted_service_route_limits([]) == {}
