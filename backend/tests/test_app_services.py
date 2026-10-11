@@ -1767,11 +1767,18 @@ def test_route_ceilings_are_bounded_by_the_exact_accepted_whole_grant():
   (1024, 2048), (0, 0), (60 * MIB + 1, 60 * MIB + 1), ("1024", "1024"), (None, None),
   (1024, "omitted"), ("omitted", 1024),
 ])
-def test_malformed_accepted_whole_grant_disables_the_service(request_bytes, response_bytes):
+@pytest.mark.parametrize("route_limits", ["omitted", [], [_route_limit("GET", "/actor", 1)]],
+                         ids=["no-routes", "empty-routes", "routes"])
+def test_malformed_accepted_whole_grant_disables_the_service(
+  request_bytes, response_bytes, route_limits,
+):
   from app.manifest_contract import accepted_service_max_bytes
 
-  service = {"route_limits": [_route_limit("GET", "/actor", 1)]}
-  for key, value in (("max_request_bytes", request_bytes), ("max_response_bytes", response_bytes)):
+  service = {}
+  for key, value in (
+    ("max_request_bytes", request_bytes), ("max_response_bytes", response_bytes),
+    ("route_limits", route_limits),
+  ):
     if value != "omitted":
       service[key] = value
   assert accepted_service_max_bytes(service) is None

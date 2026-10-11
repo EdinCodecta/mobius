@@ -1171,24 +1171,44 @@ def test_unreadable_route_limits_alone_keep_a_service_under_review(stored):
   assert diff_contracts(installed, {"schema": 6, "service": {"route_limits": stored}})["widens"] is True
 
 
+
+
 _OMITTED = object()
+_TRANSFER_FIELDS = ("max_request_bytes", "max_response_bytes", "route_limits")
+_ROUTE_SHAPES = {
+  "no-routes": _OMITTED, "empty-routes": [], "routes": [_accepted(request=1, response=1)],
+}
+_REFUSED_WHOLE_GRANTS = [
+  (1024.0, 1024.0), (True, True), (1024, 1024.0), (1024, True), (1024.0, 1024),
+  (1024, 2048), (2048, 1024), (0, 0), (-1, -1),
+  (60 * MIB + 1, 60 * MIB + 1), ("1024", "1024"), (None, None),
+  (1024, _OMITTED), (_OMITTED, 1024),
+]
+
+
+def _grant_id(value):
+  return "omitted" if value is _OMITTED else json.dumps(value)
 
 
 def _stored_grant(route_limits, *, request=1024, response=1024):
   """An accepted service carrying raw stored whole and route ceilings.
 
-  `_OMITTED` drops a whole-grant field, as in a service accepted before
-  those fields existed.
+  `_OMITTED` drops a field, as in a service accepted before it existed.
   """
   contract = json.loads(json.dumps(contract_and_digest(_routed(None, max_bytes=1024))[0]))
   service = contract["service"]
-  for key, value in (("max_request_bytes", request), ("max_response_bytes", response)):
+  for key, value in zip(_TRANSFER_FIELDS, (request, response, route_limits)):
     if value is _OMITTED:
-      del service[key]
+      service.pop(key, None)
     else:
       service[key] = value
-  service["route_limits"] = route_limits
   return contract
+
+
+def _transfer_json(contract):
+  """The stored transfer fields exactly, so 1, 1.0 and True stay distinct."""
+  service = contract["service"]
+  return json.dumps({key: service[key] for key in _TRANSFER_FIELDS if key in service}, sort_keys=True)
 
 
 def _runtime_refuses(contract):
@@ -1202,6 +1222,14 @@ def _runtime_refuses(contract):
     assert exc.status_code == 503
     return True
   return False
+
+
+def _unrelated_projection(contract, **explicit):
+  """An owner row write that does not touch the service, unless `explicit` does."""
+  from types import SimpleNamespace
+  from app.app_capabilities import contract_from_app_state
+
+  return contract_from_app_state(SimpleNamespace(capability_contract=contract), **explicit)
 
 
 def test_route_ceiling_above_the_whole_grant_needs_review_unchanged_recovered_or_introduced():
@@ -1227,6 +1255,10 @@ def test_route_ceiling_above_the_whole_grant_needs_review_unchanged_recovered_or
   assert lowered["changed"] == ["service.max_request_bytes", "service.max_response_bytes"]
   assert lowered["widens"] is True
   assert diff_contracts(over, roomy)["widens"] is True
+
+  # An unrelated row write keeps the refused pair exactly, so it stays off.
+  projected = _unrelated_projection(over)
+  assert _transfer_json(projected) == _transfer_json(over) and _runtime_refuses(projected)
 
 
 def test_route_ceiling_equal_to_the_whole_grant_is_readable_and_needs_no_review():
@@ -1257,27 +1289,92 @@ def test_route_ceilings_of_a_legacy_service_are_bounded_by_its_8_mib_default():
   assert diff_contracts(legacy_fit, legacy_over)["widens"] is True
 
 
-@pytest.mark.parametrize(("request_bytes", "response_bytes"), [
-  (1024.0, 1024.0), (True, True), (1024, 1024.0), (1024, True),
-  (1024, 2048), (2048, 1024), (0, 0), (-1, -1),
-  (60 * MIB + 1, 60 * MIB + 1), ("1024", "1024"), (None, None),
-  (1024, _OMITTED), (_OMITTED, 1024),
-], ids=lambda value: "omitted" if value is _OMITTED else json.dumps(value))
-def test_route_ceilings_under_a_whole_grant_the_runtime_refuses_need_review(
-  request_bytes, response_bytes,
+@pytest.mark.parametrize("routes", list(_ROUTE_SHAPES))
+@pytest.mark.parametrize(("request_bytes", "response_bytes"), _REFUSED_WHOLE_GRANTS, ids=_grant_id)
+def test_whole_grant_the_runtime_refuses_stays_refused_and_reviewed_with_any_route_shape(
+  routes, request_bytes, response_bytes,
 ):
-  # Each route ceiling is no larger than the valid whole grant, so only reading
-  # the whole grant exactly as the runtime does can tell this service is off.
-  refused = _stored_grant(
-    [_accepted(request=1, response=1)], request=request_bytes, response=response_bytes,
-  )
-  fit = _stored_grant([_accepted(request=1, response=1)])
+  # Every route ceiling here fits the valid grant, so only reading the whole
+  # grant exactly as the runtime does can tell this service is disabled.
+  refused = _stored_grant(_ROUTE_SHAPES[routes], request=request_bytes, response=response_bytes)
+  fit = _stored_grant(_ROUTE_SHAPES[routes])
   assert _runtime_refuses(refused) and not _runtime_refuses(fit)
+
   assert diff_contracts(refused, refused)["widens"] is True
-  assert diff_contracts(refused, fit)["widens"] is True
+  assert diff_contracts(refused, fit)["widens"] is True  # recovery re-enables it
   assert diff_contracts(fit, refused)["widens"] is True
   revoked = {key: value for key, value in refused.items() if key != "service"}
   assert diff_contracts(refused, revoked)["widens"] is False
+
+  # An unrelated row write neither repairs nor mutates the accepted grant.
+  accepted = json.dumps(refused, sort_keys=True)
+  projected = _unrelated_projection(refused)
+  assert json.dumps(refused, sort_keys=True) == accepted
+  assert _transfer_json(projected) == _transfer_json(refused)
+  assert _runtime_refuses(projected)
+
+
+@pytest.mark.parametrize(("request_bytes", "response_bytes"), [
+  (1.0, 1.0), (True, True), (1, 1.0), (1, True), (1.0, 1), (True, 1),
+], ids=_grant_id)
+def test_bool_or_float_whole_grant_lookalike_is_a_reported_reviewed_change(
+  request_bytes, response_bytes,
+):
+  # Python equates 1, True and 1.0, so value equality would hide the change
+  # that disables (or, reversed, re-enables) the service.
+  valid = _stored_grant(_OMITTED, request=1, response=1)
+  lookalike = _stored_grant(_OMITTED, request=request_bytes, response=response_bytes)
+  assert _runtime_refuses(lookalike) and not _runtime_refuses(valid)
+  differing = [
+    f"service.{key}"
+    for key, value in (("max_request_bytes", request_bytes), ("max_response_bytes", response_bytes))
+    if type(value) is not int
+  ]
+  for installed, candidate in ((valid, lookalike), (lookalike, valid)):
+    report = diff_contracts(installed, candidate)
+    assert report["changed"] == differing and report["widens"] is True
+  assert diff_contracts(lookalike, lookalike) == {
+    "unknown_previous": False, "widens": True, "added": [], "removed": [], "changed": [],
+  }
+  assert _transfer_json(_unrelated_projection(lookalike)) == _transfer_json(lookalike)
+
+
+@pytest.mark.parametrize("routes", list(_ROUTE_SHAPES))
+def test_legacy_whole_grant_absence_is_its_8_mib_default_and_survives_projection(routes):
+  legacy = _stored_grant(_ROUTE_SHAPES[routes], request=_OMITTED, response=_OMITTED)
+  explicit = _stored_grant(_ROUTE_SHAPES[routes], request=8 * MIB, response=8 * MIB)
+  assert not _runtime_refuses(legacy)
+  assert diff_contracts(legacy, json.loads(json.dumps(legacy))) == {
+    "unknown_previous": False, "widens": False, "added": [], "removed": [], "changed": [],
+  }
+  # Spelling the same default out, or dropping it again, grants nothing new.
+  assert diff_contracts(legacy, explicit)["widens"] is False
+  assert diff_contracts(explicit, legacy)["widens"] is False
+
+  projected = _unrelated_projection(legacy)
+  assert _transfer_json(projected) == _transfer_json(legacy)
+  assert "max_request_bytes" not in projected["service"]
+  assert "max_response_bytes" not in projected["service"]
+
+
+def test_unrelated_projection_keeps_the_accepted_grant_while_an_explicit_service_replaces_it():
+  accepted = _stored_grant([_accepted(request=512, response=512)])
+  assert _unrelated_projection(accepted)["service"] == accepted["service"]
+
+  refused = _stored_grant(_OMITTED, request=1024, response=2048)
+  stored = json.dumps(refused, sort_keys=True)
+  # A deliberate local service declaration is re-derived from manifest form,
+  # and the re-enabled service it produces is reviewed.
+  declared = _unrelated_projection(refused, service={
+    "id": refused["service"]["id"], "entry": "service.py", "access": "public", "max_bytes": 2048,
+  })
+  assert declared["service"]["max_request_bytes"] == declared["service"]["max_response_bytes"] == 2048
+  assert "route_limits" not in declared["service"]
+  assert not _runtime_refuses(declared)
+  assert diff_contracts(refused, declared)["widens"] is True
+  # An explicit removal removes the whole service, refused limits included.
+  assert "service" not in _unrelated_projection(refused, service=None)
+  assert json.dumps(refused, sort_keys=True) == stored
 
 
 @pytest.mark.parametrize("revoked_service", [
@@ -1285,18 +1382,19 @@ def test_route_ceilings_under_a_whole_grant_the_runtime_refuses_need_review(
   {"id": None, "entry": None, "access": False, "aliases": [], "route_limits": None},
   {"route_limits": []}, {"max_request_bytes": None, "max_response_bytes": None},
 ], ids=json.dumps)
-@pytest.mark.parametrize("stored", [
-  {"route": 2048, "whole": 1024},
-  {"route": 8 * MIB + 1, "whole": _OMITTED},
-  {"route": 1, "whole": 1024.0},
-], ids=lambda value: json.dumps(value, default=lambda _: "omitted"))
-def test_complete_service_revocation_never_widens_from_a_route_ceiling_the_grant_refuses(
-  revoked_service, stored,
+@pytest.mark.parametrize(("route_limits", "request_bytes", "response_bytes"), [
+  ([_accepted(request=2048, response=2048)], 1024, 1024),
+  ([_accepted(request=8 * MIB + 1, response=8 * MIB + 1)], _OMITTED, _OMITTED),
+  ([_accepted(request=1, response=1)], 1024.0, 1024.0),
+  (_OMITTED, 1024.0, 1024.0),
+  (_OMITTED, True, True),
+  ([], 1024, 2048),
+], ids=["route-over-grant", "route-over-legacy-default", "routes-float-grant",
+        "float-grant", "bool-grant", "empty-routes-unequal-grant"])
+def test_complete_service_revocation_never_widens_from_transfer_limits_the_runtime_refuses(
+  revoked_service, route_limits, request_bytes, response_bytes,
 ):
-  installed = _stored_grant(
-    [_accepted(request=stored["route"], response=stored["route"])],
-    request=stored["whole"], response=stored["whole"],
-  )
+  installed = _stored_grant(route_limits, request=request_bytes, response=response_bytes)
   assert _runtime_refuses(installed)
   candidate = {key: value for key, value in installed.items() if key != "service"}
   if revoked_service != "omitted":

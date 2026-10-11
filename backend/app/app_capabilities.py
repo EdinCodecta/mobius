@@ -715,7 +715,7 @@ def contract_from_app_state(
     "public_access": public_access,
     "tools": tools,
   }
-  preserved_service: dict[str, Any] = {}
+  accepted_transfer: dict[str, Any] | None = None
   if service is _PRESERVE_ACCEPTED and isinstance(
     getattr(app, "capability_contract", None), dict,
   ):
@@ -728,14 +728,15 @@ def contract_from_app_state(
       }
       if accepted_service.get("aliases"):
         service["aliases"] = list(accepted_service["aliases"])
-      accepted_limit = accepted_service.get("max_request_bytes", SERVICE_REQUEST_MAX_BYTES)
-      if accepted_limit != SERVICE_REQUEST_MAX_BYTES:
-        service["max_bytes"] = accepted_limit
-      # Dropping a reviewed route ceiling would widen that route back to the
-      # whole grant. Keep the accepted list verbatim (the runtime rejects a
-      # malformed one) rather than re-deriving it through manifest form.
-      if "route_limits" in accepted_service:
-        preserved_service["route_limits"] = deepcopy(accepted_service["route_limits"])
+      # Re-deriving transfer limits through manifest form could repair a
+      # grant the runtime refuses (re-enabling a disabled service) or drop a
+      # reviewed route ceiling (widening that route to the whole grant). Keep
+      # each accepted field verbatim, including an absent legacy whole grant
+      # and its 8 MiB default, so the runtime reads exactly what was accepted.
+      accepted_transfer = {
+        key: deepcopy(accepted_service[key])
+        for key in _TRANSFER_LIMIT_FIELDS if key in accepted_service
+      }
   if isinstance(service, dict):
     manifest["service"] = service
   if model_provider is _PRESERVE_ACCEPTED:
@@ -744,8 +745,10 @@ def contract_from_app_state(
   if isinstance(model_provider, dict):
     manifest["model_provider"] = model_provider
   contract = contract_from_manifest(manifest)
-  if preserved_service:
-    contract["service"].update(preserved_service)
+  if accepted_transfer is not None:
+    for key in _TRANSFER_LIMIT_FIELDS:
+      contract["service"].pop(key, None)
+    contract["service"].update(accepted_transfer)
   return contract
 
 
@@ -895,20 +898,20 @@ def diff_contracts(
     k for k in before.keys() & after.keys()
     if before[k] != after[k] or (
       # Python equates 1, True and 1.0; only the integer is a valid ceiling.
-      k == _ROUTE_LIMITS_PATH and _exact_json(before[k]) != _exact_json(after[k])
+      k in _TRANSFER_LIMIT_PATHS and _exact_json(before[k]) != _exact_json(after[k])
     )
   )
   widens = any(
     _widens(path, before.get(path), after.get(path), after)
     for path in [*added, *removed, *changed]
   ) or (
-    # Route ceilings the runtime refuses cannot be ranked against anything,
-    # even when they compare equal or pruning made them look absent. While
-    # the service stays granted, either side being unreadable needs review.
-    # "Granted" is the same semantic test as complete revocation in _widens:
-    # an omitted or all-closed service has no remaining leaf.
+    # Transfer limits the runtime refuses disable the service, so they cannot
+    # be ranked against anything, even when they compare equal or pruning made
+    # them look absent. While the service stays granted, either side being
+    # unreadable needs review. "Granted" is the same semantic test as complete
+    # revocation in _widens: an omitted or all-closed service has no leaf.
     any(key.startswith("service.") for key in after)
-    and (_unreadable_route_limits(installed) or _unreadable_route_limits(candidate))
+    and (_unreadable_transfer_limits(installed) or _unreadable_transfer_limits(candidate))
   )
   return {
     "unknown_previous": False,
@@ -943,27 +946,31 @@ _LIST_GRANTS = {
 
 
 _ROUTE_LIMITS_PATH = "service.route_limits"
+# The accepted service fields the runtime reads to bound every exchange.
+_TRANSFER_LIMIT_FIELDS = ("max_request_bytes", "max_response_bytes", "route_limits")
+_TRANSFER_LIMIT_PATHS = {f"service.{field}" for field in _TRANSFER_LIMIT_FIELDS}
 
 
 def _exact_json(value: Any) -> str:
   return json.dumps(value, sort_keys=True, separators=(",", ":"), default=repr)
 
 
-def _unreadable_route_limits(contract: dict[str, Any]) -> bool:
-  """Whether a stored contract carries route ceilings the runtime would refuse.
+def _unreadable_transfer_limits(contract: dict[str, Any]) -> bool:
+  """Whether a stored service carries transfer limits the runtime would refuse.
 
-  Absence and an empty list mean no ceilings, exactly as the runtime reads
-  them; any other value must pass the shared strict parser, bounded by the
-  service's whole grant just as the runtime bounds it. A ceiling above that
-  grant, or any ceiling under a whole grant the runtime itself refuses, makes
-  the list unreadable, so a disabled service is never ranked as narrower.
+  The same shared readings the runtime enforces: the whole per-direction
+  grant (absent fields are the legacy 8 MiB default), then route ceilings
+  bounded by it, where absence and an empty list mean no ceilings. The
+  runtime disables a service when either is not exactly well formed, so such
+  a service is never ranked as narrower than one it actually serves.
   """
   service = contract.get("service")
-  if not isinstance(service, dict) or "route_limits" not in service:
+  if not isinstance(service, dict):
     return False
   ceiling = accepted_service_max_bytes(service)
-  routes = accepted_service_route_limits(service["route_limits"], ceiling)
-  return routes is None or (ceiling is None and routes != {})
+  return ceiling is None or accepted_service_route_limits(
+    service.get("route_limits", []), ceiling,
+  ) is None
 
 
 def _route_ceilings(value: Any) -> dict[tuple[str, str], int] | None:
