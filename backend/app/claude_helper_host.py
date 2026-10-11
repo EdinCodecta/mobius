@@ -352,7 +352,7 @@ class ClaudeHelperHost(Host):
       return None
 
   def _save_session(self, session_id: str) -> None:
-    if not session_id or session_id == self.session_id:
+    if self._dispatcher_failed or not session_id or session_id == self.session_id:
       return
     self.session_id = session_id
     try:
@@ -794,15 +794,22 @@ class ClaudeHelperHost(Host):
     The manager can lease a fresh host immediately. This host closes only
     after its existing turns release their leases.
     """
+    if self._dispatcher_failed:
+      return
+    # Detach before making this host non-reusable. There is no await in this
+    # transition: a lease waiting on the manager's key lock then sees no host,
+    # rather than seeing a dead host and closing its running helpers.
+    manager = helper_hosts.MANAGER
+    if manager._hosts.get(self.key) is self:
+      del manager._hosts[self.key]
+      self._detached = True
     self._dispatcher_failed = True
+    # A replacement must never resume a session still owned by this process.
+    with contextlib.suppress(FileNotFoundError):
+      self._session_file.unlink()
     for queued in list(self._turn_by_dispatch.values()):
       if not queued.done.is_set() and not queued.dispatch_consumed:
         self._fail_unsubmitted(queued)
-    manager = helper_hosts.MANAGER
-    async with manager._lock(self.key):
-      if manager._hosts.get(self.key) is self:
-        del manager._hosts[self.key]
-        self._detached = True
     self._schedule_detached_close()
 
   def _own_task(self, work) -> None:
@@ -854,7 +861,7 @@ class ClaudeHelperHost(Host):
       except asyncio.CancelledError:
         raise
       except asyncio.TimeoutError:
-        if not turn.done.is_set():
+        if not turn.started.is_set() and not turn.done.is_set():
           self._specs.pop(turn.dispatch_id, None)
           turn.dispatch_error = "launch_failed" if turn.dispatch_consumed else "not_called"
           log.warning(

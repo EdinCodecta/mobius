@@ -475,6 +475,103 @@ async def test_silent_dispatcher_deadline_releases_next_request(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_started_helper_survives_dispatcher_reply_deadline(tmp_path, monkeypatch):
+  monkeypatch.setattr(claude_helper_host, 'DISPATCH_REPLY_TIMEOUT', 0.01)
+  host = _claude_host(tmp_path)
+  turn = _turn(tmp_path)
+  started, stopped = [], []
+  class SlowReply:
+    async def query(self, line):
+      host._dispatcher_call('Agent', {'description': turn.dispatch_id}, 'launch')
+      host._on_task_started(_Started('agent', 'launch'))
+    async def stop_task(self, agent_id):
+      stopped.append(agent_id)
+  host._client = SlowReply()
+  running = asyncio.create_task(host.run_turn(turn, on_started=lambda t: _record_start(started, t)))
+  await turn.started.wait()
+  await asyncio.sleep(0.03)
+  assert started == [turn] and host._dispatcher_failed
+  assert not turn.done.is_set() and turn.dispatch_error is None and stopped == []
+  turn.finish('completed')
+  assert (await running).status == 'completed'
+  await host.close()
+
+
+async def _record_start(seen, turn):
+  seen.append(turn)
+
+
+@pytest.mark.asyncio
+async def test_retirement_detaches_before_a_waiting_lease_can_close_running_helpers(
+    tmp_path, monkeypatch):
+  manager = helper_hosts.HostManager()
+  monkeypatch.setattr(helper_hosts, 'MANAGER', manager)
+  key = _claude_host(tmp_path).key
+  made = []
+  def factory():
+    host = _claude_host(tmp_path)
+    async def start():
+      host._client = object()
+    host.start = start
+    made.append(host)
+    return host
+  async with manager.lease(key, factory) as first:
+    sibling = _turn(tmp_path, dispatch_id='sibling')
+    sibling.started.set()
+    first._turn_by_agent['sibling'] = sibling
+    # Reproduce a lease already waiting on the manager lock at retirement.
+    lock = manager._lock(key)
+    await lock.acquire()
+    entered = asyncio.Event()
+    async def waiting_lease():
+      entered.set()
+      async with manager.lease(key, factory) as replacement:
+        assert replacement is not first
+        assert not first._closed and not sibling.done.is_set()
+    waiter = asyncio.create_task(waiting_lease())
+    await entered.wait()
+    await asyncio.sleep(0)
+    await first._retire_dispatcher()
+    lock.release()
+    await waiter
+    assert first._detached and not first._closed
+  await asyncio.sleep(0)
+  await asyncio.sleep(0)
+  assert first._closed and len(made) == 2
+  await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_retirement_gives_replacement_a_fresh_session_and_ignores_late_ids(
+    tmp_path, monkeypatch):
+  manager = helper_hosts.HostManager()
+  monkeypatch.setattr(helper_hosts, 'MANAGER', manager)
+  key = _claude_host(tmp_path).key
+  made = []
+  def factory():
+    host = _claude_host(tmp_path)
+    async def start():
+      host.resumed = host._saved_session()
+      host._client = object()
+    host.start = start
+    made.append(host)
+    return host
+  async with manager.lease(key, factory) as first:
+    first._save_session('old-session')
+    assert first._saved_session() == 'old-session'
+    await first._retire_dispatcher()
+    first._save_session('late-session')
+    async with manager.lease(key, factory) as replacement:
+      assert replacement.resumed is None
+      replacement._save_session('new-session')
+      first._save_session('even-later-session')
+      assert replacement._saved_session() == 'new-session'
+  await asyncio.sleep(0)
+  await asyncio.sleep(0)
+  await manager.close_all()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('failure', ['stop', 'query-error'])
 async def test_consumed_admission_is_stopped_when_a_late_start_supplies_identity(tmp_path, failure):
   host = _claude_host(tmp_path)
