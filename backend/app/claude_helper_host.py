@@ -44,6 +44,7 @@ log = logging.getLogger(__name__)
 
 SESSION_PREFIX = "claude-host:"
 DISPATCH_MODEL = "haiku"
+DISPATCH_REPLY_TIMEOUT = 30.0
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 BUILTIN_HELPER_TOOLS = ("Agent", "Task", "Workflow")
 DISPATCHER_PROMPT = (
@@ -305,7 +306,10 @@ class ClaudeHelperHost(Host):
     # helper lifetimes. The host owns draining a cancelled admission's reply,
     # so it cannot be mistaken for the next helper's dispatcher response.
     self._dispatcher_reply: asyncio.Future | None = None
+    self._dispatcher_turn: HelperTurn | None = None
     self._dispatcher_failed = False
+    self._detached = False
+    self._detached_close_scheduled = False
     self._host_tasks: set[asyncio.Task] = set()
     # The CLI's last stderr lines, logged if the host process ends.
     self.stderr_tail: list[str] = []
@@ -320,11 +324,25 @@ class ClaudeHelperHost(Host):
   @property
   def alive(self) -> bool:
     if (self._closed or self._client is None
-        or (self._dispatcher_failed and self._leases == 0)):
+        or self._dispatcher_failed):
       return False
     if self._reader is not None and self._reader.done():
       return False
     return True
+
+  def _release(self, manager) -> None:
+    super()._release(manager)
+    self._schedule_detached_close()
+
+  def _schedule_detached_close(self) -> None:
+    if not self._detached or self._leases or self._detached_close_scheduled:
+      return
+    self._detached_close_scheduled = True
+    if self._idle_task is not None:
+      self._idle_task.cancel()
+      self._idle_task = None
+    # Finish the retiring dispatch before close() cancels host tasks.
+    asyncio.get_running_loop().call_soon(lambda: asyncio.create_task(self.close()))
 
   def _saved_session(self) -> str | None:
     try:
@@ -511,7 +529,8 @@ class ClaudeHelperHost(Host):
       if not brief:
         return {}
       return {"hookSpecificOutput": {
-        "hookEventName": "PostToolUse", "additionalContext": brief,
+        "hookEventName": input_data.get("hook_event_name") or "PostToolUse",
+        "additionalContext": brief,
       }}
     if input_data.get("tool_name") not in ("Agent", "SendMessage"):
       return {}
@@ -769,17 +788,22 @@ class ClaudeHelperHost(Host):
     turn.finish("failed", "Claude could not start this helper request. "
                 "Its dispatcher is unavailable; no work was launched or message sent.")
 
-  def _retire_dispatcher(self) -> None:
-    """An ambiguous stream may drain, but never admit another request.
+  async def _retire_dispatcher(self) -> None:
+    """Detach a failed dispatcher; existing helpers retain this process.
 
-    Existing helpers keep running. Queued requests fail visibly and release
-    their leases, so the normal host lifecycle can replace this host once its
-    active helpers settle, even when no reply to the failed query will arrive.
+    The manager can lease a fresh host immediately. This host closes only
+    after its existing turns release their leases.
     """
     self._dispatcher_failed = True
     for queued in list(self._turn_by_dispatch.values()):
       if not queued.done.is_set() and not queued.dispatch_consumed:
         self._fail_unsubmitted(queued)
+    manager = helper_hosts.MANAGER
+    async with manager._lock(self.key):
+      if manager._hosts.get(self.key) is self:
+        del manager._hosts[self.key]
+        self._detached = True
+    self._schedule_detached_close()
 
   def _own_task(self, work) -> None:
     task = asyncio.create_task(work)
@@ -794,7 +818,7 @@ class ClaudeHelperHost(Host):
         log.warning("helper task stop failed agent=%s", agent_id, exc_info=True)
 
   async def _dispatch(self, turn: HelperTurn) -> None:
-    """One request and its exact reply; no model retries or guessed deadlines.
+    """One request and its exact reply, bounded by the dispatcher deadline.
 
     A stopped turn returns locally. The host still drains a submitted query's
     reply before accepting the next request; close() cancels that drain.
@@ -804,10 +828,12 @@ class ClaudeHelperHost(Host):
         return
       replied = asyncio.get_running_loop().create_future()
       self._dispatcher_reply = replied
+      self._dispatcher_turn = turn
       try:
         verb = "SPAWN" if turn.kind == "spawn" else "MESSAGE"
-        await self._client.query(f"{verb} {turn.dispatch_id}")
-        response = await replied
+        async with asyncio.timeout(DISPATCH_REPLY_TIMEOUT):
+          await self._client.query(f"{verb} {turn.dispatch_id}")
+          response = await replied
         if turn.done.is_set():
           return
         if getattr(response, "is_error", False) and not turn.started.is_set():
@@ -827,6 +853,22 @@ class ClaudeHelperHost(Host):
                       "sending its message. No work was launched or message sent.")
       except asyncio.CancelledError:
         raise
+      except asyncio.TimeoutError:
+        if not turn.done.is_set():
+          self._specs.pop(turn.dispatch_id, None)
+          turn.dispatch_error = "launch_failed" if turn.dispatch_consumed else "not_called"
+          log.warning(
+            "helper dispatch %s %s timed out tool_call_seen=%s dispatcher_last=%r",
+            turn.kind, turn.dispatch_id, turn.dispatch_consumed, self.dispatcher_last,
+          )
+          uncertainty = (
+            "Some work may have started; Möbius will not replay it automatically."
+            if turn.dispatch_consumed else
+            "No work was launched or message sent."
+          )
+          turn.finish("failed", "Claude's dispatcher did not confirm this helper "
+                      f"request before its deadline. {uncertainty}")
+        await self._retire_dispatcher()
       except Exception:
         log.warning("helper dispatch query failed id=%s", turn.dispatch_id, exc_info=True)
         if not turn.done.is_set():
@@ -838,15 +880,21 @@ class ClaudeHelperHost(Host):
         # Submission may have reached Claude, or failed before producing any
         # reply at all. Retire admissions rather than wait on an undrainable
         # response or attribute a late result to a future request.
-        self._retire_dispatcher()
+        await self._retire_dispatcher()
       finally:
         if not replied.done():
           replied.cancel()
         self._dispatcher_reply = None
+        self._dispatcher_turn = None
 
   def _dispatcher_replied(self, response=None) -> None:
     reply = self._dispatcher_reply
-    if reply is not None and not reply.done():
+    # A task-end notice produces an independent dispatcher result. It is not
+    # this request's answer until the registered one-shot tool call was seen.
+    if (reply is not None and not reply.done()
+        and self._dispatcher_turn is not None
+        and (self._dispatcher_turn.dispatch_consumed
+             or self._dispatcher_turn.done.is_set())):
       reply.set_result(response)
 
   async def stop(self, turn: HelperTurn) -> None:

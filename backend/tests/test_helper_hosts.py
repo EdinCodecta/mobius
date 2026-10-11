@@ -242,8 +242,9 @@ def test_a_resumed_helper_reports_to_its_current_follow_up_turn(tmp_path):
   assert host._turn_for_parent("toolu_launch") is follow_up
 
 
-def test_dispatcher_reply_without_the_call_fails_once_without_retry(tmp_path):
+def test_dispatcher_reply_without_the_call_fails_once_without_retry(tmp_path, monkeypatch):
   host = _claude_host(tmp_path)
+  monkeypatch.setattr(claude_host, 'DISPATCH_REPLY_TIMEOUT', 0.01)
   queries = []
   class ForgetfulDispatcher:
     async def query(self, line):
@@ -521,6 +522,7 @@ def test_a_dispatch_that_never_starts_says_what_the_dispatcher_did(
       host._dispatcher_replied()
 
   host._client = _SilentDispatcher()
+  monkeypatch.setattr(claude_host, 'DISPATCH_REPLY_TIMEOUT', 0.01)
   turn = _turn(tmp_path)
   with caplog.at_level(logging.WARNING, logger="app.claude_helper_host"):
     asyncio.run(host.run_turn(turn))
