@@ -244,16 +244,16 @@ def test_a_resumed_helper_reports_to_its_current_follow_up_turn(tmp_path):
 
 def test_dispatcher_reply_without_the_call_fails_once_without_retry(tmp_path, monkeypatch):
   host = _claude_host(tmp_path)
-  monkeypatch.setattr(claude_host, 'DISPATCH_REPLY_TIMEOUT', 0.01)
   queries = []
   class ForgetfulDispatcher:
     async def query(self, line):
       queries.append(line)
+      host._result_dispatch_id = host._dispatcher_turn.dispatch_id
       host._dispatcher_replied()
   host._client = ForgetfulDispatcher()
   turn = _turn(tmp_path)
   asyncio.run(host.run_turn(turn))
-  assert queries == ["SPAWN d1"]
+  assert queries == ["SPAWN d1"] * 3
   assert turn.dispatch_error == "not_called" and turn.status == "failed"
   assert "No work was launched" in turn.summary
   assert host._dispatcher_call("Agent", {"description": "d1"}, "late")[
@@ -329,6 +329,7 @@ class _DispatcherClient:
     )
     # A resumed helper reports under the tool call that first launched it.
     self.host._on_task_started(_Started(turn.agent_id or "agent-1", "toolu_spawn"))
+    self.host._result_dispatch_id = dispatch_id
     self.host._dispatcher_replied()
     asyncio.get_running_loop().call_soon(self.settle, turn, verb)
 
@@ -519,16 +520,16 @@ def test_a_dispatch_that_never_starts_says_what_the_dispatcher_did(
   class _SilentDispatcher:
     async def query(self, _line):
       host.dispatcher_last = "server_error: API Error: 529 Overloaded"
+      host._result_dispatch_id = host._dispatcher_turn.dispatch_id
       host._dispatcher_replied()
 
   host._client = _SilentDispatcher()
-  monkeypatch.setattr(claude_host, 'DISPATCH_REPLY_TIMEOUT', 0.01)
   turn = _turn(tmp_path)
   with caplog.at_level(logging.WARNING, logger="app.claude_helper_host"):
     asyncio.run(host.run_turn(turn))
 
   assert turn.dispatch_error == "not_called"
-  assert "529 Overloaded" in caplog.text and "tool_call_seen=False" in caplog.text
+  assert "529 Overloaded" in caplog.text and "completed without its tool call" in caplog.text
 
   startup._route_diagnostics_to_chat_log(None)
   from app.chat_logging import get_chat_log_handler

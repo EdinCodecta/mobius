@@ -9,6 +9,12 @@ from app import claude_helper_host, helper_hosts
 from tests.test_helper_hosts import _claude_host, _turn, _Started
 
 
+def _reply(host, response=None):
+  if host._dispatcher_turn is not None:
+    host._result_dispatch_id = host._dispatcher_turn.dispatch_id
+  host._dispatcher_replied(response)
+
+
 @pytest.mark.asyncio
 async def test_first_tool_waits_for_identity_even_after_two_seconds(tmp_path):
   host = _claude_host(tmp_path)
@@ -112,7 +118,7 @@ async def test_consumed_dispatch_never_replays_after_an_ambiguous_reply(tmp_path
     async def query(self, line):
       queries.append(line)
       host._dispatcher_call('Agent', {'description': turn.dispatch_id}, 'launch')
-      host._dispatcher_replied()  # No start or definite failure yet.
+      _reply(host)  # No start or definite failure yet.
   host._client = Dispatcher()
   running = asyncio.create_task(host.run_turn(turn))
   for _ in range(4):
@@ -186,7 +192,7 @@ async def test_query_exception_never_retries_consumed_work_or_leaks_a_reply(tmp_
   assert turn.dispatch_error == 'launch_failed'
   assert 'will not replay' in turn.summary
   assert queries == ['SPAWN d1']
-  host._dispatcher_replied()
+  _reply(host)
   await asyncio.gather(*host._host_tasks)
   assert host._dispatcher_reply is None
   assert turn.dispatch_id not in host._specs
@@ -232,12 +238,12 @@ async def test_dispatcher_cycles_serialize_replies_but_not_helper_lifetimes(tmp_
   assert await submitted.get() == 'SPAWN a'
   await asyncio.sleep(0)
   assert queries == ['SPAWN a']  # B cannot register a reply before its query.
-  host._dispatcher_replied()
+  _reply(host)
   assert await submitted.get() == 'SPAWN b'
   assert not a.done.is_set()  # B starts while A's helper is still working.
   await asyncio.sleep(0)
   assert not host._dispatcher_reply.done()  # A's reply cannot release B.
-  host._dispatcher_replied()
+  _reply(host)
   a.finish('completed'); b.finish('completed')
   await asyncio.gather(arun, brun)
   assert queries == ['SPAWN a', 'SPAWN b']
@@ -255,13 +261,14 @@ async def test_notice_result_before_requested_call_does_not_consume_reply(tmp_pa
   host._client = Dispatcher()
   running = asyncio.create_task(host.run_turn(turn))
   await sent.wait()
+  host._result_dispatch_id = 'notice'
   host._dispatcher_replied()  # Independent task-notification turn.
   await asyncio.sleep(0)
   assert not host._dispatcher_reply.done()
   assert turn.dispatch_id in host._specs
   host._dispatcher_call('Agent', {'description': turn.dispatch_id}, 'launch')
   host._on_task_started(_Started('agent', 'launch'))
-  host._dispatcher_replied()  # Result of the requested call.
+  _reply(host)  # Result of the requested call.
   turn.finish('completed')
   assert (await running).status == 'completed'
   await host.close()
@@ -326,10 +333,10 @@ async def test_cancelled_query_drains_its_reply_before_the_next_dispatch(tmp_pat
   finish_query.set()
   await asyncio.sleep(0)
   assert submitted.empty()
-  host._dispatcher_replied()  # Drain only cancelled A.
+  _reply(host)  # Drain only cancelled A.
   assert await submitted.get() == 'SPAWN b'
   assert not host._dispatcher_reply.done()
-  host._dispatcher_replied()
+  _reply(host)
   b.finish('completed')
   await brun
   await host.close()
@@ -360,7 +367,7 @@ async def test_provider_dispatch_completion_error_settles_consumed_admission(tmp
   class Dispatcher:
     async def query(self, line):
       host._dispatcher_call('Agent', {'description': 'd1'}, 'launch')
-      host._dispatcher_replied(SimpleNamespace(is_error=True))
+      _reply(host, SimpleNamespace(is_error=True))
   host._client = Dispatcher()
   assert (await host.run_turn(turn)).dispatch_error == 'launch_failed'
   assert turn.done.is_set()
@@ -368,207 +375,96 @@ async def test_provider_dispatch_completion_error_settles_consumed_admission(tmp
 
 
 @pytest.mark.asyncio
-async def test_query_error_retires_admissions_so_a_late_reply_cannot_complete_another_request(tmp_path):
+async def test_no_call_reply_is_reasked_twice_then_fails_promptly(tmp_path):
   host = _claude_host(tmp_path)
-  a, b = _turn(tmp_path, dispatch_id='a'), _turn(tmp_path, dispatch_id='b')
   queries = []
   class Dispatcher:
     async def query(self, line):
       queries.append(line)
-      host._dispatcher_call('Agent', {'description': 'a'}, 'launch-a')
-      raise RuntimeError('transport failed after admission')
+      _reply(host)
   host._client = Dispatcher()
-  assert (await host.run_turn(a)).dispatch_error == 'launch_failed'
-  host._dispatcher_replied()  # An ambiguous late A result cannot reopen this stream.
-  assert (await host.run_turn(b)).dispatch_error == 'launch_failed'
-  assert queries == ['SPAWN a'] and not b.dispatch_consumed
-  assert host._dispatcher_reply is None
+  turn = await host.run_turn(_turn(tmp_path))
+  assert turn.dispatch_error == 'not_called'
+  assert queries == ['SPAWN d1'] * 3
+  assert host.alive
   await host.close()
 
 
 @pytest.mark.asyncio
-async def test_pre_submission_query_error_fails_queued_admissions_without_stopping_active_siblings(tmp_path):
+async def test_query_error_preserves_session_and_next_request_and_started_sibling(tmp_path):
   host = _claude_host(tmp_path)
-  host._leases = 1  # An active sibling owns this host until its turn settles.
+  host._save_session('saved-session')
   sibling = _turn(tmp_path, dispatch_id='sibling')
   sibling.started.set()
-  host._turn_by_agent['sibling'] = sibling
-  a, b, c = [_turn(tmp_path, dispatch_id=key) for key in ['a', 'b', 'c']]
-  entered, fail = asyncio.Event(), asyncio.Event()
+  sibling.agent_id = 'sibling-agent'
+  host._turn_by_agent['sibling-agent'] = sibling
   queries = []
   class Dispatcher:
     async def query(self, line):
       queries.append(line)
-      entered.set()
-      await fail.wait()
-      raise RuntimeError('failed before submission')
+      if line == 'SPAWN a':
+        raise RuntimeError('query failed')
+      host._dispatcher_call('SendMessage', {'to': 'b'}, 'message-b')
+      host._on_task_started(_Started('sibling-agent', 'message-b'))
+      _reply(host)
   host._client = Dispatcher()
-  arun = asyncio.create_task(host.run_turn(a))
-  await entered.wait()
-  brun = asyncio.create_task(host.run_turn(b))
-  await asyncio.sleep(0)
-  fail.set()
-  assert (await arun).dispatch_error == 'launch_failed'
-  assert (await brun).dispatch_error == 'launch_failed'
-  assert (await host.run_turn(c)).dispatch_error == 'launch_failed'
-  assert queries == ['SPAWN a'] and not any(t.dispatch_consumed for t in [a, b, c])
-  assert not host._specs and not sibling.done.is_set() and not host.alive
-  assert await host._turn_for_agent('sibling') is sibling
-  host._leases = 0
-  assert not host.alive
+  assert (await host.run_turn(_turn(tmp_path, dispatch_id='a'))).dispatch_error == 'launch_failed'
+  assert host._saved_session() == 'saved-session'
+  assert not sibling.done.is_set() and host.alive
+  b = _turn(tmp_path, dispatch_id='b')
+  b.kind = 'message'
+  b.agent_id = 'sibling-agent'
+  b.spec = {'to': 'sibling-agent', 'summary': 'b', 'message': 'follow up'}
+  running = asyncio.create_task(host.run_turn(b))
+  await b.started.wait()
+  b.finish('completed')
+  assert (await running).status == 'completed'
+  assert queries == ['SPAWN a', 'MESSAGE b']
   await host.close()
 
 
 @pytest.mark.asyncio
-async def test_retired_dispatcher_is_replaced_while_its_helpers_keep_running(tmp_path, monkeypatch):
-  manager = helper_hosts.HostManager()
-  monkeypatch.setattr(helper_hosts, 'MANAGER', manager)
-  key = _claude_host(tmp_path).key
-  made = []
-  def factory():
-    host = _claude_host(tmp_path)
-    async def start():
-      class Dispatcher:
-        async def query(self, line):
-          if len(made) == 1:
-            raise RuntimeError('query failed')
-          host._dispatcher_call('Agent', {'description': line.split()[1]}, 'launch')
-          host._on_task_started(_Started('agent', 'launch'))
-          host._dispatcher_replied()
-      host._client = Dispatcher()
-    host.start = start
-    made.append(host)
-    return host
-  async with manager.lease(key, factory) as first:
-    sibling = _turn(tmp_path, dispatch_id='sibling')
-    sibling.started.set()
-    first._turn_by_agent['sibling'] = sibling
-    failed = await first.run_turn(_turn(tmp_path, dispatch_id='failed'))
-    assert failed.dispatch_error == 'launch_failed'
-    await asyncio.gather(*first._host_tasks)
-    async with manager.lease(key, factory) as replacement:
-      assert replacement is not first
-      assert not sibling.done.is_set() and not first._closed
-      turn = _turn(tmp_path, dispatch_id='new')
-      running = asyncio.create_task(replacement.run_turn(turn))
-      await turn.started.wait()
-      turn.finish('completed')
-      assert (await running).status == 'completed'
-  await asyncio.sleep(0)
-  await asyncio.sleep(0)
-  assert first._closed
-  await manager.close_all()
-
-
-@pytest.mark.asyncio
-async def test_silent_dispatcher_deadline_releases_next_request(tmp_path, monkeypatch):
-  monkeypatch.setattr(claude_helper_host, 'DISPATCH_REPLY_TIMEOUT', 0.01)
-  host = _claude_host(tmp_path)
-  class Silent:
-    async def query(self, line):
-      await asyncio.Future()
-  host._client = Silent()
-  turn = await host.run_turn(_turn(tmp_path))
-  assert turn.dispatch_error == 'not_called' and host._dispatcher_failed
-  assert host._dispatcher_reply is None
-  await host.close()
-
-
-@pytest.mark.asyncio
-async def test_started_helper_survives_dispatcher_reply_deadline(tmp_path, monkeypatch):
-  monkeypatch.setattr(claude_helper_host, 'DISPATCH_REPLY_TIMEOUT', 0.01)
+async def test_started_helper_survives_late_dispatcher_reply(tmp_path):
   host = _claude_host(tmp_path)
   turn = _turn(tmp_path)
-  started, stopped = [], []
-  class SlowReply:
+  class Dispatcher:
     async def query(self, line):
       host._dispatcher_call('Agent', {'description': turn.dispatch_id}, 'launch')
       host._on_task_started(_Started('agent', 'launch'))
-    async def stop_task(self, agent_id):
-      stopped.append(agent_id)
-  host._client = SlowReply()
-  running = asyncio.create_task(host.run_turn(turn, on_started=lambda t: _record_start(started, t)))
+  host._client = Dispatcher()
+  running = asyncio.create_task(host.run_turn(turn))
   await turn.started.wait()
-  await asyncio.sleep(0.03)
-  assert started == [turn] and host._dispatcher_failed
-  assert not turn.done.is_set() and turn.dispatch_error is None and stopped == []
+  await asyncio.sleep(0)
+  assert not turn.done.is_set() and turn.dispatch_error is None and host.alive
+  _reply(host)
   turn.finish('completed')
   assert (await running).status == 'completed'
   await host.close()
 
 
-async def _record_start(seen, turn):
-  seen.append(turn)
-
-
 @pytest.mark.asyncio
-async def test_retirement_detaches_before_a_waiting_lease_can_close_running_helpers(
-    tmp_path, monkeypatch):
-  manager = helper_hosts.HostManager()
-  monkeypatch.setattr(helper_hosts, 'MANAGER', manager)
-  key = _claude_host(tmp_path).key
-  made = []
-  def factory():
-    host = _claude_host(tmp_path)
-    async def start():
-      host._client = object()
-    host.start = start
-    made.append(host)
-    return host
-  async with manager.lease(key, factory) as first:
-    sibling = _turn(tmp_path, dispatch_id='sibling')
-    sibling.started.set()
-    first._turn_by_agent['sibling'] = sibling
-    # Reproduce a lease already waiting on the manager lock at retirement.
-    lock = manager._lock(key)
-    await lock.acquire()
-    entered = asyncio.Event()
-    async def waiting_lease():
-      entered.set()
-      async with manager.lease(key, factory) as replacement:
-        assert replacement is not first
-        assert not first._closed and not sibling.done.is_set()
-    waiter = asyncio.create_task(waiting_lease())
-    await entered.wait()
-    await asyncio.sleep(0)
-    await first._retire_dispatcher()
-    lock.release()
-    await waiter
-    assert first._detached and not first._closed
+async def test_followup_clears_prior_rejected_identity_before_first_tool(tmp_path):
+  host = _claude_host(tmp_path)
+  host._reject_identity('agent')
+  turn = _turn(tmp_path)
+  turn.kind = 'message'
+  turn.agent_id = 'agent'
+  class Dispatcher:
+    async def query(self, line):
+      host._dispatcher_call('SendMessage', {'to': turn.dispatch_id}, 'send')
+      _reply(host)
+  host._client = Dispatcher()
+  running = asyncio.create_task(host.run_turn(turn))
   await asyncio.sleep(0)
+  first_tool = asyncio.create_task(host.pre_tool_use(
+    {'agent_id': 'agent', 'tool_name': 'Write', 'tool_input': {}}, 'write', None))
   await asyncio.sleep(0)
-  assert first._closed and len(made) == 2
-  await manager.close_all()
-
-
-@pytest.mark.asyncio
-async def test_retirement_gives_replacement_a_fresh_session_and_ignores_late_ids(
-    tmp_path, monkeypatch):
-  manager = helper_hosts.HostManager()
-  monkeypatch.setattr(helper_hosts, 'MANAGER', manager)
-  key = _claude_host(tmp_path).key
-  made = []
-  def factory():
-    host = _claude_host(tmp_path)
-    async def start():
-      host.resumed = host._saved_session()
-      host._client = object()
-    host.start = start
-    made.append(host)
-    return host
-  async with manager.lease(key, factory) as first:
-    first._save_session('old-session')
-    assert first._saved_session() == 'old-session'
-    await first._retire_dispatcher()
-    first._save_session('late-session')
-    async with manager.lease(key, factory) as replacement:
-      assert replacement.resumed is None
-      replacement._save_session('new-session')
-      first._save_session('even-later-session')
-      assert replacement._saved_session() == 'new-session'
-  await asyncio.sleep(0)
-  await asyncio.sleep(0)
-  await manager.close_all()
+  assert not first_tool.done()
+  host._on_task_started(_Started('agent', 'send'))
+  assert await first_tool == {}
+  turn.finish('completed')
+  assert (await running).status == 'completed'
+  await host.close()
 
 
 @pytest.mark.asyncio
@@ -605,7 +501,7 @@ async def test_consumed_admission_is_stopped_when_a_late_start_supplies_identity
   await stopped.wait()
   assert stop_ids == ['late-agent']
   assert not sibling.done.is_set() and not host._closed
-  host._dispatcher_replied()
+  _reply(host)
   await host.close()
 
 
