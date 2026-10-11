@@ -1934,7 +1934,7 @@ async def _create_conflict_resolver_chat(
   db: Session, app_ids: list[int],
 ) -> schemas.AppConflictResolverChatOut:
   """Prepare the exact selected batch, then open its owner-visible resolver."""
-  from app import background_agents
+  from app import background_agents, install
 
   prepared = []
   sources = []
@@ -1988,7 +1988,7 @@ async def _create_conflict_resolver_chat(
     plans = []
     for app, repo, receipt in prepared:
       try:
-        plan = await asyncio.to_thread(_validate_pending_update, repo, receipt)
+        plan = await install._to_completion(_validate_pending_update, repo, receipt)
         upstream_version = await asyncio.to_thread(
           _upstream_version, repo, app.upstream_commit,
         )
@@ -2013,7 +2013,7 @@ async def _create_conflict_resolver_chat(
     # Only idle retries may restore a checkout removed by an earlier abort.
     for app, repo, receipt, plan, _version in plans:
       try:
-        await asyncio.to_thread(_park_pending_update, repo, receipt, plan)
+        await install._to_completion(_park_pending_update, repo, receipt, plan)
       except HTTPException as exc:
         raise _resolver_app_error(exc, app.id) from exc
 
@@ -2341,7 +2341,7 @@ async def resolve_app_update(
           ),
         )
       receipt = _pending_store_update_receipt(app, source_dir)
-      await asyncio.to_thread(
+      await install._to_completion(
         _require_pending_resolution, Path(source_dir),
         receipt["upstream_commit"],
       )

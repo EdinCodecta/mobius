@@ -1831,7 +1831,7 @@ async def clear_pending_conflict_update(db: Session, app: models.App) -> None:
   app.conflict_resolver_chat_id = None
   app.conflict_resolver_upstream_commit = None
   db.commit()
-  await asyncio.to_thread(_drop_pending_update_worktree, source_dir)
+  await _to_completion(_drop_pending_update_worktree, source_dir)
   shutil.rmtree(
     Path(source_dir) / ".git" / _PENDING_UPDATE_DIR,
     ignore_errors=True,

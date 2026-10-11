@@ -4345,6 +4345,137 @@ def test_conflict_resolver_batch_cannot_deadlock_contribute_publication(
   asyncio.run(run_competing_operations())
 
 
+def _assert_cancellation_drains_worker_under_lock(source_dir, operation, monkeypatch, target, attr):
+  """A lock-held disk mutation must finish before cancellation frees the lock.
+
+  Cancelling an ``asyncio.to_thread`` await does not stop its thread, so a
+  caller that unwinds at once releases the source lock while Git still writes.
+  """
+  import threading
+  from app import fs_locks
+
+  entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+
+  def blocked(*args):
+    entered.set()
+    try:
+      assert release.wait(10)
+    finally:
+      exited.set()
+
+  monkeypatch.setattr(target, attr, blocked)
+
+  async def run():
+    lock = fs_locks.source_dir_lock(str(Path(source_dir).resolve()))
+    task = asyncio.create_task(operation())
+    try:
+      assert await asyncio.to_thread(entered.wait, 5)
+      for _ in range(2):
+        task.cancel()
+        await asyncio.sleep(.02)
+        assert not task.done() and not exited.is_set()
+        assert lock.locked(), "source lock released while its worker still ran"
+    finally:
+      release.set()
+      outcome = await asyncio.gather(task, return_exceptions=True)
+    assert exited.is_set() and not lock.locked()
+    assert isinstance(outcome[0], asyncio.CancelledError), repr(outcome)
+
+  asyncio.run(run())
+
+
+@pytest.mark.parametrize("step", ["_validate_pending_update", "_park_pending_update"])
+def test_cancelled_resolver_batch_drains_worker_before_releasing_source(
+  db, tmp_path, monkeypatch, step,
+):
+  from app.routes import apps as routes
+
+  repo = tmp_path / "app"
+  repo.mkdir()
+  app = models.App(
+    name="Cancellation probe", slug="cancellation-probe",
+    source_dir=str(repo), upstream_commit="upstream",
+  )
+  db.add(app)
+  db.commit()
+
+  async def history_complete(source_dir):
+    return None
+
+  monkeypatch.setattr(routes, "_complete_history", history_complete)
+  monkeypatch.setattr(routes.app_git, "is_repo", lambda repo: True)
+  monkeypatch.setattr(routes, "_pending_store_update_receipt", lambda *args: {})
+  monkeypatch.setattr(
+    routes, "_validate_pending_update",
+    lambda *args: routes._PendingUpdatePlan(conflict_paths=["index.jsx"]),
+  )
+  monkeypatch.setattr(routes, "_upstream_version", lambda *args: "2")
+  monkeypatch.setattr(routes, "_park_pending_update", lambda *args: [])
+  _assert_cancellation_drains_worker_under_lock(
+    repo, lambda: routes._create_conflict_resolver_chat(db, [app.id]),
+    monkeypatch, routes, step,
+  )
+
+
+def test_cancelled_resolver_finish_drains_merge_commit_before_releasing_source(
+  db, tmp_path, monkeypatch,
+):
+  from app import schemas
+  from app.routes import apps as routes
+
+  repo = tmp_path / "finish"
+  receipt_file = install.pending_update_receipt_file(repo)
+  receipt_file.parent.mkdir(parents=True)
+  receipt_file.write_text("pending")
+  app = models.App(
+    name="Finish probe", slug="finish-probe",
+    source_dir=str(repo), upstream_commit="upstream",
+  )
+  db.add(app)
+  db.commit()
+  monkeypatch.setattr(routes, "_validate_source_dir", lambda *args: str(repo))
+  monkeypatch.setattr(routes, "_pending_store_update_app", lambda *args, **kwargs: app)
+  monkeypatch.setattr(
+    routes, "_pending_store_update_receipt",
+    lambda *args: {"upstream_commit": "upstream"},
+  )
+  _assert_cancellation_drains_worker_under_lock(
+    repo,
+    lambda: routes.resolve_app_update(
+      schemas.AppResolveUpdate(source_dir=str(repo)), db, None,
+    ),
+    monkeypatch, routes, "_require_pending_resolution",
+  )
+
+
+def test_cancelled_pending_cleanup_drains_worktree_removal_before_releasing_source(
+  db, tmp_path, monkeypatch,
+):
+  from app import fs_locks
+
+  repo = tmp_path / "cleanup"
+  receipt_file = install.pending_update_receipt_file(repo)
+  receipt_file.parent.mkdir(parents=True)
+  receipt_file.write_text("pending")
+  app = models.App(
+    name="Cleanup probe", slug="cleanup-probe",
+    source_dir=str(repo), upstream_commit="upstream",
+    conflict_resolver_upstream_commit="upstream",
+  )
+  db.add(app)
+  db.commit()
+
+  async def cleanup():
+    async with fs_locks.source_dir_lock(str(repo.resolve())):
+      await install.clear_pending_conflict_update(db, app)
+
+  _assert_cancellation_drains_worker_under_lock(
+    repo, cleanup, monkeypatch, install, "_drop_pending_update_worktree",
+  )
+  assert not receipt_file.exists()
+  assert app.conflict_resolver_upstream_commit is None
+
+
 def test_conflict_resolver_batch_deduplicates_and_sorts_canonical_sources(
   db, tmp_path, monkeypatch,
 ):
