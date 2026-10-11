@@ -84,6 +84,26 @@ when their browser frame and accessibility subtree are healthy. Do not weaken
 the iframe sandbox. Re-snapshot after state changes and return to `frame main`
 before checking shell state.
 
+The frame context scopes refs and snapshots, not everything:
+
+- `eval` always runs in the shell document, even after `frame @eN`. Read app
+  state from a frame-scoped `snapshot` instead.
+- Raw `mouse` commands use page coordinates and do reach the app, but
+  `get box` inside the frame reports frame-relative coordinates. Passing those
+  to `mouse move` misses the target.
+
+For press-and-hold or drag, let a ref place the pointer, then press:
+
+```bash
+agent-browser hover @eN    # an app ref from the frame snapshot
+agent-browser mouse down
+agent-browser wait 800
+agent-browser mouse up
+```
+
+For a canvas point with no ref, add the in-frame offset to the iframe's own
+page box, read with `get box` on the iframe ref from `frame main`.
+
 `agent-browser wait --text` and `wait --fn` can observe the top-level document
 rather than the opaque app iframe. For initial load, rely on
 `preview_app.sh`'s mounted-frame gate. For an in-app transition, do not invent
@@ -138,3 +158,9 @@ follow-up. If it cannot close cleanly, name the profile
 `python3 "$SCRIPTS_DIR/agent_browser_session_reset.py" "$AGENT_BROWSER_PROFILE"`.
 The shared lifecycle owner verifies exact process identities, includes orphan
 Chrome/helpers, and refuses uncertain ownership. Never use `pkill -f`.
+
+Never run `agent-browser close --all`: every chat on this server shares one
+session directory, so it closes other chats' browsers too. A second browser
+doubles memory, so work in the chat's own session. If a task truly needs
+another session, put its profile under `$TMPDIR`, never in
+`/data/agent-browser-profiles/`, and close it in the same turn.

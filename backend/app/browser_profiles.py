@@ -19,6 +19,14 @@ from app.run_state import running_chat_ids
 
 
 _CHAT_PROFILE = re.compile(r"^chat-([0-9a-fA-F-]{36})$")
+# An agent that needs a second browser often names its extra profile after its
+# chat with a short prefix (for example `sd-<chat id>`). Such a profile is that
+# chat's scratch, not a deliberately long-lived named session, so it retires
+# with the chat. Only that exact `<prefix>-<chat id>` shape qualifies; any other
+# name keeps the named-session grace.
+_EMBEDDED_CHAT_ID = re.compile(
+  r"^[a-z0-9]+-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"
+)
 _CACHE_PATHS = (
   "Default/Cache",
   "Default/Code Cache",
@@ -230,6 +238,12 @@ def enforce_browser_profile_quota(
       if path.is_symlink() or not path.is_dir():
         continue
       chat_id = match.group(1) if match else None
+      if chat_id is None:
+        embedded = _EMBEDDED_CHAT_ID.fullmatch(path.name)
+        # Only a known chat claims an ad-hoc profile; an unrecognised id may
+        # be anything, so that profile keeps the named-session grace.
+        if embedded and embedded.group(1) in chats:
+          chat_id = embedded.group(1)
       chat = chats.get(chat_id) if chat_id else None
       activity = chat.get("activity_at") if chat else None
       if activity is not None and activity.tzinfo is not None:

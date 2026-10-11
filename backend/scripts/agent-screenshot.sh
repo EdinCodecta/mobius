@@ -61,6 +61,42 @@ case "$SCREENSHOT_RECOVERY_COUNT" in
   *) SCREENSHOT_RECOVERY_COUNT=1 ;;
 esac
 
+# Two different limits bound browser commands, and they mean different things.
+#
+# The step ceiling detects a wedged browser. agent-browser bounds each action
+# itself (AGENT_BROWSER_DEFAULT_TIMEOUT, 25 s by default) and answers with an
+# error when that expires, so a command still running past that bound plus a
+# small grace has a stuck daemon behind it. Only then does the helper reset the
+# session and retry once. A shorter fixed kill misreads a slow machine as a
+# stuck browser: on a loaded 1 GB server ordinary commands take ~5 s, and
+# killing the first navigation mid-flight is what wedges the daemon.
+#
+# The capture deadline bounds the whole capture, including that one recovery,
+# so the helper reports and cleans up before its callers' own limits kill it
+# mid-command (the screenshot tool allows 150 s; an agent's shell command
+# commonly 120 s). Reaching it means the machine is too busy, not that the
+# browser is stuck, so it never triggers a session reset.
+CAPTURE_DEADLINE_SECONDS=90
+STEP_GRACE_SECONDS=5
+case "${AGENT_BROWSER_DEFAULT_TIMEOUT:-}" in
+  ''|*[!0-9]*) BROWSER_ACTION_TIMEOUT_MS=25000 ;;
+  *) BROWSER_ACTION_TIMEOUT_MS="$AGENT_BROWSER_DEFAULT_TIMEOUT" ;;
+esac
+BROWSER_STEP_CEILING_SECONDS=$((
+  (BROWSER_ACTION_TIMEOUT_MS + 999) / 1000 + STEP_GRACE_SECONDS
+))
+# The recovery re-exec inherits the original deadline rather than starting a
+# fresh budget.
+CAPTURE_DEADLINE=""
+if [ "$SCREENSHOT_RECOVERY_COUNT" -eq 1 ]; then
+  case "${MOBIUS_SCREENSHOT_DEADLINE:-}" in
+    ''|*[!0-9]*) : ;;
+    *) CAPTURE_DEADLINE="$MOBIUS_SCREENSHOT_DEADLINE" ;;
+  esac
+fi
+[ -n "$CAPTURE_DEADLINE" ] \
+  || CAPTURE_DEADLINE=$((EPOCHSECONDS + CAPTURE_DEADLINE_SECONDS))
+
 cleanup() {
   local path
   for path in \
@@ -72,9 +108,17 @@ cleanup() {
 
 die() {
   local timed_out_phase=""
+  local timed_out_limit=""
   if [ -n "$BROWSER_TIMEOUT_FILE" ] && [ -s "$BROWSER_TIMEOUT_FILE" ]; then
-    timed_out_phase="$(head -n 1 "$BROWSER_TIMEOUT_FILE")"
-    if [ "$SCREENSHOT_RECOVERY_COUNT" -eq 0 ]; then
+    timed_out_phase="$(sed -n 1p "$BROWSER_TIMEOUT_FILE")"
+    timed_out_limit="$(sed -n 2p "$BROWSER_TIMEOUT_FILE")"
+    if [ "$timed_out_limit" = deadline ]; then
+      # A busy machine, not a stuck browser: resetting would destroy a working
+      # session and retrying has no time left. The session is left running; a
+      # later capture resets it once if it turns out to be stuck.
+      printf 'agent-screenshot.sh: %s did not finish within the %ss capture deadline; the machine is too busy, so the browser session was left running instead of being reset\n' \
+        "$timed_out_phase" "$CAPTURE_DEADLINE_SECONDS" >&2
+    elif [ "$SCREENSHOT_RECOVERY_COUNT" -eq 0 ]; then
       if [ "$CURRENT_PAGE" -eq 1 ]; then
         printf 'agent-screenshot.sh: %s timed out; cleaning up the isolated browser session\n' \
           "$timed_out_phase" >&2
@@ -94,6 +138,7 @@ die() {
         fi
         cleanup
         export MOBIUS_SCREENSHOT_RECOVERY_COUNT=1
+        export MOBIUS_SCREENSHOT_DEADLINE="$CAPTURE_DEADLINE"
         exec bash "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
       fi
       echo "agent-screenshot.sh: the isolated browser session could not be reset safely" >&2
@@ -116,36 +161,51 @@ die() {
 }
 
 browser_command() {
-  local timeout_seconds="$1"
+  # Runs one agent-browser command under the step ceiling or the remaining
+  # capture deadline, whichever is sooner (see CAPTURE_DEADLINE_SECONDS). A
+  # kill records the phase and which limit fired in BROWSER_TIMEOUT_FILE, since
+  # callers run this in subshells; die() reads it to choose the recovery.
   local status=0
-  shift
+  local remaining
+  local limit=step
+  local ceiling="$BROWSER_STEP_CEILING_SECONDS"
   if [ -n "$BROWSER_TIMEOUT_FILE" ] && [ -s "$BROWSER_TIMEOUT_FILE" ]; then
+    return 124
+  fi
+  remaining=$((CAPTURE_DEADLINE - EPOCHSECONDS))
+  if [ "$remaining" -lt "$ceiling" ]; then
+    limit=deadline
+    ceiling="$remaining"
+  fi
+  if [ "$ceiling" -le 0 ]; then
+    printf 'capture deadline reached before the next command\n' \
+      > "$BROWSER_ERROR_FILE"
+    printf '%s\n%s\n' "$BROWSER_PHASE" "$limit" > "$BROWSER_TIMEOUT_FILE"
     return 124
   fi
   : > "$BROWSER_ERROR_FILE"
   # The browser daemon outlives this process. Never let it inherit the capture
   # transaction's flock descriptor or every later capture would block behind a
   # lock whose owning helper already exited.
-  timeout --kill-after=2s "${timeout_seconds}s" agent-browser "$@" 9>&- \
+  timeout --kill-after=2s "${ceiling}s" agent-browser "$@" 9>&- \
     2>"$BROWSER_ERROR_FILE" || status=$?
   # GNU timeout reports 137 when the client ignores TERM and needs KILL.
-  # Treat either deadline outcome as a poisoned session, not a retryable error.
+  # Treat either outcome as a timeout, never as a retryable command error.
   [ "$status" -ne 137 ] || status=124
   if [ "$status" -eq 124 ] && [ ! -s "$BROWSER_ERROR_FILE" ]; then
-    printf 'command timed out after %ss\n' "$timeout_seconds" \
+    printf 'command timed out after %ss\n' "$ceiling" \
       > "$BROWSER_ERROR_FILE"
   fi
   if [ "$status" -eq 124 ] && [ -n "$BROWSER_TIMEOUT_FILE" ]; then
-    printf '%s\n' "$BROWSER_PHASE" > "$BROWSER_TIMEOUT_FILE"
+    printf '%s\n%s\n' "$BROWSER_PHASE" "$limit" > "$BROWSER_TIMEOUT_FILE"
   fi
   return "$status"
 }
 
 browser_wait() {
-  # agent-browser's DOM wait normally returns after its own 25s deadline. The
-  # outer bound is solely for a daemon already poisoned by an earlier caller;
-  # it converts that infrastructure hang into the same one-reset recovery path.
-  browser_command 30 wait "$@"
+  # agent-browser's DOM wait returns after its own action timeout, inside the
+  # step ceiling, so only a stuck daemon reaches the reset path.
+  browser_command wait "$@"
 }
 
 browser_eval_retry() {
@@ -153,7 +213,7 @@ browser_eval_retry() {
   local output=""
   local attempt
   for attempt in 1 2 3; do
-    if output="$(browser_command 5 eval "$expression")"; then
+    if output="$(browser_command eval "$expression")"; then
       printf '%s' "$output"
       return 0
     fi
@@ -190,7 +250,7 @@ browser_screenshot_retry() {
     if ! browser_ensure_fonts_ready; then
       continue
     fi
-    if browser_command 5 screenshot "$output_path" >/dev/null; then
+    if browser_command screenshot "$output_path" >/dev/null; then
       byte_count="$(wc -c < "$output_path" 2>/dev/null || printf '0')"
       if { [ "${CAPTURE_MIN_BYTES:-0}" -le 0 ] \
             || [ "${byte_count:-0}" -ge "${CAPTURE_MIN_BYTES}" ]; } \
@@ -239,16 +299,16 @@ browser_open_origin_retry() {
   local settled=""
   local attempt
   for attempt in 1 2 3 4 5; do
-    browser_command 5 open "$url" >/dev/null || true
+    browser_command open "$url" >/dev/null || true
     [ ! -s "$BROWSER_TIMEOUT_FILE" ] || return 1
     sleep 0.2
     current="$(
-      browser_command 5 get url || true
+      browser_command get url || true
     )"
     [ ! -s "$BROWSER_TIMEOUT_FILE" ] || return 1
     sleep 0.2
     confirmed="$(
-      browser_command 5 get url || true
+      browser_command get url || true
     )"
     [ ! -s "$BROWSER_TIMEOUT_FILE" ] || return 1
     if [ "$current" != "$confirmed" ]; then
@@ -264,7 +324,7 @@ browser_open_origin_retry() {
           esac
           sleep 0.2
           settled="$(
-            browser_command 5 get url || true
+            browser_command get url || true
           )"
           [ "$confirmed" = "$settled" ] && return 0
           ;;
@@ -290,16 +350,16 @@ browser_open_exact_retry() {
   local confirmed=""
   local attempt
   for attempt in 1 2 3 4 5; do
-    browser_command 5 open "$url" >/dev/null || true
+    browser_command open "$url" >/dev/null || true
     [ ! -s "$BROWSER_TIMEOUT_FILE" ] || return 1
     sleep 0.2
     current="$(
-      browser_command 5 get url || true
+      browser_command get url || true
     )"
     [ ! -s "$BROWSER_TIMEOUT_FILE" ] || return 1
     sleep 0.2
     confirmed="$(
-      browser_command 5 get url || true
+      browser_command get url || true
     )"
     [ ! -s "$BROWSER_TIMEOUT_FILE" ] || return 1
     [ "$current" = "$url" ] && [ "$confirmed" = "$url" ] && return 0
@@ -310,7 +370,7 @@ browser_open_exact_retry() {
 browser_set_viewport_retry() {
   local attempt
   for attempt in 1 2 3 4 5; do
-    if browser_command 5 set viewport "$VIEWPORT_WIDTH" "$VIEWPORT_HEIGHT" \
+    if browser_command set viewport "$VIEWPORT_WIDTH" "$VIEWPORT_HEIGHT" \
         "$VIEWPORT_PIXEL_RATIO" \
         >/dev/null; then
       return 0
@@ -408,6 +468,9 @@ recover_singleton_contention() {
     clear_stale_browser_profile_lock
     cleanup
     export MOBIUS_SCREENSHOT_RECOVERY_COUNT=1
+    # Like die()'s recovery, the fresh attempt keeps the original deadline so
+    # one capture can never outlive the screenshot tool's own limit.
+    export MOBIUS_SCREENSHOT_DEADLINE="$CAPTURE_DEADLINE"
     exec bash "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
   fi
   die "browser profile contention could not be reset safely"
@@ -566,7 +629,7 @@ trap cleanup EXIT
 if [ "$CURRENT_PAGE" -eq 0 ]; then
   # Start the browser, then wait narrowly for its command socket before applying
   # viewport state. A cold launch can return before that socket is connectable.
-  browser_command 5 open "${API_BASE_URL}/api/browser-bootstrap" >/dev/null || true
+  browser_command open "${API_BASE_URL}/api/browser-bootstrap" >/dev/null || true
   recover_singleton_contention
   if ! browser_set_viewport_retry; then
     recover_singleton_contention
@@ -622,7 +685,7 @@ print(
   + visual + reset + " return true })()"
 )
 ' \
-      | browser_command 5 eval --stdin >/dev/null; then
+      | browser_command eval --stdin >/dev/null; then
     TOKEN_READY=1
     break
   fi
