@@ -4530,6 +4530,30 @@ def test_cancelled_pending_cleanup_drains_worktree_removal_before_releasing_sour
   assert app.conflict_resolver_upstream_commit is None
 
 
+@pytest.mark.parametrize("candidate_package_id, matches", [
+  ("pkg-installed", True),
+  (None, False),
+  ("pkg-other", False),
+])
+def test_update_candidate_for_a_packaged_app_matches_only_its_package(
+  candidate_package_id, matches,
+):
+  """Update check must not offer what install refuses for a packaged row."""
+  from app.routes import apps as routes
+
+  url = "https://raw.githubusercontent.com/acme/packaged/main/mobius.json"
+  manifest = {"id": "packaged", "name": "Packaged", "version": "2.0.0"}
+  if candidate_package_id:
+    manifest["package_id"] = candidate_package_id
+  installed = install._canonical_identity_key(url, "packaged")
+
+  assert routes._update_candidate_matches_installed(
+    installed, url, manifest, "pkg-installed",
+  ) is matches
+  manifest.pop("package_id", None)
+  assert routes._update_candidate_matches_installed(installed, url, manifest, None)
+
+
 def test_conflict_resolver_batch_deduplicates_and_sorts_canonical_sources(
   db, tmp_path, monkeypatch,
 ):

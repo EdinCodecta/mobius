@@ -1379,13 +1379,14 @@ def _update_candidate_matches_installed(
 ) -> bool:
   """Accept the installed package identity or its reviewed predecessor.
 
-  A permanent `package_id` binds the package across manifest id renames, as
-  it does for install.
+  An installed permanent `package_id` is the whole identity, as it is for
+  install: it binds the package across manifest id renames, and install
+  refuses any candidate without it.
   """
   from app import install
 
-  if same_permanent_package(candidate_manifest, installed_package_id):
-    return True
+  if installed_package_id:
+    return same_permanent_package(candidate_manifest, installed_package_id)
 
   predecessor_source, _ = install._reviewed_predecessor_source(
     candidate_manifest, candidate_manifest_url,
