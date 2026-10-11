@@ -9,7 +9,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
@@ -997,9 +997,10 @@ def mark_chat_failure_seen(
   return Response(status_code=204)
 
 
-# Chats whose titles are searchable but whose message text is not yet: the
-# previous release wrote them and they are not converted. Additive to the
-# result list, which stays the response body.
+# Drawer chats whose titles are searchable but whose message text is not yet:
+# the previous release wrote them and they await conversion
+# (chat_search.unindexed_chat_count). Additive to the result list, which stays
+# the response body.
 SEARCH_UNINDEXED_HEADER = "X-Search-Unindexed-Chats"
 
 
@@ -1020,7 +1021,7 @@ def search_chats(
   mark matches with private-use sentinels U+E000/U+E001; the drawer converts
   them to highlight marks.
   """
-  response.headers[SEARCH_UNINDEXED_HEADER] = str(transcript_rows.unconverted_count(db))
+  response.headers[SEARCH_UNINDEXED_HEADER] = str(chat_search.unindexed_chat_count(db))
   query = q.strip()
   if not query:
     return []

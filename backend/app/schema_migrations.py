@@ -6321,6 +6321,9 @@ def _repair_transcript_derived_rows(eng) -> None:
         f"DELETE FROM {table} WHERE chat_id NOT IN (SELECT id FROM chats)"
       )
     conn.exec_driver_sql("DELETE FROM chat_search_entries WHERE seq = -1")
+    # 0087's own title rebuild, kept as a copy: the ledger hashes 0087's code
+    # and everything it references, so the two cannot share one definition.
+    # Rebuilding in this transaction keeps the DELETE and the INSERT atomic.
     conn.exec_driver_sql(
       "INSERT INTO chat_search_entries (chat_id, seq, text) "
       f"SELECT id, -1, trim(title, {whitespace}) FROM chats "

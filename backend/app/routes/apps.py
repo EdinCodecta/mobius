@@ -24,7 +24,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session, defer
 
 from app import chat_writer
-from app import transcript_rows
 from app import (
   activity, app_activity, app_apply, app_badge, app_capability_acceptance, app_cron,
   app_git, app_jobs, app_recency, chat_app_artifacts, chat_queue, drawer_pins, fs_locks,

@@ -16,10 +16,12 @@ import json
 import os
 import shlex
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch, AsyncMock, MagicMock
 from urllib.parse import urlparse
 
+import httpx
 import pytest
 
 from app import app_apply, app_git, install, models, transcript_rows
@@ -6310,6 +6312,151 @@ def test_package_identity_adopts_a_github_owner_transfer_by_repository_id(
   assert adopted.json()["id"] == app_id
   assert adopted.json()["slug"] == "social"
   assert adopted.json()["package_id"] == moved["package_id"]
+
+
+def _recording_async_client(responses: dict, requested: list[str]):
+  factory = _fake_async_client(responses)
+
+  def make(*args, **kwargs):
+    client = factory()
+    stream = client.stream
+
+    def recording_stream(method, url, **stream_kwargs):
+      requested.append(url)
+      return stream(method, url, **stream_kwargs)
+
+    client.stream = recording_stream
+    return client
+
+  return make
+
+
+@pytest.mark.parametrize("repo, repository_id", [
+  ("mobius-os/app-store", 1253755424),
+  ("mobius-os/app-social", 1354986466),
+  ("Mobius-OS/App-Store", 1253755424),
+])
+def test_trusted_catalog_package_identity_needs_no_github_api(
+  client, auth, db, bypass_url_validation, repo, repository_id,
+):
+  """First boot must not spend the anonymous API budget on its own catalog."""
+  base = f"https://raw.githubusercontent.com/{repo}/main/"
+  manifest = _simple_manifest("store")
+  manifest["package_id"] = "urn:uuid:cbcc33c4-6ff4-4bab-abe7-b9d9363ab72b"
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  requested: list[str] = []
+  with patch(
+    "app.install.httpx.AsyncClient",
+    side_effect=_recording_async_client(responses, requested),
+  ), patch("app.install._derive_repo_ref", return_value=None):
+    installed = client.post(
+      "/api/apps/install", headers=auth,
+      json={"manifest_url": base + "mobius.json"},
+    )
+
+  assert installed.status_code == 201, installed.text
+  assert not [url for url in requested if "api.github.com" in url]
+  row = db.get(models.App, installed.json()["id"])
+  assert row.source_identity == f"github:{repository_id}"
+
+
+def test_trusted_catalog_identity_is_read_before_any_request():
+  from app.install import _resolve_source_identity
+
+  def refuse(request: httpx.Request) -> httpx.Response:
+    raise AssertionError(f"unexpected request to {request.url}")
+
+  async def resolve():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(refuse)) as cli:
+      return await _resolve_source_identity(
+        cli,
+        "https://raw.githubusercontent.com/mobius-os/app-store/main/mobius.json",
+      )
+
+  assert asyncio.run(resolve()) == (
+    "github:1253755424",
+    "https://raw.githubusercontent.com/mobius-os/app-store/main/mobius.json",
+  )
+
+
+def test_other_repository_identity_still_asks_github_and_reports_its_limit(
+  client, auth, bypass_url_validation,
+):
+  base = "https://raw.githubusercontent.com/alice/app-notes/main/"
+  manifest = _simple_manifest("notes")
+  manifest["package_id"] = "urn:uuid:4c1f4a52-9d0b-5a57-9b5e-2a3a0e7f5b11"
+  reset = int(time.time()) + 600
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+    "https://api.github.com/repos/alice/app-notes": (
+      403, b"rate limited",
+      {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(reset)},
+    ),
+  }
+  requested: list[str] = []
+  with patch(
+    "app.install.httpx.AsyncClient",
+    side_effect=_recording_async_client(responses, requested),
+  ), patch("app.install._derive_repo_ref", return_value=None):
+    refused = client.post(
+      "/api/apps/install", headers=auth,
+      json={"manifest_url": base + "mobius.json"},
+    )
+
+  assert "https://api.github.com/repos/alice/app-notes" in requested
+  assert refused.status_code == 429, refused.text
+  assert "GitHub rate-limited" in refused.json()["detail"]
+  assert 590 <= int(refused.headers["retry-after"]) <= 600
+
+
+def test_store_installed_through_the_api_updates_without_handoff(
+  client, auth, db, bypass_url_validation,
+):
+  """Rows that stored the API-resolved id keep matching the table's id."""
+  base = "https://raw.githubusercontent.com/mobius-os/app-store/main/"
+  manifest = _simple_manifest("store")
+  manifest["package_id"] = "urn:uuid:cbcc33c4-6ff4-4bab-abe7-b9d9363ab72b"
+  first = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+    "https://api.github.com/repos/mobius-os/app-store": (
+      200, b'{"id":1253755424,"full_name":"mobius-os/app-store"}',
+    ),
+  }
+  with patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(first),
+  ), patch("app.install._derive_repo_ref", return_value=None), patch.dict(
+    "app.install._TRUSTED_CATALOG_REPOSITORY_IDS", clear=True,
+  ):
+    installed = client.post(
+      "/api/apps/install", headers=auth,
+      json={"manifest_url": base + "mobius.json"},
+    )
+  assert installed.status_code == 201, installed.text
+  assert db.get(
+    models.App, installed.json()["id"],
+  ).source_identity == "github:1253755424"
+
+  update = {**manifest, "version": "2.0.0"}
+  second = {
+    base + "mobius.json": (200, json.dumps(update).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  with patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(second),
+  ), patch("app.install._derive_repo_ref", return_value=None):
+    updated = client.post(
+      "/api/apps/install", headers=auth,
+      json={"manifest_url": base + "mobius.json"},
+    )
+
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["mode"] == "update"
+  assert updated.json()["id"] == installed.json()["id"]
 
 
 def test_package_identity_rejects_a_different_repository_without_old_source_handoff(

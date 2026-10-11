@@ -315,6 +315,13 @@ async def lifespan(app):
   record_memory_checkpoint("startup_frontend_watcher_started")
   if database_boot.serviceable:
     await supervisors.start_database_services()
+    # Like cron mutation and restoration, the retry never runs in the test
+    # runtime, where it would reach other tests' HTTP doubles.
+    if (
+      startup_context.bootstrap_retry is not None
+      and os.environ.get("MOBIUS_TEST_RUNTIME") != "1"
+    ):
+      supervisors.retry_bootstrap_apps(startup_context.bootstrap_retry)
     from app.saved_secure_inputs import recover_interrupted
     await recover_interrupted()
     from app.startup import _capture_platform_activation_snapshot

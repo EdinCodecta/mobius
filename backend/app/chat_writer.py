@@ -62,7 +62,6 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app import chat_archive, models, schemas, transcript_rows
 from app.goals import admit_goal
-from app.chat_message_identity import assistant_message_index
 from app.chat_titles import apply_generated_title, first_message_title
 from app.json_safety import json_safe
 from app.upload_lifecycle import claim_uploads, release_uploads
@@ -3666,7 +3665,6 @@ class ChatWriterActor:
     def settle_activation_card() -> None:
       if activation_wait is None:
         return
-      from sqlalchemy.orm.attributes import flag_modified
       messages = transcript_rows.reverse_iter(db, chat)
       found = False
       for seq, original in messages:

@@ -24,7 +24,7 @@ from sqlalchemy import (
 )
 
 from sqlalchemy.types import TypeDecorator
-from sqlalchemy.orm import column_property, deferred, relationship, validates
+from sqlalchemy.orm import column_property, deferred, relationship
 
 from app.database import Base
 from app.shell_install_pass import ShellInstallPassGrant

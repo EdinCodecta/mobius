@@ -13,11 +13,14 @@ import logging
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, Protocol
+from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
 
 from app.database import SessionLocal
 from app.memory_observability import record_memory_checkpoint
 from app.storage_io import atomic_write
+
+if TYPE_CHECKING:
+  from app.bootstrap import BootstrapOutcome
 
 
 class StartupState(Protocol):
@@ -74,6 +77,8 @@ class StartupContext:
   # regression) — assertable by a contract test and visible to diagnostics,
   # instead of vanishing into a single ERROR log line.
   failed_tasks: list[str] = field(default_factory=list)
+  # Default apps that failed only transiently, retried once serving.
+  bootstrap_retry: BootstrapOutcome | None = None
 
 
 TaskAction = Callable[[StartupContext], object | Awaitable[object]]
@@ -604,9 +609,10 @@ async def _install_bootstrap_apps(context: StartupContext) -> None:
   from app.bootstrap import ensure_bootstrap_apps_installed
 
   with SessionLocal() as db:
-    await ensure_bootstrap_apps_installed(db)
-
-
+    outcome = await ensure_bootstrap_apps_installed(db)
+  # A rate limit or slow transfer must not leave the instance without its
+  # default apps until the next restart: the runtime supervisors retry them.
+  context.bootstrap_retry = outcome if outcome.pending else None
 
 
 def _reconcile_app_cron(context: StartupContext) -> None:

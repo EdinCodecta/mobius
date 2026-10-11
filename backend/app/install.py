@@ -35,6 +35,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -801,7 +802,7 @@ async def _http_get(
         if r.status_code == 404:
           raise HTTPException(404, f"Not found: {url}")
         if _is_rate_limited(url, r.status_code, r.headers):
-          raise HTTPException(429, _rate_limit_detail(url, r.headers))
+          raise _rate_limit_error(url, r.headers)
         if r.status_code >= 400:
           raise HTTPException(
             502, f"Upstream {r.status_code} fetching {url}",
@@ -885,6 +886,30 @@ async def _resolve_source_identity(
     return f"url:{digest}", source_url
 
   owner, repo = repository
+  repository_id = _TRUSTED_CATALOG_REPOSITORY_IDS.get(repository)
+  if repository_id is not None:
+    canonical_owner, canonical_repo = repository
+  else:
+    repository_id, canonical_owner, canonical_repo = (
+      await _fetch_github_repository(client, owner, repo)
+    )
+
+  parsed = urlparse(source_url)
+  parts = [part for part in parsed.path.split("/") if part]
+  if len(parts) < 3:
+    raise HTTPException(400, "GitHub package source is not a root manifest.")
+  parts[0] = canonical_owner
+  parts[1] = canonical_repo
+  trailing_slash = parsed.path.endswith("/")
+  canonical_path = "/" + "/".join(parts) + ("/" if trailing_slash else "")
+  canonical_url = parsed._replace(path=canonical_path).geturl()
+  return f"github:{repository_id}", canonical_url
+
+
+async def _fetch_github_repository(
+  client: httpx.AsyncClient, owner: str, repo: str,
+) -> tuple[int, str, str]:
+  """Return GitHub's numeric id and canonical owner/name for one repository."""
   api_url = f"https://api.github.com/repos/{owner}/{repo}"
   try:
     raw = await _http_get(client, api_url, 256 * 1024)
@@ -903,17 +928,7 @@ async def _resolve_source_identity(
   canonical_owner, canonical_repo = full_name.split("/", 1)
   if not canonical_owner or not canonical_repo:
     raise HTTPException(502, "GitHub returned incomplete repository metadata.")
-
-  parsed = urlparse(source_url)
-  parts = [part for part in parsed.path.split("/") if part]
-  if len(parts) < 3:
-    raise HTTPException(400, "GitHub package source is not a root manifest.")
-  parts[0] = canonical_owner
-  parts[1] = canonical_repo
-  trailing_slash = parsed.path.endswith("/")
-  canonical_path = "/" + "/".join(parts) + ("/" if trailing_slash else "")
-  canonical_url = parsed._replace(path=canonical_path).geturl()
-  return f"github:{repository_id}", canonical_url
+  return repository_id, canonical_owner, canonical_repo
 
 
 def _header(headers, name: str) -> str | None:
@@ -935,6 +950,17 @@ _GITHUB_RATE_LIMIT_HOSTS = frozenset((
   "github.com", "api.github.com", "raw.githubusercontent.com",
 ))
 
+# GitHub's permanent ids for the platform's own catalog repositories whose
+# packages declare `package_id`. The `mobius-os` organization is already the
+# trust root for these sources, so their identity needs no anonymous API call,
+# which shared egress addresses often have exhausted on first boot. Any other
+# repository is still resolved through the API. `tests/test_bootstrap_live.py`
+# checks every live default app against this table.
+_TRUSTED_CATALOG_REPOSITORY_IDS = {
+  ("mobius-os", "app-store"): 1253755424,
+  ("mobius-os", "app-social"): 1354986466,
+}
+
 
 def _is_rate_limited(url: str, status_code: int, headers) -> bool:
   """True for 429, and for the 403 GitHub uses for its rate limits.
@@ -953,26 +979,38 @@ def _is_rate_limited(url: str, status_code: int, headers) -> bool:
   )
 
 
-def _rate_limit_detail(url: str, headers) -> str:
-  host = urlparse(url).hostname or "upstream"
-  service = "GitHub" if host in _GITHUB_RATE_LIMIT_HOSTS else host
-  detail = f"{service} rate-limited this app request."
+def _rate_limit_wait_seconds(headers) -> int | None:
+  """Seconds the upstream asked us to wait, from retry-after or its reset."""
   retry_after = _header(headers, "retry-after")
   if retry_after:
     try:
       seconds = int(float(retry_after))
       if seconds > 0:
-        return f"{detail} Try again in {_wait_label(seconds)}."
+        return seconds
     except ValueError:
       pass
   reset = _header(headers, "x-ratelimit-reset")
   if reset:
     try:
-      reset_at = datetime.fromtimestamp(int(reset), UTC)
-      return f"{detail} Try again after {reset_at.isoformat(timespec='minutes')}."
-    except (ValueError, OSError):
+      return max(1, int(reset) - int(time.time()))
+    except ValueError:
       pass
-  return f"{detail} Please wait a minute and try again."
+  return None
+
+
+def _rate_limit_error(url: str, headers) -> HTTPException:
+  """The 429 for a rate-limited fetch, carrying the wait as Retry-After."""
+  host = urlparse(url).hostname or "upstream"
+  service = "GitHub" if host in _GITHUB_RATE_LIMIT_HOSTS else host
+  detail = f"{service} rate-limited this app request."
+  wait = _rate_limit_wait_seconds(headers)
+  if wait is None:
+    return HTTPException(429, f"{detail} Please wait a minute and try again.")
+  return HTTPException(
+    429,
+    f"{detail} Try again in {_wait_label(wait)}.",
+    headers={"Retry-After": str(wait)},
+  )
 
 
 def _seed_value_is_inline(value) -> bool:
