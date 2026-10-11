@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, jsonOrThrow } from '../../../api/client.js'
 import { getOnlineSnapshot } from '../../../lib/connectivityStore.js'
-import { compactFailureInput } from '../slashCommands.js'
+import { isOwnerWorkspace } from '../../../lib/workspaceStorage.js'
+import { composerDraftRevision } from '../composerDraft.js'
 import { sendFailureMessage } from '../sendFailure.js'
 import { isProviderSwitchBlocking } from '../providerSwitch.js'
 
@@ -102,6 +103,17 @@ export default function useCompactCommands({
   // the visible transcript is untouched and the platform renders the stored
   // compaction as its own "Context compacted" card. A card action passes no
   // submitted input, so the owner's unrelated draft is left untouched.
+  //
+  // A submitted command stays in its chat's draft until a finished compaction
+  // is acknowledged, so rejection, transport failure, Pause, or leaving the
+  // chat never has to put it back: every pane of the chat already reads it.
+  // Only the submitting pane, still showing its chat in the owner workspace
+  // it submitted from, clears it, and only while the draft revision and text
+  // are unchanged; any later edit (text, an emptied draft, or uploads) is
+  // newer input. Otherwise the command deliberately stays as an editable
+  // draft, saved and visible alike, and is never sent again on its own. Guest
+  // drafts carry no revision, so an upload-only edit or a same-text cycle
+  // would be invisible to the fence: they never auto-clear.
   async function runCompactCommand(instructions = '', submittedInput = '/compact', recoveryId = null) {
     if (!activationSettledRef.current) return
     if (!chatId || provisionalNewChat) {
@@ -112,13 +124,14 @@ export default function useCompactCommands({
     if (isProviderSwitchBlocking(chatId)) return
     const actionKey = `compact:${chatId}`
     if (!claimAction(actionKey)) return
-    if (submittedInput !== null) setComposerInput('')
+    const ownerDraft = submittedInput !== null && isOwnerWorkspace()
+      ? { text: inputValueRef.current, revision: composerDraftRevision(chatId) }
+      : null
     setSendFailure(null)
     const targetChatId = chatId
     const lifecycle = compactActionLifecycleRef.current
     const stillVisible = () => lifecycle?.active && activeCompactChatRef.current === targetChatId
     cancelCompactProgress()
-    let completed = false
     try {
       const result = await jsonOrThrow(await api.chats.compact(targetChatId, {
         ...(instructions ? { instructions } : {}),
@@ -132,16 +145,13 @@ export default function useCompactCommands({
         setCompactProgressRecord({ chatId: targetChatId, progress: result.progress || null })
       }
       if (result.ok) {
-        completed = true
+        if (ownerDraft && stillVisible() && isOwnerWorkspace()
+          && composerDraftRevision(targetChatId) === ownerDraft.revision
+          && inputValueRef.current === ownerDraft.text) setComposerInput('')
         if (stillVisible()) await fetchMessages({ force: true })
       }
     } catch (err) {
-      if (stillVisible()) {
-        if (!completed && submittedInput !== null) {
-          setComposerInput(compactFailureInput(inputValueRef.current, submittedInput))
-        }
-        setSendFailure(sendFailureMessage(err, { online: getOnlineSnapshot() }))
-      }
+      if (stillVisible()) setSendFailure(sendFailureMessage(err, { online: getOnlineSnapshot() }))
     } finally {
       // Status readback is optional: it must never own the action latch.
       releaseAction(actionKey)

@@ -2,7 +2,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { api } from '../../../../api/client.js'
+import { persistComposerDraft, readComposerDraft } from '../../composerDraft.js'
 import useCompactCommands from '../useCompactCommands.js'
+import useComposerDraftState from '../useComposerDraftState.js'
+import { setActiveSharedBrowserGrantId } from '../../../../lib/sharedBrowserWorkspace.js'
 import { renderHook } from './react-hook-shim.mjs'
 
 const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve() }
@@ -13,8 +16,8 @@ const deferred = () => {
   return { promise, resolve, reject }
 }
 
-function setup(t, overrides = {}) {
-  const reads = [], posts = [], stops = [], drafts = [], failures = [], messages = [], turnStops = []
+function installApi(t) {
+  const reads = [], posts = [], stops = []
   for (const name of ['compact', 'compactStop', 'compactProgress']) {
     const original = api.chats[name]
     t.after(() => { api.chats[name] = original })
@@ -34,6 +37,12 @@ function setup(t, overrides = {}) {
     stops.push({ chatId, ...pending })
     return pending.promise
   }
+  return { reads, posts, stops }
+}
+
+function setup(t, overrides = {}) {
+  const { reads, posts, stops } = installApi(t)
+  const drafts = [], failures = [], messages = [], turnStops = []
   const props = {
     chatId: 'a', provisionalNewChat: false, hidden: false, serverCompactingKind: null,
     activationSettledRef: { current: true }, inputValueRef: { current: '' },
@@ -93,7 +102,7 @@ test('Pause POST releases its admission latch independently of deferred and fail
   await third
 })
 
-test('failed compact restores the submitted slash command without losing a newer draft or recovery handle', async t => {
+test('failed compact leaves the draft to its owner, reports the failure, and keeps the recovery handle', async t => {
   const { hook, props, reads, posts, drafts, failures } = setup(t)
   reads[0].resolve(response({ progress: { state: 'paused', recovery_id: 'saved' } }))
   await flush()
@@ -102,20 +111,21 @@ test('failed compact restores the submitted slash command without losing a newer
   posts[0].reject(new Error('POST failed'))
   await action
   assert.equal(hook.result.current.preparing, false)
-  assert.equal(drafts.at(-1), 'new owner draft', 'restoration does not overwrite newer input')
+  assert.deepEqual(drafts, [], 'neither the command nor the newer draft is rewritten')
   assert.match(failures.at(-1), /couldn’t send/)
   reads[1].reject(new Error('GET failed'))
   await flush()
   assert.equal(hook.result.current.compactionProgress.recovery_id, 'saved')
 })
 
-test('failed compaction restores a literal draft through the persistence owner', async t => {
-  const { hook, posts, drafts } = setup(t)
+test('a submitted command is never cleared before the server acknowledges it', async t => {
   const submitted = '/compact Preserve key decisions'
+  const { hook, posts, drafts } = setup(t, { inputValueRef: { current: submitted } })
   const action = hook.result.current.runCompactCommand('Preserve key decisions', submitted)
+  assert.deepEqual(drafts, [], 'the composer keeps the command while the POST is pending')
   posts[0].reject(new Error('POST failed'))
   await action
-  assert.deepEqual(drafts, ['', submitted], 'restoration passes the literal draft, not a state updater')
+  assert.deepEqual(drafts, [], 'a failure has nothing to put back')
   assert.equal(hook.result.current.preparing, false)
 })
 
@@ -130,7 +140,7 @@ test('chat switch cancels status GET and fences late GET/POST errors, draft rest
   await action
   await flush()
   assert.equal(hook.result.current.compactionProgress.recovery_id, 'new')
-  assert.deepEqual(drafts, [''])
+  assert.deepEqual(drafts, [])
   assert.deepEqual(failures, [null])
   assert.deepEqual(messages, [])
   assert.equal(reads.length, 2, 'old action finally cannot read either chat again')
@@ -222,7 +232,7 @@ test('a POST from a departed chat activation cannot overwrite a later activation
   await action
   assert.equal(hook.result.current.compactionProgress.recovery_id, 'current')
   assert.equal(reads.length, 3)
-  assert.deepEqual(drafts, [''])
+  assert.deepEqual(drafts, [], 'a departed activation calls no pane setter')
   assert.deepEqual(failures, [null])
   assert.deepEqual(messages, [])
 })
@@ -417,4 +427,353 @@ test('B completes in its own activation while A stays pending, and unmount fence
   await flush()
   assert.equal(reads.length, readsBeforeUnmount, 'unmounted A cannot resurrect a GET')
   assert.deepEqual(failures, [null, null], 'late A failure is not reported')
+})
+
+
+// A submitted command stays in its chat's draft. Only the submitting owner
+// pane, still showing its chat, clears it once a finished compaction is
+// acknowledged and the draft is unchanged; everywhere else it stays editable.
+// Each chat id below is unique because the draft store is module state shared
+// by every test in this file.
+const rejections = {
+  'HTTP 409': post => post.resolve(Response.json({ detail: 'Not admissible now' }, { status: 409 })),
+  'HTTP 422': post => post.resolve(Response.json({ detail: 'Invalid instructions' }, { status: 422 })),
+  'transport failure': post => post.reject(new TypeError('Failed to fetch')),
+}
+const completed = post => post.resolve(Response.json({ ok: true, progress: null }))
+const attachment = { name: 'plan.pdf', size: 12, mime_type: 'application/pdf', status: 'done' }
+const fileNames = files => files.map(file => file.name)
+
+// Mirrors the composer owner's setter: bound to one chat, persisting before state.
+function boundDraft(chatId, writes) {
+  return {
+    chatId,
+    setComposerInput: text => {
+      writes.push([chatId, text])
+      persistComposerDraft(chatId, text, readComposerDraft(chatId).attachments)
+    },
+  }
+}
+
+for (const [name, fail] of Object.entries(rejections)) {
+  test(`A to B to A: after a ${name} the custom command is still A's draft, with no retired callback`, async t => {
+    const chatA = `retire-a-${name}`, chatB = `retire-b-${name}`
+    const submitted = '/compact Preserve the exact owner constraint'
+    const writes = []
+    persistComposerDraft(chatA, submitted)
+    persistComposerDraft(chatB, 'B owner draft')
+    const { hook, props, posts, failures } = setup(t, {
+      ...boundDraft(chatA, writes), inputValueRef: { current: submitted },
+    })
+    const action = hook.result.current.runCompactCommand('Preserve the exact owner constraint', submitted)
+    hook.rerender({ ...props, ...boundDraft(chatB, writes) })
+    hook.rerender(props)
+    fail(posts[0])
+    await action
+    assert.equal(readComposerDraft(chatA).input, submitted, 'the rejected command is never lost')
+    assert.equal(readComposerDraft(chatB).input, 'B owner draft', 'nothing crosses into chat B')
+    assert.deepEqual(writes, [], 'no pane setter runs, before or after the POST')
+    assert.deepEqual(failures, [null], 'the retired activation reports nothing to the current pane')
+  })
+}
+
+// A real pane: the composer owner and the compaction hook, keyed by chat as
+// ChatView is, so leaving a chat unmounts both and reopening mounts fresh ones.
+function usePane(props) {
+  const draft = useComposerDraftState({ chatId: props.chatId, hidden: props.hidden, inputRef: { current: null } })
+  const compact = useCompactCommands({
+    ...props,
+    inputValueRef: draft.inputValueRef,
+    setComposerInput: draft.setComposerInput,
+    setSendFailure: draft.setSendFailure,
+  })
+  return { draft, compact }
+}
+
+function mountPane(t, chatId, overrides = {}) {
+  const props = {
+    chatId, provisionalNewChat: false, hidden: false, serverCompactingKind: null,
+    activationSettledRef: { current: true }, fetchMessages: async () => {}, stopTurn: () => {},
+    ...overrides,
+  }
+  const pane = renderHook(usePane, props)
+  t.after(() => pane.unmount())
+  return { pane, props }
+}
+
+// The owner types a custom command into a composer holding one upload and
+// submits it the way ChatView does.
+function submitFromPane(pane, chatId, submitted) {
+  pane.result.current.draft.handleComposerInputChange(submitted)
+  const action = pane.result.current.compact.runCompactCommand(submitted.slice('/compact '.length), submitted)
+  assert.equal(pane.result.current.draft.input, submitted, 'the pending command stays in the composer')
+  assert.equal(readComposerDraft(chatId).input, submitted)
+  return action
+}
+
+function view(pane) {
+  const { input, pendingFiles, sendFailure } = pane.result.current.draft
+  return { input, files: fileNames(pendingFiles), sendFailure }
+}
+
+for (const [name, fail] of Object.entries(rejections)) {
+  test(`a pane reopened before a ${name} already shows the original command and upload`, async t => {
+    const chatId = `reopened-${name}`
+    const submitted = '/compact Keep the migration plan'
+    const { posts } = installApi(t)
+    persistComposerDraft(chatId, '', [attachment])
+    const { pane } = mountPane(t, chatId)
+    const action = submitFromPane(pane, chatId, submitted)
+    pane.unmount()
+    const { pane: reopened } = mountPane(t, chatId, { serverCompactingKind: 'compact' })
+    assert.deepEqual(view(reopened), { input: submitted, files: ['plan.pdf'], sendFailure: null })
+    fail(posts[0])
+    await action
+    assert.deepEqual(view(reopened), { input: submitted, files: ['plan.pdf'], sendFailure: null },
+      'no visibility toggle or durable re-read is needed, and no retired error appears')
+    assert.equal(readComposerDraft(chatId).input, submitted)
+  })
+}
+
+test('an edit in the reopened pane is made against the visible original, so it cannot destroy it unknowingly', async t => {
+  const chatId = 'reopened-edit'
+  const { posts } = installApi(t)
+  const { pane } = mountPane(t, chatId)
+  const action = submitFromPane(pane, chatId, '/compact Keep owners')
+  pane.unmount()
+  const { pane: reopened } = mountPane(t, chatId)
+  reopened.result.current.draft.handleComposerInputChange('/compact Keep owners and tests')
+  posts[0].reject(new TypeError('Failed to fetch'))
+  await action
+  assert.equal(view(reopened).input, '/compact Keep owners and tests')
+  assert.equal(readComposerDraft(chatId).input, '/compact Keep owners and tests')
+})
+
+test('unmount then reopen after a failure: the next pane starts with the command and upload', async t => {
+  const chatId = 'reopened-after'
+  const { posts } = installApi(t)
+  persistComposerDraft(chatId, '', [attachment])
+  const { pane } = mountPane(t, chatId)
+  const action = submitFromPane(pane, chatId, '/compact Keep both')
+  pane.unmount()
+  posts[0].resolve(Response.json({ detail: 'Not admissible now' }, { status: 409 }))
+  await action
+  const { pane: reopened } = mountPane(t, chatId)
+  assert.deepEqual(view(reopened), { input: '/compact Keep both', files: ['plan.pdf'], sendFailure: null })
+})
+
+test('a failure in the pane that still shows the chat reports it and keeps the command', async t => {
+  const chatId = 'visible-failure'
+  const { posts } = installApi(t)
+  const { pane, props } = mountPane(t, chatId)
+  const action = submitFromPane(pane, chatId, '/compact Keep visible')
+  pane.rerender({ ...props, hidden: true })
+  posts[0].resolve(Response.json({ detail: 'Not admissible now' }, { status: 409 }))
+  await action
+  assert.equal(view(pane).input, '/compact Keep visible')
+  assert.match(view(pane).sendFailure, /couldn’t send/)
+})
+
+test('a paused partial batch keeps the command; Continue never touches the draft', async t => {
+  const chatId = 'paused-batch'
+  const { posts } = installApi(t)
+  const { pane } = mountPane(t, chatId)
+  const action = submitFromPane(pane, chatId, '/compact Keep paused')
+  posts[0].resolve(Response.json({ ok: false, progress: { state: 'paused', recovery_id: 'r-1' } }))
+  await action
+  assert.equal(view(pane).input, '/compact Keep paused')
+  assert.equal(pane.result.current.compact.compactionProgress.recovery_id, 'r-1')
+  pane.result.current.compact.continueCompaction()
+  completed(posts[1])
+  await flush()
+  assert.equal(posts[1].body.recovery_id, 'r-1')
+  assert.equal(view(pane).input, '/compact Keep paused', 'a card action has no draft effect')
+})
+
+test('the live submitting owner pane clears exactly the acknowledged command and keeps uploads', async t => {
+  const chatId = 'visible-success'
+  const { posts } = installApi(t)
+  persistComposerDraft(chatId, '', [attachment])
+  const { pane } = mountPane(t, chatId)
+  const action = submitFromPane(pane, chatId, '/compact Done here')
+  completed(posts[0])
+  await action
+  assert.deepEqual(view(pane), { input: '', files: ['plan.pdf'], sendFailure: null })
+  assert.deepEqual(readComposerDraft(chatId), { input: '', attachments: [attachment] })
+})
+
+const newerEdits = {
+  'text': draft => draft.handleComposerInputChange('newer owner text'),
+  'deliberately emptied draft': draft => draft.handleComposerInputChange(''),
+  'removed upload': draft => draft.restoreFiles([]),
+  'added upload': draft => draft.restoreFiles([attachment, { ...attachment, name: 'notes.md' }]),
+}
+
+for (const [name, edit] of Object.entries(newerEdits)) {
+  test(`a newer ${name} wins over a finished compaction in the same pane`, async t => {
+    const chatId = `fence-live-${name}`
+    const { posts } = installApi(t)
+    persistComposerDraft(chatId, '', [attachment])
+    const { pane } = mountPane(t, chatId)
+    const action = submitFromPane(pane, chatId, '/compact Old command')
+    edit(pane.result.current.draft)
+    const newer = view(pane)
+    completed(posts[0])
+    await action
+    assert.deepEqual(view(pane), newer)
+    assert.equal(readComposerDraft(chatId).input, newer.input)
+  })
+}
+
+test('a pane reopened before success keeps the command editable, saved and visible alike, with no replay', async t => {
+  const chatId = 'reopened-before-success'
+  const { posts } = installApi(t)
+  persistComposerDraft(chatId, '', [attachment])
+  const { pane } = mountPane(t, chatId)
+  const action = submitFromPane(pane, chatId, '/compact Keep both views')
+  pane.unmount()
+  const { pane: reopened } = mountPane(t, chatId)
+  completed(posts[0])
+  await action
+  await flush()
+  const saved = readComposerDraft(chatId)
+  const expected = { input: '/compact Keep both views', files: ['plan.pdf'], sendFailure: null }
+  assert.deepEqual(view(reopened), expected)
+  assert.deepEqual({ input: saved.input, files: fileNames(saved.attachments), sendFailure: null }, expected)
+  assert.equal(posts.length, 1, 'the retained command is never sent again on its own')
+})
+
+test('success after retirement retains the command through a later reopen', async t => {
+  const chatId = 'retired-success'
+  const { posts } = installApi(t)
+  persistComposerDraft(chatId, '', [attachment])
+  const { pane } = mountPane(t, chatId)
+  const action = submitFromPane(pane, chatId, '/compact Finished')
+  pane.unmount()
+  completed(posts[0])
+  await action
+  const { pane: reopened } = mountPane(t, chatId)
+  await flush()
+  assert.deepEqual(view(reopened), { input: '/compact Finished', files: ['plan.pdf'], sendFailure: null })
+  assert.equal(posts.length, 1)
+})
+
+test('A to B to A: success after the activation retired runs no setter and keeps the command', async t => {
+  const chatA = 'retire-success-a', chatB = 'retire-success-b'
+  const submitted = '/compact Keep it'
+  const writes = []
+  persistComposerDraft(chatA, submitted)
+  const { hook, props, posts } = setup(t, {
+    ...boundDraft(chatA, writes), inputValueRef: { current: submitted },
+  })
+  const action = hook.result.current.runCompactCommand('Keep it', submitted)
+  hook.rerender({ ...props, ...boundDraft(chatB, writes) })
+  hook.rerender(props)
+  completed(posts[0])
+  await action
+  assert.deepEqual(writes, [])
+  assert.equal(readComposerDraft(chatA).input, submitted)
+  assert.equal(readComposerDraft(chatB).input, '')
+})
+
+test('card actions leave an unrelated draft alone through success and failure, even when retired', async t => {
+  const chatId = 'card-actions'
+  const { posts } = installApi(t)
+  persistComposerDraft(chatId, 'unrelated owner draft')
+  const { pane } = mountPane(t, chatId)
+  const start = pane.result.current.compact.runCompactCommand('', null)
+  completed(posts[0])
+  await start
+  const resume = pane.result.current.compact.runCompactCommand('', null, 'recovery-x')
+  pane.unmount()
+  posts[1].reject(new TypeError('Failed to fetch'))
+  await resume
+  assert.equal(readComposerDraft(chatId).input, 'unrelated owner draft')
+})
+
+// Guest drafts live in grant tab storage and carry no revision, so a
+// finished compaction never clears one: an upload-only edit or a same-text
+// cycle would look unchanged. The owner workspace a command was submitted from
+// must also still be current. Each guest mount settles first: a guest pane's
+// async hydration has no revision to defer to a same-tick edit.
+function workspaces(t) {
+  const previous = { location: globalThis.location, sessionStorage: globalThis.sessionStorage }
+  const values = new Map()
+  globalThis.sessionStorage = {
+    get length() { return values.size },
+    key: index => [...values.keys()][index] ?? null,
+    getItem: key => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: key => values.delete(key),
+  }
+  t.after(() => {
+    setActiveSharedBrowserGrantId(null)
+    Object.assign(globalThis, previous)
+  })
+  return {
+    owner: () => { globalThis.location = { pathname: '/shell/' } },
+    guest: () => {
+      globalThis.location = { pathname: '/shell/shared' }
+      setActiveSharedBrowserGrantId('guest-grant')
+    },
+  }
+}
+
+const guestCases = {
+  'an unchanged guest command': {},
+  'an upload-only guest edit': { attach: true, edit: draft => draft.restoreFiles([]) },
+  'a same-text guest cycle': {
+    edit: draft => {
+      draft.handleComposerInputChange('something else')
+      draft.handleComposerInputChange('/compact Guest command')
+    },
+  },
+  'an owner command acknowledged in a guest workspace': { submitAs: 'owner' },
+  'a guest command acknowledged in the owner workspace': { ackAs: 'owner' },
+}
+
+for (const [name, { attach, edit, submitAs = 'guest', ackAs = 'guest' }] of Object.entries(guestCases)) {
+  test(`${name} stays after a finished compaction`, async t => {
+    const chatId = `workspace-${name}`
+    const space = workspaces(t)
+    space[submitAs]()
+    const { posts } = installApi(t)
+    if (attach) persistComposerDraft(chatId, '', [attachment])
+    const { pane } = mountPane(t, chatId)
+    await flush()
+    const action = submitFromPane(pane, chatId, '/compact Guest command')
+    edit?.(pane.result.current.draft)
+    const before = view(pane)
+    space[ackAs]()
+    completed(posts[0])
+    await action
+    assert.deepEqual(view(pane), before)
+    assert.equal(view(pane).input, '/compact Guest command')
+  })
+}
+
+test('an owner draft replaced without a revision, as durable hydration does, is not cleared', async t => {
+  const inputValueRef = { current: '/compact Submitted' }
+  const { hook, posts, drafts } = setup(t, { chatId: 'hydrated-text', inputValueRef })
+  const action = hook.result.current.runCompactCommand('Submitted', '/compact Submitted')
+  inputValueRef.current = 'hydrated newer durable draft'
+  completed(posts[0])
+  await action
+  assert.deepEqual(drafts, [])
+})
+
+test('an owner command restored from tab storage and sent unedited stays when acknowledged as a guest', async t => {
+  const chatId = 'workspace-unedited-owner'
+  const space = workspaces(t)
+  space.owner()
+  globalThis.sessionStorage.setItem(`draft:${chatId}`, '/compact Restored')
+  const { posts } = installApi(t)
+  const { pane } = mountPane(t, chatId)
+  await flush()
+  assert.equal(view(pane).input, '/compact Restored', 'an unedited restored draft has revision 0')
+  const action = pane.result.current.compact.runCompactCommand('Restored', '/compact Restored')
+  space.guest()
+  completed(posts[0])
+  await action
+  assert.equal(view(pane).input, '/compact Restored', 'the guest partition is never written')
 })
