@@ -1190,6 +1190,7 @@ def test_background_helper_projection_owns_waiting_until_parent_wake(
     "items": [{
       "id": delegation_id,
       "task_key": "task-waiting-owner",
+      "title": "task-waiting-owner",
       "provider": "claude",
       "status": "running",
     }],
@@ -3606,6 +3607,43 @@ def test_same_task_key_can_be_reused_by_a_new_goal_on_one_physical_run(db, chat)
   assert delegations_mod.parent_wake_blocker(
     db, chat.id, "goal-A", "one-run",
   )[0] == "goal_closed"
+
+
+def test_goal_helper_result_uses_current_attempt_and_attaches_earlier_helpers(db, chat):
+  from app import delegations as delegations_mod
+  from app.run_state import queued_continuation_root
+
+  db.add(make_goal_run(db, id="attempt-r1", root_run_id="attempt-r1",
+    chat_id=chat.id, status="completed", provider="codex", goal_id="goal-shared",
+    started_at=datetime(2026, 1, 1)))
+  db.commit()
+  base = dict(app_id=None, parent_chat_id=chat.id, goal_id="goal-shared",
+    prompt="Do the task", provider="codex", model=None, effort=None, cwd="/data")
+  d1, attached = create_or_attach_delegation(db, DelegationIntent(
+    **base, parent_root_run_id="attempt-r1", task_key="d1"))
+  assert not attached
+  db.add(make_goal_run(db, id="attempt-r2", root_run_id="attempt-r2",
+    chat_id=chat.id, status="running", provider="codex", goal_id="goal-shared",
+    started_at=datetime(2026, 1, 2)))
+  db.commit()
+  d2, attached = create_or_attach_delegation(db, DelegationIntent(
+    **base, parent_root_run_id="attempt-r2", task_key="d2"))
+  assert not attached
+  db.commit()
+
+  assert delegations_mod._parent_wake_continuation_root(
+    db, chat.id, "goal-shared") == "attempt-r2"
+  assert queued_continuation_root(db, chat.id, {
+    "kind": "delegation_result", "source_work_id": "goal-shared",
+  }) == "attempt-r2"
+  assert {item["id"] for item in own_helper_statuses(
+    db, chat.id, "attempt-r2")} == {d1.id, d2.id}
+  again, attached = create_or_attach_delegation(db, DelegationIntent(
+    **base, parent_root_run_id="attempt-r2", task_key="d2"))
+  assert attached and again.id == d2.id
+  earlier, attached = create_or_attach_delegation(db, DelegationIntent(
+    **base, parent_root_run_id="attempt-r2", task_key="d1"))
+  assert attached and earlier.id == d1.id
 
 
 def test_legacy_goal_root_resolves_its_completion_run_after_rebind(db):

@@ -140,6 +140,8 @@ def same_delegation_intent(
     row.app_id == intent.app_id,
     row.parent_chat_id == intent.parent_chat_id,
     (row.parent_root_run_id == intent.parent_root_run_id or
+     (intent.goal_id is not None and row.goal_id == intent.goal_id
+      and intent.source_work_id is None) or
      (row.goal_id is None and row.parent_root_run_id == intent.goal_id)),
     (row.goal_id == intent.goal_id or
      (row.goal_id is None and row.parent_root_run_id == intent.goal_id)),
@@ -222,9 +224,9 @@ def create_or_attach_delegation(
     (delegation_source_work_filter(intent.goal_id or intent.parent_root_run_id)
      if intent.source_work_id is None else
      models.Delegation.parent_root_run_id == intent.parent_root_run_id),
-    or_(models.Delegation.parent_root_run_id == intent.parent_root_run_id,
-        and_(models.Delegation.goal_id.is_(None),
-             models.Delegation.parent_root_run_id == intent.goal_id)),
+    (delegation_source_work_filter(intent.goal_id)
+     if intent.goal_id and intent.source_work_id is None else
+     models.Delegation.parent_root_run_id == intent.parent_root_run_id),
   ).first()
   if row is not None:
     return _attach_existing_delegation(db, row, resolved_intent)
@@ -1926,12 +1928,9 @@ def own_helper_statuses(
     db.query(models.Delegation)
     .filter(
       models.Delegation.parent_chat_id == parent_chat_id,
-      or_(
-        models.Delegation.parent_root_run_id == root_id,
-        and_(models.Delegation.goal_id.is_(None),
-             models.Delegation.parent_root_run_id == source_work_id),
-      ),
-      delegation_source_work_filter(source_work_id),
+      (delegation_source_work_filter(source_work_id)
+       if inherited_goal_id or run.goal_id else
+       models.Delegation.parent_root_run_id == root_id),
     )
     .order_by(models.Delegation.created_at.asc())
     .all()
@@ -2661,6 +2660,7 @@ def serialize_background_helpers(db: Session, parent_chat_id: str) -> dict:
       {
         "id": row.id,
         "task_key": row.task_key,
+        "title": row.task_key,
         "provider": row.provider,
         "status": status,
       }
@@ -3308,52 +3308,8 @@ def _parent_wake_delivery_identity(
 def _parent_wake_continuation_root(
   db: Session, parent_chat_id: str, source_work_id: str,
 ) -> str | None:
-  """Resolve immutable helper ownership before consulting mutable run links."""
-  owner = db.query(models.Delegation).filter(
-    models.Delegation.parent_chat_id == parent_chat_id,
-    delegation_source_work_filter(source_work_id),
-  ).order_by(models.Delegation.created_at.asc()).first()
-  if owner is not None:
-    physical_root = owner.parent_root_run_id
-    physical = db.query(models.ChatRun.id).filter(
-      models.ChatRun.chat_id == parent_chat_id,
-      models.ChatRun.id == physical_root,
-    ).first()
-    if physical is not None:
-      return physical_root
-    # Pre-migration Goal rows overloaded parent_root_run_id with Goal id.
-  source = (
-    db.query(models.ChatRun)
-    .filter(
-      models.ChatRun.chat_id == parent_chat_id,
-      models.ChatRun.goal_id == source_work_id,
-    )
-    .order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc())
-    .first()
-  )
-  if source is None:
-    goal = db.query(models.ChatGoal).filter(
-      models.ChatGoal.id == source_work_id,
-      models.ChatGoal.chat_id == parent_chat_id,
-    ).first()
-    if goal is not None and goal.completion_run_id:
-      source = db.query(models.ChatRun).filter(
-        models.ChatRun.id == goal.completion_run_id,
-        models.ChatRun.chat_id == parent_chat_id,
-      ).first()
-  if source is None:
-    source = db.query(models.ChatRun).filter(
-      models.ChatRun.chat_id == parent_chat_id,
-      models.ChatRun.id == source_work_id,
-    ).first()
-  if source is None:
-    return None
-  root_run_id = source.root_run_id or source.id
-  root_exists = db.query(models.ChatRun.id).filter(
-    models.ChatRun.chat_id == parent_chat_id,
-    models.ChatRun.id == root_run_id,
-  ).first()
-  return root_run_id if root_exists is not None else None
+  from app.run_state import helper_result_continuation_root
+  return helper_result_continuation_root(db, parent_chat_id, source_work_id)
 
 
 def _committed_parent_wake(

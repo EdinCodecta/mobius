@@ -171,13 +171,7 @@ def queued_continuation_root(
   ):
     source = query.filter(models.ChatRun.id == source_work_id).first()
   elif kind == DELEGATION_RESULT_MESSAGE_KIND:
-    source = query.filter(
-      models.ChatRun.goal_id == source_work_id,
-    ).order_by(
-      models.ChatRun.started_at.desc(), models.ChatRun.id.desc(),
-    ).first()
-    if source is None:
-      source = query.filter(models.ChatRun.id == source_work_id).first()
+    return helper_result_continuation_root(db, chat_id, source_work_id)
   else:
     return None
   if source is None:
@@ -188,6 +182,41 @@ def queued_continuation_root(
     models.ChatRun.id == root_run_id,
   ).first()
   return root_run_id if exists is not None else None
+
+
+def helper_result_continuation_root(
+  db: Session, chat_id: str, source_work_id: str,
+) -> str | None:
+  """A Goal's helpers resume its latest attempt, not their spawning attempt."""
+  query = db.query(models.ChatRun).filter(models.ChatRun.chat_id == chat_id)
+  goal = db.query(models.ChatGoal).filter(
+    models.ChatGoal.id == source_work_id,
+    models.ChatGoal.chat_id == chat_id,
+  ).first()
+  source = None
+  if goal is not None:
+    source = query.filter(models.ChatRun.goal_id == goal.id).order_by(
+      models.ChatRun.started_at.desc(), models.ChatRun.id.desc(),
+    ).first()
+    if source is None and goal.completion_run_id:
+      source = query.filter(models.ChatRun.id == goal.completion_run_id).first()
+  if source is None:
+    # Nested helpers can inherit an ancestor's Goal without a ChatGoal row in
+    # their own parent chat. Their persisted spawning root remains authoritative.
+    owner_root = db.query(models.Delegation.parent_root_run_id).filter(
+      models.Delegation.parent_chat_id == chat_id,
+      (models.Delegation.goal_id == source_work_id) |
+      ((models.Delegation.goal_id.is_(None)) &
+       (models.Delegation.parent_root_run_id == source_work_id)),
+    ).order_by(models.Delegation.created_at.asc()).scalar()
+    if owner_root:
+      source = query.filter(models.ChatRun.id == owner_root).first()
+  if source is None:
+    source = query.filter(models.ChatRun.id == source_work_id).first()
+  if source is None:
+    return None
+  root = source.root_run_id or source.id
+  return root if query.filter(models.ChatRun.id == root).first() is not None else None
 
 
 def latest_run(db: Session, chat_id: str) -> models.ChatRun | None:
