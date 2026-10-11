@@ -105,6 +105,7 @@ from app.manifest_contract import (
 # net_utils.py for why the two SSRF validators were unified.
 from app.net_utils import (
   MAX_REDIRECTS as _MAX_REDIRECTS,
+  pinned_client,
   validate_url_safe as _validate_url_safe,
 )
 from app.storage_io import atomic_write
@@ -2492,10 +2493,7 @@ async def preview_manifest_capabilities(
   db: Session | None = None,
 ) -> tuple[dict, str, dict, str]:
   """Return the validated manifest/base and its canonical review contract."""
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT,
-    follow_redirects=False,
-  ) as cli:
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
     loaded, normalized_base = await _fetch_and_validate_manifest(
       cli,
       manifest_url=manifest_url,
@@ -3078,10 +3076,7 @@ async def _fetch_install_candidate(
   db: Session | None = None,
 ) -> InstallCandidate:
   """Fetch every install input once and enforce all review/replay guards."""
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT,
-    follow_redirects=False,
-  ) as cli:
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
     manifest, raw_base = await _fetch_and_validate_manifest(
       cli,
       manifest_url=manifest_url,
@@ -3286,10 +3281,7 @@ async def _authorize_source_handoff(
   package_id = target.package_id
   if existing is None or not package_id or not existing.manifest_url:
     raise HTTPException(409, "App source changed without a trusted handoff.")
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT,
-    follow_redirects=False,
-  ) as cli:
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
     # The old row's own address is fetched without the stored id binding:
     # trust here comes from `package_id` + `moved_to`, and a `package_id` app
     # may have changed its manifest id without `previous_id`.
