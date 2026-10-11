@@ -6982,6 +6982,36 @@ def test_rename_adopts_predecessor_row_and_moves_source_dir(
   assert r3.json()["id"] == gym_id
 
 
+@pytest.mark.parametrize("renamed_package_id, message", [
+  (None, "This installed app requires its permanent package identity."),
+  (
+    "urn:uuid:9b1e7a52-0c3d-5f4e-8a6b-7c2d1e0f3a94",
+    "Permanent package identity changed.",
+  ),
+])
+def test_rename_never_replaces_the_predecessor_package_identity(
+  client, auth, bypass_url_validation, renamed_package_id, message,
+):
+  """A previous_id rename is held to the same package rule as any update."""
+  base = "https://rename.test/packaged/"
+  original = _simple_manifest("gym")
+  original["package_id"] = "urn:uuid:5d2c8f61-4b7a-5e93-9c1d-2f6a8b3e7d05"
+  first = _install_simple(client, auth, base, original)
+  assert first.status_code == 201, first.text
+
+  renamed = _simple_manifest("workout", version="2.0.0", previous_id="gym")
+  if renamed_package_id is not None:
+    renamed["package_id"] = renamed_package_id
+  refused = _install_simple(client, auth, base, renamed)
+
+  assert refused.status_code == 409, refused.text
+  assert refused.json()["detail"] == message
+  listed = client.get("/api/apps/", headers=auth).json()
+  assert [(a["slug"], a["package_id"]) for a in listed] == [
+    ("gym", original["package_id"]),
+  ]
+
+
 def test_catalog_rename_adopts_trusted_checkout_with_unrelated_git_history(
   client, auth, bypass_url_validation,
 ):

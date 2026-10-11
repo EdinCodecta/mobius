@@ -2919,10 +2919,10 @@ async def _settle_before_cancel(work: Awaitable):
     if isinstance(outcome, _UncheckedPythonTree):
       outcome.discard()  # An install's hand-off that will never be checked.
     elif isinstance(outcome, HTTPException):
-      log.info("install: refused after its caller was cancelled: %s", outcome.detail)
+      log.info("Work refused after its caller was cancelled: %s", outcome.detail)
     elif outcome is not None:
       log.error(
-        "install: work failed after its caller was cancelled", exc_info=outcome,
+        "Work failed after its caller was cancelled", exc_info=outcome,
       )
     raise asyncio.CancelledError
   return work.result()
@@ -3373,12 +3373,6 @@ def _select_install_target(
       db, source_url=previous_source, manifest_id=manifest_id,
     )
 
-  if existing is not None:
-    try:
-      require_permanent_package(manifest, existing.package_id)
-    except ValueError as exc:
-      raise HTTPException(409, str(exc)) from exc
-
   adopting_previous_id = False
   origin_migration = None
   if existing is None:
@@ -3417,6 +3411,14 @@ def _select_install_target(
         adopting_previous_id = True
       else:
         origin_migration = None
+
+  # Every resolved row, including a previous_id predecessor, keeps its
+  # permanent package identity.
+  if existing is not None:
+    try:
+      require_permanent_package(manifest, existing.package_id)
+    except ValueError as exc:
+      raise HTTPException(409, str(exc)) from exc
 
   if (
     existing is not None
