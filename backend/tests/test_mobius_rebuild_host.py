@@ -1410,13 +1410,13 @@ def test_generated_units_allow_the_bounded_recovery_budget(tmp_path):
   from app import platform_activation
 
   source = INSTALLER.read_text()
-  start = source.index("cat >/etc/systemd/system/mobius-rebuild.service")
-  end = source.index("chmod 0644 /etc/systemd/system/mobius-rebuild.service", start)
+  start = source.index('cat >"$STAGE/mobius-rebuild.service"')
+  end = source.index("for unit in mobius-rebuild.service", start)
   # Execute the installer's actual unit heredocs, redirecting only their
   # destination. No root installation, Docker, or systemctl is invoked.
-  units = source[start:end].replace("/etc/systemd/system/", f"{tmp_path}/")
+  units = source[start:end]
   subprocess.run(["bash", "-eu", "-c", units], check=True,
-                 env={**os.environ, "DATA_SOURCE": str(tmp_path / "data")})
+                 env={**os.environ, "STAGE": str(tmp_path), "DATA_SOURCE": str(tmp_path / "data")})
   main = configparser.ConfigParser()
   main.read(tmp_path / "mobius-rebuild.service")
   reconcile = configparser.ConfigParser()
@@ -1726,22 +1726,27 @@ def test_readiness_budget_preserves_single_rollback_policy(
   assert c.docker.starts == before
 
 
-def test_installer_stops_before_publishing_units_when_seeding_refuses(tmp_path):
+def test_installer_seed_refusal_does_not_activate_launcher_or_enable_dispatch(tmp_path):
   source = INSTALLER.read_text()
   start = source.index("MOBIUS_REBUILD_LOCK_HELD=1")
-  end = source.index("install -D", start)
+  end = source.index("MIGRATION_COMPLETE=1", start)
   python = tmp_path / "python"
-  python.write_text("#!/bin/sh\n[ \"$MOBIUS_REBUILD_LOCK_HELD\" = 1 ] || exit 99\nexit 1\n")
+  python.write_text('#!/bin/sh\n[ "$MOBIUS_REBUILD_LOCK_HELD" = 1 ] || exit 99\nexit 1\n')
   python.chmod(0o700)
-  seed = source[start:end].replace("/usr/bin/python3", str(python))
-  published = tmp_path / "units-published"
+  # Prerequisites may already be staged. A refused commit must not activate
+  # the new launcher, publish capabilities, or enable normal dispatch.
+  activation = tmp_path / "activation"
+  prelude = 'durable_publish() { echo launcher >>"$ACTIVATION"; }\n'
+  prelude += 'systemctl() { echo "$*" >>"$ACTIVATION"; }\n'
+  prelude += 'flock() { echo lock-release >>"$ACTIVATION"; }\n'
+  tail = source[start:end].replace("/usr/bin/python3", str(python))
   result = subprocess.run(
-    ["bash", "-eu", "-c", seed + '\n touch "$PUBLISHED"'],
-    env={**os.environ, "ROOT": str(tmp_path), "PUBLISHED": str(published)},
+    ["bash", "-eu", "-c", prelude + tail],
+    env={**os.environ, "ROOT": str(tmp_path), "ACTIVATION": str(activation)},
     capture_output=True, text=True,
   )
   assert result.returncode == 1
-  assert not published.exists()
+  assert not activation.exists()
 
 
 @pytest.mark.parametrize("failure", [
@@ -2171,3 +2176,27 @@ def test_fixed_helper_and_compatible_launcher_reach_normal_admission(monkeypatch
   monkeypatch.setattr(host, "config", config)
   with pytest.raises(Admitted):
     host.run()
+
+
+def test_disposable_systemd_proof_extracts_the_actual_staged_units(tmp_path):
+  import textwrap
+
+  harness = (SCRIPT.parent / "test-rebuild-recovery-units.py").read_text()
+  # Execute only the proof's extraction and bash heredoc generation. The
+  # subsequent real-systemd installation stays outside this hermetic test.
+  start = harness.index("        start = source.index(")
+  end = harness.index("        try:", start)
+  prefix = "mobius-recovery-test-extraction"
+  worker = tmp_path / "worker"
+  scope = {"source": INSTALLER.read_text(), "root": tmp_path,
+           "data": tmp_path / "data", "worker": worker, "prefix": prefix,
+           "os": os, "subprocess": subprocess}
+  exec(compile(textwrap.dedent(harness[start:end]), "<proof-unit-extraction>", "exec"), scope)
+  expected = {f"{prefix}{suffix}" for suffix in (
+    ".service", ".path", "-reconcile.service", "-reconcile.timer")}
+  assert {path.name for path in tmp_path.iterdir()} == expected
+  main = (tmp_path / f"{prefix}.service").read_text()
+  assert f"ExecStart={worker} run" in main
+  assert f"ExecStopPost={worker} reconcile" in main
+  for path in tmp_path.iterdir():
+    assert "mobius-rebuild" not in path.read_text()

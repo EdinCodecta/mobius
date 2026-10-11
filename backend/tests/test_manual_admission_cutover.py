@@ -48,7 +48,7 @@ class _Fixture(tuple):
 def fixture(tmp_path, monkeypatch):
     state = tmp_path / 'state'
     state.mkdir()
-    for name in ('replace.lock', 'candidate.lock', 'compose.yml', 'config.json'):
+    for name in ('replace.lock', 'candidate.lock', 'compose.yml', 'config.v4.json'):
         (state / name).write_text('')
     (state / 'compose.yml').write_text('services:\n  app: {}\n')
     desired = state / 'desired.json'
@@ -59,7 +59,7 @@ def fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(adapter, 'TRIAL_LOCK', state / 'candidate.lock')
     monkeypatch.setattr(adapter, 'JOURNAL', state / 'transaction.json')
     monkeypatch.setattr(adapter, 'COMPOSE', state / 'compose.yml')
-    monkeypatch.setattr(adapter, 'CONFIG', state / 'config.json')
+    monkeypatch.setattr(adapter, 'CONFIG', state / 'config.v4.json')
     monkeypatch.setattr(adapter, 'STATUS', state / 'status.json')
     monkeypatch.setattr(adapter, 'trusted', lambda *a, **k: None)
     monkeypatch.setattr(adapter, 'TRUSTED_UID', os.geteuid())

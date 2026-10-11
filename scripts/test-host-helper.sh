@@ -101,6 +101,56 @@ active_revision() {
   python3 -c 'import json; print(json.load(open("/var/lib/mobius-rebuild/workers.json"))["active"]["revision"])'
 }
 
+# BEGIN CONTROLLER QUIESCENCE
+# With dispatch stopped, a oneshot controller started earlier can still be
+# activating (its worker runs), deactivating (ExecStopPost reconciles), or hold
+# a queued start job while inactive. `systemctl is-active` calls none of those
+# active, so positively require each controller service to be inactive or
+# failed with no job. This only observes: running recovery is never stopped.
+CONTROLLER_UNITS=(mobius-rebuild.service mobius-rebuild-reconcile.service)
+controller_unit_state() {  # <unit>: sets UNIT_ACTIVE/UNIT_JOB; fails on unreadable evidence
+  local info line key value load= seen=
+  UNIT_ACTIVE= UNIT_JOB=
+  info=$(systemctl show "$1" --all --property=LoadState --property=ActiveState --property=Job) \
+    || { echo "systemctl show $1 failed" >&2; return 1; }
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    [[ $line == *=* ]] || { echo "$1: unparseable systemd line: $line" >&2; return 1; }
+    key=${line%%=*} value=${line#*=}
+    [[ " $seen " != *" $key "* ]] || { echo "$1: duplicate systemd property $key" >&2; return 1; }
+    seen+=" $key"
+    case $key in
+      LoadState) load=$value ;;
+      ActiveState) UNIT_ACTIVE=$value ;;
+      Job) UNIT_JOB=$value ;;
+      *) echo "$1: unexpected systemd property $key" >&2; return 1 ;;
+    esac
+  done <<<"$info"
+  # An older seed may not install the reconcile unit: not-found is inactive.
+  [[ $load == loaded || $load == not-found ]] \
+    || { echo "$1: unusable LoadState '${load}'" >&2; return 1; }
+  [[ $UNIT_ACTIVE =~ ^[a-z-]+$ ]] || { echo "$1: unusable ActiveState '${UNIT_ACTIVE}'" >&2; return 1; }
+  [[ $seen == *" Job"* && $UNIT_JOB =~ ^[0-9]*$ ]] \
+    || { echo "$1: unusable Job '${UNIT_JOB}'" >&2; return 1; }
+}
+wait_controllers_quiescent() {  # <attempts> <interval-seconds>
+  local attempts=$1 interval=$2 attempt unit busy
+  for (( attempt = 1; attempt <= attempts; attempt++ )); do
+    busy=
+    for unit in "${CONTROLLER_UNITS[@]}"; do
+      controller_unit_state "$unit" || fail "cannot prove $unit is quiescent"
+      if [[ $UNIT_ACTIVE != inactive && $UNIT_ACTIVE != failed ]] \
+          || [[ -n $UNIT_JOB && $UNIT_JOB != 0 ]]; then
+        busy+=" $unit=$UNIT_ACTIVE/job:${UNIT_JOB:-none}"
+      fi
+    done
+    if [[ -z $busy ]]; then return 0; fi
+    if (( attempt < attempts )); then sleep "$interval"; fi
+  done
+  fail "previous replacement still running or queued after $attempts checks:$busy"
+}
+# END CONTROLLER QUIESCENCE
+
 wait_status() {  # <nonce> <state>: wait until the root status names this request
   for _ in $(seq 1 240); do
     if [[ -f $STATUS ]] && [[ $(field "$STATUS" 'd.get("request_nonce")') == "$1" ]]; then
@@ -641,11 +691,7 @@ if (( target_helper > previous_helper )); then
   if systemctl cat mobius-rebuild-reconcile.timer >/dev/null 2>&1; then
     systemctl stop mobius-rebuild-reconcile.timer
   fi
-  for _ in $(seq 1 60); do
-    systemctl is-active --quiet mobius-rebuild.service || break
-    sleep 2
-  done
-  systemctl is-active --quiet mobius-rebuild.service && fail "previous replacement still running"
+  wait_controllers_quiescent 60 2
   nonce=$(queue "$PREVIOUS")
   if (( (seed_launcher == 1 && target_helper >= 4) ||
         (previous_helper < 5 && target_helper >= 5) )); then
@@ -708,6 +754,11 @@ for src, dst in (
     assert stat.S_ISREG(st.st_mode) and st.st_uid == st.st_gid == 0, installed
     assert stat.S_IMODE(st.st_mode) == 0o755, installed
     assert installed.read_bytes() == (source / "scripts" / src).read_bytes(), installed
+config = Path("/etc/mobius-rebuild/config.v4.json")
+st = config.lstat()
+assert stat.S_ISREG(st.st_mode) and st.st_uid == st.st_gid == 0, config
+assert stat.S_IMODE(st.st_mode) == 0o600, config
+assert json.loads(config.read_text())["version"] == 4
 state = Path("/var/lib/mobius-rebuild/admission")
 st = state.lstat()
 assert stat.S_ISDIR(st.st_mode) and st.st_uid == st.st_gid == 0
@@ -733,11 +784,7 @@ wait_status "$nonce" succeeded
 replaced_with "$PREVIOUS"
 expected=$(( target_revision > seeded ? target_revision : seeded ))
 # The worker reports before it exits; the launcher settles after it.
-for _ in $(seq 1 60); do
-  if ! systemctl is-active --quiet mobius-rebuild.service \
-     && [[ $(active_revision) == "$expected" ]]; then break; fi
-  sleep 2
-done
+wait_controllers_quiescent 60 2
 [[ $(active_revision) == "$expected" ]] \
   || fail "worker revision $expected is not active (active: $(active_revision))"
 [[ $(field "$STATUS" 'd.get("worker_revision")') == "$expected" ]] \

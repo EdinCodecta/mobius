@@ -472,7 +472,7 @@ HEALTHCHECK --interval=1s --timeout=1s --retries=2 CMD test -f /data/ready
       - ./data:/data
 ''')
                 override.write_text('{}\n')
-                patch.setattr(host, "CONFIG", base / "config.json")
+                patch.setattr(host, "CONFIG", base / "config.v4.json")
                 patch.setattr(host, "COMPOSE", compose_file)
                 patch.setattr(host, "OVERRIDE", override)
                 patch.setattr(host, "STATE_DIR", state)

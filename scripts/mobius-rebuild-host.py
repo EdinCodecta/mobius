@@ -23,7 +23,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 STATE_DIR = Path("/var/lib/mobius-rebuild")
-CONFIG = Path("/etc/mobius-rebuild/config.json")
+# Version 4 lives at its own versioned path. The released v3 worker keeps
+# reading config.json, so neither worker ever reads the other's schema and
+# the installer's durable worker selection is the single migration commit.
+CONFIG = Path("/etc/mobius-rebuild/config.v4.json")
 COMPOSE = Path("/etc/mobius-rebuild/compose.yml")
 OVERRIDE = Path("/etc/mobius-rebuild/image.override.yml")
 STATUS = STATE_DIR / "status.json"
@@ -52,7 +55,7 @@ REQUEST_VERSIONS = [1, 2]
 # each requested official image only when this number is higher than every
 # worker it has run. Increase it with every change to this file; never lower
 # it. The launcher reads it as text, so keep it a plain literal on one line.
-WORKER_REVISION = 12
+WORKER_REVISION = 13
 # The frozen launcher runs the worker selected here; see offer_worker().
 WORKERS = STATE_DIR / "workers"
 WORKER_INDEX = STATE_DIR / "workers.json"

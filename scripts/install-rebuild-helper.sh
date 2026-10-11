@@ -68,6 +68,9 @@ else
 fi
 WORKING_DIR=${LABELS[1]:-}
 FROZEN_SOURCE=
+# Version 4 has its own path, read only by the new worker. The released v3
+# config.json stays inert for the released worker and is never rewritten.
+CONFIG_V4=/etc/mobius-rebuild/config.v4.json
 FILES=()
 ENV_FILES=()
 if [[ $ADMISSION_MANAGED == 1 ]] || [[ $WORKING_DIR == /etc/mobius-rebuild \
@@ -80,22 +83,19 @@ if [[ $ADMISSION_MANAGED == 1 ]] || [[ $WORKING_DIR == /etc/mobius-rebuild \
      && $(stat -c '%u' /etc/mobius-rebuild) == 0 \
      && $((8#$(stat -c '%a' /etc/mobius-rebuild) & 8#022)) == 0 ]] \
     || { echo "Existing replacement topology directory is not root-controlled." >&2; exit 1; }
-  for frozen in /etc/mobius-rebuild/config.json \
-                /etc/mobius-rebuild/compose.yml \
+  # A helper-managed app was created by a version-4 worker: its frozen identity
+  # is required. An older helper-created app is described by either file; each
+  # is validated with every other existing configuration below.
+  [[ $ADMISSION_MANAGED == 0 || -f $CONFIG_V4 ]] \
+    || { echo "A helper-managed app requires its frozen version 4 identity in $CONFIG_V4." >&2; exit 1; }
+  [[ -f $CONFIG_V4 || -f /etc/mobius-rebuild/config.json ]] \
+    || { echo "A helper-created app requires its frozen helper configuration." >&2; exit 1; }
+  for frozen in /etc/mobius-rebuild/compose.yml \
                 /etc/mobius-rebuild/image.override.yml; do
     [[ -f $frozen && ! -L $frozen && $(stat -c '%u' "$frozen") == 0 \
        && $((8#$(stat -c '%a' "$frozen") & 8#022)) == 0 ]] \
       || { echo "Existing replacement topology is not root-controlled." >&2; exit 1; }
   done
-  python3 - "$PROJECT" <<'PY_OWNER'
-import json, sys
-with open("/etc/mobius-rebuild/config.json") as handle:
-    configuration = json.load(handle)
-# Version 3 is the released legacy layout migrated here; version 4 adds the
-# frozen deployment container name. Helper-managed apps require version 4.
-if configuration.get("version") not in (3, 4) or configuration.get("project") != sys.argv[1]:
-    raise SystemExit("Frozen helper configuration belongs to a different project")
-PY_OWNER
   FROZEN_SOURCE=/etc/mobius-rebuild/compose.yml
 else
   FILES_OUTPUT=$(python3 "$ROOT/scripts/rebuild-topology.py" compose-files \
@@ -122,7 +122,7 @@ import json, re, stat, sys
 from pathlib import Path
 
 project, cid, raw = sys.argv[1:]
-configuration = json.loads(Path("/etc/mobius-rebuild/config.json").read_text())
+configuration = json.loads(Path("/etc/mobius-rebuild/config.v4.json").read_text())
 expected = json.loads(Path("/etc/mobius-rebuild/image.override.yml").read_text())
 actual = json.loads(raw)
 # Frozen files escape only values for Compose; inspection returns literals.
@@ -221,15 +221,47 @@ DATA_SOURCE=$(docker inspect "$CID" --format \
   '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}')
 [[ $DATA_SOURCE =~ ^/[A-Za-z0-9_./-]+$ && -d $DATA_SOURCE ]] \
   || { echo "Could not resolve the persistent /data mount on the host." >&2; exit 1; }
-if [[ -n $FROZEN_SOURCE ]]; then
-  python3 - "$DATA_SOURCE" <<'PY_DATA'
-import json, sys
-with open("/etc/mobius-rebuild/config.json") as handle:
-    configuration = json.load(handle)
-if configuration.get("data_dir") != sys.argv[1]:
-    raise SystemExit("Running data mount differs from the frozen helper configuration")
-PY_DATA
-fi
+# Every existing helper configuration, legacy or frozen-source alike, must
+# describe this exact project and persistent data directory. The released
+# config.json is never rewritten, so a changed topology would otherwise pair it
+# with a newly staged compose snapshot. Refuse before any controller change,
+# and again under both locks: a concurrent installer may have written one since.
+check_existing_configuration() {
+python3 - "$PROJECT" "$DATA_SOURCE" <<'PY_EXISTING'
+import json, os, stat, sys
+
+TRUSTED_UID = 0
+project, data_source = sys.argv[1:]
+directory = "/etc/mobius-rebuild"
+try:
+    info = os.lstat(directory)
+except FileNotFoundError:
+    raise SystemExit(0)
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != TRUSTED_UID or info.st_mode & 0o022:
+    raise SystemExit("Existing replacement topology directory is not root-controlled.")
+for name, version in (("config.v4.json", 4), ("config.json", 3)):
+    path = os.path.join(directory, name)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        continue
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != TRUSTED_UID or info.st_mode & 0o022:
+        raise SystemExit(f"Existing helper configuration is not root-controlled: {path}")
+    try:
+        with open(path) as handle:
+            configuration = json.load(handle)
+    except ValueError:
+        configuration = None
+    if not isinstance(configuration, dict) or configuration.get("version") != version:
+        raise SystemExit(f"Existing helper configuration has an unexpected schema: {path}")
+    if configuration.get("project") != project or configuration.get("data_dir") != data_source:
+        raise SystemExit(
+            f"Existing helper configuration {path} describes a different Compose project or "
+            "data directory. Settle that deployment's helper state explicitly first; the "
+            "installer never pairs it with a changed topology.")
+PY_EXISTING
+}
+check_existing_configuration
 APP_UID=$(docker exec "$CID" id -u mobius)
 APP_GID=$(docker exec "$CID" id -g mobius)
 [[ $APP_UID =~ ^[0-9]+$ && $APP_GID =~ ^[0-9]+$ ]] \
@@ -311,7 +343,7 @@ if not (isinstance(observed, str) and observed[:1] == "/" and NAME.fullmatch(obs
     refuse("the live container name is invalid")
 observed = observed[1:]
 if managed == "1":
-    configuration = json.loads(Path("/etc/mobius-rebuild/config.json").read_text())
+    configuration = json.loads(Path("/etc/mobius-rebuild/config.v4.json").read_text())
     name, source = configuration.get("deployment_name"), configuration.get("name_source")
     if configuration.get("version") != 4 or configuration.get("project") != project:
         refuse("a helper-managed app requires its frozen version 4 identity")
@@ -373,6 +405,7 @@ migration_cleanup() {
   local rc=$? i
   trap - EXIT
   rm -f "$RESOLVED"
+  [[ -z ${STAGE:-} ]] || rm -rf -- "$STAGE"
   # Release our fences before restoring dispatch. No active worker was stopped.
   exec 9>&- 8>&-
   if [[ $MIGRATION_COMPLETE == 0 ]]; then
@@ -430,6 +463,7 @@ if [[ $ADMISSION_MANAGED == 1 ]]; then
 fi
 [[ $(deployment_identity) == "$IDENTITY" ]] \
   || { echo "The running app's deployment name changed during preflight; retry helper migration." >&2; exit 1; }
+check_existing_configuration
 
 # BEGIN PINNED BOOT ADMISSION INSTALL
 # Publish the prerequisite before adopting a worker that can use it. Existing
@@ -507,62 +541,102 @@ for destination, payload in zip(destinations, payloads):
 PY_GATE
 # END PINNED BOOT ADMISSION INSTALL
 
-# Seed the active worker, including an exact still-pending image candidate.
-# Refusal exits before publishing new units/capabilities; high-water alone
-# does not mean the required worker is active. A genuinely newer active worker
-# and any newer offered candidate are preserved.
-MOBIUS_REBUILD_LOCK_HELD=1 \
-  /usr/bin/python3 -I -S "$ROOT/scripts/mobius-rebuild-host.py" adopt-self
-install -D -m 0755 "$ROOT/scripts/mobius-rebuild-launcher.py" \
-  /usr/local/libexec/.mobius-rebuild-host.new
-mv -f /usr/local/libexec/.mobius-rebuild-host.new \
-  /usr/local/libexec/mobius-rebuild-host
-SNAPSHOT=$(mktemp /etc/mobius-rebuild/compose.XXXXXX)
-if [[ -n $FROZEN_SOURCE ]]; then
-  cp "$FROZEN_SOURCE" "$SNAPSHOT"
-else
-  MOBIUS_IMAGE="$CURRENT_IMAGE" docker compose \
-    "${ARGS[@]}" config >"$SNAPSHOT"
-fi
-chmod 0600 "$SNAPSHOT"
-mv -f "$SNAPSHOT" /etc/mobius-rebuild/compose.yml
-# A wrapped live app is discovered through this exact current attempt record.
-# Preserve it on reinstall; never merge it into the reusable base snapshot.
-if [[ $ADMISSION_MANAGED == 0 ]]; then
-OVERRIDE_NEW=$(mktemp /etc/mobius-rebuild/image.override.XXXXXX)
-cat >"$OVERRIDE_NEW" <<'EOF'
-services:
-  app:
-    image: ${MOBIUS_IMAGE:?MOBIUS_IMAGE is required}
-EOF
-chmod 0600 "$OVERRIDE_NEW"
-mv -f "$OVERRIDE_NEW" /etc/mobius-rebuild/image.override.yml
-fi
-# Existing root-owned controller state under /var/lib/mobius-rebuild, including
-# any host-owned removal tombstones, is preserved: never deleted or reset here.
-python3 - "$PROJECT" "$DATA_SOURCE" "$IDENTITY" <<'PY'
-import json, os, sys, tempfile
+# BEGIN DURABLE STAGED PUBLICATION
+# Two workers and two schemas meet here: the released worker reads only the
+# version-3 config.json; the new worker reads only config.v4.json. Every file
+# below is published durably (fsync, atomic rename, directory fsync) by one
+# helper. Phase 1 stages every input the new worker reads before the single
+# commit; each is inert to, or keeps its released meaning for, the still-selected
+# worker. The commit selects the new worker. Phase 2 then installs launcher 2.
+# Launcher 2 never runs beside the released worker, so a reboot before the
+# commit cannot trial (and consume) a pending candidate of this revision.
+# Between the commit and launcher 2, launcher 1 runs the new worker: it refuses
+# replacement runs without touching queued requests and reconciles with its
+# complete inputs. Replacements therefore wait, not run, until rerunning the
+# installer (idempotent at the commit) publishes launcher 2. A failure,
+# SIGKILL, or power loss at any point leaves a coherent pair for the cleanup's
+# restored dispatch or reboot-enabled units. The released config.json is never
+# rewritten.
+durable_publish() {
+  python3 - "$@" <<'PY_PUBLISH'
+import os, stat, sys, tempfile
+
+OWNER = (0, 0)
+arguments = sys.argv[1:]
+separator = arguments.index("--")
+triples, directories = arguments[:separator], arguments[separator + 1:]
+if not triples or len(triples) % 3:
+    raise SystemExit("Invalid staged publication")
+
+
+def fsync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+# Read and validate everything before replacing anything.
+publications = []
+for index in range(0, len(triples), 3):
+    source, destination, mode = triples[index:index + 3]
+    parent = os.path.dirname(destination)
+    info = os.lstat(parent)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != OWNER[0]
+            or info.st_mode & 0o022):
+        raise SystemExit(f"Publication directory is not root-controlled: {parent}")
+    with open(source, "rb") as handle:
+        publications.append((destination, int(mode, 8), handle.read()))
+for directory in directories:
+    fsync_directory(directory)
+# In order: each file is durable before the next, and all before the commit.
+for destination, mode, payload in publications:
+    parent = os.path.dirname(destination)
+    fd, temporary = tempfile.mkstemp(prefix="." + os.path.basename(destination) + ".", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            os.fchown(handle.fileno(), *OWNER)
+            os.fchmod(handle.fileno(), mode)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        fsync_directory(parent)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+PY_PUBLISH
+}
+STAGE=$(mktemp -d)
+python3 - "$PROJECT" "$DATA_SOURCE" "$IDENTITY" "$STAGE/config.v4.json" <<'PY'
+import json, sys
 identity = json.loads(sys.argv[3])
 if set(identity) != {"deployment_name", "name_source"}:
     raise SystemExit("invalid frozen deployment identity")
 value = {"version": 4, "project": sys.argv[1], "data_dir": sys.argv[2], **identity}
-fd, name = tempfile.mkstemp(dir="/etc/mobius-rebuild", text=True)
-with os.fdopen(fd, "w") as handle: json.dump(value, handle, separators=(",", ":"))
-os.chmod(name, 0o600)
-os.replace(name, "/etc/mobius-rebuild/config.json")
+with open(sys.argv[4], "w") as handle:
+    json.dump(value, handle, separators=(",", ":"))
 PY
-
-# Root owns status and topology; the app user can create only the fixed inbox
-# request/ready files consumed by the validated worker.
-install -d -o root -g root -m 0755 "$DATA_SOURCE/mobius-rebuild"
-# GNU install accepts a numeric owner absent from the host passwd; uutils
-# (the default coreutils on Ubuntu 25.10+) does not. The app uid exists only
-# inside the container, so set the ownership portably instead.
-mkdir -p "$DATA_SOURCE/mobius-rebuild/inbox"
-chown "$APP_UID:$APP_GID" "$DATA_SOURCE/mobius-rebuild/inbox"
-chmod 0700 "$DATA_SOURCE/mobius-rebuild/inbox"
-
-cat >/etc/systemd/system/mobius-rebuild.service <<'EOF'
+if [[ -n $FROZEN_SOURCE ]]; then
+  cp "$FROZEN_SOURCE" "$STAGE/compose.yml"
+else
+  MOBIUS_IMAGE="$CURRENT_IMAGE" docker compose \
+    "${ARGS[@]}" config >"$STAGE/compose.yml"
+fi
+PUBLISH=("$STAGE/config.v4.json" "$CONFIG_V4" 0600
+         "$STAGE/compose.yml" /etc/mobius-rebuild/compose.yml 0600)
+# A wrapped live app is discovered through this exact current attempt record.
+# Preserve it on reinstall; never merge it into the reusable base snapshot.
+if [[ $ADMISSION_MANAGED == 0 ]]; then
+cat >"$STAGE/image.override.yml" <<'EOF'
+services:
+  app:
+    image: ${MOBIUS_IMAGE:?MOBIUS_IMAGE is required}
+EOF
+PUBLISH+=("$STAGE/image.override.yml" /etc/mobius-rebuild/image.override.yml 0600)
+fi
+cat >"$STAGE/mobius-rebuild.service" <<'EOF'
 [Unit]
 Description=Replace the Möbius app container with an official image
 After=docker.service
@@ -578,7 +652,7 @@ TimeoutStartSec=9000
 # + 600 for bounded observations and settlement. Interrupted work stays journaled.
 TimeoutStopSec=3600
 EOF
-cat >/etc/systemd/system/mobius-rebuild.path <<EOF
+cat >"$STAGE/mobius-rebuild.path" <<EOF
 [Unit]
 Description=Watch for a Möbius container rebuild request
 
@@ -591,7 +665,7 @@ Unit=mobius-rebuild.service
 [Install]
 WantedBy=multi-user.target
 EOF
-cat >/etc/systemd/system/mobius-rebuild-reconcile.service <<'EOF'
+cat >"$STAGE/mobius-rebuild-reconcile.service" <<'EOF'
 [Unit]
 Description=Reconcile interrupted Möbius container rebuild state
 After=docker.service
@@ -607,7 +681,7 @@ TimeoutStartSec=3600
 [Install]
 WantedBy=multi-user.target
 EOF
-cat >/etc/systemd/system/mobius-rebuild-reconcile.timer <<'EOF'
+cat >"$STAGE/mobius-rebuild-reconcile.timer" <<'EOF'
 [Unit]
 Description=Retry interrupted Möbius container recovery
 
@@ -621,13 +695,41 @@ Unit=mobius-rebuild.service
 [Install]
 WantedBy=timers.target
 EOF
-chmod 0644 /etc/systemd/system/mobius-rebuild.service \
-  /etc/systemd/system/mobius-rebuild.path \
-  /etc/systemd/system/mobius-rebuild-reconcile.service \
-  /etc/systemd/system/mobius-rebuild-reconcile.timer
+for unit in mobius-rebuild.service mobius-rebuild.path \
+            mobius-rebuild-reconcile.service mobius-rebuild-reconcile.timer; do
+  PUBLISH+=("$STAGE/$unit" "/etc/systemd/system/$unit" 0644)
+done
+
+# Root owns status and topology; the app user can create only the fixed inbox
+# request/ready files consumed by the validated worker.
+install -d -o root -g root -m 0755 "$DATA_SOURCE/mobius-rebuild"
+# GNU install accepts a numeric owner absent from the host passwd; uutils
+# (the default coreutils on Ubuntu 25.10+) does not. The app uid exists only
+# inside the container, so set the ownership portably instead.
+mkdir -p "$DATA_SOURCE/mobius-rebuild/inbox"
+chown "$APP_UID:$APP_GID" "$DATA_SOURCE/mobius-rebuild/inbox"
+chmod 0700 "$DATA_SOURCE/mobius-rebuild/inbox"
+durable_publish "${PUBLISH[@]}" -- "$DATA_SOURCE/mobius-rebuild/inbox" \
+  "$DATA_SOURCE/mobius-rebuild" "$DATA_SOURCE"
+
+# COMMIT: the one migration point. adopt-self durably switches workers.json
+# (fsync, rename, directory fsync) to this checkout's worker, which reads only
+# the already-durable config.v4.json. It still activates an exact pending image
+# candidate and preserves a genuinely newer worker; it never downgrades or
+# readmits a revision at or below the high-water mark. A refusal leaves the
+# released selection, so the cleanup restores its own coherent dispatch.
+MOBIUS_REBUILD_LOCK_HELD=1 \
+  /usr/bin/python3 -I -S "$ROOT/scripts/mobius-rebuild-host.py" adopt-self
+# Phase 2: launcher 2 only after the new worker is durably selected.
+durable_publish "$ROOT/scripts/mobius-rebuild-launcher.py" \
+  /usr/local/libexec/mobius-rebuild-host 0755 --
 systemctl daemon-reload
-# Installation never runs recovery or replaces the healthy app. Release the
-# lock, then restore normal request/timer processing; those workers own recovery.
+# END DURABLE STAGED PUBLICATION
+
+# Only idempotent capability publication and enablement remain. Release the
+# replacement lock first, then restore normal request/timer processing; those
+# workers own recovery. Installation never runs recovery or replaces the
+# healthy app.
 flock -u 9
 exec 9>&-
 MOBIUS_REBUILD_LAUNCHER=2 \

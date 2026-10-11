@@ -121,7 +121,7 @@ dependencies to start or another attempt to scale down. Each attempt reads an
 immutable root-owned `/etc/mobius-rebuild/attempts/<token>.json`, not a changing
 shared override.
 
-The root-owned `/etc/mobius-rebuild/config.json` is **version 4**: the original
+The root-owned `/etc/mobius-rebuild/config.v4.json` is **version 4**: the original
 `project`, `data_dir`, `deployment_name`, and `name_source` (`explicit` or
 `generated`). The installer derives the name only from an unrenamed live app,
 under its locks, and refuses before changing controller state otherwise:
@@ -139,9 +139,11 @@ under its locks, and refuses before changing controller state otherwise:
   name in the reviewed Compose input that created the app, then rerun the
   installer. Multi-replica app layouts are not managed.
 
-Version 3 is accepted only as the released legacy layout being migrated.
-Reinstalling over a helper-managed app requires version 4, preserves its frozen
-fields exactly, and requires the live app to hold that name. Root-owned
+The released version-3 `/etc/mobius-rebuild/config.json` is read only as the
+source of this migration and is never rewritten; the new worker never reads it,
+and the released worker never reads `config.v4.json`. Reinstalling over a
+helper-managed app requires `config.v4.json`, preserves its frozen fields
+exactly, and requires the live app to hold that name. Root-owned
 controller state under `/var/lib/mobius-rebuild`, including any host-owned
 removal tombstones, is preserved; installation never deletes or resets it.
 
@@ -301,6 +303,51 @@ explicit helper migration. Revision **5** retains launcher revision **2** and
 installs the reviewed boot-admission wrapper. An image update alone does not
 install these host prerequisites. Reinstall from the reviewed checkout only
 during separately authorized host maintenance.
+
+#### Crash-safe migration publication
+
+The released worker (revision 10) accepts only version 3 and the new worker
+only version 4, so the two never share a configuration file. Before any
+controller change, and again under both locks, every existing `config.json` and
+`config.v4.json` must name this exact Compose project and persistent data
+directory; otherwise the installer refuses rather than pair a never-rewritten
+legacy file with a changed topology.
+
+Under both locks, after pinning the admission wrapper and manual adapter, the
+installer stages **every** input the new worker needs. It creates and syncs the
+persistent inbox, then publishes each file with one durable primitive (file
+fsync, atomic rename, directory fsync) in this order: `config.v4.json`, the
+base `compose.yml` snapshot, the unwrapped image override (fresh migrations
+only; a helper-managed app keeps its current attempt pointer), and the four
+systemd units. Each staged input is inert to, or keeps its released meaning for,
+the still-selected released worker under launcher 1.
+
+The **single commit** is the existing durable worker selection: `adopt-self`
+switches `workers.json` (fsync, rename, directory fsync) to the checkout's
+worker. Only then does the same primitive publish launcher revision 2, followed
+by `daemon-reload`, capability publication, and unit enablement. A shell
+failure, SIGKILL, or power loss before the commit leaves launcher 1 and the
+released worker with its own complete inputs. At or after the commit the new
+worker is selected with its complete inputs, under launcher 1 until launcher 2
+is durable. Launcher 1 running the new worker reconciles normally, but every
+replacement `run` refuses and leaves the request queued: replacements are
+unavailable, not unsafe, until the installer is rerun. A rerun is idempotent at
+the commit (`current: revision 13`) and finishes launcher 2 and enablement. The
+failure cleanup, and enabled units after a reboot, therefore only dispatch a
+coherent pair.
+
+Launcher 2 is published only after the commit because it, unlike launcher 1,
+consumes a pending candidate's one trial before running it. Beside the released
+worker after a reboot, it could trial (and burn) a pending exact revision-13
+candidate offered from an official image. Launcher 1 instead runs that candidate,
+which refuses under launcher 1 without changing status, so launcher 1 puts it
+back unchanged; the commit then activates exactly that pending candidate.
+Revision 13 is strictly above revision 12, which earlier unreleased review heads
+used with different bytes and a different configuration path. The high-water
+rule is unchanged: a revision at or below it is never readmitted, including an
+exact revision-13 candidate whose trial already failed. The installer then
+refuses at the commit, leaving the released pair selected (its staged inputs are
+inert to it), and a higher worker revision is required.
 
 The installer refuses **any existing transaction**, including an unwrapped
 legacy rollback whose Start may already have been issued, before changing

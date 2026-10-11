@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -82,12 +83,17 @@ def test_pending_helper_journal_blocks_even_after_lock_acquisition(harness):
   assert "CUTOVER_ALLOWED" not in result.stdout
 
 
-def test_inaccessible_or_missing_helper_lock_fails_closed(harness):
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses discretionary file permissions")
+def test_inaccessible_helper_lock_fails_closed(harness):
   _, _, lock, run = harness
   lock.chmod(0o000)
   denied = run()
   assert denied.returncode != 0
   assert "cannot open" in denied.stderr
+
+
+def test_missing_helper_lock_fails_closed(harness):
+  _, _, lock, run = harness
   lock.unlink()
   missing = run()
   assert missing.returncode != 0
@@ -518,3 +524,168 @@ def test_real_compose_service_selection_does_not_enable_disabled_proxy(tmp_path,
                           env={k: v for k, v in os.environ.items() if k != 'COMPOSE_PROFILES'},
                           check=True, capture_output=True, text=True, timeout=15)
   assert set(result.stdout.split()) == ({'app', 'caddy'} if profile_enabled else {'app'})
+
+
+# ── disposable host-helper harness: controller quiescence ──────────────
+# The real region from scripts/test-host-helper.sh, driven by a fake systemctl
+# whose per-unit `show` output evolves call by call. No real systemctl, Docker
+# or sleep is reachable: PATH is empty and every external is a recorded stub.
+HOST_HARNESS = (Path(__file__).parents[2] / "scripts/test-host-helper.sh").read_text()
+CONTROLLERS = ("mobius-rebuild.service", "mobius-rebuild-reconcile.service")
+
+
+def _quiescence_region() -> str:
+  start = HOST_HARNESS.index("# BEGIN CONTROLLER QUIESCENCE\n")
+  end = HOST_HARNESS.index("# END CONTROLLER QUIESCENCE\n", start)
+  return HOST_HARNESS[start:end]
+
+
+def _unit(active, job="", load="loaded"):
+  return f"LoadState={load}\nActiveState={active}\nJob={job}\n"
+
+
+QUIET = _unit("inactive")
+
+
+def _wait_quiescent(tmp_path, sequences, *, attempts=5):
+  """sequences: unit -> successive `show` outputs (None = command failure).
+
+  The last entry repeats once a sequence is exhausted."""
+  events = tmp_path / "events"
+  units = tmp_path / "units"
+  empty = tmp_path / "empty-path"
+  empty.mkdir(exist_ok=True)
+  for unit in CONTROLLERS:
+    folder = units / unit
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "count").write_text("0\n")
+    entries = sequences.get(unit, [QUIET])
+    for index, entry in enumerate(entries):
+      if entry is None:
+        (folder / f"{index}.fail").write_text("")
+      else:
+        (folder / str(index)).write_text(entry)
+    (folder / "last").write_text(f"{len(entries) - 1}\n")
+  script = f"""set -euo pipefail
+EVENTS={str(events)!r}; UNITS={str(units)!r}
+record() {{ printf '%s\\n' "$*" >> "$EVENTS"; }}
+fail() {{ record FAIL; printf 'FAIL %s\\n' "$*" >&2; exit 1; }}
+sleep() {{ record "sleep $*"; }}
+docker() {{ record DOCKER_CALLED; return 99; }}
+systemctl() {{
+  record "systemctl $*"
+  [ "$1" = show ] || return 97
+  [ "$3 $4 $5 $6" = "--all --property=LoadState --property=ActiveState --property=Job" ] \\
+    || return 98
+  local dir="$UNITS/$2" n last line
+  read -r n < "$dir/count"; read -r last < "$dir/last"
+  printf '%s\\n' "$((n + 1))" > "$dir/count"
+  (( n <= last )) || n=$last
+  [ ! -e "$dir/$n.fail" ] || return 1
+  while IFS= read -r line; do printf '%s\\n' "$line"; done < "$dir/$n"
+}}
+{_quiescence_region()}
+wait_controllers_quiescent {attempts} 2
+echo QUIESCENT
+"""
+  result = subprocess.run([shutil.which("bash"), "-c", script], text=True,
+                          capture_output=True, check=False, timeout=30,
+                          env={"PATH": str(empty)})
+  lines = events.read_text().splitlines() if events.exists() else []
+  return result, lines
+
+
+def _shows(lines):
+  return [line.split()[2] for line in lines if line.startswith("systemctl ")]
+
+
+def test_quiescence_call_site_replaces_is_active_probe():
+  code = "\n".join(line for line in _quiescence_region().splitlines()
+                   if not line.lstrip().startswith("#"))
+  assert "is-active" not in code
+  assert not re.search(r"systemctl (stop|kill|restart|start|reset)", code)
+  assert "CONTROLLER_UNITS=(mobius-rebuild.service mobius-rebuild-reconcile.service)" in code
+  dispatch = HOST_HARNESS.index("  systemctl stop mobius-rebuild.path\n")
+  queued = HOST_HARNESS.index('  nonce=$(queue "$PREVIOUS")\n', dispatch)
+  between = HOST_HARNESS[dispatch:queued]
+  assert "  wait_controllers_quiescent 60 2\n" in between
+  assert "is-active" not in between
+  settlement = HOST_HARNESS.index("# The worker reports before it exits; the launcher settles after it.")
+  revision_check = HOST_HARNESS.index('[[ $(active_revision) == "$expected" ]]', settlement)
+  assert "wait_controllers_quiescent 60 2\n" in HOST_HARNESS[settlement:revision_check]
+  assert "is-active" not in HOST_HARNESS[settlement:revision_check]
+
+
+def test_evolving_activating_deactivating_and_queued_jobs_are_awaited(tmp_path):
+  result, lines = _wait_quiescent(tmp_path, {
+    # is-active would call both of the first two states quiescent.
+    CONTROLLERS[0]: [_unit("activating", "41"), _unit("activating"),
+                     _unit("deactivating"), _unit("inactive")],
+    # Inactive with a queued start job is not fenced; failed+no job is.
+    CONTROLLERS[1]: [_unit("inactive", "57"), _unit("activating", "57"),
+                     _unit("deactivating"), _unit("deactivating"),
+                     _unit("failed", "0")],
+  })
+  assert result.returncode == 0, result.stderr
+  assert "QUIESCENT" in result.stdout
+  assert _shows(lines) == list(CONTROLLERS) * 5
+  assert [line for line in lines if line.startswith("sleep")] == ["sleep 2"] * 4
+  assert "DOCKER_CALLED" not in lines and "FAIL" not in lines
+
+
+@pytest.mark.parametrize("unit", CONTROLLERS)
+@pytest.mark.parametrize("state,job", [
+  ("activating", ""), ("deactivating", ""), ("active", ""), ("reloading", ""),
+  ("inactive", "88"), ("failed", "88"),
+])
+def test_either_controller_busy_or_queued_times_out_bounded(tmp_path, unit, state, job):
+  result, lines = _wait_quiescent(tmp_path, {unit: [_unit(state, job)]}, attempts=3)
+  assert result.returncode != 0
+  assert "QUIESCENT" not in result.stdout
+  assert f"after 3 checks: {unit}={state}/job:{job or 'none'}" in result.stderr
+  assert _shows(lines) == list(CONTROLLERS) * 3
+  assert [line for line in lines if line.startswith("sleep")] == ["sleep 2"] * 2
+  assert all(line.startswith(("systemctl show ", "sleep ")) or line == "FAIL"
+             for line in lines)
+
+
+@pytest.mark.parametrize("rebuild,reconcile", [
+  (_unit("inactive"), _unit("inactive")),
+  (_unit("failed"), _unit("inactive", "0")),
+  (_unit("inactive", "0"), _unit("failed")),
+  # An older seed without the reconcile unit reports it not-found/inactive.
+  (_unit("inactive"), _unit("inactive", load="not-found")),
+])
+def test_inactive_or_failed_without_job_is_accepted_at_once(tmp_path, rebuild, reconcile):
+  result, lines = _wait_quiescent(tmp_path, {CONTROLLERS[0]: [rebuild],
+                                             CONTROLLERS[1]: [reconcile]})
+  assert result.returncode == 0, result.stderr
+  assert _shows(lines) == list(CONTROLLERS)
+  assert not [line for line in lines if line.startswith("sleep")]
+
+
+@pytest.mark.parametrize("unit", CONTROLLERS)
+@pytest.mark.parametrize("evidence,message", [
+  (None, "systemctl show {unit} failed"),
+  ("", "unusable LoadState ''"),
+  ("LoadState=loaded\nActiveState=inactive\n", "unusable Job ''"),
+  ("LoadState=loaded\nJob=\n", "unusable ActiveState ''"),
+  (_unit("inactive", load="masked"), "unusable LoadState 'masked'"),
+  (_unit("inactive", load="bad-setting"), "unusable LoadState 'bad-setting'"),
+  (_unit("inactive", job="start"), "unusable Job 'start'"),
+  (_unit("Inactive"), "unusable ActiveState 'Inactive'"),
+  (_unit("inactive") + "ActiveState=inactive\n", "duplicate systemd property ActiveState"),
+  (_unit("inactive") + "SubState=dead\n", "unexpected systemd property SubState"),
+  (_unit("inactive") + "garbage\n", "unparseable systemd line: garbage"),
+])
+def test_unreadable_or_malformed_evidence_fails_closed_without_retry(
+    tmp_path, unit, evidence, message,
+):
+  # Settle the other unit first so the failure is attributable to `unit`.
+  result, lines = _wait_quiescent(tmp_path, {unit: [evidence, QUIET]})
+  assert result.returncode != 0
+  assert "QUIESCENT" not in result.stdout
+  assert message.format(unit=unit) in result.stderr
+  assert f"cannot prove {unit} is quiescent" in result.stderr
+  assert not [line for line in lines if line.startswith("sleep")]
+  assert _shows(lines) == list(CONTROLLERS[:CONTROLLERS.index(unit) + 1])
