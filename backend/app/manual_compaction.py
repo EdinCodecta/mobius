@@ -274,20 +274,19 @@ async def compact_batch(chat_id: str, body, db):
         # The registered lifetime includes the durable end checkpoint, so Stop
         # and restart cannot report completion while cleanup still uses writer.
         error = None
-        with compacting(chat_id, "compact"):
-          try:
-            return await work()
-          except asyncio.CancelledError:
-            error = "Preparation stopped. Completed sections are saved; no next batch was started."
-          except CompactionError:
-            error = "This batch could not finish safely. Completed sections are saved; the previous session is unchanged."
-          except Exception as exc:
-            log.warning("Manual compaction batch failed (%s)", type(exc).__name__)
-            error = "This batch failed. Completed preparation and the previous session are preserved."
-          finally:
-            await await_ack(get_writer().submit(EndManualCompaction(
-              chat_id=chat_id, recovery_id=recovery_id, batch_id=body.batch_id, error=error,
-            )))
+        try:
+          return await work()
+        except asyncio.CancelledError:
+          error = "Preparation stopped. Completed sections are saved; no next batch was started."
+        except CompactionError:
+          error = "This batch could not finish safely. Completed sections are saved; the previous session is unchanged."
+        except Exception as exc:
+          log.warning("Manual compaction batch failed (%s)", type(exc).__name__)
+          error = "This batch failed. Completed preparation and the previous session are preserved."
+        finally:
+          await await_ack(get_writer().submit(EndManualCompaction(
+            chat_id=chat_id, recovery_id=recovery_id, batch_id=body.batch_id, error=error,
+          )))
         return {"ok": False}
 
       result = await run_batch()
@@ -319,12 +318,17 @@ async def compact_batch(chat_id: str, body, db):
           db.get(models.ChatCompactionDraft, recovery_id), db, db.get(models.Chat, chat_id),
         )}
 
-    task = asyncio.create_task(registered_operation())
-    handle = RecoverySynthesisHandle(chat_id, task)
-    registry.register(handle)
-    try:
-      return await task
-    finally:
-      if registry.get_handle(chat_id, RunnerKind.COMPACTION) is handle:
-        registry.unregister(chat_id, RunnerKind.COMPACTION)
-      registry.discard_starting(chat_id)
+    # The shared compacting signal spans exactly this registered runner. A
+    # pane that reads ``running`` from it therefore also reads ``compacting``
+    # and routes its primary Stop to preparation-only Pause; ordinary Stop
+    # would wait on this transition lock until the batch finished.
+    with compacting(chat_id, "compact"):
+      task = asyncio.create_task(registered_operation())
+      handle = RecoverySynthesisHandle(chat_id, task)
+      registry.register(handle)
+      try:
+        return await task
+      finally:
+        if registry.get_handle(chat_id, RunnerKind.COMPACTION) is handle:
+          registry.unregister(chat_id, RunnerKind.COMPACTION)
+        registry.discard_starting(chat_id)

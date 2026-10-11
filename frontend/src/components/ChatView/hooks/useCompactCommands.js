@@ -1,4 +1,5 @@
-/* Manual compaction owns action latches, bounded status reads, and chat-scoped recovery. */
+/* Manual compaction owns action latches, bounded status reads, chat-scoped
+ * recovery, and which Stop the composer means while context is prepared. */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, jsonOrThrow } from '../../../api/client.js'
 import { getOnlineSnapshot } from '../../../lib/connectivityStore.js'
@@ -10,13 +11,13 @@ const COMPACTION_PROGRESS_TIMEOUT_MS = 15000
 
 export default function useCompactCommands({
   chatId, provisionalNewChat, hidden, serverCompactingKind,
-  activationSettledRef, inputValueRef, setComposerInput, setSendFailure, fetchMessages,
+  activationSettledRef, inputValueRef, setComposerInput, setSendFailure, fetchMessages, stopTurn,
 }) {
   // A "/compact" submission is a chat action, not a turn: it rewrites the live
-  // context instead of asking the model anything.
-  const [compactingChat, setCompactingChat] = useState(false)
+  // context instead of asking the model anything. The ref is the synchronous
+  // admission latch; the state names the chat whose POST is outstanding.
+  const [compactingChatId, setCompactingChatId] = useState(null)
   const compactingChatRef = useRef(false)
-  const compactingChatTargetRef = useRef(null)
   const stoppingCompactionRef = useRef(false)
   const [compactProgressRecord, setCompactProgressRecord] = useState(null)
   const compactProgressRequestRef = useRef(0)
@@ -32,11 +33,6 @@ export default function useCompactCommands({
     return () => { lifecycle.active = false }
   }, [chatId])
 
-  // "/compact" never becomes a message. It asks the backend to replace this
-  // chat's live context with a fresh briefing and reset the provider session;
-  // the visible transcript is untouched and the platform renders the stored
-  // compaction as its own "Context compacted" card. A card action passes no
-  // submitted input, so the owner's unrelated draft is left untouched.
   const cancelCompactProgress = useCallback(() => {
     ++compactProgressRequestRef.current
     compactProgressControllerRef.current?.abort()
@@ -87,6 +83,11 @@ export default function useCompactCommands({
     }
   }, [chatId, hidden, provisionalNewChat, serverCompactingKind, refreshCompactProgress, cancelCompactProgress])
 
+  // "/compact" never becomes a message. It asks the backend to replace this
+  // chat's live context with a fresh briefing and reset the provider session;
+  // the visible transcript is untouched and the platform renders the stored
+  // compaction as its own "Context compacted" card. A card action passes no
+  // submitted input, so the owner's unrelated draft is left untouched.
   async function runCompactCommand(instructions = '', submittedInput = '/compact', recoveryId = null) {
     if (!activationSettledRef.current) return
     if (!chatId || provisionalNewChat) {
@@ -97,12 +98,12 @@ export default function useCompactCommands({
     if (serverCompactingKind === 'compact') return
     if (isProviderSwitchBlocking(chatId)) return
     compactingChatRef.current = true
-    compactingChatTargetRef.current = chatId
-    setCompactingChat(true)
+    setCompactingChatId(chatId)
     if (submittedInput !== null) setComposerInput('')
     setSendFailure(null)
     const targetChatId = chatId
     const lifecycle = compactActionLifecycleRef.current
+    const stillVisible = () => lifecycle?.active && activeCompactChatRef.current === targetChatId
     cancelCompactProgress()
     let completed = false
     try {
@@ -113,26 +114,25 @@ export default function useCompactCommands({
       }), 'Compaction failed')
       // The action response is authoritative even if a server edge started
       // an optional GET during its POST. That older read cannot replace it.
-      if (lifecycle?.active && activeCompactChatRef.current === targetChatId) {
+      if (stillVisible()) {
         cancelCompactProgress()
         setCompactProgressRecord({ chatId: targetChatId, progress: result.progress || null })
       }
       if (result.ok) {
         completed = true
-        if (lifecycle?.active && activeCompactChatRef.current === targetChatId) await fetchMessages({ force: true })
+        if (stillVisible()) await fetchMessages({ force: true })
       }
     } catch (err) {
-      if (!completed && submittedInput !== null && lifecycle?.active && activeCompactChatRef.current === targetChatId) {
-        setComposerInput(compactFailureInput(inputValueRef.current, submittedInput))
-      }
-      if (lifecycle?.active && activeCompactChatRef.current === targetChatId) {
+      if (stillVisible()) {
+        if (!completed && submittedInput !== null) {
+          setComposerInput(compactFailureInput(inputValueRef.current, submittedInput))
+        }
         setSendFailure(sendFailureMessage(err, { online: getOnlineSnapshot() }))
       }
     } finally {
       // Status readback is optional: it must never own the action latch.
       compactingChatRef.current = false
-      compactingChatTargetRef.current = null
-      setCompactingChat(false)
+      setCompactingChatId(null)
       if (lifecycle?.active) void refreshCompactProgress(targetChatId)
     }
   }
@@ -155,5 +155,27 @@ export default function useCompactCommands({
     }
   }
 
-  return { compactingChat, compactingChatTargetRef, compactProgressRecord, runCompactCommand, stopCompactCommand }
+  // The server's compacting window spans the batch runner that makes a pane
+  // read ``running``, so a reopened pane knows preparation is the running work.
+  const preparing = (compactingChatId !== null && compactingChatId === chatId)
+    || serverCompactingKind === 'compact'
+  const compactionProgress = (compactProgressRecord?.chatId === chatId && compactProgressRecord.progress)
+    || (preparing ? { state: 'running' } : null)
+
+  function continueCompaction() {
+    const recoveryId = compactionProgress?.recovery_id
+    if (recoveryId) void runCompactCommand('', null, recoveryId)
+  }
+
+  // Turn Stop clears queued input and waits on the transition lock the batch
+  // holds, so during preparation the composer's Stop is Pause: queued input,
+  // the draft and the previous session stay intact and no next batch starts.
+  function stopComposerWork() {
+    return preparing ? stopCompactCommand() : stopTurn()
+  }
+
+  return {
+    preparing, compactionProgress,
+    runCompactCommand, continueCompaction, stopCompactCommand, stopComposerWork,
+  }
 }

@@ -4166,9 +4166,13 @@ export default function ChatView({
     patchQuestionAnswers,
   ])
 
-  const { compactingChat, compactingChatTargetRef, compactProgressRecord, runCompactCommand, stopCompactCommand } = useCompactCommands({
+  const {
+    preparing: preparingCompaction, compactionProgress,
+    runCompactCommand, continueCompaction, stopCompactCommand, stopComposerWork,
+  } = useCompactCommands({
     chatId, provisionalNewChat, hidden, serverCompactingKind,
     activationSettledRef, inputValueRef, setComposerInput, setSendFailure, fetchMessages,
+    stopTurn: handleStop,
   })
 
   function dispatchMobiusChatCommand(composed) {
@@ -6411,16 +6415,9 @@ export default function ChatView({
             focusComposer={() => focusComposerElement(inputRef.current)}
           />
         <CompactionProgress
-          progress={(compactProgressRecord?.chatId === chatId && compactProgressRecord.progress)
-            || ((compactingChat && compactingChatTargetRef.current === chatId)
-              || serverCompactingKind === 'compact' ? { state: 'running' } : null)}
-          busy={(compactingChat && compactingChatTargetRef.current === chatId)
-            || serverCompactingKind === 'compact'}
-          onContinue={() => {
-            const recoveryId = compactProgressRecord?.chatId === chatId
-              ? compactProgressRecord.progress?.recovery_id : null
-            if (recoveryId) void runCompactCommand('', null, recoveryId)
-          }}
+          progress={compactionProgress}
+          busy={preparingCompaction}
+          onContinue={continueCompaction}
           onStartOver={() => runCompactCommand('', null)}
           onStop={stopCompactCommand}
         />
@@ -6439,7 +6436,7 @@ export default function ChatView({
           listeningRef={listeningRef}
           onManualVoiceEdit={acceptManualEdit}
           onToggleVoice={toggleVoice}
-          onStop={handleStop}
+          onStop={stopComposerWork}
           onSteer={handleSteer}
           canSteer={canSteer}
           showSteer={showSteer}
@@ -6448,7 +6445,7 @@ export default function ChatView({
           canSubmitSteer={canSubmitSteer}
           sendFailure={sendFailure}
           notice={compactionNotice(
-            serverCompactingKind || (compactingChat ? 'compact' : null),
+            serverCompactingKind || (preparingCompaction ? 'compact' : null),
             { sendBlockedBySwitch: providerSwitching },
           )}
           submissionBlocked={

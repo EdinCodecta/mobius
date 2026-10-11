@@ -13,8 +13,8 @@ const deferred = () => {
   return { promise, resolve, reject }
 }
 
-function setup(t) {
-  const reads = [], posts = [], stops = [], drafts = [], failures = [], messages = []
+function setup(t, overrides = {}) {
+  const reads = [], posts = [], stops = [], drafts = [], failures = [], messages = [], turnStops = []
   for (const name of ['compact', 'compactStop', 'compactProgress']) {
     const original = api.chats[name]
     t.after(() => { api.chats[name] = original })
@@ -39,22 +39,23 @@ function setup(t) {
     activationSettledRef: { current: true }, inputValueRef: { current: '' },
     setComposerInput: text => drafts.push(text), setSendFailure: error => failures.push(error),
     fetchMessages: async options => messages.push(options),
+    stopTurn: () => turnStops.push('turn'),
+    ...overrides,
   }
   const hook = renderHook(useCompactCommands, props)
   t.after(() => hook.unmount())
-  return { hook, props, reads, posts, stops, drafts, failures, messages }
+  return { hook, props, reads, posts, stops, drafts, failures, messages, turnStops }
 }
 
 test('resolved compact POST releases busy and admission while optional status GET stays deferred', async t => {
   const { hook, reads, posts, drafts, messages } = setup(t)
   const first = hook.result.current.runCompactCommand('Keep decisions', '/compact Keep decisions')
-  assert.equal(hook.result.current.compactingChat, true)
+  assert.equal(hook.result.current.preparing, true)
   await hook.result.current.runCompactCommand()
   assert.equal(posts.length, 1, 'duplicate action during POST is blocked')
   posts[0].resolve(response({ ok: true, progress: { state: 'completed' } }))
   await first
-  assert.equal(hook.result.current.compactingChat, false)
-  assert.equal(hook.result.current.compactingChatTargetRef.current, null)
+  assert.equal(hook.result.current.preparing, false)
   assert.equal(reads.length, 2)
   assert.equal(reads[0].options.signal.aborted, true, 'superseded entry GET canceled')
   assert.equal(reads[1].options.signal.aborted, false)
@@ -66,7 +67,7 @@ test('resolved compact POST releases busy and admission while optional status GE
   assert.deepEqual(drafts, [''], 'card action preserves draft')
   reads[1].reject(new Error('status failed'))
   await flush()
-  assert.equal(hook.result.current.compactProgressRecord.progress.state, 'completed')
+  assert.equal(hook.result.current.compactionProgress.state, 'completed')
   posts[1].resolve(response({ progress: { state: 'paused', recovery_id: 'recovery-a' } }))
   await second
   assert.equal(posts.length, 2, 'readback never auto-continues')
@@ -100,12 +101,12 @@ test('failed compact restores the submitted slash command without losing a newer
   props.inputValueRef.current = 'new owner draft'
   posts[0].reject(new Error('POST failed'))
   await action
-  assert.equal(hook.result.current.compactingChat, false)
+  assert.equal(hook.result.current.preparing, false)
   assert.equal(drafts.at(-1), 'new owner draft', 'restoration does not overwrite newer input')
   assert.match(failures.at(-1), /couldn’t send/)
   reads[1].reject(new Error('GET failed'))
   await flush()
-  assert.equal(hook.result.current.compactProgressRecord.progress.recovery_id, 'saved')
+  assert.equal(hook.result.current.compactionProgress.recovery_id, 'saved')
 })
 
 test('failed compaction restores a literal draft through the persistence owner', async t => {
@@ -115,7 +116,7 @@ test('failed compaction restores a literal draft through the persistence owner',
   posts[0].reject(new Error('POST failed'))
   await action
   assert.deepEqual(drafts, ['', submitted], 'restoration passes the literal draft, not a state updater')
-  assert.equal(hook.result.current.compactingChat, false)
+  assert.equal(hook.result.current.preparing, false)
 })
 
 test('chat switch cancels status GET and fences late GET/POST errors, draft restoration, and readback', async t => {
@@ -128,8 +129,7 @@ test('chat switch cancels status GET and fences late GET/POST errors, draft rest
   posts[0].reject(new Error('old POST failed'))
   await action
   await flush()
-  assert.equal(hook.result.current.compactProgressRecord.chatId, 'b')
-  assert.equal(hook.result.current.compactProgressRecord.progress.recovery_id, 'new')
+  assert.equal(hook.result.current.compactionProgress.recovery_id, 'new')
   assert.deepEqual(drafts, [''])
   assert.deepEqual(failures, [null])
   assert.deepEqual(messages, [])
@@ -184,7 +184,7 @@ test('progress GET deadline aborts the actual transport without erasing recovery
   await flush()
   assert.equal(transports[0].options.signal.aborted, true)
   assert.equal(transports[0].options.signal.reason.name, 'TimeoutError')
-  assert.equal(hook.result.current.compactProgressRecord.progress.recovery_id, 'saved')
+  assert.equal(hook.result.current.compactionProgress.recovery_id, 'saved')
   t.mock.timers.tick(60000)
   await flush()
   assert.equal(transports.length, 1, 'there is no progress polling or timeout retry')
@@ -201,13 +201,13 @@ test('a server compaction edge GET cannot supersede the authoritative paused POS
   assert.equal(reads.length, 2)
   posts[0].resolve(response({ progress: { state: 'paused', recovery_id: 'continue-me' } }))
   await action
-  assert.equal(hook.result.current.compactingChat, false)
-  assert.equal(hook.result.current.compactProgressRecord.progress.state, 'paused')
+  assert.equal(hook.result.current.preparing, true, 'the server window still owns preparation')
+  assert.equal(hook.result.current.compactionProgress.state, 'paused')
   assert.equal(reads[1].options.signal.aborted, true)
   assert.equal(reads.length, 3, 'final readback stays deferred')
   reads[1].resolve(response({ progress: { state: 'running' } }))
   await flush()
-  assert.equal(hook.result.current.compactProgressRecord.progress.recovery_id, 'continue-me')
+  assert.equal(hook.result.current.compactionProgress.recovery_id, 'continue-me')
   assert.equal(posts.length, 1)
 })
 
@@ -220,7 +220,7 @@ test('a POST from a departed chat activation cannot overwrite a later activation
   await flush()
   posts[0].resolve(response({ ok: true, progress: { state: 'completed' } }))
   await action
-  assert.equal(hook.result.current.compactProgressRecord.progress.recovery_id, 'current')
+  assert.equal(hook.result.current.compactionProgress.recovery_id, 'current')
   assert.equal(reads.length, 3)
   assert.deepEqual(drafts, [''])
   assert.deepEqual(failures, [null])
@@ -257,6 +257,63 @@ test('the progress deadline also cancels a shared-browser read without a transpo
   await flush()
   assert.equal(transports[0].options.signal.aborted, true)
   assert.equal(transports[0].options.signal.reason.name, 'TimeoutError')
-  assert.equal(hook.result.current.compactProgressRecord.progress.recovery_id, 'saved')
+  assert.equal(hook.result.current.compactionProgress.recovery_id, 'saved')
   assert.equal(posts.length, 0)
+})
+
+test('reopened pane primary Stop pauses preparation without the turn Stop that clears queued input', async t => {
+  // A reopened pane has no local action; only the server read says preparation runs.
+  const { hook, props, reads, posts, stops, drafts, failures, turnStops } = setup(t, { serverCompactingKind: 'compact' })
+  const saved = { recovery_id: 'saved', next_chunk: 3, total_chunks: 9 }
+  reads[0].resolve(response({ progress: { state: 'running', ...saved } }))
+  await flush()
+  assert.equal(hook.result.current.preparing, true)
+  const stop = hook.result.current.stopComposerWork()
+  assert.equal(stops.length, 1, 'primary Stop uses preparation-only Pause')
+  assert.deepEqual(turnStops, [], 'turn Stop clears queued input and waits for the whole batch')
+  stops[0].resolve(response({ ok: true }))
+  await stop
+  hook.rerender({ ...props, serverCompactingKind: null })
+  reads.at(-1).resolve(response({ progress: { state: 'paused', ...saved } }))
+  await flush()
+  assert.equal(hook.result.current.preparing, false)
+  assert.deepEqual(hook.result.current.compactionProgress, { state: 'paused', ...saved }, 'completed sections stay resumable')
+  assert.equal(posts.length, 0, 'Pause never starts another synthesis batch')
+  assert.deepEqual(drafts, [], 'unsent composer input is untouched')
+  assert.deepEqual(failures, [])
+  hook.result.current.stopComposerWork()
+  assert.deepEqual(turnStops, ['turn'], 'without preparation, primary Stop is the ordinary turn Stop')
+  assert.equal(stops.length, 1)
+})
+
+test('primary Stop follows the visible chat across A to B to A during a local batch', async t => {
+  const { hook, props, posts, stops, turnStops } = setup(t)
+  const action = hook.result.current.runCompactCommand('', null)
+  assert.equal(hook.result.current.preparing, true)
+  hook.rerender({ ...props, chatId: 'b' })
+  assert.equal(hook.result.current.preparing, false)
+  assert.equal(hook.result.current.compactionProgress, null)
+  hook.result.current.stopComposerWork()
+  assert.deepEqual(turnStops, ['turn'], 'chat B has no preparation to pause')
+  hook.rerender(props)
+  assert.equal(hook.result.current.preparing, true)
+  assert.deepEqual(hook.result.current.compactionProgress, { state: 'running' })
+  void hook.result.current.stopComposerWork()
+  assert.equal(stops.length, 1)
+  assert.equal(stops[0].chatId, 'a')
+  assert.deepEqual(turnStops, ['turn'])
+  stops[0].resolve(response({ ok: true }))
+  posts[0].resolve(response({ progress: { state: 'paused', recovery_id: 'a-draft' } }))
+  await action
+  assert.equal(hook.result.current.preparing, false)
+})
+
+test('a chatless provisional pane never shows preparation or diverts its Stop', async t => {
+  const { hook, props, stops, turnStops } = setup(t)
+  hook.rerender({ ...props, chatId: null, provisionalNewChat: true })
+  assert.equal(hook.result.current.preparing, false)
+  assert.equal(hook.result.current.compactionProgress, null)
+  hook.result.current.stopComposerWork()
+  assert.deepEqual(turnStops, ['turn'])
+  assert.equal(stops.length, 0)
 })

@@ -521,6 +521,91 @@ async def test_stop_owns_admission_before_any_provider_call(client, auth, db, fa
   assert list(transcript_rows.history(row)) == original
 
 
+@pytest.mark.asyncio
+async def test_reopened_pane_reads_preparation_with_running_and_pause_keeps_queued_send(
+    client, auth, db, monkeypatch, fake_synthesis):
+  """A reopened pane has no local action state; the server read alone must tell
+  its primary Stop that the running work is preparation, not a turn."""
+  from concurrent.futures import Future
+  from unittest.mock import patch
+  from app.broadcast import get_broadcast
+  from app.chat_writer import BeginManualCompaction
+  from app.main import app
+
+  chat_id, original = make_chat(client, auth, db, large=True)
+  writer = get_writer()
+  submit = writer.submit
+  admission, calls, delivered = [], [], []
+  admitted, entered = asyncio.Event(), asyncio.Event()
+
+  def held_admission(cmd):
+    if isinstance(cmd, BeginManualCompaction) and not admission:
+      ack = Future()
+      admission.append((cmd, ack))
+      admitted.set()
+      return ack
+    return submit(cmd)
+
+  async def turn(prompt, **_kwargs):
+    calls.append(prompt)
+    if len(calls) == 2:
+      entered.set()
+      await asyncio.Event().wait()
+    return "First completed section"
+
+  async def fake_run_chat(msgs, **kwargs):
+    delivered.append([m.content for m in msgs if m.role == "user"][-1])
+    bc = get_broadcast(kwargs["chat_id"])
+    if bc and bc.running:
+      bc.mark_completed()
+
+  monkeypatch.setattr(writer, "submit", held_admission)
+  monkeypatch.setattr(compaction, "_run_provider_summarize_turn", turn)
+  with patch("app.routes.chats_stream.run_chat", new=fake_run_chat):
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as cli:
+      async def reopened_view():
+        return (await cli.get(f"/api/chats/{chat_id}/runtime", headers=auth)).json()
+
+      worker = asyncio.create_task(cli.post(
+        f"/api/chats/{chat_id}/compact", headers=auth, json={"batch_id": "first"}))
+      send = None
+      try:
+        await asyncio.wait_for(admitted.wait(), 5)
+        for _phase in ("admission", "synthesis"):
+          view = await reopened_view()
+          assert view["running"] is True
+          assert view["compacting"] == "compact"
+          if not entered.is_set():
+            cmd, ack = admission[0]
+            ack.set_result(submit(cmd).result(5))
+            await asyncio.wait_for(entered.wait(), 5)
+        send = asyncio.create_task(cli.post(
+          f"/api/chats/{chat_id}/messages", headers=auth, json={"content": "Queued owner input"}))
+        await asyncio.sleep(0.05)
+        assert not send.done(), "an owner send waits behind preparation"
+        stopped = await cli.post(f"/api/chats/{chat_id}/compact-stop", headers=auth)
+        assert stopped.status_code == 200, stopped.text
+        result = (await asyncio.wait_for(worker, 5)).json()
+        sent = await asyncio.wait_for(send, 5)
+      finally:
+        for task in (worker, send):
+          if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+  assert len(calls) == 2, "Pause started no next synthesis call"
+  assert result["ok"] is False
+  assert result["progress"]["state"] == "paused"
+  assert result["progress"]["next_chunk"] == 1
+  assert sent.status_code == 202, sent.text
+  assert delivered == ["Queued owner input"]
+  assert client.get(f"/api/chats/{chat_id}/compact-progress", headers=auth).json()["progress"]["next_chunk"] == 1
+  db.expire_all()
+  row = db.get(models.Chat, chat_id)
+  assert row.session_id == "original-session"
+  assert list(transcript_rows.history(row))[:len(original)] == original
+
+
 def test_paused_recovery_keeps_original_guidance_for_later_batches(client, auth, db, fake_synthesis):
   chat_id, _ = make_chat(client, auth, db, large=True)
   first = client.post(f"/api/chats/{chat_id}/compact", headers=auth,
