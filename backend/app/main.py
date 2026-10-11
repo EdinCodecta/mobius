@@ -55,6 +55,7 @@ from app.frontend_assets import (
   live_frontend_dir,
   resolve_frontend_dir,
 )
+from app.managed_paths import SERVED_STATIC_DIR
 from app.memory_observability import record_memory_checkpoint
 from app.runtime_provenance import (
   protected_runtime_status,
@@ -1735,7 +1736,7 @@ def _serve_app_static_asset(
   if not source_dir:
     raise HTTPException(status_code=404, detail="Not found.")
 
-  root = (Path(source_dir) / "static").resolve()
+  root = (Path(source_dir) / SERVED_STATIC_DIR).resolve()
   try:
     target = (root / (asset_path or "index.html")).resolve()
   except OSError:

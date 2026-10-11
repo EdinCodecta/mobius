@@ -5326,9 +5326,47 @@ def test_update_package_paths_uses_declarations_not_metadata():
   assert protected == {
     "mobius.json", "index.jsx", "logo.png", "job.sh", "service.py", "setup.sh",
     "requirements.lock", "prompt.md", "guide/SKILL.md", "guide/notes.md", "local.js",
-    "art/module.js", "static/served.js", "seed-source.json",
+    "art/module.js", "static/", "seed-source.json",
   }
   assert protected.isdisjoint({"README.md", "served.js", "guide/undeclared.md", "seed.json"})
+
+
+def test_served_static_conflict_parks_for_the_resolver(
+  client, auth, tmp_path, bypass_url_validation,
+):
+  """Undeclared files below static/ are served, so they are never kept local."""
+  manifest = _simple_manifest("served-static")
+  base = "https://raw.githubusercontent.com/example/served-static/main/"
+  index = (
+    "fetch('/app-assets/served-static/store/rules.txt').then(r => r.text());"
+    " export default () => <div>rules</div>"
+  )
+  work, bare, _ = _make_clone_fixture(tmp_path, index, CLONE_CARDS_V1)
+  (work / "static/store").mkdir(parents=True)
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps(manifest), "static/store/rules.txt": "BASE_POLICY",
+  })
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, index, CLONE_CARDS_V1, bare,
+  )
+  assert installed.status_code == 201, installed.text
+  source_dir = Path(installed.json()["source_dir"])
+  served = client.get("/app-assets/served-static/store/rules.txt")
+  assert served.status_code == 200 and served.text == "BASE_POLICY"
+  (source_dir / "static/store/rules.txt").write_text("LOCAL_POLICY")
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**manifest, "version": "2.0.0"}),
+    "static/store/rules.txt": "UPSTREAM_POLICY",
+  })
+
+  updated = _press_reviewed_update(
+    client, auth, installed.json()["id"], bare, base + "mobius.json",
+  )
+
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["mode"] == "conflict", updated.text
+  assert "static/store/rules.txt" in updated.json()["conflict_paths"]
+  assert client.get("/app-assets/served-static/store/rules.txt").text == "BASE_POLICY"
 
 
 @pytest.mark.parametrize("local", [
@@ -9418,6 +9456,38 @@ def test_update_discovery_fallback_follows_package_id_across_id_change(
     assert response.json()["upstream_commit"]
 
 
+@pytest.mark.parametrize("route", ["update-check", "update-candidate-preview"])
+def test_update_discovery_explicit_stored_address_follows_package_id(
+  client, auth, tmp_path, bypass_url_validation, route,
+):
+  """The row's own address finds its package after a manifest id rename."""
+  manifest = {
+    "id": "pkg-explicit", "name": "Package explicit", "version": "1.0.0",
+    "description": "Binding", "entry": "index.jsx", "source_files": ["cards.js"],
+    "package_id": "urn:uuid:9d4e2b1a-6c3f-5d8e-a2b7-1f0e9c8d7b6a",
+  }
+  base = "https://pkg-explicit.test/repo/"
+  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(manifest)})
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
+    include_source_file=True,
+  )
+  assert installed.status_code == 201, installed.text
+  renamed = {**manifest, "id": "pkg-explicit-renamed", "version": "2.0.0"}
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(renamed)})
+  with patch("app.install._derive_repo_ref", return_value=(bare.as_uri(), "main")):
+    response = client.get(
+      f"/api/apps/{installed.json()['id']}/{route}", headers=auth,
+      params={"manifest_url": installed.json()["manifest_url"]},
+    )
+  assert response.status_code == 200, response.text
+  if route == "update-check":
+    assert response.json()["update_available"] is True
+  else:
+    assert response.json()["upstream_commit"]
+
+
 def test_reviewed_update_applies_package_id_rename_through_stored_address(
   client, auth, db, tmp_path, bypass_url_validation,
 ):
@@ -9774,6 +9844,44 @@ def test_stored_address_binding_does_not_borrow_another_installed_package(
   assert result.status_code == 409, result.text
 
 
+@pytest.mark.parametrize("operation", ["preview", "install"])
+def test_live_row_wins_a_stored_address_shared_with_a_tombstone(
+  client, auth, db, bypass_url_validation, operation,
+):
+  """The live app binds an address it shares with an earlier tombstone."""
+  manifest = {**_simple_manifest("duplicate-proof"), "package_id": "app.example.duplicate"}
+  base = "https://duplicate-proof.test/repo/"
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  shared = base.rstrip("/") + "#manifest-id=duplicate-proof"
+  # The tombstone gets the lower id, so an unordered lookup could return it.
+  old = models.App(
+    name="Old duplicate", slug="old-duplicate",
+    source_dir="/tmp/unused-duplicate-proof",
+    manifest_url="https://elsewhere.test/repo#manifest-id=old-duplicate",
+    deleted_at=datetime(2026, 1, 1, tzinfo=UTC),
+  )
+  db.add(old)
+  db.commit()
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    live = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert live.status_code == 201, live.text
+  assert live.json()["manifest_url"] == shared and live.json()["id"] > old.id
+  old.manifest_url = shared
+  db.commit()
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    result = client.post(f"/api/apps/{operation}", headers=auth, json={
+      "manifest_url": shared,
+    })
+  assert result.status_code in (200, 201), result.text
+  if operation == "install":
+    assert result.json()["id"] == live.json()["id"]
+
+
 @pytest.mark.asyncio
 async def test_ancillary_bundle_comparison_uses_same_root_and_upstream_deletions(tmp_path):
   manifest = _simple_manifest("compare-bundle")
@@ -10123,12 +10231,21 @@ async def test_ancillary_source_check_and_tree_writes_leave_event_loop(monkeypat
     assert (source_path.parent / "README.md").read_bytes() == expected
     Path(out_path).write_bytes(b"identical bundle")
 
+  removed = []
+  rmtree = install.shutil.rmtree
+
+  def record_rmtree(path, *args, **kwargs):
+    removed.append(threading.get_ident())
+    return rmtree(path, *args, **kwargs)
+
   monkeypatch.setattr(install, "_source_completeness", check_source)
   monkeypatch.setattr(Path, "write_bytes", record_write)
   monkeypatch.setattr(install, "compile_jsx", compile_tree)
+  monkeypatch.setattr(install.shutil, "rmtree", record_rmtree)
   assert await install._kept_local_bundle_unchanged(
     tree, manifest, {}, {"README.md": b"upstream"}, ["README.md"],
   )
+  assert len(removed) == 1 and removed[0] != event_loop_thread
   assert len(checked) == 1 and checked[0] != event_loop_thread
   assert len(writes) == 3 and all(thread != event_loop_thread for thread in writes)
   assert len(entries) == 2 and entries[0] == entries[1]

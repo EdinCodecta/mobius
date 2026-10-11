@@ -585,6 +585,11 @@ def _find_install_identity_row(
   existing = (
     db.query(models.App)
     .filter(models.App.manifest_url == canonical)
+    # Rows can share an address; choose deterministically, as below.
+    .order_by(
+      case((models.App.deleted_at.is_(None), 0), else_=1),
+      models.App.id.asc(),
+    )
     .first()
   )
   if existing is None:
@@ -1290,9 +1295,11 @@ def committed_conflict_marker_paths(
 def _update_package_paths(
   source_dir: str | Path, incoming_manifest: dict,
 ) -> set[str] | None:
-  """Protect declarations on either side and installed static destinations.
+  """Protect declarations on either side and everything the app serves.
 
-  None protects every path when the local package contract cannot be read.
+  A trailing slash protects a whole directory: the asset route serves every
+  file below SERVED_STATIC_DIR, declared or not. None protects every path
+  when the local package contract cannot be read.
   """
   try:
     raw = app_git.read_blob(source_dir, app_git.LOCAL_BRANCH, "mobius.json") or b""
@@ -1305,12 +1312,9 @@ def _update_package_paths(
     json.JSONDecodeError, ManifestContractError, RecursionError,
   ):
     return None
-  paths = {"mobius.json"}
+  paths = {"mobius.json", f"{managed_paths.SERVED_STATIC_DIR}/"}
   for side in (incoming_manifest, local_manifest):
     paths.update(package_input_paths(side))
-    paths.update(
-      f"static/{dest}" for dest in static_asset_entries(side.get("static_assets"))
-    )
   return paths
 
 
@@ -1331,7 +1335,9 @@ async def _kept_local_bundle_unchanged(
   )
   if source_check.errors:
     return False
-  with tempfile.TemporaryDirectory(prefix="mobius-ancillary-check-") as temp:
+  # Creation and removal touch disk; keep both off the event loop.
+  temp = await asyncio.to_thread(tempfile.mkdtemp, prefix="mobius-ancillary-check-")
+  try:
     root = Path(temp).resolve() / "source"
     output = Path(temp) / "bundle.js"
 
@@ -1372,6 +1378,8 @@ async def _kept_local_bundle_unchanged(
       raise HTTPException(503, "JavaScript builder is busy; retry the update.") from exc
     except (RuntimeError, OSError, UnicodeError, KeyError, HTTPException):
       return False
+  finally:
+    await asyncio.to_thread(shutil.rmtree, temp, ignore_errors=True)
 
 
 def committed_pending_resolution(

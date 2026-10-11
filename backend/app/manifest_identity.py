@@ -34,6 +34,11 @@ def requested_manifest_source(manifest_url: str) -> tuple[str, str | None]:
   return stored_manifest_fetch_url(manifest_url), manifest_id
 
 
+def same_permanent_package(manifest: dict, package_id: str | None) -> bool:
+  """Whether a manifest keeps the installed row's permanent `package_id`."""
+  return bool(package_id) and manifest.get("package_id") == package_id
+
+
 def require_bound_manifest(
   manifest: dict, bound_id: str | None, package_id: str | None = None,
 ) -> None:
@@ -43,7 +48,7 @@ def require_bound_manifest(
   carrying that same `package_id` is the same package even if its manifest id
   changed without `previous_id`, as the installer's identity rules allow.
   """
-  if package_id and manifest.get("package_id") == package_id:
+  if same_permanent_package(manifest, package_id):
     return
   if bound_id is not None and bound_id not in (
     manifest.get("id"), manifest.get("previous_id"),
