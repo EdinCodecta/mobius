@@ -401,7 +401,7 @@ if [[ $public_host != "$DOMAIN" ]]; then
   resolved=$(getent hosts "$public_host" | awk 'NR == 1 {print $1}') || fail "cannot resolve $public_host"
   [[ $resolved == 127.0.0.1 ]] || fail "$public_host does not resolve to loopback; refusing to probe a real host"
 fi
-git init -q --bare "$RELEASES"
+git init -q --bare --initial-branch=main "$RELEASES"
 git -C "$ROOT" push -q "$RELEASES" "$PREVIOUS:refs/heads/main" "$TARGET:refs/mixed-upgrade/target" \
   || fail "cannot publish the releases locally"
 git clone -q "$RELEASES" "$CHECKOUT" || fail "cannot clone the operator checkout"

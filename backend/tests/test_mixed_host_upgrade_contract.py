@@ -74,6 +74,49 @@ def test_host_proof_uses_root_owned_source_and_the_reviewed_historical_pair():
   assert "safe.directory" not in json.dumps(job)
 
 
+@pytest.mark.parametrize("default_branch", ["master", "trunk"])
+def test_operator_clone_checks_out_previous_main_and_fast_forwards_to_target(tmp_path, default_branch):
+  home = tmp_path / "home"
+  home.mkdir()
+  (home / ".gitconfig").write_text(f"[init]\n\tdefaultBranch = {default_branch}\n")
+  env = {"PATH": CLEAN_PATH, "HOME": str(home), "GIT_CONFIG_NOSYSTEM": "1"}
+  source = tmp_path / "source"
+  source.mkdir()
+
+  def git(*args):
+    return subprocess.run(
+      ["git", "-C", str(source), *args], env=env, capture_output=True,
+      text=True, check=True, timeout=10,
+    ).stdout.strip()
+
+  git("init", "-q", "--initial-branch=main")
+  (source / ".gitignore").write_text(".env\n")
+  (source / "release").write_text("previous\n")
+  git("add", ".")
+  git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "previous")
+  previous = git("rev-parse", "HEAD")
+  (source / "release").write_text("target\n")
+  git("add", ".")
+  git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "target")
+  target = git("rev-parse", "HEAD")
+  variables = {"ROOT": str(source), "RELEASES": str(tmp_path / "releases.git"),
+               "CHECKOUT": str(tmp_path / "operator"), "PREVIOUS": previous, "TARGET": target}
+  program = "\n".join(f"{key}={shlex.quote(value)}" for key, value in variables.items())
+  program += '\nfail() { echo "$*" >&2; exit 71; }\n'
+  program += SOURCE[SOURCE.index("checkout_clean() {"):SOURCE.index('fresh_host_preflight "$ROOT"')]
+  program += SOURCE[SOURCE.index("git init -q --bare"):SOURCE.index('echo "1. the previous release')]
+  program += '\n[[ $(git -C "$CHECKOUT" symbolic-ref --short HEAD) == main ]]\n'
+  program += '[[ $(git -C "$CHECKOUT" rev-parse HEAD) == "$PREVIOUS" ]]\n'
+  program += '[[ $(cat "$CHECKOUT/release") == previous ]]\n'
+  program += 'git -C "$ROOT" push -q "$RELEASES" "$TARGET:refs/heads/main"\n'
+  program += 'git -C "$CHECKOUT" pull -q --ff-only\n'
+  program += '[[ $(git -C "$CHECKOUT" rev-parse HEAD) == "$TARGET" ]]\n'
+  program += '[[ $(cat "$CHECKOUT/release") == target ]]\ncheckout_clean\n'
+  result = _bash(program, env=env)
+  assert result.returncode == 0, (result.stdout, result.stderr)
+  assert "remote HEAD refers to nonexistent ref" not in result.stderr
+
+
 def _region(name: str) -> str:
   return SOURCE[SOURCE.index(f"# BEGIN {name}\n"):SOURCE.index(f"# END {name}\n")]
 
@@ -523,7 +566,7 @@ def test_operator_steps_run_in_the_order_the_guards_require():
     'exec env -i PATH="$CLEAN_PATH"',
     'fresh_host_preflight "$ROOT"',
     ">>/etc/hosts",
-    'git init -q --bare "$RELEASES"',
+    'git init -q --bare --initial-branch=main "$RELEASES"',
     "up -d --no-build --no-deps app",
     "the previous image is not the official",
     "the previous image records build",
