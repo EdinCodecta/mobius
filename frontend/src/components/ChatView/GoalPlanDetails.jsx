@@ -3,6 +3,9 @@
 import { Check } from '@openai/apps-sdk-ui/components/Icon'
 import { goalTaskDisplayStatus } from './goalProgress'
 import { goalHelpers } from './goalHelpers'
+import {
+  HELPER_AWAITING_PARENT_LABEL, isHelperAwaitingParent, isWorkingHelperStatus,
+} from './workingHelper.js'
 
 function taskMeta(task, tasksById) {
   if (task.status === 'running') {
@@ -21,6 +24,13 @@ function taskMeta(task, tasksById) {
   return waiting.length ? `Waiting for ${waiting.join(' + ')}` : 'Pending'
 }
 
+// A task whose helper asked a question names who owes the answer.
+function awaitingParentTaskMeta(helpers) {
+  return helpers.some(node => isWorkingHelperStatus(node.status))
+    ? `In progress · helper ${HELPER_AWAITING_PARENT_LABEL.toLowerCase()}`
+    : HELPER_AWAITING_PARENT_LABEL
+}
+
 function delegationMeta(node) {
   const state = node.status === 'completed'
     ? 'Complete'
@@ -32,10 +42,23 @@ function delegationMeta(node) {
           ? 'Cancelled'
           : node.status === 'stopped'
             ? 'Stopped'
-          : node.status === 'needs_input'
-            ? 'Needs an answer'
+          : isHelperAwaitingParent(node)
+            ? HELPER_AWAITING_PARENT_LABEL
             : 'Needs review'
   return state
+}
+
+/* The exact saved question stays inspectable here, as a record addressed to
+   the coordinating agent rather than an answer control for the owner. */
+function HelperQuestionRecord({ question }) {
+  if (!question?.text) return null
+  return <div className="chat__goal-helper-question">
+    <span className="chat__goal-task-meta">Asked its coordinating agent</span>
+    <p>{question.text}</p>
+    {!!question.options?.length && <span className="chat__goal-task-meta">
+      Options offered: {question.options.join(' · ')}
+    </span>}
+  </div>
 }
 
 function GoalPlanRow({ title, status, meta, depth, emphasized, children }) {
@@ -89,8 +112,10 @@ export default function GoalPlanDetails({ plan, holdReason = null }) {
       status={goalTaskDisplayStatus(task, helpers)}
       depth={depth}
       emphasized={task.ready_to_verify ? 'verify' : task.ready ? 'ready' : ''}
-      meta={goalTaskDisplayStatus(task, helpers) !== task.status
-        ? 'In progress' : task.ready_to_verify ? 'Ready to verify' : taskMeta(task, tasksById)}
+      meta={helpers.some(isHelperAwaitingParent)
+        ? awaitingParentTaskMeta(helpers)
+        : goalTaskDisplayStatus(task, helpers) !== task.status
+          ? 'In progress' : task.ready_to_verify ? 'Ready to verify' : taskMeta(task, tasksById)}
     >
       {children}
     </GoalPlanRow>
@@ -108,6 +133,7 @@ export default function GoalPlanDetails({ plan, holdReason = null }) {
           {allHelpers.map(node => <li key={node.id}>
             <span>{node.title || tasksById.get(node.plan_task)?.title || 'Unassigned helper'}</span>
             <span className="chat__goal-task-meta">{delegationMeta(node)}</span>
+            {isHelperAwaitingParent(node) && <HelperQuestionRecord question={node.question} />}
           </li>)}
         </ul>
       </details>}
