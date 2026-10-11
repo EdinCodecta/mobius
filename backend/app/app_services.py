@@ -34,8 +34,8 @@ from app.applied_app_runtime import AppliedRuntimeUnavailable, hold_runtime, run
 from app.browser_access import BrowserLineage, require_live
 from app.config import get_settings
 from app.manifest_contract import (
-  SERVICE_REQUEST_MAX_BYTES, SERVICE_TRANSFER_MAX_BYTES,
-  accepted_service_route_limits, service_route_key,
+  SERVICE_REQUEST_MAX_BYTES,
+  accepted_service_max_bytes, accepted_service_route_limits, service_route_key,
 )
 
 
@@ -300,15 +300,10 @@ def service_contract(app, *, access: str) -> dict:
 
 def service_max_bytes(service: dict) -> int:
   """The one reviewed serialized request/response ceiling, including old grants."""
-  request_limit = service.get("max_request_bytes", SERVICE_REQUEST_MAX_BYTES)
-  response_limit = service.get("max_response_bytes", SERVICE_REQUEST_MAX_BYTES)
-  if (
-    type(request_limit) is not int or type(response_limit) is not int
-    or request_limit != response_limit
-    or not 1 <= request_limit <= SERVICE_TRANSFER_MAX_BYTES
-  ):
+  ceiling = accepted_service_max_bytes(service)
+  if ceiling is None:
     raise HTTPException(503, "Accepted app service transfer limit is invalid.")
-  return request_limit
+  return ceiling
 
 
 def _accepted_transfer_limits(service: dict) -> tuple[int, dict[tuple[str, str], int]]:

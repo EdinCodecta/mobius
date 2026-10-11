@@ -1737,6 +1737,51 @@ def test_route_ceiling_matches_one_canonical_once_decoded_path():
   assert app_services.exchange_max_bytes({}, None, None) == 8 * MIB
 
 
+def test_route_ceilings_are_bounded_by_the_exact_accepted_whole_grant():
+  def whole(max_bytes, *limits):
+    return {"max_request_bytes": max_bytes, "max_response_bytes": max_bytes,
+            "route_limits": list(limits)}
+
+  # A ceiling equal to its grant is valid, including at the platform maximum
+  # and under the 8 MiB default of a service accepted without whole fields.
+  exact = whole(1024, _route_limit("GET", "/actor", 1024))
+  assert app_services.exchange_max_bytes(exact, "GET", "actor") == 1024
+  top = whole(60 * MIB, _route_limit("GET", "/actor", 60 * MIB))
+  assert app_services.exchange_max_bytes(top, "GET", "actor") == 60 * MIB
+  legacy = {"route_limits": [_route_limit("GET", "/actor", 8 * MIB)]}
+  assert app_services.exchange_max_bytes(legacy, "GET", "actor") == 8 * MIB
+
+  for service in (
+    whole(1024, _route_limit("GET", "/actor", 2048)),
+    {"route_limits": [_route_limit("GET", "/actor", 8 * MIB + 1)]},
+  ):
+    with pytest.raises(HTTPException) as refused:
+      app_services.exchange_max_bytes(service, "POST", "unrelated")
+    assert (refused.value.status_code, refused.value.detail) == (
+      503, "Accepted app service route limits are invalid.",
+    )
+
+
+@pytest.mark.parametrize(("request_bytes", "response_bytes"), [
+  (1024.0, 1024.0), (True, True), (1024, 1024.0), (1024.0, 1024), (1024, True),
+  (1024, 2048), (0, 0), (60 * MIB + 1, 60 * MIB + 1), ("1024", "1024"), (None, None),
+  (1024, "omitted"), ("omitted", 1024),
+])
+def test_malformed_accepted_whole_grant_disables_the_service(request_bytes, response_bytes):
+  from app.manifest_contract import accepted_service_max_bytes
+
+  service = {"route_limits": [_route_limit("GET", "/actor", 1)]}
+  for key, value in (("max_request_bytes", request_bytes), ("max_response_bytes", response_bytes)):
+    if value != "omitted":
+      service[key] = value
+  assert accepted_service_max_bytes(service) is None
+  with pytest.raises(HTTPException) as refused:
+    app_services.exchange_max_bytes(service, "GET", "actor")
+  assert (refused.value.status_code, refused.value.detail) == (
+    503, "Accepted app service transfer limit is invalid.",
+  )
+
+
 @pytest.mark.parametrize("route_limits", [
   {"GET /actor": 1024},
   [["GET", "/actor", 1024]],

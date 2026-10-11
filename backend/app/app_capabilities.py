@@ -15,7 +15,9 @@ from copy import deepcopy
 from typing import Any
 from urllib.parse import urlsplit
 
-from app.manifest_contract import SERVICE_REQUEST_MAX_BYTES, accepted_service_route_limits
+from app.manifest_contract import (
+  SERVICE_REQUEST_MAX_BYTES, accepted_service_max_bytes, accepted_service_route_limits,
+)
 
 
 CONTRACT_SCHEMA = 6
@@ -951,13 +953,17 @@ def _unreadable_route_limits(contract: dict[str, Any]) -> bool:
   """Whether a stored contract carries route ceilings the runtime would refuse.
 
   Absence and an empty list mean no ceilings, exactly as the runtime reads
-  them; any other value must pass the shared strict parser.
+  them; any other value must pass the shared strict parser, bounded by the
+  service's whole grant just as the runtime bounds it. A ceiling above that
+  grant, or any ceiling under a whole grant the runtime itself refuses, makes
+  the list unreadable, so a disabled service is never ranked as narrower.
   """
   service = contract.get("service")
-  return (
-    isinstance(service, dict) and "route_limits" in service
-    and accepted_service_route_limits(service["route_limits"]) is None
-  )
+  if not isinstance(service, dict) or "route_limits" not in service:
+    return False
+  ceiling = accepted_service_max_bytes(service)
+  routes = accepted_service_route_limits(service["route_limits"], ceiling)
+  return routes is None or (ceiling is None and routes != {})
 
 
 def _route_ceilings(value: Any) -> dict[tuple[str, str], int] | None:

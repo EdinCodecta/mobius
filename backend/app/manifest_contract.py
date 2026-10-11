@@ -446,6 +446,26 @@ def is_service_route_path(path) -> bool:
   )
 
 
+def accepted_service_max_bytes(service: Mapping) -> int | None:
+  """A stored service's whole per-direction ceiling, or None when not exactly well formed.
+
+  The one reading of an accepted `max_request_bytes`/`max_response_bytes`
+  pair, shared by runtime enforcement and update review. Both directions must
+  be the same integer (not a bool or float that merely compares equal) within
+  the platform maximum. A service accepted before these fields existed had the
+  8 MiB default.
+  """
+  request_bytes = service.get("max_request_bytes", SERVICE_REQUEST_MAX_BYTES)
+  response_bytes = service.get("max_response_bytes", SERVICE_REQUEST_MAX_BYTES)
+  if (
+    type(request_bytes) is not int or type(response_bytes) is not int
+    or request_bytes != response_bytes
+    or not 1 <= request_bytes <= SERVICE_TRANSFER_MAX_BYTES
+  ):
+    return None
+  return request_bytes
+
+
 def accepted_service_route_limits(
   route_limits, max_bytes: int | None = None,
 ) -> dict[tuple[str, str], int] | None:

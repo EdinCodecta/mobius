@@ -1169,3 +1169,138 @@ def test_unreadable_route_limits_alone_keep_a_service_under_review(stored):
   # refuse, so it is never mistaken for complete revocation.
   installed, _digest = contract_and_digest(_routed([_limit("GET", "/actor", 1)]))
   assert diff_contracts(installed, {"schema": 6, "service": {"route_limits": stored}})["widens"] is True
+
+
+_OMITTED = object()
+
+
+def _stored_grant(route_limits, *, request=1024, response=1024):
+  """An accepted service carrying raw stored whole and route ceilings.
+
+  `_OMITTED` drops a whole-grant field, as in a service accepted before
+  those fields existed.
+  """
+  contract = json.loads(json.dumps(contract_and_digest(_routed(None, max_bytes=1024))[0]))
+  service = contract["service"]
+  for key, value in (("max_request_bytes", request), ("max_response_bytes", response)):
+    if value is _OMITTED:
+      del service[key]
+    else:
+      service[key] = value
+  service["route_limits"] = route_limits
+  return contract
+
+
+def _runtime_refuses(contract):
+  from types import SimpleNamespace
+  from fastapi import HTTPException
+  from app import app_services
+
+  try:
+    app_services.service_contract(SimpleNamespace(capability_contract=contract), access="public")
+  except HTTPException as exc:
+    assert exc.status_code == 503
+    return True
+  return False
+
+
+def test_route_ceiling_above_the_whole_grant_needs_review_unchanged_recovered_or_introduced():
+  # The runtime bounds every route ceiling by the service's whole grant, so
+  # this stored service is disabled; ranking 2048 -> 1024 as "lower" would
+  # silently enable it, and an unchanged copy is still one the runtime refuses.
+  over = _stored_grant([_accepted(request=2048, response=2048)])
+  fit = _stored_grant([_accepted(request=1024, response=1024)])
+  assert _runtime_refuses(over) and not _runtime_refuses(fit)
+
+  assert diff_contracts(over, over) == {
+    "unknown_previous": False, "widens": True, "added": [], "removed": [], "changed": [],
+  }
+  recovery = diff_contracts(over, fit)
+  assert recovery["changed"] == ["service.route_limits"] and recovery["widens"] is True
+  assert diff_contracts(fit, over)["widens"] is True  # reverse: raise past the grant
+
+  # Lowering the whole grant beneath an unchanged route ceiling disables the
+  # service too, and restoring it re-enables it; both need review.
+  roomy = _stored_grant([_accepted(request=2048, response=2048)], request=2048, response=2048)
+  assert not _runtime_refuses(roomy)
+  lowered = diff_contracts(roomy, over)
+  assert lowered["changed"] == ["service.max_request_bytes", "service.max_response_bytes"]
+  assert lowered["widens"] is True
+  assert diff_contracts(over, roomy)["widens"] is True
+
+
+def test_route_ceiling_equal_to_the_whole_grant_is_readable_and_needs_no_review():
+  unchanged = {
+    "unknown_previous": False, "widens": False, "added": [], "removed": [], "changed": [],
+  }
+  fit = _stored_grant([_accepted(request=1024, response=1024)])
+  assert diff_contracts(fit, json.loads(json.dumps(fit))) == unchanged
+  assert diff_contracts(fit, _stored_grant([_accepted(request=512, response=512)]))["widens"] is False
+
+  top = 60 * MIB
+  ceiling = _stored_grant([_accepted(request=top, response=top)], request=top, response=top)
+  assert not _runtime_refuses(ceiling)
+  assert diff_contracts(ceiling, json.loads(json.dumps(ceiling))) == unchanged
+
+
+def test_route_ceilings_of_a_legacy_service_are_bounded_by_its_8_mib_default():
+  legacy_fit = _stored_grant(
+    [_accepted(request=8 * MIB, response=8 * MIB)], request=_OMITTED, response=_OMITTED,
+  )
+  legacy_over = _stored_grant(
+    [_accepted(request=8 * MIB + 1, response=8 * MIB + 1)], request=_OMITTED, response=_OMITTED,
+  )
+  assert not _runtime_refuses(legacy_fit) and _runtime_refuses(legacy_over)
+  assert diff_contracts(legacy_fit, json.loads(json.dumps(legacy_fit)))["widens"] is False
+  assert diff_contracts(legacy_over, legacy_over)["widens"] is True
+  assert diff_contracts(legacy_over, legacy_fit)["widens"] is True  # recovery enables it
+  assert diff_contracts(legacy_fit, legacy_over)["widens"] is True
+
+
+@pytest.mark.parametrize(("request_bytes", "response_bytes"), [
+  (1024.0, 1024.0), (True, True), (1024, 1024.0), (1024, True),
+  (1024, 2048), (2048, 1024), (0, 0), (-1, -1),
+  (60 * MIB + 1, 60 * MIB + 1), ("1024", "1024"), (None, None),
+  (1024, _OMITTED), (_OMITTED, 1024),
+], ids=lambda value: "omitted" if value is _OMITTED else json.dumps(value))
+def test_route_ceilings_under_a_whole_grant_the_runtime_refuses_need_review(
+  request_bytes, response_bytes,
+):
+  # Each route ceiling is no larger than the valid whole grant, so only reading
+  # the whole grant exactly as the runtime does can tell this service is off.
+  refused = _stored_grant(
+    [_accepted(request=1, response=1)], request=request_bytes, response=response_bytes,
+  )
+  fit = _stored_grant([_accepted(request=1, response=1)])
+  assert _runtime_refuses(refused) and not _runtime_refuses(fit)
+  assert diff_contracts(refused, refused)["widens"] is True
+  assert diff_contracts(refused, fit)["widens"] is True
+  assert diff_contracts(fit, refused)["widens"] is True
+  revoked = {key: value for key, value in refused.items() if key != "service"}
+  assert diff_contracts(refused, revoked)["widens"] is False
+
+
+@pytest.mark.parametrize("revoked_service", [
+  "omitted", None, False, {},
+  {"id": None, "entry": None, "access": False, "aliases": [], "route_limits": None},
+  {"route_limits": []}, {"max_request_bytes": None, "max_response_bytes": None},
+], ids=json.dumps)
+@pytest.mark.parametrize("stored", [
+  {"route": 2048, "whole": 1024},
+  {"route": 8 * MIB + 1, "whole": _OMITTED},
+  {"route": 1, "whole": 1024.0},
+], ids=lambda value: json.dumps(value, default=lambda _: "omitted"))
+def test_complete_service_revocation_never_widens_from_a_route_ceiling_the_grant_refuses(
+  revoked_service, stored,
+):
+  installed = _stored_grant(
+    [_accepted(request=stored["route"], response=stored["route"])],
+    request=stored["whole"], response=stored["whole"],
+  )
+  assert _runtime_refuses(installed)
+  candidate = {key: value for key, value in installed.items() if key != "service"}
+  if revoked_service != "omitted":
+    candidate["service"] = revoked_service
+  assert diff_contracts(installed, candidate)["widens"] is False
+  # The same refused service that actually remains is still reviewed.
+  assert diff_contracts(installed, installed)["widens"] is True
