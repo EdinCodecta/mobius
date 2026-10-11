@@ -5317,7 +5317,7 @@ async def _install_candidate(
     db.rollback()
     journal.rollback_materialization()
     raise git_source_error(
-      "The installed version was left unchanged.", exc,
+      "The installed version was left unchanged.", exc, failure=f"{exc}.",
     ) from exc
   except (HTTPException, _UncheckedPythonTree):
     db.rollback()

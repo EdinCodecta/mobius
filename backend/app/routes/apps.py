@@ -1118,7 +1118,7 @@ def _validate_pending_update(repo: Path, receipt: dict) -> _PendingUpdatePlan:
     )
   except app_git.HistoryIncomplete as exc:
     raise install.git_source_error(
-      "The installed version was left unchanged.", exc,
+      "The installed version was left unchanged.", exc, failure=f"{exc}.",
     ) from exc
   if merge.status != "conflict" or not merge.conflict_paths:
     raise _conflict_state_changed()

@@ -4554,6 +4554,25 @@ def test_update_candidate_for_a_packaged_app_matches_only_its_package(
   assert routes._update_candidate_matches_installed(installed, url, manifest, None)
 
 
+def test_incomplete_history_tells_the_owner_why(tmp_path, monkeypatch):
+  from fastapi import HTTPException
+  from app.routes import apps as routes
+
+  monkeypatch.setattr(routes.app_git, "merge_in_progress", lambda repo: False)
+  monkeypatch.setattr(install, "pending_update_resolved", lambda *args: False)
+  monkeypatch.setattr(install, "pending_update_worktree", lambda repo: tmp_path / "none")
+
+  def hidden_base(repo):
+    raise app_git.HistoryIncomplete("The app's Git history is incomplete")
+
+  monkeypatch.setattr(routes.app_git, "merge_upstream", hidden_base)
+  with pytest.raises(HTTPException) as caught:
+    routes._validate_pending_update(tmp_path, {"upstream_commit": "upstream"})
+  assert caught.value.detail["message"] == (
+    "The app's Git history is incomplete. The installed version was left unchanged."
+  )
+
+
 def test_conflict_resolver_batch_deduplicates_and_sorts_canonical_sources(
   db, tmp_path, monkeypatch,
 ):
