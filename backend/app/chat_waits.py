@@ -158,7 +158,7 @@ def _closed_wait_goal(db: Session, row: models.ChatWait) -> bool:
 
 def _held_wait_goal(db: Session, row: models.ChatWait) -> bool:
   goal = db.get(models.ChatGoal, row.goal_id) if row.goal_id else None
-  return goal is not None and goal.chat_id == row.chat_id and goal.status in ("stopped", "held")
+  return goal is not None and goal.chat_id == row.chat_id and goal.status == "stopped"
 
 # Cancellation is synchronous at the API/chat-lifecycle boundary while checks
 # run in the supervisor's event loop. A None PID reserves an admission while

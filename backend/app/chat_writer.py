@@ -4309,6 +4309,24 @@ class ChatWriterActor:
     )
     run.goal_objective = cmd.objective
     run.goal_id = goal_id
+    if goal_was_missing:
+      # A helper spawned before promotion has no Goal snapshot yet. Adopt only
+      # this physical attempt's helpers, never an earlier turn sharing its root.
+      frontier = [cmd.chat_id]
+      first = True
+      while frontier:
+        rows = db.query(models.Delegation).filter(
+          models.Delegation.parent_chat_id.in_(frontier),
+          models.Delegation.goal_id.is_(None),
+          models.Delegation.app_id.is_(None),
+          models.Delegation.source_work_id.is_(None),
+          *((models.Delegation.parent_root_run_id == root_id,
+             models.Delegation.created_at >= run.started_at) if first else ()),
+        ).all()
+        for row in rows:
+          row.goal_id = goal_id
+        frontier = [row.child_chat_id for row in rows]
+        first = False
     if (identity_changed or goal_was_missing or reopening) and not _commit_or_rollback(db):
       raise _PersistFailed("PromoteRunToGoal did not persist")
     if not identity_changed and not goal_was_missing and not reopening:
