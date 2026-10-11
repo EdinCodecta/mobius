@@ -1219,7 +1219,13 @@ def test_connect_published_app_reuses_reviewed_local_row_idempotently(
   monkeypatch.setattr(
     github_routes, "_merged_upstream_sha", lambda *_args: landed,
   )
-  monkeypatch.setattr(app_git, "fetch_origin_commit", lambda *_args: landed)
+  async def fetched_commit(_repo, ref):
+    from app import fs_locks
+    # Publication handoff transfers before it takes any app lock.
+    assert not fs_locks.install_uninstall_lock().locked()
+    assert not fs_locks.source_dir_lock(str(_repo)).locked()
+    return ref
+  monkeypatch.setattr(install, "fetch_app_commit", fetched_commit)
   async def fetched(_url):
     return candidate
   monkeypatch.setattr(install, "fetch_install_candidate", fetched)
@@ -1809,7 +1815,13 @@ def test_connect_published_app_rejects_full_handoff_drift_after_install(
     return reviewed_head
 
   monkeypatch.setattr(github_routes, "_merged_upstream_sha", merged_upstream)
-  monkeypatch.setattr(app_git, "fetch_origin_commit", lambda *_args: reviewed_head)
+  async def fetched_commit(_repo, ref):
+    from app import fs_locks
+    # Publication handoff transfers before it takes any app lock.
+    assert not fs_locks.install_uninstall_lock().locked()
+    assert not fs_locks.source_dir_lock(str(_repo)).locked()
+    return ref
+  monkeypatch.setattr(install, "fetch_app_commit", fetched_commit)
   def verify_landed(repo, **kwargs):
     expected = original_spec
     if drift_field == "reviewed_head_sha" and json.loads(
