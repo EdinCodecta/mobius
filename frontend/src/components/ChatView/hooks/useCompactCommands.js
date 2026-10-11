@@ -14,11 +14,13 @@ export default function useCompactCommands({
   activationSettledRef, inputValueRef, setComposerInput, setSendFailure, fetchMessages, stopTurn,
 }) {
   // A "/compact" submission is a chat action, not a turn: it rewrites the live
-  // context instead of asking the model anything. The ref is the synchronous
-  // admission latch; the state names the chat whose POST is outstanding.
-  const [compactingChatId, setCompactingChatId] = useState(null)
-  const compactingChatRef = useRef(false)
-  const stoppingCompactionRef = useRef(false)
+  // context instead of asking the model anything. Compact and Pause belong to
+  // their chat, so a pending action in one chat never blocks another chat's.
+  // A ``kind:chatId`` key is the synchronous same-chat duplicate latch, added
+  // and removed only by the call that owns it; the state snapshot lets the
+  // visible chat render its own outstanding compact POST.
+  const pendingActionsRef = useRef(new Set())
+  const [pendingActions, setPendingActions] = useState(() => new Set())
   const [compactProgressRecord, setCompactProgressRecord] = useState(null)
   const compactProgressRequestRef = useRef(0)
   const compactProgressControllerRef = useRef(null)
@@ -32,6 +34,18 @@ export default function useCompactCommands({
     compactActionLifecycleRef.current = lifecycle
     return () => { lifecycle.active = false }
   }, [chatId])
+
+  function claimAction(key) {
+    if (pendingActionsRef.current.has(key)) return false
+    pendingActionsRef.current.add(key)
+    setPendingActions(new Set(pendingActionsRef.current))
+    return true
+  }
+
+  function releaseAction(key) {
+    pendingActionsRef.current.delete(key)
+    setPendingActions(new Set(pendingActionsRef.current))
+  }
 
   const cancelCompactProgress = useCallback(() => {
     ++compactProgressRequestRef.current
@@ -94,11 +108,10 @@ export default function useCompactCommands({
       setSendFailure('There’s no chat context to compact yet.')
       return
     }
-    if (compactingChatRef.current) return
     if (serverCompactingKind === 'compact') return
     if (isProviderSwitchBlocking(chatId)) return
-    compactingChatRef.current = true
-    setCompactingChatId(chatId)
+    const actionKey = `compact:${chatId}`
+    if (!claimAction(actionKey)) return
     if (submittedInput !== null) setComposerInput('')
     setSendFailure(null)
     const targetChatId = chatId
@@ -131,15 +144,14 @@ export default function useCompactCommands({
       }
     } finally {
       // Status readback is optional: it must never own the action latch.
-      compactingChatRef.current = false
-      setCompactingChatId(null)
+      releaseAction(actionKey)
       if (lifecycle?.active) void refreshCompactProgress(targetChatId)
     }
   }
 
   async function stopCompactCommand() {
-    if (!chatId || stoppingCompactionRef.current) return
-    stoppingCompactionRef.current = true
+    const actionKey = `pause:${chatId}`
+    if (!chatId || !claimAction(actionKey)) return
     const targetChatId = chatId
     const lifecycle = compactActionLifecycleRef.current
     cancelCompactProgress()
@@ -150,14 +162,14 @@ export default function useCompactCommands({
         setSendFailure(sendFailureMessage(err, { online: getOnlineSnapshot() }))
       }
     } finally {
-      stoppingCompactionRef.current = false
+      releaseAction(actionKey)
       if (lifecycle?.active) void refreshCompactProgress(targetChatId)
     }
   }
 
   // The server's compacting window spans the batch runner that makes a pane
   // read ``running``, so a reopened pane knows preparation is the running work.
-  const preparing = (compactingChatId !== null && compactingChatId === chatId)
+  const preparing = pendingActions.has(`compact:${chatId}`)
     || serverCompactingKind === 'compact'
   const compactionProgress = (compactProgressRecord?.chatId === chatId && compactProgressRecord.progress)
     || (preparing ? { state: 'running' } : null)
