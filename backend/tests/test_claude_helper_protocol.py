@@ -10,8 +10,11 @@ from tests.test_helper_hosts import _claude_host, _turn, _Started
 
 
 def _reply(host, response=None):
+  from claude_agent_sdk.types import UserMessage
   if host._dispatcher_turn is not None:
-    host._result_dispatch_id = host._dispatcher_turn.dispatch_id
+    turn = host._dispatcher_turn
+    host._on_dispatcher_user_message(UserMessage(
+      content=f"{'SPAWN' if turn.kind == 'spawn' else 'MESSAGE'} {turn.dispatch_id}"))
   host._dispatcher_replied(response)
 
 
@@ -251,6 +254,57 @@ async def test_dispatcher_cycles_serialize_replies_but_not_helper_lifetimes(tmp_
 
 
 @pytest.mark.asyncio
+async def test_missing_echo_times_out_without_failing_started_helper_or_blocking_next_spawn(
+  tmp_path, monkeypatch,
+):
+  monkeypatch.setattr(claude_helper_host, 'DISPATCH_REPLY_TIMEOUT_SECONDS', 0.03)
+  host = _claude_host(tmp_path)
+  first, second = _turn(tmp_path, dispatch_id='a'), _turn(tmp_path, dispatch_id='b')
+  queries = []
+
+  class Dispatcher:
+    async def query(self, line):
+      queries.append(line)
+      key = line.split()[1]
+      host._dispatcher_call('Agent', {'description': key}, 'launch-'+key)
+      host._on_task_started(_Started('agent-'+key, 'launch-'+key))
+      if key == 'b':
+        _reply(host)
+      else:
+        # A Result without its echoed user message cannot match the request.
+        host._dispatcher_replied()
+
+  host._client = Dispatcher()
+  arun = asyncio.create_task(host.run_turn(first))
+  await asyncio.wait_for(first.started.wait(), 1)
+  brun = asyncio.create_task(host.run_turn(second))
+  await asyncio.wait_for(second.started.wait(), 1)
+  assert queries == ['SPAWN a', 'SPAWN b']
+  assert first.dispatch_error is None and not first.done.is_set()
+  first.finish('completed'); second.finish('completed')
+  assert (await arun).status == (await brun).status == 'completed'
+  assert host.alive
+  await host.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_echo_fails_unstarted_request_visibly_and_releases_host(tmp_path, monkeypatch):
+  monkeypatch.setattr(claude_helper_host, 'DISPATCH_REPLY_TIMEOUT_SECONDS', 0.03)
+  host = _claude_host(tmp_path)
+
+  class Dispatcher:
+    async def query(self, line):
+      host._dispatcher_replied()
+
+  host._client = Dispatcher()
+  turn = await asyncio.wait_for(host.run_turn(_turn(tmp_path)), 1)
+  assert turn.dispatch_error == 'reply_timeout'
+  assert turn.status == 'failed' and 'did not confirm' in turn.summary
+  assert not host._query_lock.locked() and host.alive
+  await host.close()
+
+
+@pytest.mark.asyncio
 async def test_notice_result_before_requested_call_does_not_consume_reply(tmp_path):
   host = _claude_host(tmp_path)
   turn = _turn(tmp_path)
@@ -261,7 +315,8 @@ async def test_notice_result_before_requested_call_does_not_consume_reply(tmp_pa
   host._client = Dispatcher()
   running = asyncio.create_task(host.run_turn(turn))
   await sent.wait()
-  host._result_dispatch_id = 'notice'
+  from claude_agent_sdk.types import UserMessage
+  host._on_dispatcher_user_message(UserMessage(content='NOTICE unrelated'))
   host._dispatcher_replied()  # Independent task-notification turn.
   await asyncio.sleep(0)
   assert not host._dispatcher_reply.done()

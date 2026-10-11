@@ -45,6 +45,7 @@ log = logging.getLogger(__name__)
 SESSION_PREFIX = "claude-host:"
 DISPATCH_MODEL = "haiku"
 DISPATCH_REASKS = 2
+DISPATCH_REPLY_TIMEOUT_SECONDS = 120
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 BUILTIN_HELPER_TOOLS = ("Agent", "Task", "Workflow")
 DISPATCHER_PROMPT = (
@@ -616,22 +617,7 @@ class ClaudeHelperHost(Host):
         error = getattr(message, "error", None)
         if not parent:
           if isinstance(message, UserMessage):
-            blocks = message.content if isinstance(message.content, list) else []
-            # Tool results belong to the current turn. A fresh user message,
-            # including a task notice, identifies the next result instead.
-            if not any(isinstance(block, ToolResultBlock) for block in blocks):
-              content = (message.content if isinstance(message.content, str)
-                         else _message_text(message))
-              command = content.strip().split()
-              self._result_dispatch_id = (
-                command[1] if len(command) == 2 and command[0] in ("SPAWN", "MESSAGE")
-                else None
-              )
-            for block in blocks:
-              if isinstance(block, ToolResultBlock) and block.is_error:
-                turn = self._turn_by_tool_use.get(block.tool_use_id)
-                if turn is not None:
-                  self._fail_dispatch(block.tool_use_id, "Agent" if turn.kind == "spawn" else "SendMessage")
+            self._on_dispatcher_user_message(message)
           session = getattr(message, "session_id", None)
           if session:
             self._save_session(session)
@@ -786,6 +772,26 @@ class ClaudeHelperHost(Host):
       except Exception:
         log.warning("helper task stop failed agent=%s", agent_id, exc_info=True)
 
+  def _on_dispatcher_user_message(self, message) -> None:
+    from claude_agent_sdk.types import ToolResultBlock
+
+    blocks = message.content if isinstance(message.content, list) else []
+    # Tool results belong to the current turn. A fresh user message,
+    # including a task notice, identifies the next result instead.
+    if not any(isinstance(block, ToolResultBlock) for block in blocks):
+      content = (message.content if isinstance(message.content, str)
+                 else _message_text(message))
+      command = content.strip().split()
+      self._result_dispatch_id = (
+        command[1] if len(command) == 2 and command[0] in ("SPAWN", "MESSAGE")
+        else None
+      )
+    for block in blocks:
+      if isinstance(block, ToolResultBlock) and block.is_error:
+        turn = self._turn_by_tool_use.get(block.tool_use_id)
+        if turn is not None:
+          self._fail_dispatch(block.tool_use_id, "Agent" if turn.kind == "spawn" else "SendMessage")
+
   async def _dispatch(self, turn: HelperTurn) -> None:
     """Serialize commands and drain each exact reply before the next request."""
     async with self._query_lock:
@@ -800,8 +806,9 @@ class ClaudeHelperHost(Host):
         self._dispatcher_turn = turn
         self._result_dispatch_id = None
         try:
-          await self._client.query(f"{verb} {turn.dispatch_id}")
-          response = await replied
+          async with asyncio.timeout(DISPATCH_REPLY_TIMEOUT_SECONDS):
+            await self._client.query(f"{verb} {turn.dispatch_id}")
+            response = await replied
           if turn.done.is_set():
             return
           if getattr(response, "is_error", False):
@@ -823,6 +830,13 @@ class ClaudeHelperHost(Host):
                       "sending its message. No work was launched or message sent.")
         except asyncio.CancelledError:
           raise
+        except TimeoutError:
+          log.warning("helper dispatch reply timed out id=%s key=%s", turn.dispatch_id, self.key.digest)
+          if not turn.started.is_set() and not turn.done.is_set():
+            self._specs.pop(turn.dispatch_id, None)
+            turn.dispatch_error = "reply_timeout"
+            turn.finish("failed", "Claude did not confirm this helper request in time. "
+                        "Some work may have started; Möbius will not replay it automatically.")
         except Exception:
           log.warning("helper dispatch query failed id=%s", turn.dispatch_id, exc_info=True)
           if not turn.started.is_set() and not turn.done.is_set():
@@ -1043,7 +1057,8 @@ def _host_options(
         "PreCompact": [HookMatcher(matcher=None, hooks=[host.pre_compact])],
         "SubagentStop": [HookMatcher(hooks=[host.subagent_stop])],
       },
-      extra_args={"settings": json.dumps({"disableWorkflows": True})},
+      extra_args={"settings": json.dumps({"disableWorkflows": True}),
+                  "replay-user-messages": None},
     )
     if skills_enabled:
       options["skills"] = "all"

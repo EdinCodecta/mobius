@@ -248,7 +248,8 @@ def test_dispatcher_reply_without_the_call_fails_once_without_retry(tmp_path, mo
   class ForgetfulDispatcher:
     async def query(self, line):
       queries.append(line)
-      host._result_dispatch_id = host._dispatcher_turn.dispatch_id
+      from claude_agent_sdk.types import UserMessage
+      host._on_dispatcher_user_message(UserMessage(content=line))
       host._dispatcher_replied()
   host._client = ForgetfulDispatcher()
   turn = _turn(tmp_path)
@@ -329,7 +330,8 @@ class _DispatcherClient:
     )
     # A resumed helper reports under the tool call that first launched it.
     self.host._on_task_started(_Started(turn.agent_id or "agent-1", "toolu_spawn"))
-    self.host._result_dispatch_id = dispatch_id
+    from claude_agent_sdk.types import UserMessage
+    self.host._on_dispatcher_user_message(UserMessage(content=line))
     self.host._dispatcher_replied()
     asyncio.get_running_loop().call_soon(self.settle, turn, verb)
 
@@ -520,7 +522,8 @@ def test_a_dispatch_that_never_starts_says_what_the_dispatcher_did(
   class _SilentDispatcher:
     async def query(self, _line):
       host.dispatcher_last = "server_error: API Error: 529 Overloaded"
-      host._result_dispatch_id = host._dispatcher_turn.dispatch_id
+      from claude_agent_sdk.types import UserMessage
+      host._on_dispatcher_user_message(UserMessage(content=_line))
       host._dispatcher_replied()
 
   host._client = _SilentDispatcher()
@@ -649,6 +652,7 @@ def test_every_hosted_helper_gets_the_claude_register_and_text_stream(tmp_path, 
     with ExitStack() as stack:
       options = factory(host, resume, stack)
     assert options.include_partial_messages and options.forward_subagent_text
+    assert "replay-user-messages" in options.extra_args
     assert "PostToolUseFailure" in options.hooks
     assert all("SubagentHandback" in agent.disallowedTools for agent in options.agents.values())
     assert set(options.agents) == {
