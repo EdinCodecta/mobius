@@ -141,7 +141,11 @@ under its locks, and refuses before changing controller state otherwise:
 
 The released version-3 `/etc/mobius-rebuild/config.json` is read only as the
 source of this migration and is never rewritten; the new worker never reads it,
-and the released worker never reads `config.v4.json`. Reinstalling over a
+and the released worker never reads `config.v4.json`. The installer still checks
+both files against the frozen project and data directory on every reinstall.
+Changing either field requires a separately planned host migration, including
+deliberate retirement of obsolete legacy configuration, not a routine reinstall.
+Reinstalling over a
 helper-managed app requires `config.v4.json`, preserves its frozen fields
 exactly, and requires the live app to hold that name. Root-owned
 controller state under `/var/lib/mobius-rebuild`, including any host-owned
@@ -330,22 +334,23 @@ failure, SIGKILL, or power loss before the commit leaves launcher 1 and the
 released worker with its own complete inputs. At or after the commit the new
 worker is selected with its complete inputs, under launcher 1 until launcher 2
 is durable. Launcher 1 running the new worker reconciles normally, but every
-replacement `run` refuses and leaves the request queued: replacements are
-unavailable, not unsafe, until the installer is rerun. A rerun is idempotent at
-the commit (`current: revision 13`) and finishes launcher 2 and enablement. The
+replacement `run` refuses and leaves the request queued until the installer is
+rerun. The privileged manual adapter can still use the selected worker directly;
+it does not depend on the launcher's `run` entry point. A rerun is idempotent at
+the commit (`current: revision 14`) and finishes launcher 2 and enablement. The
 failure cleanup, and enabled units after a reboot, therefore only dispatch a
 coherent pair.
 
 Launcher 2 is published only after the commit because it, unlike launcher 1,
 consumes a pending candidate's one trial before running it. Beside the released
-worker after a reboot, it could trial (and burn) a pending exact revision-13
+worker after a reboot, it could trial (and burn) a pending exact revision-14
 candidate offered from an official image. Launcher 1 instead runs that candidate,
 which refuses under launcher 1 without changing status, so launcher 1 puts it
 back unchanged; the commit then activates exactly that pending candidate.
-Revision 13 is strictly above revision 12, which earlier unreleased review heads
-used with different bytes and a different configuration path. The high-water
+Revision 14 is strictly above revisions 12 and 13 from earlier unreleased
+review heads; revision 12 also used a different configuration path. The high-water
 rule is unchanged: a revision at or below it is never readmitted, including an
-exact revision-13 candidate whose trial already failed. The installer then
+exact revision-14 candidate whose trial already failed. The installer then
 refuses at the commit, leaving the released pair selected (its staged inputs are
 inert to it), and a higher worker revision is required.
 

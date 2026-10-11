@@ -55,7 +55,7 @@ REQUEST_VERSIONS = [1, 2]
 # each requested official image only when this number is higher than every
 # worker it has run. Increase it with every change to this file; never lower
 # it. The launcher reads it as text, so keep it a plain literal on one line.
-WORKER_REVISION = 13
+WORKER_REVISION = 14
 # The frozen launcher runs the worker selected here; see offer_worker().
 WORKERS = STATE_DIR / "workers"
 WORKER_INDEX = STATE_DIR / "workers.json"
@@ -1058,6 +1058,10 @@ def write_attempt_file(expected: dict) -> bytes:
     info = directory.lstat()
     if directory.is_symlink() or info.st_uid != os.geteuid() or info.st_mode & 0o022:
         raise RuntimeError("untrusted attempt configuration directory")
+    # The journal will outlive this call: publish the directory entry before
+    # any attempt can be referenced. Also sync on replay after a failed mkdir
+    # publication; existence alone does not prove the parent entry is durable.
+    _fsync_dir(directory.parent)
     token = expected["services"]["app"]["labels"]["io.mobius.admission.token"]
     path = attempt_path(token)
     raw = json.dumps(compose_file_document(expected)).encode()

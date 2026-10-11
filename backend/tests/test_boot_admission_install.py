@@ -1019,7 +1019,7 @@ class _Host:
             # v4 and an immutable attempt pointer as its live override.
             files["config.v4.json"] = json.dumps(self.expected_v4).encode()
             files["image.override.yml"] = json.dumps({"name": "mobius-admission-" + "b" * 32}).encode()
-            launcher, active, high_water = self.launcher, self._store(13, self.worker), 13
+            launcher, active, high_water = self.launcher, self._store(14, self.worker), 14
             for unit in UNITS:
                 (host / "etc/systemd/system" / unit).write_text("# installed by the previous run\n")
         else:
@@ -1037,10 +1037,10 @@ class _Host:
         entry = None
         if candidate == "published12":
             entry, high_water = self._store(12, PUBLISHED_12.format(config=str(self.legacy)).encode()), 12
-        elif candidate == "exact13":
-            entry, high_water = self._store(13, self.worker), 13
-        elif candidate == "tried13":
-            high_water = 13  # an exact revision-13 trial was already consumed
+        elif candidate == "exact14":
+            entry, high_water = self._store(14, self.worker), 14
+        elif candidate == "tried14":
+            high_water = 14  # an exact revision-14 trial was already consumed
         self.write_index({"version": 1, "high_water": high_water, "active": active, "candidate": entry})
 
     def _store(self, revision: int, data: bytes) -> dict:
@@ -1137,8 +1137,8 @@ MIGRATION_COMPLETE=0
         assert self.accepts_own_config(active), "the selected worker rejects the config it reads"
         # Launcher 2 never runs beside the released worker: it is published
         # only after the new worker is durably selected.
-        assert not (launcher2 and active["revision"] < 13)
-        if active["revision"] == 13:
+        assert not (launcher2 and active["revision"] < 14)
+        if active["revision"] == 14:
             # The commit happened only after every input it reads was durable.
             assert json.loads(self.v4.read_text()) == self.expected_v4
             for unit in UNITS:
@@ -1158,7 +1158,7 @@ MIGRATION_COMPLETE=0
         self.assert_coherent()
         launcher2, active, candidate = self.selected()
         assert launcher2 and active["sha256"] == _digest(self.worker) and candidate is None
-        assert self.index()["high_water"] == 13
+        assert self.index()["high_water"] == 14
         for name, mode in (("config.v4.json", 0o600), ("compose.yml", 0o600), ("image.override.yml", 0o600)):
             assert stat.S_IMODE((self.etc / name).stat().st_mode) == mode
         assert stat.S_IMODE((self.root / "usr/local/libexec/mobius-rebuild-host").stat().st_mode) == 0o755
@@ -1199,7 +1199,7 @@ def test_every_interruption_leaves_a_coherent_worker_and_rerun_converges(tmp_pat
     assert result.returncode != 0
     host.assert_coherent()
     launcher2, active, _ = host.selected()
-    assert (active["revision"] == 13) is ((mode, point) in POST_COMMIT)
+    assert (active["revision"] == 14) is ((mode, point) in POST_COMMIT)
     # Launcher 2 is the first replacement after the commit (the 8th overall).
     assert launcher2 is ((mode, point) in POST_COMMIT and point not in (8,))
     if mode.startswith("FAIL"):
@@ -1223,20 +1223,20 @@ def test_uninterrupted_publication_commits_once_after_every_input(tmp_path):
     assert calls == ["daemon-reload", "enable mobius-rebuild-reconcile.service",
                      "enable --now mobius-rebuild-reconcile.timer", "enable --now mobius-rebuild.path"]
     status = json.loads((host.state / "status.json").read_text())
-    assert status["worker_revision"] == 13 and status["launcher_revision"] == 2
+    assert status["worker_revision"] == 14 and status["launcher_revision"] == 2
     # A second run is idempotent: same selection, same inputs.
     before = {path: path.read_bytes() for path in (host.v4, host.etc / "compose.yml",
                                                    host.state / "workers.json")}
     result, _ = host.run()
     assert result.returncode == 0, result.stderr
-    assert "current: revision 13" in result.stdout
+    assert "current: revision 14" in result.stdout
     assert {path: path.read_bytes() for path in before} == before
 
 
-# Every interruption point with the exact pending revision-13 candidate (the
+# Every interruption point with the exact pending revision-14 candidate (the
 # one a premature launcher 2 could burn); a sample with an older candidate.
 @pytest.mark.parametrize("candidate,mode,point",
-                         [("exact13", mode, point) for mode, point in PRE_COMMIT + POST_COMMIT]
+                         [("exact14", mode, point) for mode, point in PRE_COMMIT + POST_COMMIT]
                          + [("published12", mode, point) for mode, point in PRE_COMMIT[::3] + POST_COMMIT[:4]])
 def test_pending_image_candidate_across_reboot_is_not_burned_and_converges(tmp_path, candidate, mode, point):
     host = _Host(tmp_path, candidate=candidate)
@@ -1252,27 +1252,27 @@ def test_pending_image_candidate_across_reboot_is_not_burned_and_converges(tmp_p
         assert index["candidate"] == pending and index["high_water"] == pending["revision"]
     else:
         # The commit consumed the pending candidate: an exact one became active.
-        assert index["candidate"] is None and index["active"]["revision"] == 13
-        if candidate == "exact13":
+        assert index["candidate"] is None and index["active"]["revision"] == 14
+        if candidate == "exact14":
             assert index["active"]["sha256"] == pending["sha256"]
     host.assert_coherent()
     result, _ = host.run()
     assert result.returncode == 0, result.stderr
     host.assert_migrated()
-    if candidate == "exact13":
+    if candidate == "exact14":
         # The retry activated exactly the pending candidate's bytes and file.
         assert host.index()["active"]["file"] == pending["file"]
-        assert ("installed: revision 13" in result.stdout) is ((mode, point) in PRE_COMMIT)
+        assert ("installed: revision 14" in result.stdout) is ((mode, point) in PRE_COMMIT)
 
 
 def test_failed_exact_trial_is_never_readmitted_and_released_pair_stays_coherent(tmp_path):
-    host = _Host(tmp_path, candidate="tried13")
+    host = _Host(tmp_path, candidate="tried14")
     result, calls = host.run()
     assert result.returncode != 0
-    assert "rejected: revision 13 was already tried or superseded" in result.stdout + result.stderr
+    assert "rejected: revision 14 was already tried or superseded" in result.stdout + result.stderr
     # The refusal is at the commit: the released selection keeps its own config
     # and launcher; staged new inputs are inert to it; dispatch is restored.
-    assert host.index()["active"]["revision"] == 10 and host.index()["high_water"] == 13
+    assert host.index()["active"]["revision"] == 10 and host.index()["high_water"] == 14
     assert host.selected()[0] is False
     host.assert_coherent()
     assert calls[-2:] == ["start mobius-rebuild.path", "start mobius-rebuild-reconcile.timer"]
@@ -1315,8 +1315,8 @@ def test_each_input_is_durable_before_the_next_and_launcher_follows_the_commit(t
         str(host.root / "etc/systemd/system" / unit) for unit in UNITS]
     launcher = str(host.root / "usr/local/libexec/mobius-rebuild-host")
     # Phase 1 under the previous selection; launcher 2 only after the commit.
-    before = 13 if managed else 10
-    assert destinations == [(path, before) for path in staged] + [(launcher, 13)]
+    before = 14 if managed else 10
+    assert destinations == [(path, before) for path in staged] + [(launcher, 14)]
     assert len(destinations) == (7 if managed else 8)
     commit = log.index(["point", "before-commit"])
     assert replaces[-2] < commit < replaces[-1]
@@ -1364,11 +1364,11 @@ def test_commit_separates_staging_from_launcher_publication():
 
 
 def test_new_worker_revision_exceeds_every_published_revision():
-    # Unreleased review heads used revision 12 with different bytes. The
+    # Unreleased review heads used revisions 12 and 13 with different bytes. The
     # checkout must be strictly newer, or a host holding that high-water mark
     # (for example a pending revision-12 candidate) would refuse it.
     text = (ROOT / "scripts/mobius-rebuild-host.py").read_text()
-    assert re.search(r"^WORKER_REVISION = 13$", text, re.M)
+    assert re.search(r"^WORKER_REVISION = 14$", text, re.M)
 
 
 @pytest.mark.parametrize("problem", ["writable", "foreign_owner"])

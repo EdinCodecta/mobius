@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import time
 from types import SimpleNamespace
@@ -386,6 +387,66 @@ def assert_target_interruption_recovers_once(case):
     assert len(starts) == len(set(starts))
     case.host.reconcile()
     assert case.docker.starts == starts
+
+
+@pytest.mark.parametrize("already_exists", [False, True])
+def test_first_attempt_directory_survives_power_loss_after_journal_publication(
+        incident, monkeypatch, already_exists):
+    case = incident
+    transaction = target_replacement(case)
+    assert not case.docker.containers
+    directory = case.host.CONFIG.parent / "attempts"
+    if already_exists:
+        # A previous mkdir survived in memory, but its parent was never synced.
+        directory.mkdir(mode=0o700)
+    synced = []
+    sync = case.host._fsync_dir
+    def trace_sync(path):
+        sync(path)
+        synced.append(path)
+    monkeypatch.setattr(case.host, "_fsync_dir", trace_sync)
+    allocate = case.gate.allocate
+    def interrupt(*_args):
+        raise PowerLoss("journal published before allocation")
+    monkeypatch.setattr(case.gate, "allocate", interrupt)
+    with pytest.raises(PowerLoss):
+        case.host.prepare_attempt(case.config, transaction, "target")
+    record = case.host.read_transaction()["attempts"][0]
+    assert case.host.attempt_path(record["token"]).exists()
+    before_crash = list(synced)
+    # Persistence model, not a physical power cut: lose only the new directory
+    # entry if its parent was not synced before the durable journal reference.
+    if case.host.CONFIG.parent not in before_crash:
+        shutil.rmtree(directory)
+    monkeypatch.setattr(case.gate, "allocate", allocate)
+    assert_target_interruption_recovers_once(case)
+    assert before_crash.index(case.host.CONFIG.parent) < before_crash.index(directory)
+    assert before_crash.index(directory) < before_crash.index(case.host.STATE_DIR)
+
+
+@pytest.mark.parametrize("error,after_sync", [(OSError, False), (PowerLoss, False), (PowerLoss, True)])
+def test_attempt_directory_sync_failure_does_not_publish_identity_and_retry_recovers(
+        incident, monkeypatch, error, after_sync):
+    case = incident
+    transaction = target_replacement(case)
+    directory = case.host.CONFIG.parent / "attempts"
+    sync = case.host._fsync_dir
+    def interrupt(path):
+        if path == directory.parent:
+            if after_sync:
+                sync(path)
+            raise error("attempt directory parent sync")
+        sync(path)
+    monkeypatch.setattr(case.host, "_fsync_dir", interrupt)
+    with pytest.raises(error, match="attempt directory parent sync"):
+        case.host.prepare_attempt(case.config, transaction, "target")
+    assert directory.is_dir()
+    assert not list(directory.iterdir())
+    assert not case.host.read_transaction().get("attempts")
+    assert not case.gate.observe()["slots"]["target"]["attempts"]
+    assert not case.docker.creates and not case.docker.starts
+    monkeypatch.setattr(case.host, "_fsync_dir", sync)
+    assert_target_interruption_recovers_once(case)
 
 
 @pytest.mark.parametrize("method", ["allocate", "bind", "open", "issue_start"])
