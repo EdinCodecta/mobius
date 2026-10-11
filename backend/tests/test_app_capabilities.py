@@ -1140,3 +1140,32 @@ def test_readable_identical_absent_or_empty_route_limits_need_no_review():
   assert diff_contracts(plain, empty) == unchanged
   assert diff_contracts(empty, plain) == unchanged
   assert contract_and_digest(_routed([]))[1] == plain_digest
+
+
+@pytest.mark.parametrize("revoked_service", [
+  "omitted", None, False, {},
+  {"id": None, "entry": None, "access": False, "aliases": [], "route_limits": None},
+  {"route_limits": []}, {"route_limits": False},
+], ids=json.dumps)
+@pytest.mark.parametrize("stored", [None, {}, "1024", [_accepted(response=True)]],
+                         ids=lambda value: json.dumps(value)[:40])
+def test_complete_service_revocation_never_widens_from_unreadable_route_limits(
+  revoked_service, stored,
+):
+  installed, _digest = contract_and_digest(_routed(None))
+  installed["service"]["route_limits"] = stored
+  candidate = {key: value for key, value in installed.items() if key != "service"}
+  if revoked_service != "omitted":
+    candidate["service"] = revoked_service
+  assert diff_contracts(installed, candidate)["widens"] is False
+  # Malformed limits on a service that actually remains are still reviewed.
+  assert diff_contracts(installed, installed)["widens"] is True
+
+
+@pytest.mark.parametrize("stored", ["1024", {"GET /actor": 1}, [_accepted(path=[])]],
+                         ids=lambda value: json.dumps(value)[:40])
+def test_unreadable_route_limits_alone_keep_a_service_under_review(stored):
+  # A remaining non-closed route field is still a service the runtime must
+  # refuse, so it is never mistaken for complete revocation.
+  installed, _digest = contract_and_digest(_routed([_limit("GET", "/actor", 1)]))
+  assert diff_contracts(installed, {"schema": 6, "service": {"route_limits": stored}})["widens"] is True

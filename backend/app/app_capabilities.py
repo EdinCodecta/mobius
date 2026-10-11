@@ -903,7 +903,9 @@ def diff_contracts(
     # Route ceilings the runtime refuses cannot be ranked against anything,
     # even when they compare equal or pruning made them look absent. While
     # the service stays granted, either side being unreadable needs review.
-    isinstance(candidate.get("service"), dict)
+    # "Granted" is the same semantic test as complete revocation in _widens:
+    # an omitted or all-closed service has no remaining leaf.
+    any(key.startswith("service.") for key in after)
     and (_unreadable_route_limits(installed) or _unreadable_route_limits(candidate))
   )
   return {
