@@ -864,6 +864,7 @@ async def install_app(
           code="git_install_unavailable",
           failure="The app's Git repository could not be cloned or verified; "
           "retry when its source is available.",
+          retryable=True,
         ) from exc
     # Serialize the whole install against any concurrent uninstall — both are
     # app-lifecycle operations over the same /data/apps trees, and letting them

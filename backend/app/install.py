@@ -40,7 +40,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Awaitable, Callable, Mapping, Sequence
 from urllib.parse import quote, unquote, urljoin, urlparse
 
 import httpx
@@ -1760,6 +1760,7 @@ def _verify_git_install_candidate(
           "reviewed. Refresh the update and try again."
         ),
         "reason": reason,
+        "retryable": True,
       },
     )
 
@@ -2831,17 +2832,22 @@ def read_git_package_summary(
 def git_source_error(
   outcome: str, exc: BaseException, *,
   code: str = "git_update_unavailable", failure: str = "",
+  retryable: bool = False,
 ) -> HTTPException:
   """The owner-facing 409 for a Git source that could not be used.
 
   A transfer exceeding its wall-clock ceiling is reported as a timeout,
-  distinct from a missing or unverifiable source.
+  distinct from a missing or unverifiable source. ``retryable`` marks a
+  failure the same request may later get past unchanged; bootstrap retries it.
   """
   if isinstance(exc, app_git.GitTransferTimeout):
     code = "git_transfer_timeout"
     failure = f"The app's Git transfer timed out: {exc}."
     outcome = f"{outcome} Retrying on a steadier connection may help."
-  return HTTPException(409, detail={"code": code, "message": f"{failure} {outcome}".strip()})
+    retryable = True
+  return HTTPException(409, detail={
+    "code": code, "message": f"{failure} {outcome}".strip(), "retryable": retryable,
+  })
 
 
 def git_transfer_root() -> Path:
@@ -2883,11 +2889,18 @@ async def _stage(stage: Callable[..., app_git.Staged], *args) -> app_git.Staged:
 
 
 async def _to_completion(function: Callable, *args):
-  """Run a thread that must finish before its caller releases a lock.
+  """Run a thread that must finish before its caller releases a lock."""
+  return await _settle_before_cancel(asyncio.to_thread(function, *args))
 
-  A cancelled caller still waits for the thread, then re-raises.
+
+async def _settle_before_cancel(work: Awaitable):
+  """Await ``work`` to its end even if the caller is cancelled meanwhile.
+
+  Cancelling an ``asyncio.to_thread`` await does not stop its thread. A
+  cancelled caller re-raises only once ``work`` settles, so it never releases a
+  lock or rolls back under writes that are still running.
   """
-  work = asyncio.ensure_future(asyncio.to_thread(function, *args))
+  work = asyncio.ensure_future(work)
   cancelled = False
   while not work.done():
     try:
@@ -2895,6 +2908,8 @@ async def _to_completion(function: Callable, *args):
     except asyncio.CancelledError:
       cancelled = True
   if cancelled:
+    if not work.cancelled():
+      work.exception()  # Retrieved: the caller's outcome is its cancellation.
     raise asyncio.CancelledError
   return work.result()
 
@@ -4481,12 +4496,14 @@ async def install_from_manifest(
     publication_handoff_app_id=publication_handoff_app_id,
     staged_clone=staged_clone,
   )
+  # Each pass holds the source lock across many Git threads and rolls back on
+  # failure, so a cancelled caller waits for the pass to settle on its own.
   try:
-    return await install_candidate(python_check=None)
+    return await _settle_before_cancel(install_candidate(python_check=None))
   except _UncheckedPythonTree as unchecked:
     pending = unchecked
   python_check = await _check_reconciled_python(pending)
-  return await install_candidate(python_check=python_check)
+  return await _settle_before_cancel(install_candidate(python_check=python_check))
 
 
 async def _install_candidate(
@@ -5079,6 +5096,7 @@ async def _install_candidate(
               code="git_install_unavailable",
               failure="The app's Git repository could not be cloned or verified; "
               "retry when its source is available.",
+              retryable=True,
             ) from exc
         if not cloned_install:
           # record the pristine source tree on `upstream`, then align the

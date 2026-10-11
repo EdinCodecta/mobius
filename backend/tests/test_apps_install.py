@@ -1160,6 +1160,7 @@ def test_known_git_origin_clone_failure_rolls_back_instead_of_importing_http(
     })
   assert failed.status_code == 409, failed.text
   assert failed.json()["detail"]["code"] == "git_install_unavailable"
+  assert failed.json()["detail"]["retryable"] is True
   assert db.query(models.App).filter_by(slug="required-git").first() is None
   source_dir = Path(get_settings().data_dir) / "apps" / "required-git"
   assert not source_dir.exists()
@@ -1204,8 +1205,54 @@ def test_fresh_clone_cannot_replace_owner_reviewed_source(
     })
   assert response.status_code == 409, response.text
   assert response.json()["detail"]["code"] == "git_source_mismatch"
+  assert response.json()["detail"]["retryable"] is True
   assert db.query(models.App).filter_by(slug="reviewed").first() is None
   assert not (Path(get_settings().data_dir) / "apps" / "reviewed").exists()
+
+
+def test_cancelled_install_rolls_back_only_after_its_git_worker_exits(
+  db, tmp_path, monkeypatch, bypass_url_validation,
+):
+  from app import install
+
+  _, bare, commit = _make_clone_fixture(tmp_path, JSX, "export const cards = []")
+  base = "https://raw.githubusercontent.com/acme/cancelled/main/"
+  manifest = {
+    "id": "cancelled", "name": "Cancelled", "version": "1.0.0",
+    "description": "Cancelled mid-install", "entry": "index.jsx",
+  }
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  source_dir = Path(get_settings().data_dir) / "apps" / "cancelled"
+  monkeypatch.setattr(
+    install.httpx, "AsyncClient", MagicMock(side_effect=_fake_async_client(responses)),
+  )
+  monkeypatch.setattr(install, "_derive_repo_ref", lambda url: (bare.as_uri(), commit))
+
+  async def cancelled_install():
+    staged = await install.stage_package_clone(base + "mobius.json")
+    try:
+      await install.install_from_manifest(
+        db, manifest_url=base + "mobius.json", manifest=None, raw_base=None,
+        staged_clone=staged,
+      )
+    finally:
+      install.discard_staged(staged)
+
+  def unverifiable():
+    raise RuntimeError("Git package is missing declared source cards.js")
+
+  _assert_cancellation_drains_worker_under_lock(
+    source_dir, cancelled_install, monkeypatch,
+    install, "_verify_git_install_candidate",
+    while_blocked=lambda: source_dir.is_dir(), then=unverifiable,
+  )
+  db.expire_all()
+  assert db.query(models.App).filter_by(slug="cancelled").first() is None
+  assert not source_dir.exists()
+
 
 def test_update_dropping_schedule_unregisters_orphan_cron(
     client, auth, bypass_url_validation):
@@ -4345,11 +4392,16 @@ def test_conflict_resolver_batch_cannot_deadlock_contribute_publication(
   asyncio.run(run_competing_operations())
 
 
-def _assert_cancellation_drains_worker_under_lock(source_dir, operation, monkeypatch, target, attr):
+def _assert_cancellation_drains_worker_under_lock(
+  source_dir, operation, monkeypatch, target, attr, *,
+  while_blocked=lambda: True, then=lambda: None,
+):
   """A lock-held disk mutation must finish before cancellation frees the lock.
 
   Cancelling an ``asyncio.to_thread`` await does not stop its thread, so a
   caller that unwinds at once releases the source lock while Git still writes.
+  ``while_blocked`` checks state the cancelled caller must not yet undo;
+  ``then`` is the worker's own outcome once released.
   """
   import threading
   from app import fs_locks
@@ -4360,6 +4412,7 @@ def _assert_cancellation_drains_worker_under_lock(source_dir, operation, monkeyp
     entered.set()
     try:
       assert release.wait(10)
+      return then()
     finally:
       exited.set()
 
@@ -4375,6 +4428,7 @@ def _assert_cancellation_drains_worker_under_lock(source_dir, operation, monkeyp
         await asyncio.sleep(.02)
         assert not task.done() and not exited.is_set()
         assert lock.locked(), "source lock released while its worker still ran"
+        assert while_blocked(), "cancelled caller undid state under its worker"
     finally:
       release.set()
       outcome = await asyncio.gather(task, return_exceptions=True)
