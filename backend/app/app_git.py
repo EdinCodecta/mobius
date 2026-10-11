@@ -4028,6 +4028,7 @@ def resolve_benign_conflict(
   (a recorded previous release unrelated to the installed history), so this
   proof reasons from the same base.
 
+  An entry ending in ``/`` protects every path below that directory.
   If the per-file merge fails, a path outside ``package_paths`` can keep its
   local version, including a local deletion of a base file. Synthetic conflict
   paths absent from both local and base trees need the resolver. None protects
@@ -4083,7 +4084,11 @@ def resolve_benign_conflict(
     if merged is not None:
       resolved[rel] = merged
     elif (
-      package_paths is not None and rel not in package_paths
+      package_paths is not None
+      and not any(
+        rel == path or (path.endswith("/") and rel.startswith(path))
+        for path in package_paths
+      )
       and (ours is not None or base is not None)
     ):
       resolved[rel] = ours

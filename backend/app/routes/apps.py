@@ -32,7 +32,7 @@ from app import (
   source_dirs, workspace_files,
 )
 from app.manifest_identity import (
-  requested_manifest_source, stored_manifest_fetch_url,
+  requested_manifest_source, same_permanent_package, stored_manifest_fetch_url,
 )
 from app.app_identity import (
   reject_if_source_dir_taken as _reject_if_source_dir_taken,
@@ -1305,9 +1305,17 @@ def _update_candidate_matches_installed(
   installed_manifest_url: str,
   candidate_manifest_url: str,
   candidate_manifest: dict,
+  installed_package_id: str | None,
 ) -> bool:
-  """Accept the installed package identity or its reviewed predecessor."""
+  """Accept the installed package identity or its reviewed predecessor.
+
+  A permanent `package_id` binds the package across manifest id renames, as
+  it does for install.
+  """
   from app import install
+
+  if same_permanent_package(candidate_manifest, installed_package_id):
+    return True
 
   predecessor_source, _ = install._reviewed_predecessor_source(
     candidate_manifest, candidate_manifest_url,
@@ -1498,6 +1506,7 @@ async def update_check(
       )
       if manifest_url is not None and not _update_candidate_matches_installed(
         installed_manifest_url, manifest_url, candidate.manifest,
+        installed_package_id,
       ):
         return _unknown()
       # The durable pending receipt wins before parsing/comparing a baseline.
@@ -1638,6 +1647,7 @@ async def update_candidate_preview(
       )
       if manifest_url is not None and not _update_candidate_matches_installed(
         installed_manifest_url, manifest_url, candidate.manifest,
+        installed_package_id,
       ):
         raise HTTPException(
           409, "Requested update source does not match the installed app.",
