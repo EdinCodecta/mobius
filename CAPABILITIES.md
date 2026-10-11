@@ -212,8 +212,8 @@ further decoding: the app owns its route identity, so a route it reaches only
 by decoding again is not matched. An unmatched route or method keeps the
 whole `max_bytes` grant. A matched route's ceiling bounds the request body
 read (before buffering), the serialized request, the service's stdout and a
-decoded binary response, and the exchange reserves three times that smaller
-ceiling. The ceiling governs admission accounting only; it promises no
+decoded binary response, and execution admission reserves three times that
+smaller ceiling. The ceiling governs admission accounting only; it promises no
 execution priority, queue position, availability under load or process RSS.
 Adding or lowering a route ceiling narrows the service in update review;
 removing, renaming or raising one widens it.
@@ -242,14 +242,25 @@ sub-budget within that same 512 MiB total**, not an additional allowance. This
 prevents stalled public bodies from taking all private/tool admission. Once a
 public read completes, its sub-budget share is released while the same total
 reservation continues to own the body, decoding, execution and response.
-Each exchange reserves three times its accepted serialized
-ceiling for simultaneous raw, pipe/buffer and encoder copies, plus decoded
-cost before materialization. Once request decoding is complete, its freed
+Each phase charges what it can actually hold. A body read is charged three
+copies of the bytes actually received (buffer growth, reallocation and the
+final copy) before each buffer growth, whatever its `Content-Length` says;
+a declared length over the ceiling is still refused before reading. A request
+waiting for its execution slot holds only its retained envelope estimate.
+Inside the slot, before the request is serialized or any process starts, the
+exchange reserves three times its accepted serialized ceiling for
+simultaneous raw, pipe/buffer and encoder copies. When the budget cannot hold
+that allowance, the call answers a retryable HTTP **503** with `Retry-After`
+and no service runs. Once the service answers, the allowance is replaced by
+three copies of its actual stdout, so finished responses awaiting handoff do
+not hold a media-sized allowance. Decoded cost is charged before
+materialization. Once request decoding is complete, its freed
 transient Unicode copy is replaced by the retained envelope estimate; the
 response estimate is added to that request cost, never substituted for it.
 The combined reservation stays held through HTTP response construction or the
-tool/policy result handoff. Budget exhaustion rejects immediately rather than
-retaining another queued body. Request resource/admission violations return
+tool/policy result handoff. Budget exhaustion while reading or decoding a
+request rejects immediately rather than buffering more. Request
+resource/admission violations return
 HTTP 413; malformed requests within the resource bounds still return 400.
 Service response structural, decoded-cost or combined-budget violations
 return 502, as do malformed service responses. The existing serialized-output

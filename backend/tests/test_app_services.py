@@ -864,19 +864,35 @@ def test_http_dense_container_decode_peak_includes_input_allocation(
   print(f"HTTP decode peak including input: before={baseline}, after={repaired} bytes")
 
 
-@pytest.mark.parametrize("route", ["self", "shared", "public"])
-def test_http_resource_admission_precedes_body_read_for_every_route(
-  client, auth, db, monkeypatch, route,
-):
-  from app.routes import app_services as routes
+class _BodyBuffer(bytearray):
+  """Record the shared body reader's buffer copies and the cost admitted before each."""
 
+  events: list = []
+
+  def extend(self, chunk):
+    _BodyBuffer.events.append(("extend", len(self) + len(chunk), app_services._admitted_exchange_cost))
+    super().extend(chunk)
+
+  def __bytes__(self):
+    _BodyBuffer.events.append(("copy", len(self), app_services._admitted_exchange_cost))
+    return bytes(memoryview(self))
+
+
+@pytest.fixture
+def body_buffer(monkeypatch):
+  from app import storage_io
+
+  _BodyBuffer.events = []
+  monkeypatch.setattr(storage_io, "bytearray", _BodyBuffer, raising=False)
+  return _BodyBuffer.events
+
+
+@pytest.mark.parametrize("route", ["self", "shared", "public"])
+def test_http_resource_admission_precedes_each_body_buffer_copy_for_every_route(
+  client, auth, db, body_buffer, monkeypatch, route,
+):
   app = _service_app(db, access="public")
   monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", 1)
-
-  async def forbidden_read(*_args, **_kwargs):
-    pytest.fail("request body was read before admission")
-
-  monkeypatch.setattr(routes, "read_capped_body", forbidden_read)
   path = {
     "self": f"/api/apps/{app.id}/service/echo",
     "shared": f"/api/services/{app.slug}/echo",
@@ -884,7 +900,9 @@ def test_http_resource_admission_precedes_body_read_for_every_route(
   }[route]
   response = client.post(path, headers=auth, content=b"{}")
   assert response.status_code == 413
-  assert app_services._admitted_exchange_cost == 0
+  assert response.json()["detail"] == "App service request admission budget is exhausted."
+  assert body_buffer == [], "request body was buffered before admission"
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
 
 
 @pytest.mark.parametrize("raw", [
@@ -966,7 +984,9 @@ print(json.dumps({"body": [{"size": len(base64.b64decode(item)), "sha256": hashl
 
 
 @pytest.mark.asyncio
-async def test_queued_http_payloads_keep_admission_and_reject_new_reads(monkeypatch):
+async def test_queued_http_payloads_keep_their_envelope_admission_and_reject_new_growth(
+  monkeypatch, body_buffer,
+):
   from starlette.requests import Request
   from app.routes.app_services import _envelope
 
@@ -985,13 +1005,17 @@ async def test_queued_http_payloads_keep_admission_and_reject_new_reads(monkeypa
   monkeypatch.setattr(app_services, "service_contract", lambda *_a, **_k: {"max_request_bytes": 1024, "max_response_bytes": 1024})
   monkeypatch.setattr(app_services, "hold_runtime", lambda *_: SimpleNamespace(close=lambda: None))
 
+  body = b'{"payload":"' + b'x' * 256 + b'"}'
+  admissions = []
+
   async def http_call():
     async def receive():
       reads.append(True)
-      return {"type": "http.request", "body": b'{"payload":"' + b'x' * 256 + b'"}', "more_body": False}
+      return {"type": "http.request", "body": body, "more_body": False}
 
     request = Request({"type": "http", "method": "POST", "headers": [], "query_string": b""}, receive)
     with app_services.ServiceExchangeAdmission(1024) as admission:
+      admissions.append(admission)
       envelope = await _envelope(request, "echo", public=False, actor={}, max_bytes=1024, admission=admission)
       return await app_services.invoke_service(SimpleNamespace(id=1), None, envelope, admission=admission)
 
@@ -999,12 +1023,18 @@ async def test_queued_http_payloads_keep_admission_and_reject_new_reads(monkeypa
   try:
     await asyncio.wait_for(gate.waiting.wait(), 1)
     reserved = app_services._admitted_exchange_cost
-    assert reserved > 3 * 1024, "queued decoded input was no longer counted"
-    monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", reserved + 3 * 1024 - 1)
+    assert reserved > len(body), "queued decoded input was no longer counted"
+    # Only the retained envelope is held while queued, not a transfer allowance.
+    assert reserved == admissions[0].request_cost
+    assert admissions[0].transfer_cost == 0
+    monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", reserved + 3 * len(body) - 1)
+    buffered = list(body_buffer)
+    assert buffered[-1][:2] == ("copy", len(body))
     with pytest.raises(HTTPException) as caught:
       await http_call()
     assert caught.value.status_code == 413
-    assert reads == [True], "rejected backlog request buffered its body"
+    assert reads == [True, True]
+    assert body_buffer == buffered, "rejected backlog request buffered its body"
     assert app_services._admitted_exchange_cost == reserved
   finally:
     first.cancel()
@@ -1017,7 +1047,8 @@ async def test_cancellation_while_reading_releases_admission():
   started = asyncio.Event()
 
   async def read():
-    with app_services.ServiceExchangeAdmission(1024):
+    with app_services.ServiceExchangeAdmission(1024) as admission:
+      admission.admit_received(1024)
       started.set()
       await asyncio.Event().wait()
 
@@ -1226,12 +1257,20 @@ async def test_response_budget_adds_retained_request_before_parsing(db, auth, mo
   monkeypatch.setattr(service_preload, "ready_host", lambda *_: None)
   raw = b'{"body":"' + b'x' * 1000 + b'"}'
   envelope = {"actor": {}, "body": "x" * 1000}
+  with app_services.ServiceExchangeAdmission(4096) as alone:
+    alone.admit_output(raw)
+    await alone.decode_response(raw)
+    response_alone = alone.cost
+  assert app_services._admitted_exchange_cost == 0
 
   async def reply(*_args):
     request_reserved = app_services._admitted_exchange_cost
     assert request_reserved > 3 * 4096
+    retained_request = request_reserved - 3 * 4096
     # Either direction fits alone; their simultaneously retained costs do not.
-    monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", request_reserved + 1000)
+    monkeypatch.setattr(
+      app_services, "MAX_ADMITTED_EXCHANGE_COST", retained_request + response_alone - 1,
+    )
     return raw, b"", 0
 
   monkeypatch.setattr(app_services, "_run_spawned", reply)
@@ -1263,7 +1302,9 @@ def test_http_exchange_reservation_covers_simultaneous_envelopes_and_json_respon
   async def decode(self, raw):
     value = await real_decode(self, raw)
     seen.append((self.cost, self.request_cost, self.response_cost))
-    assert self.cost == 3 * self.max_bytes + self.request_cost + self.response_cost
+    # Three copies of the actual stdout replace the execution allowance.
+    assert self.transfer_cost == 3 * len(raw) < 3 * self.max_bytes
+    assert self.cost == self.transfer_cost + self.request_cost + self.response_cost
     assert self.request_cost > 0 and self.response_cost > 0
     return value
 
@@ -1485,7 +1526,7 @@ async def test_actual_http_body_deadline_is_total_and_releases_reservations(
 
 @pytest.mark.asyncio
 async def test_stalled_public_http_cannot_monopolize_private_or_tool_admission(
-  db, auth, monkeypatch,
+  db, auth, monkeypatch, body_buffer,
 ):
   import httpx
   from app.main import app as application
@@ -1494,32 +1535,41 @@ async def test_stalled_public_http_cannot_monopolize_private_or_tool_admission(
   app = _service_app(db, access="public", max_bytes=60 * 1024 * 1024)
   owner = db.query(models.Owner).first()
   monkeypatch.setattr(routes, "SERVICE_BODY_TIMEOUT_SECONDS", 5)
+  assert app_services.MAX_PUBLIC_INGRESS_COST == 192 * 1024 * 1024
+  assert app_services.MAX_ADMITTED_EXCHANGE_COST == 512 * 1024 * 1024
+  # A public read holds what it actually received, so saturate a scaled
+  # sub-budget with real bytes rather than buffering 64 MiB in a test.
+  received = 64 * 1024
+  held = 3 * received
+  monkeypatch.setattr(app_services, "MAX_PUBLIC_INGRESS_COST", held)
   started = asyncio.Event()
   cancelled = asyncio.Event()
-  denied_reads = []
 
   async def stalled():
     try:
+      yield b'"' + b"x" * (received - 1)
       started.set()
-      yield b'"'
       await asyncio.Event().wait()
     finally:
       cancelled.set()
 
   async def denied():
-    denied_reads.append(True)
     yield b'{}'
 
   async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as http:
     first = asyncio.create_task(http.post(f"/api/app-services/{app.slug}/echo", content=stalled()))
     try:
       await asyncio.wait_for(started.wait(), 2)
-      held = 3 * 60 * 1024 * 1024
+      for _ in range(100):
+        if app_services._public_ingress_cost == held:
+          break
+        await asyncio.sleep(0.01)
       assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == held
+      buffered = list(body_buffer)
       second = await http.post(f"/api/app-services/{app.slug}/echo", content=denied())
       assert second.status_code == 413
       assert "public ingress budget" in second.json()["detail"]
-      assert denied_reads == []
+      assert body_buffer == buffered, "a denied public body was buffered"
       # Both real HTTP private execution and direct tool execution retain the
       # same 60 MiB grant while the anonymous read remains stalled.
       private = await asyncio.wait_for(http.post(f"/api/apps/{app.id}/service/echo", headers=auth, json={}), 3)
@@ -1543,27 +1593,29 @@ async def test_public_read_transfer_keeps_total_body_ownership(monkeypatch):
   from app.routes.app_services import _envelope
 
   max_bytes = 4096
-  initial = 3 * max_bytes
+  body = b'{"value":"accepted"}'
+  received = 3 * len(body)
   observed = []
   real_decode = app_services.ServiceExchangeAdmission.decode
 
   async def decode(self, raw):
     assert app_services._public_ingress_cost == 0
-    assert app_services._admitted_exchange_cost == self.cost == initial
+    assert app_services._admitted_exchange_cost == self.cost == received
     observed.append(raw)
     return await real_decode(self, raw)
 
   monkeypatch.setattr(app_services.ServiceExchangeAdmission, "decode", decode)
 
   async def receive():
-    assert app_services._public_ingress_cost == app_services._admitted_exchange_cost == initial
-    return {"type": "http.request", "body": b'{"value":"accepted"}', "more_body": False}
+    # Nothing is charged before a byte arrives: the header is not trusted.
+    assert app_services._public_ingress_cost == app_services._admitted_exchange_cost == 0
+    return {"type": "http.request", "body": body, "more_body": False}
 
   request = Request({"type": "http", "method": "POST", "headers": [], "query_string": b""}, receive)
   with app_services.ServiceExchangeAdmission(max_bytes, public_ingress=True) as admission:
     envelope = await _envelope(request, "echo", public=True, actor={}, max_bytes=max_bytes, admission=admission)
     assert envelope["body"] == {"value": "accepted"}
-    assert app_services._admitted_exchange_cost == admission.cost > initial
+    assert app_services._admitted_exchange_cost == admission.cost > received
     assert app_services._public_ingress_cost == 0
     admission.finish_ingress()  # phase completion is idempotent
     assert app_services._admitted_exchange_cost == admission.cost
@@ -1648,13 +1700,17 @@ async def test_cooperative_resource_scan_cancel_releases_owned_bytes(monkeypatch
 
   async def decode():
     with app_services.ServiceExchangeAdmission(1024 * 1024) as admission:
-      return await (admission.decode(raw) if direction == "request" else admission.decode_response(raw))
+      if direction == "request":
+        admission.admit_received(len(raw))
+        return await admission.decode(raw)
+      admission.admit_output(raw)
+      return await admission.decode_response(raw)
 
   task = asyncio.create_task(decode())
   try:
     await asyncio.wait_for(scanned.wait(), 1)
     assert not task.done()
-    assert app_services._admitted_exchange_cost == 3 * 1024 * 1024
+    assert app_services._admitted_exchange_cost == 3 * len(raw)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
       await task
@@ -1846,8 +1902,12 @@ async def test_http_route_ceiling_is_reserved_and_enforced_before_body_decode(
   )
   reads = []
   decoded = []
+  grown = []
+  executions = []
   real_read = routes.read_capped_body
   real_decode = app_services.ServiceExchangeAdmission.decode
+  real_grow = app_services.ServiceExchangeAdmission.admit_received
+  real_execute = app_services.ServiceExchangeAdmission.admit_execution
 
   async def tracked_read(request, limit, **kwargs):
     reads.append((
@@ -1860,8 +1920,18 @@ async def test_http_route_ceiling_is_reserved_and_enforced_before_body_decode(
     decoded.append(len(raw))
     return await real_decode(self, raw)
 
+  def tracked_grow(self, size):
+    real_grow(self, size)
+    grown.append((size, app_services._public_ingress_cost))
+
+  def tracked_execute(self, max_bytes):
+    real_execute(self, max_bytes)
+    executions.append((max_bytes, self.transfer_cost))
+
   monkeypatch.setattr(routes, "read_capped_body", tracked_read)
   monkeypatch.setattr(app_services.ServiceExchangeAdmission, "decode", tracked_decode)
+  monkeypatch.setattr(app_services.ServiceExchangeAdmission, "admit_received", tracked_grow)
+  monkeypatch.setattr(app_services.ServiceExchangeAdmission, "admit_execution", tracked_execute)
   url = {
     "self": f"/api/apps/{app.id}/service/activity",
     "shared": f"/api/services/{app.slug}/activity",
@@ -1892,8 +1962,12 @@ async def test_http_route_ceiling_is_reserved_and_enforced_before_body_decode(
   assert exact.status_code == 413
   assert small.status_code == 201
   assert [read[0] for read in reads] == [cap, cap, cap]
-  assert all(read[1] == 3 * cap for read in reads), "admission did not reserve the route ceiling"
-  assert all(read[2] == (3 * cap if route == "public" else 0) for read in reads)
+  # Nothing is reserved before bytes arrive; growth charges only received
+  # bytes, never beyond the route ceiling, and execution reserves that ceiling.
+  assert all(read[1] == read[2] == 0 for read in reads)
+  assert max(size for size, _public in grown) == cap
+  assert all(public == (3 * size if route == "public" else 0) for size, public in grown)
+  assert executions == [(cap, 3 * cap)] * 2, "admission did not reserve the route ceiling"
   if framing == "understated-length":
     assert [read[3] for read in reads[:2]] == ["2", "2"]
   assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
@@ -2061,28 +2135,42 @@ async def test_declared_control_routes_coexist_with_a_stalled_undeclared_public_
   monkeypatch.setattr(routes, "SERVICE_BODY_TIMEOUT_SECONDS", 5)
   started = asyncio.Event()
   cancelled = asyncio.Event()
-  public_peaks = []
-  real_reserve = app_services.ServiceExchangeAdmission._reserve
+  executions = []
+  started_services = []
+  real_execute = app_services.ServiceExchangeAdmission.admit_execution
+  real_entry = app_services.service_entry
 
-  def measured_reserve(self, cost, **kwargs):
-    real_reserve(self, cost, **kwargs)
-    public_peaks.append(app_services._public_ingress_cost)
+  def tracked_execute(self, max_bytes):
+    executions.append(max_bytes)
+    real_execute(self, max_bytes)
 
-  monkeypatch.setattr(app_services.ServiceExchangeAdmission, "_reserve", measured_reserve)
+  def tracked_entry(*args):
+    started_services.append(True)
+    return real_entry(*args)
+
+  monkeypatch.setattr(app_services.ServiceExchangeAdmission, "admit_execution", tracked_execute)
+  monkeypatch.setattr(app_services, "service_entry", tracked_entry)
+  received = 64 * 1024
 
   async def stalled():
     try:
+      yield b'"' + b"x" * (received - 1)
       started.set()
-      yield b'"'
       await asyncio.Event().wait()
     finally:
       cancelled.set()
 
-  held = 3 * 60 * MIB
+  held = 3 * received
+  # Leave room for a control route's whole allowance, not a media grant's.
+  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", held + 4 * MIB)
   async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as http:
     first = asyncio.create_task(http.post(f"/api/app-services/{app.slug}/echo", content=stalled()))
     try:
       await asyncio.wait_for(started.wait(), 2)
+      for _ in range(100):
+        if app_services._public_ingress_cost == held:
+          break
+        await asyncio.sleep(0.01)
       assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == held
       actor = await asyncio.wait_for(http.get(f"/api/app-services/{app.slug}/actor"), 3)
       activity = await asyncio.wait_for(
@@ -2090,7 +2178,7 @@ async def test_declared_control_routes_coexist_with_a_stalled_undeclared_public_
       )
       assert (actor.status_code, actor.json()["method"], actor.json()["path"]) == (201, "GET", "actor")
       assert (activity.status_code, activity.json()["body"]) == (201, {"type": "Like"})
-      assert held + 3 * MIB in public_peaks, "a declared control route reserved more than its ceiling"
+      assert executions == [MIB, MIB], "a declared control route reserved more than its ceiling"
       # The route ceiling is enforced, not just reserved.
       oversize = await http.post(
         f"/api/app-services/{app.slug}/activity", content=b'"' + b"x" * MIB + b'"',
@@ -2098,11 +2186,13 @@ async def test_declared_control_routes_coexist_with_a_stalled_undeclared_public_
       assert oversize.status_code == 413
       assert oversize.json()["detail"] == "App service request is too large."
       # Wrong method and unmatched routes keep the whole 60 MiB grant, which
-      # the stalled read's share still excludes.
+      # the remaining budget cannot hold: a retryable busy answer, no process.
       for method, path in (("GET", "activity"), ("POST", "actor"), ("POST", "inbox")):
         denied = await http.request(method, f"/api/app-services/{app.slug}/{path}", content=b"{}")
-        assert denied.status_code == 413
-        assert "public ingress budget" in denied.json()["detail"]
+        assert denied.status_code == 503
+        assert denied.headers["retry-after"] == "1"
+      assert executions == [MIB, MIB, 60 * MIB, 60 * MIB, 60 * MIB]
+      assert len(started_services) == 2
       assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == held
     finally:
       first.cancel()
@@ -2133,6 +2223,12 @@ sys.stdout.write('{"body":"' + '\\\\n' * 100_000 + '"}')
   scanned = asyncio.Event()
   matcher = app_services._JSON_STRING_CONTENT
   reserved = []
+  executed = []
+  real_execute = app_services.ServiceExchangeAdmission.admit_execution
+
+  def tracked_execute(self, max_bytes):
+    real_execute(self, max_bytes)
+    executed.append(app_services._admitted_exchange_cost)
 
   class ObservedMatcher:
     def match(self, *args):
@@ -2140,13 +2236,16 @@ sys.stdout.write('{"body":"' + '\\\\n' * 100_000 + '"}')
       scanned.set()
       return matcher.match(*args)
 
+  monkeypatch.setattr(app_services.ServiceExchangeAdmission, "admit_execution", tracked_execute)
   monkeypatch.setattr(app_services, "_JSON_STRING_CONTENT", ObservedMatcher())
   task = asyncio.create_task(app_services.invoke_service(app, owner, {
     "method": "POST", "path": "/tools/feed", "actor": {"browser_grant_id": grant_id},
   }, lane="tools"))
   try:
     await asyncio.wait_for(scanned.wait(), 3)
-    assert 3 * cap <= reserved[0] < 3 * MIB
+    # Execution reserved the route ceiling; the scan holds the actual output.
+    assert 3 * cap <= executed[0] < 3 * MIB
+    assert 3 * 200_000 < reserved[0] < 3 * cap
     assert app_services.browser_grant_has_active_calls(grant_id)
     await app_services.cancel_browser_grant_calls(grant_id)
     assert task.cancelled()
@@ -2154,4 +2253,399 @@ sys.stdout.write('{"body":"' + '\\\\n' * 100_000 + '"}')
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
   assert grant_id not in app_services._browser_calls
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
+# Phase-aware exchange admission: a queued exchange holds only its retained
+# envelope, a body read is charged for bytes actually received before each
+# buffer copy, and the whole transfer allowance is reserved inside the
+# execution slot before serialization or any process starts.
+
+
+class _ParkedLane(asyncio.Semaphore):
+  """An execution slot that counts the exchanges queued on it."""
+
+  def __init__(self, value=0):
+    super().__init__(value)
+    self.queued = 0
+    self.changed = asyncio.Event()
+
+  async def acquire(self):
+    self.queued += 1
+    self.changed.set()
+    return await super().acquire()
+
+  async def wait_queued(self, count):
+    while self.queued < count:
+      self.changed.clear()
+      await asyncio.wait_for(self.changed.wait(), 5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gateway", ["shared", "same-app"])
+async def test_queued_bodyless_gets_hold_only_their_envelopes_and_all_complete(
+  auth, db, monkeypatch, gateway,
+):
+  import httpx
+  from app.main import app as application
+
+  app = _service_app(db, max_bytes=60 * MIB, service_id="queued-social", route_limits=[
+    _route_limit("GET", "/actor", MIB), _route_limit("POST", "/activity", MIB),
+  ])
+  lane = _ParkedLane()
+  monkeypatch.setattr(app_services, "_app_slots", {(app.id, "private"): lane})
+  route = "/api/services/queued-social" if gateway == "shared" else f"/api/apps/{app.id}/service"
+  async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as http:
+    calls = [
+      asyncio.create_task(http.get(f"{route}/board-media/post-{n}/0?thumbnail=true", headers=auth))
+      for n in range(4)
+    ]
+    try:
+      while lane.queued < 4:
+        refused = [task.result().status_code for task in calls if task.done()]
+        assert refused == [], f"a queued read was refused instead of waiting: {refused}"
+        await asyncio.sleep(0.01)
+      held = app_services._admitted_exchange_cost
+      # Four undeclared 60 MiB-grant reads wait on one serialized lane while
+      # holding only their small envelopes, not 4 x 180 MiB of allowance.
+      assert 0 < held < 64 * 1024
+      assert app_services._public_ingress_cost == 0
+      lane.release()
+      replies = await asyncio.wait_for(asyncio.gather(*calls), 30)
+    finally:
+      for task in calls:
+        task.cancel()
+      await asyncio.gather(*calls, return_exceptions=True)
+  assert [reply.status_code for reply in replies] == [201] * 4
+  assert [reply.json()["path"] for reply in replies] == [
+    f"board-media/post-{n}/0" for n in range(4)
+  ]
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_burst_of_tiny_responses_never_needs_a_second_transfer_allowance(
+  auth, db, monkeypatch,
+):
+  import httpx
+  from app.main import app as application
+
+  app = _service_app(db, max_bytes=60 * MIB)
+  # One execution allowance plus room for small envelopes and responses: a
+  # finished or queued exchange must not keep a media-sized reservation.
+  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", 3 * 60 * MIB + MIB)
+  async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as http:
+    replies = await asyncio.wait_for(asyncio.gather(*(
+      http.get(f"/api/apps/{app.id}/service/thumb/{n}", headers=auth) for n in range(5)
+    )), 30)
+  assert [reply.status_code for reply in replies] == [201] * 5
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_finished_tiny_responses_release_their_transfer_allowance_before_handoff(
+  db, auth, monkeypatch,
+):
+  from app import service_preload
+
+  cap = 60 * MIB
+  app = _service_app(db, max_bytes=cap)
+  owner = db.query(models.Owner).first()
+  monkeypatch.setattr(service_preload, "ready_host", lambda *_: None)
+  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", 3 * cap + MIB)
+  executed = []
+
+  async def reply(*_args):
+    executed.append(app_services._admitted_exchange_cost)
+    return b'{"body":{"ok":true}}', b"", 0
+
+  monkeypatch.setattr(app_services, "_run_spawned", reply)
+  release = asyncio.Event()
+  handed_off = []
+
+  async def exchange(n):
+    # The HTTP routes' shape: the reservation is held through response handoff.
+    with app_services.ServiceExchangeAdmission(cap) as admission:
+      result = await app_services.invoke_service(app, owner, {
+        "method": "GET", "path": f"thumb/{n}", "actor": {}, "public": False,
+      }, admission=admission)
+      handed_off.append(admission.cost)
+      await release.wait()
+      return result
+
+  parked = []
+  try:
+    for n in range(4):
+      parked.append(asyncio.create_task(exchange(n)))
+      while len(handed_off) <= n:
+        assert not parked[-1].done(), parked[-1].result()
+        await asyncio.sleep(0)
+    # Each later call ran while every earlier response was still awaiting
+    # handoff, because those hold only their envelope and tiny response.
+    assert len(handed_off) == 4 and all(cost < 64 * 1024 for cost in handed_off)
+    assert all(3 * cap <= cost < 3 * cap + MIB for cost in executed)
+    release.set()
+    results = await asyncio.gather(*parked)
+  finally:
+    release.set()
+    for task in parked:
+      task.cancel()
+    await asyncio.gather(*parked, return_exceptions=True)
+  assert [result[:2] for result in results] == [(200, {"ok": True})] * 4
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["self", "public"])
+@pytest.mark.parametrize("framing", ["unframed-chunked", "understated-length", "overstated-length"])
+async def test_http_body_growth_charges_only_received_bytes_whatever_the_length_header(
+  db, auth, route, framing,
+):
+  import httpx
+  from app.main import app as application
+
+  app = _service_app(db, access="public", max_bytes=60 * MIB)
+  payload = json.dumps({"payload": "x" * 3000}).encode()
+  headers = dict(auth)
+  if framing == "understated-length":
+    headers["content-length"] = "2"
+  elif framing == "overstated-length":
+    headers["content-length"] = str(len(payload) + 4096)
+  charged = []
+
+  def observe():
+    charged.append((app_services._admitted_exchange_cost, app_services._public_ingress_cost))
+
+  async def chunks():
+    # Each observation runs when the reader asks for more, after it has
+    # admitted and buffered everything sent before.
+    for start in range(0, len(payload), 1000):
+      observe()
+      yield payload[start:start + 1000]
+    observe()
+
+  url = f"/api/apps/{app.id}/service/echo" if route == "self" else f"/api/app-services/{app.slug}/echo"
+  async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as http:
+    response = await http.post(url, headers=headers, content=chunks())
+  assert response.status_code == 201
+  assert response.json()["body"] == {"payload": "x" * 3000}
+  received = [0, 1000, 2000, 3000, len(payload)]
+  assert charged == [
+    (3 * size, 3 * size if route == "public" else 0) for size in received
+  ], "body admission did not follow the bytes actually received"
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_missing_length_http2_body_is_read_and_charged_not_treated_as_bodyless():
+  from starlette.requests import Request
+  from app.routes.app_services import _envelope
+
+  sent = []
+
+  async def receive():
+    if not sent:
+      sent.append(True)
+      return {"type": "http.request", "body": b'{"x":1}', "more_body": False}
+    return {"type": "http.disconnect"}
+
+  request = Request({
+    "type": "http", "method": "POST", "path": "/echo", "headers": [],
+    "query_string": b"", "http_version": "2",
+  }, receive)
+  with app_services.ServiceExchangeAdmission(1024) as admission:
+    envelope = await _envelope(request, "echo", public=False, actor={}, max_bytes=1024, admission=admission)
+    assert envelope["body"] == {"x": 1}
+    assert admission.transfer_cost == 3 * len(b'{"x":1}')
+  assert app_services._admitted_exchange_cost == 0
+
+
+def _busy_lane_envelope(lane):
+  return {
+    "schema": 1, "method": "POST", "path": "/tools/echo" if lane == "tools" else "echo",
+    "query": {}, "headers": {}, "body": {"value": "ok"}, "public": lane == "public",
+    "actor": {},
+  }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["private", "public", "tools", "policy"])
+async def test_exhausted_execution_admission_is_retryable_busy_without_side_effects(
+  db, auth, monkeypatch, lane,
+):
+  from app import service_preload
+
+  cap = 4096
+  service = b'''import json, sys
+request = json.load(sys.stdin)
+print(json.dumps({"body": {"path": request["path"]}}))
+'''
+  app = _service_app(db, access="public", service_bytes=service, max_bytes=cap)
+  owner = db.query(models.Owner).first()
+  real = {
+    "serialize": getattr(app_services, "_serialize_request", None),
+    "entry": app_services.service_entry,
+    "spawn": asyncio.create_subprocess_exec,
+  }
+  side_effects = []
+  monkeypatch.setattr(
+    app_services, "_serialize_request",
+    lambda *a: side_effects.append("serialize") or real["serialize"](*a), raising=False,
+  )
+  monkeypatch.setattr(app_services, "service_entry", lambda *a: side_effects.append("entry") or real["entry"](*a))
+  monkeypatch.setattr(service_preload, "ready_host", lambda *_: side_effects.append("preload") or None)
+
+  async def spawn(*args, **kwargs):
+    side_effects.append("process")
+    return await real["spawn"](*args, **kwargs)
+
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+  # The retained envelope fits; the whole three-copy allowance does not.
+  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", 3 * cap - 1)
+
+  async def call():
+    if lane == "policy":
+      return await app_services.invoke_policy(app, owner, "echo", {"value": "ok"})
+    return await app_services.invoke_service(
+      app, owner, _busy_lane_envelope(lane), lane="tools" if lane == "tools" else None,
+    )
+
+  with pytest.raises(HTTPException) as caught:
+    await call()
+  assert caught.value.status_code == 503
+  assert caught.value.detail == "App service is busy; retry shortly."
+  assert caught.value.headers == {"Retry-After": "1"}
+  assert side_effects == [], "a busy exchange serialized or started its service"
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+  # Busy is truthful: the identical request runs once the allowance is free.
+  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", 512 * MIB)
+  result = await call()
+  assert side_effects == ["serialize", "entry", "preload", "process"]
+  assert (result if lane == "policy" else result[1]) == {"path": _busy_lane_envelope(lane)["path"]}
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.parametrize("route", ["self", "shared", "public"])
+def test_http_busy_execution_answers_retry_after_and_starts_no_service(
+  client, auth, db, monkeypatch, route,
+):
+  app = _service_app(db, access="public", max_bytes=4096)
+  started = []
+  monkeypatch.setattr(app_services, "service_entry", lambda *a: started.append(True))
+  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", 3 * 4096 - 1)
+  path = {
+    "self": f"/api/apps/{app.id}/service/echo",
+    "shared": f"/api/services/{app.slug}/echo",
+    "public": f"/api/app-services/{app.slug}/echo",
+  }[route]
+  response = client.post(path, headers=auth, json={"value": "ok"})
+  assert response.status_code == 503
+  assert response.headers["retry-after"] == "1"
+  assert response.json()["detail"] == "App service is busy; retry shortly."
+  assert started == []
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["tool", "policy"])
+async def test_queued_tool_and_policy_requests_serialize_only_after_execution_admission(
+  db, auth, monkeypatch, caller,
+):
+  from app import service_preload
+
+  cap = 64 * 1024
+  app = _service_app(db, max_bytes=cap)
+  owner = db.query(models.Owner).first()
+  lane = _ParkedLane()
+  if caller == "tool":
+    monkeypatch.setattr(app_services, "_global_slots", {**app_services._global_slots, "tools": lane})
+  else:
+    monkeypatch.setattr(app_services, "_app_slots", {(app.id, "private"): lane})
+  monkeypatch.setattr(service_preload, "ready_host", lambda *_: None)
+  serialized = []
+  real_serialize = getattr(app_services, "_serialize_request", None)
+
+  def serialize(envelope, max_bytes):
+    serialized.append((max_bytes, app_services._admitted_exchange_cost))
+    return real_serialize(envelope, max_bytes)
+
+  async def reply(_python, _entry, _environment, request, _timeout, _max_stdout):
+    assert json.loads(request)["body"] == {"text": "x" * 1000}
+    return b'{"body":{"ok":true}}', b"", 0
+
+  monkeypatch.setattr(app_services, "_serialize_request", serialize, raising=False)
+  monkeypatch.setattr(app_services, "_run_spawned", reply)
+  body = {"text": "x" * 1000}
+  task = asyncio.create_task(
+    app_services.invoke_service(app, owner, {
+      "schema": 1, "method": "POST", "path": "/tools/log", "query": {}, "headers": {},
+      "body": body, "public": False, "actor": {},
+    }, lane="tools") if caller == "tool"
+    else app_services.invoke_policy(app, owner, "reviewer/validate", body)
+  )
+  try:
+    await lane.wait_queued(1)
+    retained = app_services._admitted_exchange_cost
+    assert 1000 < retained < 3 * cap, "a queued call held a transfer allowance"
+    assert serialized == [], "a queued call serialized its request"
+    lane.release()
+    result = await asyncio.wait_for(task, 5)
+  finally:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+  assert (result if caller == "policy" else result[1]) == {"ok": True}
+  assert serialized == [(cap, 3 * cap + retained)]
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_revoking_a_queued_browser_call_releases_its_envelope_and_starts_nothing(
+  db, auth, monkeypatch,
+):
+  app = _service_app(db, max_bytes=60 * MIB)
+  owner = db.query(models.Owner).first()
+  grant_id = "c" * 32
+  lane = _ParkedLane()
+  started = []
+  monkeypatch.setattr(app_services, "_app_slots", {(app.id, "private"): lane})
+  monkeypatch.setattr(app_services, "_validate_browser_call", lambda *_: None)
+  monkeypatch.setattr(app_services, "service_entry", lambda *a: started.append(True))
+  task = asyncio.create_task(app_services.invoke_service(app, owner, {
+    "method": "GET", "path": "media/1", "actor": {"browser_grant_id": grant_id},
+  }))
+  try:
+    await lane.wait_queued(1)
+    assert 0 < app_services._admitted_exchange_cost < 64 * 1024
+    assert app_services.browser_grant_has_active_calls(grant_id)
+    await app_services.cancel_browser_grant_calls(grant_id)
+    assert task.cancelled()
+  finally:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+  assert started == []
+  assert grant_id not in app_services._browser_calls
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("public", [False, True], ids=["private", "public"])
+async def test_disconnect_after_body_growth_releases_the_received_charge(public):
+  from starlette.requests import ClientDisconnect, Request
+  from app.routes.app_services import _envelope
+
+  observed = []
+  messages = iter([
+    {"type": "http.request", "body": b'"' + b"x" * 999, "more_body": True},
+    {"type": "http.disconnect"},
+  ])
+
+  async def receive():
+    observed.append((app_services._admitted_exchange_cost, app_services._public_ingress_cost))
+    return next(messages)
+
+  request = Request({"type": "http", "method": "POST", "headers": [], "query_string": b""}, receive)
+  with pytest.raises(ClientDisconnect):
+    with app_services.ServiceExchangeAdmission(4096, public_ingress=public) as admission:
+      await _envelope(request, "echo", public=public, actor={}, max_bytes=4096, admission=admission)
+  assert observed == [(0, 0), (3000, 3000 if public else 0)]
   assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0

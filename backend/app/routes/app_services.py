@@ -93,11 +93,12 @@ async def _envelope(
         request,
         max_bytes,
         too_large="App service request is too large.",
+        admit_growth=admission.admit_received,
       )
   except TimeoutError as exc:
     raise HTTPException(408, "App service request body timed out.") from exc
   # Only the anonymous ingress share is released. The raw body remains owned
-  # by the same total exchange reservation through decoding and invocation.
+  # by the same total exchange reservation until only its envelope remains.
   admission.finish_ingress()
   body = None
   if raw:

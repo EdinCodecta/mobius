@@ -71,7 +71,7 @@ _app_slots: weakref.WeakValueDictionary[tuple[int, str], asyncio.Semaphore] = (
 
 # This is an exchange allocation budget, not another transfer grant. It is
 # shared by every lane and held through the execution queue and response
-# handoff. Exhaustion never queues an already-buffered/decoded payload.
+# handoff. Exhaustion never buffers another body byte and never starts a process.
 MAX_JSON_STRUCTURE = 262_144
 MAX_JSON_DEPTH = 64
 MAX_JSON_DECODE_COST = 320 * 1024 * 1024
@@ -103,22 +103,30 @@ class ServiceExchangeAdmission:
   syntax/value parser. Incremental stdlib text decoding and fixed-size scan
   chunks avoid constructing either the JSON tree or a full Unicode copy first.
   Estimates deliberately overcount duplicate keys, escapes and shared values.
-  Three transfer ceilings cover simultaneous raw, pipe/buffer and encoder
-  copies. Request and response decoded costs are added, never substituted.
-  After request materialization its transient Unicode decode copy is gone;
-  retain() charges the surviving envelope before execution. The response's
-  decode/encode estimate stays held through HTTP rendering or tool handoff.
+
+  The reservation is the sum of three parts, each charged by the phase that
+  owns it and never substituted for another: transfer, request and response.
+  Transfer charges three copies of serialized bytes (raw, pipe/buffer and
+  encoder): of the bytes actually received while a body is read
+  (``admit_received``), nothing while the decoded envelope waits for an
+  execution slot (``retain``), the whole transfer ceiling from inside that slot
+  before serialization or any process starts (``admit_execution``), and the
+  actual stdout once the process has answered (``admit_output``). Request and
+  response decoded costs are added, never substituted. After request
+  materialization its transient Unicode decode copy is gone; retain() charges
+  the surviving envelope. The response's decode/encode estimate stays held
+  through HTTP rendering or tool handoff.
   """
 
   def __init__(self, max_bytes: int, *, public_ingress: bool = False):
     self.max_bytes = max_bytes
     self.public_ingress = public_ingress
     self.cost = 0
+    self.transfer_cost = 0
     self.request_cost = 0
     self.response_cost = 0
 
   def __enter__(self):
-    self._reserve(3 * self.max_bytes)
     return self
 
   def __exit__(self, *_):
@@ -126,6 +134,7 @@ class ServiceExchangeAdmission:
     self.finish_ingress()
     _admitted_exchange_cost -= self.cost
     self.cost = 0
+    self.transfer_cost = 0
     self.request_cost = 0
     self.response_cost = 0
 
@@ -150,16 +159,54 @@ class ServiceExchangeAdmission:
     self.cost = cost
 
   def _reject(self, direction: str, detail: str):
+    if direction == "execution":
+      # Nothing was serialized or started; the same request can succeed once
+      # another exchange releases its transfer allowance.
+      raise HTTPException(503, "App service is busy; retry shortly.", headers={"Retry-After": "1"})
     raise HTTPException(502 if direction == "response" else 413, f"App service {direction} {detail}.")
+
+  def _hold(
+    self, direction: str, *, transfer: int | None = None,
+    request: int | None = None, response: int | None = None,
+  ):
+    transfer = self.transfer_cost if transfer is None else transfer
+    request = self.request_cost if request is None else request
+    response = self.response_cost if response is None else response
+    self._reserve(transfer + request + response, direction=direction)
+    self.transfer_cost = transfer
+    self.request_cost = request
+    self.response_cost = response
+
+  def admit_received(self, size: int):
+    """Charge a body read for ``size`` bytes before its buffer grows to them.
+
+    Three copies cover the growing buffer's slack, a reallocation's old and
+    new buffers, and the final immutable copy (``read_capped_body``).
+    """
+    self._hold("request", transfer=3 * size)
+
+  def admit_execution(self, max_bytes: int):
+    """Reserve the whole transfer allowance from inside an execution slot.
+
+    Runs before the request is serialized or a process is started, so an
+    exhausted budget answers a retryable 503 with no side effect.
+    """
+    self._hold("execution", transfer=3 * max_bytes)
+
+  def admit_output(self, stdout: bytes):
+    """Replace the transfer allowance by the stdout the process produced.
+
+    The serialized request is gone; the response's raw, decoded and rendered
+    copies are bounded by three copies of its actual stdout. A finished
+    exchange awaiting response handoff therefore no longer holds a ceiling
+    sized for output it did not produce.
+    """
+    self._hold("response", transfer=3 * len(stdout))
 
   def _decoded_cost(self, cost: int, *, direction: str = "request"):
     if cost > MAX_JSON_DECODE_COST:
       self._reject(direction, "decoded resource limit exceeded")
-    request_cost = cost if direction == "request" else self.request_cost
-    response_cost = cost if direction == "response" else self.response_cost
-    self._reserve(3 * self.max_bytes + request_cost + response_cost, direction=direction)
-    self.request_cost = request_cost
-    self.response_cost = response_cost
+    self._hold(direction, **{direction: cost})
 
   async def decode(self, raw: bytes):
     return await self._decode(raw, direction="request")
@@ -253,7 +300,13 @@ class ServiceExchangeAdmission:
     return json.loads(raw, parse_constant=_reject_json_constant)
 
   def retain(self, value):
-    """Apply the same resource boundary to already-materialized tool/policy JSON."""
+    """Charge the decoded envelope as the only request copy awaiting execution.
+
+    This applies the same resource boundary to already-materialized
+    tool/policy JSON. An HTTP body's raw bytes are released by then, so a
+    queued exchange holds only its actual bounded envelope, not a transfer
+    allowance.
+    """
     nodes = 0
     cost = 0
 
@@ -274,7 +327,7 @@ class ServiceExchangeAdmission:
           visit(child, depth + 1)
 
     visit(value, 0)
-    self._decoded_cost(cost)
+    self._hold("request", transfer=0, request=cost)
 
 
 def _reject_json_constant(value: str):
@@ -364,6 +417,28 @@ def _reject_oversize_json_strings(value, max_bytes: int) -> None:
   elif isinstance(value, (list, tuple)):
     for item in value:
       _reject_oversize_json_strings(item, max_bytes)
+
+
+def _serialize_request(request_envelope: dict, max_bytes: int) -> bytes:
+  """Encode the stdin request without building more than ``max_bytes`` of it.
+
+  Tool and policy calls bypass HTTP body reads, so this bounds their
+  serialization too rather than building an arbitrarily large request first.
+  """
+  try:
+    buffer = io.BytesIO()
+    size = 0
+    for part in json.JSONEncoder(
+      ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).iterencode(request_envelope):
+      encoded = part.encode("utf-8")
+      size += len(encoded)
+      if size > max_bytes:
+        raise HTTPException(413, "App service request is too large.")
+      buffer.write(encoded)
+    return buffer.getvalue()
+  except (TypeError, ValueError, RecursionError) as exc:
+    raise HTTPException(400, "App service request contains invalid JSON data.") from exc
 
 
 def request_actor(db, principal, caller=None) -> dict:
@@ -604,7 +679,7 @@ async def invoke_service(
   admission: ServiceExchangeAdmission | None = None,
 ) -> tuple[int, object, dict[str, str], str | None]:
   service = service_contract(app, access="public" if request_envelope.get("public") is True else "self")
-  # HTTP callers admit with the same route ceiling before reading a body.
+  # HTTP callers admit their body read under the same route ceiling.
   boundary = (
     contextlib.nullcontext(admission) if admission is not None
     else ServiceExchangeAdmission(exchange_max_bytes(
@@ -615,8 +690,8 @@ async def invoke_service(
   grant_id = browser.grant_id if browser is not None else None
   try:
     with boundary as admitted:
-      # HTTP admission already covers decoding. Also account for the envelope
-      # metadata and impose the same structural boundary on non-HTTP callers.
+      # The envelope, with its metadata, is the only request copy retained
+      # while queued; non-HTTP callers get the same structural boundary.
       admitted.retain(request_envelope)
       return await _invoke_admitted_service(
         app, owner, request_envelope, timeout_seconds=timeout_seconds, lane=lane,
@@ -647,23 +722,9 @@ async def _invoke_admitted_service(
   max_bytes = min(admission.max_bytes, exchange_max_bytes(
     service, request_envelope.get("method"), request_envelope.get("path"),
   ))
-  try:
-    _reject_oversize_json_strings(request_envelope, max_bytes)
-    # Tool calls bypass HTTP body admission. Bound their serialization too,
-    # rather than building an arbitrarily large complete request first.
-    buffer = io.BytesIO()
-    size = 0
-    for part in json.JSONEncoder(
-      ensure_ascii=False, separators=(",", ":"), allow_nan=False,
-    ).iterencode(request_envelope):
-      encoded = part.encode("utf-8")
-      size += len(encoded)
-      if size > max_bytes:
-        raise HTTPException(413, "App service request is too large.")
-      buffer.write(encoded)
-    request_bytes = buffer.getvalue()
-  except (TypeError, ValueError, RecursionError) as exc:
-    raise HTTPException(400, "App service request contains invalid JSON data.") from exc
+  # A bounded scalar check needs no copy, so an oversize request fails before
+  # it waits. Serialization itself runs only after execution admission.
+  _reject_oversize_json_strings(request_envelope, max_bytes)
 
   # A service owns its persistence semantics. Serialize one app's private
   # requests so simple file-backed services do not need a platform-specific
@@ -698,6 +759,11 @@ async def _invoke_admitted_service(
   try:
     async with slot, _global_slots[lane]:
       _validate_browser_call(owner, browser)
+      # Waiting held only the retained envelope. The whole transfer allowance
+      # is reserved here, before serialization or any process start, so
+      # exhaustion is a side-effect-free retryable 503.
+      admission.admit_execution(max_bytes)
+      request_bytes = _serialize_request(request_envelope, max_bytes)
       entry = service_entry(app, service)
       python_env = service_python_env(app, entry)
       python = app_python_env.python_for(python_env)
@@ -726,7 +792,9 @@ async def _invoke_admitted_service(
         outcome = await _run_spawned(
           python, entry, environment, request_bytes, timeout_seconds, max_bytes,
         )
+      del request_bytes
       stdout, stderr, returncode = outcome
+      admission.admit_output(stdout)
       if returncode != 0:
         detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
         log.warning("App service %s failed: %s", app.slug, detail or "no diagnostics")

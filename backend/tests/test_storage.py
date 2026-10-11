@@ -791,6 +791,122 @@ async def test_read_capped_body_propagates_disconnect_and_cancellation():
     await read_capped_body(request, cap=4)
 
 
+@pytest.fixture
+def body_copies(monkeypatch):
+  """Record read_capped_body's buffer growth and final copy, in order."""
+  from app import storage_io
+
+  events = []
+
+  class Buffer(bytearray):
+    def extend(self, chunk):
+      events.append(("extend", len(self) + len(chunk)))
+      super().extend(chunk)
+
+    def __bytes__(self):
+      events.append(("copy", len(self)))
+      return bytes(memoryview(self))
+
+  monkeypatch.setattr(storage_io, "bytearray", Buffer, raising=False)
+  return events
+
+
+def _streamed_request(chunks, headers=()):
+  from starlette.requests import Request
+
+  messages = iter([
+    {"type": "http.request", "body": chunk, "more_body": index < len(chunks) - 1}
+    for index, chunk in enumerate(chunks)
+  ])
+
+  async def receive():
+    return next(messages)
+
+  return Request({"type": "http", "headers": list(headers)}, receive)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [
+  [], [(b"content-length", b"1")], [(b"content-length", b"6")],
+  [(b"transfer-encoding", b"chunked")],
+], ids=["no-length", "understated", "overstated", "chunked"])
+async def test_read_capped_body_admits_received_growth_before_each_buffer_copy(
+  body_copies, headers,
+):
+  from app.storage_io import read_capped_body
+
+  def admit(size):
+    body_copies.append(("admit", size))
+
+  request = _streamed_request([b"ab", b"", b"cde"], headers)
+  assert await read_capped_body(request, cap=8, admit_growth=admit) == b"abcde"
+  # Charged from bytes actually received, never from the length header; the
+  # final copy follows a charge that already covers it.
+  assert body_copies == [
+    ("admit", 2), ("extend", 2), ("admit", 5), ("extend", 5), ("copy", 5),
+  ]
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_refused_growth_buffers_nothing_more(body_copies):
+  from fastapi import HTTPException
+  from app.storage_io import read_capped_body
+
+  def admit(size):
+    if size > 2:
+      raise HTTPException(413, "budget")
+
+  request = _streamed_request([b"ab", b"cde"])
+  with pytest.raises(HTTPException) as refused:
+    await read_capped_body(request, cap=8, admit_growth=admit)
+  assert refused.value.detail == "budget"
+  assert body_copies == [("extend", 2)]
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_byte_cap_precedes_growth_admission(body_copies):
+  from fastapi import HTTPException
+  from app.storage_io import read_capped_body
+
+  admitted = []
+  request = _streamed_request([b"ab", b"cde"])
+  with pytest.raises(HTTPException) as refused:
+    await read_capped_body(request, cap=4, too_large="cap", admit_growth=admitted.append)
+  assert refused.value.detail == "cap"
+  assert admitted == [2] and body_copies == [("extend", 2)]
+
+  async def never():
+    pytest.fail("declared oversize must reject before receive")
+
+  from starlette.requests import Request
+  declared = Request({"type": "http", "headers": [(b"content-length", b"5")]}, never)
+  with pytest.raises(HTTPException):
+    await read_capped_body(declared, cap=4, admit_growth=admitted.append)
+  assert admitted == [2]
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_missing_length_http2_body_is_not_bodyless():
+  from starlette.requests import Request
+  from app.storage_io import read_capped_body
+
+  sent = []
+
+  async def receive():
+    if not sent:
+      sent.append(True)
+      return {"type": "http.request", "body": b'{"x":1}', "more_body": False}
+    return {"type": "http.disconnect"}
+
+  admitted = []
+  request = Request({
+    "type": "http", "method": "POST", "path": "/echo", "headers": [],
+    "query_string": b"", "http_version": "2",
+  }, receive)
+  assert await read_capped_body(request, 1024, admit_growth=admitted.append) == b'{"x":1}'
+  assert admitted == [7]
+
+
 def test_large_text_read_roundtrips(client, auth, owner_token):
   """A text file above the inline threshold streams back intact via the
   FileResponse path (round-8 #3)."""
