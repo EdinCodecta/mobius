@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 import hashlib
 import io
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -1244,6 +1245,7 @@ def test_cancelled_install_rolls_back_only_after_its_git_worker_exits(
   def unverifiable():
     raise RuntimeError("Git package is missing declared source cards.js")
 
+  caplog.set_level(logging.INFO, logger="mobius.install")
   _assert_cancellation_drains_worker_under_lock(
     source_dir, cancelled_install, monkeypatch,
     install, "_verify_git_install_candidate",
@@ -1252,7 +1254,31 @@ def test_cancelled_install_rolls_back_only_after_its_git_worker_exits(
   db.expire_all()
   assert db.query(models.App).filter_by(slug="cancelled").first() is None
   assert not source_dir.exists()
-  # The pass's own failure is not lost behind the caller's cancellation.
+  # The pass's own refusal is not lost behind the caller's cancellation, but
+  # an expected, rolled-back refusal is not reported as an error either.
+  assert "refused after its caller was cancelled" in caplog.text
+  assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def test_cancelled_caller_logs_an_unexpected_failure_of_settling_work(caplog):
+  async def run():
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    async def failing_work():
+      started.set()
+      await finish.wait()
+      raise RuntimeError("unexpected")
+
+    task = asyncio.create_task(install._settle_before_cancel(failing_work()))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+
+  asyncio.run(run())
+  assert [record.levelno for record in caplog.records] == [logging.ERROR]
   assert "failed after its caller was cancelled" in caplog.text
 
 

@@ -2914,11 +2914,15 @@ async def _settle_before_cancel(work: Awaitable):
     except asyncio.CancelledError:
       cancelled = True
   if cancelled:
-    if not work.cancelled() and work.exception() is not None:
-      # The caller's outcome is its cancellation; keep the failure visible.
+    # The caller's outcome is its cancellation, so nobody takes ``work``'s.
+    outcome = None if work.cancelled() else work.exception()
+    if isinstance(outcome, _UncheckedPythonTree):
+      outcome.discard()  # An install's hand-off that will never be checked.
+    elif isinstance(outcome, HTTPException):
+      log.info("install: refused after its caller was cancelled: %s", outcome.detail)
+    elif outcome is not None:
       log.error(
-        "install: work failed after its caller was cancelled",
-        exc_info=work.exception(),
+        "install: work failed after its caller was cancelled", exc_info=outcome,
       )
     raise asyncio.CancelledError
   return work.result()
@@ -3991,6 +3995,10 @@ class _UncheckedPythonTree(Exception):
     self.runtime = runtime
     self.app_id = app_id
 
+  def discard(self) -> None:
+    """Remove the handed-out runtime copy once checked, or once abandoned."""
+    shutil.rmtree(self.runtime.root, ignore_errors=True)
+
 
 async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPythonTree:
   """Build or reuse the env and smoke-run the exact reconciled tree, unlocked."""
@@ -4010,7 +4018,7 @@ async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPyth
       500, "Install failed due to an unexpected server error.",
     ) from exc
   finally:
-    shutil.rmtree(pending.runtime.root, ignore_errors=True)
+    pending.discard()
   return CheckedPythonTree(tree_oid=pending.tree_oid, env=env)
 
 
