@@ -9875,10 +9875,12 @@ def test_update_discovery_explicit_stored_address_follows_package_id(
 
 @pytest.mark.parametrize("route", ["update-check", "update-candidate-preview"])
 @pytest.mark.parametrize("candidate_package_id", [None, "urn:uuid:another-package"])
-def test_update_discovery_fallback_never_offers_what_install_refuses(
+@pytest.mark.parametrize("catalog_address", [False, True])
+def test_update_discovery_never_offers_what_install_refuses(
   client, auth, tmp_path, bypass_url_validation, route, candidate_package_id,
+  catalog_address,
 ):
-  """Without a catalog address, the stored one applies install's package rule."""
+  """With or without a catalog address, discovery applies install's package rule."""
   manifest = {
     "id": "pkg-strict", "name": "Package strict", "version": "1.0.0",
     "description": "Binding", "entry": "index.jsx", "source_files": ["cards.js"],
@@ -9897,8 +9899,11 @@ def test_update_discovery_fallback_never_offers_what_install_refuses(
   if candidate_package_id:
     republished["package_id"] = candidate_package_id
   _publish_clone_files(work, bare, {"mobius.json": json.dumps(republished)})
+  params = {"manifest_url": base + "mobius.json"} if catalog_address else {}
   with patch("app.install._derive_repo_ref", return_value=(bare.as_uri(), "main")):
-    response = client.get(f"/api/apps/{installed.json()['id']}/{route}", headers=auth)
+    response = client.get(
+      f"/api/apps/{installed.json()['id']}/{route}", headers=auth, params=params,
+    )
   if route == "update-check":
     assert response.status_code == 200, response.text
     assert response.json()["update_available"] is None
