@@ -951,6 +951,29 @@ async def test_retry_stages_each_clone_before_taking_the_lifecycle_lock(
 
 
 @pytest.mark.asyncio
+async def test_unreachable_git_host_at_first_boot_leaves_apps_pending(
+  db, monkeypatch,
+):
+  """Staging the clone is the first network step; its failure is retried."""
+  from app import bootstrap as bootstrap_mod
+  from app import install as install_mod
+
+  monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
+  monkeypatch.setattr(bootstrap_mod, "stage_package_clone", install_mod.stage_package_clone)
+  monkeypatch.setattr(install_mod, "_derive_repo_ref", lambda _url: (
+    "https://unresolvable.invalid/app.git", "main",
+  ))
+  install = AsyncMock()
+  with patch("app.bootstrap.install_from_manifest", install):
+    outcome = await bootstrap_mod.ensure_bootstrap_apps_installed(db)
+
+  install.assert_not_awaited()
+  assert outcome.pending == tuple(
+    app.manifest_id for app in bootstrap_mod._CORE_BOOTSTRAP_APPS
+  )
+
+
+@pytest.mark.asyncio
 async def test_runtime_supervisors_own_the_retry_until_shutdown(monkeypatch):
   import logging
 

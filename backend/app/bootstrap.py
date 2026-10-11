@@ -137,7 +137,9 @@ class BootstrapOutcome:
 
 def _transient_failure(exc: Exception) -> tuple[bool, int | None]:
   """Whether an install failure is worth retrying, and any upstream wait."""
-  if isinstance(exc, app_git.GitTransferTimeout):
+  if isinstance(exc, app_git.GitTransferFailed):
+    # Staging a clone is the first network step; a failure there, including
+    # an unreachable host, is the network until proven otherwise.
     return True, None
   if not isinstance(exc, HTTPException):
     return False, None

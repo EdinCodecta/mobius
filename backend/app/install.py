@@ -24,6 +24,7 @@ See feature ticket 062 for the design rationale.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import dataclasses
 import functools
@@ -2855,6 +2856,14 @@ def discard_staged(staged: app_git.Staged | None) -> None:
     shutil.rmtree(staged.path, ignore_errors=True)
 
 
+# Transfers may each hold a thread for the full transfer ceiling, so they get
+# their own small pool instead of the default one the rest of the server uses.
+_GIT_TRANSFER_WORKERS = 4
+_TRANSFER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+  max_workers=_GIT_TRANSFER_WORKERS, thread_name_prefix="git-transfer",
+)
+
+
 async def _stage(stage: Callable[..., app_git.Staged], *args) -> app_git.Staged:
   """Run a staging transfer; a cancelled caller still discards its result.
 
@@ -2862,7 +2871,9 @@ async def _stage(stage: Callable[..., app_git.Staged], *args) -> app_git.Staged:
   eventual staging directory to a callback instead of leaking it on disk.
   """
   loop = asyncio.get_running_loop()
-  transfer = asyncio.ensure_future(asyncio.to_thread(stage, *args))
+  transfer = loop.run_in_executor(
+    _TRANSFER_EXECUTOR, functools.partial(stage, *args),
+  )
   try:
     return await asyncio.shield(transfer)
   except asyncio.CancelledError:

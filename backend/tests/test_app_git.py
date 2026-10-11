@@ -317,6 +317,9 @@ def test_stage_clone_uses_real_origin_and_app_gitignore(tmp_path):
   ).stdout.strip()
   assert origin_url == bare.as_uri()
   assert origin_head == fixture_head
+  assert app_git._run(
+    source_dir, "symbolic-ref", "refs/remotes/origin/HEAD",
+  ).stdout.strip() == "refs/remotes/origin/main"
   assert branch == app_git.LOCAL_BRANCH
   assert local_head == fixture_head
   assert upstream_head == fixture_head
@@ -4793,9 +4796,13 @@ def test_only_the_transfer_uses_the_network_ceiling(tmp_path, monkeypatch):
     assert str(source) not in cmd
   imports = [cmd for cmd, _ in seen if "fetch" in cmd and bare.as_uri() not in cmd]
   assert len(imports) == 1 and str(source) in imports[0]
+  # Writing the cloned working tree is proportional to the download too.
   assert {
-    timeout for cmd, timeout in seen if "fetch" not in cmd
+    timeout for cmd, timeout in seen if "fetch" not in cmd and "checkout" not in cmd
   } == {app_git._GIT_TIMEOUT}
+  assert {
+    timeout for cmd, timeout in seen if "checkout" in cmd
+  } == {app_git._GIT_TRANSFER_TIMEOUT}
 
 
 def test_overlong_transfer_surfaces_as_a_timeout(tmp_path, monkeypatch):
@@ -4900,9 +4907,10 @@ def test_staging_transfers_only_new_objects_and_leaves_live_repo_alone(tmp_path)
   refs, status, head, shallow = _live_state(source)
   assert (status, head, shallow) == before[1:]
   changed = set(refs.splitlines()) ^ set(before[0].splitlines())
-  # Only the private candidate ref and the last-fetched origin branch move.
+  # Only the private candidate ref and the last-fetched origin branch (which
+  # origin/HEAD follows) move.
   assert {line.split()[0] for line in changed} == {
-    app_git.FETCHED_REF, "refs/remotes/origin/main",
+    app_git.FETCHED_REF, "refs/remotes/origin/main", "refs/remotes/origin/HEAD",
   }
   assert app_git.head_sha(source, "origin/main") == new_head
   assert app_git.head_sha(source, app_git.FETCHED_REF) == new_head
@@ -4960,7 +4968,7 @@ def test_transfer_never_reads_an_origin_url_as_an_option(tmp_path):
   stage.mkdir()
   app_git._run(stage, "init", "-q", "--bare")
   marker = tmp_path / "ran"
-  with pytest.raises(subprocess.CalledProcessError):
+  with pytest.raises(app_git.GitTransferFailed):
     app_git._transfer(stage, f"--upload-pack=touch {marker}", "main", unshallow=False)
   assert not marker.exists()
 
@@ -4980,7 +4988,7 @@ def test_transfer_rejects_a_missing_or_different_commit(tmp_path, monkeypatch):
   source = tmp_path / "source"
   _clone(source, bare.as_uri(), "main")
   before = _live_state(source)
-  with pytest.raises(subprocess.CalledProcessError):
+  with pytest.raises(app_git.GitTransferFailed):
     _fetch(source, "f" * 40)
   real_resolve = app_git._resolve_commit
   head = app_git.head_sha(source, "main")

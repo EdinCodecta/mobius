@@ -413,7 +413,7 @@ def test_stalled_transfer_fails_fast_and_cleanly(git_server, monkeypatch):
   monkeypatch.setattr(app_git, "_GIT_LOW_SPEED_TIME", 2)
   git_server.pause("stalled")
   started = time.monotonic()
-  with pytest.raises(subprocess.CalledProcessError):
+  with pytest.raises(app_git.GitTransferFailed):
     asyncio.run(_stage_clone(git_server.url("stalled"), "main"))
   assert time.monotonic() - started < 30
   assert _no_leftovers()
@@ -824,3 +824,49 @@ def test_stored_address_installs_a_renamed_git_package(
     })
   assert result.status_code == 201, result.text
   assert result.json()["id"] == first.json()["id"]
+
+
+def test_transfers_run_on_their_own_bounded_pool(
+  client, auth, git_server, monkeypatch, bypass_url_validation,
+):
+  """A long transfer never occupies the default pool the server shares."""
+  _app_id, manifest = _install_served(client, auth, git_server, "pooled")
+  git_server.commit("pooled", {**manifest, "version": "2.0.0"}, JSX, push=True)
+  threads = []
+  real_transfer = app_git._transfer
+
+  def recorded(*args, **kwargs):
+    threads.append(threading.current_thread().name)
+    return real_transfer(*args, **kwargs)
+
+  monkeypatch.setattr(app_git, "_transfer", recorded)
+  asyncio.run(install.fetch_app_commit(_repo("pooled"), "main"))
+  assert threads and all(name.startswith("git-transfer") for name in threads)
+  assert install._TRANSFER_EXECUTOR._max_workers == install._GIT_TRANSFER_WORKERS
+
+
+def test_history_falls_back_to_the_origin_branch(
+  client, auth, git_server, monkeypatch, bypass_url_validation,
+):
+  """A recorded upstream no longer fetchable by id still completes history."""
+  from app.routes import apps as apps_routes
+
+  _app_id, manifest = _install_served(client, auth, git_server, "fallback")
+  repo = _repo("fallback")
+  v2 = git_server.commit("fallback", {**manifest, "version": "2.0.0"}, JSX, push=True)
+  app_git._run(repo, "fetch", "-q", "origin", f"+main:refs/heads/{app_git.UPSTREAM_BRANCH}")
+  (repo / ".git" / "shallow").write_text(v2 + "\n")
+  requested = []
+  real_fetch = install.fetch_app_commit
+
+  async def by_id_gone(source_dir, ref, **kwargs):
+    requested.append(ref)
+    if ref == v2:
+      raise app_git.GitTransferFailed("not our ref")
+    return await real_fetch(source_dir, ref, **kwargs)
+
+  monkeypatch.setattr(install, "fetch_app_commit", by_id_gone)
+  asyncio.run(apps_routes._complete_history(repo))
+  assert requested == [v2, "main"]
+  assert not (repo / ".git" / "shallow").exists()
+  app_git.require_merge_history(repo)

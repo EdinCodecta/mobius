@@ -121,7 +121,11 @@ _GIT_LOW_SPEED_TIME = 60  # seconds
 FETCHED_REF = "refs/mobius/fetched"
 
 
-class GitTransferTimeout(RuntimeError):
+class GitTransferFailed(RuntimeError):
+  """A Git network transfer failed: the host, the network or the repository."""
+
+
+class GitTransferTimeout(GitTransferFailed):
   """A Git transfer exceeded its wall-clock ceiling."""
 
 
@@ -2682,7 +2686,10 @@ def _transfer(
       ) from exc
     except subprocess.CalledProcessError as exc:
       if source == sources[-1] or "couldn't find remote ref" not in exc.stderr:
-        raise
+        lines = (exc.stderr or "").strip().splitlines()
+        raise GitTransferFailed(
+          lines[-1] if lines else f"git exited with status {exc.returncode}"
+        ) from exc
   fetched = _resolve_commit(stage, FETCHED_REF)
   if fetched is None:
     raise RuntimeError("origin ref did not resolve to a commit")
@@ -2795,8 +2802,18 @@ def stage_clone(url: str, ref: str, root: Path) -> Staged:
     sha, branch = _transfer(stage, url, ref, unshallow=False)
     staged = Staged(stage, sha, url, branch)
     _record_origin_branch(stage, staged)
+    if branch:
+      # Source status reads the remote's default branch through origin/HEAD.
+      _run(
+        stage, "symbolic-ref", "refs/remotes/origin/HEAD",
+        f"refs/remotes/origin/{branch}",
+      )
     _run(stage, "branch", "-f", UPSTREAM_BRANCH, sha)
-    _run(stage, "checkout", "-q", "-B", LOCAL_BRANCH, sha)
+    # Writing a large working tree is proportional to the download.
+    _run(
+      stage, "checkout", "-q", "-B", LOCAL_BRANCH, sha,
+      timeout=_GIT_TRANSFER_TIMEOUT,
+    )
     # Keep the app's OWN .gitignore committed (it travels upstream), but layer
     # Möbius's managed-artifact ignores locally via .git/info/exclude so a
     # later `git add -A` never tracks generated per-install files.
@@ -2826,8 +2843,11 @@ def adopt_clone(staged: Staged, source_dir: str | Path) -> Callable[[], None]:
     for name in reversed(moved):
       shutil.move(str(repo / name), str(staged.path / name))
     moved.clear()
-    _run(staged.path, "checkout", "-q", "-f", "-B", LOCAL_BRANCH, staged.sha)
-    _run(staged.path, "clean", "-q", "-ffdx")
+    _run(
+      staged.path, "checkout", "-q", "-f", "-B", LOCAL_BRANCH, staged.sha,
+      timeout=_GIT_TRANSFER_TIMEOUT,
+    )
+    _run(staged.path, "clean", "-q", "-ffdx", timeout=_GIT_TRANSFER_TIMEOUT)
 
   try:
     for child in list(staged.path.iterdir()):
@@ -3368,8 +3388,24 @@ def require_merge_history(
   ):
     return
   raise HistoryIncomplete(
-    f"app history is incomplete: no merge base between {left} and {right}"
+    f"the app's Git history is incomplete (no merge base between {left} and "
+    f"{right}); retry when the app's source is reachable"
   )
+
+
+def origin_branch(source_dir: str | Path) -> str | None:
+  """The last-fetched origin branch, preferring ``main`` and ``master``."""
+  branches = [
+    name for name in _run(
+      Path(source_dir), "for-each-ref", "--format=%(refname:lstrip=3)",
+      "refs/remotes/origin/", read_only=True,
+    ).stdout.split()
+    if name != "HEAD"
+  ]
+  for preferred in ("main", "master"):
+    if preferred in branches:
+      return preferred
+  return branches[0] if branches else None
 
 
 def merge_upstream(

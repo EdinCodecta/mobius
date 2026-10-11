@@ -1335,7 +1335,15 @@ async def _complete_history(source_dir: str | Path) -> None:
   if upstream is None:
     return
   try:
-    await install.fetch_app_commit(repo, upstream)
+    try:
+      await install.fetch_app_commit(repo, upstream)
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):
+      # The recorded commit may no longer be fetchable by id; the full history
+      # of its origin branch can still reveal the merge base.
+      branch = await asyncio.to_thread(app_git.origin_branch, repo)
+      if branch is None:
+        raise
+      await install.fetch_app_commit(repo, branch)
   except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
     raise install.git_source_error(
       "The installed version was left unchanged.",
