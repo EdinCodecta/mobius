@@ -313,3 +313,129 @@ def test_exhausted_owner_supersession_retry_stays_owed_with_manual_recovery(db, 
   assert chat_waits.wait_resume_blocker(db, wait) == "resume_failed"
   assert _owed(db, chat, a)[1] == (wait.id,)
   assert db.get(models.ChatWait, wait.id).result_disposition is None
+
+
+@pytest.mark.parametrize("origin", ["failed", "owner-superseded"])
+def test_completed_retry_with_failed_receipt_exposes_recovery_and_manual_resume_receives(
+  db, chat, monkeypatch, origin,
+):
+  from app.chat_writer import ChatWriterActor, FinishRun, StartTurn
+  from app.goal_plans import _goal_handoff
+  source = _run(db, chat, "source", "goal")
+  wait = _wait(db, chat, source)
+  original = _run(db, chat, "wait-resume-" + wait.id, source.goal_id, admitted=False)
+  original.status = "failed" if origin == "failed" else "interrupted"
+  original.owner_superseded_by_run_id = "owner" if origin == "owner-superseded" else None
+  db.commit()
+  scheduled = []
+  def schedule(**kw):
+    scheduled.append(kw)
+    chat_mod.discard_starting(kw["chat_id"])
+    return True
+  monkeypatch.setattr(chat_mod, "_schedule_continuation", schedule)
+  assert asyncio.run(chat_waits._deliver_resume(wait.id))
+  retry_id = original.id + ".retry"
+  get_writer().submit(AdmitProviderExecution(chat_id=chat.id, run_token=retry_id,
+    wait_results=(wait.id,))).result(timeout=5)
+
+  def fail_receipt(*args):
+    raise _PersistFailed("receipt transaction unavailable")
+  # Exercise the real successful-provider boundary's best-effort failure path,
+  # followed by successful writer finalization, rather than seeding completion.
+  with monkeypatch.context() as patch:
+    patch.setattr(ChatWriterActor, "_acknowledge_provider_success", fail_receipt)
+    asyncio.run(chat_mod._acknowledge_provider_success(chat_id=chat.id,
+      run_token=retry_id, delivered_through=None, wait_results=(wait.id,)))
+  get_writer().submit(FinishRun(chat_id=chat.id, run_token=retry_id,
+    terminal_status="completed")).result(timeout=5)
+  db.expire_all()
+  retry = db.get(models.ChatRun, retry_id)
+  goal = db.get(models.ChatGoal, source.goal_id)
+  assert retry.status == "completed" and retry.provider_execution_admitted
+  assert goal.status == "open" and wait.result_disposition is None
+  assert not asyncio.run(chat_waits._deliver_resume(wait.id))
+  assert len(scheduled) == 1  # No second retry, including after success without receipt.
+  assert chat_waits.wait_resume_blocker(db, wait) == "manual_resume"
+  assert _goal_handoff(db, retry, goal) == {"kind": "recovery", "reason": "manual_resume"}
+
+  get_writer().submit(StartTurn(chat_id=chat.id, run_token="manual-owner", owner_input=True,
+    user_msg={"kind": "continuation", "continuation_reason": "manual", "cid": "manual-owner"},
+    resume_goal_id=goal.id, resume_goal_revision=goal.revision)).result(timeout=5)
+  db.expire_all()
+  resumed = db.get(models.ChatRun, "manual-owner")
+  assert resumed.goal_id == goal.id and _owed(db, chat, resumed)[1] == (wait.id,)
+  get_writer().submit(AdmitProviderExecution(chat_id=chat.id, run_token=resumed.id,
+    wait_results=(wait.id,))).result(timeout=5)
+  _ack(chat, resumed, (wait.id,))
+  db.expire_all()
+  assert wait.result_disposition == "delivered" and wait.received_run_id == resumed.id
+
+
+@pytest.mark.parametrize("outcome", ["completed", "cancelled", "withdrawn"])
+def test_non_receipt_history_stays_with_owning_answer_not_unrelated_next_answer(db, chat, outcome):
+  from datetime import timedelta, UTC
+  source = _run(db, chat, "declaring", "goal")
+  wait = _wait(db, chat, source)
+  unrelated = _run(db, chat, "unrelated", "other-goal")
+  base = now_naive_utc()
+  wait.created_at = base - timedelta(seconds=10)
+  wait.met_at = base
+  if outcome == "withdrawn":
+    wait.result_disposition = "withdrawn"
+    wait.result_disposed_at = base + timedelta(seconds=10)
+  else:
+    chat_waits.stage_retire_fired_goal_waits(db, chat.id, source.goal_id)
+    db.get(models.ChatGoal, source.goal_id).status = outcome
+  db.commit()
+  db.expire_all()
+  def answer(run, seconds):
+    return {"role": "assistant", "id": run.id,
+      "ts": (base + timedelta(seconds=seconds)).replace(tzinfo=UTC).timestamp() * 1000}
+  messages = [answer(source, -20), answer(unrelated, 2)]
+  summaries = chat_waits.terminal_wait_summaries_by_message_index(db, chat.id, messages)
+  assert set(summaries) == {0}
+  summary = summaries[0][0]
+  assert summary["result_disposition"] == wait.result_disposition
+  assert summary["delivery_pending"] is False
+  assert wait.received_run_id is None and wait.resume_delivered_at is None
+  # A page lacking this Goal's answer cannot promote unrelated work to owner.
+  assert chat_waits.terminal_wait_summaries_by_message_index(db, chat.id, messages[1:]) == {}
+
+
+@pytest.mark.parametrize("disposition", [None, "legacy_consumed", "scheduled"])
+def test_legacy_and_activation_history_keep_timestamp_receipt_fallback(db, chat, disposition):
+  from datetime import timedelta, UTC
+  source = _run(db, chat, "declaring")
+  wait = _wait(db, chat, source)
+  base = now_naive_utc()
+  wait.met_at = base
+  wait.resume_delivered_at = base + timedelta(seconds=1)
+  wait.result_disposition = disposition
+  if disposition == "scheduled":
+    wait.kind = "platform_activation"
+  db.commit()
+  messages = [{"role": "assistant", "ts": (base + timedelta(seconds=seconds)).replace(
+    tzinfo=UTC).timestamp() * 1000} for seconds in (-10, 2)]
+  summaries = chat_waits.terminal_wait_summaries_by_message_index(db, chat.id, messages)
+  assert set(summaries) == {1}
+  assert summaries[1][0]["result_disposition"] == disposition
+  assert summaries[1][0]["delivery_pending"] is False
+
+
+def test_retirement_history_can_use_visible_own_goal_answer_when_declaration_is_absent(db, chat):
+  from datetime import timedelta, UTC
+  source = _run(db, chat, "declaring", "goal")
+  wait = _wait(db, chat, source)
+  retiring = _run(db, chat, "retiring", source.goal_id)
+  unrelated = _run(db, chat, "unrelated", "other-goal")
+  chat_waits.stage_retire_fired_goal_waits(db, chat.id, source.goal_id)
+  db.commit()
+  db.expire_all()
+  before_disposal = now_naive_utc() - timedelta(seconds=2)
+  messages = [{"role": "assistant", "id": run.id,
+    "ts": before_disposal.replace(tzinfo=UTC).timestamp() * 1000}
+    for run in (retiring, unrelated)]
+  summaries = chat_waits.terminal_wait_summaries_by_message_index(db, chat.id, messages)
+  assert set(summaries) == {0}
+  assert summaries[0][0]["result_disposition"] == "retired_by_goal_outcome"
+  assert summaries[0][0]["id"] == wait.id

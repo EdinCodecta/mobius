@@ -446,13 +446,12 @@ def wait_resume_blocker(db: Session, row: models.ChatWait) -> str | None:
     return blocker
   if is_chat_running(row.chat_id):
     return "live_turn"
-  retry = db.get(models.ChatRun, f"wait-resume-{row.id}{_RESUME_RETRY}")
-  if retry is not None and retry.status in {"failed", "interrupted"}:
-    return "resume_failed"
-  original = db.get(models.ChatRun, f"wait-resume-{row.id}") if row.goal_id else None
-  if (original is not None and original.status in {"stopped", "completed", "interrupted"}
-      and not _wait_carrier_can_retry(row, original)):
-    return "manual_resume"
+  if row.kind != "platform_activation":
+    carrier_id, carrier = _selected_wait_carrier(db, row)
+    if carrier is not None and not _wait_carrier_can_schedule(carrier):
+      if carrier_id.endswith(_RESUME_RETRY) and carrier.status in {"failed", "interrupted"}:
+        return "resume_failed"
+      return "manual_resume"
   return None
 
 
@@ -543,7 +542,9 @@ def terminal_wait_summaries_by_message_index(
   wake turn, so chat detail derives a small presentational marker instead.
   Successful/failed/deadline outcomes settle beside the first visible answer
   of the run that received them; a deliberate stop stays beside the most recent
-  answer that owned the wait. Until a wake answer exists, the latest prior
+  answer that owned the wait. Explicit retirement/withdrawal never invents a
+  recipient: it stays with the declaring answer (or another visible answer of
+  that Goal). Until a wake answer exists, the latest prior
   answer is a truthful temporary anchor and naturally moves on the next read.
   """
   rows = (
@@ -597,6 +598,12 @@ def terminal_wait_summaries_by_message_index(
         models.ChatRun.id.in_(answer_by_run_id),
       ).all()
     ]
+  non_waking = {"retired_by_goal_outcome", "withdrawn"}
+  owning_goals = dict(db.query(models.ChatRun.id, models.ChatRun.goal_id).filter(
+    models.ChatRun.chat_id == chat_id, models.ChatRun.id.in_(answer_by_run_id),
+  ).all()) if answer_by_run_id and any(
+    row.result_disposition in non_waking and row.goal_id for row in rows
+  ) else {}
 
   projected: dict[int, list[dict]] = {}
   for row in rows:
@@ -611,7 +618,27 @@ def terminal_wait_summaries_by_message_index(
       continue
 
     candidate_index: int | None
-    if row.status == "cancelled":
+    if row.result_disposition in non_waking:
+      candidate_index = answer_by_run_id.get(row.created_by_run_id)
+      if candidate_index is None and row.goal_id:
+        disposed_ms = epoch_ms(row.result_disposed_at) or settled_ms
+        candidate_index = next((
+          index for index, ts in reversed(assistant_rows)
+          if ts <= disposed_ms + 1000
+          and owning_goals.get(assistant_message_run_id(messages[index].get("id"))) == row.goal_id
+        ), None)
+      if candidate_index is None and not row.goal_id and row.created_by_run_id is None:
+        # Unowned, pre-run-ledger waits have only their declaration time. Keep
+        # that non-waking marker by a prior answer, not a later guessed recipient.
+        candidate_index = next((
+          index for index, ts in reversed(assistant_rows)
+          if created_ms is not None and ts <= created_ms + 1000
+        ), None)
+      if candidate_index is None:
+        # A paginated view may exclude every owning answer. Do not relabel
+        # unrelated work as the owner merely to make the marker visible.
+        continue
+    elif row.status == "cancelled":
       candidate_index = next((
         index for index, ts in reversed(assistant_rows)
         if ts <= settled_ms + 1000
@@ -649,6 +676,7 @@ def terminal_wait_summaries_by_message_index(
       "description": row.description,
       "condition_owner": row.condition_owner,
       "status": row.status,
+      "result_disposition": row.result_disposition,
       "delivery_pending": row.status in _OUTCOMES and row.resume_delivered_at is None and row.result_disposition is None,
       "checks_count": int(row.checks_count or 0),
       "created_at": row.created_at.isoformat() if row.created_at else None,
@@ -895,6 +923,28 @@ def _wait_carrier_can_retry(row: models.ChatWait, carrier: models.ChatRun) -> bo
   )
 
 
+def _selected_wait_carrier(db: Session, row: models.ChatWait) -> tuple[str, models.ChatRun | None]:
+  """The bounded carrier identity shared by delivery and recovery projection."""
+  activation = row.kind == "platform_activation"
+  run_id = f"activation-resume-{row.id}" if activation else f"wait-resume-{row.id}"
+  def existing(identity):
+    return db.query(models.ChatRun).filter(
+      models.ChatRun.id == identity, models.ChatRun.chat_id == row.chat_id,
+    ).first()
+  carrier = existing(run_id)
+  if not activation and carrier is not None and _wait_carrier_can_retry(row, carrier):
+    # Only one retry. A completed retry without a receipt is still exhausted;
+    # neither a failed acknowledgement nor a later read authorizes replay.
+    run_id += _RESUME_RETRY
+    carrier = existing(run_id)
+  return run_id, carrier
+
+
+def _wait_carrier_can_schedule(carrier: models.ChatRun) -> bool:
+  """Only an unentered running orphan can be picked up, never a terminal run."""
+  return carrier.status == "running" and carrier.provider_execution_admitted is False
+
+
 async def _deliver_resume(row_id: str) -> bool:
   """Deliver one met/expired wait's resume to its chat and stamp the latch."""
   import app.chat_queue as chat_queue
@@ -958,31 +1008,9 @@ async def _deliver_resume(row_id: str) -> bool:
       ).first()
       if source_work_id is not None else None
     )
-    resume_run_id = (
-      f"activation-resume-{row_id}" if activation
-      else f"wait-resume-{row_id}"
-    )
-    existing_resume = db.query(models.ChatRun).filter(
-      models.ChatRun.id == resume_run_id,
-      models.ChatRun.chat_id == chat_id,
-    ).first()
-    if (
-      not activation and existing_resume is not None
-      and _wait_carrier_can_retry(row, existing_resume)
-    ):
-      # An unrelated turn can supersede a committed resume before provider
-      # entry, but cannot adopt that Goal's result. Give this proven unentered
-      # carrier with proven owner supersession the same bounded retry as
-      # failure. Stop/held Goals never enter
-      # this path; ambiguous executed interruptions are not replayed.
-      resume_run_id = f"wait-resume-{row_id}{_RESUME_RETRY}"
-      existing_resume = db.query(models.ChatRun).filter(
-        models.ChatRun.id == resume_run_id,
-        models.ChatRun.chat_id == chat_id,
-      ).first()
+    resume_run_id, existing_resume = _selected_wait_carrier(db, row)
     if not activation and existing_resume is not None and not (
-      existing_resume.status == "running"
-      and existing_resume.provider_execution_admitted is False
+      _wait_carrier_can_schedule(existing_resume)
       and not is_chat_running(chat_id)
     ):
       # Otherwise the resume turn ran (or was stopped or superseded); only

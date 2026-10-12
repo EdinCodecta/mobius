@@ -20,9 +20,14 @@ const OUTCOMES = {
   cancelled: { kicker: 'Wait stopped', tone: 'stopped', spoken: 'Stopped wait' },
 }
 
-/** Only a delivered result can explain what started an answer. Undelivered
- * results and deliberate stops stay beside the answer that owned the wait. */
+/** New receipts distinguish a waking delivery from a Goal outcome. Older
+ * summaries lack that distinction, so retain their historical placement. */
 export function waitWokeItsAnswer(summary) {
+  if (summary?.result_disposition === 'retired_by_goal_outcome'
+    || summary?.result_disposition === 'withdrawn') return false
+  if (summary?.result_disposition === 'delivered'
+    || summary?.result_disposition === 'scheduled') return true
+  // legacy_consumed and absent dispositions cannot identify a receiving run.
   return summary?.status !== 'cancelled' && !summary?.delivery_pending
 }
 

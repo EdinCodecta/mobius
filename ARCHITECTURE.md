@@ -1358,8 +1358,10 @@ fabricated receiving run and no historical wake storm. A Goal-owned carrier
 superseded before proven provider entry uses the existing single retry identity
 only with writer-stamped `owner_superseded_by_run_id` evidence;
 an unrelated turn cannot adopt its result. Stop/hold still blocks that wake.
-After the bounded retry fails or is interrupted, the result stays owed for the
-Goal's next authorized turn and presents recovery rather than a healthy wake.
+Delivery and recovery presentation select the same bounded carrier. After that
+retry fails, is interrupted, or completes without a successful receipt, the result
+stays owed for the Goal's next authorized turn and presents manual recovery,
+never another automatic replay.
 A crash after provider execution but before acknowledgement remains ambiguous:
 results stay owed, not proof of exactly-once model execution or external effects.
 Fresh programmatic continuations share `programmatic_start_blocked`: saved Q&A/sealed input, usage
@@ -1395,6 +1397,11 @@ policy; dependencies join the shared handoff seam in a later slice.
 
 History markers derive from durable wait rows, using exact receiving-run identity
 for new receipts and timestamps only for legacy or temporary anchors; no duplicate outcomes are written into chat messages.
+Explicit retirement/withdrawal markers carry their disposition and stay beside
+the declaring answer or another visible answer of their owning Goal, never an
+invented recipient. They cannot become an answer's starting cause. Legacy
+ambiguous receipts and the activation scheduling exception retain their prior
+placement; a page with no visible owning answer omits the non-waking marker.
 This currently scans terminal history and can move a temporary marker to the
 wake's answer. Measure before changing that projection or adding a history index.
 
