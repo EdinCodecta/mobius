@@ -2489,6 +2489,9 @@ def mark_app_opened(
 
 class AppActivitySeenRequest(BaseModel):
   activity_version: int = Field(ge=1, le=(2**63 - 1))
+  # Optional so a shell loaded before lifetime-bound acknowledgements keeps
+  # working until it reloads; without it the write is bound to the live app.
+  app_created_at: str | None = None
 
 
 @router.post(
@@ -2503,9 +2506,17 @@ def mark_app_activity_seen(
   _: models.Owner = Depends(get_current_owner),
 ):
   """Clear an app's durable activity dot when the owner opens the app."""
-  live_app_or_404(db, app_id)
-  app_activity.mark_seen(db, app_id, body.activity_version)
+  app = live_app_or_404(db, app_id)
+  app_created_at = app.created_at.isoformat()
+  if body.app_created_at is not None and body.app_created_at != app_created_at:
+    raise HTTPException(409, "App identity changed before activity acknowledgement")
+  seen_version = app_activity.mark_seen(db, app_id, body.activity_version, app.created_at)
   db.commit()
+  if seen_version is not None:
+    get_system_broadcast().publish({
+      "type": "app_activity_seen", "appId": str(app_id),
+      "appCreatedAt": app_created_at, "seenThroughVersion": seen_version,
+    })
   return Response(status_code=204)
 
 
