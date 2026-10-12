@@ -49,7 +49,7 @@ test('the key field is a labelled password input that browsers do not autofill',
 })
 
 test('a key added beside a sign-in explains that the sign-in keeps precedence', () => {
-  assert.match(render(ClaudeApiKeyForm, { subscriptionActive: true }), /the key is used only without it/)
+  assert.match(render(ClaudeApiKeyForm, { subscriptionActive: true }), /takes precedence, even if it stops working/)
   assert.doesNotMatch(render(ClaudeApiKeyForm, {}), /used only without it/)
 })
 
@@ -68,7 +68,7 @@ test('a sign-in with a standby key says the key is only a fallback', () => {
     authenticated: true, compact: true, authMethod: 'subscription', apiKeySaved: true,
   })
   assert.match(html, /with your Claude sign-in/)
-  assert.match(html, /used only while no Claude sign-in is connected/)
+  assert.match(html, /takes precedence while it is connected/)
   assert.match(html, />Remove API key</)
 })
 

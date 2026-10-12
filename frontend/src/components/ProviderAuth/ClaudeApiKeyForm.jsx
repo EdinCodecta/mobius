@@ -68,7 +68,7 @@ export default function ClaudeApiKeyForm({ subscriptionActive = false, onSaved, 
       <p className="pa__muted">
         Create a key in the <a href={CONSOLE_KEYS_URL} target="_blank" rel="noopener noreferrer">Claude Console</a>.
         {' '}Claude chats and background tasks are then billed per use to that account.
-        {subscriptionActive && ' Your Claude sign-in stays in use while it works; the key is used only without it.'}
+        {subscriptionActive && ' While a Claude sign-in is connected it takes precedence, even if it stops working; to use the key instead, disconnect Claude and save the key again.'}
       </p>
       <div className="provider-connection__actions">
         {onCancel && (

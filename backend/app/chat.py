@@ -4160,7 +4160,7 @@ def _park_exit(
     sink.publish(_pause_note(error_text, kind="credits", provider=provider_id))
     return {"parked": False}
   if claude_on_api_key and error_kind is ProviderErrorKind.AUTH:
-    # The CLI's own advice ("run /login") does not apply inside Möbius.
+    # The CLI's own advice (e.g. "Fix external API key") does not apply inside Möbius.
     error_text = (
       f"{error_text or 'Anthropic rejected the request.'}\n\n"
       "Anthropic rejected the saved API key. Replace it in Settings under "

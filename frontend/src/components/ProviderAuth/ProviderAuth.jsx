@@ -213,7 +213,7 @@ export default function ProviderAuth({
           </div>
           {authMethod === 'subscription' && apiKeySaved && (
             <p className="pa__muted">
-              An API key is also saved. The sign-in takes precedence; the key is used only while no Claude sign-in is connected.
+              An API key is also saved. The sign-in takes precedence while it is connected; to use the key instead, disconnect Claude and save the key again.
             </p>
           )}
           <div className="provider-connection__actions">
