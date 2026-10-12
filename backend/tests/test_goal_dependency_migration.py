@@ -16,15 +16,24 @@ def _seed_legacy_follow(eng, *, suffix, goal_status="open", held=False,
   interest_time = now - timedelta(days=interest_age)
   with Session(eng) as db:
     db.add(create_chat(id=f"chat-{suffix}", messages=[]))
+    db.add(create_chat(id=f"source-{suffix}", messages=[]))
     db.add(models.ChatGoal(
       id=f"goal-{suffix}", chat_id=f"chat-{suffix}", objective="Follow work",
       status=goal_status, hold_json={"reason": "owner"} if held else None,
       created_at=claim_time,
     ))
+    db.add(models.ChatGoal(
+      id=f"source-goal-{suffix}", chat_id=f"source-{suffix}",
+      objective="Own work", status="open", created_at=claim_time,
+    ))
+    db.add(models.ChatRun(
+      id=f"run-{suffix}", chat_id=f"source-{suffix}",
+      goal_id=f"source-goal-{suffix}", status="completed",
+    ))
     db.add(models.AgentWorkClaim(
       id=f"claim-{suffix}", owner_id=1, work_key=f"work-{suffix}",
-      summary="Work", owner_chat_id=f"chat-{suffix}",
-      owner_run_id=f"run-{suffix}", owner_goal_id=f"goal-{suffix}",
+      summary="Work", owner_chat_id=f"source-{suffix}",
+      owner_run_id=f"run-{suffix}", owner_goal_id=f"source-goal-{suffix}",
       claimed_at=claim_time,
       released_at=None if claim_live else now,
     ))
@@ -46,12 +55,37 @@ def test_legacy_claim_follow_upgrade_is_conservative_and_repeatable(tmp_path):
   _seed_legacy_follow(eng, suffix="old", interest_age=3)
   _seed_legacy_follow(eng, suffix="released", claim_live=False)
   _seed_legacy_follow(eng, suffix="resolved", resolved=True, claim_live=False)
+  _seed_legacy_follow(eng, suffix="source-deleted")
+  _seed_legacy_follow(eng, suffix="source-stopped")
+  _seed_legacy_follow(eng, suffix="source-missing")
+  _seed_legacy_follow(eng, suffix="source-run-missing")
+  _seed_legacy_follow(eng, suffix="helper")
+  _seed_legacy_follow(eng, suffix="dependent-missing")
+  _seed_legacy_follow(eng, suffix="self")
+  _seed_legacy_follow(eng, suffix="bad-hold", goal_status="stopped")
   with eng.begin() as conn:
     # Existing acquisitions had no identity. Retrying a partially completed
     # migration must retain whatever ids its first pass already assigned.
     conn.execute(text("UPDATE agent_work_claims SET acquisition_id=NULL"))
+    conn.execute(text("UPDATE chats SET deleted_at='2026-10-12 12:00:00' "
+                      "WHERE id='source-source-deleted'"))
+    conn.execute(text("UPDATE chat_goals SET status='stopped' "
+                      "WHERE id='source-goal-source-stopped'"))
+    conn.execute(text("DELETE FROM chats WHERE id='source-source-missing'"))
+    conn.execute(text("DELETE FROM chat_runs WHERE id='run-source-run-missing'"))
+    conn.execute(text("DELETE FROM chats WHERE id='chat-dependent-missing'"))
+    conn.execute(text("UPDATE agent_work_claims SET owner_chat_id='chat-self', "
+                      "owner_goal_id='goal-self' WHERE id='claim-self'"))
+    conn.execute(text("UPDATE chat_goals SET hold_json='not-json' "
+                      "WHERE id='goal-bad-hold'"))
+    conn.execute(text("INSERT INTO delegations "
+                      "(id, parent_chat_id, parent_root_run_id, task_key, child_chat_id, "
+                      "provider, scope, cwd, prompt_sha256) VALUES "
+                      "('delegation-helper', 'source-helper', 'run-helper', 'task', "
+                      "'chat-helper', 'codex', 'write', '/data', 'digest')"))
 
   schema_migrations._add_goal_dependencies(eng)
+  schema_migrations._repair_legacy_goal_dependency_classification(eng)
   with eng.connect() as conn:
     first = conn.execute(text(
       "SELECT waiting_goal_id, target_key, target_acquisition_id, "
@@ -65,6 +99,13 @@ def test_legacy_claim_follow_upgrade_is_conservative_and_repeatable(tmp_path):
   for row in first[:2]:
     assert row[1] == f"claim:{row[2]}"
     assert row[3:] == (None, None, None)
+  with eng.connect() as conn:
+    assert dict(conn.execute(text(
+      "SELECT waiting_goal_id, target_chat_id FROM goal_dependencies "
+      "WHERE resolved_at IS NULL"
+    )).all()) == {
+      "goal-live": "source-live", "goal-held": "source-held",
+    }
   resolved = next(row for row in first if row[0] == "goal-resolved")
   assert resolved[1] == "legacy-interest:interest-resolved"
   assert resolved[2] is None
@@ -73,6 +114,7 @@ def test_legacy_claim_follow_upgrade_is_conservative_and_repeatable(tmp_path):
   assert "legacy_consumed" in resolved[5]
 
   schema_migrations._add_goal_dependencies(eng)
+  schema_migrations._repair_legacy_goal_dependency_classification(eng)
   with eng.connect() as conn:
     assert conn.execute(text(
       "SELECT waiting_goal_id, target_key, target_acquisition_id, "
@@ -82,7 +124,7 @@ def test_legacy_claim_follow_upgrade_is_conservative_and_repeatable(tmp_path):
     assert dict(conn.execute(text(
       "SELECT id, acquisition_id FROM agent_work_claims"
     )).all()) == claim_ids
-    assert conn.execute(text("SELECT count(*) FROM agent_work_interests")).scalar_one() == 7
+    assert conn.execute(text("SELECT count(*) FROM agent_work_interests")).scalar_one() == 15
   assert "goal_dependencies" in inspect(eng).get_table_names()
 
 
@@ -94,7 +136,31 @@ def test_partial_dependency_migration_reuses_existing_acquisition(tmp_path):
     conn.execute(text("UPDATE agent_work_claims SET acquisition_id='first-generation'"))
     conn.execute(text("DROP TABLE goal_dependencies"))
   schema_migrations._add_goal_dependencies(eng)
+  schema_migrations._repair_legacy_goal_dependency_classification(eng)
   with eng.connect() as conn:
     assert conn.execute(text(
-      "SELECT target_key FROM goal_dependencies"
-    )).scalar_one() == "claim:first-generation"
+      "SELECT target_key, target_chat_id FROM goal_dependencies"
+    )).one() == ("claim:first-generation", "source-partial")
+
+
+def test_legacy_direct_cycle_does_not_arm_either_side(tmp_path):
+  eng = create_engine(f"sqlite:///{tmp_path / 'cycle.db'}")
+  models.Base.metadata.create_all(eng)
+  _seed_legacy_follow(eng, suffix="a")
+  _seed_legacy_follow(eng, suffix="b")
+  with eng.begin() as conn:
+    for suffix, other in (("a", "b"), ("b", "a")):
+      conn.execute(text(
+        "UPDATE chat_runs SET chat_id=:chat_id, goal_id=:goal_id WHERE id=:run_id"
+      ), {"chat_id": f"chat-{other}", "goal_id": f"goal-{other}",
+          "run_id": f"run-{suffix}"})
+      conn.execute(text(
+        "UPDATE agent_work_claims SET owner_chat_id=:chat_id, "
+        "owner_goal_id=:goal_id WHERE id=:claim_id"
+      ), {"chat_id": f"chat-{other}", "goal_id": f"goal-{other}",
+          "claim_id": f"claim-{suffix}"})
+  schema_migrations._add_goal_dependencies(eng)
+  schema_migrations._repair_legacy_goal_dependency_classification(eng)
+  with eng.connect() as conn:
+    assert conn.execute(text("SELECT count(*) FROM goal_dependencies")).scalar_one() == 0
+    assert conn.execute(text("SELECT count(*) FROM agent_work_interests")).scalar_one() == 2

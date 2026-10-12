@@ -6662,7 +6662,10 @@ def _add_goal_dependencies(eng) -> None:
          claimed_at, released_at, completed_at) in rows:
       # A stopped Goal is eligible only when explicitly held. Dismissed,
       # deleted, terminal and cross-chat identities must not arm work.
-      hold = json.loads(hold_json) if isinstance(hold_json, str) else hold_json
+      try:
+        hold = json.loads(hold_json) if isinstance(hold_json, str) else hold_json
+      except (TypeError, ValueError):
+        hold = None
       if (goal_chat_id != chat_id or deleted_at is not None or
           not (goal_status == "open" or
                (goal_status == "stopped" and isinstance(hold, dict)))):
@@ -6703,6 +6706,97 @@ def _add_goal_dependencies(eng) -> None:
         "disposition": disposition, "disposed_at": resolved_at,
         "created_at": created_at,
       })
+
+
+def _repair_legacy_goal_dependency_classification(eng) -> None:
+  """Narrow 0090's legacy candidates to independently proven owners.
+
+  Keep 0090 append-only. Its CREATE TABLE statement is atomic, and its
+  indexes are idempotent; a stopped pass before ledger insertion simply reruns
+  it. This follow-up removes only rows identifiable as its pending backfill.
+  The original interests remain unchanged for uncertain/manual reconciliation.
+  """
+  from sqlalchemy import inspect, text
+
+  tables = set(inspect(eng).get_table_names())
+  needed = {"goal_dependencies", "agent_work_interests", "agent_work_claims",
+            "chat_goals", "chats", "chat_runs", "delegations"}
+  if not needed.issubset(tables):
+    return
+  with eng.begin() as conn:
+    # The claim row may later lose its owner on deletion. Its current owner is
+    # proof only for pending follows, not for an older resolved interest.
+    conn.execute(text("""
+      UPDATE goal_dependencies SET target_chat_id = (
+        SELECT c.owner_chat_id FROM agent_work_claims c
+        WHERE c.id = goal_dependencies.target_claim_id
+      )
+      WHERE target_kind='claim_acquisition' AND created_by_run_id IS NULL
+        AND target_chat_id IS NULL AND resolved_at IS NULL
+    """))
+    rows = conn.execute(text("""
+      SELECT d.id, d.waiting_goal_id, d.waiting_chat_id, d.target_acquisition_id,
+             wc.id, wc.deleted_at, wg.id, wg.status, wg.hold_json,
+             c.id, c.acquisition_id, c.owner_chat_id, c.owner_run_id, c.owner_goal_id,
+             c.released_at, c.completed_at,
+             sc.id, sc.deleted_at, sr.id, sr.chat_id,
+             sg.id, sg.chat_id, sg.status,
+             EXISTS(SELECT 1 FROM delegations x WHERE x.child_chat_id=d.waiting_chat_id)
+      FROM goal_dependencies d
+      LEFT JOIN chats wc ON wc.id=d.waiting_chat_id
+      LEFT JOIN chat_goals wg ON wg.id=d.waiting_goal_id
+      LEFT JOIN agent_work_claims c ON c.id=d.target_claim_id
+      LEFT JOIN chats sc ON sc.id=c.owner_chat_id
+      LEFT JOIN chat_runs sr ON sr.id=c.owner_run_id
+      LEFT JOIN chat_goals sg ON sg.id=c.owner_goal_id
+      WHERE d.target_kind='claim_acquisition' AND d.created_by_run_id IS NULL
+        AND d.resolved_at IS NULL AND d.result_disposition IS NULL
+        AND EXISTS(SELECT 1 FROM agent_work_interests i
+                   WHERE i.claim_id=d.target_claim_id AND i.goal_id=d.waiting_goal_id
+                     AND i.chat_id=d.waiting_chat_id AND i.resolved_at IS NULL)
+    """)).all()
+    # Snapshot all edges before removal so A<->B removes both, not just the
+    # first edge visited by the loop.
+    edges = {(goal_id, source_goal_id) for (
+      _dep_id, goal_id, _chat_id, _target_acquisition_id, _wc_id, _wc_deleted,
+      _wg_id, _wg_status, _wg_hold, _claim_id, _claim_acquisition_id,
+      _source_chat_id, _source_run_id, source_goal_id,
+      _released, _completed, _sc_id, _sc_deleted, _sr_id, _sr_chat_id,
+      _sg_id, _sg_chat_id, _sg_status, _helper,
+    ) in rows if source_goal_id is not None}
+    for (dep_id, goal_id, chat_id, target_acquisition_id,
+         waiting_chat_exists, waiting_chat_deleted,
+         waiting_goal_exists, waiting_status, waiting_hold, claim_exists,
+         claim_acquisition_id, source_chat_id, source_run_id, source_goal_id,
+         released_at, completed_at,
+         source_chat_exists, source_chat_deleted, source_run_exists,
+         source_run_chat_id, source_goal_exists, source_goal_chat_id,
+         source_goal_status, is_helper) in rows:
+      try:
+        hold = json.loads(waiting_hold) if isinstance(waiting_hold, str) else waiting_hold
+      except (TypeError, ValueError):
+        hold = None
+      dependent_ok = (
+        waiting_chat_exists is not None and waiting_chat_deleted is None and
+        waiting_goal_exists is not None and not is_helper and
+        (waiting_status == "open" or
+         (waiting_status == "stopped" and isinstance(hold, dict)))
+      )
+      source_ok = (
+        claim_exists is not None and target_acquisition_id is not None and
+        target_acquisition_id == claim_acquisition_id and
+        source_chat_id is not None and
+        source_chat_id != chat_id and source_chat_exists is not None and
+        source_chat_deleted is None and source_run_exists is not None and
+        source_run_chat_id == source_chat_id and released_at is None and
+        completed_at is None and source_goal_id != goal_id and
+        (source_goal_id is None or
+         (source_goal_exists is not None and
+          source_goal_chat_id == source_chat_id and source_goal_status == "open"))
+      )
+      direct_cycle = (source_goal_id, goal_id) in edges if source_goal_id else False
+      if not dependent_ok or not source_ok or direct_cycle:
+        conn.execute(text("DELETE FROM goal_dependencies WHERE id=:id"), {"id": dep_id})
 
 
 _SCHEMA_MIGRATIONS = (
@@ -6817,6 +6911,7 @@ _SCHEMA_MIGRATIONS = (
   ("0086_goal_execution_identity", _goal_execution_identity),
   ("0089_wait_result_receipts", _add_wait_result_receipts),
   ("0090_goal_dependencies", _add_goal_dependencies),
+  ("0091_repair_legacy_goal_dependency_classification", _repair_legacy_goal_dependency_classification),
 )
 
 

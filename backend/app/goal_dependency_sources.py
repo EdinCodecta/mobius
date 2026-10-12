@@ -201,20 +201,25 @@ def stage_reconcile_claim_sources(db: Session) -> int:
   ).all()
   settled = 0
   for row in rows:
+    blocker = dependency_source_blocker(db, row)
+    if blocker is None:
+      continue
     claim = db.get(models.AgentWorkClaim, row.target_claim_id) if row.target_claim_id else None
     if claim is not None:
-      # Serialize observation with finish/transfer/reacquire. This is a write
-      # lock on SQLite too; a stale claimant is re-read after the fence.
-      db.query(models.AgentWorkClaim).filter(
+      # Only a stalled candidate needs a source write lock. Re-read after the
+      # lock so a simultaneous finish/transfer wins over stale observation.
+      changed = db.query(models.AgentWorkClaim).filter(
         models.AgentWorkClaim.id == claim.id,
         models.AgentWorkClaim.revision == claim.revision,
       ).update({models.AgentWorkClaim.updated_at: now_naive_utc()},
                synchronize_session=False)
+      if changed != 1:
+        continue
       db.expire(claim)
       db.refresh(claim)
-    blocker = dependency_source_blocker(db, row)
-    if blocker is None:
-      continue
+      blocker = dependency_source_blocker(db, row)
+      if blocker is None:
+        continue
     settled += db.query(models.GoalDependency).filter(
       models.GoalDependency.id == row.id,
       models.GoalDependency.resolved_at.is_(None),
