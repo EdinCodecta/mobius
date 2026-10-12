@@ -70,6 +70,7 @@ import signal
 import socket
 import subprocess
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -2659,6 +2660,7 @@ _PERMANENT_FETCH_ERROR = re.compile(
   r"|no space left on device|disk quota exceeded",
   re.IGNORECASE,
 )
+_DNS_RECHECK_TIMEOUT = 5  # seconds
 _UNRESOLVED_HOST = re.compile(r"could not resolve host: ([^\s']+)", re.IGNORECASE)
 
 
@@ -2674,13 +2676,21 @@ def _transient_fetch_error(stderr: str) -> bool:
   unresolved = _UNRESOLVED_HOST.search(stderr)
   if unresolved is None:
     return True
-  try:
-    socket.getaddrinfo(unresolved.group(1), None)
-  except socket.gaierror as exc:
-    return exc.errno == socket.EAI_AGAIN
-  except (OSError, UnicodeError):
-    pass
-  return True
+  answers: list[bool] = []
+
+  def lookup() -> None:
+    try:
+      socket.getaddrinfo(unresolved.group(1), None)
+    except socket.gaierror as exc:
+      answers.append(exc.errno == socket.EAI_AGAIN)
+    except (OSError, UnicodeError):
+      pass
+
+  # A resolver too slow to answer is itself a temporary failure.
+  lookup_thread = threading.Thread(target=lookup, daemon=True)
+  lookup_thread.start()
+  lookup_thread.join(_DNS_RECHECK_TIMEOUT)
+  return answers[0] if answers else True
 
 
 def _transfer(

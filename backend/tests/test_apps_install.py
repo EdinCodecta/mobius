@@ -1201,6 +1201,56 @@ def test_known_git_origin_clone_failure_rolls_back_instead_of_importing_http(
   assert app_git.head_sha(source_dir, "upstream") == commit
 
 
+def test_root_manifest_not_named_mobius_json_installs_over_http(
+  client, auth, db, bypass_url_validation,
+):
+  """A Git package is read from its root mobius.json, so a root manifest with
+  another name is imported over HTTP rather than cloned."""
+  base = "https://raw.githubusercontent.com/acme/other-name/main/"
+  manifest = {
+    "id": "other-name", "name": "Other Name", "version": "1.0.0",
+    "description": "Root manifest named app.json", "entry": "index.jsx",
+  }
+  assert install._derive_repo_ref(base + "app.json") is None
+  responses = {
+    base + "app.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  with patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
+  ), patch(
+    "app.install.app_git.stage_clone",
+    side_effect=AssertionError("a non-mobius.json manifest must not be cloned"),
+  ):
+    response = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "app.json",
+    })
+  assert response.status_code == 201, response.text
+  source_dir = Path(get_settings().data_dir) / "apps" / "other-name"
+  assert (source_dir / "index.jsx").read_text() == JSX
+
+
+def test_install_refuses_both_a_manifest_url_and_an_inline_manifest(
+  client, auth, db, bypass_url_validation,
+):
+  base = "https://raw.githubusercontent.com/acme/both/main/"
+  manifest = {
+    "id": "both", "name": "Both", "version": "1.0.0",
+    "description": "Two sources", "entry": "index.jsx",
+  }
+  with patch(
+    "app.install.app_git.stage_clone",
+    side_effect=AssertionError("refused before any transfer"),
+  ):
+    response = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json", "manifest": manifest,
+      "raw_base": base,
+    })
+  assert response.status_code == 400, response.text
+  assert "exactly one" in response.json()["detail"]
+  assert db.query(models.App).filter_by(slug="both").first() is None
+
+
 def test_clone_failure_on_a_full_disk_is_not_retryable(
   client, auth, db, bypass_url_validation,
 ):

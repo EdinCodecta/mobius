@@ -305,9 +305,10 @@ def _derive_raw_base(manifest_url: str) -> str:
 def _derive_repo_ref(manifest_url: str) -> tuple[str, str] | None:
   """Return the GitHub repo/ref for a raw GitHub manifest URL, if derivable.
 
-  Deliberately narrow: only a ROOT manifest at a SINGLE-SEGMENT ref
-  (`raw.githubusercontent.com/<org>/<repo>/<ref>/<manifest-file>`, exactly four
-  path segments) is clone-eligible. That is the canonical `mobius-os/app-*`
+  Deliberately narrow: only a ROOT `mobius.json` at a SINGLE-SEGMENT ref
+  (`raw.githubusercontent.com/<org>/<repo>/<ref>/mobius.json`, exactly four
+  path segments) is clone-eligible, since a Git package is read from its root
+  `mobius.json`; any other manifest file name is imported over HTTP. That is the canonical `mobius-os/app-*`
   shape, and it is the only shape where the repo root's `index.jsx` is the entry
   the manifest points at. Two other shapes must NOT be clone-derived — they are
   imported over HTTP into a local Git repository instead of mis-cloning:
@@ -316,8 +317,8 @@ def _derive_repo_ref(manifest_url: str) -> tuple[str, str] | None:
     - a branch name CONTAINING A SLASH (`…/<repo>/feature/x/mobius.json`) — a
       greedy `parts[:3]` would mis-read the ref as `feature`.
   Both push the segment count past four, so the strict `== 4` check rejects
-  them. The caller (`install_from_manifest`) treats a `None` return as
-  not-clone-eligible and keeps the already-fetched HTTP entry.
+  them. Callers treat a `None` return as not-clone-eligible and fetch the
+  package over HTTP.
   """
   parsed = urlparse(requested_manifest_source(manifest_url)[0])
   parts = [unquote(part) for part in parsed.path.split("/") if part]
@@ -327,7 +328,9 @@ def _derive_repo_ref(manifest_url: str) -> tuple[str, str] | None:
     or len(parts) != 4
   ):
     return None
-  org, repo, ref, _manifest_file = parts
+  org, repo, ref, manifest_file = parts
+  if manifest_file != "mobius.json":
+    return None
   for part in (org, repo, ref):
     if part in ("", ".", "..") or part.startswith("-") or "\\" in part:
       return None
@@ -1733,21 +1736,31 @@ def _require_git_candidate(
   A prepared install reads its package from the very commit it adopts; only a
   caller that fetched over HTTP, such as a publication handoff, needs this.
   """
+  reason = None
   try:
     actual = read_git_install_candidate(
       source_dir, commit, candidate.raw_base + "mobius.json",
-    ).candidate.source_review_digest
+    ).candidate
+    if actual.manifest != candidate.manifest:
+      reason = "manifest changed"
+    elif actual.source_review_digest != candidate.source_review_digest:
+      reason = "package files changed"
+  except HTTPException as exc:  # An invalid Git manifest.
+    reason = f"invalid mobius.json: {exc.detail}"
   except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-    actual = str(exc)
-  if actual != candidate.source_review_digest:
-    raise HTTPException(409, detail={
-      "code": "git_source_mismatch",
-      "message": (
-        "The fetched Git commit does not match the package bytes that were "
-        "reviewed. Refresh the update and try again."
-      ),
-      "retryable": True,
-    })
+    reason = str(exc)
+  if reason is None:
+    return
+  log.warning("install: Git commit %s does not match its package: %s", commit, reason)
+  raise HTTPException(409, detail={
+    "code": "git_source_mismatch",
+    "message": (
+      "The fetched Git commit does not match the package bytes that were "
+      "reviewed. Refresh the update and try again."
+    ),
+    "reason": reason,
+    "retryable": True,
+  })
 
 
 async def clear_pending_conflict_update(db: Session, app: models.App) -> None:
@@ -2719,9 +2732,15 @@ def read_git_install_candidate(
   source_url: str,
   *,
   source_identity: str | None = None,
+  predecessor_source_identity: str | None = None,
+  canonical_source_url: str | None = None,
   strict: bool = True,
 ) -> GitInstallCandidate:
-  """Read every declared install input from one already-fetched commit."""
+  """Read every declared install input from one already-fetched commit.
+
+  Without a resolved ``predecessor_source_identity``, a predecessor in the
+  same repository shares ``source_identity``.
+  """
   repo = Path(source_dir)
   resolved = _reviewed_git_package_commit(repo, commit)
   # Spool the commit rather than reading every file into memory: the package
@@ -2744,10 +2763,10 @@ def read_git_install_candidate(
     source_url.rsplit("/mobius.json", 1)[0]
     if "/mobius.json" in source_url else source_url
   )
-  predecessor_source_identity = None
   previous_source = manifest.get("previous_manifest_url")
   if (
-    source_identity is not None
+    predecessor_source_identity is None
+    and source_identity is not None
     and previous_source
     and _github_root_manifest_identity(previous_source)
     == _github_root_manifest_identity(source_url)
@@ -2768,7 +2787,9 @@ def read_git_install_candidate(
       source_review_digest=content_digest,
       source_identity=source_identity,
       predecessor_source_identity=predecessor_source_identity,
-      canonical_source_url=source_url if source_identity else None,
+      canonical_source_url=canonical_source_url or (
+        source_url if source_identity else None
+      ),
     ),
   )
 
@@ -2941,31 +2962,6 @@ async def _settle_before_cancel(
       )
     raise asyncio.CancelledError
   return work.result()
-
-
-async def stage_package_clone(
-  manifest_url: str, *,
-  reviewed_capability_digest: str | None = None,
-  db: Session | None = None,
-) -> app_git.Staged | None:
-  """The pre-lock Git step of a URL install: clone the package's repository.
-
-  Returns None for a package that is not a root Git repository. An owner
-  request passes ``db``: the manifest is validated first, with the stored
-  address checks the preview uses, so a missing or invalid package is reported
-  before any history is transferred, and the connection is released before
-  the transfer.
-  """
-  repo_ref = _derive_repo_ref(manifest_url)
-  if repo_ref is None:
-    return None
-  if db is not None:
-    previewed, *_ = await preview_manifest_capabilities(
-      manifest_url=manifest_url, manifest=None, raw_base=None, db=db,
-    )
-    db.rollback()
-    _require_reviewed_capabilities(previewed, reviewed_capability_digest)
-  return await _stage(app_git.stage_clone, *repo_ref, git_transfer_root())
 
 
 # One transfer per (repository, origin, ref) at a time; concurrent requests,
@@ -3233,16 +3229,33 @@ async def prepare_package(
 ) -> PreparedPackage:
   """The network half of a fresh install; run it holding no lock.
 
-  Changed capabilities are refused from the manifest alone, before any code
-  or history is downloaded.
+  A root Git package is cloned and read from its clone. An owner request
+  passes ``db``: the manifest is validated first, with the stored address
+  checks the preview uses, so a missing or invalid package, or one whose
+  capabilities changed since review, is refused before any history is
+  transferred, and the connection is released before the transfer.
   """
-  staged = None
+  if (manifest_url is None) == (manifest is None):
+    raise HTTPException(
+      400, "Provide exactly one of `manifest_url` or `manifest`.",
+    )
+  repo_ref = _derive_repo_ref(manifest_url) if manifest_url else None
+  if repo_ref is None:
+    candidate = await _fetch_install_candidate(
+      manifest_url=manifest_url, manifest=manifest, raw_base=raw_base,
+      reviewed_capability_digest=reviewed_capability_digest, db=db,
+    )
+    if db is not None:
+      db.rollback()  # No connection is held while the caller waits for a lock.
+    return PreparedPackage(candidate)
+  if db is not None:
+    previewed, *_ = await preview_manifest_capabilities(
+      manifest_url=manifest_url, manifest=None, raw_base=None, db=db,
+    )
+    db.rollback()
+    _require_reviewed_capabilities(previewed, reviewed_capability_digest)
   try:
-    if manifest_url is not None:
-      staged = await stage_package_clone(
-        manifest_url, reviewed_capability_digest=reviewed_capability_digest,
-        db=db,
-      )
+    staged = await _stage(app_git.stage_clone, *repo_ref, git_transfer_root())
   except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
     raise git_source_error(
       "Nothing was installed.",
@@ -3251,14 +3264,6 @@ async def prepare_package(
       failure="The app's Git repository could not be cloned or verified; "
       "retry when its source is available.",
     ) from exc
-  if staged is None:
-    candidate = await _fetch_install_candidate(
-      manifest_url=manifest_url, manifest=manifest, raw_base=raw_base,
-      reviewed_capability_digest=reviewed_capability_digest, db=db,
-    )
-    if db is not None:
-      db.rollback()  # No connection is held while the caller waits for a lock.
-    return PreparedPackage(candidate)
   try:
     return PreparedPackage(
       await _staged_clone_candidate(manifest_url, staged, db=db), staged,
@@ -3273,10 +3278,28 @@ async def _staged_clone_candidate(
 ) -> InstallCandidate:
   """Read a root Git package from its staged clone, binding its identity."""
   source_url = requested_manifest_source(manifest_url)[0]
+  identity: dict = {}
   try:
-    candidate = (await asyncio.to_thread(
+    declared = json.loads(await asyncio.to_thread(
+      app_git.read_blob, staged.path, staged.sha, "mobius.json",
+    ) or b"null")
+  except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):
+    declared = None  # The reader below reports what is wrong with it.
+  if isinstance(declared, dict) and declared.get("package_id"):
+    async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
+      source_identity, predecessor, canonical = await _resolve_package_identity(
+        cli, declared, source_url,
+      )
+    identity = dict(
+      source_identity=source_identity,
+      predecessor_source_identity=predecessor,
+      canonical_source_url=canonical,
+    )
+  try:
+    candidate = (await asyncio.to_thread(functools.partial(
       read_git_install_candidate, staged.path, staged.sha, source_url,
-    )).candidate
+      **identity,
+    ))).candidate
   except PackageTooLarge as exc:
     raise HTTPException(
       413, detail={"code": "package_too_large", "message": str(exc)},
@@ -3286,24 +3309,7 @@ async def _staged_clone_candidate(
   validate_manifest_address(candidate.manifest, manifest_url, db=db)
   if db is not None:
     db.rollback()
-  if not candidate.manifest.get("package_id"):
-    return candidate
-  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
-    source_identity, predecessor, canonical = await _resolve_package_identity(
-      cli, candidate.manifest, source_url,
-    )
-  return _new_candidate(
-    **{
-      name: getattr(candidate, name) for name in (
-        "manifest", "raw_base", "entry_bytes", "icon_processed",
-        "icon_warning", "bundled_job", "static_assets", "source_files",
-        "seeds", "source_review_digest",
-      )
-    },
-    source_identity=source_identity,
-    predecessor_source_identity=predecessor,
-    canonical_source_url=canonical,
-  )
+  return candidate
 
 
 def _require_reviewed_capabilities(

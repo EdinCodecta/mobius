@@ -962,14 +962,14 @@ def test_push_between_staging_and_install_installs_the_staged_commit(
   manifest = git_server.publish(name)
   staged_head = app_git.head_sha(git_server.root / f"{name}.git", "main")
   v2 = {**manifest, "version": "2.0.0"}
-  real_stage = install.stage_package_clone
+  real_stage = install._stage
 
-  async def stage_then_push(url, **kwargs):
-    staged = await real_stage(url, **kwargs)
+  async def stage_then_push(*args):
+    staged = await real_stage(*args)
     git_server.commit(name, v2, JSX.replace("ok", "pushed"), push=True)
     return staged
 
-  monkeypatch.setattr(install, "stage_package_clone", stage_then_push)
+  monkeypatch.setattr(install, "_stage", stage_then_push)
   with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(
     _responses(name, v2, JSX.replace("ok", "pushed")),
   )):
@@ -1076,3 +1076,42 @@ def test_changed_capabilities_refuse_a_git_install_before_any_transfer(
   assert refused.status_code == 409, refused.text
   assert refused.json()["detail"]["code"] == "capability_changed"
   assert transfers == []
+
+
+def test_present_commit_check_accepts_the_same_package_and_names_a_mismatch(
+  tmp_path, caplog,
+):
+  """A package fetched over HTTP (a publication handoff) is adopted from a
+  present Git commit only when that commit holds the same package."""
+  from fastapi import HTTPException
+
+  base = "https://raw.githubusercontent.com/test/present/main/"
+  repo = tmp_path / "present"
+  subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+  manifest = {
+    "id": "present", "name": "Present", "version": "1.0.0",
+    "description": "Present commit", "entry": "index.jsx",
+  }
+
+  def commit(manifest_text: str, jsx: str) -> str:
+    (repo / "mobius.json").write_text(manifest_text)
+    (repo / "index.jsx").write_text(jsx)
+    return _fixture_commit(repo, "c")
+
+  same = commit(json.dumps(manifest), JSX)
+  candidate = install.read_git_install_candidate(
+    repo, same, base + "mobius.json",
+  ).candidate
+  install._require_git_candidate(repo, same, candidate)
+
+  for changed, reason in (
+    (commit(json.dumps(manifest), JSX.replace("ok", "drift")), "package files changed"),
+    (commit(json.dumps({**manifest, "version": "2.0.0"}), JSX), "manifest changed"),
+    (commit(json.dumps({"id": "present"}), JSX), "invalid mobius.json"),
+  ):
+    with pytest.raises(HTTPException) as refused:
+      install._require_git_candidate(repo, changed, candidate)
+    assert refused.value.status_code == 409
+    assert refused.value.detail["code"] == "git_source_mismatch"
+    assert refused.value.detail["reason"].startswith(reason)
+    assert reason in caplog.text
