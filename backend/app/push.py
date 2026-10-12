@@ -176,8 +176,8 @@ def _prepare_owner_notification(
       agents; the /send default), 'app' + source_id=str(app_id) (also
       lights the drawer activity dot). New subsystems add a short
       stable slug.
-    - target: in-scope deep-link only — '/shell/?app=<id>' or
-      '/shell/?chat=<id>'.
+    - target: in-scope deep-link only — '/shell/?app=<id>',
+      '/shell/?chat=<id>' or '/shell/?settings=<section>'.
       Clients treat it as UNTRUSTED and fail closed on anything else.
     - tag: optional grouping key for the OS notification only (history rows
       are unaffected). It is namespaced as '<source_type>:<source_id>:<tag>'

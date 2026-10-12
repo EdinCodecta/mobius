@@ -907,10 +907,10 @@ def test_manual_try_now_preserves_messages_queued_behind_future_limit_park(
     parked.root_run_id = parked.id
     parked.goal_objective = "Finish the durable Goal"
     parked.goal_id = parked.id
-    parked.goal_plan_json = {
+    plan = {
       "tasks": [{"id": "finish", "status": "running"}],
     }
-    persist_goal_fixture(setup_db, parked)
+    persist_goal_fixture(setup_db, parked, plan=plan)
     setup_db.commit()
   first = client.post(
     f"/api/chats/{cid}/messages",
@@ -3507,3 +3507,41 @@ def test_provider_limit_continuation_does_not_claim_quota_recovered():
   assert source["hidden"] is True
   assert "Provider availability is not yet confirmed" in source["content"]
   assert "usage is available" not in source["content"]
+
+
+@pytest.mark.asyncio
+async def test_setup_failure_is_saved_as_a_resumable_error_in_the_transcript(
+  owner_token, monkeypatch,
+):
+  del owner_token
+  cid = "setup-failure-visible"
+  _seed_chat(cid)
+  _seed_run(cid, "rt-setup-failure")
+
+  async def admitted(_data_dir):
+    pass
+
+  setup_started = False
+
+  async def broken_impl(*_args, **_kwargs):
+    nonlocal setup_started
+    setup_started = True
+    raise AttributeError("'Chat' object has no attribute 'messages'")
+
+  # Exercise setup recovery, not the host's storage/memory admission policy.
+  monkeypatch.setattr(chat_mod, "require_agent_turn_admission", admitted)
+  monkeypatch.setattr(chat_mod, "_run_chat_impl", broken_impl)
+  await chat_mod.run_chat(
+    [], chat_id=cid, session_id=None, provider_id="codex",
+    run_gen=chat_mod.current_run_generation(cid), run_token="rt-setup-failure",
+  )
+
+  assert setup_started, "injected setup failure must be reached"
+  assert _run_row("rt-setup-failure")["status"] == "failed"
+  tail = _chat_row(cid)["messages"][-1]
+  assert tail["role"] == "assistant"
+  error = tail["blocks"][-1]
+  assert error["type"] == "error"
+  assert "AttributeError" in error["message"]
+  assert "has no attribute 'messages'" not in error["message"]
+  assert error["resumable"] is True

@@ -1,5 +1,6 @@
 import { fetchFreshShellList, letSystemStreamOwnListRefresh } from './shellListReconciliation.js'
 import { requestChatChanges } from '../../lib/chatChangesNavigation.js'
+import { clearAppNavLocation } from '../../lib/appNavLocationStore.js'
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useMemo, useReducer, useRef } from 'react'
 import { flushSync } from 'react-dom'
 import { useQueryClient } from '@tanstack/react-query'
@@ -26,9 +27,11 @@ import { makeAppChatController } from '../../lib/appChatControl.js'
 import { handleAppProjectsRequest } from '../../lib/appProjectControl.js'
 import { parseNotificationTarget } from '../../lib/notificationTarget.js'
 import { requestChatQuestionReveal } from '../../lib/chatQuestionReveal.js'
+import { settingsSectionOrNull } from '../../lib/settingsSections.js'
 import { recordClientError } from '../../lib/errorLog.js'
 import { setChatCompacting } from '../ChatView/chatCompactionStore.js'
 import useSystemEventStream from '../../hooks/useSystemEventStream.js'
+import { useManagedAppEvents } from '../../hooks/useManagedAppEvents.js'
 import useTheme from '../../hooks/useTheme.js'
 import useProviderAuthStatus from '../../hooks/useProviderAuthStatus.js'
 import {
@@ -88,7 +91,7 @@ import {
   workspaceRequestsForBuiltApps,
   ACTIVATE_FOREGROUND,
 } from './workspacePlacement.js'
-import { appCrashReportDraft } from '../../lib/appRecovery.js'
+import { appCrashReportDraft, appReportChatId } from '../../lib/appRecovery.js'
 import {
   acknowledgeAppActivity,
   appAttentionIds,
@@ -211,12 +214,6 @@ import { HistoryDismissProvider } from '../../hooks/useHistoryDismiss.jsx'
 import { rememberRecentDestination } from '../../lib/recentSelections.js'
 import { isSharedBrowserRoute, sharedBrowserRoutePath, sharedBrowserStorageForGrant } from '../../lib/sharedBrowserWorkspace.js'
 
-const APP_SETTINGS_SECTIONS = new Set([
-  'ai-providers',
-  'background-agents',
-  'github',
-  'models',
-])
 const EMPTY_LIST = Object.freeze([])
 // Reconnect list reads order durable state ahead of buffered system events, so
 // they need a short deadline rather than holding notifications behind a stalled request.
@@ -2657,8 +2654,18 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     navToRef,
   })
 
+  // The one way the shell opens Settings for someone else (a mini-app, the
+  // agent's open_item, a notification tap): navigate there and focus a known
+  // section. Navigation only; every action inside Settings stays the owner's.
+  const openSettingsSection = useCallback((section) => {
+    setSettingsFocusTarget(section ? { section, nonce: Date.now() } : null)
+    if (activeViewRef.current !== 'settings') navToRef.current('settings')
+  }, [activeViewRef])
+
   const handleNotificationOpen = useCallback((target) => {
-    if (target?.view === 'canvas') {
+    if (target?.view === 'settings') {
+      openSettingsSection(target.section)
+    } else if (target?.view === 'canvas') {
       void openAppWithIntent(target.app, target.intent)
     } else if (target?.view === 'chat') {
       if (target.focusQuestion === true) requestChatQuestionReveal(target.chatId)
@@ -2673,7 +2680,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       if (project) openProjectRef.current(project)
       else navToRef.current('projects')
     }
-  }, [openAppWithIntent, requestComposer])
+  }, [openAppWithIntent, openSettingsSection, requestComposer])
 
   const coldDeepLinkHandledRef = useRef(false)
   useEffect(() => {
@@ -2728,7 +2735,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     const appEntry = appsRef.current.find(a => String(a.id) === String(appId))
     const appName = appEntry?.name || `app ${appId}`
     const report = appCrashReportDraft(appName, error)
-    const buildingChatId = appEntry?.chat_id || chatId || null
+    const buildingChatId = appReportChatId(appEntry, chatId)
     const buildingChat = buildingChatId
       && chatsRef.current.find(c => c.id === buildingChatId)
     if (buildingChat) {
@@ -2811,13 +2818,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
         await openAppWithIntent(request.appId, request.intent)
         return
       }
-      const section = APP_SETTINGS_SECTIONS.has(request.section)
-        ? request.section
-        : 'ai-providers'
-      setSettingsFocusTarget({ section, nonce: Date.now() })
-      if (activeViewRef.current !== 'settings') navToRef.current('settings')
+      openSettingsSection(settingsSectionOrNull(request.section) ?? 'ai-providers')
     })()
-  }, [openAppWithIntent, queryClient, refreshChats, requestComposer])
+  }, [openAppWithIntent, openSettingsSection, queryClient, refreshChats, requestComposer])
 
   // Restore the active chat after Shell mount. Two cache layers can
   // satisfy this effect: (1) the persisted TanStack cache hydrated
@@ -2970,8 +2973,11 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       chatsQuery.isFetchedAfterMount, dispatchWorkspace, applyModeDestination,
       requestEmptySingleNewChat, workspaceStateRef, activeChatIdRef])
 
+  const [subscribeManagedAppEvents, observeManagedAppEvent] = useManagedAppEvents()
+
   // Handle non-content SSE events: theme changes, app updates, shell rebuilds.
   const handleSystemEvent = useCallback((ev) => {
+    observeManagedAppEvent(ev)
     if (ev.type === 'agent_coordination_message') {
       // Mailbox hints refresh owner views without polling a model inbox.
       const affected = new Set([ev.senderChatId, ...(ev.recipientChatIds || [])])
@@ -3097,6 +3103,10 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       // copy, or a stale one, of a chat archived elsewhere.
       if (ev.chatId) refreshChatRows(ev.chatId)
       void projectQueries.list.invalidate(queryClient)
+    } else if (ev.type === 'chat_visibility_changed') {
+      // Membership comes from the scoped owner read, including an absent row
+      // when a companion hides its chat. Absence is not deletion evidence.
+      if (ev.chatId) refreshChatRows(ev.chatId)
     } else if (ev.type === 'chat_renamed') {
       // The committed event carries the exact changed row fields. Apply those
       // in place so renaming one chat cannot parse and reconcile all hundreds
@@ -3140,7 +3150,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       // Refresh server truth before warming or placing. app_updated/app_created
       // remain lifecycle refreshes; app_preview_ready is the explicit
       // build-session action that reveals either a new app or an updated one.
-      // `updated_at` drives the iframe live-swap; the chat-artifact query above
+      // `frame_version` drives the iframe live-swap; the chat-artifact query above
       // owns the durable Icon Drop and unread-dot state.
       Promise.all([
         invalidateShellListCache('apps'),
@@ -3173,6 +3183,12 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           }
         }
       })
+    } else if (ev.type === 'open_item' && ev.itemKind === 'settings') {
+      // Settings is the shell's single Settings screen, not a placeable
+      // workspace item: the agent's open navigates there like a mini-app's
+      // moebius:open-settings. An id this shell does not know (a newer
+      // backend's section) still opens Settings, just without a focus.
+      openSettingsSection(settingsSectionOrNull(ev.itemId))
     } else if (ev.type === 'open_item') {
       // An explicit agent-initiated open (design §6.3), system-bus-only so it
       // fires exactly once. Confirm the item actually exists in fresh server
@@ -3230,12 +3246,11 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
         if (!ev.compacting) markChatRunReconcile(ev.chatId)
       }
     } else if (ev.type === 'chat_wait_changed') {
-      if (ev.chatId) {
-        // Self-resuming handoffs are durable chat state, not a running turn.
-        // Reconcile ChatView immediately and refresh the compact list so its
-        // Waiting card and Recents marker agree across tabs and reconnects.
-        markChatRunReconcile(ev.chatId)
-        refreshChatRows(ev.chatId)
+      const changedChatId = ev.chat_id ?? ev.chatId
+      if (changedChatId) {
+        // Goal and Wait invalidations use the same always-live reconciliation owner.
+        markChatRunReconcile(changedChatId)
+        refreshChatRows(changedChatId)
       }
     } else if (ev.type === 'chat_run_started') {
       if (ev.chatId) {
@@ -3285,6 +3300,11 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           void queryClient.invalidateQueries({
             queryKey: ['projects', 'git', String(projectId)],
           })
+          // The same fact as the cursor's agent_run_completed row: an open
+          // project refreshes its selected file now instead of on its next poll.
+          window.dispatchEvent(new CustomEvent('mobius:project-change', {
+            detail: { projectId, change: { kind: 'agent_run_completed', path: null } },
+          }))
         }
         // Attention iff the finished chat is NOT visible in ANY pane — membership
         // in the visible set, not equality with one global id, so a chat visible
@@ -3353,9 +3373,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     confirmChatDeleted, confirmChatIdentityIsLive, confirmChatRecovered,
     loadTheme, markChatOwnerActivity, markChatRunActivity, markChatRunFinished, markChatRunReconcile,
     markChatOwnerInput, markChatRunState, markShellUpdateAvailable,
-    markStreamingAcknowledged, markStreamingEnd,
-    onNotificationCreated, placeInWorkspace, projectChatLookup, queryClient,
-    refreshApps, refreshChatRows, refreshChats, tombstoneRoute, warmAppCode,
+    markStreamingAcknowledged, markStreamingEnd, observeManagedAppEvent,
+    onNotificationCreated, openSettingsSection, placeInWorkspace, projectChatLookup,
+    queryClient, refreshApps, refreshChatRows, refreshChats, tombstoneRoute, warmAppCode,
   ])
 
   // Shell-level SSE subscription for system events. Stays open for
@@ -3435,6 +3455,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       const target = parseNotificationTarget(e.data.target)
       if (target?.view === 'canvas') void openAppWithIntent(target.app, target.intent)
       else if (target?.view === 'chat') navTo('chat', { chatId: target.chatId })
+      else if (target?.view === 'settings') openSettingsSection(target.section)
     }
 
     if (navigator.serviceWorker) {
@@ -3445,7 +3466,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
         navigator.serviceWorker.removeEventListener('message', onSwMessage)
       }
     }
-  }, [navTo, openAppWithIntent])
+  }, [navTo, openAppWithIntent, openSettingsSection])
 
   // Resolve a deferred candidate or allocate a fresh row. Ordinary Standard
   // New Chat never reaches this with the visible blank: that is a synchronous
@@ -4448,6 +4469,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     // CLOSE_TAB(reason:'deleted') owns the view transition — the derived triple
     // follows the workspace to its recent tab or collapsed sibling; no global demote.
     retireAppHistory(id, 'deleted')
+    clearAppNavLocation(id)
     tombstoneRoute('app', id)
     const sid = String(id)
     dropFromWarmLru(cid => String(cid) === sid)
@@ -4469,9 +4491,10 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // Wipes an app's stored data back to empty while KEEPING it installed —
   // a separate, additive action from deleteApp (which tombstones the whole
   // app). Lives here, like deleteApp, so it has access to notifyShell and
-  // refreshApps. The app STAYS in the list; refreshApps picks up the bumped
-  // updated_at, which rotates versionForApp's cache-buster so an open iframe
-  // remounts against its now-empty storage — no manual cache eviction.
+  // refreshApps. The app STAYS in the list; refreshApps picks up the new
+  // storage generation in frame_version, which rotates versionForApp's
+  // cache-buster so an open iframe remounts against its now-empty storage —
+  // no manual cache eviction.
   async function deleteAppData(id) {
     let res
     try {
@@ -4493,6 +4516,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     // retire the old frame's physical history — its replacement starts with an
     // empty internal nav stack (contract §4.1.5) — and drop any warm-only frame.
     retireAppHistory(id, 'data-reset')
+    clearAppNavLocation(id)
     const sid = String(id)
     dropFromWarmLru(cid => String(cid) === sid)
     clearAppFrameStorage(id)
@@ -4950,10 +4974,12 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
               interactive={appRuntimeVisible
                 && !modalDrawerOpen && !modeBeatActive}
               version={versionForApp(id)}
+              storageGeneration={app?.storage_generation}
               appName={app?.name}
               appSlug={app?.slug}
               offlineCapable={!!app?.offline_capable}
               capabilityContract={app?.capability_contract || null}
+              subscribeManagedAppEvents={subscribeManagedAppEvents}
               pendingIntent={appIntents[String(id)] || null}
               immersiveMode={immersiveActive && String(immersiveAppId) === String(id)
                 ? immersiveMode
