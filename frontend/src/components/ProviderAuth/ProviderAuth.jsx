@@ -4,6 +4,7 @@ import { api } from '../../api/client.js'
 import { authQueries } from '../../hooks/queries.js'
 import { closeAuthWindow, navigateAuthWindow, reserveAuthWindow } from '../../utils/authWindow.js'
 import { detailToMessage } from '../../lib/errorDetail.js'
+import ClaudeApiKeyForm from './ClaudeApiKeyForm.jsx'
 import './ProviderAuth.css'
 
 /**
@@ -19,8 +20,18 @@ import './ProviderAuth.css'
  *   onDone        — called after successful auth (optional)
  *   compact       — if true, renders inline status row instead of full card
  *   className     — additional class on the wrapper (optional)
+ *   authMethod    — 'subscription' | 'api_key' | null, from the same status
+ *                   query: which Claude credential runs use now
+ *   apiKeySaved   — whether an API key is saved (it may be standing by
+ *                   behind a sign-in, which takes precedence)
+ *
+ * Claude offers two ways in: sign in with a Claude subscription, or use an
+ * Anthropic API key billed per use.
  */
-export default function ProviderAuth({ authenticated, onDone, compact = false, className = '' }) {
+export default function ProviderAuth({
+  authenticated, onDone, compact = false, className = '',
+  authMethod = null, apiKeySaved = false,
+}) {
   const queryClient = useQueryClient()
   const [authUrl, setAuthUrl] = useState('')
   const [authCode, setAuthCode] = useState('')
@@ -29,6 +40,8 @@ export default function ProviderAuth({ authenticated, onDone, compact = false, c
   const [starting, setStarting] = useState(false)
   const [justConnected, setJustConnected] = useState(false)
   const [openedAuthWindow, setOpenedAuthWindow] = useState(true)
+  const [enteringKey, setEnteringKey] = useState(false)
+  const [removingKey, setRemovingKey] = useState(false)
   const authCodeId = useId()
   // The sign-in tab is reserved before the auth URL exists, so any path that
   // ends without navigating it has to close it or the owner keeps a blank tab.
@@ -104,6 +117,49 @@ export default function ProviderAuth({ authenticated, onDone, compact = false, c
     }
   }
 
+  function keySaved() {
+    setEnteringKey(false)
+    setJustConnected(true)
+    setTimeout(() => setJustConnected(false), 3000)
+    onDone?.()
+  }
+
+  async function removeKey() {
+    setError('')
+    setRemovingKey(true)
+    try {
+      const res = await api.auth.provider.claude.removeApiKey()
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        setError(detailToMessage(data.detail, 'Could not remove the key.'))
+        return
+      }
+      void authQueries.provider.statuses.invalidate(queryClient)
+    } catch {
+      setError('Network error.')
+    } finally {
+      setRemovingKey(false)
+    }
+  }
+
+  if (enteringKey && !authUrl) {
+    return (
+      <div className={`pa__flow ${className}`}>
+        <ClaudeApiKeyForm
+          subscriptionActive={authMethod === 'subscription'}
+          onSaved={keySaved}
+          onCancel={() => setEnteringKey(false)}
+        />
+      </div>
+    )
+  }
+
+  const keyAction = (
+    <button className="pa__btn pa__btn--sm" onClick={() => { setError(''); setEnteringKey(true) }} disabled={starting}>
+      {apiKeySaved ? 'Replace API key' : 'Use an API key'}
+    </button>
+  )
+
   // Active auth flow — always show the code input when authUrl is set.
   if (authUrl) {
     return (
@@ -147,13 +203,31 @@ export default function ProviderAuth({ authenticated, onDone, compact = false, c
   if (authenticated) {
     if (compact) {
       return (
-        <div className={`pa__row ${className}`}>
-          <span className="pa__label">
-            {justConnected ? <span className="pa__success" role="status">Connected</span> : 'Connected'}
-          </span>
-          <button className="pa__btn pa__btn--sm" onClick={startAuth} disabled={starting}>
-            Reconnect
-          </button>
+        <div className={`pa__flow ${className}`}>
+          <div className="pa__row">
+            <span className="pa__label">
+              {justConnected ? <span className="pa__success" role="status">Connected</span> : 'Connected'}
+              {authMethod === 'api_key' && ' with an Anthropic API key'}
+              {authMethod === 'subscription' && ' with your Claude sign-in'}
+            </span>
+          </div>
+          {authMethod === 'subscription' && apiKeySaved && (
+            <p className="pa__muted">
+              An API key is also saved. The sign-in takes precedence while it is connected; to use the key instead, disconnect Claude and save the key again.
+            </p>
+          )}
+          <div className="provider-connection__actions">
+            <button className="pa__btn pa__btn--sm" onClick={startAuth} disabled={starting}>
+              {authMethod === 'subscription' ? 'Sign in again' : 'Sign in with Claude'}
+            </button>
+            {keyAction}
+            {apiKeySaved && (
+              <button className="pa__btn pa__btn--sm" onClick={removeKey} disabled={removingKey}>
+                {removingKey ? 'Removing…' : 'Remove API key'}
+              </button>
+            )}
+          </div>
+          {error && <p className="pa__error" role="alert">{error}</p>}
         </div>
       )
     }
@@ -171,10 +245,15 @@ export default function ProviderAuth({ authenticated, onDone, compact = false, c
   return (
     <div className={`pa__flow ${className}`}>
       {compact && (
-        <p className="pa__muted">Not connected. Sign in to use the agent.</p>
+        <p className="pa__muted">
+          Not connected. Sign in with a Claude subscription, or use an Anthropic API key billed per use.
+        </p>
       )}
       <button className="pa__btn" onClick={startAuth} disabled={starting}>
         {starting ? 'Starting…' : 'Sign in with Claude'}
+      </button>
+      <button className="pa__btn pa__btn--secondary" onClick={() => { setError(''); setEnteringKey(true) }} disabled={starting}>
+        Use an API key
       </button>
       {error && <p className="pa__error" role="alert">{error}</p>}
     </div>

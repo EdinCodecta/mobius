@@ -536,6 +536,34 @@ def test_visual_testing_selector_guidance_requires_observed_evidence():
   assert "## Close the browser session when you are done" in visual
 
 
+def test_visual_testing_names_the_working_app_frame_pointer_path():
+  """Frame-relative boxes once made raw pointer input look blocked.
+
+  Raw mouse input does reach a response-sandboxed app frame at page
+  coordinates; `eval` stays in the shell document. The guidance must keep
+  naming the supported press-and-hold path rather than calling it untestable.
+  """
+  repo = Path(__file__).resolve().parents[2]
+  visual = (
+    repo / "backend" / "scripts" / "seed-skills" / "visual-testing.md"
+  ).read_text(encoding="utf-8")
+
+  assert "`eval` always runs in the shell document" in visual
+  assert "`get box` inside the frame reports frame-relative coordinates" in visual
+  assert "agent-browser hover @eN" in visual
+  assert "agent-browser mouse down\nagent-browser wait 800\nagent-browser mouse up" in visual
+
+
+def test_visual_testing_keeps_extra_browsers_chat_scoped():
+  repo = Path(__file__).resolve().parents[2]
+  visual = (
+    repo / "backend" / "scripts" / "seed-skills" / "visual-testing.md"
+  ).read_text(encoding="utf-8")
+
+  assert "Never run `agent-browser close --all`" in visual
+  assert "put its profile under `$TMPDIR`, never in\n`/data/agent-browser-profiles/`" in visual
+
+
 def test_seeded_guidance_uses_current_preview_recovery_and_resolver_contracts():
   repo = Path(__file__).resolve().parents[2]
   seed_dir = repo / "backend" / "scripts" / "seed-skills"

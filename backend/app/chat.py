@@ -127,6 +127,7 @@ from app.events import (
 from app.providers import (
   DEFAULT_PROVIDER,
   authenticated_provider_ids,
+  claude_auth_method,
   effective_agent_settings,
   get_provider,
   get_skill_path,
@@ -4151,12 +4152,30 @@ def _park_exit(
   # reached rate limit (429), but no reset time will refill them, so it is a
   # manual pause the owner resumes after adding credits. Other credit
   # failures are shown as plain errors.
+  # Anthropic refuses API-key turns with "credit balance is too low" (a 400,
+  # not a 429). Like exhausted workspace credits, only the owner adding
+  # credits fixes it, so it is the same manual pause rather than a red error.
+  # Its copy points at Console billing, so it applies only to API-key turns;
+  # a subscriber's credit refusal stays a plain error.
+  claude_on_api_key = (
+    provider_id == "claude"
+    and error_kind in (ProviderErrorKind.CREDITS, ProviderErrorKind.AUTH)
+    and claude_auth_method(get_settings().data_dir) == "api_key"
+  )
   if (
     (runner_result or {}).get("credits_depleted") is True
     or is_workspace_credits_exhausted(error_text)
+    or (claude_on_api_key and error_kind is ProviderErrorKind.CREDITS)
   ):
     sink.publish(_pause_note(error_text, kind="credits", provider=provider_id))
     return {"parked": False}
+  if claude_on_api_key and error_kind is ProviderErrorKind.AUTH:
+    # The CLI's own advice (e.g. "Fix external API key") does not apply inside Möbius.
+    error_text = (
+      f"{error_text or 'Anthropic rejected the request.'}\n\n"
+      "Anthropic rejected the saved API key. Replace it in Settings under "
+      "Accounts, Claude Code, or sign in with Claude there."
+    )
   # A false positive only parks the queue for manual resend; a false negative
   # reinstates the limit storm.
   limit = error_kind is ProviderErrorKind.USAGE_LIMIT
@@ -5333,12 +5352,17 @@ def _helper_host_key(db, run_policy, *, provider_id: str, connector_plan):
     }
   # Claude fixes a helper's model on the host's helper definitions, so its
   # hosts are also per model; a Codex thread chooses its model per turn.
-  model = run_policy.model if provider_runtime_kind(get_provider(provider_id)) == "claude_sdk" else None
+  claude = provider_runtime_kind(get_provider(provider_id)) == "claude_sdk"
+  model = run_policy.model if claude else None
+  # A Claude host fixes its credential method (sign-in or API key) at start,
+  # so a changed method must start a new host rather than keep billing the
+  # old one.
+  auth = claude_auth_method(get_settings().data_dir) if claude else None
   return helper_hosts.HostKey(
     parent_chat_id=row[0],
     provider_id=provider_id,
     cwd=run_policy.cwd,
-    setup=helper_hosts.setup_digest(connectors, model),
+    setup=helper_hosts.setup_digest(connectors, model, auth),
   )
 
 

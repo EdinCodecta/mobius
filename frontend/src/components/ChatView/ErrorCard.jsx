@@ -52,6 +52,14 @@ export function errorCardViewModel(block) {
   }
 }
 
+// Each provider bills credits in its own place; the copy names where to add them.
+export function creditsCopy(provider) {
+  if (provider === 'claude') {
+    return 'Your Anthropic API credit balance is too low. Your progress is saved. Add credits under Billing in the Claude Console, then Resume.'
+  }
+  return 'Your workspace is out of credits. Your progress is saved. Add credits to your workspace, then Resume.'
+}
+
 // `children` is the slot for surface-specific affordances — MsgContent
 // appends its tail-gated Resume button there; the live surface renders none
 // (a terminal error promotes within the same breath, and the button's
@@ -151,7 +159,7 @@ export default function ErrorCard({
             </div>
             <div className="chat__recovery-copy">
               {platformHold ? recoveryCopy : vm.credits
-                ? 'Your workspace is out of credits. Your progress is saved. Add credits to your workspace, then Resume.'
+                ? creditsCopy(block.pause?.provider)
                 : vm.modelCapacityExhausted
                 ? 'Five automatic retries were used. Choose another model, then Resume to continue your saved work.'
                 : vm.goalHandoff

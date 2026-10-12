@@ -107,6 +107,19 @@
   }
 }
 
+/* The alternative to the primary CTA: same size, outlined. */
+.pa__btn--secondary {
+  background: transparent;
+  color: var(--text, #d4d4d8);
+  border: 1px solid var(--border, #252b36);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .pa__btn--secondary:hover:not(:disabled) {
+    background: var(--surface-2, #1a1f28);
+  }
+}
+
 .pa__label {
   font-size: 14px;
   font-weight: 600;
