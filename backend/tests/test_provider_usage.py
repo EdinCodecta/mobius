@@ -3000,3 +3000,64 @@ def test_abandoned_staged_reading_is_removed_by_the_next_stage(monkeypatch, tmp_
   assert not abandoned.exists()
   assert live.exists() and other_provider.exists()
   assert json.loads(path.read_bytes())["snapshot"]["state"] == "ready"
+
+
+@pytest.mark.parametrize("failure_state", ["unavailable", "refused"])
+def test_later_started_failure_cannot_serve_a_reading_cleared_by_a_disconnect(
+  monkeypatch, tmp_path, failure_state,
+):
+  """Warm cache: a disconnect publishes before a later-started failing probe
+  completes. The failure must not answer with the pre-disconnect balance."""
+  from app import provider_usage
+
+  data_dir = str(tmp_path)
+  key = provider_usage._cache_key("codex", data_dir)
+  answers = [WEEKLY_READY]
+
+  async def warm(_provider_id, _data_dir):
+    return answers.pop(0)
+
+  monkeypatch.setattr(provider_usage, "_provider_snapshot", warm)
+  assert asyncio.run(provider_usage.read_provider_usage("codex", data_dir))["state"] == "ready"
+  # The fresh hold has expired; the reading is still stale-servable.
+  provider_usage._provider_usage_cache[key].next_check_at = 0
+
+  started = [threading.Event(), threading.Event()]
+  finish = [threading.Event(), threading.Event()]
+  calls = []
+
+  async def snapshot(_provider_id, _data_dir):
+    index = len(calls)
+    calls.append(index)
+    started[index].set()
+    assert await asyncio.to_thread(finish[index].wait, 5)
+    if index == 0:
+      return {**WEEKLY_READY, "state": "disconnected"}
+    if failure_state == "refused":
+      raise provider_usage.ProviderUsageRefused("codex", None)
+    return provider_usage._unavailable()
+
+  def read():
+    return asyncio.run(provider_usage.read_provider_usage("codex", data_dir))
+
+  monkeypatch.setattr(provider_usage, "_provider_snapshot", snapshot)
+  with ThreadPoolExecutor(max_workers=2) as pool:
+    disconnect = pool.submit(read)
+    try:
+      assert started[0].wait(5)
+      failure = pool.submit(read)
+      assert started[1].wait(5)
+      finish[0].set()
+      assert disconnect.result(timeout=5)["state"] == "disconnected"
+      finish[1].set()
+      result = failure.result(timeout=5)
+    finally:
+      for event in finish:
+        event.set()
+
+  assert result["state"] in {"unavailable", "disconnected"}
+  assert result.get("windows") == []
+  cached = provider_usage._provider_usage_cache.get(key)
+  assert cached is None or cached.snapshot["state"] != "ready"
+  assert asyncio.run(provider_usage.read_provider_usage("codex", data_dir))["state"] != "ready"
+  assert not provider_usage._last_reading_path(data_dir, "codex").exists()

@@ -1513,7 +1513,9 @@ async def read_provider_usage(
           _last_reading_path(data_dir, provider_id).unlink(missing_ok=True)
           return snapshot
         if (
-          not force_refresh and prior is not None
+          # A prior that another probe replaced or a disconnect removed is no
+          # longer this account's reading; never answer with it.
+          not force_refresh and prior is not None and current is prior
           and _stale_reading_is_servable(prior, now)
         ):
           prior.next_check_at = next_check_at
