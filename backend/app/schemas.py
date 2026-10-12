@@ -505,6 +505,12 @@ class UpdateCandidatePreviewOut(BaseModel):
   source_digest: str = Field(
     min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$",
   )
+  # Mirrors update-check's pending_update_state so the Store can surface a
+  # conflict warning during review rather than letting the install attempt
+  # fail or silently re-create the resolver.
+  pending_update_state: Literal[
+    "none", "needs_resolution", "replay_pending", "unknown",
+  ] = "none"
 
 
 class UpdateCheckOut(BaseModel):

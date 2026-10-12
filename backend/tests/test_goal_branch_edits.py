@@ -228,3 +228,25 @@ def test_parent_acceptance_keeps_live_child_visible_and_can_reopen_work(client, 
   assert reopened.status_code == 200, reopened.text
   resumed = patch(client, child_branch, [{"id": "backend-api", "note": "Requested follow-up"}])
   assert resumed.status_code == 200, resumed.text
+
+
+def test_unfiled_helper_cannot_file_a_child_under_another_branch(
+  client, owner_token, db, started,
+):
+  """A helper with no plan task has no checklist-write scope, so it must not
+  be able to hand one to a child by filing it under somebody else's task."""
+  plan = {"tasks": [
+    {"id": "frontend", "title": "Frontend", "status": "pending"},
+    {"id": "backend", "title": "Backend", "status": "pending"},
+  ]}
+  owner = _goal_parent(client, owner_token, db, plan=plan)
+  scout = _spawned(client, owner_token, db, owner, "scout", None)
+  assert scout.goal_task_id is None
+  headers = _helper_headers(db, scout, _helper_run(db, scout, "scout-run"))
+
+  refused = _spawn(client, headers, scout.child_chat_id, "intruder", "frontend")
+  assert refused.status_code in (400, 409, 422), refused.text
+  assert "no plan task of its own" in refused.text
+
+  unfiled = _spawn(client, headers, scout.child_chat_id, "worker")
+  assert unfiled.status_code == 201, unfiled.text

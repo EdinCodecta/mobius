@@ -1002,6 +1002,59 @@ def test_store_update_whose_merged_lock_diverges_is_refused_and_leaves_no_build(
   assert {path.resolve() for path in (_data_dir() / "app-envs" / "builds").iterdir()} == linked
 
 
+def test_cancelled_install_discards_its_unchecked_python_runtime(
+  db, monkeypatch, store, caplog,
+):
+  """A cancelled caller never checks pass 1's runtime, so it must not stay."""
+  import asyncio
+  import logging
+  import threading
+  from app import install
+  from tests.test_apps_install import _fake_async_client
+
+  _fake_builds(monkeypatch)
+  base = "https://deps.test/repo/"
+  manifest = _manifest(
+    python={"lock": "requirements.lock"}, service={"entry": "service.py"},
+    source_files=["service.py", "requirements.lock"],
+  )
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, b"export default function App() { return <div>x</div> }"),
+    base + "service.py": (200, b"import json, sys\n"),
+    base + "requirements.lock": (200, b"a==1\n"),
+  }
+  entered, release = threading.Event(), threading.Event()
+  snapshot = app_git.snapshot_worktree
+
+  def blocked_snapshot(source_dir):
+    entered.set()
+    assert release.wait(10)
+    return snapshot(source_dir)
+
+  monkeypatch.setattr(app_git, "snapshot_worktree", blocked_snapshot)
+
+  async def run():
+    task = asyncio.create_task(install.install_from_manifest(
+      db, manifest_url=base + "mobius.json", manifest=None, raw_base=None,
+    ))
+    try:
+      assert await asyncio.to_thread(entered.wait, 5)
+      task.cancel()
+      await asyncio.sleep(.02)
+    finally:
+      release.set()
+      outcome = await asyncio.gather(task, return_exceptions=True)
+    assert isinstance(outcome[0], asyncio.CancelledError), repr(outcome)
+
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    with caplog.at_level(logging.INFO, logger="mobius.install"):
+      asyncio.run(run())
+
+  assert not list((_data_dir() / "app-runtime").glob(".staged-*"))
+  assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
 def _assert_no_unlinked_env_or_runtime(app_id: int) -> None:
   linked = {
     link.resolve() for link in app_python_env.envs_parent(_data_dir(), app_id).iterdir()

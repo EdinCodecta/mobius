@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from app import app_git, models
+from app import app_git, install, models
 from app.bootstrap import (
   BOOTSTRAP_IDENTITY_MANIFEST_URL,
   BOOTSTRAP_INTEGRATIONS_MANIFEST_URL,
@@ -793,6 +793,7 @@ async def test_rate_limited_store_is_retried_and_takes_its_default_pin(
 @pytest.mark.parametrize("exc", [
   HTTPException(422, "App failed to compile."),
   HTTPException(404, "Not found"),
+  install.git_source_error("Nothing changed.", RuntimeError("bad origin")),
   ValueError("unexpected"),
 ])
 async def test_non_transient_failure_schedules_no_retry(db, monkeypatch, exc):
@@ -816,7 +817,12 @@ def _unresolvable_host():
 @pytest.mark.parametrize("exc", [
   HTTPException(502, "Upstream 500"),
   HTTPException(504, "Timeout"),
-  HTTPException(409, {"code": "git_transfer_timeout", "message": "slow"}),
+  install.git_source_error("Nothing changed.", app_git.GitTransferTimeout("slow")),
+  install.git_source_error(
+    "Nothing was installed.", RuntimeError("offline"),
+    code="git_install_unavailable", retryable=True,
+  ),
+  HTTPException(409, {"code": "git_source_mismatch", "retryable": True}),
   app_git.GitTransferTimeout("clone exceeded its ceiling"),
   _unresolvable_host(),
 ])
