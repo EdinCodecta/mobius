@@ -17,6 +17,34 @@ def command(*args):
     return subprocess.run(args, check=True, capture_output=True, text=True, timeout=15)
 
 
+def render_units(stage, *, prefix, worker, data_source, through="mobius-rebuild-reconcile.timer",
+                 mount_ordering=True):
+    """Write the installer's actual unit heredocs into ``stage``, renamed to
+    ``prefix`` and running ``worker``. ``through`` names the last unit to
+    render; ``mount_ordering=False`` reproduces units from before protocol 6."""
+    source = (Path(__file__).parent / "install-rebuild-helper.sh").read_text()
+    start = source.index('cat >"$STAGE/mobius-rebuild.service"')
+    end = (source.index("for unit in mobius-rebuild.service", start)
+           if through == "mobius-rebuild-reconcile.timer"
+           else source.index("\nEOF\n", source.index(f'cat >"$STAGE/{through}"')) + len("\nEOF\n"))
+    units = source[start:end].replace("/usr/local/libexec/mobius-rebuild-host", str(worker))
+    units = units.replace("mobius-rebuild", prefix)
+    if not mount_ordering:
+        units = "\n".join(line for line in units.splitlines()
+                           if not line.startswith("RequiresMountsFor=")) + "\n"
+    subprocess.run(["bash", "-eu", "-c", units], check=True, timeout=10,
+                   env={**os.environ, "STAGE": str(stage), "DATA_SOURCE": str(data_source)})
+    return units
+
+
+def mounted(path):
+    """Kernel mount table, not os.path.ismount: a bind mount on the same
+    filesystem keeps its parent's device and is invisible to ismount."""
+    target = os.path.realpath(path)
+    with open("/proc/self/mountinfo", encoding="utf-8") as table:
+        return any(line.split()[4].replace("\\040", " ") == target for line in table)
+
+
 def watcher_follows_the_data_across_a_volume_unmount(*, watch_mountpoint):
     """Production 2026-10-09/12: a bind-option Docker volume is unmounted while
     no container uses it. systemd re-arms a path unit's inotify watches when
@@ -41,18 +69,9 @@ if sys.argv[1] == "run":
         pathlib.Path({str(root / "dispatched")!r}).touch()
 ''')
         worker.chmod(0o755)
-        source = (Path(__file__).parent / "install-rebuild-helper.sh").read_text()
-        start = source.index('cat >"$STAGE/mobius-rebuild.service"')
-        end = source.index('cat >"$STAGE/mobius-rebuild-reconcile.service"', start)
-        units = source[start:end].replace("/usr/local/libexec/mobius-rebuild-host", str(worker))
-        units = units.replace("mobius-rebuild", prefix)
-        data_source = volume if watch_mountpoint else stable
-        if watch_mountpoint:
-            # Reproduce the old installer's units, which had no mount ordering.
-            units = "\n".join(line for line in units.splitlines()
-                               if not line.startswith("RequiresMountsFor="))
-        subprocess.run(["bash", "-eu", "-c", units], check=True, timeout=10,
-                       env={**os.environ, "STAGE": str(root), "DATA_SOURCE": str(data_source)})
+        render_units(root, prefix=prefix, worker=worker, through="mobius-rebuild.path",
+                     data_source=volume if watch_mountpoint else stable,
+                     mount_ordering=not watch_mountpoint)
         request = volume / prefix / "inbox" / "request.json"  # the app's view of /data
         try:
             command("mount", "--bind", str(stable), str(volume))
@@ -84,7 +103,7 @@ if sys.argv[1] == "run":
                     subprocess.run(["systemctl", "stop", *[p.name for p in installed]], check=False,
                                    timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             finally:
-                while os.path.ismount(volume):
+                while mounted(volume):
                     command("umount", str(volume))
                 for path in installed:
                     path.unlink()
@@ -131,18 +150,14 @@ elif (root / "allow-recovery").exists():
     (root / "reconciled").touch()
 ''')
         worker.chmod(0o755)
-        source = (Path(__file__).parent / "install-rebuild-helper.sh").read_text()
-        start = source.index('cat >"$STAGE/mobius-rebuild.service"')
-        end = source.index("for unit in mobius-rebuild.service", start)
-        units = source[start:end].replace("/usr/local/libexec/mobius-rebuild-host", str(worker))
-        units = units.replace("mobius-rebuild", prefix)
+        render_units(root, prefix=prefix, worker=worker, data_source=data)
         # Scale only the timer interval; the Python contract test checks the
         # installed production budget, and systemd's dispatch semantics remain real.
         # Four seconds also stays below the normal 5-starts/10-seconds service
         # limit; a one-second test timer would itself exhaust that limit.
-        units = units.replace("OnBootSec=30", "OnBootSec=4").replace("OnUnitInactiveSec=30", "OnUnitInactiveSec=4")
-        subprocess.run(["bash", "-eu", "-c", units], check=True, timeout=10,
-                       env={**os.environ, "STAGE": str(root), "DATA_SOURCE": str(data)})
+        timer = root / f"{prefix}-reconcile.timer"
+        timer.write_text(timer.read_text().replace("OnBootSec=30", "OnBootSec=4")
+                         .replace("OnUnitInactiveSec=30", "OnUnitInactiveSec=4"))
         try:
             for name in names:
                 destination = Path("/run/systemd/system") / name

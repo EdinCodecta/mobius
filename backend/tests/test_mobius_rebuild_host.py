@@ -2183,24 +2183,30 @@ def test_fixed_helper_and_compatible_launcher_reach_normal_admission(monkeypatch
 
 
 def test_disposable_systemd_proof_extracts_the_actual_staged_units(tmp_path):
-  import textwrap
-
-  harness = (SCRIPT.parent / "test-rebuild-recovery-units.py").read_text()
-  # Execute only the proof's extraction and bash heredoc generation. The
-  # subsequent real-systemd installation stays outside this hermetic test.
-  start = harness.index("        start = source.index(")
-  end = harness.index("        try:", start)
+  # The hosted real-systemd proof renders the installer's own unit heredocs;
+  # exercise that renderer hermetically (systemd installation stays hosted).
+  spec = importlib.util.spec_from_file_location(
+    "recovery_units_proof", SCRIPT.parent / "test-rebuild-recovery-units.py")
+  proof = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(proof)
   prefix = "mobius-recovery-test-extraction"
-  worker = tmp_path / "worker"
-  scope = {"source": INSTALLER.read_text(), "root": tmp_path,
-           "data": tmp_path / "data", "worker": worker, "prefix": prefix,
-           "os": os, "subprocess": subprocess}
-  exec(compile(textwrap.dedent(harness[start:end]), "<proof-unit-extraction>", "exec"), scope)
+  worker, data = tmp_path / "worker", tmp_path / "data"
+  full, watch, legacy = (tmp_path / name for name in ("full", "watch", "legacy"))
+  for stage in (full, watch, legacy):
+    stage.mkdir()
+  proof.render_units(full, prefix=prefix, worker=worker, data_source=data)
+  proof.render_units(watch, prefix=prefix, worker=worker, data_source=data,
+                     through="mobius-rebuild.path")
+  proof.render_units(legacy, prefix=prefix, worker=worker, data_source=data,
+                     through="mobius-rebuild.path", mount_ordering=False)
   expected = {f"{prefix}{suffix}" for suffix in (
     ".service", ".path", "-reconcile.service", "-reconcile.timer")}
-  assert {path.name for path in tmp_path.iterdir()} == expected
-  main = (tmp_path / f"{prefix}.service").read_text()
+  assert {path.name for path in full.iterdir()} == expected
+  assert {path.name for path in watch.iterdir()} == {f"{prefix}.service", f"{prefix}.path"}
+  main = (full / f"{prefix}.service").read_text()
   assert f"ExecStart={worker} run" in main
   assert f"ExecStopPost={worker} reconcile" in main
-  for path in tmp_path.iterdir():
+  assert f"RequiresMountsFor={data}" in (watch / f"{prefix}.path").read_text()
+  assert "RequiresMountsFor" not in (legacy / f"{prefix}.path").read_text()
+  for path in full.iterdir():
     assert "mobius-rebuild" not in path.read_text()

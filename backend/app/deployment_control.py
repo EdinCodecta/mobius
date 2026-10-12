@@ -508,16 +508,14 @@ def _required_helper_protocol(target_sha: str | None = None) -> int | None:
   try:
     if platform_update._rev(repo, target_sha) != target_sha:
       return None
-    shown = platform_update._git(
-      "show", f"{target_sha}:{_HELPER_REQUIREMENT_PATH}", repo=repo, check=False,
-    )
   except (OSError, subprocess.SubprocessError):
     return None
-  if shown.returncode != 0:
+  shown = platform_update._git_blob(repo, target_sha, _HELPER_REQUIREMENT_PATH)
+  if shown is None:
     return required  # a release from before the requirement existed
   try:
-    return max(required, int(shown.stdout.strip()))
-  except ValueError:
+    return max(required, int(shown.decode("ascii").strip()))
+  except (UnicodeError, ValueError):
     return None
 
 

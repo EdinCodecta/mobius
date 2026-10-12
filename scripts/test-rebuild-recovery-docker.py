@@ -47,6 +47,14 @@ def command(*args, timeout=60, **kwargs):
                           timeout=timeout, **kwargs)
 
 
+def mounted(path):
+    """Kernel mount table, not os.path.ismount: Docker's bind-option volume
+    mount shares the root filesystem with its Mountpoint on hosted runners."""
+    target = os.path.realpath(path)
+    with open("/proc/self/mountinfo", encoding="utf-8") as table:
+        return any(line.split()[4].replace("\\040", " ") == target for line in table)
+
+
 def load(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader
@@ -529,7 +537,7 @@ volumes:
                 if bind_option_volume:
                     mountpoint = command("docker", "volume", "inspect", "-f", "{{.Mountpoint}}",
                                          f"{project}_data").stdout.strip()
-                    assert os.path.ismount(mountpoint) and mountpoint != str(data)
+                    assert mounted(mountpoint) and mountpoint != str(data)
                     # The installer's resolver names the stable device.
                     assert host.persistent_data_dir("volume", f"{project}_data") == os.path.realpath(data)
                 ledger = _load_supervisor()
@@ -593,7 +601,7 @@ volumes:
                     if mountpoint:
                         # With no container, the old installer's data_dir is a
                         # hidden directory that does not hold the live ledger.
-                        assert not os.path.ismount(mountpoint)
+                        assert not mounted(mountpoint)
                         assert not Path(mountpoint, ".restart-ledger/cutover-receipt.json").exists()
                 elif kind in {"start-timeout", "delayed-entry"}:
                     gate = host.prepare_admission(config, tx)
