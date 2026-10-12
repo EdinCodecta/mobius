@@ -1120,7 +1120,7 @@ async def test_compact_number_work_has_one_verdict_over_http_and_materialized(va
 async def test_redundant_number_text_costs_more_only_over_http():
   # Whitespace and longer spellings are parse work the raw text really holds;
   # the materialized value is charged on its compact form only.
-  raw = b"[" + b"1.00000000000000000000e0 ,  " * 30_000 + b"1]"
+  raw = b"[" + b"1.00000000000000000000e0 ,  " * 40_000 + b"1]"
   value = json.loads(raw)
   with pytest.raises(HTTPException):
     with app_services.ServiceExchangeAdmission(60 * MIB) as admission:
@@ -1346,6 +1346,124 @@ async def test_costly_big_ints_are_still_refused_and_cancellation_releases_their
   task.cancel()
   await asyncio.gather(task, return_exceptions=True)
   assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
+# Ordinary numbers an 8 MiB service accepted before number work was charged:
+# short and repr-length small exponents and 19-digit nanosecond timestamps.
+_ORDINARY_EXPONENTS_AND_TIMESTAMPS = {
+  "small-repr-exponents-30k": [10 ** random.Random(7).uniform(-9, -4.1) for _ in range(30_000)],
+  "short-exponents-60k": [float(f"{1 + i % 9}.{1 + i % 7}e-0{5 + i % 5}") for i in range(60_000)],
+  "ns-timestamps-150k": [1697040000123456789 + i for i in range(150_000)],
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(_ORDINARY_EXPONENTS_AND_TIMESTAMPS))
+@pytest.mark.parametrize("direction", ["request", "response", "materialized"])
+async def test_ordinary_exponents_and_timestamps_are_accepted_in_every_direction(shape, direction):
+  value = _ORDINARY_EXPONENTS_AND_TIMESTAMPS[shape]
+  raw = _compact(value)
+  assert len(raw) < 8 * MIB
+  with app_services.ServiceExchangeAdmission(8 * MIB) as admission:
+    if direction == "materialized":
+      await admission.retain({"body": value})
+    else:
+      admission.admit_received(len(raw))
+      decoded = await (admission.decode(raw) if direction == "request" else admission.decode_response(raw))
+      assert decoded == value
+  assert app_services._admitted_exchange_cost == 0
+
+
+def _token_work(token: str) -> float:
+  shape = app_services._json_number_shape(token, 0, len(token))
+  exponent = app_services._json_exponent_state(token, 0, len(token), app_services._JSON_NO_EXPONENT)
+  return app_services._json_number_work(len(token), shape, token.startswith("-"), exponent)
+
+
+@pytest.mark.parametrize("token,tier", [
+  ("1.5e-05", "low"), ("-1.5E+05", "low"), ("1e0", "low"), ("1e9", "low"), ("1e22", "low"),
+  ("1e23", "high"), ("-1e+99", "high"), ("1.23456789012345678e-91", "high"),
+  ("1e-099", "full"), ("1e-0000009", "full"), ("1e100", "full"), ("1e-0100", "full"),
+  ("1.2345678901234567e-9", "low"), ("1.2345678901234567890e-1", "low"),
+  ("1.23456789012345678901e-1", "full"), ("1e", "full"),
+], ids=lambda value: value)
+def test_exponent_tier_follows_the_exponent_field_and_token_length(token, tier):
+  # A one- or two-character exponent field (after its sign) in a token of at
+  # most 24 characters is charged by its value; anything else, a padded
+  # field included, keeps the costliest charge.
+  expected = {
+    "low": 3 + len(token) // 2, "high": 8 + len(token) // 2,
+    "full": len(token) + 12 + max(0, len(token) - 24),
+  }[tier]
+  assert _token_work(token) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token", [
+  "1.5e-05", "-1.5E+05", "1e-099", "-9.999999999999999e+0099", "1e100",
+  "1.2345678901234567e-9", "1.23456789012345678901e-1", "-1234567890123456789", "9" * 83,
+])
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-32-be"])
+async def test_every_chunk_cut_of_a_number_gets_the_whole_tokens_verdict(monkeypatch, token, encoding):
+  # A small scan chunk puts every cut position of the token on a boundary.
+  scan_bytes = 8 * len("x".encode(encoding))
+  monkeypatch.setattr(app_services, "_JSON_SCAN_BYTES", scan_bytes)
+  for pad in range(8):
+    text = "[" + " " * pad + token + "]"
+    raw = text.encode(encoding)
+    units = 1 + len(text) // app_services._JSON_BARE_CHARS_PER_UNIT + _token_work(token)
+    monkeypatch.setattr(app_services, "MAX_JSON_STRUCTURE", units)
+    with app_services.ServiceExchangeAdmission(MIB) as admission:
+      assert await admission.decode(raw) == [json.loads(token)]
+    monkeypatch.setattr(app_services, "MAX_JSON_STRUCTURE", units - 1)
+    with pytest.raises(HTTPException):
+      with app_services.ServiceExchangeAdmission(MIB) as admission:
+        await admission.decode(raw)
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [
+  1.5e-05, -1.5e05, 1e-99, -9.999999999999999e99, 1e100, 1.2345678901234567e-9,
+  1697040000123456789, -1697040000123456789,
+])
+async def test_compact_number_charge_is_the_same_over_http_and_materialized(monkeypatch, value):
+  items = [value] * 1000
+  raw = _compact(items)
+  units = len(items) + len(raw) // app_services._JSON_BARE_CHARS_PER_UNIT + 1000 * _token_work(json.dumps(value))
+  for cap, expected in ((units, "accepted"), (units - 1, "App service request structural resource limit exceeded.")):
+    monkeypatch.setattr(app_services, "MAX_JSON_STRUCTURE", cap)
+    assert await _number_work_verdicts(items) == [expected, expected]
+
+
+def test_number_classifier_matches_stdlib_for_fuzzed_tokens_and_every_split():
+  rng = random.Random(53)
+  for _ in range(3000):
+    sign = rng.choice(["", "-"])
+    mantissa = str(rng.randrange(1, 10 ** rng.randint(1, 20)))
+    if rng.random() < 0.5 and len(mantissa) > 1:
+      cut = rng.randrange(1, len(mantissa))
+      mantissa = mantissa[:cut] + "." + mantissa[cut:]
+    exponent = ""
+    if rng.random() < 0.7:
+      digits = str(rng.randrange(0, 10 ** rng.randint(1, 4)))
+      exponent = rng.choice("eE") + rng.choice(["", "+", "-"]) + "0" * rng.randint(0, 3) + digits
+    token = sign + mantissa + exponent
+    value = json.loads(token)  # stdlib ground truth: valid, and its type
+    shape = app_services._json_number_shape(token, 0, len(token))
+    whole = app_services._json_exponent_state(token, 0, len(token), app_services._JSON_NO_EXPONENT)
+    assert (shape == app_services._JSON_INT) == isinstance(value, int)
+    if exponent:
+      field = exponent[1:].lstrip("+-")
+      assert app_services._json_exponent_value(whole) == (int(field) if len(field) <= 2 else None)
+    else:
+      assert whole == app_services._JSON_NO_EXPONENT
+    for split in range(1, len(token)):
+      head = app_services._json_exponent_state(token, 0, split, app_services._JSON_NO_EXPONENT)
+      assert app_services._json_exponent_state(token, split, len(token), head) == whole
+      assert max(
+        app_services._json_number_shape(token, 0, split), app_services._json_number_shape(token, split, len(token)),
+      ) == shape
 
 
 def _resource_corpus():

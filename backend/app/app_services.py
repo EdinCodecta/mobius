@@ -355,6 +355,7 @@ class ServiceExchangeAdmission:
     number_length = 0
     number_shape = _JSON_INT
     number_signed = False
+    number_exponent = _JSON_NO_EXPONENT
     # Whether the next chunk may start a value (the document's first, or one
     # after a separator and whitespace that ended the last chunk).
     value_pending = True
@@ -395,8 +396,9 @@ class ServiceExchangeAdmission:
         end = _JSON_NUMBER_TAIL.match(chunk).end()
         number_length += end
         number_shape = max(number_shape, _json_number_shape(chunk, 0, end))
+        number_exponent = _json_exponent_state(chunk, 0, end, number_exponent)
         if end < len(chunk) or final:
-          number_work += _json_number_work(number_length, number_shape, number_signed)
+          number_work += _json_number_work(number_length, number_shape, number_signed, number_exponent)
           number_length = 0
         last = end
       elif value_pending:
@@ -410,12 +412,17 @@ class ServiceExchangeAdmission:
             index, end = value.span("number")
             shape = _json_number_shape(chunk, index, end)
             signed = chunk[index] == "-"
+            exponent = (
+              _JSON_NO_EXPONENT if shape != _JSON_EXPONENT
+              else _json_exponent_state(chunk, index, end, _JSON_NO_EXPONENT)
+            )
             if end == len(chunk) and not final:
               number_length = end - index
               number_shape = shape
               number_signed = signed
+              number_exponent = exponent
             else:
-              number_work += _json_number_work(end - index, shape, signed)
+              number_work += _json_number_work(end - index, shape, signed, exponent)
           elif value.start("pending") != -1:
             value_pending = True
           value = None
@@ -498,10 +505,11 @@ class ServiceExchangeAdmission:
       bare = text_length - string_chars - (string_length + 1 if in_string else 0)
       # Units only bound work done after the scan, so checking them per
       # bounded chunk still rejects before the stdlib parser runs.
+      # A number still continuing into the next chunk is charged when it ends
+      # (before any parse): its partial text does not yet show its class.
       units = (
         strings + lists + dicts + commas + members + number_work + stray
         + bare // _JSON_BARE_CHARS_PER_UNIT
-        + _json_number_work(number_length, number_shape, number_signed)
       )
       if units > MAX_JSON_STRUCTURE:
         self._reject(direction, "structural resource limit exceeded")
@@ -625,7 +633,10 @@ class ServiceExchangeAdmission:
       elif isinstance(item, float):
         text = repr(item)
         bare += len(text)
-        number_work += _json_number_work(len(text), _json_number_shape(text, 0, len(text)), item < 0)
+        shape = _json_number_shape(text, 0, len(text))
+        number_work += _json_number_work(
+          len(text), shape, item < 0, _json_exponent_state(text, 0, len(text), _JSON_NO_EXPONENT),
+        )
         del text
       cost += sys.getsizeof(item) + _RETAINED_BLOCK_SLACK * (1 if children is None else 2)
       depth = len(pending) - 1
@@ -661,31 +672,90 @@ def _json_number_shape(text: str, start: int, end: int) -> int:
   return _JSON_DECIMAL if text.find(".", start, end) != -1 else _JSON_INT
 
 
-def _json_number_work(length: int, shape: int, signed: bool = False) -> int:
+# Bounded classifier state for an exponent, which a chunk boundary can split
+# anywhere: no marker yet, right after it (a sign may follow), or its field
+# of digits after the sign, encoded as _JSON_EXPONENT_FIELD + 100 * count +
+# value. The count is capped at 3 and only a field of at most two characters
+# keeps its value; leading zeros count as field characters.
+_JSON_NO_EXPONENT, _JSON_EXPONENT_SIGN, _JSON_EXPONENT_FIELD = -1, 0, 1
+
+
+def _json_exponent_state(text: str, start: int, end: int, state: int) -> int:
+  """Advance ``state`` over one span of a number token: native searches and at
+  most two Python character steps, never one per character."""
+  if state == _JSON_NO_EXPONENT:
+    marker = text.find("e", start, end)
+    upper = text.find("E", start, end)
+    if upper != -1 and (marker == -1 or upper < marker):
+      marker = upper
+    if marker == -1:
+      return state
+    start, state = marker + 1, _JSON_EXPONENT_SIGN
+  if state == _JSON_EXPONENT_SIGN and start < end:
+    if text[start] in "+-":
+      start += 1
+    state = _JSON_EXPONENT_FIELD
+  if state >= _JSON_EXPONENT_FIELD and start < end:
+    count, value = divmod(state - _JSON_EXPONENT_FIELD, 100)
+    for char in text[start:min(end, start + max(0, 2 - count))]:
+      value = value * 10 + int(char) if char.isdigit() else 100
+    count = min(3, count + end - start)
+    state = _JSON_EXPONENT_FIELD + 100 * count + (value if count <= 2 and value < 100 else 0)
+  return state
+
+
+def _json_exponent_value(state: int) -> int | None:
+  """The exponent's value when its field is one or two digits, else None."""
+  if state <= _JSON_EXPONENT_FIELD:
+    return None
+  count, value = divmod(state - _JSON_EXPONENT_FIELD, 100)
+  return value if 1 <= count <= 2 else None
+
+
+def _json_number_work(
+  length: int, shape: int, signed: bool = False, exponent: int = _JSON_NO_EXPONENT,
+) -> int:
   """Parse work of one number token beyond its mark and characters, in units.
 
-  Calibrated in thread CPU time against the per-element cost of a small int,
-  worst measured case per class with at least 1.2x margin. A decimal without
-  an exponent of at most 16 characters has at most 15 digits and a decimal
-  exponent within 15, so it takes the exact double fast path (measured under
-  1.5 units). Up to 24 characters a correction loop runs on small big ints
-  (under 8). An exponent, or a longer decimal, can force big-int comparison
-  near a halfway point ("2.2e-308" 13.3, "2.2250738585072014e-300" 15.5, and
-  roughly 1.2 units per character past 40). Ints past 18 digits leave the
-  machine-word path and grow quadratically (4300 digits, the stdlib's limit:
-  under 1,300 units). An int is charged by its digits: a ``signed`` one's
-  minus sign changes neither path (measured within noise), so it costs only
-  its character, wherever a chunk boundary or materialization puts it.
+  Calibrated in thread CPU time against the per-element cost of a small int
+  (an int of at most 18 digits, the unit itself, so at par within measurement
+  noise rather than with a margin). Every class with extra work was checked
+  per token and with documents filled to the unit cap of that class alone,
+  whose parse must take at most the small-int cap document's time over 1.2.
+  A decimal without an exponent of at most 16 characters has at most 15
+  digits and a decimal exponent within 15, so it takes the exact double fast
+  path (measured under 1.5 units). Up to 24 characters a correction loop runs
+  on small big ints (under 8). A token of at most 24 characters with a one-
+  or two-digit exponent field (after its sign, leading zeros included) costs
+  3 plus half its length up to exponent 22 and 8 plus half its length up to
+  99 (worst near-halfway mantissas measured 12.9 units at 24 characters, and
+  cap documents at most 0.52 of the small-int one). Any other exponent, or a
+  longer decimal, can force big-int comparison near a halfway point
+  ("2.2e-308" 13.3, "2.2250738585072014e-300" 15.5, and roughly 1.2 units per
+  character past 40). Ints past 18 digits leave the machine-word path: up to
+  90 digits they measured at most 6 units, under a charge growing a sixteenth
+  of a unit per digit from 1.44 (cap documents at most 0.78), and they grow
+  quadratically toward 4300 digits (the stdlib's limit, under 1,300 units).
+  An int is charged by its digits: a ``signed`` one's minus sign changes
+  neither path (measured within noise), so it costs only its character,
+  wherever a chunk boundary or materialization puts it. An exponent token
+  whose ``exponent`` state is unknown gets the costliest charge. Fractions are
+  exact sixteenths, summed per document.
   """
   if not length:
     return 0
   if shape == _JSON_INT:
     digits = length - signed
-    return digits * digits // 7000 + 2 if digits > _JSON_LINEAR_DIGITS else 0
+    if digits <= _JSON_LINEAR_DIGITS:
+      return 0
+    return (digits + 4) / 16 + digits * digits // 7000
   if shape == _JSON_DECIMAL and length <= 16:
     return 2 + length // 8
   if shape == _JSON_DECIMAL and length <= 24:
     return 2 + length // 2
+  value = _json_exponent_value(exponent) if shape == _JSON_EXPONENT and length <= 24 else None
+  if value is not None:
+    return (3 if value <= 22 else 8) + length // 2
   return length + 12 + max(0, length - 24)
 
 
