@@ -203,6 +203,13 @@ def claim_work(
       "The expected owner changed; inspect the current claim before transfer."
     )
 
+  # Transfer may create a reverse Goal edge, so share the tenant-scoped graph
+  # fence with ordinary follow registration before checking direct cycles.
+  db.query(models.Owner).filter(models.Owner.id == owner_id).update(
+    {models.Owner.username: models.Owner.username}, synchronize_session=False,
+  )
+  db.expire(row)
+  db.refresh(row)
   previous = row.owner_chat_id
   previous_run_id = row.owner_run_id
   previous_goal_id = row.owner_goal_id

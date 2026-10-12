@@ -57,6 +57,11 @@ def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
   The CAS write serializes with settlement/transfer, including on SQLite where
   SELECT FOR UPDATE alone is ineffective. The caller commits both together.
   """
+  # One tenant-scoped write fence serializes graph mutations across *different*
+  # claims too (including SQLite, where FOR UPDATE is ineffective).
+  db.query(models.Owner).filter(models.Owner.id == claim.owner_id).update(
+    {models.Owner.username: models.Owner.username}, synchronize_session=False,
+  )
   goal = _eligible_goal(db, chat_id, run_id)
   if goal is None:
     return 'no_open_top_level_goal'
