@@ -915,6 +915,8 @@ def terminal_goal_summaries_by_message_index(
     models.ChatGoal.chat_id == chat_id,
     models.ChatGoal.status.in_(("completed", "cannot_complete", "cancelled")),
   ).order_by(models.ChatGoal.created_at.asc(), models.ChatGoal.id.asc()).all()
+  if not goals:
+    return {}
   goal_rows = db.query(models.ChatRun).options(load_only(
     models.ChatRun.id, models.ChatRun.chat_id, models.ChatRun.goal_id,
     models.ChatRun.root_run_id, models.ChatRun.goal_objective,

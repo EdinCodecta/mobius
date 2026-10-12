@@ -102,7 +102,7 @@ def owed_wait_results(
     models.ChatWait.kind != "platform_activation",
     _FIRED_UNDELIVERED,
   ).order_by(models.ChatWait.created_at.asc()).all()
-  rows = [row for row in rows if not _closed_wait_goal(db, row)]
+  rows = [row for row in rows if not _closed_wait_goal(db, row) and not _held_wait_goal(db, row)]
   notices = [
     notice for notice in (
       _compose_resume_notice(row, _OUTCOMES[row.status]) for row in rows
@@ -150,8 +150,15 @@ def _closed_wait_goal(db: Session, row: models.ChatWait) -> bool:
     return False
   goal = db.get(models.ChatGoal, row.goal_id)
   # Missing ownership is ambiguous, not an invitation to adopt the current
-  # Goal. Only an established open Goal may receive an ordinary wake.
-  return goal is None or goal.chat_id != row.chat_id or goal.status != "open"
+  # Goal. A stopped Goal is held, not terminal.
+  return goal is None or goal.chat_id != row.chat_id or goal.status in (
+    "completed", "cancelled", "cannot_complete",
+  )
+
+
+def _held_wait_goal(db: Session, row: models.ChatWait) -> bool:
+  goal = db.get(models.ChatGoal, row.goal_id) if row.goal_id else None
+  return goal is not None and goal.chat_id == row.chat_id and goal.status == "stopped"
 
 # Cancellation is synchronous at the API/chat-lifecycle boundary while checks
 # run in the supervisor's event loop. A None PID reserves an admission while
@@ -849,6 +856,8 @@ async def _deliver_resume(row_id: str) -> bool:
     if not activation and _closed_wait_goal(db, row):
       row.resume_delivered_at = now_naive_utc()
       db.commit()
+      return False
+    if not activation and _held_wait_goal(db, row):
       return False
     if activation:
       from app.platform_restart import activation_notice

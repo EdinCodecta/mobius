@@ -567,6 +567,9 @@ def test_core_routes_operational_recipes_to_their_owning_skills():
   # The open_item tool builds the event; its placement rules live in the skill.
   assert "The `open_item` tool" in notifications
   assert "Default `activation` to `background`" in notifications
+  # Opening Settings for the owner is navigation; the changes stay theirs.
+  assert "Opening only navigates" in notifications
+  assert "that only navigates" in core
 
 
 def test_notifications_skill_leaves_card_notifications_to_the_platform():

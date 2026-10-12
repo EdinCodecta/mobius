@@ -10,7 +10,6 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import or_, and_
 from sqlalchemy.orm import Session
 
 from app import models, providers, transcript_rows
@@ -28,7 +27,7 @@ from app.delegations import (
   create_or_attach_delegation,
   derived_status,
   delegation_goal_id,
-  delegation_source_work_filter,
+  delegation_ownership_match,
   ensure_delegation_started,
   normalize_cwd,
   parent_root_run_id,
@@ -184,15 +183,9 @@ async def submit_or_attach(
   # Omission means core ownership only for a new task, not reassignment of a
   # historical app-owned child. The same live-app gate still applies below.
   if body.app_id is None and parent_delegation is None:
-    previous = db.query(models.Delegation).filter(
-      models.Delegation.parent_chat_id == parent.id,
-      or_(models.Delegation.parent_root_run_id == root_id,
-          and_(models.Delegation.goal_id.is_(None),
-               models.Delegation.parent_root_run_id == effective_goal_id)),
-      delegation_source_work_filter(effective_goal_id or root_id),
-      models.Delegation.source_work_id.is_(None),
-      models.Delegation.task_key == body.task_key,
-    ).first()
+    previous = db.query(models.Delegation).filter(delegation_ownership_match(
+      parent.id, root_id, effective_goal_id, body.task_key,
+    )).first()
     if previous is not None:
       owner_app_id = previous.app_id
   if owner_app_id is not None:
@@ -269,14 +262,9 @@ async def submit_or_attach(
         status_code=409,
         detail="The parent chat run changed during delegation admission.",
       )
-    existing = db.query(models.Delegation).filter(
-      or_(models.Delegation.parent_root_run_id == root_id,
-          and_(models.Delegation.goal_id.is_(None),
-               models.Delegation.parent_root_run_id == effective_goal_id)),
-      delegation_source_work_filter(effective_goal_id or root_id),
-      models.Delegation.source_work_id.is_(None),
-      models.Delegation.task_key == body.task_key,
-    ).first()
+    existing = db.query(models.Delegation).filter(delegation_ownership_match(
+      parent.id, root_id, effective_goal_id, body.task_key,
+    )).first()
     # Omitted cwd means "attach wherever this exact task already runs". This
     # preserves legacy rows created when older helpers materialized their shell
     # cwd, while a new task still gets the platform's stable /data default.

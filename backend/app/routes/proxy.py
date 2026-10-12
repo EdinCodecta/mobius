@@ -18,7 +18,9 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.deps import authorize_current_owner_or_app_detached, reject_cross_site
-from app.net_utils import MAX_REDIRECTS as _MAX_REDIRECTS, validate_url_safe
+from app.net_utils import (
+  MAX_REDIRECTS as _MAX_REDIRECTS, pinned_client, validate_url_safe,
+)
 
 router = APIRouter(prefix="/api/proxy", tags=["proxy"])
 
@@ -315,7 +317,7 @@ async def proxy_favicon(
   first tries conventional root icons with safe redirect handling. Only sites
   that need it pay for a bounded HTML read and declared-icon discovery.
   """
-  async with httpx.AsyncClient(follow_redirects=False, timeout=15) as client:
+  async with pinned_client(timeout=15) as client:
     icon = await _first_supported_icon(
       client, _canonical_root_icon_urls(url),
     )
@@ -371,7 +373,7 @@ async def proxy_get(
   Redirects are followed like app install follows them, with every hop
   validated and pinned, so a manifest URL that installs also previews.
   """
-  async with httpx.AsyncClient(follow_redirects=False, timeout=15) as client:
+  async with pinned_client(timeout=15) as client:
     read = await _read_external_get(
       client, url, _MAX_BYTES, headers={"User-Agent": _PROXY_USER_AGENT},
       probe_truncation=False,
@@ -395,7 +397,7 @@ async def proxy_post(
   pinned_url, host_header, sni_host = await asyncio.to_thread(
     validate_url_safe, body.url,
   )
-  async with httpx.AsyncClient(follow_redirects=False, timeout=15) as client:
+  async with pinned_client(timeout=15) as client:
     req = client.build_request(
       "POST", pinned_url,
       content=body.body.encode(),

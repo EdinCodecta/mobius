@@ -27,6 +27,7 @@ from app.continuations import WAIT_RESULT_MESSAGE_KIND
 from app.delegations import RunPolicy, delegation_execution_token
 from app.run_state import goal_identity_for_run_start
 from app.timeutil import now_naive_utc
+from tests.goal_fixtures import goal_run as make_goal_run
 
 
 def _owner_chat(client, owner_token):
@@ -2354,7 +2355,7 @@ def test_wait_route_accepts_typed_check_but_rejects_mixed_execution(client, owne
     assert client.post('/api/chat-waits', json={**payload, **extra}, headers=auth).status_code == 422
 
 
-@pytest.mark.parametrize("closed_status", ["completed", "stopped", "cancelled"])
+@pytest.mark.parametrize("closed_status", ["completed", "cancelled", "cannot_complete"])
 def test_wait_snapshot_cannot_follow_rebound_run_to_new_goal(
   client, owner_token, db, monkeypatch,
   closed_status,
@@ -2396,6 +2397,39 @@ def test_wait_snapshot_cannot_follow_rebound_run_to_new_goal(
   assert db.get(models.ChatWait, row.id).resume_delivered_at is not None
   text, ids = chat_waits_mod.owed_wait_results(db, chat_id, "")
   assert text == "" and ids == ()
+
+
+def test_wait_fired_during_owner_stopped_goal_stays_owed_until_continue(
+  client, owner_token, db, monkeypatch,
+):
+  chat_id = _owner_chat(client, owner_token)
+  run = make_goal_run(db, id="held-wait-run", root_run_id="held-wait-run",
+    chat_id=chat_id, status="completed", provider="claude", goal_id="held-wait-goal")
+  db.add(run)
+  db.commit()
+  row = _command_wait(db, chat_id=chat_id, description="held timer",
+    kind="timer", delay_secs=60, created_by_run_id=run.id)
+  assert row.goal_id == "held-wait-goal"
+  goal = db.get(models.ChatGoal, row.goal_id)
+  goal.status = "stopped"
+  db.add(models.ChatGoal(id="held-wait-other-goal", chat_id=chat_id,
+    objective="Other work", status="open"))
+  run.goal_id = "held-wait-other-goal"
+  row.status = "met"
+  row.met_at = now_naive_utc()
+  db.commit()
+  starts = _capture_starts(monkeypatch, running=False)
+
+  assert asyncio.run(chat_waits_mod._deliver_resume(row.id)) is False
+  assert starts == []
+  db.expire_all()
+  assert db.get(models.ChatWait, row.id).resume_delivered_at is None
+  assert db.get(models.ChatWait, row.id).goal_id == "held-wait-goal"
+  assert chat_waits_mod.owed_wait_results(db, chat_id, "")[1] == ()
+
+  db.get(models.ChatGoal, row.goal_id).status = "open"
+  db.commit()
+  assert chat_waits_mod.owed_wait_results(db, chat_id, "")[1] == (row.id,)
 
 
 def test_unowned_wait_never_counts_toward_creators_later_goal(db, chat):

@@ -148,7 +148,7 @@ def _transient_failure(exc: Exception) -> tuple[bool, int | None]:
     return True, None
   detail = exc.detail
   if exc.status_code not in (429, 502, 504) and not (
-    isinstance(detail, dict) and detail.get("code") == "git_transfer_timeout"
+    isinstance(detail, dict) and detail.get("retryable") is True
   ):
     return False, None
   try:
