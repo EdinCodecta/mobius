@@ -81,7 +81,7 @@ from claude_agent_sdk.types import (
   UserMessage,
 )
 
-from app import activity, generated_files, tracing
+from app import activity, generated_files, settled, tracing
 from app.memory_observability import cgroup_oom_kill_count, process_was_oom_killed
 from app.claude_events import (
   NativeContinuationTracker,
@@ -859,22 +859,16 @@ class ActiveClaudeClient:
     ):
       return
     self._force_stop_started = True
-    reap_task = asyncio.create_task(asyncio.to_thread(
-      _terminate_claude_processes, self._process_group_id, self._run_marker,
-    ))
-    deferred_cancel: asyncio.CancelledError | None = None
-    while not reap_task.done():
+    process_group_id, run_marker = self._process_group_id, self._run_marker
+
+    def reap() -> None:
       try:
-        await asyncio.shield(reap_task)
-      except asyncio.CancelledError as exc:
-        deferred_cancel = deferred_cancel or exc
-    try:
-      reap_task.result()
-    except Exception:
-      log.warning("Claude process-group cleanup failed chat_id=%s", self.chat_id,
-                  exc_info=True)
-    if deferred_cancel is not None:
-      raise deferred_cancel
+        _terminate_claude_processes(process_group_id, run_marker)
+      except Exception:
+        log.warning("Claude process-group cleanup failed chat_id=%s", self.chat_id,
+                    exc_info=True)
+
+    await settled.run_settled(reap)
 
   def mark_finished(self) -> None:
     """Resolves the stop waiter once the runner is fully drained."""

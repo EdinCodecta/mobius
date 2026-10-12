@@ -26,7 +26,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from app import app_python_env, auth, models, service_preload, tracing
+from app import app_python_env, auth, models, service_preload, settled, tracing
 from app.applied_app_runtime import AppliedRuntimeUnavailable, hold_runtime, runtime_root
 from app.browser_access import BrowserLineage, require_live
 from app.config import get_settings
@@ -211,6 +211,18 @@ async def _stop_process(process, *tasks) -> None:
   await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def _stop_spawned(spawn: asyncio.Task) -> None:
+  """Stop a child whose request was cancelled; the cancellation still wins."""
+  try:
+    process = await spawn
+  except OSError:
+    return
+  try:
+    await _stop_process(process)
+  except Exception:
+    log.exception("Could not stop an app service whose request was cancelled")
+
+
 def _response_headers(value, *, public: bool) -> dict[str, str]:
   if value is None:
     return {}
@@ -252,23 +264,9 @@ async def _run_spawned(
       process = await asyncio.shield(spawn)
     except asyncio.CancelledError:
       # Admission can be cancelled after the OS child exists but before
-      # asyncio returns its handle. Finish recovery before releasing the
+      # asyncio returns its handle. Stop that child before releasing the
       # runtime pin, even if shutdown cancels this request again.
-
-      async def recover_spawn() -> None:
-        try:
-          process = await asyncio.shield(spawn)
-        except OSError:
-          pass
-        else:
-          await _stop_process(process)
-
-      recovery = asyncio.create_task(recover_spawn())
-      while not recovery.done():
-        try:
-          await asyncio.shield(recovery)
-        except asyncio.CancelledError:
-          continue
+      await settled.settle(_stop_spawned(spawn))
       raise
   except OSError as exc:
     raise ServiceBoundaryError("start_failed", 502, "App service could not start.") from exc

@@ -38,6 +38,7 @@ from app import (
   questions,
   run_state,
   schemas,
+  settled,
   skills as skills_platform,
 )
 from app.broadcast import (
@@ -3630,20 +3631,10 @@ async def _close_turn_browser(chat_id: str, run_gen: int | None) -> None:
 async def _join_browser_close(chat_id: str) -> bool:
   """Run browser teardown to completion; call only under the lifecycle lock.
 
-  Shield and JOIN cleanup on cancellation: releasing the gate while a worker
+  A cancelled caller waits for the teardown: releasing the gate while a worker
   thread still sends signals would endanger the successor.
   """
-  task = asyncio.create_task(_close_browser_session(chat_id))
-  try:
-    return await asyncio.shield(task)
-  except asyncio.CancelledError:
-    while not task.done():
-      try:
-        await asyncio.shield(task)
-      except asyncio.CancelledError:
-        continue
-    task.result()
-    raise
+  return await settled.settle(_close_browser_session(chat_id))
 
 
 async def reap_unowned_browsers(*, memory_budget_bytes: int | None) -> dict:

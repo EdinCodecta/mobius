@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from app import generated_files
+from app import generated_files, settled
 from app.codex_sdk_contract import (
   app_server_exit_code,
   app_server_pid,
@@ -2590,17 +2590,14 @@ async def _run_codex_sdk_turn(
       (process_group_id is not None or run_marker)
       and not group_already_terminated
     ):
-      reap_task = asyncio.create_task(asyncio.to_thread(
-        _terminate_codex_processes, process_group_id, run_marker,
-      ))
-      while not reap_task.done():
-        try:
-          await asyncio.shield(reap_task)
-        except asyncio.CancelledError as exc:
-          # shield keeps the worker alive. Defer every caller cancellation
-          # until its bounded TERM/KILL sequence has completed.
-          deferred_cancel = deferred_cancel or exc
-      reap_task.result()
+      try:
+        # The worker finishes its bounded TERM/KILL sequence before any
+        # caller cancellation is raised; that cancellation then wins.
+        await settled.run_settled(
+          _terminate_codex_processes, process_group_id, run_marker,
+        )
+      except asyncio.CancelledError as exc:
+        deferred_cancel = deferred_cancel or exc
     if codex_call_executor is not None:
       codex_call_executor.close()
     if deferred_cancel is not None:
