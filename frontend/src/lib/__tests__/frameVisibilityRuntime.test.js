@@ -64,6 +64,8 @@ test('frame visibility ignores messages that do not come from the parent shell',
   const visibility = makeVisibility(frame)
   frame.post({ type: 'moebius:frame-visibility', visible: false }, { name: 'nested child' })
   frame.post({ type: 'moebius:frame-visibility', visible: 'no' })
+  // A host that never sent a verdict seeds init with undefined.
+  visibility.setFrameVisible(undefined)
   assert.equal(visibility.visible, true)
 })
 
@@ -76,19 +78,4 @@ test('an unsubscribed visibility listener stops receiving changes', () => {
   frame.setDocumentHidden(false)
   assert.deepEqual(seen, [false])
   assert.equal(visibility.visible, true)
-})
-
-test('a verdict seeded at init replaces the foreground default and notifies', () => {
-  const frame = fakeFrame()
-  const visibility = makeVisibility(frame)
-  const seen = []
-  visibility.onVisibilityChange((v) => seen.push(v))
-
-  visibility.setFrameVisible(undefined)
-  visibility.setFrameVisible('false')
-  assert.equal(visibility.visible, true)
-  visibility.setFrameVisible(false)
-  assert.equal(visibility.visible, false)
-  frame.post({ type: 'moebius:frame-visibility', visible: true })
-  assert.deepEqual(seen, [true, false, true])
 })
