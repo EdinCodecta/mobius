@@ -1470,8 +1470,8 @@ def test_capture_at_four_seconds_per_command_finishes_within_the_tool_budget(tmp
 
   A fixed 90 s capture deadline once failed captures at ~3 s per command that
   had succeeded in ~100 s before it, well inside the screenshot tool's own
-  150 s limit. The helper's budget now comes from the tool, and an app capture
-  makes few enough commands to finish at 4 s each.
+  limit. The helper's budget now comes from the tool, and an app capture makes
+  few enough commands to finish at 4 s each.
   """
   control = _control_module()
   started = time.monotonic()
@@ -1492,6 +1492,14 @@ def test_capture_at_four_seconds_per_command_finishes_within_the_tool_budget(tmp
   assert elapsed < control.SCREENSHOT_CAPTURE_BUDGET_SECONDS
   # The helper's own pauses are stubbed here; real ones add a few seconds.
   assert len(browser_log.read_text().splitlines()) <= 29
+
+
+def test_tool_budget_covers_a_full_capture_on_a_loaded_small_server():
+  """~5 s per command on a loaded 1 GB server times up to 29 commands, with
+  room for the helper's pauses, must fit the budget the tool hands over."""
+  control = _control_module()
+  assert control.SCREENSHOT_CAPTURE_BUDGET_SECONDS >= 29 * 5 * 1.25
+  assert control.SCREENSHOT_CAPTURE_BUDGET_SECONDS < control.SCREENSHOT_TIMEOUT_SECONDS
 
 
 def test_recovery_attempt_inherits_the_original_capture_deadline(tmp_path: Path):

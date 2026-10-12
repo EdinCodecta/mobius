@@ -1153,7 +1153,10 @@ def _call_apply_app(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 SCREENSHOT_SCRIPT = Path(__file__).with_name("agent-screenshot.sh")
-SCREENSHOT_TIMEOUT_SECONDS = 150
+# A capture makes up to 29 browser commands, and a loaded 1 GB server takes
+# ~5 s per command, so a healthy capture there needs ~150 s before pauses or
+# its one reset. The control server allows a tool far longer than this.
+SCREENSHOT_TIMEOUT_SECONDS = 240
 # The helper bounds its whole capture by the time this tool can wait, less a
 # margin for its final kill, cleanup, and report, so a too-busy machine yields
 # the helper's own explanation instead of this tool's bare timeout.

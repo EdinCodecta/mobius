@@ -212,8 +212,10 @@ browser_command() {
   if [ "$remaining" -lt "$MIN_COMMAND_SECONDS" ]; then
     # Too little time for even one busy-machine command (see
     # MIN_COMMAND_SECONDS): stop cleanly rather than kill it mid-flight.
-    printf 'capture budget ran out before the next command\n' \
-      > "$BROWSER_ERROR_FILE"
+    # agent-browser never ran, so leave its error file empty and say so in
+    # this helper's own name.
+    : > "$BROWSER_ERROR_FILE"
+    echo "agent-screenshot.sh: capture budget ran out before the next command" >&2
     printf '%s\n%s\n' "$BROWSER_PHASE" deadline > "$BROWSER_TIMEOUT_FILE"
     return 124
   fi
