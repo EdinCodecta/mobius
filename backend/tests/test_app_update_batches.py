@@ -177,7 +177,7 @@ async def test_entries_share_the_single_update_path_and_lifecycle_lock(tmp_path,
     assert kwargs["reviewed_upstream_commit"] == COMMIT
     assert kwargs["reviewed_source_digest"] == "b" * 64
     assert kwargs["reviewed_capability_digest"] == "c" * 64
-    assert kwargs["staged_clone"] is None
+    assert kwargs["prepared"] is None
     return SimpleNamespace(mode="update", app=SimpleNamespace(version="2.0"), warnings=["w"])
 
   monkeypatch.setattr(install, "fetch_app_commit", fetch_app_commit)
