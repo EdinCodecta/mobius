@@ -96,13 +96,14 @@ async def test_dispatch_failure_is_structural_not_a_text_search(tmp_path, tool, 
   await host.post_tool_use({'tool_name': tool, 'tool_response': response}, 'launch', None)
   failed = json.loads(response).get('success') is False if isinstance(response, str) else (
     response.get('success') is False or response.get('isError') is True)
-  assert turn.started.is_set() == failed
-  assert turn.dispatch_error == (('launch_failed' if tool == 'Agent' else 'unreachable') if failed else None)
+  assert not turn.started.is_set()
+  assert turn.dispatch_tool_error is failed
+  assert turn.dispatch_error is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('failure_channel', ['post-tool', 'post-tool-failure', 'stream-result'])
-async def test_failed_launch_settles_dispatch_without_waiting_or_replay(tmp_path, failure_channel):
+async def test_errored_dispatch_reasks_then_starts_helper(tmp_path, failure_channel):
   from claude_agent_sdk.types import UserMessage, ToolResultBlock
   host = _claude_host(tmp_path)
   turn = _turn(tmp_path)
@@ -110,21 +111,50 @@ async def test_failed_launch_settles_dispatch_without_waiting_or_replay(tmp_path
   class Dispatcher:
     async def query(self, line):
       queries.append(line)
-      host._dispatcher_call('Agent', {'description': turn.dispatch_id}, 'launch')
-      if failure_channel == 'stream-result':
-        await host._read()
+      tool_id = f'launch-{len(queries)}'
+      host._dispatcher_call('Agent', {'description': turn.dispatch_id}, tool_id)
+      if len(queries) == 2:
+        host._on_task_started(_Started('agent', tool_id))
+        host._on_task_end('agent', 'completed', 'done', None)
+      elif failure_channel == 'stream-result':
+        host._on_dispatcher_user_message(UserMessage(content=[
+          ToolResultBlock(tool_use_id=tool_id, content='failed', is_error=True)]))
       else:
         await host.post_tool_use({'tool_name': 'Agent', 'tool_response': {'success': False},
           'hook_event_name': 'PostToolUseFailure' if failure_channel == 'post-tool-failure' else 'PostToolUse'},
-          'launch', None)
-    async def receive_messages(self):
-      yield UserMessage(content=[ToolResultBlock(tool_use_id='launch', content='failed', is_error=True)])
+          tool_id, None)
+      _reply(host)
   host._client = Dispatcher()
   await host.run_turn(turn)
-  assert turn.dispatch_error == 'launch_failed'
-  assert queries == ['SPAWN d1']
+  assert turn.status == 'completed' and turn.dispatch_error is None
+  assert queries == ['SPAWN d1'] * 2
   await host.close()
   assert host._dispatcher_reply is None
+
+
+@pytest.mark.asyncio
+async def test_errored_dispatch_exhausts_same_reask_budget(tmp_path):
+  from claude_agent_sdk.types import UserMessage, ToolResultBlock
+  host = _claude_host(tmp_path)
+  turn = _turn(tmp_path)
+  queries = []
+  class Dispatcher:
+    async def query(self, line):
+      queries.append(line)
+      tool_id = f'launch-{len(queries)}'
+      host._dispatcher_call('Agent', {'description': turn.dispatch_id}, tool_id)
+      host._on_dispatcher_user_message(UserMessage(content=[
+        ToolResultBlock(tool_use_id=tool_id, content='transient permission denial', is_error=True)]))
+      _reply(host)
+  host._client = Dispatcher()
+  await host.run_turn(turn)
+  assert queries == ['SPAWN d1'] * 3
+  assert turn.dispatch_error == 'launch_failed'
+  assert 'retry budget was exhausted' in turn.summary
+  assert turn.dispatch_id not in host._specs
+  host._on_task_started(_Started('late', 'launch-3'))
+  assert 'late' not in host._turn_by_agent
+  await host.close()
 
 
 @pytest.mark.asyncio
@@ -190,6 +220,7 @@ async def test_failed_consumed_dispatch_cannot_admit_a_late_identity(tmp_path):
   turn = _turn(tmp_path)
   host._turn_by_tool_use['launch'] = turn
   host._fail_dispatch('launch', 'Agent')
+  turn.finish('failed', 'Retries exhausted')
   host._on_task_started(_Started('agent', 'launch'))
   assert turn.done.is_set()
   assert 'agent' not in host._turn_by_agent
@@ -231,6 +262,7 @@ async def test_rejected_late_start_denies_pending_and_later_identity_without_clo
     'tool_name': 'Write', 'tool_input': {}}, 'write', None))
   await asyncio.sleep(0)
   host._fail_dispatch('failed-launch', 'Agent')
+  failed.finish('failed', 'Retries exhausted')
   host._on_task_started(_Started('late-agent', 'failed-launch'))
   assert (await pending)['hookSpecificOutput']['permissionDecision'] == 'deny'
   assert await host._turn_for_agent('late-agent') is None

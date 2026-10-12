@@ -262,6 +262,7 @@ class HelperTurn:
   report: HelperReport = dataclasses.field(default_factory=HelperReport)
   usage: dict | None = None
   dispatch_error: str | None = None
+  dispatch_tool_error: bool = False
   dispatch_consumed: bool = False
   dispatch_cancelled: bool = False
   # The helper's last API error from its provider, as (kind, message text).
@@ -534,9 +535,12 @@ class ClaudeHelperHost(Host):
   def _fail_dispatch(self, tool_use_id, tool_name: str) -> None:
     turn = self._turn_by_tool_use.get(tool_use_id or "")
     if turn is not None and not turn.started.is_set():
-      turn.dispatch_error = "unreachable" if tool_name == "SendMessage" else "launch_failed"
-      log.warning("helper dispatch failed kind=%s id=%s", turn.kind, turn.dispatch_id)
-      turn.finish("failed", "The provider could not dispatch this helper turn.")
+      # A definite tool error did not start a helper. Restore only this spec;
+      # a successful or ambiguous one-shot call must never be replayed.
+      turn.dispatch_tool_error = True
+      if not turn.done.is_set() and turn.dispatch_id in self._turn_by_dispatch:
+        self._specs[turn.dispatch_id] = turn.spec
+      log.warning("helper dispatch tool error kind=%s id=%s", turn.kind, turn.dispatch_id)
 
   async def subagent_stop(self, input_data, tool_use_id, context) -> dict:
     """Capture the documented final response, never a task notification summary.
@@ -797,7 +801,7 @@ class ClaudeHelperHost(Host):
         return
       verb = "SPAWN" if turn.kind == "spawn" else "MESSAGE"
       for attempt in range(DISPATCH_REASKS + 1):
-        if turn.done.is_set():
+        if turn.done.is_set() or turn.started.is_set():
           return
         replied = asyncio.get_running_loop().create_future()
         self._dispatcher_reply = replied
@@ -815,17 +819,25 @@ class ClaudeHelperHost(Host):
               turn.finish("failed", "Claude failed to dispatch this helper request. "
                           "Möbius will not replay it automatically.")
             return
+          if turn.started.is_set():
+            return
           if turn.dispatch_id not in self._specs:
             return  # The one-shot tool call was consumed; never replay it.
           if attempt < DISPATCH_REASKS:
             continue
           self._specs.pop(turn.dispatch_id, None)
-          turn.dispatch_error = "not_called"
+          if turn.dispatch_tool_error:
+            turn.dispatch_error = "unreachable" if turn.kind == "message" else "launch_failed"
+            summary = ("Claude's helper dispatch tool failed and the retry budget was "
+                       "exhausted. No helper started or message was sent.")
+          else:
+            turn.dispatch_error = "not_called"
+            summary = ("Claude finished without starting this helper or sending its "
+                       "message. No work was launched or message sent.")
           log.warning("helper dispatch %s %s completed without its tool call key=%s "
                       "dispatcher_last=%r", turn.kind, turn.dispatch_id,
                       self.key.digest, self.dispatcher_last)
-          turn.finish("failed", "Claude finished without starting this helper or "
-                      "sending its message. No work was launched or message sent.")
+          turn.finish("failed", summary)
         except asyncio.CancelledError:
           raise
         except TimeoutError:
