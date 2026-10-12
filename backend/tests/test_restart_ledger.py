@@ -219,6 +219,34 @@ def test_failed_cutover_can_rearm_exact_rollback_then_finalize(
   assert not supervisor.rearm_cutover(cutover_id, now=now + 7)
 
 
+def test_rollback_rearm_long_after_an_unstarted_cutover_authorizes_one_boot(
+  tmp_path, monkeypatch,
+):
+  # Production 2026-10-12: the replacement was created but never started, and
+  # recovery re-armed the rollback 30 minutes after the cutover acceptance.
+  # The unconsumed acceptance must be re-dated, not returned already expired.
+  supervisor = _load_supervisor()
+  _bind(supervisor, tmp_path, monkeypatch)
+  now = time.time()
+  source_boot = "boot-source-1234"
+  rollback_boot = "boot-rollback-1234"
+  later_boot = "boot-later-12345"
+  cutover_id = "cutover-12345678"
+  nonce = "nonce-12345678"
+
+  supervisor.begin_boot(source_boot, now=now)
+  supervisor.open_cutover(cutover_id, now=now + 1)
+  platform_ledger.publish_cutover_intent(
+    boot_id=source_boot, nonce=nonce, cutover_id=cutover_id, runs=[], now=now + 1,
+  )
+  assert supervisor.accept_cutover(cutover_id, now=now + 2)
+  late = now + 2 + 30 * 60
+  assert supervisor.rearm_cutover(cutover_id, now=late)
+  assert supervisor.begin_boot(rollback_boot, now=late + 60)
+  assert _authorized(tmp_path, rollback_boot) == nonce
+  assert not supervisor.begin_boot(later_boot, now=late + 120)
+
+
 def test_restart_intent_keeps_exact_runs_for_older_frozen_supervisors(
   tmp_path, monkeypatch,
 ):

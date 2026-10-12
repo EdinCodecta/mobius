@@ -76,10 +76,10 @@ def _install_control(tmp_path, monkeypatch):
   control = tmp_path / "mobius-rebuild"
   inbox = control / "inbox"
   inbox.mkdir(parents=True)
-  (control / "status.json").write_text(
-    '{"state":"idle","handoff":"external-cutover-v1","request_versions":[1,2]}',
-    encoding="utf-8",
-  )
+  (control / "status.json").write_text(json.dumps({
+    "state": "idle", "handoff": "external-cutover-v1", "request_versions": [1, 2],
+    "helper_protocol": dc._required_helper_protocol(),
+  }), encoding="utf-8")
   monkeypatch.setattr(dc, "_control_dir", lambda: control)
   return control, inbox
 
@@ -1291,6 +1291,51 @@ async def test_legacy_host_helper_is_visible_but_cannot_queue_replacement(
   assert not (inbox / "request.json").exists()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("installed", [None, "6", True, -1, "older"])
+async def test_host_helper_below_the_release_protocol_cannot_queue_replacement(
+  tmp_path, monkeypatch, installed,
+):
+  # Production 2026-10-12: the recovery fix was merged but the host still ran
+  # the old helper, so the next replacement took the same fatal path. A helper
+  # whose installer never certified the served release's protocol may still
+  # report status, but must not be sent a replacement.
+  control, inbox = _install_control(tmp_path, monkeypatch)
+  status = {"state": "idle", "handoff": "external-cutover-v1", "request_versions": [1, 2]}
+  if installed == "older":
+    status["helper_protocol"] = dc._required_helper_protocol() - 1
+  elif installed is not None:
+    status["helper_protocol"] = installed
+  (control / "status.json").write_text(json.dumps(status), encoding="utf-8")
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+
+  assert (await dc.read_rebuild_status())["supported"] is True
+  with pytest.raises(dc.DeploymentControlError) as exc:
+    await dc._request_self_hosted_rebuild(
+      expected_sha="a" * 40,
+      final_check=lambda: pytest.fail("outdated helper reached final check"),
+    )
+  assert exc.value.code == "controller_upgrade_required"
+  assert "install-rebuild-helper.sh" in exc.value.message
+  assert not (inbox / "request.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_outdated_helper_recovery_status_stays_visible(tmp_path, monkeypatch):
+  control, _inbox = _install_control(tmp_path, monkeypatch)
+  (control / "status.json").write_text(json.dumps({
+    "state": "needs_recovery", "code": "handoff_boot_unconfirmed",
+    "operation_id": "a" * 32, "handoff": "external-cutover-v1",
+    "request_versions": [1, 2], "worker_revision": 9,
+  }), encoding="utf-8")
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+
+  status = await dc.read_rebuild_status()
+
+  assert status["supported"] is True
+  assert status["state"] == "needs_recovery"
+
+
 def test_prepare_path_requires_matching_root_owned_operation(tmp_path, monkeypatch):
   control, _inbox = _install_control(tmp_path, monkeypatch)
   operation = "a" * 32
@@ -1601,7 +1646,8 @@ async def test_compatible_deployment_source_does_not_block_reviewed_replacement(
 
 
 def _write_host_status(control, **fields):
-  base = {"handoff": "external-cutover-v1", "request_versions": [1, 2]}
+  base = {"handoff": "external-cutover-v1", "request_versions": [1, 2],
+          "helper_protocol": dc._required_helper_protocol()}
   base.update(fields)
   (control / "status.json").write_text(json.dumps(base), encoding="utf-8")
 
@@ -1957,6 +2003,7 @@ async def test_safe_terminal_host_status_releases_binding_and_allows_retry(
   (control / "status.json").write_text(json.dumps({
     "state": state, "request_nonce": old["id"], "expected_sha": target,
     "handoff": "external-cutover-v1", "request_versions": [1, 2],
+    "helper_protocol": dc._required_helper_protocol(),
   }), encoding="utf-8")
   await dc.release_ended_binding()
   assert bound_operations == [("unbind", target, old)]

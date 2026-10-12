@@ -6,8 +6,9 @@ set -euo pipefail
 # This installs the frozen launcher and seeds it with this checkout's worker;
 # later worker changes arrive with verified official images, so this runs once.
 #
-# Helper protocol revision: 5 (explicit root-pinned boot admission migration).
+# Helper protocol revision: 6 (stable host path for the persistent /data).
 # Keep in step with deployment/self-hosted-helper.required; never decrement.
+HELPER_PROTOCOL=6
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run with sudo from the trusted Möbius checkout." >&2
@@ -117,11 +118,11 @@ verify_admission_identity() {
   local inspected
   inspected=$(docker inspect "$CID" --format \
     '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Entrypoint":{{json .Config.Entrypoint}},"Cmd":{{json .Config.Cmd}},"Labels":{{json .Config.Labels}},"Mounts":{{json .Mounts}}}') || return 1
-  python3 - "$PROJECT" "$CID" "$inspected" <<'PY_ADMISSION'
+  python3 - "$PROJECT" "$CID" "$inspected" "$DATA_MOUNT_SOURCE" <<'PY_ADMISSION'
 import json, re, stat, sys
 from pathlib import Path
 
-project, cid, raw = sys.argv[1:]
+project, cid, raw, data_mount_source = sys.argv[1:]
 configuration = json.loads(Path("/etc/mobius-rebuild/config.v4.json").read_text())
 expected = json.loads(Path("/etc/mobius-rebuild/image.override.yml").read_text())
 actual = json.loads(raw)
@@ -182,7 +183,9 @@ require(json.loads(attempt_path.read_text()) == expected)
 for target, source, writable, kind in (
     ("/run/mobius-boot-admission.py", "/usr/local/libexec/mobius-boot-admission.py", False, "bind"),
     ("/run/mobius-admission", "/var/lib/mobius-rebuild/admission/" + operation, True, "bind"),
-    ("/data", configuration.get("data_dir"), True, None),
+    # Docker reports a volume's Mountpoint here; the worker separately proves
+    # the frozen data_dir is that volume's stable host source.
+    ("/data", data_mount_source, True, None),
 ):
     require(isinstance(source, str) and source.startswith("/"))
     matches = [mount for mount in actual.get("Mounts", []) if mount.get("Destination") == target]
@@ -217,21 +220,29 @@ ARGS=()
 for file in "${ENV_FILES[@]}"; do ARGS+=(--env-file "$file"); done
 ARGS+=(-p "$PROJECT")
 for file in "${FILES[@]}"; do ARGS+=(-f "$file"); done
-DATA_SOURCE=$(docker inspect "$CID" --format \
-  '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}')
-[[ $DATA_SOURCE =~ ^/[A-Za-z0-9_./-]+$ && -d $DATA_SOURCE ]] \
-  || { echo "Could not resolve the persistent /data mount on the host." >&2; exit 1; }
+# The host must reach /data even while no app container runs. Docker reports a
+# bind-option local volume at its Mountpoint, which it mounts only while a
+# container uses the volume; the worker's resolver returns the stable source
+# (and refuses volumes the host cannot reach) for config, units and recovery.
+DATA_PATHS=$(/usr/bin/python3 -I -S "$ROOT/scripts/mobius-rebuild-host.py" data-source "$CID") \
+  || { echo "Could not resolve a stable host path for the persistent /data." >&2; exit 1; }
+DATA_SOURCE=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["data_dir"])' "$DATA_PATHS")
+DATA_MOUNT_SOURCE=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["mount_source"])' "$DATA_PATHS")
+for path in "$DATA_SOURCE" "$DATA_MOUNT_SOURCE"; do
+  [[ $path =~ ^/[A-Za-z0-9_./-]+$ && -d $path ]] \
+    || { echo "Could not resolve the persistent /data mount on the host." >&2; exit 1; }
+done
 # Every existing helper configuration, legacy or frozen-source alike, must
 # describe this exact project and persistent data directory. The released
 # config.json is never rewritten, so a changed topology would otherwise pair it
 # with a newly staged compose snapshot. Refuse before any controller change,
 # and again under both locks: a concurrent installer may have written one since.
 check_existing_configuration() {
-python3 - "$PROJECT" "$DATA_SOURCE" <<'PY_EXISTING'
+python3 - "$PROJECT" "$DATA_SOURCE" "$DATA_MOUNT_SOURCE" <<'PY_EXISTING'
 import json, os, stat, sys
 
 TRUSTED_UID = 0
-project, data_source = sys.argv[1:]
+project, data_source, mount_source = sys.argv[1:]
 directory = "/etc/mobius-rebuild"
 try:
     info = os.lstat(directory)
@@ -254,7 +265,10 @@ for name, version in (("config.v4.json", 4), ("config.json", 3)):
         configuration = None
     if not isinstance(configuration, dict) or configuration.get("version") != version:
         raise SystemExit(f"Existing helper configuration has an unexpected schema: {path}")
-    if configuration.get("project") != project or configuration.get("data_dir") != data_source:
+    # An older installer recorded Docker's Mountpoint for the same volume. It
+    # names the same data, so it is reinstalled with the stable spelling.
+    if configuration.get("project") != project or configuration.get("data_dir") not in {
+            data_source, mount_source}:
         raise SystemExit(
             f"Existing helper configuration {path} describes a different Compose project or "
             "data directory. Settle that deployment's helper state explicitly first; the "
@@ -636,11 +650,12 @@ services:
 EOF
 PUBLISH+=("$STAGE/image.override.yml" /etc/mobius-rebuild/image.override.yml 0600)
 fi
-cat >"$STAGE/mobius-rebuild.service" <<'EOF'
+cat >"$STAGE/mobius-rebuild.service" <<EOF
 [Unit]
 Description=Replace the Möbius app container with an official image
 After=docker.service
 Requires=docker.service
+RequiresMountsFor=$DATA_SOURCE
 
 [Service]
 Type=oneshot
@@ -655,6 +670,10 @@ EOF
 cat >"$STAGE/mobius-rebuild.path" <<EOF
 [Unit]
 Description=Watch for a Möbius container rebuild request
+# Watch the stable data source, never a Docker volume Mountpoint: systemd
+# re-arms inotify whenever its service stops, and a Mountpoint that is not
+# mounted at that moment leaves the watches on a hidden directory forever.
+RequiresMountsFor=$DATA_SOURCE
 
 [Path]
 # Edge-trigger requests; a queued request behind recovery must not spin this
@@ -665,11 +684,12 @@ Unit=mobius-rebuild.service
 [Install]
 WantedBy=multi-user.target
 EOF
-cat >"$STAGE/mobius-rebuild-reconcile.service" <<'EOF'
+cat >"$STAGE/mobius-rebuild-reconcile.service" <<EOF
 [Unit]
 Description=Reconcile interrupted Möbius container rebuild state
 After=docker.service
 Requires=docker.service
+RequiresMountsFor=$DATA_SOURCE
 Before=mobius-rebuild.path
 
 [Service]
@@ -739,6 +759,14 @@ exec 8>&-
 systemctl enable mobius-rebuild-reconcile.service
 systemctl enable --now mobius-rebuild-reconcile.timer
 systemctl enable --now mobius-rebuild.path
+# Certify the protocol only once every piece is installed and dispatching: the
+# app sends replacements only to a host whose certified protocol meets the
+# served release's deployment/self-hosted-helper.required.
+printf '%s\n' "$HELPER_PROTOCOL" >"$STAGE/helper-protocol"
+durable_publish "$STAGE/helper-protocol" /var/lib/mobius-rebuild/helper-protocol 0600 --
+MOBIUS_REBUILD_LAUNCHER=2 \
+  /usr/bin/python3 -I -S "$ROOT/scripts/mobius-rebuild-host.py" publish-capabilities \
+  || echo "The helper status reports protocol $HELPER_PROTOCOL after the next reconcile." >&2
 MIGRATION_COMPLETE=1
 
 echo "Container rebuild support installed for Compose project '$PROJECT'."

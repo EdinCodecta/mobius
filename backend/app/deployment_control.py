@@ -101,6 +101,18 @@ _UPGRADE_MESSAGE = (
   "safe external chat-handoff contract. Re-run "
   "scripts/install-rebuild-helper.sh from the current trusted checkout."
 )
+_HELPER_PROTOCOL_MESSAGE = (
+  "The Host replacement helper is older than this release requires. Update "
+  "the Möbius checkout on the host, then re-run sudo "
+  "scripts/install-rebuild-helper.sh there before replacing the container."
+)
+# The host helper protocol this served source requires; a release that needs
+# new host pieces advances it. Compared with the protocol the host installer
+# certified, so a helper fix that was merged but never installed on this host
+# blocks replacement instead of running the old cutover path.
+_REQUIRED_HELPER_PROTOCOL = (
+  Path(__file__).resolve().parents[2] / "deployment" / "self-hosted-helper.required"
+)
 
 
 def _empty_status(
@@ -483,6 +495,13 @@ def _read_host_status() -> dict[str, Any]:
   return value
 
 
+def _required_helper_protocol() -> int | None:
+  try:
+    return int(_REQUIRED_HELPER_PROTOCOL.read_text(encoding="ascii").strip())
+  except (OSError, UnicodeError, ValueError):
+    return None  # an unreadable requirement never admits a replacement
+
+
 def _current_host_controller(raw: dict[str, Any]) -> bool:
   # Request version 2 carries the app's nonce, which the helper echoes so only
   # that exact replacement can confirm an update (``reconcile_bound_operation``).
@@ -491,6 +510,17 @@ def _current_host_controller(raw: dict[str, Any]) -> bool:
     raw.get("handoff") == _HANDOFF_VERSION
     and not raw.get("runtime_overlay")
     and isinstance(versions, list) and _HOST_REQUEST_VERSION in versions
+  )
+
+
+def _host_helper_meets_release(raw: dict[str, Any]) -> bool:
+  """Dispatch-only: status of an older helper stays readable for recovery."""
+  installed = raw.get("helper_protocol")
+  required = _required_helper_protocol()
+  return (
+    required is not None
+    and isinstance(installed, int) and not isinstance(installed, bool)
+    and installed >= required
   )
 
 
@@ -875,6 +905,10 @@ async def _request_self_hosted_rebuild(
       status_code=409,
     )
   _ensure_can_rebuild(await read_rebuild_status())
+  if not _host_helper_meets_release(await asyncio.to_thread(_read_host_status)):
+    raise DeploymentControlError(
+      "controller_upgrade_required", _HELPER_PROTOCOL_MESSAGE, status_code=409,
+    )
   # A binding left by an attempt that provably ended may be replaced.
   stale = await asyncio.to_thread(_bound_operation)
   replacing = stale if stale and await _binding_ended(stale) else None

@@ -483,6 +483,11 @@ def rearm_cutover(cutover_id: str, *, now: float | None = None) -> bool:
     and existing.get("nonce") == receipt.get("nonce")
     and existing.get("cutover_id") == cutover_id
   ):
+    # The target never booted, so this exact acceptance is still unconsumed.
+    # Re-date it for the rollback boot: begin_boot rejects acceptances older
+    # than MAX_ACCEPTED_AGE_SECONDS, and a rollback can start long after the
+    # cutover. This is the same single authorization, not a second one.
+    _write_json(ACCEPTED_PATH, {**existing, "accepted_at": current}, 0o600)
     return True
 
   ack = _read_bounded_json(ACK_PATH)
