@@ -67,8 +67,10 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -122,7 +124,16 @@ FETCHED_REF = "refs/mobius/fetched"
 
 
 class GitTransferFailed(RuntimeError):
-  """A Git network transfer failed: the host, the network or the repository."""
+  """A Git network transfer failed: the host, the network or the repository.
+
+  ``transient`` says whether the same transfer may later succeed unchanged: a
+  timeout or a dropped connection may, a missing ref or repository, refused
+  credentials, a name that does not exist or a full disk will not.
+  """
+
+  def __init__(self, message: str, *, transient: bool = True) -> None:
+    super().__init__(message)
+    self.transient = transient
 
 
 class GitTransferTimeout(GitTransferFailed):
@@ -2641,6 +2652,47 @@ def _is_shallow(repo: Path) -> bool:
   ).stdout.strip() == "true"
 
 
+# Failures, in Git's untranslated text, that a later identical fetch repeats.
+_PERMANENT_FETCH_ERROR = re.compile(
+  r"couldn't find remote ref|not our ref|repository\b.*\bnot found"
+  r"|does not appear to be a git repository|authentication failed"
+  r"|could not read (?:username|password)|returned error: 40[134]\b"
+  r"|no space left on device|disk quota exceeded",
+  re.IGNORECASE,
+)
+_DNS_RECHECK_TIMEOUT = 5  # seconds
+_UNRESOLVED_HOST = re.compile(r"could not resolve host: ([^\s']+)", re.IGNORECASE)
+
+
+def _transient_fetch_error(stderr: str) -> bool:
+  """Whether a failed fetch may succeed unchanged later; anything unknown may.
+
+  Git reports every resolver failure alike, so the host is looked up again:
+  as for connectors, only a resolver that could not answer (``EAI_AGAIN``) is
+  temporary, while a name that does not exist stays missing.
+  """
+  if _PERMANENT_FETCH_ERROR.search(stderr):
+    return False
+  unresolved = _UNRESOLVED_HOST.search(stderr)
+  if unresolved is None:
+    return True
+  answers: list[bool] = []
+
+  def lookup() -> None:
+    try:
+      socket.getaddrinfo(unresolved.group(1), None)
+    except socket.gaierror as exc:
+      answers.append(exc.errno == socket.EAI_AGAIN)
+    except (OSError, UnicodeError):
+      pass
+
+  # A resolver too slow to answer is itself a temporary failure.
+  lookup_thread = threading.Thread(target=lookup, daemon=True)
+  lookup_thread.start()
+  lookup_thread.join(_DNS_RECHECK_TIMEOUT)
+  return answers[0] if answers else True
+
+
 def _transfer(
   stage: Path, url: str, ref: str, *, unshallow: bool,
 ) -> tuple[str, str | None]:
@@ -2676,7 +2728,8 @@ def _transfer(
         "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
         *(["--unshallow"] if unshallow else []),
         "--end-of-options", url, f"+{source}:{FETCHED_REF}",
-        # The tag fallback below reads Git's untranslated error text.
+        # The tag fallback and the failure's classification read Git's
+        # untranslated error text.
         timeout=_GIT_TRANSFER_TIMEOUT, env={"LC_ALL": "C"},
       )
       break
@@ -2688,7 +2741,8 @@ def _transfer(
       if source == sources[-1] or "couldn't find remote ref" not in exc.stderr:
         lines = (exc.stderr or "").strip().splitlines()
         raise GitTransferFailed(
-          lines[-1] if lines else f"git exited with status {exc.returncode}"
+          lines[-1] if lines else f"git exited with status {exc.returncode}",
+          transient=_transient_fetch_error(exc.stderr or ""),
         ) from exc
   fetched = _resolve_commit(stage, FETCHED_REF)
   if fetched is None:

@@ -30,8 +30,8 @@ from app.bootstrap import (
 
 @pytest.fixture(autouse=True)
 def _no_git_transfer(monkeypatch):
-  """These tests replace the installer, so nothing needs a staged clone."""
-  monkeypatch.setattr("app.bootstrap.stage_package_clone", AsyncMock(return_value=None))
+  """These tests replace the installer, so nothing needs a prepared package."""
+  monkeypatch.setattr("app.bootstrap.prepare_package", AsyncMock(return_value=None))
 
 
 def _install_result(name="App", slug="app", app_id=1, mode="install"):
@@ -790,6 +790,12 @@ async def test_rate_limited_store_is_retried_and_takes_its_default_pin(
   assert db.query(models.Notification).count() == 0
 
 
+def _unresolvable_host(errno_=socket.EAI_AGAIN):
+  exc = HTTPException(400, "Cannot resolve host 'api.github.com'")
+  exc.__cause__ = socket.gaierror(errno_, "name resolution failed")
+  return exc
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exc", [
   HTTPException(422, "App failed to compile."),
@@ -800,6 +806,15 @@ async def test_rate_limited_store_is_retried_and_takes_its_default_pin(
     "Nothing was installed.", OSError(errno.ENOSPC, "No space left on device"),
     code="git_install_unavailable",
   ),
+  # A missing repository or branch, or a name that does not exist, stays so.
+  install.git_source_error(
+    "Nothing was installed.",
+    app_git.GitTransferFailed("repository not found", transient=False),
+    code="git_install_unavailable",
+  ),
+  app_git.GitTransferFailed("couldn't find remote ref", transient=False),
+  socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
+  _unresolvable_host(socket.EAI_NONAME),
   ValueError("unexpected"),
 ])
 async def test_non_transient_failure_schedules_no_retry(db, monkeypatch, exc):
@@ -812,12 +827,6 @@ async def test_non_transient_failure_schedules_no_retry(db, monkeypatch, exc):
     outcome = await ensure_bootstrap_apps_installed(db)
 
   assert outcome == bootstrap_mod.BootstrapOutcome()
-
-
-def _unresolvable_host():
-  exc = HTTPException(400, "Cannot resolve host 'api.github.com'")
-  exc.__cause__ = socket.gaierror(-3, "Temporary failure in name resolution")
-  return exc
 
 
 @pytest.mark.parametrize("exc", [
@@ -836,7 +845,7 @@ def _unresolvable_host():
   app_git.GitTransferFailed("could not resolve host"),
   app_git.GitTransferTimeout("clone exceeded its ceiling"),
   app_git.HistoryIncomplete("merge base hidden"),
-  socket.gaierror(-3, "Temporary failure in name resolution"),
+  socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
   _unresolvable_host(),
 ])
 def test_gateway_and_transfer_timeouts_are_transient(exc):
@@ -952,13 +961,13 @@ async def test_retry_stages_each_clone_before_taking_the_lifecycle_lock(
   monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
   locked = []
 
-  async def stage(url):
+  async def prepare(url):
     locked.append(fs_locks.install_uninstall_lock().locked())
     if url == BOOTSTRAP_SOCIAL_MANIFEST_URL:
       raise app_git.GitTransferTimeout("it ran longer than 600 seconds")
     return None
 
-  monkeypatch.setattr(bootstrap_mod, "stage_package_clone", stage)
+  monkeypatch.setattr(bootstrap_mod, "prepare_package", prepare)
   install = AsyncMock(side_effect=_installing_rows(db))
   with patch("app.bootstrap.install_from_manifest", install):
     outcome = await bootstrap_mod.ensure_bootstrap_apps_installed(
@@ -976,23 +985,32 @@ async def test_retry_stages_each_clone_before_taking_the_lifecycle_lock(
 async def test_unreachable_git_host_at_first_boot_leaves_apps_pending(
   db, monkeypatch,
 ):
-  """Staging the clone is the first network step; its failure is retried."""
+  """Staging the clone is the first network step; a resolver that could not
+  answer is retried, while a host that does not exist is not."""
   from app import bootstrap as bootstrap_mod
   from app import install as install_mod
 
   monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
-  monkeypatch.setattr(bootstrap_mod, "stage_package_clone", install_mod.stage_package_clone)
+  monkeypatch.setattr(bootstrap_mod, "prepare_package", install_mod.prepare_package)
   monkeypatch.setattr(install_mod, "_derive_repo_ref", lambda _url: (
     "https://unresolvable.invalid/app.git", "main",
   ))
-  install = AsyncMock()
-  with patch("app.bootstrap.install_from_manifest", install):
-    outcome = await bootstrap_mod.ensure_bootstrap_apps_installed(db)
+  for errno_, pending in (
+    (socket.EAI_AGAIN, tuple(
+      app.manifest_id for app in bootstrap_mod._CORE_BOOTSTRAP_APPS
+    )),
+    (socket.EAI_NONAME, ()),
+  ):
+    def resolve(*_args, errno_=errno_):
+      raise socket.gaierror(errno_, "name resolution failed")
 
-  install.assert_not_awaited()
-  assert outcome.pending == tuple(
-    app.manifest_id for app in bootstrap_mod._CORE_BOOTSTRAP_APPS
-  )
+    monkeypatch.setattr(app_git.socket, "getaddrinfo", resolve)
+    install = AsyncMock()
+    with patch("app.bootstrap.install_from_manifest", install):
+      outcome = await bootstrap_mod.ensure_bootstrap_apps_installed(db)
+
+    install.assert_not_awaited()
+    assert outcome.pending == pending
 
 
 @pytest.mark.asyncio
