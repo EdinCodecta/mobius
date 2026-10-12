@@ -3326,6 +3326,20 @@ def test_git_conflicting_update_leaves_source_unchanged_until_resolve(
   assert update.status_code == 200, update.text
   assert update.json()["update_available"] is True
   assert update.json()["pending_update_state"] == "needs_resolution"
+
+  # The pre-install review reports the same pending state, so the Store can
+  # block the install instead of re-entering the resolver.
+  def preview_state():
+    with _git_update_source(
+      _git_candidate({**m, "version": "2.0.0"}, jsx_v2),
+    ):
+      preview = client.get(
+        f"/api/apps/{payload['id']}/update-candidate-preview", headers=auth,
+      )
+    assert preview.status_code == 200, preview.text
+    return preview.json()["pending_update_state"]
+
+  assert preview_state() == "needs_resolution"
   assert update.json()["needs_resolution"] is True
   assert update.json()["upstream_version"] == "2.0.0"
   bypass = client.patch(
@@ -3368,6 +3382,7 @@ def test_git_conflicting_update_leaves_source_unchanged_until_resolve(
     f"/api/apps/{payload['id']}/update-check", headers=auth,
   )
   assert resolved_update.json()["pending_update_state"] == "replay_pending"
+  assert preview_state() == "replay_pending"
   redundant_resolver = client.post(
     f"/api/apps/{payload['id']}/conflict-resolver-chat", headers=auth,
   )
@@ -5234,6 +5249,7 @@ def test_update_candidate_preview_fetches_incoming_diff_without_mutation(
   assert "a/index.jsx" in payload["upstream_diff"]
   assert "b/index.jsx" in payload["upstream_diff"]
   assert len(payload["source_digest"]) == 64
+  assert payload["pending_update_state"] == "none"
   assert jsx_file.read_text() == before
 
   changed_after_review = jsx_v2.replace("INCOMING FOOTER", "MOVED AGAIN")
