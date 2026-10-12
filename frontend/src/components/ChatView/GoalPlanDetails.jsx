@@ -48,6 +48,12 @@ function delegationMeta(node) {
   return state
 }
 
+const SOURCE_RECOVERY_BLOCKERS = new Set([
+  'source_missing', 'source_failed', 'source_deleted', 'source_held',
+  'source_goal_missing', 'owner_not_progressing', 'owner_deleted',
+  'owner_goal_not_open', 'acquisition_changed', 'source_settled_without_outcome',
+])
+
 /* The exact saved question stays inspectable here, as a record addressed to
    the coordinating agent rather than an answer control for the owner. */
 function HelperQuestionRecord({ question }) {
@@ -127,7 +133,7 @@ export default function GoalPlanDetails({ plan, holdReason = null, dependencies 
         {dependencies.map(dependency => <div role="listitem" key={dependency.id} className="chat__goal-task">
           <span className="chat__goal-task-copy">
             <span className="chat__goal-task-title">{goalDependencyLabel(dependency)}</span>
-            <span className="chat__goal-task-meta">{['source_missing', 'source_failed', 'source_deleted', 'source_held', 'source_goal_missing', 'owner_not_progressing'].includes(dependency.resume_blocker)
+            <span className="chat__goal-task-meta">{SOURCE_RECOVERY_BLOCKERS.has(dependency.resume_blocker)
               ? 'Source not progressing · manual recovery needed'
               : dependency.automatic ? 'Continues automatically when the result arrives' : 'Manual follow-up needed'}</span>
           </span>
