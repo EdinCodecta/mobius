@@ -6799,6 +6799,83 @@ def _repair_legacy_goal_dependency_classification(eng) -> None:
         conn.execute(text("DELETE FROM goal_dependencies WHERE id=:id"), {"id": dep_id})
 
 
+def _narrow_legacy_dependency_wakes_and_add_owner_suppression(eng) -> None:
+  """Keep only legacy follows with a durable, exact source continuation.
+
+  Old interests are evidence of interest, not evidence that an executor is
+  still working. In particular an open Goal and an unreleased claim do not
+  make a completed or failed run live. Uncertain Wait/helper/queue handoffs
+  remain in agent_work_interests for manual recovery, never newly owed mail.
+  This only removes 0090-created pending rows; resolved history is immutable.
+  """
+  from sqlalchemy import inspect, text
+
+  inspector = inspect(eng)
+  tables = set(inspector.get_table_names())
+  if "goal_dependencies" not in tables:
+    return
+  with eng.begin() as conn:
+    if "owner_suppressed_at" not in {
+      col["name"] for col in inspector.get_columns("goal_dependencies")
+    }:
+      conn.execute(text(
+        "ALTER TABLE goal_dependencies ADD COLUMN owner_suppressed_at TIMESTAMP"
+      ))
+    if not {"agent_work_interests", "agent_work_claims", "chat_runs",
+            "chat_goals", "chats"}.issubset(tables):
+      return
+    rows = conn.execute(text("""
+      SELECT d.id, d.waiting_goal_id, d.waiting_chat_id, d.created_at,
+             d.target_claim_id, d.target_acquisition_id, d.target_key,
+             c.acquisition_id, c.owner_chat_id, c.owner_goal_id,
+             c.released_at, c.completed_at, sc.deleted_at,
+             sg.chat_id, sg.status, sc.pending_question_id,
+             r.id, r.goal_id, r.status
+      FROM goal_dependencies d
+      LEFT JOIN agent_work_claims c ON c.id=d.target_claim_id
+      LEFT JOIN chats sc ON sc.id=c.owner_chat_id
+      LEFT JOIN chat_goals sg ON sg.id=c.owner_goal_id
+      LEFT JOIN chat_runs r ON r.id=(
+        SELECT x.id FROM chat_runs x WHERE x.chat_id=c.owner_chat_id
+        ORDER BY x.started_at DESC, x.id DESC LIMIT 1
+      )
+      WHERE d.target_kind='claim_acquisition' AND d.created_by_run_id IS NULL
+        AND d.resolved_at IS NULL AND d.result_disposition IS NULL
+        AND d.withdrawn_at IS NULL
+        AND EXISTS(SELECT 1 FROM agent_work_interests i
+                   WHERE i.claim_id=d.target_claim_id
+                          AND i.goal_id=d.waiting_goal_id
+                          AND i.chat_id=d.waiting_chat_id
+                          AND i.created_at=d.created_at
+                          AND i.resolved_at IS NULL)
+    """)).all()
+    for (dep_id, waiting_goal_id, waiting_chat_id, created_at, claim_id,
+         target_acquisition_id, target_key, claim_acquisition_id,
+         owner_chat_id, owner_goal_id, released_at, completed_at, deleted_at,
+         source_goal_chat_id, source_goal_status, pending_question_id,
+         latest_run_id, latest_goal_id, latest_status) in rows:
+      # The exact latest run must belong to the claim's current Goal. A card
+      # marker only proves ownership when that same Goal owns the latest run;
+      # another Goal's card cannot keep this acquisition armed.
+      live = (
+        claim_id is not None and target_acquisition_id is not None and
+        target_acquisition_id == claim_acquisition_id and
+        target_key == f"claim:{claim_acquisition_id}" and
+        owner_chat_id is not None and owner_chat_id != waiting_chat_id and
+        deleted_at is None and owner_goal_id is not None and
+        owner_goal_id != waiting_goal_id and
+        source_goal_chat_id == owner_chat_id and source_goal_status == "open" and
+        released_at is None and completed_at is None and
+        latest_run_id is not None and latest_goal_id == owner_goal_id and
+        (latest_status == "running" or pending_question_id is not None)
+      )
+      if not live:
+        conn.execute(text(
+          "DELETE FROM goal_dependencies WHERE id=:id AND resolved_at IS NULL "
+          "AND result_disposition IS NULL"
+        ), {"id": dep_id})
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -6912,6 +6989,7 @@ _SCHEMA_MIGRATIONS = (
   ("0089_wait_result_receipts", _add_wait_result_receipts),
   ("0090_goal_dependencies", _add_goal_dependencies),
   ("0091_repair_legacy_goal_dependency_classification", _repair_legacy_goal_dependency_classification),
+  ("0092_narrow_legacy_dependency_wakes_and_add_owner_suppression", _narrow_legacy_dependency_wakes_and_add_owner_suppression),
 )
 
 

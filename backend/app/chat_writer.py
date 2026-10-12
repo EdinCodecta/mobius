@@ -1329,6 +1329,13 @@ class PrepareAutoResume(_Command):
 
 
 @dataclass
+class ReconcileClaimSources(_Command):
+  """Decide source nonviability between, never during, queue/run transitions."""
+  chat_id: str = ""
+  run_token: str = ""
+
+
+@dataclass
 class Barrier(_Command):
   """Acked only after every preceding command is processed.
 
@@ -2044,6 +2051,12 @@ class ChatWriterActor:
     real helpers.  The contention tests in `test_chat_writer_contention`
     drive a real `SessionLocal`, exercising the real dispatch below.
     """
+    if isinstance(cmd, ReconcileClaimSources):
+      from app.goal_dependency_sources import stage_reconcile_claim_sources
+      resolved = stage_reconcile_claim_sources(db)
+      if not _commit_or_rollback(db):
+        raise _PersistFailed("ReconcileClaimSources did not persist")
+      return resolved
     if isinstance(cmd, _SnapshotReady):
       if self._on_snapshot_ready_for_test is not None:
         # Test hook: lets a test interleave a fence between dequeue and take.
@@ -4557,6 +4570,7 @@ class ChatWriterActor:
       owner_run = _question_owner_run(db, chat, cmd.question_id)
       # The saved card, not the queue tail or newest Goal, owns its answer.
       new_msg["goal_id"] = owner_run.goal_id if owner_run is not None else None
+      new_msg["source_work_id"] = owner_run.id if owner_run is not None else None
     if cmd.initiated_by_app_id is not None:
       new_msg["_initiated_by_app_id"] = cmd.initiated_by_app_id
     # Idempotent append: `cid` is untrusted client input, and a retried POST

@@ -155,12 +155,14 @@ def claim_work(
   if row.owner_chat_id == chat_id:
     # Refreshing ownership from a different Goal in the same chat also changes
     # graph edges. Serialize it with follows/transfers and reject reverse edges.
+    db.query(models.Owner).filter(models.Owner.id == owner_id).update(
+      {models.Owner.username: models.Owner.username}, synchronize_session=False,
+    )
+    db.refresh(row)
+    if row.owner_chat_id != chat_id:
+      db.rollback()
+      raise ValueError("The claim changed while refreshing; inspect it before retrying.")
     if goal_id and goal_id != row.owner_goal_id:
-      db.query(models.Owner).filter(models.Owner.id == owner_id).update(
-        {models.Owner.username: models.Owner.username}, synchronize_session=False,
-      )
-      db.expire(row)
-      db.refresh(row)
       from app.goal_dependency_sources import _direct_cycle
       followers = db.query(models.GoalDependency.waiting_goal_id).filter(
         models.GoalDependency.target_acquisition_id == row.acquisition_id,
@@ -168,6 +170,7 @@ def claim_work(
         models.GoalDependency.resolved_at.is_(None),
         models.GoalDependency.result_disposition.is_(None),
         models.GoalDependency.withdrawn_at.is_(None),
+        models.GoalDependency.owner_suppressed_at.is_(None),
       ).all()
       if any(_direct_cycle(db, waiting_goal_id=follower, source_goal_id=goal_id)
              for (follower,) in followers):
@@ -177,6 +180,7 @@ def claim_work(
     changed = db.query(models.AgentWorkClaim).filter(
       models.AgentWorkClaim.id == row.id,
       models.AgentWorkClaim.owner_chat_id == chat_id,
+      models.AgentWorkClaim.owner_goal_id == row.owner_goal_id,
       models.AgentWorkClaim.revision == previous_revision,
       models.AgentWorkClaim.completed_at.is_(None),
       models.AgentWorkClaim.released_at.is_(None),
@@ -253,6 +257,7 @@ def claim_work(
     models.GoalDependency.resolved_at.is_(None),
     models.GoalDependency.result_disposition.is_(None),
     models.GoalDependency.withdrawn_at.is_(None),
+    models.GoalDependency.owner_suppressed_at.is_(None),
   ).first():
     raise ValueError("Transfer would create a direct Goal dependency cycle.")
   changed = db.query(models.AgentWorkClaim).filter(
@@ -286,6 +291,7 @@ def claim_work(
       models.GoalDependency.resolved_at.is_(None),
       models.GoalDependency.result_disposition.is_(None),
       models.GoalDependency.withdrawn_at.is_(None),
+      models.GoalDependency.owner_suppressed_at.is_(None),
     ).all()
     if any(_direct_cycle(db, waiting_goal_id=follower_goal, source_goal_id=goal_id)
            for (follower_goal,) in follower_goals):
@@ -296,18 +302,21 @@ def claim_work(
     models.GoalDependency.resolved_at.is_(None),
     models.GoalDependency.result_disposition.is_(None),
     models.GoalDependency.withdrawn_at.is_(None),
+    models.GoalDependency.owner_suppressed_at.is_(None),
   ).update({models.GoalDependency.target_chat_id: chat_id}, synchronize_session=False)
   # A new owner must not keep a self-follow on its own acquisition.
   db.query(models.GoalDependency).filter(
     models.GoalDependency.target_acquisition_id == row.acquisition_id,
     models.GoalDependency.waiting_chat_id == chat_id,
     models.GoalDependency.resolved_at.is_(None),
+    models.GoalDependency.result_disposition.is_(None),
     models.GoalDependency.withdrawn_at.is_(None),
-  ).update({models.GoalDependency.withdrawn_at: now}, synchronize_session=False)
+    models.GoalDependency.owner_suppressed_at.is_(None),
+  ).update({models.GoalDependency.owner_suppressed_at: now}, synchronize_session=False)
   previous_follow_status = "no_open_top_level_goal"
   if previous_goal_id and previous != chat_id:
     previous_follow_status = stage_follow_claim(db, row, chat_id=previous,
-      run_id=previous_run_id, waiting_goal_id=previous_goal_id)
+      run_id=previous_run_id, waiting_goal_id=previous_goal_id, restore_owner_follow=True)
     if previous_follow_status not in {"followed", "result_owed", "no_open_top_level_goal"}:
       db.rollback()
       raise ValueError("Transfer cannot preserve the former Goal's follow: " + previous_follow_status)

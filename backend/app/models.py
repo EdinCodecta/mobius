@@ -1690,6 +1690,8 @@ class GoalDependency(Base):
   result_disposed_at = Column(DateTime, nullable=True)
   received_run_id = Column(String(64), nullable=True)
   withdrawn_at = Column(DateTime, nullable=True)
+  # Temporary self-follow suppression on transfer, never a user withdrawal.
+  owner_suppressed_at = Column(DateTime, nullable=True)
   created_at = Column(DateTime, nullable=False, default=now_naive_utc)
 
 

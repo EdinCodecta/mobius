@@ -534,7 +534,7 @@ def test_release_stamps_old_acquisition_before_reclaim(db):
   assert old.outcome_json['outcome'] == 'Not done'
 
 
-def test_transfer_keeps_acquisition_and_withdraws_new_owner_self_follow(db):
+def test_transfer_keeps_acquisition_and_suppresses_new_owner_self_follow(db):
   owner, first, second = _fixture(db)
   won = claim_work(db, owner_id=owner.id, chat_id=first.id,
                    run_id='claim-run-first', work_key=KEY, summary='Do work')
@@ -547,7 +547,8 @@ def test_transfer_keeps_acquisition_and_withdraws_new_owner_self_follow(db):
   assert moved['acquisition_id'] == won['acquisition_id']
   deps = db.query(models.GoalDependency).all()
   assert len(deps) == 2
-  assert next(d for d in deps if d.waiting_chat_id == second.id).withdrawn_at
+  assert next(d for d in deps if d.waiting_chat_id == second.id).owner_suppressed_at
+  assert next(d for d in deps if d.waiting_chat_id == second.id).withdrawn_at is None
   assert next(d for d in deps if d.waiting_chat_id == first.id).withdrawn_at is None
 
 
@@ -858,3 +859,181 @@ def test_two_goals_in_one_chat_register_independent_follows_of_one_acquisition(d
   rows = db.query(models.GoalDependency).all()
   assert {row.waiting_goal_id for row in rows} == {"claim-goal-second", "second-follower-goal"}
   assert len({row.target_acquisition_id for row in rows}) == 1
+
+
+def test_follow_rechecks_rebound_ownership_after_graph_fence(db, monkeypatch):
+  """Collision snapshot A1 must not hide A2 -> B when X rebinds to A2."""
+  from app import agent_work_claims
+  from app.database import SessionLocal
+  owner, first, second = _fixture(db)
+  db.add(models.ChatGoal(id="a2", chat_id=first.id, objective="Other work"))
+  db.add(models.ChatRun(id="a2-run", chat_id=first.id, goal_id="a2", status="running"))
+  db.commit()
+  other_key = "platform:graph-y"
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="X")
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=other_key, summary="Y")
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="a2-run", work_key=other_key, summary="A2 follows Y")
+  original = agent_work_claims._follow
+  def rebind_between_read_and_fence(session, claim, **kwargs):
+    assert claim.owner_goal_id == "claim-goal-first"
+    with SessionLocal() as competing:
+      claim_work(competing, owner_id=owner.id, chat_id=first.id, run_id="a2-run", work_key=KEY, summary="A2 now owns X")
+    return original(session, claim, **kwargs)
+  monkeypatch.setattr(agent_work_claims, "_follow", rebind_between_read_and_fence)
+  result = claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY, summary="B follows X")
+  assert result["follow_status"] == "direct_cycle"
+  assert db.query(models.GoalDependency).count() == 1
+  assert _claim_row(db).owner_goal_id == "a2"
+
+
+def test_existing_follow_cannot_bypass_acquisition_recheck(db):
+  from app.database import SessionLocal
+  from app.goal_dependency_sources import stage_follow_claim
+  owner, first, second = _owned_goal_claim(db)
+  stale_claim = _claim_row(db)
+  acquisition = stale_claim.acquisition_id
+  with SessionLocal() as competing:
+    finish_work(competing, owner_id=owner.id, chat_id=first.id, work_key=KEY, outcome="Released", release=True)
+    claim_work(competing, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="Reacquired")
+  with pytest.raises(ValueError, match="claim changed while following"):
+    stage_follow_claim(db, stale_claim, chat_id=second.id, run_id="claim-run-second")
+  db.rollback()
+  row = db.query(models.GoalDependency).one()
+  assert row.target_acquisition_id == acquisition and row.outcome_json["kind"] == "released"
+
+
+@pytest.mark.parametrize("round_trips", [1, 3])
+@pytest.mark.parametrize("initial_follow", [False, True])
+def test_round_trip_transfer_restores_only_automatically_suppressed_follow(db, round_trips, initial_follow):
+  from app.goal_dependencies import outstanding_dependencies
+  owner, first, second = _fixture(db)
+  acquired = claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="Action")
+  if initial_follow:
+    claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY, summary="Follow")
+  for _ in range(round_trips):
+    for source, target, target_run in [(first, second, "claim-run-second"), (second, first, "claim-run-first")]:
+      moved = claim_work(db, owner_id=owner.id, chat_id=target.id, run_id=target_run,
+        work_key=KEY, summary="Transfer", expected_owner_chat_id=source.id,
+        takeover_reason="Accepted transfer of this exact action")
+      assert moved["acquisition_id"] == acquired["acquisition_id"]
+      assert moved["previous_follow_status"] == "followed"
+      db.expire_all()
+      assert [row.waiting_chat_id for row in outstanding_dependencies(db).all()] == [source.id]
+      assert all(row.withdrawn_at is None for row in db.query(models.GoalDependency).all())
+  assert db.query(models.GoalDependency).count() == 2
+  finish_work(db, owner_id=owner.id, chat_id=first.id, work_key=KEY, outcome="Done", release=False)
+  db.expire_all()
+  follower = outstanding_dependencies(db).one()
+  assert follower.waiting_chat_id == second.id and follower.outcome_json["kind"] == "completed"
+
+
+@pytest.mark.parametrize("explicit_end", ["withdrawn", "delivered"])
+def test_round_trip_does_not_revive_a_deliberately_ended_follow(db, explicit_end):
+  owner, first, second = _owned_goal_claim(db)
+  dependency = db.query(models.GoalDependency).one()
+  if explicit_end == "withdrawn":
+    dependency.withdrawn_at = now_naive_utc()
+  else:
+    dependency.result_disposition = "delivered"
+    dependency.resolved_at = now_naive_utc()
+    dependency.outcome_json = {"kind": "owner_not_progressing"}
+  db.commit()
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY,
+    summary="Transfer", expected_owner_chat_id=first.id, takeover_reason="Accepted exact action ownership")
+  with pytest.raises(ValueError, match="cannot preserve the former Goal's follow"):
+    claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY,
+      summary="Return", expected_owner_chat_id=second.id, takeover_reason="Accepted exact action back")
+  assert _claim_row(db).owner_chat_id == second.id
+
+
+@pytest.mark.parametrize("goal_less", [False, True])
+def test_accepted_answer_owns_source_progress_before_queue_promotion(db, goal_less):
+  from app import transcript_rows
+  from app.chat_handoffs import goal_handoffs
+  from app.chat_writer import AppendPending, PromotePending, ReconcileClaimSources, get_writer
+  from app.run_state import goal_identity_for_run_start
+  owner, first, second = _owned_goal_claim(db)
+  source = db.get(models.ChatRun, "claim-run-first")
+  if goal_less:
+    claim = _claim_row(db)
+    source.goal_id = None
+    claim.owner_goal_id = None
+  source.status = "completed"
+  first.pending_question_id = "source-question"
+  transcript_rows.replace_all(db, first, [{"role": "assistant", "id": source.id,
+    "content": "", "ts": 1, "blocks": [{"type": "question", "question_id": "source-question",
+      "response_mode": "continuation", "questions": [{"id": "q", "question": "Proceed?", "options": ["Yes", "No"]}]}]}])
+  db.commit()
+  writer = get_writer()
+  answer = writer.submit(AppendPending(chat_id=first.id, run_token="", owner_input=True,
+    user_msg={"role": "user", "kind": "continuation", "continuation_reason": "question_answer",
+      "content": "Yes", "cid": "answer:source-question", "ts": 2},
+    answers={"q": "Yes"}, question_id="source-question", require_answer_match=True)).result(timeout=5)
+  db.expire_all()
+  assert first.pending_question_id is None
+  assert answer["stored"]["source_work_id"] == source.id
+  from app.chat_handoffs import queued_goal_continuations
+  assert queued_goal_continuations(db, first.id, source.goal_id, root_run_id=source.root_run_id or source.id) == ("answer:source-question",)
+  assert goal_identity_for_run_start(db, first.id, answer["stored"])[1] == source.goal_id
+  if not goal_less:
+    native = goal_handoffs(db, db.get(models.ChatGoal, source.goal_id))
+    assert native.queued == ("answer:source-question",) and native.progress_owned
+  # The real production reconciliation command shares the writer's order with
+  # both ends of the card -> accepted queue -> physical run handoff.
+  assert writer.submit(ReconcileClaimSources()).result(timeout=5) == 0
+  promoted = writer.submit(PromotePending(chat_id=first.id, run_token="source-answer-run")).result(timeout=5)
+  assert promoted["promoted"] is not None
+  assert writer.submit(ReconcileClaimSources()).result(timeout=5) == 0
+  finish_work(db, owner_id=owner.id, chat_id=first.id, work_key=KEY, outcome="Action completed after answer", release=False)
+  db.expire_all()
+  row = db.query(models.GoalDependency).one()
+  assert row.outcome_json["kind"] == "completed"
+  assert row.outcome_json["outcome"] == "Action completed after answer"
+
+
+@pytest.mark.parametrize("queue_kind", ["absent", "ordinary", "other_goal", "closed_goal", "rejected", "uncorrelated"])
+@pytest.mark.parametrize("goal_less", [False, True])
+def test_unowned_source_is_not_kept_alive_by_unrelated_or_invalid_queue(db, queue_kind, goal_less):
+  from app.chat_writer import AppendPending, ReconcileClaimSources, get_writer
+  owner, first, second = _owned_goal_claim(db)
+  claim = _claim_row(db)
+  if goal_less:
+    claim.owner_goal_id = None
+    db.get(models.ChatRun, "claim-run-first").goal_id = None
+  db.get(models.ChatRun, "claim-run-first").status = "completed"
+  db.add(models.ChatGoal(id="unrelated-queued-goal", chat_id=first.id, objective="Different work",
+    status="completed" if queue_kind == "closed_goal" else "open"))
+  db.commit()
+  message = {"role": "user", "content": "Unrelated", "cid": "queued-control", "ts": 1,
+    "kind": "continuation", "continuation_reason": "question_answer",
+    "goal_id": None if goal_less else "claim-goal-first", "source_work_id": "claim-run-first"}
+  if queue_kind == "ordinary":
+    message.pop("kind")
+  elif queue_kind in {"other_goal", "closed_goal"}:
+    message["goal_id"] = "unrelated-queued-goal"
+  elif queue_kind == "rejected":
+    message["delivery_status"] = "rejected"
+  elif queue_kind == "uncorrelated":
+    message.pop("goal_id")
+  if queue_kind != "absent":
+    get_writer().submit(AppendPending(chat_id=first.id, run_token="", user_msg=message)).result(timeout=5)
+  assert get_writer().submit(ReconcileClaimSources()).result(timeout=5) == 1
+  db.expire_all()
+  assert db.query(models.GoalDependency).one().outcome_json["kind"] == "owner_not_progressing"
+
+
+@pytest.mark.parametrize("exact_root", [False, True])
+def test_source_progress_shares_legacy_helper_exact_root_rules(db, monkeypatch, exact_root):
+  from types import SimpleNamespace
+  from app import delegations
+  from app.chat_writer import ReconcileClaimSources, get_writer
+  owner, first, _ = _owned_goal_claim(db)
+  source = db.get(models.ChatRun, "claim-run-first")
+  source.status = "completed"
+  db.commit()
+  helpers = [(SimpleNamespace(id="legacy-helper", goal_id=None,
+    parent_root_run_id=source.goal_id if exact_root else "another-goal"), "running")]
+  monkeypatch.setattr(delegations, "_self_resuming_helper_rows", lambda *_: helpers)
+  assert get_writer().submit(ReconcileClaimSources()).result(timeout=5) == (0 if exact_root else 1)
+  db.expire_all()
+  assert (db.query(models.GoalDependency).one().resolved_at is None) == exact_root

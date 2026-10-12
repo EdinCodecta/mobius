@@ -51,6 +51,7 @@ def _direct_cycle(db: Session, *, waiting_goal_id: str, source_goal_id: str | No
     models.AgentWorkClaim.owner_goal_id == waiting_goal_id,
     models.AgentWorkClaim.acquisition_id == models.GoalDependency.target_acquisition_id,
     models.GoalDependency.withdrawn_at.is_(None),
+    models.GoalDependency.owner_suppressed_at.is_(None),
     models.GoalDependency.result_disposition.is_(None),
     models.GoalDependency.resolved_at.is_(None),
   ).first() is not None
@@ -60,17 +61,31 @@ MAX_CLAIM_DEPENDENCIES_PER_GOAL = 64
 
 
 def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
-                       chat_id: str, run_id: str, waiting_goal_id=None) -> str:
+                       chat_id: str, run_id: str, waiting_goal_id=None,
+                       restore_owner_follow: bool = False) -> str:
   """Register under the claim's write lock; return followed or a truthful reason.
 
   The CAS write serializes with settlement/transfer, including on SQLite where
   SELECT FOR UPDATE alone is ineffective. The caller commits both together.
   """
-  # One tenant-scoped write fence serializes graph mutations across *different*
-  # claims too (including SQLite, where FOR UPDATE is ineffective).
+  # Lock graph ownership, then re-read: an ORM object from the collision read
+  # may predate a same-chat Goal rebind even when its acquisition is unchanged.
+  expected_acquisition = claim.acquisition_id
   db.query(models.Owner).filter(models.Owner.id == claim.owner_id).update(
     {models.Owner.username: models.Owner.username}, synchronize_session=False,
   )
+  db.refresh(claim)
+  if claim.acquisition_id != expected_acquisition:
+    raise ValueError('The claim changed while following; inspect it before retrying.')
+  changed = db.query(models.AgentWorkClaim).filter(
+    models.AgentWorkClaim.id == claim.id,
+    models.AgentWorkClaim.revision == claim.revision,
+    models.AgentWorkClaim.acquisition_id == expected_acquisition,
+    models.AgentWorkClaim.released_at.is_(None),
+    models.AgentWorkClaim.completed_at.is_(None),
+  ).update({models.AgentWorkClaim.updated_at: now_naive_utc()}, synchronize_session=False)
+  if changed != 1:
+    raise ValueError('The claim changed while following; inspect it before retrying.')
   goal = _eligible_goal(db, chat_id, run_id, waiting_goal_id)
   if goal is None:
     return 'no_open_top_level_goal'
@@ -91,27 +106,24 @@ def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
       return 'withdrawn'
     if existing.result_disposition is not None:
       return existing.result_disposition
-    return 'followed' if existing.resolved_at is None else 'result_owed'
+    if existing.owner_suppressed_at is None:
+      return 'followed' if existing.resolved_at is None else 'result_owed'
+    if not restore_owner_follow or existing.resolved_at is not None:
+      return 'owner_suppressed'
   count = db.query(func.count(models.GoalDependency.id)).filter(
     models.GoalDependency.waiting_goal_id == goal.id,
     models.GoalDependency.target_kind == 'claim_acquisition',
     models.GoalDependency.withdrawn_at.is_(None),
+    models.GoalDependency.owner_suppressed_at.is_(None),
     models.GoalDependency.result_disposition.is_(None),
   ).scalar() or 0
   if count >= MAX_CLAIM_DEPENDENCIES_PER_GOAL:
     return 'dependency_limit'
-  revision = claim.revision
-  changed = db.query(models.AgentWorkClaim).filter(
-    models.AgentWorkClaim.id == claim.id,
-    models.AgentWorkClaim.revision == revision,
-    models.AgentWorkClaim.acquisition_id == claim.acquisition_id,
-    models.AgentWorkClaim.released_at.is_(None),
-    models.AgentWorkClaim.completed_at.is_(None),
-  ).update({models.AgentWorkClaim.updated_at: now_naive_utc()}, synchronize_session=False)
-  if changed != 1:
-    raise ValueError('The claim changed while following; inspect it before retrying.')
-  if _direct_cycle(db, waiting_goal_id=goal.id, source_goal_id=claim.owner_goal_id):
-    return 'direct_cycle'
+  if existing is not None:
+    existing.owner_suppressed_at = None
+    existing.target_chat_id = claim.owner_chat_id
+    db.flush()
+    return 'followed'
   source_run = db.get(models.ChatRun, run_id)
   created_by_run_id = (run_id if source_run is not None and source_run.chat_id == chat_id
     and source_run.goal_id == goal.id else None)
@@ -143,6 +155,7 @@ def stage_stamp_claim_outcome(db: Session, row: models.AgentWorkClaim,
     models.GoalDependency.target_acquisition_id == row.acquisition_id,
     models.GoalDependency.resolved_at.is_(None),
     models.GoalDependency.withdrawn_at.is_(None),
+    models.GoalDependency.owner_suppressed_at.is_(None),
     models.GoalDependency.result_disposition.is_(None),
   ).update({models.GoalDependency.outcome_json: payload,
             models.GoalDependency.resolved_at: now}, synchronize_session=False)
@@ -154,7 +167,8 @@ def dependency_source_blocker(db: Session, row: models.GoalDependency, *, _seen=
   This is observational, not a polling or takeover operation. Resolved and
   withdrawn rows already have their own authoritative outcome/disposition.
   """
-  if row.resolved_at is not None or row.withdrawn_at is not None or row.result_disposition is not None:
+  if (row.resolved_at is not None or row.withdrawn_at is not None
+      or row.result_disposition is not None or row.owner_suppressed_at is not None):
     return None
   if row.target_kind != 'claim_acquisition':
     return None
@@ -172,76 +186,55 @@ def dependency_source_blocker(db: Session, row: models.GoalDependency, *, _seen=
     goal = db.get(models.ChatGoal, claim.owner_goal_id)
     if goal is None or goal.status != 'open':
       return 'source_held' if goal is not None and goal.status == 'stopped' else 'source_failed'
-    latest = db.query(models.ChatRun).filter(
-      models.ChatRun.chat_id == claim.owner_chat_id,
-      models.ChatRun.goal_id == goal.id,
-    ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).first()
-    if latest is None:
+    from app.chat_handoffs import native_goal_handoffs
+    if native_goal_handoffs(db, goal).progress_owned:
+      return None
+    # Follow a finite chain of real sources, not the existence of a stale row.
+    # Direct cycles are rejected on writes. Longer cycles remain representable,
+    # but a detected chain of stalled executors is recovery, not automatic work.
+    seen = set(_seen or ())
+    if row.id in seen:
       return 'owner_not_progressing'
-    if latest.status in ('failed', 'stopped', 'interrupted', 'completed',
-                         'parked', 'resume_pending', 'parked_notified'):
-      from app.chat_waits import _FIRED_UNDELIVERED, _goal_waits, wait_resume_blocker
-      from app.delegations import _self_resuming_helper_rows
-      latest_chat_id = db.query(models.ChatRun.id).filter(
-        models.ChatRun.chat_id == chat.id,
-      ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).limit(1).scalar()
-      if latest_chat_id == latest.id:
-        if chat.pending_question_id is not None:
-          return None
-        if latest.status in models.CONTINUATION_RUN_STATUSES:
-          from app.chat import continuation_handoff_for_chat
-          if continuation_handoff_for_chat(db, chat.id)['kind'] in {'automatic', 'owner_input'}:
-            return None
-      for wait in _goal_waits(db, chat.id, goal.id).filter(
-        (models.ChatWait.status == 'armed') | _FIRED_UNDELIVERED,
-      ).all():
-        if wait.status == 'armed' or wait_resume_blocker(db, wait) not in {
-          'manual_resume', 'resume_failed', 'restart',
+    seen.add(row.id)
+    from app.goal_dependencies import dependency_resume_blocker
+    for dependency in db.query(models.GoalDependency).filter(
+      models.GoalDependency.waiting_goal_id == goal.id,
+      models.GoalDependency.result_disposition.is_(None),
+      models.GoalDependency.withdrawn_at.is_(None),
+      models.GoalDependency.owner_suppressed_at.is_(None),
+    ).all():
+      if dependency.resolved_at is not None:
+        if dependency_resume_blocker(db, dependency) not in {
+          'manual_resume', 'goal_closed', 'goal_held', 'chat_deleted', 'disposed', 'restart',
         }:
           return None
-      if any(helper.goal_id == goal.id for helper, _ in
-             _self_resuming_helper_rows(db, {chat.id})):
+      elif dependency_source_blocker(db, dependency, _seen=seen) is None:
         return None
-      # Follow a finite chain of real sources, not the existence of a stale row.
-      # Direct cycles are rejected on writes. Longer cycles remain representable,
-      # but a detected chain of stalled executors is recovery, not automatic work.
-      seen = set(_seen or ())
-      if row.id in seen:
-        return 'owner_not_progressing'
-      seen.add(row.id)
-      from app.goal_dependencies import dependency_resume_blocker
-      for dependency in db.query(models.GoalDependency).filter(
-        models.GoalDependency.waiting_goal_id == goal.id,
-        models.GoalDependency.result_disposition.is_(None),
-        models.GoalDependency.withdrawn_at.is_(None),
-      ).all():
-        if dependency.resolved_at is not None:
-          if dependency_resume_blocker(db, dependency) not in {
-            'manual_resume', 'goal_closed', 'goal_held', 'chat_deleted', 'disposed', 'restart',
-          }:
-            return None
-        elif dependency_source_blocker(db, dependency, _seen=seen) is None:
-          return None
-      return 'owner_not_progressing'
+    return 'owner_not_progressing'
 
   else:
     run = db.get(models.ChatRun, claim.owner_run_id)
     if run is None:
       return 'owner_not_progressing'
-    if run.status in ('failed', 'stopped', 'interrupted', 'completed',
-                      'parked', 'resume_pending', 'parked_notified'):
-      latest_chat_id = db.query(models.ChatRun.id).filter(
-        models.ChatRun.chat_id == chat.id,
-      ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).limit(1).scalar()
-      if latest_chat_id == run.id:
-        if chat.pending_question_id is not None:
-          return None
-        if run.status in models.CONTINUATION_RUN_STATUSES:
-          from app.chat import continuation_handoff_for_chat
-          if continuation_handoff_for_chat(db, chat.id)['kind'] in {'automatic', 'owner_input'}:
-            return None
+    from app.chat_handoffs import queued_goal_continuations
+    if queued_goal_continuations(db, chat.id, None, root_run_id=run.root_run_id or run.id):
+      return None
+    latest = db.query(models.ChatRun).filter(
+      models.ChatRun.chat_id == chat.id,
+    ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).first()
+    # A Goal-less answer continues the same causal root but creates a new
+    # physical run. Neither another root nor a later Goal inherits this claim.
+    if (latest is None or latest.goal_id is not None
+        or (latest.root_run_id or latest.id) != (run.root_run_id or run.id)):
       return 'owner_not_progressing'
-  return None
+    if latest.status == 'running' or chat.pending_question_id is not None:
+      return None
+    if latest.status in models.CONTINUATION_RUN_STATUSES:
+      from app.chat import continuation_handoff_for_chat
+      if continuation_handoff_for_chat(db, chat.id)['kind'] in {'automatic', 'owner_input'}:
+        return None
+    return 'owner_not_progressing'
+
 
 
 def stage_reconcile_claim_sources(db: Session) -> int:
@@ -249,12 +242,15 @@ def stage_reconcile_claim_sources(db: Session) -> int:
 
   A failed source Goal remains viable when a card, Wait, helper, or direct
   dependency still owns progress; otherwise its failure is surfaced once.
-  This deliberately never polls or assumes an elapsed-time deadline.
+  Production calls this only inside ReconcileClaimSources on the chat writer,
+  serialized with answer commits and queue-to-run promotion. No cross-chat
+  asyncio lock is acquired, and no elapsed-time deadline is assumed.
   """
   rows = db.query(models.GoalDependency).filter(
     models.GoalDependency.target_kind == 'claim_acquisition',
     models.GoalDependency.resolved_at.is_(None),
     models.GoalDependency.withdrawn_at.is_(None),
+    models.GoalDependency.owner_suppressed_at.is_(None),
     models.GoalDependency.result_disposition.is_(None),
   ).all()
   settled = 0
@@ -282,6 +278,7 @@ def stage_reconcile_claim_sources(db: Session) -> int:
       models.GoalDependency.id == row.id,
       models.GoalDependency.resolved_at.is_(None),
       models.GoalDependency.withdrawn_at.is_(None),
+      models.GoalDependency.owner_suppressed_at.is_(None),
       models.GoalDependency.result_disposition.is_(None),
     ).update({models.GoalDependency.outcome_json: {
         'kind': 'owner_not_progressing', 'reason': blocker,

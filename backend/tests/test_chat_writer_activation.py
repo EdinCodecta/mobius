@@ -317,6 +317,13 @@ def test_finalize_failure_via_run_chat_leaves_marker_for_reconciliation(
   must leave the durable run marker SET after `run_chat` returns (so
   reconciliation would recover it) and perform NO continuation/promotion —
   no half-persisted, unexecuted turn."""
+  # This tests persistence failure, not host pressure. Admission binds its
+  # default reader at import time, so supply the normal-disk fixture explicitly.
+  from functools import partial
+  from app import resource_pressure
+  monkeypatch.setattr(chat_mod, "require_agent_turn_admission", partial(
+    chat_mod.require_agent_turn_admission, status_reader=resource_pressure.resource_status,
+  ))
   _seed_chat(
     "c-fin",
     messages=[{"role": "user", "content": "hi", "ts": 1}],

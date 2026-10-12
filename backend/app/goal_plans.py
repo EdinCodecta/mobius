@@ -797,6 +797,8 @@ def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal, 
     return {"kind": "owner_input", "reason": "saved_card"}
   if native.running:
     return {"kind": "working", "reason": None}
+  if native.queued:
+    return {"kind": "automatic", "reason": "queued_continuation"}
   if any(wait.resume_blocker == "owner_input" for wait in native.waits):
     return {"kind": "blocked", "reason": "other_work"}
   handoff = project_handoff(owner_input=False, running=False,

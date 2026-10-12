@@ -1873,6 +1873,7 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0089_wait_result_receipts",
     "0090_goal_dependencies",
     "0091_repair_legacy_goal_dependency_classification",
+    "0092_narrow_legacy_dependency_wakes_and_add_owner_suppression",
   ]
   assert second == first
 

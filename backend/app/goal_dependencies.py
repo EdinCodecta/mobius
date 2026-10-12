@@ -20,15 +20,19 @@ from app.timeutil import now_naive_utc
 _LOG = logging.getLogger("moebius.goal_dependencies")
 
 
-def outstanding_dependencies(db: Session):
+def undisposed_dependencies(db: Session):
   return db.query(models.GoalDependency).filter(
     models.GoalDependency.result_disposition.is_(None),
     models.GoalDependency.withdrawn_at.is_(None),
   )
 
 
+def outstanding_dependencies(db: Session):
+  return undisposed_dependencies(db).filter(models.GoalDependency.owner_suppressed_at.is_(None))
+
+
 def dependency_delivery_blocker(db, row):
-  if row.withdrawn_at is not None or row.result_disposition is not None:
+  if row.withdrawn_at is not None or row.result_disposition is not None or row.owner_suppressed_at is not None:
     return "disposed"
   chat = db.get(models.Chat, row.waiting_chat_id)
   if chat is None or chat.deleted_at is not None:
@@ -110,7 +114,7 @@ def stage_dependency_results_delivered(db, chat_id, dependency_ids, *, run_id):
 
 
 def stage_retire_goal_dependencies(db, chat_id, goal_id):
-  return outstanding_dependencies(db).filter(
+  return undisposed_dependencies(db).filter(
     models.GoalDependency.waiting_chat_id == chat_id,
     models.GoalDependency.waiting_goal_id == goal_id,
   ).update({models.GoalDependency.result_disposition: "retired_by_goal_outcome",
@@ -120,7 +124,7 @@ def stage_retire_goal_dependencies(db, chat_id, goal_id):
 def stage_retire_chat_dependencies(db, chat_id):
   """Deletion is permanent for pending/owed links, even if the chat is restored."""
   now = now_naive_utc()
-  return outstanding_dependencies(db).filter(
+  return undisposed_dependencies(db).filter(
     models.GoalDependency.waiting_chat_id == chat_id,
   ).update({models.GoalDependency.result_disposition: "withdrawn",
     models.GoalDependency.result_disposed_at: now,
@@ -279,7 +283,7 @@ async def withdraw_disposed_dependency_notices(chat_id):
       if message.get("kind") != DEPENDENCY_RESULT_MESSAGE_KIND:
         continue
       row = dependency_result_row(db, chat_id, message)
-      if row is None or row.result_disposition is not None or row.withdrawn_at is not None:
+      if row is None or row.result_disposition is not None or row.withdrawn_at is not None or row.owner_suppressed_at is not None:
         stale.append(message["cid"])
   for cid in stale:
     await await_ack(get_writer().submit(CancelPending(chat_id=chat_id, run_token="", cid=cid)))
@@ -289,10 +293,9 @@ async def withdraw_disposed_dependency_notices(chat_id):
 async def deliver_pending_dependencies():
   """Existing supervisor reconciliation, never a polling agent or new runner."""
   from app.database import SessionLocal
-  from app.goal_dependency_sources import stage_reconcile_claim_sources
+  from app.chat_writer import ReconcileClaimSources, await_ack, get_writer
+  await await_ack(get_writer().submit(ReconcileClaimSources()))
   with SessionLocal() as db:
-    stage_reconcile_claim_sources(db)
-    db.commit()
     rows = outstanding_dependencies(db).all()
     ids = [row.id for row in rows if row.resolved_at is not None]
     chats = {row.waiting_chat_id for row in rows}

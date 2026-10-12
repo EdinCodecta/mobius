@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -67,6 +67,7 @@ class GoalHandoffs:
   dependencies: tuple[GoalDependencyHandoff, ...]
   park: GoalParkHandoff | None
   failed_attempt: bool
+  queued: tuple[str, ...] = ()
 
   @property
   def owner_input(self) -> bool:
@@ -82,16 +83,25 @@ class GoalHandoffs:
             else {"kind": "none", "reason": None})
 
   @property
+  def progress_owned(self) -> bool:
+    """A real executor or eligible native handoff still owns the next step."""
+    return (self.running or self.owner_input or bool(self.queued) or bool(self.helpers)
+      or any(not wait.delivery_pending or wait.resume_blocker not in {
+        "manual_resume", "resume_failed", "restart",
+      } for wait in self.waits)
+      or (self.park is not None and self.park.kind in {"automatic", "owner_input"}))
+
+  @property
   def prevents_settlement(self) -> bool:
     """A native owner still owes this Goal a next step or result."""
-    return (self.owner_input or bool(self.waits) or bool(self.helpers)
+    return (self.owner_input or bool(self.waits) or bool(self.helpers) or bool(self.queued)
             or any(dep.automatic and (
               dep.outcome is None or dep.delivery_pending
             ) for dep in self.dependencies)
             or (self.park is not None and self.park.kind in {"automatic", "owner_input"}))
 
 
-def goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
+def native_goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
   """Read the native handoffs of one Goal, never another Goal in its chat.
 
   A NULL-owned historical helper is included only when its immutable root is
@@ -101,7 +111,6 @@ def goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
   from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED, serialize_wait
   from app.delegations import _self_resuming_helper_rows
   from app.chat import continuation_handoff_for_chat
-  from app.goal_dependencies import goal_dependency_handoffs
 
   latest = db.query(models.ChatRun.id, models.ChatRun.goal_id, models.ChatRun.status).filter(
     models.ChatRun.chat_id == goal.chat_id,
@@ -146,10 +155,63 @@ def goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
     running=bool(owns_chat_attempt and latest.status == "running"),
     waits=waits,
     helpers=helpers,
-    dependencies=tuple(GoalDependencyHandoff(**item) for item in goal_dependency_handoffs(db, goal)),
+    dependencies=(),
+    queued=queued_goal_continuations(db, goal.chat_id, goal.id),
     park=park,
     failed_attempt=bool(owns_chat_attempt and latest.status in {"failed", "interrupted"}),
   )
+
+def goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
+  from app.goal_dependencies import goal_dependency_handoffs
+  return replace(native_goal_handoffs(db, goal), dependencies=tuple(
+    GoalDependencyHandoff(**item) for item in goal_dependency_handoffs(db, goal)
+  ))
+
+
+def queued_goal_continuations(db, chat_id, goal_id, *, root_run_id=None) -> tuple[str, ...]:
+  """Accepted exact-owned queue work, not arbitrary messages in the same chat.
+
+  Question answer commits retire the card before promotion admits its run.
+  These reads share the writer's identity/admission predicates. A Goal-less
+  source additionally needs exact causal-root evidence, never a newest Goal.
+  """
+  from app import models
+  from app.continuations import is_continuation_message, is_retired_goal_handoff, PRODUCT_RESULT_MESSAGE_KINDS
+  from app.run_state import goal_identity_for_run_start, queued_continuation_root
+  from app.chat_waits import wait_result_message_blocker
+  from app.goal_dependencies import dependency_result_message_blocker
+  from app.chat_writer import _PersistFailed, _require_browser_grant
+  chat = db.get(models.Chat, chat_id)
+  if chat is None or chat.deleted_at is not None:
+    return ()
+  owned = []
+  for message in chat.pending_messages or ():
+    if (not isinstance(message, dict) or not message.get("cid")
+        or message.get("delivery_status") == "rejected"
+        or is_retired_goal_handoff(message)):
+      continue
+    # Continuations require the writer's explicit identity snapshot. Product
+    # results instead resolve their exact saved result identity at admission.
+    if not ((is_continuation_message(message) and "goal_id" in message)
+            or message.get("kind") in PRODUCT_RESULT_MESSAGE_KINDS):
+      continue
+    try:
+      _require_browser_grant(db, message.get("_browser_grant_id"))
+    except _PersistFailed:
+      continue
+    if (wait_result_message_blocker(db, chat_id, message)
+        or dependency_result_message_blocker(db, chat_id, message)):
+      continue
+    if goal_id is None and message.get("goal_id") is not None:
+      continue  # A closed/invalid Goal does not become a Goal-less handoff.
+    if goal_identity_for_run_start(db, chat_id, message)[1] != goal_id:
+      continue
+    if goal_id is None and (root_run_id is None
+        or queued_continuation_root(db, chat_id, message) != root_run_id):
+      continue
+    owned.append(message["cid"])
+  return tuple(owned)
+
 
 def project_handoff(*, owner_input: bool, running: bool, waits: list[dict],
                              helper_count: int, park: dict, goal: dict | None = None) -> dict:
