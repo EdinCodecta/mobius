@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Sequence
-from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 from fastapi import HTTPException
@@ -79,6 +79,7 @@ from app.manifest_identity import (
   MANIFEST_ID_MARKER as _MANIFEST_ID_MARKER,
   canonical_manifest_base as _canonical_base,
   canonical_manifest_identity_key as _canonical_identity_key,
+  parse_root_manifest,
   requested_manifest_source,
   require_bound_manifest as _require_bound_manifest,
   require_permanent_package,
@@ -303,38 +304,18 @@ def _derive_raw_base(manifest_url: str) -> str:
 
 
 def _derive_repo_ref(manifest_url: str) -> tuple[str, str] | None:
-  """Return the GitHub repo/ref for a raw GitHub manifest URL, if derivable.
+  """The clone URL and ref of a root Git package, or None to fetch it over HTTP.
 
-  Deliberately narrow: only a ROOT `mobius.json` at a SINGLE-SEGMENT ref
-  (`raw.githubusercontent.com/<org>/<repo>/<ref>/mobius.json`, exactly four
-  path segments) is clone-eligible, since a Git package is read from its root
-  `mobius.json`; any other manifest file name is imported over HTTP. That is the canonical `mobius-os/app-*`
-  shape, and it is the only shape where the repo root's `index.jsx` is the entry
-  the manifest points at. Two other shapes must NOT be clone-derived — they are
-  imported over HTTP into a local Git repository instead of mis-cloning:
-    - a manifest in a repo SUBDIR (`…/<ref>/<subdir>/mobius.json`) — cloning the
-      repo root would then get the wrong `index.jsx`.
-    - a branch name CONTAINING A SLASH (`…/<repo>/feature/x/mobius.json`) — a
-      greedy `parts[:3]` would mis-read the ref as `feature`.
-  Both push the segment count past four, so the strict `== 4` check rejects
-  them. Callers treat a `None` return as not-clone-eligible and fetch the
-  package over HTTP.
+  Only a root ``mobius.json`` (``parse_root_manifest`` with a file name) is
+  cloned, because a Git package is read from its repository root. A manifest
+  in a repository subdirectory, at a ref containing a slash, or under another
+  file name is imported over HTTP into a local Git repository instead. A
+  stored identity key is resolved to its fetch address first.
   """
-  parsed = urlparse(requested_manifest_source(manifest_url)[0])
-  parts = [unquote(part) for part in parsed.path.split("/") if part]
-  if (
-    parsed.scheme != "https"
-    or parsed.netloc != "raw.githubusercontent.com"
-    or len(parts) != 4
-  ):
+  root = parse_root_manifest(requested_manifest_source(manifest_url)[0])
+  if root is None or root.filename is None:
     return None
-  org, repo, ref, manifest_file = parts
-  if manifest_file != "mobius.json":
-    return None
-  for part in (org, repo, ref):
-    if part in ("", ".", "..") or part.startswith("-") or "\\" in part:
-      return None
-  return f"https://github.com/{org}/{repo}.git", ref
+  return root.origin_url, root.ref
 
 
 def _normalize_raw_base(raw_base: str) -> str:
@@ -350,82 +331,22 @@ def _normalize_raw_base(raw_base: str) -> str:
   return base if base.endswith("/") else base + "/"
 
 
-def _trusted_catalog_repo_base(url_or_base: str) -> str | None:
-  """A ref-INDEPENDENT identity base for a trusted mobius-os catalog ROOT
-  manifest, or None when `url_or_base` isn't that shape.
-
-  `raw.githubusercontent.com/mobius-os/<repo>/<ref>/mobius.json` collapses to the
-  identity `raw.githubusercontent.com/mobius-os/<repo>` — the mutable `<ref>`
-  segment dropped. A `mobius-os/app-*` repo is ONE app whatever revision we
-  fetch, so a pinned-commit bump (bootstrap moving app-skills from `main` to a
-  reviewed commit, and every later re-pin) must name the SAME app as the row it
-  supersedes — never fork a duplicate, never miss an owner's tombstone and
-  silently undo their uninstall.
-
-  Deliberately narrow, mirroring `_derive_repo_ref`: only the canonical
-  single-segment-ref ROOT shape (canonical base == `<org>/<repo>/<ref>`, three
-  path parts) qualifies. A repo SUBDIR manifest keeps its ref-bearing base, so
-  two apps hosted in one repo can never collapse onto one identity.
-  """
-  if not isinstance(url_or_base, str) or not url_or_base:
-    return None
-  base = _canonical_base(url_or_base)
-  parsed = urlparse(base)
-  if parsed.hostname != "raw.githubusercontent.com":
-    return None
-  parts = [unquote(part) for part in parsed.path.split("/") if part]
-  if len(parts) != 3 or ".." in parts:
-    return None
-  org, repo, ref = parts
-  if org != "mobius-os":
-    return None
-  for part in (org, repo, ref):
-    if part in ("", ".", "..") or part.startswith("-") or "\\" in part:
-      return None
-  return f"{parsed.scheme}://{parsed.hostname}/{org}/{repo}"
-
-
 def _trusted_catalog_origin_url(url_or_base: str) -> str | None:
-  """Return the one canonical Git origin proven by a trusted catalog URL."""
-  parsed = urlparse(url_or_base)
-  if (
-    parsed.scheme != "https"
-    or parsed.netloc != "raw.githubusercontent.com"
-    or parsed.username is not None
-    or parsed.password is not None
-  ):
+  """The Git origin of a root package in the trusted ``mobius-os`` catalog.
+
+  A ``mobius-os/<repo>`` repository is one app at every ref, so a pinned
+  commit and a branch name the same origin.
+  """
+  root = parse_root_manifest(url_or_base)
+  if root is None or root.repository[0] != "mobius-os":
     return None
-  repo_base = _trusted_catalog_repo_base(url_or_base)
-  if repo_base is None:
-    return None
-  parts = [part for part in urlparse(repo_base).path.split("/") if part]
-  if len(parts) != 2:
-    return None
-  return f"https://github.com/{parts[0]}/{parts[1]}.git"
+  return root.origin_url
 
 
 def _github_root_manifest_identity(url_or_base: str) -> tuple[str, str] | None:
-  """Return owner/repository for one root raw-GitHub manifest URL."""
-  if not isinstance(url_or_base, str) or not url_or_base:
-    return None
-  parsed = urlparse(_canonical_base(url_or_base))
-  if (
-    parsed.scheme != "https"
-    or parsed.hostname != "raw.githubusercontent.com"
-    or parsed.username is not None
-    or parsed.password is not None
-  ):
-    return None
-  parts = [unquote(part) for part in parsed.path.split("/") if part]
-  if len(parts) != 3 or ".." in parts:
-    return None
-  owner, repo, ref = parts
-  if any(
-    part in ("", ".", "..") or part.startswith("-") or "\\" in part
-    for part in (owner, repo, ref)
-  ):
-    return None
-  return owner.lower(), repo.lower()
+  """Return the lowercased owner/repository of one root raw-GitHub package."""
+  root = parse_root_manifest(url_or_base)
+  return root.repository if root is not None else None
 
 
 def _github_origin_url(url_or_base: str) -> str | None:
@@ -481,11 +402,7 @@ def _trusted_catalog_origin_matches(
   expected_origin = _trusted_catalog_origin_url(source_url)
   if expected_origin is None:
     return False
-  actual_origin = app_git.origin_url(source_dir)
-  return bool(
-    actual_origin
-    and actual_origin.rstrip("/") == expected_origin.rstrip("/")
-  )
+  return app_git.same_origin(app_git.origin_url(source_dir), expected_origin)
 
 
 def trusted_catalog_checkout(
@@ -2726,6 +2643,21 @@ def _read_git_package_inputs(
   )
 
 
+def _same_repository_predecessor(
+  manifest: dict, source_url: str, source_identity: str | None,
+) -> str | None:
+  """A ``previous_manifest_url`` in the source's own repository shares its identity."""
+  previous_source = manifest.get("previous_manifest_url")
+  if (
+    source_identity is not None
+    and previous_source
+    and _github_root_manifest_identity(previous_source)
+    == _github_root_manifest_identity(source_url)
+  ):
+    return source_identity
+  return None
+
+
 def read_git_install_candidate(
   source_dir: str | Path,
   commit: str,
@@ -2763,15 +2695,10 @@ def read_git_install_candidate(
     source_url.rsplit("/mobius.json", 1)[0]
     if "/mobius.json" in source_url else source_url
   )
-  previous_source = manifest.get("previous_manifest_url")
-  if (
-    predecessor_source_identity is None
-    and source_identity is not None
-    and previous_source
-    and _github_root_manifest_identity(previous_source)
-    == _github_root_manifest_identity(source_url)
-  ):
-    predecessor_source_identity = source_identity
+  if predecessor_source_identity is None:
+    predecessor_source_identity = _same_repository_predecessor(
+      manifest, source_url, source_identity,
+    )
   return GitInstallCandidate(
     commit=resolved,
     candidate=_new_candidate(
@@ -2865,14 +2792,18 @@ def transient_failure(exc: BaseException) -> tuple[bool, int | None]:
 def git_source_error(
   outcome: str, exc: BaseException, *,
   code: str = "git_update_unavailable", failure: str = "",
+  retry_hint: str = "",
 ) -> HTTPException:
   """The owner-facing 409 for a Git source that could not be used.
 
   A transfer exceeding its wall-clock ceiling is reported as a timeout,
   distinct from a missing or unverifiable source. ``retryable`` marks a
   failure the same request may later get past unchanged (``transient_failure``);
-  bootstrap retries it.
+  bootstrap retries it, and only then is ``retry_hint`` added to the message.
   """
+  retryable = transient_failure(exc)[0]
+  if retryable and retry_hint:
+    failure = f"{failure} {retry_hint}"
   if isinstance(exc, app_git.GitTransferTimeout):
     code = "git_transfer_timeout"
     failure = f"The app's Git transfer timed out: {exc}."
@@ -2885,7 +2816,7 @@ def git_source_error(
     )
   return HTTPException(409, detail={
     "code": code, "message": f"{failure} {outcome}".strip(),
-    "retryable": transient_failure(exc)[0],
+    "retryable": retryable,
   })
 
 
@@ -3025,19 +2956,6 @@ def _url_update_commit(
       409, "The app's Git update must be fetched before it is installed.",
     )
   return present
-
-
-def install_candidate_content_digest(candidate: InstallCandidate) -> str:
-  """Return the origin-independent package digest for one fetched candidate."""
-  return package_content_digest(
-    manifest=candidate.manifest,
-    entry_bytes=candidate.entry_bytes,
-    icon_processed=candidate.icon_processed,
-    bundled_job=candidate.bundled_job,
-    static_assets=candidate.static_assets,
-    source_files=candidate.source_files,
-    seeds=candidate.seeds,
-  )
 
 
 @dataclass(frozen=True)
@@ -3261,8 +3179,8 @@ async def prepare_package(
       "Nothing was installed.",
       exc,
       code="git_install_unavailable",
-      failure="The app's Git repository could not be cloned or verified; "
-      "retry when its source is available.",
+      failure="The app's Git repository could not be cloned or verified.",
+      retry_hint="Retry when its source is available.",
     ) from exc
   try:
     return PreparedPackage(
@@ -3278,28 +3196,10 @@ async def _staged_clone_candidate(
 ) -> InstallCandidate:
   """Read a root Git package from its staged clone, binding its identity."""
   source_url = requested_manifest_source(manifest_url)[0]
-  identity: dict = {}
   try:
-    declared = json.loads(await asyncio.to_thread(
-      app_git.read_blob, staged.path, staged.sha, "mobius.json",
-    ) or b"null")
-  except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):
-    declared = None  # The reader below reports what is wrong with it.
-  if isinstance(declared, dict) and declared.get("package_id"):
-    async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
-      source_identity, predecessor, canonical = await _resolve_package_identity(
-        cli, declared, source_url,
-      )
-    identity = dict(
-      source_identity=source_identity,
-      predecessor_source_identity=predecessor,
-      canonical_source_url=canonical,
-    )
-  try:
-    candidate = (await asyncio.to_thread(functools.partial(
+    candidate = (await asyncio.to_thread(
       read_git_install_candidate, staged.path, staged.sha, source_url,
-      **identity,
-    ))).candidate
+    )).candidate
   except PackageTooLarge as exc:
     raise HTTPException(
       413, detail={"code": "package_too_large", "message": str(exc)},
@@ -3309,6 +3209,27 @@ async def _staged_clone_candidate(
   validate_manifest_address(candidate.manifest, manifest_url, db=db)
   if db is not None:
     db.rollback()
+  if candidate.manifest.get("package_id"):
+    # Resolved from the bounded manifest the reader just accepted.
+    async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
+      source_identity, predecessor, canonical = await _resolve_package_identity(
+        cli, candidate.manifest, source_url,
+      )
+    candidate = _new_candidate(
+      manifest=candidate.manifest,
+      raw_base=candidate.raw_base,
+      entry_bytes=candidate.entry_bytes,
+      icon_processed=candidate.icon_processed,
+      icon_warning=candidate.icon_warning,
+      bundled_job=candidate.bundled_job,
+      static_assets=candidate.static_assets,
+      source_files=candidate.source_files,
+      seeds=candidate.seeds,
+      source_review_digest=candidate.source_review_digest,
+      source_identity=source_identity,
+      predecessor_source_identity=predecessor,
+      canonical_source_url=canonical,
+    )
   return candidate
 
 
@@ -3338,6 +3259,7 @@ def _require_reviewed_candidate(
   reviewed_capability_digest: str | None,
   reviewed_source_digest: str | None,
   expected_candidate_digest: str | None,
+  is_update: bool,
 ) -> None:
   """Refuse a candidate that is not the package the owner reviewed."""
   if manifest is not None and manifest != candidate.manifest:
@@ -3351,7 +3273,10 @@ def _require_reviewed_candidate(
       "code": "update_changed",
       "message": (
         "The app source changed after it was reviewed. "
-        "Refresh the update preview and try again."
+        + (
+          "Refresh the update preview and try again." if is_update
+          else "Review the app again and try again."
+        )
       ),
     })
   if (
@@ -3407,6 +3332,111 @@ async def _authorize_source_handoff(
     raise HTTPException(409, "Trusted app handoff names a different source.")
 
 
+@dataclass(frozen=True)
+class PackageRow:
+  """The installed row, if any, that one candidate package is."""
+
+  row: models.App | None
+  renamed: bool = False  # Found through the candidate's `previous_id`.
+  origin_migration: tuple[str, str] | None = None
+
+
+def resolve_package_row(
+  db: Session,
+  manifest: dict,
+  source_url: str,
+  *,
+  source_identity: str | None = None,
+  predecessor_identity: str | None = None,
+  canonical_source_url: str | None = None,
+) -> PackageRow:
+  """Resolve which installed row a candidate package is, by one rule.
+
+  Install, update-check and the update preview all call this, so discovery
+  offers an update exactly when install would apply it to that row:
+
+  1. Its permanent ``package_id`` and its address (the stored identity, any
+     ref of the same root GitHub package, or a proven legacy origin); when
+     both find a row they must agree.
+  2. Its ``previous_manifest_url`` under the same ``id``, for a permanent
+     package whose provider identity proves it is the same repository.
+  3. A ``previous_id`` rename: under the current address, then (permanent
+     package) the proven predecessor address, or (otherwise) a predecessor
+     owned by the same GitHub account. A deleted predecessor is not revived.
+
+  A row holding a permanent ``package_id`` is only ever that package.
+  Raises HTTPException 409 for a conflicting or changed permanent identity and
+  400 for a rename across GitHub accounts without a permanent identity.
+  """
+  manifest_id = manifest["id"]
+  package_id = manifest.get("package_id")
+  previous_id = manifest.get("previous_id")
+  previous_source = manifest.get("previous_manifest_url")
+  key_source = canonical_source_url or source_url
+  existing = _find_install_identity_row(
+    db, source_url=source_url, manifest_id=manifest_id, package_id=package_id,
+  )
+  renamed = False
+  origin_migration = None
+  if existing is None:
+    same_repository = bool(
+      package_id and previous_source
+      and predecessor_identity == source_identity
+    )
+    # (address, manifest id, whether the row is a `previous_id` rename)
+    lookups: list[tuple[str, str, bool]] = []
+    if same_repository:
+      lookups.append((previous_source, manifest_id, False))
+    if previous_id and package_id:
+      lookups.append((key_source, previous_id, True))
+      if same_repository:
+        lookups.append((previous_source, previous_id, True))
+    elif previous_id:
+      predecessor_source, origin_migration = _reviewed_predecessor_source(
+        manifest, key_source,
+      )
+      lookups.append((predecessor_source, previous_id, True))
+    for lookup_source, lookup_id, rename in lookups:
+      existing = _find_install_identity_row(
+        db, source_url=lookup_source, manifest_id=lookup_id,
+      )
+      if existing is not None:
+        renamed = rename
+        break
+    if renamed and existing.deleted_at is not None:
+      existing, renamed = None, False
+    if not renamed:
+      origin_migration = None
+  if existing is not None:
+    try:
+      require_permanent_package(manifest, existing.package_id)
+    except ValueError as exc:
+      raise HTTPException(409, str(exc)) from exc
+  return PackageRow(existing, renamed, origin_migration)
+
+
+def resolve_update_row(
+  db: Session, manifest: dict, manifest_url: str, source_identity: str | None,
+) -> PackageRow:
+  """The row a Store update of this Git candidate would apply to.
+
+  A Store update reads its package from the installed app's repository and
+  binds it to that row's own source identity (``install_from_manifest``), so
+  update discovery passes install the same inputs and needs no request.
+  """
+  fetch_url = requested_manifest_source(manifest_url)[0]
+  return resolve_package_row(
+    db,
+    manifest,
+    manifest_url,
+    source_identity=source_identity,
+    predecessor_identity=_same_repository_predecessor(
+      manifest, fetch_url, source_identity,
+    ),
+    canonical_source_url=fetch_url if source_identity else None,
+  )
+
+
 def _select_install_target(
   db: Session,
   *,
@@ -3423,83 +3453,26 @@ def _select_install_target(
   requested_source = (
     manifest_url if manifest_url is not None else candidate.raw_base
   )
-  source_for_key = candidate.canonical_source_url or (
-    requested_source
-  )
+  source_for_key = candidate.canonical_source_url or requested_source
   canonical_manifest_url = _canonical_identity_key(
     source_for_key, manifest_id,
   )
-  existing = _find_install_identity_row(
+  resolved = resolve_package_row(
     db,
-    source_url=requested_source,
-    manifest_id=manifest_id,
-    package_id=package_id,
+    manifest,
+    requested_source,
+    source_identity=candidate.source_identity,
+    predecessor_identity=candidate.predecessor_source_identity,
+    canonical_source_url=candidate.canonical_source_url,
   )
-  previous_source = manifest.get("previous_manifest_url")
-  if (
-    existing is None
-    and package_id
-    and previous_source
-    and candidate.predecessor_source_identity == candidate.source_identity
-  ):
-    existing = _find_install_identity_row(
-      db, source_url=previous_source, manifest_id=manifest_id,
-    )
-
-  adopting_previous_id = False
-  origin_migration = None
-  if existing is None:
-    # A rename is explicit and source-bound. Ordinarily previous_id is looked
-    # up under the same package base; previous_manifest_url may name an old
-    # repository owned by the same GitHub account.
-    prev_id = manifest.get("previous_id")
-    if prev_id:
-      if package_id:
-        # First recover identity-free installs already checked out from the
-        # current trusted repository (Main's pre-manifest Social state).
-        existing = _find_install_identity_row(
-          db, source_url=source_for_key, manifest_id=prev_id,
-        )
-        # A persisted predecessor URL is safe across owner/repo renames only
-        # when the provider proves both paths are the same repository.
-        if (
-          existing is None
-          and previous_source
-          and candidate.predecessor_source_identity
-          == candidate.source_identity
-        ):
-          existing = _find_install_identity_row(
-            db, source_url=previous_source, manifest_id=prev_id,
-          )
-      else:
-        predecessor_source, origin_migration = _reviewed_predecessor_source(
-          manifest, source_for_key,
-        )
-        existing = _find_install_identity_row(
-          db, source_url=predecessor_source, manifest_id=prev_id,
-        )
-      if existing is not None and existing.deleted_at is not None:
-        existing = None
-      if existing:
-        adopting_previous_id = True
-      else:
-        origin_migration = None
-
-  # Every resolved row, including a previous_id predecessor, keeps its
-  # permanent package identity.
-  if existing is not None:
-    try:
-      require_permanent_package(manifest, existing.package_id)
-    except ValueError as exc:
-      raise HTTPException(409, str(exc)) from exc
-
-  if (
+  existing = resolved.row
+  origin_migration = resolved.origin_migration
+  adopting_previous_id = resolved.renamed or bool(
     existing is not None
     and package_id
     and existing.package_id == package_id
     and existing.slug != manifest_id
-  ):
-    adopting_previous_id = True
+  )
 
   required_app_id = (
     expected_app_id
@@ -3522,7 +3495,7 @@ def _select_install_target(
 
   old_origin = _github_origin_url(existing.manifest_url) if existing else None
   new_origin = _github_origin_url(source_for_key)
-  if old_origin and new_origin and old_origin.lower() != new_origin.lower():
+  if old_origin and new_origin and not app_git.same_origin(old_origin, new_origin):
     origin_migration = (old_origin, new_origin)
 
   service = manifest.get("service")
@@ -4392,10 +4365,11 @@ async def install_from_manifest(
 
   The per-app git model is unconditional. Every installed app has a canonical
   source directory and repository; updates never overwrite source blindly.
-  Callers hold the lifecycle lock, so a fresh install arrives ``prepared`` (by
-  ``prepare_package``) and a reviewed update as a commit already made present
-  by ``fetch_app_commit``. Only a call with neither, such as a publication
-  handoff or a legacy conflict replay, still fetches its package here.
+  Callers hold the lifecycle lock, so a fresh install or a publication handoff
+  arrives ``prepared`` (by ``prepare_package``, or the handoff's verified
+  candidate) and a reviewed update or conflict replay as a commit already made
+  present by ``fetch_app_commit``. Only a legacy conflict replay whose commit
+  has no manifest still fetches its package here.
 
   Failure modes:
     - Pre-commit failures (manifest fetch, validation, JSX compile,
@@ -4505,20 +4479,18 @@ async def install_from_manifest(
           },
         ) from exc
       validate_manifest_address(candidate.manifest, manifest_url, db=db)
-  elif prepared is not None:
+  elif prepared is None:
+    raise ValueError("an install without a reviewed commit needs its prepared package")
+  else:
     candidate = prepared.candidate
     validate_manifest_address(candidate.manifest, manifest_url, db=db)
-  else:
-    candidate = await _fetch_install_candidate(
-      manifest_url=manifest_url, manifest=manifest, raw_base=raw_base,
-      reviewed_capability_digest=reviewed_capability_digest, db=db,
-    )
   _require_reviewed_candidate(
     candidate,
     manifest=manifest,
     reviewed_capability_digest=reviewed_capability_digest,
     reviewed_source_digest=reviewed_source_digest,
     expected_candidate_digest=expected_candidate_digest,
+    is_update=reviewed_id is not None,
   )
 
   # Phase 2: immutable identity/update decision. No writes occur here.
@@ -5162,8 +5134,9 @@ async def _install_candidate(
               "Nothing was installed.",
               exc,
               code="git_install_unavailable",
-              failure="The app's Git repository could not be cloned or verified; "
-              "retry when its source is available.",
+              failure="The app's Git repository could not be cloned or "
+              "verified.",
+              retry_hint="Retry when its source is available.",
             ) from exc
         if not cloned_install:
           # record the pristine source tree on `upstream`, then align the

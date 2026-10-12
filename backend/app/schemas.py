@@ -513,6 +513,17 @@ class UpdateCandidatePreviewOut(BaseModel):
   ] = "none"
 
 
+class UpdateCandidateRejection(BaseModel):
+  """Why install would refuse a discovered update candidate for this app.
+
+  ``identity_mismatch``: the candidate is not this installed package under
+  install's identity rule (another or no installed row, a changed permanent
+  ``package_id``, or a rename install does not accept).
+  """
+  code: Literal["identity_mismatch"]
+  message: str
+
+
 class UpdateCheckOut(BaseModel):
   """Git-native update detection: fetched upstream source vs recorded upstream.
 
@@ -549,6 +560,9 @@ class UpdateCheckOut(BaseModel):
   candidate_source_digest: str | None = Field(
     default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$",
   )
+  # Set, with `update_available` null, when the fetched candidate is one that
+  # install would refuse for this app; null for every other unknown.
+  candidate_rejected: UpdateCandidateRejection | None = None
   checked_at: datetime
 
 
