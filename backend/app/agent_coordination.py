@@ -333,9 +333,19 @@ def scope_participants(
   current_chat_id: str | None = None,
   *,
   limit: int = MAX_PEERS,
+  alive_chat_ids: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
-  """Project a bounded affinity roster without exposing peer transcripts."""
-  from app.runner_registry import registry
+  """Project a bounded affinity roster without exposing peer transcripts.
+
+  A caller in a worker thread passes ``alive_chat_ids`` captured on the event
+  loop, so the thread never reads the loop-owned runner registry.
+  """
+  if alive_chat_ids is None:
+    from app.runner_registry import registry
+
+    is_alive = registry.is_alive
+  else:
+    is_alive = alive_chat_ids.__contains__
 
   chat_ids, delegation_by_chat = _scope_membership(db, scope, limit=limit)
   if not chat_ids:
@@ -376,7 +386,7 @@ def scope_participants(
       "provider": provider,
       "parent_chat_id": parent_chat_id,
       "status": status,
-      "online": registry.is_alive(chat_id),
+      "online": is_alive(chat_id),
       "is_current": chat_id == current_chat_id,
       "scope_member": True,
       "goal": run.goal_objective if run is not None else None,
@@ -926,6 +936,7 @@ def agent_context_snapshot(
   physical_run_id: str | None,
   *,
   chat: models.Chat | None = None,
+  alive_chat_ids: frozenset[str] | None = None,
 ) -> dict[str, Any] | None:
   """The small, event-oriented coordination payload injected into a turn."""
   scope = scope_for_chat(db, chat_id, physical_run_id)
@@ -935,6 +946,7 @@ def agent_context_snapshot(
   if scope.kind == "project" or _delegation_scope_has_children(db, scope):
     participants = scope_participants(
       db, scope, current_chat_id=chat_id, limit=MAX_CONTEXT_PEERS + 2,
+      alive_chat_ids=alive_chat_ids,
     )
   collaborators = [
     model_peer(peer, include_ended_at=True)
@@ -1299,6 +1311,16 @@ def _prune_direct_inboxes(
       db.delete(row)
 
 
+def publish_message_hint(hint: dict[str, Any]) -> None:
+  """Publish one hint collected by ``_persist_send``; event loop only."""
+  _publish_message_hint(
+    hint["channel"],
+    sender_chat_id=hint["sender_chat_id"],
+    recipients=hint["recipients"],
+    broadcast=hint["broadcast"],
+  )
+
+
 def _publish_message_hint(
   channel: CoordinationScope,
   *,
@@ -1336,7 +1358,13 @@ def _persist_send(
   delivery: str,
   body: str,
   send_id: str | None,
+  hints: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+  """Persist one send; ``hints`` collects the live hint instead of publishing.
+
+  A worker-thread caller passes ``hints`` and publishes them on the event
+  loop, which owns the system broadcast.
+  """
   clean_body = _clean_message(kind, body)
   clean_delivery = _clean_delivery(delivery, broadcast=broadcast)
   requested_send_id = _clean_send_id(send_id)
@@ -1408,12 +1436,16 @@ def _persist_send(
     raise
   for row in rows:
     db.refresh(row)
-  _publish_message_hint(
-    channel,
-    sender_chat_id=sender_chat_id,
-    recipients=recipients,
-    broadcast=broadcast,
-  )
+  hint = {
+    "channel": channel,
+    "sender_chat_id": sender_chat_id,
+    "recipients": recipients,
+    "broadcast": broadcast,
+  }
+  if hints is None:
+    publish_message_hint(hint)
+  else:
+    hints.append(hint)
   return serialize_messages(db, rows)
 
 
@@ -1429,6 +1461,7 @@ def send_scope_message(
   body: str,
   delivery: str = DELIVERY_NEXT_TURN,
   send_id: str | None = None,
+  hints: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
   """Persist one scope-confined broadcast or legacy directed note."""
   member_ids = set(_scope_membership(db, scope, limit=None)[0])
@@ -1454,6 +1487,7 @@ def send_scope_message(
     delivery=delivery,
     body=body,
     send_id=send_id,
+    hints=hints,
   )
 
 
@@ -1522,6 +1556,7 @@ def send_agent_message(
   body: str,
   delivery: str = DELIVERY_NEXT_TURN,
   send_id: str | None = None,
+  hints: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
   """Send a scope broadcast or global direct note from one exact live run."""
   if broadcast:
@@ -1536,6 +1571,7 @@ def send_agent_message(
       delivery=delivery,
       body=body,
       send_id=send_id,
+      hints=hints,
     )
 
   unique_recipients = list(dict.fromkeys(str(value) for value in recipients))
@@ -1560,7 +1596,58 @@ def send_agent_message(
     delivery=delivery,
     body=body,
     send_id=send_id,
+    hints=hints,
   )
+
+
+@dataclass(frozen=True)
+class AgentSendResult:
+  """A run's persisted send, as plain data, for the event loop to finish."""
+
+  rows: list[dict[str, Any]]
+  hints: list[dict[str, Any]]
+
+
+def send_agent_message_off_loop(
+  *,
+  owner_id: int,
+  sender_chat_id: str,
+  sender_run_id: str,
+  recipients: list[str],
+  broadcast: bool,
+  kind: str,
+  body: str,
+  delivery: str = DELIVERY_NEXT_TURN,
+  send_id: str | None = None,
+) -> AgentSendResult | None:
+  """Resolve the sender's scope and persist one send in a worker thread.
+
+  The send validates recipients, writes, and prunes the recipient inbox; on a
+  busy disk that froze the event loop for seconds. Returns None when the run
+  has no coordination scope. The caller publishes ``hints`` on the loop.
+  """
+  from app.database import SessionLocal
+
+  with SessionLocal() as db:
+    scope = scope_for_chat(db, sender_chat_id, sender_run_id)
+    if scope is None:
+      return None
+    hints: list[dict[str, Any]] = []
+    rows = send_agent_message(
+      db,
+      scope,
+      owner_id=owner_id,
+      sender_chat_id=sender_chat_id,
+      sender_run_id=sender_run_id,
+      recipients=recipients,
+      broadcast=broadcast,
+      kind=kind,
+      delivery=delivery,
+      body=body,
+      send_id=send_id,
+      hints=hints,
+    )
+    return AgentSendResult(rows=rows, hints=hints)
 
 
 def send_work_claim_notice(
@@ -2064,10 +2151,11 @@ def build_coordination_context_delivery(
   physical_run_id: str | None,
   *,
   chat: models.Chat | None = None,
+  alive_chat_ids: frozenset[str] | None = None,
 ) -> CoordinationContextDelivery:
   """Build peer context and retain its boundary for provider admission."""
   snapshot = agent_context_snapshot(
-    db, chat_id, physical_run_id, chat=chat,
+    db, chat_id, physical_run_id, chat=chat, alive_chat_ids=alive_chat_ids,
   )
   if snapshot is None:
     return CoordinationContextDelivery(text="", delivered_through=None)
@@ -2151,6 +2239,27 @@ def build_coordination_context_delivery(
   return CoordinationContextDelivery(
     text=text, delivered_through=delivered_through,
   )
+
+
+def build_coordination_context_delivery_off_loop(
+  chat_id: str,
+  physical_run_id: str | None,
+  alive_chat_ids: frozenset[str],
+) -> CoordinationContextDelivery:
+  """Build a turn's peer context in a worker thread with its own session.
+
+  The run-start path calls this through ``asyncio.to_thread``: the roster,
+  inbox window and carrier scan are several reads (and a transcript decode)
+  that froze the event loop for seconds on a busy disk. ``alive_chat_ids`` is
+  the runner registry captured on the loop; the result is plain data.
+  """
+  from app.database import SessionLocal
+
+  with SessionLocal() as db:
+    chat = db.query(models.Chat).filter(models.Chat.id == chat_id).first()
+    return build_coordination_context_delivery(
+      db, chat_id, physical_run_id, chat=chat, alive_chat_ids=alive_chat_ids,
+    )
 
 
 def build_coordination_context(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
@@ -18,8 +20,8 @@ from app.agent_coordination import (
   model_message,
   owner_chat_snapshot,
   owner_project_snapshot,
-  scope_for_chat,
-  send_agent_message,
+  publish_message_hint,
+  send_agent_message_off_loop,
   send_work_claim_notice,
   visible_peer_messages,
 )
@@ -95,17 +97,6 @@ class AgentWorkClaimFinish(BaseModel):
   work_key: str = Field(min_length=3, max_length=256)
   outcome: str = Field(min_length=1, max_length=1000)
   release: bool = False
-
-
-def _agent_scope(
-  db: Session, principal: Principal,
-):
-  if principal.chat_id is None or principal.run_id is None:
-    raise HTTPException(403, "Current chat-bound agent run required.")
-  scope = scope_for_chat(db, principal.chat_id, principal.run_id)
-  if scope is None:
-    raise HTTPException(409, "This agent does not have a coordination scope.")
-  return scope
 
 
 @router.post("/work-claims", dependencies=[Depends(reject_cross_site)])
@@ -234,13 +225,14 @@ def current_network(
 async def send_current_message(
   body: AgentMessageCreate,
   principal: Principal = Depends(get_agent_run_principal),
-  db: Session = Depends(get_db),
 ):
-  scope = _agent_scope(db, principal)
+  if principal.chat_id is None or principal.run_id is None:
+    raise HTTPException(403, "Current chat-bound agent run required.")
+  # Scope resolution, validation, the write and the inbox prune run in a
+  # worker with their own session; the live hint is published here.
   try:
-    rows = send_agent_message(
-      db,
-      scope,
+    sent = await asyncio.to_thread(
+      send_agent_message_off_loop,
       owner_id=principal.owner.id,
       sender_chat_id=principal.chat_id,
       sender_run_id=principal.run_id,
@@ -253,6 +245,11 @@ async def send_current_message(
     )
   except ValueError as exc:
     raise HTTPException(422, str(exc)) from exc
+  if sent is None:
+    raise HTTPException(409, "This agent does not have a coordination scope.")
+  for hint in sent.hints:
+    publish_message_hint(hint)
+  rows = sent.rows
   # Meaning and delivery are independent. A direct interrupt steers a live
   # recipient or wakes its idle unfinished Goal; next_turn and every broadcast
   # stay quiet so one broad note cannot manufacture a wave of model work.

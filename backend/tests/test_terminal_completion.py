@@ -322,8 +322,20 @@ def test_settled_turn_reclaims_caches_without_retired_summary_publisher(monkeypa
   )
   _patch_claude_runner(monkeypatch)
   calls = []
-  monkeypatch.setattr(chat_mod.gc, "collect", lambda: calls.append("gc"))
-  monkeypatch.setattr(allocator, "trim_glibc", lambda: calls.append("trim"))
+  monkeypatch.setattr(
+    chat_mod.gc, "collect", lambda *gen: calls.append(("gc", *gen)),
+  )
+
+  def on_loop():
+    try:
+      asyncio.get_running_loop()
+    except RuntimeError:
+      return False
+    return True
+
+  monkeypatch.setattr(
+    allocator, "trim_glibc", lambda: calls.append(("trim", on_loop())),
+  )
   monkeypatch.setattr(
     file_cache, "reclaim_settled_cache",
     lambda data_dir, chat_id: calls.append((data_dir, chat_id)),
@@ -335,10 +347,46 @@ def test_settled_turn_reclaims_caches_without_retired_summary_publisher(monkeypa
     run_gen=chat_mod.current_run_generation("settled-reclaim"),
   )
 
-  assert "gc" in calls
-  assert "trim" in calls
+  # The only turn just settled, so a full collection cannot stall another.
+  assert ("gc", 2) in calls
+  assert ("trim", False) in calls
   assert any(item[1] == "settled-reclaim" for item in calls if isinstance(item, tuple))
   assert not hasattr(chat_mod, "_ensure_chat_note")
+
+
+def test_settled_turn_collects_only_young_generations_while_others_run(
+  monkeypatch,
+):
+  """A full collection holds the GIL; another live turn would freeze with it."""
+  from app import allocator, file_cache
+
+  _seed_owner_and_creds()
+  _seed_chat(
+    "settled-young",
+    messages=[{"role": "user", "content": "hi", "ts": 1}],
+    pending=[], running="running", run_token="rt-settled-young",
+  )
+  _patch_claude_runner(monkeypatch)
+  generations = []
+  monkeypatch.setattr(
+    chat_mod.gc, "collect", lambda *gen: generations.append(gen),
+  )
+  monkeypatch.setattr(allocator, "trim_glibc", lambda: None)
+  monkeypatch.setattr(
+    file_cache, "reclaim_settled_cache", lambda data_dir, chat_id: None,
+  )
+  monkeypatch.setattr(
+    chat_mod.registry, "all_alive_chat_ids", lambda: {"another-chat"},
+  )
+
+  chat_mod.mark_starting("settled-young")
+  _run_real_chat(
+    "settled-young", run_token="rt-settled-young",
+    run_gen=chat_mod.current_run_generation("settled-young"),
+  )
+
+  assert (1,) in generations
+  assert (2,) not in generations and () not in generations
 
 
 def test_provider_error_clears_marker_but_records_failed_run(monkeypatch):

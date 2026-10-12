@@ -1842,13 +1842,25 @@ def publish_source_work_changed(
   """Publish source-work freshness and one durable terminal attention item."""
   if row.source_work_id is None:
     return
+  _publish_source_work_status(
+    delegation_id=row.id,
+    parent_chat_id=row.parent_chat_id,
+    source_work_id=row.source_work_id,
+    status=status,
+  )
+
+
+def _publish_source_work_status(
+  *, delegation_id: str, parent_chat_id: str, source_work_id: str, status: str,
+) -> None:
+  """``publish_source_work_changed`` from plain fields; event loop only."""
   from app.broadcast import get_system_broadcast
 
   get_system_broadcast().publish({
     "type": "delegation_changed",
-    "chatId": row.parent_chat_id,
-    "delegationId": row.id,
-    "sourceWorkId": row.source_work_id,
+    "chatId": parent_chat_id,
+    "delegationId": delegation_id,
+    "sourceWorkId": source_work_id,
     "status": status,
   })
   if status not in WAKE_ELIGIBLE_STATUSES:
@@ -1865,11 +1877,11 @@ def publish_source_work_changed(
     # Claim this exact result once. Source work can settle before any child
     # run exists (a pre-start failure or completion without start); that
     # result is recorded as settled-before-start, which a later run supersedes.
-    result_run_id = current_result_run_ids(db, [row.id]).get(
-      row.id, SETTLED_BEFORE_START,
+    result_run_id = current_result_run_ids(db, [delegation_id]).get(
+      delegation_id, SETTLED_BEFORE_START,
     )
     claimed = db.query(models.Delegation).filter(
-      models.Delegation.id == row.id,
+      models.Delegation.id == delegation_id,
       models.Delegation.source_work_id.is_not(None),
       models.Delegation.cancelled_at.is_(None),
       or_(
@@ -1900,8 +1912,8 @@ def publish_source_work_changed(
         if completed else "The contribution helper stopped at a step that needs review."
       ),
       source_type="agent",
-      source_id=row.parent_chat_id,
-      target=f"/shell/?chat={row.parent_chat_id}",
+      source_id=parent_chat_id,
+      target=f"/shell/?chat={parent_chat_id}",
     )
 
 
@@ -2015,6 +2027,16 @@ def active_parent_context(
     "<active_delegations>"
     f"{payload}</active_delegations>"
   )
+
+
+def active_parent_context_off_loop(
+  parent_chat_id: str, physical_run_id: str,
+) -> str:
+  """``active_parent_context`` with its own session, for a worker thread."""
+  from app.database import SessionLocal
+
+  with SessionLocal() as db:
+    return active_parent_context(db, parent_chat_id, physical_run_id)
 
 
 def delegation_execution_token(
@@ -3501,12 +3523,11 @@ def _committed_parent_wake_is_unowned(
     return not adopted
   if physical.status != "running":
     return False
-  from app.chat import is_chat_running
-
-  return bool(
-    not is_chat_running(chat.id)
-    and safe_parent_wake_startup_writer_orphan(db, chat, physical)
-  )
+  # Durable state only: this runs inside _plan_parent_wake's worker thread,
+  # which must not read the loop-owned runner registry. The loop re-checks
+  # is_chat_running after planning, under the same transition lock, before
+  # it starts anything.
+  return safe_parent_wake_startup_writer_orphan(db, chat, physical)
 
 
 async def steer_results_into_running_parent(
@@ -3527,47 +3548,34 @@ async def steer_results_into_running_parent(
   from app.chat_steering import has_live_steerable_turn, steer_into_active_turn
   from app.chat_writer import AppendPending, await_ack, get_writer
   from app.continuations import DELEGATION_RESULT_MESSAGE_KIND
-  from app.database import SessionLocal
 
   async with chat_queue.get_lock(parent_chat_id):
-    with SessionLocal() as db:
-      chat = db.query(models.Chat).filter(
-        models.Chat.id == parent_chat_id,
-        models.Chat.deleted_at.is_(None),
-      ).first()
-      if chat is None or not is_chat_running(parent_chat_id):
-        return False
-      if is_draining() or questions.is_waiting(parent_chat_id):
-        return False
-      provider = chat.provider or "claude"
-      if not has_live_steerable_turn(parent_chat_id, provider):
-        return False
-      # Never jump ahead of owner-authored or other queued work.
-      if list(chat.pending_messages or []):
-        return False
-      # A result the live turn already admitted into its context latches only
-      # at that turn's Finalize; steering it in again would be a duplicate.
-      rows = _wake_eligible_rows_for_parent(
-        db, parent_chat_id, source_work_id,
-        pending_ids=_delivered_to_live_parent_runs(db, {parent_chat_id}),
-      )
-      if not rows:
-        return False
-      results = settled_result_run_ids(db, [row.id for row in rows])
-      rows = [row for row in rows if row.id in results]
-      if not rows:
-        return False
-      content = _compose_wake_notice(db, rows, results)
-      _run_id, cid = _parent_wake_delivery_identity(rows, results)
-      carrier = {
-        "role": "user",
-        "content": content,
-        "ts": int(datetime.now().timestamp() * 1000),
-        "cid": cid,
-        "hidden": True,
-        "kind": DELEGATION_RESULT_MESSAGE_KIND,
-        "source_work_id": delegation_source_work_id(rows[0]),
-      }
+    if not is_chat_running(parent_chat_id):
+      return False
+    # The durable reads run in a worker; the runner, question and drain
+    # registries are read here on the loop, after it, still under the queue
+    # lock that orders this against queued sends.
+    plan = await asyncio.to_thread(
+      _plan_result_steer, parent_chat_id, source_work_id,
+    )
+    if plan is None or not is_chat_running(parent_chat_id):
+      return False
+    if is_draining() or questions.is_waiting(parent_chat_id):
+      return False
+    provider = plan.provider
+    if not has_live_steerable_turn(parent_chat_id, provider):
+      return False
+    content = plan.content
+    cid = plan.cid
+    carrier = {
+      "role": "user",
+      "content": content,
+      "ts": int(datetime.now().timestamp() * 1000),
+      "cid": cid,
+      "hidden": True,
+      "kind": DELEGATION_RESULT_MESSAGE_KIND,
+      "source_work_id": plan.source_work_id,
+    }
     stored = await await_ack(get_writer().submit(AppendPending(
       chat_id=parent_chat_id,
       run_token="",
@@ -3586,6 +3594,52 @@ async def steer_results_into_running_parent(
   return bool(accepted)
 
 
+@dataclass(frozen=True)
+class _ResultSteerPlan:
+  """Durable half of a result steer, decided in a worker thread."""
+  provider: str
+  content: str
+  cid: str
+  source_work_id: str
+
+
+def _plan_result_steer(
+  parent_chat_id: str, source_work_id: str,
+) -> _ResultSteerPlan | None:
+  from app.database import SessionLocal
+
+  with SessionLocal() as db:
+    chat = db.query(models.Chat).filter(
+      models.Chat.id == parent_chat_id,
+      models.Chat.deleted_at.is_(None),
+    ).first()
+    if chat is None:
+      return None
+    # Never jump ahead of owner-authored or other queued work. Sends queue
+    # under the same chat queue lock the caller holds across this read.
+    if list(chat.pending_messages or []):
+      return None
+    # A result the live turn already admitted into its context latches only
+    # at that turn's Finalize; steering it in again would be a duplicate.
+    rows = _wake_eligible_rows_for_parent(
+      db, parent_chat_id, source_work_id,
+      pending_ids=_delivered_to_live_parent_runs(db, {parent_chat_id}),
+    )
+    if not rows:
+      return None
+    results = settled_result_run_ids(db, [row.id for row in rows])
+    rows = [row for row in rows if row.id in results]
+    if not rows:
+      return None
+    _run_id, cid = _parent_wake_delivery_identity(rows, results)
+    return _ResultSteerPlan(
+      provider=chat.provider or "claude",
+      content=_compose_wake_notice(db, rows, results),
+      cid=cid,
+      source_work_id=delegation_source_work_id(rows[0]),
+    )
+
+
 async def deliver_results_after_parent_settled(parent_chat_id: str) -> None:
   """Once a parent's turn ends, deliver helper results that finished meanwhile.
 
@@ -3593,20 +3647,8 @@ async def deliver_results_after_parent_settled(parent_chat_id: str) -> None:
   periodic recovery sweep would find it eventually, but the parent should not
   wait for that. Best-effort: the sweep remains the backstop.
   """
-  from app.database import SessionLocal
-
   try:
-    with SessionLocal() as db:
-      sources = [
-        source for (source,) in db.query(
-          models.Delegation.parent_root_run_id,
-        ).filter(
-          models.Delegation.parent_chat_id == parent_chat_id,
-          models.Delegation.notify_parent_on_complete.is_(True),
-          models.Delegation.cancelled_at.is_(None),
-          current_result_undelivered(),
-        ).distinct().all()
-      ]
+    sources = await asyncio.to_thread(_undelivered_result_sources, parent_chat_id)
     for source in sources:
       await _deliver_parent_wake(parent_chat_id, source)
   except Exception:
@@ -3614,6 +3656,23 @@ async def deliver_results_after_parent_settled(parent_chat_id: str) -> None:
       "helper results after parent settle skipped chat=%s",
       parent_chat_id, exc_info=True,
     )
+
+
+def _undelivered_result_sources(parent_chat_id: str) -> list[str]:
+  """Source work with an owed helper result; runs in a worker thread."""
+  from app.database import SessionLocal
+
+  with SessionLocal() as db:
+    return [
+      source for (source,) in db.query(
+        models.Delegation.parent_root_run_id,
+      ).filter(
+        models.Delegation.parent_chat_id == parent_chat_id,
+        models.Delegation.notify_parent_on_complete.is_(True),
+        models.Delegation.cancelled_at.is_(None),
+        current_result_undelivered(),
+      ).distinct().all()
+    ]
 
 
 async def _deliver_parent_wake(
@@ -3772,6 +3831,65 @@ def _chat_has_running_run(db: Session, chat_id: str) -> bool:
   ).scalar()
 
 
+@dataclass(frozen=True)
+class _ChildSettlePlan:
+  """What a child's settle should publish and whether it wakes its parent."""
+  delegation_id: str
+  parent_chat_id: str
+  status: str
+  # Set for source-attached work, which only refreshes its source surfaces.
+  source_work_id: str | None
+  goal_chat_ids: tuple[str, ...]
+  activity_changed: bool
+  wake_source_work_id: str | None
+
+
+def _plan_child_settle(child_chat_id: str) -> _ChildSettlePlan | None:
+  """Durable half of a child's settle; runs in a worker thread."""
+  from app.database import SessionLocal
+  from app.goal_plans import plan_change_chat_ids
+
+  with SessionLocal() as db:
+    row = (
+      db.query(models.Delegation)
+      .filter(models.Delegation.child_chat_id == child_chat_id)
+      .first()
+    )
+    if row is None:
+      return None
+    status, _, _ = derived_status(db, row, load_result=False)
+    if row.source_work_id is not None:
+      plan = _ChildSettlePlan(
+        delegation_id=str(row.id),
+        parent_chat_id=str(row.parent_chat_id),
+        status=status,
+        source_work_id=str(row.source_work_id),
+        goal_chat_ids=(),
+        activity_changed=True,
+        wake_source_work_id=None,
+      )
+      if status in TERMINAL_DELEGATION_STATUSES:
+        row.source_work_active_chat_id = None
+      _record_lifecycle(db, row, status)
+      db.commit()
+      return plan
+    wakes = (
+      row.notify_parent_on_complete
+      and row.cancelled_at is None
+      and not current_result_delivered(db, row)
+      and status in WAKE_ELIGIBLE_STATUSES
+    )
+    return _ChildSettlePlan(
+      delegation_id=str(row.id),
+      parent_chat_id=str(row.parent_chat_id),
+      status=status,
+      source_work_id=None,
+      goal_chat_ids=plan_change_chat_ids(db, row),
+      activity_changed=status in TERMINAL_DELEGATION_STATUSES,
+      wake_source_work_id=delegation_source_work_id(row) if wakes else None,
+    )
+
+
 async def wake_parent_after_child_settled(child_chat_id: str) -> None:
   """Observe a delegation child's settle transition. Best-effort.
 
@@ -3779,42 +3897,32 @@ async def wake_parent_after_child_settled(child_chat_id: str) -> None:
   terminal result records the parent's live frontier once and refreshes the
   parent's activity surfaces; only an opted-in, unwoken, wake-eligible result
   also wakes the parent."""
-  from app.database import SessionLocal
+  from app.goal_plans import publish_goal_changed
 
   try:
-    with SessionLocal() as db:
-      row = (
-        db.query(models.Delegation)
-        .filter(models.Delegation.child_chat_id == child_chat_id)
-        .first()
+    # Durable reads (and the source-work lifecycle write) run in a worker;
+    # every broadcast and registry read stays here on the loop.
+    plan = await asyncio.to_thread(_plan_child_settle, child_chat_id)
+    if plan is None:
+      return
+    if plan.source_work_id is not None:
+      publish_chat_activity_changed(plan.parent_chat_id)
+      _publish_source_work_status(
+        delegation_id=plan.delegation_id,
+        parent_chat_id=plan.parent_chat_id,
+        source_work_id=plan.source_work_id,
+        status=plan.status,
       )
-      if row is not None and row.source_work_id is not None:
-        status, _, _ = derived_status(db, row, load_result=False)
-        if status in TERMINAL_DELEGATION_STATUSES:
-          row.source_work_active_chat_id = None
-        _record_lifecycle(db, row, status)
-        db.commit()
-        publish_chat_activity_changed(row.parent_chat_id)
-        publish_source_work_changed(row, status)
-        return
-      if row is None:
-        return
-      from app.goal_plans import publish_plan_for_delegation
-      publish_plan_for_delegation(db, row)
-      publish_parent_waiting_changed(row.parent_chat_id)
-      status, _, _ = derived_status(db, row, load_result=False)
-      if status in TERMINAL_DELEGATION_STATUSES:
-        publish_chat_activity_changed(row.parent_chat_id)
-      if (
-        not row.notify_parent_on_complete
-        or row.cancelled_at is not None
-        or current_result_delivered(db, row)
-      ):
-        return
-      if status not in WAKE_ELIGIBLE_STATUSES:
-        return
-      parent_chat_id = row.parent_chat_id
-      source_work_id = delegation_source_work_id(row)
+      return
+    for chat_id in plan.goal_chat_ids:
+      publish_goal_changed(chat_id)
+    publish_parent_waiting_changed(plan.parent_chat_id)
+    if plan.activity_changed:
+      publish_chat_activity_changed(plan.parent_chat_id)
+    if plan.wake_source_work_id is None:
+      return
+    parent_chat_id = plan.parent_chat_id
+    source_work_id = plan.wake_source_work_id
     from app.chat import is_chat_running
     if is_chat_running(parent_chat_id):
       await steer_results_into_running_parent(parent_chat_id, source_work_id)

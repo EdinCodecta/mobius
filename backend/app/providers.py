@@ -1266,17 +1266,48 @@ def sync_app_model_providers(data_dir: str, *, force: bool = False) -> None:
   read throttle avoids adding one app query to every model/agent decision while
   still making install, update and uninstall visible without a server restart.
   """
+  if not _claim_app_provider_sync(force):
+    return
+  declarations = _read_app_model_declarations()
+  if declarations is not None:
+    _apply_app_model_declarations(declarations)
+
+
+async def refresh_app_model_providers(
+  data_dir: str, *, force: bool = False,
+) -> None:
+  """``sync_app_model_providers`` for async callers, with the read off-loop.
+
+  The declaration query is the only slow part, and on a saturated disk it
+  froze the event loop for seconds at every turn start. It runs in a worker
+  thread with its own session; the registry itself is updated back on the
+  calling loop. A sync caller inside the same throttle window reuses this
+  refresh instead of reading again.
+  """
+  if not _claim_app_provider_sync(force):
+    return
+  declarations = await asyncio.to_thread(_read_app_model_declarations)
+  if declarations is not None:
+    _apply_app_model_declarations(declarations)
+
+
+def _claim_app_provider_sync(force: bool) -> bool:
   global _app_provider_sync_at
   now = time.monotonic()
   if not force and now - _app_provider_sync_at < 1.0:
-    return
+    return False
   _app_provider_sync_at = now
+  return True
+
+
+def _read_app_model_declarations() -> list[tuple[Any, dict]] | None:
+  """Accepted app model declarations as plain data; safe in a worker."""
   try:
     from app import models
     from app.database import SessionLocal
     with SessionLocal() as db:
       rows = db.query(models.App).filter(models.App.deleted_at.is_(None)).all()
-      declarations = [
+      return [
         (row.id, row.capability_contract["model_provider"])
         for row in rows
         if isinstance(row.capability_contract, dict)
@@ -1284,7 +1315,10 @@ def sync_app_model_providers(data_dir: str, *, force: bool = False) -> None:
       ]
   except Exception as exc:
     _model_registry_log.warning("app model registry read failed: %s", exc)
-    return
+    return None
+
+
+def _apply_app_model_declarations(declarations: list[tuple[Any, dict]]) -> None:
   next_ids: set[str] = set()
   native_match = next(((app_id, declaration) for app_id, declaration in declarations
                        if declaration.get("transport") == "identity_broker"), None)

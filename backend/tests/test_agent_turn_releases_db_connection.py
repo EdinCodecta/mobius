@@ -92,6 +92,16 @@ async def test_agent_turn_closes_preflight_session_before_provider_wait(
       self.close_calls += 1
       self.real.close()
 
+    def __enter__(self):
+      # Turn-start reads in worker threads open their own short ``with``
+      # sessions; only the turn's own session is opened without one.
+      turn_sessions.remove(self)
+      return self
+
+    def __exit__(self, *exc):
+      self.close()
+      return False
+
     def __getattr__(self, name):
       return getattr(self.real, name)
 

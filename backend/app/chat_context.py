@@ -118,6 +118,18 @@ def _last_user_message_elapsed(db, chat_id: str) -> str | None:
   return None
 
 
+def _last_user_message_elapsed_off_loop(chat_id: str) -> str | None:
+  """``_last_user_message_elapsed`` with its own session, for a worker.
+
+  The backward transcript scan decodes stored rows; on a long chat or a busy
+  disk that froze the event loop at every turn start.
+  """
+  from app.database import SessionLocal
+
+  with SessionLocal() as db:
+    return _last_user_message_elapsed(db, chat_id)
+
+
 def _build_time_context(timezone: str | None, elapsed: str | None = None) -> str:
   """A one-line, per-turn time stamp injected into the user message.
 
