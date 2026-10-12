@@ -14,7 +14,8 @@ def _reply(host, response=None):
   if host._dispatcher_turn is not None:
     turn = host._dispatcher_turn
     host._on_dispatcher_user_message(UserMessage(
-      content=f"{'SPAWN' if turn.kind == 'spawn' else 'MESSAGE'} {turn.dispatch_id}"))
+      content=f"{'SPAWN' if turn.kind == 'spawn' else 'MESSAGE'} {turn.dispatch_id}",
+      origin={'kind': 'human'}))
   host._dispatcher_replied(response)
 
 
@@ -308,15 +309,16 @@ async def test_missing_echo_fails_unstarted_request_visibly_and_releases_host(tm
 async def test_notice_result_before_requested_call_does_not_consume_reply(tmp_path):
   host = _claude_host(tmp_path)
   turn = _turn(tmp_path)
-  sent = asyncio.Event()
+  sent = asyncio.Queue()
   class Dispatcher:
     async def query(self, line):
-      sent.set()
+      await sent.put(line)
   host._client = Dispatcher()
   running = asyncio.create_task(host.run_turn(turn))
-  await sent.wait()
+  assert await sent.get() == f'SPAWN {turn.dispatch_id}'
   from claude_agent_sdk.types import UserMessage
-  host._on_dispatcher_user_message(UserMessage(content='NOTICE unrelated'))
+  host._on_dispatcher_user_message(UserMessage(
+    content='NOTICE unrelated', origin={'kind': 'task-notification'}))
   host._dispatcher_replied()  # Independent task-notification turn.
   await asyncio.sleep(0)
   assert not host._dispatcher_reply.done()
@@ -324,6 +326,35 @@ async def test_notice_result_before_requested_call_does_not_consume_reply(tmp_pa
   host._dispatcher_call('Agent', {'description': turn.dispatch_id}, 'launch')
   host._on_task_started(_Started('agent', 'launch'))
   _reply(host)  # Result of the requested call.
+  turn.finish('completed')
+  assert (await running).status == 'completed'
+  await host.close()
+
+
+@pytest.mark.asyncio
+async def test_task_notice_between_command_echo_and_reply_keeps_dispatch_correlation(tmp_path):
+  host = _claude_host(tmp_path)
+  turn = _turn(tmp_path)
+  sent = asyncio.Queue()
+
+  class Dispatcher:
+    async def query(self, line):
+      await sent.put(line)
+
+  host._client = Dispatcher()
+  running = asyncio.create_task(host.run_turn(turn))
+  assert await sent.get() == f'SPAWN {turn.dispatch_id}'
+  from claude_agent_sdk.types import UserMessage
+  host._on_dispatcher_user_message(UserMessage(
+    content=f'SPAWN {turn.dispatch_id}', origin={'kind': 'human'}))
+  host._on_dispatcher_user_message(UserMessage(
+    content='Task completed', origin={'kind': 'task-notification'}))
+  host._dispatcher_replied()
+  assert await asyncio.wait_for(sent.get(), 1) == f'SPAWN {turn.dispatch_id}'
+  host._dispatcher_call('Agent', {'description': turn.dispatch_id}, 'launch')
+  host._on_task_started(_Started('agent', 'launch'))
+  _reply(host)
+  assert turn.dispatch_error is None
   turn.finish('completed')
   assert (await running).status == 'completed'
   await host.close()

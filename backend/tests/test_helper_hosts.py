@@ -249,7 +249,7 @@ def test_dispatcher_reply_without_the_call_fails_once_without_retry(tmp_path, mo
     async def query(self, line):
       queries.append(line)
       from claude_agent_sdk.types import UserMessage
-      host._on_dispatcher_user_message(UserMessage(content=line))
+      host._on_dispatcher_user_message(UserMessage(content=line, origin={'kind': 'human'}))
       host._dispatcher_replied()
   host._client = ForgetfulDispatcher()
   turn = _turn(tmp_path)
@@ -331,7 +331,7 @@ class _DispatcherClient:
     # A resumed helper reports under the tool call that first launched it.
     self.host._on_task_started(_Started(turn.agent_id or "agent-1", "toolu_spawn"))
     from claude_agent_sdk.types import UserMessage
-    self.host._on_dispatcher_user_message(UserMessage(content=line))
+    self.host._on_dispatcher_user_message(UserMessage(content=line, origin={'kind': 'human'}))
     self.host._dispatcher_replied()
     asyncio.get_running_loop().call_soon(self.settle, turn, verb)
 
@@ -523,7 +523,7 @@ def test_a_dispatch_that_never_starts_says_what_the_dispatcher_did(
     async def query(self, _line):
       host.dispatcher_last = "server_error: API Error: 529 Overloaded"
       from claude_agent_sdk.types import UserMessage
-      host._on_dispatcher_user_message(UserMessage(content=_line))
+      host._on_dispatcher_user_message(UserMessage(content=_line, origin={'kind': 'human'}))
       host._dispatcher_replied()
 
   host._client = _SilentDispatcher()
@@ -850,7 +850,7 @@ def test_dispatcher_prompt_names_the_builtin_tools_and_how_to_load_sendmessage()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('error', ['timeout', 'unreachable'])
+@pytest.mark.parametrize('error', ['reply_timeout', 'launch_failed', 'unreachable'])
 async def test_follow_up_dispatch_failure_does_not_invent_session_loss(
   tmp_path, monkeypatch, error,
 ):
@@ -864,6 +864,7 @@ async def test_follow_up_dispatch_failure_does_not_invent_session_loss(
     session_id = 'saved-host'
     async def run_turn(self, turn, on_started):
       turn.dispatch_error = error
+      turn.summary = 'Some work may have started.'
   @asynccontextmanager
   async def lease(*_):
     yield Host()
@@ -876,7 +877,7 @@ async def test_follow_up_dispatch_failure_does_not_invent_session_loss(
   assert result['session_id'] == 'claude-host:saved-host:child:launch'
   assert 'DELEGATION_WRITE_REVIEW_REQUIRED' in result['error']
   assert 'will not replay work automatically' in result['error']
-  assert ('did not start' in result['error']) == (error == 'timeout')
+  assert ('Some work may have started.' in result['error']) == (error != 'unreachable')
   assert ('could not deliver' in result['error']) == (error == 'unreachable')
 
 

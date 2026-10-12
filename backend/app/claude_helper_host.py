@@ -776,16 +776,12 @@ class ClaudeHelperHost(Host):
     from claude_agent_sdk.types import ToolResultBlock
 
     blocks = message.content if isinstance(message.content, list) else []
-    # Tool results belong to the current turn. A fresh user message,
-    # including a task notice, identifies the next result instead.
-    if not any(isinstance(block, ToolResultBlock) for block in blocks):
-      content = (message.content if isinstance(message.content, str)
-                 else _message_text(message))
-      command = content.strip().split()
-      self._result_dispatch_id = (
-        command[1] if len(command) == 2 and command[0] in ("SPAWN", "MESSAGE")
-        else None
-      )
+    # Only a human-origin root echo can belong to the serialized query. Task
+    # notifications are also UserMessages and may arrive before its Result.
+    origin = getattr(message, "origin", None) or {}
+    if (origin.get("kind") == "human" and self._result_dispatch_id is None
+        and self._dispatcher_turn is not None):
+      self._result_dispatch_id = self._dispatcher_turn.dispatch_id
     for block in blocks:
       if isinstance(block, ToolResultBlock) and block.is_error:
         turn = self._turn_by_tool_use.get(block.tool_use_id)
@@ -1171,8 +1167,7 @@ async def run_claude_host_turn(
         failure = (
           "Claude could not deliver the message to this helper's session."
           if turn.dispatch_error == "unreachable" else
-          "Claude's dispatcher did not start this helper's follow-up. "
-          "This does not establish that its session was lost."
+          (turn.summary or "Claude could not confirm this helper's follow-up.")
         )
         return {
           "session_id": session_id, "cost_usd": None,
