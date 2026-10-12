@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -504,11 +505,14 @@ def _required_helper_protocol(target_sha: str | None = None) -> int | None:
   if target_sha is None:
     return required
   repo = platform_update.PLATFORM_REPO
-  if platform_update._rev(repo, target_sha) != target_sha:
+  try:
+    if platform_update._rev(repo, target_sha) != target_sha:
+      return None
+    shown = platform_update._git(
+      "show", f"{target_sha}:{_HELPER_REQUIREMENT_PATH}", repo=repo, check=False,
+    )
+  except (OSError, subprocess.SubprocessError):
     return None
-  shown = platform_update._git(
-    "show", f"{target_sha}:{_HELPER_REQUIREMENT_PATH}", repo=repo, check=False,
-  )
   if shown.returncode != 0:
     return required  # a release from before the requirement existed
   try:

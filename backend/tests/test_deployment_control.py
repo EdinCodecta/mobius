@@ -288,6 +288,15 @@ async def test_reviewed_rebuild_uses_exact_plan_target_and_digest(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_railway_reviewed_rebuild_never_consults_the_host_helper(monkeypatch):
+  # The host-helper protocol is a self-hosted contract; a managed deployment
+  # has no host status to read and must not be refused for its absence.
+  monkeypatch.setattr(dc, "_ensure_host_helper_meets_release",
+                      lambda _target: pytest.fail("Railway consulted the host helper gate"))
+  await test_reviewed_rebuild_uses_exact_plan_target_and_digest(monkeypatch)
+
+
+@pytest.mark.asyncio
 async def test_reviewed_immutable_plan_does_not_reconsult_moving_ghcr_main(
   monkeypatch,
 ):

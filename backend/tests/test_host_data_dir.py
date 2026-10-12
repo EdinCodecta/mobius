@@ -165,3 +165,15 @@ def test_installer_units_and_config_use_the_stable_path_and_certify_last():
     assert launcher < dispatching < certified < capabilities < complete
     marker = host.Path(host.__file__).parents[1] / "deployment" / "self-hosted-helper.required"
     assert f"HELPER_PROTOCOL={marker.read_text().strip()}\n" in source
+
+
+def test_installer_resolves_data_paths_after_the_clean_checkout_and_before_identity():
+    # Review finding: verify_admission_identity reads DATA_MOUNT_SOURCE, so a
+    # helper-managed host stopped (set -u) before the variable existed. Root
+    # may run the checkout's resolver only after the checkout is proven clean.
+    source = host.Path(host.__file__).parent.joinpath("install-rebuild-helper.sh").read_text()
+    body = source[source.index("PY_ADMISSION\n}\n"):]
+    clean = body.index("diff --quiet HEAD")
+    resolved = body.index("DATA_MOUNT_SOURCE=$(")
+    preflight = body.index("\n  verify_admission_identity\n")
+    assert clean < resolved < preflight

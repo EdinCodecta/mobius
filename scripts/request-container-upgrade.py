@@ -186,7 +186,13 @@ def check_no_pending_update() -> None:
 
 
 def required_helper_protocol(target: str) -> int:
-    """The host helper protocol the target release requires (0 before it existed)."""
+    """The host helper protocol the target release requires.
+
+    Every release that ships this bridge also ships the requirement, so 0 (no
+    requirement) is only a defensive reading. Any requirement, even one older
+    than certification, refuses an uncertified helper: the old helper's
+    cutover path is the hazard whatever the target.
+    """
     shown = git("show", f"{target}:deployment/self-hosted-helper.required")
     if shown.returncode != 0:
         return 0
