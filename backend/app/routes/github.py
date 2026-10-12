@@ -54,6 +54,7 @@ from app import (
   github_auth,
   models,
   providers,
+  transcript_rows,
 )
 from app.config import get_settings
 from app.broadcast import get_system_broadcast
@@ -2669,10 +2670,12 @@ def _source_chat_metadata(app_id: int, source_root: str) -> list[dict]:
     # without edit previews; streaming bounds Python's transcript working set.
     # Full sidecars remain authoritative even when a preview omitted a path.
     candidates = db.query(models.Chat).options(load_only(
-      models.Chat.id, models.Chat.messages,
+      models.Chat.id,
     ), selectinload(models.Chat.live_snapshot)).filter(
       models.Chat.deleted_at.is_(None),
-      or_(cast(models.Chat.messages, Text).contains('"edit_preview"'),
+      or_(models.Chat.id.in_(transcript_rows.chats_with_flag(
+        db, transcript_rows.EDIT_PREVIEW, '"edit_preview"',
+      )),
           models.Chat.live_snapshot.has(
             cast(models.ChatLiveAssistant.snapshot, Text).contains('"edit_preview"'))),
     ).yield_per(20)
@@ -5422,10 +5425,8 @@ async def connect_published_app(
     )
 
   try:
+    await install.fetch_app_commit(spec.source_repo, merge_sha)
     async with fs_locks.source_dir_lock(str(spec.source_repo)):
-      await asyncio.to_thread(
-        app_git.fetch_origin_commit, spec.source_repo, merge_sha,
-      )
       witnessed = await asyncio.to_thread(
         app_git.verify_landed_equivalent_change,
         spec.source_repo,
@@ -5907,9 +5908,7 @@ async def autopilot_respond(
   if status == "escalate":
     await _autopilot_escalate_and_notify(
       db, app_id, record_id, owner_id,
-      "Autopilot reached its five-round limit without resolving the reviews."
-      if verdict.get("reason") == "round_limit"
-      else "Autopilot's follow-up rounds keep failing to complete.",
+      "Autopilot's follow-up rounds keep failing to complete.",
     )
     await autopilot.mirror_to_ledger(app_id, record_id)
     return {"status": "escalated", "reason": verdict.get("reason")}

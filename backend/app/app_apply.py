@@ -17,14 +17,13 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.parse import parse_qs, urlsplit
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app import (
   app_git, app_python_env, chat_app_artifacts, icon_assets, managed_paths, models,
-  service_preload, timeutil,
+  service_preload, timeutil, tracing,
 )
 from app.app_capabilities import (
   contract_from_app_state,
@@ -39,12 +38,13 @@ from app.compiler import (
   unlink_app_bundle,
 )
 from app.config import get_settings
+from app.manifest_identity import requested_manifest_source
 from app.manifest_contract import (
-  ICON_MAX_BYTES,
   MANIFEST_MAX_BYTES,
-  STATIC_ASSET_MAX_BYTES,
-  STATIC_ASSETS_TOTAL_MAX,
+  PACKAGE_MAX_BYTES,
   ManifestContractError,
+  package_bytes_on_disk,
+  package_limit_message,
   static_asset_entries,
   validate_manifest_contract,
   validate_repo_relative_path,
@@ -185,7 +185,6 @@ def _snapshot_static_assets(
 ) -> dict[str, bytes]:
   """Read local package assets from the same immutable tree being accepted."""
   assets: dict[str, bytes] = {}
-  total = 0
   for destination, source in static_asset_entries(
     manifest.get("static_assets") or {},
   ).items():
@@ -211,17 +210,6 @@ def _snapshot_static_assets(
         "static_asset_unreadable",
         f"Could not read manifest static asset {source!r}: {exc}",
       ) from exc
-    if len(raw) > STATIC_ASSET_MAX_BYTES:
-      raise AppApplyError(
-        "static_asset_too_large",
-        f"Manifest static asset {source!r} exceeds {STATIC_ASSET_MAX_BYTES} bytes.",
-      )
-    total += len(raw)
-    if total > STATIC_ASSETS_TOTAL_MAX:
-      raise AppApplyError(
-        "static_assets_too_large",
-        f"Manifest static assets exceed {STATIC_ASSETS_TOTAL_MAX} bytes total.",
-      )
     assets[destination] = raw
   return assets
 
@@ -385,6 +373,9 @@ def _read_manifest(snapshot_dir: Path) -> dict:
     validate_manifest_contract(manifest)
   except ManifestContractError as exc:
     raise AppApplyError("manifest_invalid", str(exc)) from exc
+  size = package_bytes_on_disk(snapshot_dir, manifest)
+  if size > PACKAGE_MAX_BYTES:
+    raise AppApplyError("package_too_large", package_limit_message(size))
   return dict(manifest)
 
 
@@ -432,18 +423,6 @@ def _entry_source(snapshot_dir: Path, relative: str) -> str:
   return source
 
 
-def _normalize_manifest_icon(relative: str, raw: bytes) -> bytes:
-  if len(raw) > ICON_MAX_BYTES:
-    raise AppApplyError(
-      "icon_too_large",
-      f"Manifest icon {relative!r} exceeds the {ICON_MAX_BYTES}-byte limit.",
-    )
-  try:
-    return icon_assets.normalize_icon(raw)
-  except icon_assets.InvalidIcon as exc:
-    raise AppApplyError("icon_invalid", str(exc)) from exc
-
-
 def _manifest_icon(snapshot_dir: Path, manifest: dict) -> bytes | None:
   """Normalize the icon declared by this exact accepted source snapshot."""
   relative = manifest.get("icon")
@@ -460,7 +439,10 @@ def _manifest_icon(snapshot_dir: Path, manifest: dict) -> bytes | None:
     raise AppApplyError(
       "icon_unreadable", f"Could not read manifest icon {relative!r}: {exc}",
     ) from exc
-  return _normalize_manifest_icon(relative, raw)
+  try:
+    return icon_assets.normalize_icon(raw)
+  except icon_assets.InvalidIcon as exc:
+    raise AppApplyError("icon_invalid", str(exc)) from exc
 
 
 def retire_integrated_app_provenance(db: Session) -> tuple[int, list[str]]:
@@ -496,11 +478,9 @@ def _validate_local_identity(
 ) -> None:
   accepted_ids = {source_dir.name}
   if app is not None and app.manifest_url:
-    accepted_ids.update(
-      value for value in parse_qs(urlsplit(app.manifest_url).fragment).get(
-        "manifest-id", []
-      ) if value
-    )
+    _, bound_id = requested_manifest_source(app.manifest_url)
+    if bound_id is not None:
+      accepted_ids.add(bound_id)
   if manifest["id"] not in accepted_ids:
     raise AppApplyError(
       "manifest_id_mismatch",
@@ -558,6 +538,7 @@ def _apply_explicit_package_runtime(
     app.offline_capable = runtime_fields["offline_capable"]
   if "embeds_agent" in manifest:
     app.embeds_agent = bool(manifest["embeds_agent"])
+  app.shell_shortcuts = bool(manifest.get("shell_shortcuts", True))
   app.offline_contract = manifest.get("offline") or None
   app.system_prompt_file = manifest.get("system_prompt") or None
   app.project_templates_json = manifest.get("project_templates") or None
@@ -602,6 +583,7 @@ def _apply_local_manifest_runtime(
   if "offline_capable" in runtime_fields:
     app.offline_capable = runtime_fields["offline_capable"]
   app.embeds_agent = bool(manifest.get("embeds_agent", False))
+  app.shell_shortcuts = bool(manifest.get("shell_shortcuts", True))
   app.offline_contract = manifest.get("offline") or None
   app.system_prompt_file = manifest.get("system_prompt") or None
   app.project_templates_json = manifest.get("project_templates") or None
@@ -643,6 +625,7 @@ def _live_runtime_state(app: models.App) -> tuple:
     app.connect_manage,
     app.offline_capable,
     app.embeds_agent,
+    app.shell_shortcuts,
     app.offline_contract,
     app.system_prompt_file,
     app.project_templates_json,
@@ -662,6 +645,28 @@ def _live_runtime_state(app: models.App) -> tuple:
 
 
 async def apply_source_revision(
+  db: Session,
+  *,
+  source_dir: str,
+  app: models.App | None,
+  chat_id: str | None,
+  accept_local_package: bool = False,
+) -> ApplyResult:
+  """Compile, accept, and publish one source revision (traced as app.apply)."""
+  with tracing.span("app.apply", {
+    "mobius.app_id": app.id if app is not None else None,
+    "mobius.chat_id": chat_id,
+  }):
+    return await _apply_source_revision(
+      db,
+      source_dir=source_dir,
+      app=app,
+      chat_id=chat_id,
+      accept_local_package=accept_local_package,
+    )
+
+
+async def _apply_source_revision(
   db: Session,
   *,
   source_dir: str,
