@@ -20,6 +20,16 @@ from app.goal_commands import (
 )
 
 
+def open_goal_identity_for_chat(
+  db: Session, chat_id: str, goal_id: str | None,
+) -> tuple[str | None, str | None]:
+  """Bind a run only to an open Goal owned by that run's chat."""
+  goal = db.get(models.ChatGoal, goal_id) if goal_id else None
+  if goal is None or goal.chat_id != chat_id or goal.status != "open":
+    return None, None
+  return goal.objective, goal.id
+
+
 def _recoverable_result_goal(
   db: Session,
   chat_id: str,
@@ -28,10 +38,7 @@ def _recoverable_result_goal(
   """A delivery names its Goal; only the Goal's explicit outcome can retire it."""
   if source is None or not source.goal_id:
     return None, None
-  goal = db.get(models.ChatGoal, source.goal_id)
-  if goal is None or goal.chat_id != chat_id or goal.status != "open":
-    return None, None
-  return goal.objective, goal.id
+  return open_goal_identity_for_chat(db, chat_id, source.goal_id)
 
 
 def _wait_result_row(db, chat_id, message):
@@ -82,10 +89,7 @@ def goal_identity_for_run_start(db, chat_id, message):
     # New peer carriers retain the exact Goal, including an explicit NULL.
     # Uncorrelated old carriers cannot prove ownership after source rebinding.
     goal_id = message.get("goal_id")
-    goal = db.get(models.ChatGoal, goal_id) if goal_id else None
-    if goal is not None and goal.chat_id == chat_id and goal.status == "open":
-      return goal.objective, goal.id
-    return None, None
+    return open_goal_identity_for_chat(db, chat_id, goal_id)
   if exact_goal_id:
     goal = db.get(models.ChatGoal, exact_goal_id)
     if goal is not None and goal.chat_id == chat_id and goal.status == "open":
@@ -171,13 +175,7 @@ def queued_continuation_root(
   ):
     source = query.filter(models.ChatRun.id == source_work_id).first()
   elif kind == DELEGATION_RESULT_MESSAGE_KIND:
-    source = query.filter(
-      models.ChatRun.goal_id == source_work_id,
-    ).order_by(
-      models.ChatRun.started_at.desc(), models.ChatRun.id.desc(),
-    ).first()
-    if source is None:
-      source = query.filter(models.ChatRun.id == source_work_id).first()
+    return helper_result_continuation_root(db, chat_id, source_work_id)
   else:
     return None
   if source is None:
@@ -188,6 +186,46 @@ def queued_continuation_root(
     models.ChatRun.id == root_run_id,
   ).first()
   return root_run_id if exists is not None else None
+
+
+def helper_result_continuation_root(
+  db: Session, chat_id: str, source_work_id: str,
+) -> str | None:
+  """A Goal's helpers resume its latest attempt, not their spawning attempt."""
+  query = db.query(models.ChatRun).filter(models.ChatRun.chat_id == chat_id)
+  goal = db.query(models.ChatGoal).filter(
+    models.ChatGoal.id == source_work_id,
+    models.ChatGoal.chat_id == chat_id,
+  ).first()
+  source = None
+  if goal is not None:
+    source = query.filter(models.ChatRun.goal_id == goal.id).order_by(
+      models.ChatRun.started_at.desc(), models.ChatRun.id.desc(),
+    ).first()
+    if source is None and goal.completion_run_id:
+      source = query.filter(models.ChatRun.id == goal.completion_run_id).first()
+  if source is None:
+    # Plain work names its own physical root.
+    source = query.filter(models.ChatRun.id == source_work_id).first()
+  if source is None:
+    # Nested helpers inherit an ancestor Goal without a ChatGoal in this chat.
+    # Resolve the newest spawning attempt, not the first helper inserted for
+    # this source. Multiple helpers may share an attempt.
+    source = query.join(
+      models.Delegation,
+      models.Delegation.parent_root_run_id == models.ChatRun.id,
+    ).filter(
+      models.Delegation.parent_chat_id == chat_id,
+      (models.Delegation.goal_id == source_work_id) |
+      ((models.Delegation.goal_id.is_(None)) &
+       (models.Delegation.parent_root_run_id == source_work_id)),
+    ).order_by(
+      models.ChatRun.started_at.desc(), models.ChatRun.id.desc(),
+    ).first()
+  if source is None:
+    return None
+  root = source.root_run_id or source.id
+  return root if query.filter(models.ChatRun.id == root).first() is not None else None
 
 
 def latest_run(db: Session, chat_id: str) -> models.ChatRun | None:

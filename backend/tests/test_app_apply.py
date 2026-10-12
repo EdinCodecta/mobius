@@ -850,6 +850,39 @@ def test_compile_failure_keeps_previous_live_revision(client, auth, db):
   assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == previous_head
 
 
+def test_stalled_build_is_reported_as_environment_not_source(
+  client, auth, db, monkeypatch,
+):
+  """A build stopped by its wall limit must not read as a compile failure."""
+  from app import compiler
+
+  source = _source()
+  created = _apply(client, auth, source)
+  app_id = created.json()["app"]["id"]
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  previous_bundle = row.compiled_path
+  previous_head = app_git.head_sha(source, app_git.LOCAL_BRANCH)
+  (source / "index.jsx").write_text(
+    "export default function App(){ return 'second' }\n"
+  )
+  monkeypatch.setattr(compiler, "ROLLDOWN_WALL_LIMIT_SECS", 1)
+  monkeypatch.setattr(
+    compiler, "rolldown_command",
+    lambda *_args, **_kwargs: ["sleep", "300"],
+  )
+
+  failed = _apply(client, auth, source)
+
+  assert failed.status_code == 503
+  detail = failed.json()["detail"]
+  assert detail["code"] == "build_stalled"
+  assert "source was not judged" in detail["message"]
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert row.compiled_path == previous_bundle
+  assert "first" in row.jsx_source
+  assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == previous_head
+
+
 def test_compile_failure_reports_the_error_and_location_without_colour(client, auth):
   source = _source()
   _apply(client, auth, source)

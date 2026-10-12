@@ -14,6 +14,8 @@ from app import auth as auth_mod, models
 from app.goal_context import project_goal
 from app.goal_plans import goal_assignment, normalize_tasks
 from tests.goal_fixtures import goal_run
+# Bind the real Claude runner helpers before any test patches the runner.
+from tests.test_claude_sdk_runner import _Bus, _install_fake_client, _run_turn
 
 # Sample sizes for structural projection tests; not plan admission limits.
 MAX_TASKS = 64
@@ -529,7 +531,6 @@ def _stale_refresh(text="FRESH_BRIEF"):
 
 @pytest.mark.asyncio
 async def test_claude_compaction_refreshes_brief_at_next_root_tool_result(monkeypatch):
-  from tests.test_claude_sdk_runner import _Bus, _install_fake_client, _run_turn
   clients = _install_fake_client(monkeypatch)
   refresh = _stale_refresh()
   await _run_turn("chat-claude-refresh", bc=_Bus(), cwd="/data", goal_brief_refresh=refresh)
@@ -685,7 +686,6 @@ def test_goal_less_turn_arms_lazy_refresh_for_mid_turn_promotion(
     assert refresh is not None
     assert await refresh.take() == ""
     if provider == "claude":
-      from tests.test_claude_sdk_runner import _Bus, _install_fake_client, _run_turn
       clients = _install_fake_client(monkeypatch)
       await _run_turn(chat_id, bc=_Bus(), goal_brief_refresh=refresh)
       hooks = clients[0].options.hooks

@@ -1105,10 +1105,6 @@ class ChatEventSink:
       # Projection metadata belongs to the exact segment and goes through the
       # normal writer snapshot, never a second user-visible text broadcast.
       content = event.get("content")
-      if content is None and event.get("text_item_id"):
-        content = next((block.get("content", "") for block in reversed(self.assistant_blocks)
-                        if block.get("type") == "text"
-                        and block.get("text_item_id") == event["text_item_id"]), None)
       if isinstance(content, str):
         self._assistant_result = (self.assistant_message_id, content)
       return True

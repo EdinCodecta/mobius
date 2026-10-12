@@ -44,6 +44,8 @@ log = logging.getLogger(__name__)
 
 SESSION_PREFIX = "claude-host:"
 DISPATCH_MODEL = "haiku"
+DISPATCH_REASKS = 2
+DISPATCH_REPLY_TIMEOUT_SECONDS = 120
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 BUILTIN_HELPER_TOOLS = ("Agent", "Task", "Workflow")
 DISPATCHER_PROMPT = (
@@ -260,6 +262,7 @@ class HelperTurn:
   report: HelperReport = dataclasses.field(default_factory=HelperReport)
   usage: dict | None = None
   dispatch_error: str | None = None
+  dispatch_tool_error: bool = False
   dispatch_consumed: bool = False
   dispatch_cancelled: bool = False
   # The helper's last API error from its provider, as (kind, message text).
@@ -305,7 +308,8 @@ class ClaudeHelperHost(Host):
     # helper lifetimes. The host owns draining a cancelled admission's reply,
     # so it cannot be mistaken for the next helper's dispatcher response.
     self._dispatcher_reply: asyncio.Future | None = None
-    self._dispatcher_failed = False
+    self._dispatcher_turn: HelperTurn | None = None
+    self._result_dispatch_id: str | None = None
     self._host_tasks: set[asyncio.Task] = set()
     # The CLI's last stderr lines, logged if the host process ends.
     self.stderr_tail: list[str] = []
@@ -319,8 +323,7 @@ class ClaudeHelperHost(Host):
 
   @property
   def alive(self) -> bool:
-    if (self._closed or self._client is None
-        or (self._dispatcher_failed and self._leases == 0)):
+    if self._closed or self._client is None:
       return False
     if self._reader is not None and self._reader.done():
       return False
@@ -511,7 +514,8 @@ class ClaudeHelperHost(Host):
       if not brief:
         return {}
       return {"hookSpecificOutput": {
-        "hookEventName": "PostToolUse", "additionalContext": brief,
+        "hookEventName": input_data.get("hook_event_name") or "PostToolUse",
+        "additionalContext": brief,
       }}
     if input_data.get("tool_name") not in ("Agent", "SendMessage"):
       return {}
@@ -531,9 +535,12 @@ class ClaudeHelperHost(Host):
   def _fail_dispatch(self, tool_use_id, tool_name: str) -> None:
     turn = self._turn_by_tool_use.get(tool_use_id or "")
     if turn is not None and not turn.started.is_set():
-      turn.dispatch_error = "unreachable" if tool_name == "SendMessage" else "launch_failed"
-      log.warning("helper dispatch failed kind=%s id=%s", turn.kind, turn.dispatch_id)
-      turn.finish("failed", "The provider could not dispatch this helper turn.")
+      # A definite tool error did not start a helper. Restore only this spec;
+      # a successful or ambiguous one-shot call must never be replayed.
+      turn.dispatch_tool_error = True
+      if not turn.done.is_set() and turn.dispatch_id in self._turn_by_dispatch:
+        self._specs[turn.dispatch_id] = turn.spec
+      log.warning("helper dispatch tool error kind=%s id=%s", turn.kind, turn.dispatch_id)
 
   async def subagent_stop(self, input_data, tool_use_id, context) -> dict:
     """Capture the documented final response, never a task notification summary.
@@ -613,12 +620,8 @@ class ClaudeHelperHost(Host):
         parent = getattr(message, "parent_tool_use_id", None)
         error = getattr(message, "error", None)
         if not parent:
-          if isinstance(message, UserMessage) and isinstance(message.content, list):
-            for block in message.content:
-              if isinstance(block, ToolResultBlock) and block.is_error:
-                turn = self._turn_by_tool_use.get(block.tool_use_id)
-                if turn is not None:
-                  self._fail_dispatch(block.tool_use_id, "Agent" if turn.kind == "spawn" else "SendMessage")
+          if isinstance(message, UserMessage):
+            self._on_dispatcher_user_message(message)
           session = getattr(message, "session_id", None)
           if session:
             self._save_session(session)
@@ -692,7 +695,8 @@ class ClaudeHelperHost(Host):
     if turn is None or turn.done.is_set() or self._identity_closed:
       self._reject_identity(message.task_id)
       if (turn is not None and turn.dispatch_consumed and not self._identity_closed
-          and (turn.dispatch_cancelled or turn.dispatch_error)):
+          and (turn.dispatch_cancelled or
+               (turn.dispatch_error and turn.kind == "spawn"))):
         self._own_task(self._stop_agent(message.task_id))
       return
     self._rejected_agents.discard(message.task_id)
@@ -728,9 +732,6 @@ class ClaudeHelperHost(Host):
     ``on_started`` is awaited once the turn's agent exists, before the turn
     settles.
     """
-    if self._dispatcher_failed:
-      self._fail_unsubmitted(turn)
-      return turn
     if self._identity_closed:
       turn.host_lost = True
       turn.finish("failed", "The helper host is no longer available.")
@@ -738,6 +739,7 @@ class ClaudeHelperHost(Host):
     self._specs[turn.dispatch_id] = turn.spec
     self._turn_by_dispatch[turn.dispatch_id] = turn
     if turn.kind == "message" and turn.agent_id:
+      self._rejected_agents.discard(turn.agent_id)
       # Route the resumed helper's output to this turn from its first event;
       # its messages carry its original launch id.
       self._turn_by_agent[turn.agent_id] = turn
@@ -763,24 +765,6 @@ class ClaudeHelperHost(Host):
       self._specs.pop(turn.dispatch_id, None)
       self._turn_by_dispatch.pop(turn.dispatch_id, None)
 
-  def _fail_unsubmitted(self, turn: HelperTurn) -> None:
-    self._specs.pop(turn.dispatch_id, None)
-    turn.dispatch_error = "launch_failed"
-    turn.finish("failed", "Claude could not start this helper request. "
-                "Its dispatcher is unavailable; no work was launched or message sent.")
-
-  def _retire_dispatcher(self) -> None:
-    """An ambiguous stream may drain, but never admit another request.
-
-    Existing helpers keep running. Queued requests fail visibly and release
-    their leases, so the normal host lifecycle can replace this host once its
-    active helpers settle, even when no reply to the failed query will arrive.
-    """
-    self._dispatcher_failed = True
-    for queued in list(self._turn_by_dispatch.values()):
-      if not queued.done.is_set() and not queued.dispatch_consumed:
-        self._fail_unsubmitted(queued)
-
   def _own_task(self, work) -> None:
     task = asyncio.create_task(work)
     self._host_tasks.add(task)
@@ -793,61 +777,99 @@ class ClaudeHelperHost(Host):
       except Exception:
         log.warning("helper task stop failed agent=%s", agent_id, exc_info=True)
 
-  async def _dispatch(self, turn: HelperTurn) -> None:
-    """One request and its exact reply; no model retries or guessed deadlines.
+  def _on_dispatcher_user_message(self, message) -> None:
+    from claude_agent_sdk.types import ToolResultBlock
 
-    A stopped turn returns locally. The host still drains a submitted query's
-    reply before accepting the next request; close() cancels that drain.
-    """
+    blocks = message.content if isinstance(message.content, list) else []
+    # SDK query echoes have no origin in the production CLI. Only explicitly
+    # tagged injected turns (notably task notifications) are foreign.
+    origin = getattr(message, "origin", None)
+    if ((origin is None or origin.get("kind") == "human")
+        and self._result_dispatch_id is None
+        and self._dispatcher_turn is not None):
+      self._result_dispatch_id = self._dispatcher_turn.dispatch_id
+    for block in blocks:
+      if isinstance(block, ToolResultBlock) and block.is_error:
+        turn = self._turn_by_tool_use.get(block.tool_use_id)
+        if turn is not None:
+          self._fail_dispatch(block.tool_use_id, "Agent" if turn.kind == "spawn" else "SendMessage")
+
+  async def _dispatch(self, turn: HelperTurn) -> None:
+    """Serialize commands and drain each exact reply before the next request."""
     async with self._query_lock:
-      if turn.done.is_set() or self._identity_closed or self._dispatcher_failed:
+      if turn.done.is_set() or self._identity_closed:
         return
-      replied = asyncio.get_running_loop().create_future()
-      self._dispatcher_reply = replied
-      try:
-        verb = "SPAWN" if turn.kind == "spawn" else "MESSAGE"
-        await self._client.query(f"{verb} {turn.dispatch_id}")
-        response = await replied
-        if turn.done.is_set():
+      verb = "SPAWN" if turn.kind == "spawn" else "MESSAGE"
+      for attempt in range(DISPATCH_REASKS + 1):
+        if turn.done.is_set() or turn.started.is_set():
           return
-        if getattr(response, "is_error", False) and not turn.started.is_set():
+        replied = asyncio.get_running_loop().create_future()
+        self._dispatcher_reply = replied
+        self._dispatcher_turn = turn
+        self._result_dispatch_id = None
+        try:
+          async with asyncio.timeout(DISPATCH_REPLY_TIMEOUT_SECONDS):
+            await self._client.query(f"{verb} {turn.dispatch_id}")
+            response = await replied
+          if turn.done.is_set():
+            return
+          if (getattr(response, "is_error", False)
+              and not (turn.dispatch_tool_error and turn.dispatch_id in self._specs)):
+            if not turn.started.is_set():
+              turn.dispatch_error = "launch_failed"
+              turn.finish("failed", "Claude failed to dispatch this helper request. "
+                          "Möbius will not replay it automatically.")
+            return
+          if turn.started.is_set():
+            return
+          if turn.dispatch_id not in self._specs:
+            return  # The one-shot tool call was consumed; never replay it.
+          if attempt < DISPATCH_REASKS:
+            continue
           self._specs.pop(turn.dispatch_id, None)
-          turn.dispatch_error = "launch_failed"
-          turn.finish("failed", "Claude failed to dispatch this helper request. "
-                      "Möbius will not replay it automatically.")
-        elif turn.dispatch_id in self._specs:
-          self._specs.pop(turn.dispatch_id, None)
-          turn.dispatch_error = "not_called"
-          log.warning(
-            "helper dispatch %s %s completed without its tool call key=%s "
-            "tool_call_seen=False dispatcher_last=%r",
-            turn.kind, turn.dispatch_id, self.key.digest, self.dispatcher_last,
-          )
-          turn.finish("failed", "Claude finished without starting this helper or "
-                      "sending its message. No work was launched or message sent.")
-      except asyncio.CancelledError:
-        raise
-      except Exception:
-        log.warning("helper dispatch query failed id=%s", turn.dispatch_id, exc_info=True)
-        if not turn.done.is_set():
-          turn.dispatch_error = turn.dispatch_error or "launch_failed"
-          turn.finish("failed", "Claude could not confirm this helper request. "
-                      "Some work may have started; Möbius will not replay it automatically.")
-          if turn.agent_id and turn.dispatch_consumed:
-            self._own_task(self._stop_agent(turn.agent_id))
-        # Submission may have reached Claude, or failed before producing any
-        # reply at all. Retire admissions rather than wait on an undrainable
-        # response or attribute a late result to a future request.
-        self._retire_dispatcher()
-      finally:
-        if not replied.done():
-          replied.cancel()
-        self._dispatcher_reply = None
+          if turn.dispatch_tool_error:
+            turn.dispatch_error = "unreachable" if turn.kind == "message" else "launch_failed"
+            summary = ("Claude's helper dispatch tool failed and the retry budget was "
+                       "exhausted. No helper started or message was sent.")
+          else:
+            turn.dispatch_error = "not_called"
+            summary = ("Claude finished without starting this helper or sending its "
+                       "message. No work was launched or message sent.")
+          log.warning("helper dispatch %s %s completed without its tool call key=%s "
+                      "dispatcher_last=%r", turn.kind, turn.dispatch_id,
+                      self.key.digest, self.dispatcher_last)
+          turn.finish("failed", summary)
+        except asyncio.CancelledError:
+          raise
+        except TimeoutError:
+          log.warning("helper dispatch reply timed out id=%s key=%s", turn.dispatch_id, self.key.digest)
+          if not turn.started.is_set() and not turn.done.is_set():
+            self._specs.pop(turn.dispatch_id, None)
+            turn.dispatch_error = "reply_timeout"
+            turn.finish("failed", "Claude did not confirm this helper request in time. "
+                        "Some work may have started; Möbius will not replay it automatically.")
+        except Exception:
+          log.warning("helper dispatch query failed id=%s", turn.dispatch_id, exc_info=True)
+          if not turn.started.is_set() and not turn.done.is_set():
+            turn.dispatch_error = "launch_failed"
+            turn.finish("failed", "Claude could not confirm this helper request. "
+                        "Some work may have started; Möbius will not replay it automatically.")
+          # Do not discard the saved session or close this host: already-started
+          # helpers and their agent ids must remain reachable on later turns.
+        finally:
+          if not replied.done():
+            replied.cancel()
+          self._dispatcher_reply = None
+          self._dispatcher_turn = None
+        return
 
   def _dispatcher_replied(self, response=None) -> None:
     reply = self._dispatcher_reply
-    if reply is not None and not reply.done():
+    turn = self._dispatcher_turn
+    if (reply is not None and not reply.done() and turn is not None
+        and self._result_dispatch_id == turn.dispatch_id):
       reply.set_result(response)
+    self._result_dispatch_id = None
 
   async def stop(self, turn: HelperTurn) -> None:
     turn.dispatch_cancelled = True
@@ -1046,7 +1068,11 @@ def _host_options(
         "PreCompact": [HookMatcher(matcher=None, hooks=[host.pre_compact])],
         "SubagentStop": [HookMatcher(hooks=[host.subagent_stop])],
       },
-      extra_args={"settings": json.dumps({"disableWorkflows": True})},
+      # Required for the root UserMessage echo that correlates each query's
+      # ResultMessage. Verified against the production CLI; without it a
+      # no-call reply cannot release the serialized dispatcher lock.
+      extra_args={"settings": json.dumps({"disableWorkflows": True}),
+                  "replay-user-messages": None},
     )
     if skills_enabled:
       options["skills"] = "all"
@@ -1159,8 +1185,7 @@ async def run_claude_host_turn(
         failure = (
           "Claude could not deliver the message to this helper's session."
           if turn.dispatch_error == "unreachable" else
-          "Claude's dispatcher did not start this helper's follow-up. "
-          "This does not establish that its session was lost."
+          (turn.summary or "Claude could not confirm this helper's follow-up.")
         )
         return {
           "session_id": session_id, "cost_usd": None,

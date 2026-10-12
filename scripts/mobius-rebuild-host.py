@@ -55,13 +55,18 @@ REQUEST_VERSIONS = [1, 2]
 # each requested official image only when this number is higher than every
 # worker it has run. Increase it with every change to this file; never lower
 # it. The launcher reads it as text, so keep it a plain literal on one line.
-WORKER_REVISION = 14
+WORKER_REVISION = 15
 # The frozen launcher runs the worker selected here; see offer_worker().
 WORKERS = STATE_DIR / "workers"
 WORKER_INDEX = STATE_DIR / "workers.json"
 WORKER_IN_IMAGE = "/app/platform-baked/scripts/mobius-rebuild-host.py"
 MAX_WORKER_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 4096
+# The installer records the helper protocol it completed (units, config,
+# launcher and admission helper together). Workers only report it; the app
+# refuses to dispatch a replacement until it meets the served source's
+# deployment/self-hosted-helper.required.
+HELPER_PROTOCOL = STATE_DIR / "helper-protocol"
 ADMISSION_CODE = Path("/usr/local/libexec/mobius-boot-admission.py")
 ADMISSION_ROOT = STATE_DIR / "admission"
 ADMISSION_CODE_TARGET = "/run/mobius-boot-admission.py"
@@ -194,6 +199,59 @@ def config() -> dict:
 
 
 
+def installed_helper_protocol(*, trusted_uid: int = 0) -> int:
+    """The protocol a completed installer run certified; 0 when unknown."""
+    try:
+        info = HELPER_PROTOCOL.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != trusted_uid
+                or info.st_mode & 0o022):
+            return 0
+        value = HELPER_PROTOCOL.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return 0
+    return int(value) if re.fullmatch(r"[1-9][0-9]{0,5}", value) else 0
+
+
+def persistent_data_dir(kind: str, source: str) -> str:
+    """The host directory that IS the app's /data whether or not it runs.
+
+    A bind mount's source is that directory. A plain ``local`` volume keeps
+    its data in Docker's Mountpoint. A ``local`` volume created with bind
+    options (type=none, o=bind, device=DIR) is only *mounted* at its
+    Mountpoint while a container uses it: once the app container is removed
+    -- exactly when a replacement or rollback needs the data -- that path is
+    a stale, unrelated directory on the host's root filesystem. Host reads,
+    writes, watches and ``docker run --mount type=bind`` must use DIR.
+    Anything the host cannot reach while the app is stopped is refused.
+    """
+    if kind == "bind":
+        path = source
+    elif kind == "volume":
+        volume = json.loads(docker_command(
+            ["docker", "volume", "inspect", "--format", "{{json .}}", source],
+            timeout=30,
+        ).stdout)
+        options = volume.get("Options") or {}
+        if volume.get("Name") != source or volume.get("Driver") != "local":
+            raise RuntimeError("the /data volume must use Docker's local driver so the "
+                               "host helper can reach it while the app is stopped")
+        if not options:
+            path = volume.get("Mountpoint", "")
+        elif (set(options) <= {"type", "o", "device"} and options.get("type") == "none"
+              and {"bind", "rbind"} & set(str(options.get("o", "")).split(","))
+              and "ro" not in str(options.get("o", "")).split(",")):
+            path = options.get("device", "")
+        else:
+            raise RuntimeError("the /data volume's driver options hide its data from the "
+                               "host while the app is stopped; use a bind mount or a "
+                               "plain local volume")
+    else:
+        raise RuntimeError("replacement cannot preserve this /data mount type")
+    if not isinstance(path, str) or not os.path.isabs(path) or not os.path.isdir(path):
+        raise RuntimeError("the persistent /data directory is not reachable on the host")
+    return os.path.realpath(path)
+
+
 def write_status(config_value: dict, **fields) -> dict:
     current = {
         "supported": True, "operation_id": None, "state": "idle",
@@ -210,6 +268,7 @@ def write_status(config_value: dict, **fields) -> dict:
     current["handoff"] = HANDOFF_VERSION
     current["request_versions"] = REQUEST_VERSIONS
     current["worker_revision"] = WORKER_REVISION
+    current["helper_protocol"] = installed_helper_protocol()
     launcher = os.environ.get("MOBIUS_REBUILD_LAUNCHER", "")
     current["launcher_revision"] = int(launcher) if launcher.isdigit() else None
     current.pop("runtime_overlay", None)
@@ -420,18 +479,14 @@ def wrapped_configuration(config_value: dict, transaction: dict, role: str,
     if len(data_mounts) != 1 or data_mounts[0].get("read_only", False):
         raise RuntimeError("replacement must preserve one writable /data mount")
     data_mount = data_mounts[0]
-    if data_mount.get("type") == "bind":
-        data_source = data_mount.get("source", "")
-    elif data_mount.get("type") == "volume":
-        volume = resolved.get("volumes", {}).get(data_mount.get("source"), {})
-        name = volume.get("name")
-        if not name:
+    source = data_mount.get("source", "")
+    if data_mount.get("type") == "volume":
+        source = resolved.get("volumes", {}).get(source, {}).get("name")
+        if not source:
             raise RuntimeError("persistent data volume has no immutable resource name")
-        data_source = docker_command(["docker", "volume", "inspect", "--format", "{{.Mountpoint}}", name]).stdout.strip()
-    else:
-        raise RuntimeError("replacement cannot preserve this /data mount type")
-    if os.path.realpath(data_source) != os.path.realpath(config_value["data_dir"]):
-        raise RuntimeError("replacement /data mount differs from the trusted deployment")
+    if persistent_data_dir(data_mount.get("type"), source) != os.path.realpath(config_value["data_dir"]):
+        raise RuntimeError("the trusted host data path is not this deployment's persistent "
+                           "/data; rerun scripts/install-rebuild-helper.sh")
     prefix = ["python3", "-I", "-S", ADMISSION_CODE_TARGET, "enter",
               "--state-dir", ADMISSION_STATE_TARGET, "--data-dir", "/data",
               "--token", token, "--"]
@@ -2205,7 +2260,33 @@ def reconcile() -> int:
     return 0
 
 
+def data_source(cid: str) -> int:
+    """Installer discovery: the live app's stable /data and Docker's view of it."""
+    if not FULL_CID_RE.fullmatch(cid):
+        print("invalid container id", file=sys.stderr)
+        return 2
+    mounts = json.loads(docker_command(
+        ["docker", "container", "inspect", "--format", "{{json .Mounts}}", cid], timeout=30,
+    ).stdout) or []
+    data = [mount for mount in mounts if mount.get("Destination") == "/data"]
+    if len(data) != 1 or not data[0].get("RW"):
+        print("the app must have exactly one writable /data mount", file=sys.stderr)
+        return 1
+    mount = data[0]
+    try:
+        stable = persistent_data_dir(
+            mount.get("Type"), mount.get("Name") if mount.get("Type") == "volume" else mount.get("Source"))
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps({"data_dir": stable, "mount_source": mount.get("Source")},
+                     separators=(",", ":")))
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "data-source" and os.geteuid() == 0:
+        raise SystemExit(data_source(sys.argv[2]))
     if len(sys.argv) == 2 and sys.argv[1] == "publish-capabilities" and os.geteuid() == 0:
         raise SystemExit(publish_capabilities())
     if len(sys.argv) == 2 and sys.argv[1] == "run" and os.geteuid() == 0:

@@ -147,7 +147,7 @@ When the partner asks to share a local-first app as a repo, make the existing so
 1. Keep `mobius.json` at the repo root with stable `id`, `name`, `version`, `description`, `entry`, `icon`, complete `source_files`, any `static_assets`, permissions, and offline flags.
 2. Keep runtime data, tokens, logs, generated reports, and local caches out of the repo; source plus declared static assets only.
 3. Initialize git in the app source if needed: `git init -b main`, commit, push to GitHub, and keep the package at repo root on `main` or a tag. Root packages give the installer a real `origin` clone and clean PR-friendly diffs; repo subdirs and branch names with slashes fall back to synthetic upstream tracking.
-4. Run `python3 /data/platform/backend/scripts/validate-app.py /data/apps/<name>` before push. It checks the declared source/import closure and bundles the real entry with the installer’s exact Rolldown contract, catching missing files, missing default exports, and production-only compile failures locally.
+4. Run `python3 /data/platform/backend/scripts/validate-app.py /data/apps/<name>` before push. It checks the declared source/import closure and bundles the real entry with the installer’s exact Rolldown contract, catching missing files, missing default exports, and production-only compile failures locally. Exit 3 (`INCONCLUSIVE`, or `build_stalled` from apply) means the machine was too busy to finish the build, not that the source is wrong: retry later instead of editing.
 5. Smoke-install from the raw GitHub `mobius.json` URL on a clean instance or under a test slug before calling it shareable.
 
 **Don't hand-bump a version constant in app source.** If an app carries its released version inline (e.g. `const APP_VERSION = '1.2.0'`), leave that line alone — the catalog/installer sets it per release, not your edits. Bumping it locally guarantees a merge conflict on the *next* update: your bump and the new release's bump land on the same line, so every update stops to ask the owner to reconcile a version number. Git already tracks your edits — you never need a version bump to record them. (This is the single most common avoidable update conflict.)
@@ -259,7 +259,9 @@ manifest, layered by how always-on they are:
 - **A system-prompt fragment (always-on, while installed).**
   `"system_prompt": "<name>.md"` (also a root-level `source_files` entry) —
   the file is appended to the base system prompt for EVERY chat, but ONLY while
-  the app is installed; uninstall removes it. Use it for a short,
+  the app is installed; uninstall removes it. Chats read it from the app's
+  last applied version, so an edit reaches chats started after the next
+  apply, never while it is still being written. Use it for a short,
   always-relevant default the agent should carry without being asked, and keep
   it tight — it costs tokens on every session. Memory ships `memory-core.md`;
   Pages ships `pages-core.md`. Max 256 KB.
@@ -835,6 +837,35 @@ useEffect(() => {
   can show status without reading transcripts.
 - Keep the chat as the interaction surface; it gives the user a persistent
   transcript, normal agent tooling, and follow-up questions in one place.
+
+---
+
+## Pausing work while the app is hidden
+
+The shell keeps recently used apps loaded but hidden so switching back is
+instant. A hidden app frame's `document.hidden` stays `false` unless the whole
+browser tab is hidden, so a timer gated only on `document.hidden` keeps
+polling, animating, or playing audio for an app nobody can see. Gate that work
+on the runtime's combined signal instead:
+
+```jsx
+useEffect(() => {
+  let timer = null
+  const stop = window.mobius.onVisibilityChange((visible) => {
+    clearInterval(timer)
+    if (!visible) return
+    refresh() // catch up at once on return, then resume the cadence
+    timer = setInterval(refresh, 5000)
+  })
+  return () => { clearInterval(timer); stop() }
+}, [])
+```
+
+`window.mobius.visible` is `true` only while the shell shows this frame and the
+tab is visible. `onVisibilityChange(cb)` calls `cb(visible)` immediately and on
+every change, and returns an unsubscribe function. A Store app that may run on
+an older Möbius checks `window.mobius.runtimeFeatures?.frameVisibility` and
+otherwise falls back to `document.hidden` with `visibilitychange`.
 
 ---
 

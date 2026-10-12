@@ -1,6 +1,6 @@
 """A Goal is durable work, not the physical turn executing it."""
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -151,3 +151,42 @@ def test_completed_goal_can_promote_successor_and_reuse_helper_name_without_old_
   assert goal_identity_for_run_start(db, chat.id, {
     "kind": "wait_result", "cid": f"wait-result-{wait.id}", "source_work_id": run.id,
   }) == (None, None)
+
+
+def test_promotion_adopts_only_this_runs_unowned_helpers_and_nested_descendants(db, chat):
+  from app.delegations import DelegationIntent, create_or_attach_delegation, own_helper_statuses
+  from app.goal_plans import _delegation_tree, active_goal_helpers
+
+  started = datetime.now(UTC).replace(tzinfo=None)
+  previous = models.ChatRun(id="previous", root_run_id="previous", chat_id=chat.id,
+                            status="completed", started_at=started - timedelta(minutes=2))
+  run = models.ChatRun(id="current", root_run_id="previous", chat_id=chat.id,
+                       status="running", started_at=started)
+  db.add_all([previous, run]); db.commit()
+
+  def spawn(parent_chat_id, key):
+    row, attached = create_or_attach_delegation(db, DelegationIntent(
+      app_id=None, parent_chat_id=parent_chat_id,
+      parent_root_run_id="previous", task_key=key, prompt=f"Do {key}",
+      provider="codex", model=None, effort=None, cwd="/data",
+    ))
+    assert not attached
+    return row
+
+  older = spawn(chat.id, "older")
+  older.created_at = started - timedelta(minutes=1)
+  scout = spawn(chat.id, "scout")
+  nested = spawn(scout.child_chat_id, "nested")
+  db.add(models.ChatRun(id="scout-run", chat_id=scout.child_chat_id, status="running"))
+  db.add(models.ChatRun(id="nested-run", chat_id=nested.child_chat_id, status="running"))
+  db.commit()
+
+  promoted = promote(db, chat, run, "Explore")
+  goal = db.get(models.ChatGoal, promoted["goal_id"])
+  assert older.goal_id is None
+  assert scout.goal_id == nested.goal_id == goal.id
+  assert [item["id"] for item in own_helper_statuses(db, chat.id, run.id)] == [scout.id]
+  assert [item["id"] for item in _delegation_tree(db, run, goal)] == [scout.id]
+  assert active_goal_helpers(db, run, goal)
+  with pytest.raises(GoalPlanError, match=r"active delegations.*: scout"):
+    update_goal_record(db, run, goal, goal.revision, complete=True)

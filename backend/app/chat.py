@@ -5933,20 +5933,25 @@ async def _run_chat_impl_with_db(
   # request; live app state is never recomposed for an established chat.
   runner_agent_settings = agent_settings
   custom_prompt = _custom_system_prompt(chat_overrides)
-  from app.system_prompts import exact_prompt_for_chat, prompt_for_chat
+  from app.system_prompts import (
+    compose_system_prompt_off_loop, exact_prompt_for_chat, prompt_for_chat,
+  )
   try:
-    system_prompt = (
-      exact_prompt_for_chat(
+    if run_policy is not None:
+      system_prompt = exact_prompt_for_chat(
         chat_row, run_policy.system_prompt, db, persist=True,
       )
-      if run_policy is not None
-      else prompt_for_chat(
-        chat_row,
-        custom_prompt if custom_prompt else _read_skill_text(),
-        db,
-        persist=True,
+    else:
+      base_prompt = custom_prompt if custom_prompt else _read_skill_text()
+      # Composing reads each app's fragment from Git, so a chat that has no
+      # snapshot yet composes off the event loop.
+      composed = (
+        None if chat_row.system_prompt_snapshot_id
+        else await compose_system_prompt_off_loop(base_prompt, db)
       )
-    )
+      system_prompt = prompt_for_chat(
+        chat_row, base_prompt, db, persist=True, composed=composed,
+      )
     db.commit()
   except Exception:
     log.exception("failed to snapshot system prompt chat_id=%s", chat_id)

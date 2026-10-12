@@ -242,17 +242,19 @@ def test_a_resumed_helper_reports_to_its_current_follow_up_turn(tmp_path):
   assert host._turn_for_parent("toolu_launch") is follow_up
 
 
-def test_dispatcher_reply_without_the_call_fails_once_without_retry(tmp_path):
+def test_dispatcher_reply_without_the_call_fails_once_without_retry(tmp_path, monkeypatch):
   host = _claude_host(tmp_path)
   queries = []
   class ForgetfulDispatcher:
     async def query(self, line):
       queries.append(line)
+      from claude_agent_sdk.types import UserMessage
+      host._on_dispatcher_user_message(UserMessage(content=line, origin=None))
       host._dispatcher_replied()
   host._client = ForgetfulDispatcher()
   turn = _turn(tmp_path)
   asyncio.run(host.run_turn(turn))
-  assert queries == ["SPAWN d1"]
+  assert queries == ["SPAWN d1"] * 3
   assert turn.dispatch_error == "not_called" and turn.status == "failed"
   assert "No work was launched" in turn.summary
   assert host._dispatcher_call("Agent", {"description": "d1"}, "late")[
@@ -328,6 +330,8 @@ class _DispatcherClient:
     )
     # A resumed helper reports under the tool call that first launched it.
     self.host._on_task_started(_Started(turn.agent_id or "agent-1", "toolu_spawn"))
+    from claude_agent_sdk.types import UserMessage
+    self.host._on_dispatcher_user_message(UserMessage(content=line, origin=None))
     self.host._dispatcher_replied()
     asyncio.get_running_loop().call_soon(self.settle, turn, verb)
 
@@ -518,6 +522,8 @@ def test_a_dispatch_that_never_starts_says_what_the_dispatcher_did(
   class _SilentDispatcher:
     async def query(self, _line):
       host.dispatcher_last = "server_error: API Error: 529 Overloaded"
+      from claude_agent_sdk.types import UserMessage
+      host._on_dispatcher_user_message(UserMessage(content=_line, origin=None))
       host._dispatcher_replied()
 
   host._client = _SilentDispatcher()
@@ -526,7 +532,7 @@ def test_a_dispatch_that_never_starts_says_what_the_dispatcher_did(
     asyncio.run(host.run_turn(turn))
 
   assert turn.dispatch_error == "not_called"
-  assert "529 Overloaded" in caplog.text and "tool_call_seen=False" in caplog.text
+  assert "529 Overloaded" in caplog.text and "completed without its tool call" in caplog.text
 
   startup._route_diagnostics_to_chat_log(None)
   from app.chat_logging import get_chat_log_handler
@@ -646,6 +652,7 @@ def test_every_hosted_helper_gets_the_claude_register_and_text_stream(tmp_path, 
     with ExitStack() as stack:
       options = factory(host, resume, stack)
     assert options.include_partial_messages and options.forward_subagent_text
+    assert "replay-user-messages" in options.extra_args
     assert "PostToolUseFailure" in options.hooks
     assert all("SubagentHandback" in agent.disallowedTools for agent in options.agents.values())
     assert set(options.agents) == {
@@ -843,7 +850,7 @@ def test_dispatcher_prompt_names_the_builtin_tools_and_how_to_load_sendmessage()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('error', ['timeout', 'unreachable'])
+@pytest.mark.parametrize('error', ['reply_timeout', 'launch_failed', 'unreachable'])
 async def test_follow_up_dispatch_failure_does_not_invent_session_loss(
   tmp_path, monkeypatch, error,
 ):
@@ -857,6 +864,7 @@ async def test_follow_up_dispatch_failure_does_not_invent_session_loss(
     session_id = 'saved-host'
     async def run_turn(self, turn, on_started):
       turn.dispatch_error = error
+      turn.summary = 'Some work may have started.'
   @asynccontextmanager
   async def lease(*_):
     yield Host()
@@ -869,7 +877,7 @@ async def test_follow_up_dispatch_failure_does_not_invent_session_loss(
   assert result['session_id'] == 'claude-host:saved-host:child:launch'
   assert 'DELEGATION_WRITE_REVIEW_REQUIRED' in result['error']
   assert 'will not replay work automatically' in result['error']
-  assert ('did not start' in result['error']) == (error == 'timeout')
+  assert ('Some work may have started.' in result['error']) == (error != 'unreachable')
   assert ('could not deliver' in result['error']) == (error == 'unreachable')
 
 

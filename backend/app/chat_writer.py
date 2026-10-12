@@ -4159,22 +4159,11 @@ class ChatWriterActor:
       db.rollback()
       return StartContinuationBlocked(blocker)
     goal_id = delegation_goal_id(db, trigger)
-    goal = db.get(models.ChatGoal, goal_id) if goal_id else None
-    if goal_id is not None and goal is None:
-      db.rollback()
-      return StartContinuationBlocked("goal_missing")
-    goal_objective = goal.objective if goal is not None else None
-    if goal is not None and goal.chat_id != cmd.chat_id:
-      from app.goal_plans import goal_assignment
-      assignment = goal_assignment(db, cmd.chat_id)
-      if assignment is None or assignment.goal.id != goal.id:
-        db.rollback()
-        return StartContinuationBlocked("foreign_goal_not_assigned")
-      # A nested helper works in its coordinator's Goal, but this physical
-      # run belongs to the helper chat. Keep the shared Goal in the activity
-      # source and resolve its scoped brief through the assignment chain.
-      goal_id = None
-      goal_objective = None
+    # A nested helper works in its coordinator's Goal, but this physical run
+    # belongs to the helper chat: bind only an open Goal this chat owns. The
+    # shared Goal stays in the activity source and the assignment chain.
+    from app.run_state import open_goal_identity_for_chat
+    goal_objective, goal_id = open_goal_identity_for_chat(db, cmd.chat_id, goal_id)
 
     existing = transcript_rows.read_all(db, chat)
     try:
@@ -4323,6 +4312,24 @@ class ChatWriterActor:
     )
     run.goal_objective = cmd.objective
     run.goal_id = goal_id
+    if goal_was_missing:
+      # A helper spawned before promotion has no Goal snapshot yet. Adopt only
+      # this physical attempt's helpers, never an earlier turn sharing its root.
+      frontier = [cmd.chat_id]
+      first = True
+      while frontier:
+        rows = db.query(models.Delegation).filter(
+          models.Delegation.parent_chat_id.in_(frontier),
+          models.Delegation.goal_id.is_(None),
+          models.Delegation.app_id.is_(None),
+          models.Delegation.source_work_id.is_(None),
+          *((models.Delegation.parent_root_run_id == root_id,
+             models.Delegation.created_at >= run.started_at) if first else ()),
+        ).all()
+        for row in rows:
+          row.goal_id = goal_id
+        frontier = [row.child_chat_id for row in rows]
+        first = False
     if (identity_changed or goal_was_missing or reopening) and not _commit_or_rollback(db):
       raise _PersistFailed("PromoteRunToGoal did not persist")
     if not identity_changed and not goal_was_missing and not reopening:

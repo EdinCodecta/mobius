@@ -482,7 +482,7 @@ def test_unchanged_final_text_is_stored_once(chat, db, monkeypatch):
     sink = sink_for(chat)
     sink.publish({'type': 'text_final', 'text_item_id': 'progress', 'content': 'Looking around.'})
     sink.publish({'type': 'text_final', 'text_item_id': 'answer', 'content': 'Verdict: ship it.'})
-    sink.publish({'type': 'assistant_result', 'text_item_id': 'answer'})
+    sink.publish({'type': 'assistant_result', 'content': 'Verdict: ship it.'})
     await sink.finalize()
   asyncio.run(scenario())
   db.expire_all()

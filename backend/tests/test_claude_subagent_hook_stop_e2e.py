@@ -128,7 +128,7 @@ class FakeAnthropic:
     """Return (kind, content blocks)."""
     system = _system_text(body)
     messages = body.get("messages") or []
-    last = messages[-1] if messages else {}
+    last = next((msg for msg in reversed(messages) if msg.get("role") == "user"), {})
     if HELPER_SYS in system:
       return "helper", self._helper(messages, last)
     if DISPATCHER_SYS in system:

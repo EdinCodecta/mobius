@@ -222,6 +222,8 @@ import {
   combineOwnerMessagesForDisplay,
   ownerMessageBatch,
   jumpToLatestShown,
+  RUNTIME_SAFETY_POLL_MS,
+  runtimeStreamDelivering,
   runtimeSnapshot,
   runtimeSnapshotTransition,
   shouldRepairRuntimeStream,
@@ -1815,6 +1817,7 @@ export default function ChatView({
     disconnect,
     clearStreamItems,
     patchQuestionAnswers,
+    lastReadAtRef: streamLastReadAtRef,
   } = useStreamConnection(chatId, {
     onCatchUpSettled: acceptInitialStreamCatchUp,
     onConnectionLost: () => {
@@ -5108,9 +5111,20 @@ export default function ChatView({
           if (!cancelled && runtime) ensureRuntimeStreamConnected(runtime)
         })
     }
-    run()
-    const intervalMs = hasQueue ? 1000 : 3000
-    const timer = setInterval(run, intervalMs)
+    // Tick fast, but while the chat stream is demonstrably delivering, read
+    // only at the safety cadence (and not at once): the stream already carries
+    // the run, question, steer, and queue-promotion state this read fetches.
+    const delivering = () => runtimeStreamDelivering({
+      isStreaming, connectionError, lastReadAt: streamLastReadAtRef.current,
+    })
+    let lastRuntimeReadAt = delivering() ? Date.now() : 0
+    const tick = () => {
+      if (delivering() && Date.now() - lastRuntimeReadAt < RUNTIME_SAFETY_POLL_MS) return
+      lastRuntimeReadAt = Date.now()
+      run()
+    }
+    tick()
+    const timer = setInterval(tick, hasQueue ? 1000 : 3000)
     // Foreground and recovery signals belong to the effect below, also for
     // idle chats. This effect owns only active-turn/queue fallback polling.
     return () => {
@@ -5123,6 +5137,9 @@ export default function ChatView({
     turnActive,
     deliveryReady,
     pendingQueue.pendingMessages.length,
+    isStreaming,
+    connectionError,
+    streamLastReadAtRef,
     reconcileRuntimeState,
   ])
 

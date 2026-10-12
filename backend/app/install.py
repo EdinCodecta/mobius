@@ -34,13 +34,14 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Awaitable, Callable, Mapping, Sequence
 from urllib.parse import quote, unquote, urljoin, urlparse
 
 import httpx
@@ -64,6 +65,7 @@ from app import (
 from app import app_cron
 from app.build_admission import BuildLeaseUnavailable
 from app.app_capabilities import contract_and_digest
+from app.app_compile_contract import RolldownStalled
 from app.app_source_check import SourceCheckResult, check_app_source
 from app.compiler import (
   CompileError,
@@ -79,6 +81,7 @@ from app.manifest_identity import (
   canonical_manifest_identity_key as _canonical_identity_key,
   requested_manifest_source,
   require_bound_manifest as _require_bound_manifest,
+  require_permanent_package,
   stored_manifest_fetch_url,
 )
 from app.manifest_contract import (
@@ -105,6 +108,7 @@ from app.manifest_contract import (
 # net_utils.py for why the two SSRF validators were unified.
 from app.net_utils import (
   MAX_REDIRECTS as _MAX_REDIRECTS,
+  pinned_client,
   validate_url_safe as _validate_url_safe,
 )
 from app.storage_io import atomic_write
@@ -779,7 +783,8 @@ async def _http_get(
     raise HTTPException(
       502, f"Too many redirects (>{_MAX_REDIRECTS}) starting from {url}",
     )
-  pinned_url, host_header, sni_host = _validate_url_safe(url)
+  # getaddrinfo blocks; resolve off the event loop.
+  pinned_url, host_header, sni_host = await asyncio.to_thread(_validate_url_safe, url)
   try:
     async with client.stream(
       "GET", pinned_url,
@@ -1415,6 +1420,9 @@ async def _kept_local_bundle_unchanged(
       return kept_bundle == await asyncio.to_thread(output.read_bytes)
     except BuildLeaseUnavailable as exc:
       raise HTTPException(503, "JavaScript builder is busy; retry the update.") from exc
+    except RolldownStalled as exc:
+      # A stall says nothing about whether the trees differ.
+      raise HTTPException(503, exc.detail()) from exc
     except (RuntimeError, OSError, UnicodeError, KeyError, HTTPException):
       return False
   finally:
@@ -1759,6 +1767,7 @@ def _verify_git_install_candidate(
           "reviewed. Refresh the update and try again."
         ),
         "reason": reason,
+        "retryable": True,
       },
     )
 
@@ -1830,7 +1839,7 @@ async def clear_pending_conflict_update(db: Session, app: models.App) -> None:
   app.conflict_resolver_chat_id = None
   app.conflict_resolver_upstream_commit = None
   db.commit()
-  await asyncio.to_thread(_drop_pending_update_worktree, source_dir)
+  await _to_completion(_drop_pending_update_worktree, source_dir)
   shutil.rmtree(
     Path(source_dir) / ".git" / _PENDING_UPDATE_DIR,
     ignore_errors=True,
@@ -2429,9 +2438,7 @@ def validate_manifest_address(
   if manifest_url is None:
     return
   _, bound_id = requested_manifest_source(manifest_url)
-  if bound_id is None:
-    return
-  if db is not None:
+  if db is not None and bound_id is not None:
     existing = _find_install_identity_row(
       db, source_url=manifest_url, manifest_id=bound_id,
     )
@@ -2492,10 +2499,7 @@ async def preview_manifest_capabilities(
   db: Session | None = None,
 ) -> tuple[dict, str, dict, str]:
   """Return the validated manifest/base and its canonical review contract."""
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT,
-    follow_redirects=False,
-  ) as cli:
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
     loaded, normalized_base = await _fetch_and_validate_manifest(
       cli,
       manifest_url=manifest_url,
@@ -2682,10 +2686,15 @@ def _read_git_package_inputs(
 
   icon_processed = None
   icon_warning = None
-  if manifest.get("icon"):
+  icon = manifest.get("icon")
+  if icon and icon not in tree:
+    # As over HTTP, an optional icon the package lacks is only a warning. A
+    # listed but unreadable object still fails closed like any other input.
+    icon_warning = f"icon: candidate Git tree is missing icon {icon}"
+  elif icon:
     try:
       icon_processed = icon_assets.normalize_icon(
-        _package_input_bytes(required(manifest["icon"], "icon")),
+        _package_input_bytes(required(icon, "icon")),
       )
     except icon_assets.InvalidIcon as exc:
       icon_warning = f"icon: {exc}"
@@ -2830,6 +2839,38 @@ def read_git_package_summary(
     )
 
 
+_TRANSIENT_STATUS_CODES = frozenset({429, 502, 503, 504})
+
+
+def transient_failure(exc: BaseException) -> tuple[bool, int | None]:
+  """Whether the same request may later get past ``exc`` unchanged, and any wait.
+
+  The one rule for install, update and bootstrap retries: a Git transfer that
+  failed or timed out, incomplete Git history, a host that did not resolve,
+  and an upstream rate limit or gateway failure. A failure the installer has
+  already classified carries ``retryable`` in its detail. Anything else, such
+  as a full disk or an invalid package, will fail the same way again.
+  """
+  if isinstance(exc, (
+    app_git.GitTransferFailed, app_git.HistoryIncomplete, socket.gaierror,
+  )):
+    return True, None
+  if not isinstance(exc, HTTPException):
+    return False, None
+  if isinstance(exc.__cause__, socket.gaierror):
+    return True, None
+  detail = exc.detail
+  if exc.status_code not in _TRANSIENT_STATUS_CODES and not (
+    isinstance(detail, dict) and detail.get("retryable") is True
+  ):
+    return False, None
+  try:
+    wait = int((exc.headers or {}).get("Retry-After") or 0)
+  except ValueError:
+    wait = 0
+  return True, wait or None
+
+
 def git_source_error(
   outcome: str, exc: BaseException, *,
   code: str = "git_update_unavailable", failure: str = "",
@@ -2837,13 +2878,24 @@ def git_source_error(
   """The owner-facing 409 for a Git source that could not be used.
 
   A transfer exceeding its wall-clock ceiling is reported as a timeout,
-  distinct from a missing or unverifiable source.
+  distinct from a missing or unverifiable source. ``retryable`` marks a
+  failure the same request may later get past unchanged (``transient_failure``);
+  bootstrap retries it.
   """
   if isinstance(exc, app_git.GitTransferTimeout):
     code = "git_transfer_timeout"
     failure = f"The app's Git transfer timed out: {exc}."
     outcome = f"{outcome} Retrying on a steadier connection may help."
-  return HTTPException(409, detail={"code": code, "message": f"{failure} {outcome}".strip()})
+  elif isinstance(exc, app_git.HistoryIncomplete):
+    log.warning("install: %s", exc)  # Names the refs; the owner text does not.
+    failure = (
+      "The app's Git history is incomplete, so the update can't be merged "
+      "safely; retry when its source is reachable."
+    )
+  return HTTPException(409, detail={
+    "code": code, "message": f"{failure} {outcome}".strip(),
+    "retryable": transient_failure(exc)[0],
+  })
 
 
 def git_transfer_root() -> Path:
@@ -2885,18 +2937,38 @@ async def _stage(stage: Callable[..., app_git.Staged], *args) -> app_git.Staged:
 
 
 async def _to_completion(function: Callable, *args):
-  """Run a thread that must finish before its caller releases a lock.
+  """Run a thread that must finish before its caller releases a lock."""
+  return await _settle_before_cancel(asyncio.to_thread(function, *args))
 
-  A cancelled caller still waits for the thread, then re-raises.
+
+async def _settle_before_cancel(
+  work: Awaitable, *, abandoned: asyncio.Event | None = None,
+):
+  """Await ``work`` to its end even if the caller is cancelled meanwhile.
+
+  Cancelling an ``asyncio.to_thread`` await does not stop its thread. A
+  cancelled caller re-raises only once ``work`` settles, so it never releases a
+  lock or rolls back under writes that are still running. ``abandoned`` is set
+  on the first cancellation, so multi-step work can stop at its next safe point.
   """
-  work = asyncio.ensure_future(asyncio.to_thread(function, *args))
+  work = asyncio.ensure_future(work)
   cancelled = False
   while not work.done():
     try:
       await asyncio.wait({work})
     except asyncio.CancelledError:
       cancelled = True
+      if abandoned is not None:
+        abandoned.set()
   if cancelled:
+    # The caller's outcome is its cancellation, so nobody takes ``work``'s.
+    outcome = None if work.cancelled() else work.exception()
+    if isinstance(outcome, HTTPException):
+      log.info("Work refused after its caller was cancelled: %s", outcome.detail)
+    elif outcome is not None:
+      log.error(
+        "Work failed after its caller was cancelled", exc_info=outcome,
+      )
     raise asyncio.CancelledError
   return work.result()
 
@@ -3078,10 +3150,7 @@ async def _fetch_install_candidate(
   db: Session | None = None,
 ) -> InstallCandidate:
   """Fetch every install input once and enforce all review/replay guards."""
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT,
-    follow_redirects=False,
-  ) as cli:
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
     manifest, raw_base = await _fetch_and_validate_manifest(
       cli,
       manifest_url=manifest_url,
@@ -3286,10 +3355,7 @@ async def _authorize_source_handoff(
   package_id = target.package_id
   if existing is None or not package_id or not existing.manifest_url:
     raise HTTPException(409, "App source changed without a trusted handoff.")
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT,
-    follow_redirects=False,
-  ) as cli:
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
     # The old row's own address is fetched without the stored id binding:
     # trust here comes from `package_id` + `moved_to`, and a `package_id` app
     # may have changed its manifest id without `previous_id`.
@@ -3352,14 +3418,6 @@ def _select_install_target(
       db, source_url=previous_source, manifest_id=manifest_id,
     )
 
-  if existing is not None and existing.package_id is not None:
-    if package_id is None:
-      raise HTTPException(
-        409, "This installed app requires its permanent package identity.",
-      )
-    if existing.package_id != package_id:
-      raise HTTPException(409, "Permanent package identity changed.")
-
   adopting_previous_id = False
   origin_migration = None
   if existing is None:
@@ -3398,6 +3456,14 @@ def _select_install_target(
         adopting_previous_id = True
       else:
         origin_migration = None
+
+  # Every resolved row, including a previous_id predecessor, keeps its
+  # permanent package identity.
+  if existing is not None:
+    try:
+      require_permanent_package(manifest, existing.package_id)
+    except ValueError as exc:
+      raise HTTPException(409, str(exc)) from exc
 
   if (
     existing is not None
@@ -3976,6 +4042,10 @@ class _UncheckedPythonTree(Exception):
     self.runtime = runtime
     self.app_id = app_id
 
+  def discard(self) -> None:
+    """Remove the handed-out runtime copy once checked, or once abandoned."""
+    shutil.rmtree(self.runtime.root, ignore_errors=True)
+
 
 async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPythonTree:
   """Build or reuse the env and smoke-run the exact reconciled tree, unlocked."""
@@ -3995,7 +4065,7 @@ async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPyth
       500, "Install failed due to an unexpected server error.",
     ) from exc
   finally:
-    shutil.rmtree(pending.runtime.root, ignore_errors=True)
+    pending.discard()
   return CheckedPythonTree(tree_oid=pending.tree_oid, env=env)
 
 
@@ -4489,11 +4559,33 @@ async def install_from_manifest(
     publication_handoff_app_id=publication_handoff_app_id,
     staged_clone=staged_clone,
   )
+  # Each pass holds the source lock across many Git threads and rolls back on
+  # failure, and the env check runs threads from the handed-out runtime, all
+  # under the caller's lifecycle lock. So the passes and the check settle as
+  # one unit: a cancelled caller waits for the step in flight, which then
+  # stops at its next safe point.
+  abandoned = asyncio.Event()
+  return await _settle_before_cancel(
+    _install_in_passes(install_candidate, abandoned), abandoned=abandoned,
+  )
+
+
+async def _install_in_passes(
+  install_candidate: Callable[..., Awaitable[InstallResult]],
+  abandoned: asyncio.Event,
+) -> InstallResult:
+  """Run the install's passes; once ``abandoned``, discard and stop between steps."""
   try:
     return await install_candidate(python_check=None)
   except _UncheckedPythonTree as unchecked:
     pending = unchecked
+  if abandoned.is_set():
+    pending.discard()
+    raise asyncio.CancelledError
   python_check = await _check_reconciled_python(pending)
+  if abandoned.is_set():
+    app_python_env.discard_env(python_check.env)
+    raise asyncio.CancelledError
   return await install_candidate(python_check=python_check)
 
 
@@ -5303,6 +5395,10 @@ async def _install_candidate(
     db.rollback()
     journal.rollback_materialization()
     raise HTTPException(422, _compile_error_detail(app_name, exc))
+  except RolldownStalled as exc:
+    db.rollback()
+    journal.rollback_materialization()
+    raise HTTPException(503, exc.detail()) from exc
   except app_git.HistoryIncomplete as exc:
     db.rollback()
     journal.rollback_materialization()
