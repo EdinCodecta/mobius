@@ -382,6 +382,8 @@ class RuntimeSupervisors:
             pass
           try:
             await sweep_due_waits(force_kind=force_kind)
+            from app.goal_dependencies import deliver_pending_dependencies
+            await deliver_pending_dependencies()
           except asyncio.CancelledError:
             raise
           except Exception as exc:

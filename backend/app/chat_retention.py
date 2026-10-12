@@ -180,19 +180,14 @@ def purge_expired_chat_tombstones(db: Session) -> list[str]:
   # not rely on FK enforcement for lifecycle cleanup). Any legacy unfinished
   # claim reaching this seven-day boundary becomes reclaimable before its last
   # owner identity is removed.
-  now = now_naive_utc()
-  db.query(models.AgentWorkClaim).filter(
-    models.AgentWorkClaim.owner_chat_id.in_(chat_ids),
-    models.AgentWorkClaim.completed_at.is_(None),
-    models.AgentWorkClaim.released_at.is_(None),
-  ).update({
-    models.AgentWorkClaim.released_at: now,
-    models.AgentWorkClaim.updated_at: now,
-    models.AgentWorkClaim.outcome: (
-      "Owning chat was deleted before this action completed."
-    ),
-    models.AgentWorkClaim.revision: models.AgentWorkClaim.revision + 1,
-  }, synchronize_session=False)
+  from app.agent_work_claims import stage_release_claims_for_chat
+  from app.goal_dependencies import stage_retire_chat_dependencies
+  for chat_id in chat_ids:
+    stage_release_claims_for_chat(db, chat_id)
+    stage_retire_chat_dependencies(db, chat_id)
+  db.query(models.GoalDependency).filter(
+    models.GoalDependency.waiting_chat_id.in_(chat_ids),
+  ).delete(synchronize_session=False)
   db.query(models.AgentWorkClaim).filter(
     models.AgentWorkClaim.owner_chat_id.in_(chat_ids),
   ).update({

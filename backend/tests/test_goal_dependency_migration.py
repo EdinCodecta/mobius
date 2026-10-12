@@ -78,11 +78,12 @@ def test_legacy_claim_follow_upgrade_is_conservative_and_repeatable(tmp_path):
                       "owner_goal_id='goal-self' WHERE id='claim-self'"))
     conn.execute(text("UPDATE chat_goals SET hold_json='not-json' "
                       "WHERE id='goal-bad-hold'"))
-    conn.execute(text("INSERT INTO delegations "
-                      "(id, parent_chat_id, parent_root_run_id, task_key, child_chat_id, "
-                      "provider, scope, cwd, prompt_sha256) VALUES "
-                      "('delegation-helper', 'source-helper', 'run-helper', 'task', "
-                      "'chat-helper', 'codex', 'write', '/data', 'digest')"))
+  with Session(eng) as db:
+    db.add(models.Delegation(id="delegation-helper", parent_chat_id="source-helper",
+      parent_root_run_id="run-helper", task_key="task", child_chat_id="chat-helper",
+      provider="codex", scope="write", cwd="/data", prompt_sha256="digest"))
+    db.commit()
+
 
   schema_migrations._add_goal_dependencies(eng)
   schema_migrations._repair_legacy_goal_dependency_classification(eng)

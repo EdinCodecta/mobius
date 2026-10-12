@@ -771,7 +771,9 @@ def _goal_presentation(
   from app.chat_handoffs import goal_handoffs
   native = goal_handoffs(db, root)
   presentation["handoff"] = _goal_handoff(db, physical, root, native=native)
-  presentation["dependencies"] = list(native.dependencies)
+  from dataclasses import asdict
+  if native.dependencies:
+    presentation["dependencies"] = [asdict(item) for item in native.dependencies]
   presentation["plan"] = plan
   return presentation
 
@@ -805,10 +807,10 @@ def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal, 
     return handoff
   # A foreign claim is a handoff only while its source can progress or its
   # result is owed automatically. A lost/failed source needs explicit recovery.
-  if any(not dep["automatic"] for dep in native.dependencies):
+  if any(not dep.automatic for dep in native.dependencies):
     return {"kind": "recovery", "reason": "dependency_source"}
   if any(
-    dep["automatic"] and (dep["outcome"] is None or dep["delivery_pending"])
+    dep.automatic and (dep.outcome is None or dep.delivery_pending)
     for dep in native.dependencies
   ):
     return {"kind": "automatic", "reason": "dependency"}

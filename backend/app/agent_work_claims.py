@@ -153,6 +153,26 @@ def claim_work(
     db.refresh(row)
     return _serialize(db, row, "claimed")
   if row.owner_chat_id == chat_id:
+    # Refreshing ownership from a different Goal in the same chat also changes
+    # graph edges. Serialize it with follows/transfers and reject reverse edges.
+    if goal_id and goal_id != row.owner_goal_id:
+      db.query(models.Owner).filter(models.Owner.id == owner_id).update(
+        {models.Owner.username: models.Owner.username}, synchronize_session=False,
+      )
+      db.expire(row)
+      db.refresh(row)
+      from app.goal_dependency_sources import _direct_cycle
+      followers = db.query(models.GoalDependency.waiting_goal_id).filter(
+        models.GoalDependency.target_acquisition_id == row.acquisition_id,
+        models.GoalDependency.waiting_chat_id != chat_id,
+        models.GoalDependency.resolved_at.is_(None),
+        models.GoalDependency.result_disposition.is_(None),
+        models.GoalDependency.withdrawn_at.is_(None),
+      ).all()
+      if any(_direct_cycle(db, waiting_goal_id=follower, source_goal_id=goal_id)
+             for (follower,) in followers):
+        db.rollback()
+        raise ValueError("Claim refresh would create a direct Goal dependency cycle.")
     previous_revision = row.revision
     changed = db.query(models.AgentWorkClaim).filter(
       models.AgentWorkClaim.id == row.id,
@@ -210,6 +230,9 @@ def claim_work(
   )
   db.expire(row)
   db.refresh(row)
+  if row.owner_chat_id != expected_owner_chat_id:
+    db.rollback()
+    raise ValueError("The expected owner changed; inspect the current claim before transfer.")
   previous = row.owner_chat_id
   previous_run_id = row.owner_run_id
   previous_goal_id = row.owner_goal_id
@@ -253,22 +276,27 @@ def claim_work(
     raise ValueError("The claim changed during transfer; inspect it before retrying.")
   db.expire(row)
   db.refresh(row)
-  # Recheck after the ownership write fence before adding the reverse follow.
-  if goal_id and previous_goal_id and db.query(models.GoalDependency.id).join(
-    models.AgentWorkClaim,
-    models.AgentWorkClaim.id == models.GoalDependency.target_claim_id,
-  ).filter(
-    models.GoalDependency.waiting_goal_id == goal_id,
-    models.GoalDependency.target_kind == "claim_acquisition",
-    models.AgentWorkClaim.owner_goal_id == previous_goal_id,
-    models.AgentWorkClaim.acquisition_id == models.GoalDependency.target_acquisition_id,
-    models.GoalDependency.target_acquisition_id != row.acquisition_id,
+  # Existing subscribers change source owner too. Check every affected edge,
+  # not just the reverse link newly created for the former executor.
+  from app.goal_dependency_sources import _direct_cycle
+  if goal_id:
+    follower_goals = db.query(models.GoalDependency.waiting_goal_id).filter(
+      models.GoalDependency.target_acquisition_id == row.acquisition_id,
+      models.GoalDependency.waiting_chat_id != chat_id,
+      models.GoalDependency.resolved_at.is_(None),
+      models.GoalDependency.result_disposition.is_(None),
+      models.GoalDependency.withdrawn_at.is_(None),
+    ).all()
+    if any(_direct_cycle(db, waiting_goal_id=follower_goal, source_goal_id=goal_id)
+           for (follower_goal,) in follower_goals):
+      db.rollback()
+      raise ValueError("Transfer would create a direct Goal dependency cycle.")
+  db.query(models.GoalDependency).filter(
+    models.GoalDependency.target_acquisition_id == row.acquisition_id,
     models.GoalDependency.resolved_at.is_(None),
     models.GoalDependency.result_disposition.is_(None),
     models.GoalDependency.withdrawn_at.is_(None),
-  ).first():
-    db.rollback()
-    raise ValueError("Transfer would create a direct Goal dependency cycle.")
+  ).update({models.GoalDependency.target_chat_id: chat_id}, synchronize_session=False)
   # A new owner must not keep a self-follow on its own acquisition.
   db.query(models.GoalDependency).filter(
     models.GoalDependency.target_acquisition_id == row.acquisition_id,
@@ -276,12 +304,18 @@ def claim_work(
     models.GoalDependency.resolved_at.is_(None),
     models.GoalDependency.withdrawn_at.is_(None),
   ).update({models.GoalDependency.withdrawn_at: now}, synchronize_session=False)
+  previous_follow_status = "no_open_top_level_goal"
   if previous_goal_id and previous != chat_id:
-    _follow(db, row, chat_id=previous, run_id=previous_run_id)
+    previous_follow_status = stage_follow_claim(db, row, chat_id=previous,
+      run_id=previous_run_id, waiting_goal_id=previous_goal_id)
+    if previous_follow_status not in {"followed", "result_owed", "no_open_top_level_goal"}:
+      db.rollback()
+      raise ValueError("Transfer cannot preserve the former Goal's follow: " + previous_follow_status)
   db.commit()
   db.refresh(row)
   result = _serialize(db, row, "transferred")
   result["previous_owner_chat_id"] = previous
+  result["previous_follow_status"] = previous_follow_status
   return result
 
 
@@ -384,7 +418,7 @@ def stage_release_claims_for_chat(
   action. Deleting the chat ends both responsibilities: followers may reclaim
   the action, while completed claims remain untouched as idempotency history.
   The caller commits the release atomically with the chat tombstone and then
-  delivers the returned follower notices.
+  nudges exact-Goal dependency delivery.
   """
   released = [
     settled for row in _open_claims_for_chat(db, chat_id)
@@ -430,8 +464,8 @@ def stage_settle_goal_claims(
   Goal that still owns an open exact action. A completing Goal completes only
   the claims it names in ``finished_keys``; every other open claim, and every
   claim of a stopped or dismissed Goal, is released so followers may reclaim
-  it. The caller delivers follower notices after commit
-  (``pending_settlement_notices``).
+  it. The caller may nudge exact-Goal result delivery after commit; immutable
+  subscribed outcomes do not depend on that nudge.
   """
   if not goal_id or status == "open":
     return []
@@ -526,12 +560,11 @@ def stage_settle_claims_with_owner(
 def pending_settlement_notices(
   db: Session, chat_id: str,
 ) -> list[ReleasedClaim]:
-  """Settled claims of this chat whose follower notice is not yet acknowledged.
+  """Legacy settlement latch awaiting a latency nudge and acknowledgement.
 
-  ``notification_revision < revision`` is the durable retry latch shared with
-  explicit finish and transfer: a crash between the settling commit and the
-  wake leaves it set, and the next lifecycle seam for the chat re-sends the
-  idempotent notice.
+  Outcomes are already durable on exact Goal dependencies. This latch no longer
+  authorizes chat-wide follower notices or receipts; transfer still has its own
+  prompt revocation notice. Retained until the legacy cleanup stage.
   """
   rows = db.query(models.AgentWorkClaim).filter(
     models.AgentWorkClaim.owner_chat_id == chat_id,

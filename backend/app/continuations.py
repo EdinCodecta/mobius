@@ -26,6 +26,7 @@ DELEGATION_RESULT_MESSAGE_KIND = "delegation_result"
 # A durable declared wait resuming its own chat travels the same hidden
 # user-message slot: product-owned, never owner speech.
 WAIT_RESULT_MESSAGE_KIND = "wait_result"
+DEPENDENCY_RESULT_MESSAGE_KIND = "dependency_result"
 
 # A later ready boot resumes the logical work that declared the typed Restart
 # card. It is separate from generic command/timer waits because its writer
@@ -35,6 +36,7 @@ PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND = "platform_activation_result"
 PRODUCT_RESULT_MESSAGE_KINDS = frozenset({
   DELEGATION_RESULT_MESSAGE_KIND,
   WAIT_RESULT_MESSAGE_KIND,
+  DEPENDENCY_RESULT_MESSAGE_KIND,
   PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND,
 })
 
@@ -155,6 +157,8 @@ def product_result_run_token(
     or not isinstance(cid, str) or not cid
   ):
     return None
+  if kind == DEPENDENCY_RESULT_MESSAGE_KIND and cid.startswith("dependency-result-"):
+    return f"dependency-resume-{cid.removeprefix('dependency-result-')}"
   if kind == WAIT_RESULT_MESSAGE_KIND and cid.startswith("wait-result-"):
     return f"wait-resume-{cid.removeprefix('wait-result-')}"
   if isinstance(explicit, str) and explicit:
@@ -175,6 +179,7 @@ def continues_logical_root(message: Mapping[str, Any] | None) -> bool:
       *CONTINUATION_MESSAGE_KINDS,
       DELEGATION_RESULT_MESSAGE_KIND,
       WAIT_RESULT_MESSAGE_KIND,
+      DEPENDENCY_RESULT_MESSAGE_KIND,
       PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND,
     )
   )

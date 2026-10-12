@@ -551,14 +551,15 @@ def test_transfer_keeps_acquisition_and_withdraws_new_owner_self_follow(db):
   assert next(d for d in deps if d.waiting_chat_id == first.id).withdrawn_at is None
 
 
-def test_failed_source_without_handoff_resolves_owner_not_progressing(db):
+@pytest.mark.parametrize("ended_status", ["failed", "completed", "parked_notified"])
+def test_ended_source_without_handoff_resolves_owner_not_progressing(db, ended_status):
   from app.goal_dependency_sources import stage_reconcile_claim_sources
   owner, first, second = _fixture(db)
   claim_work(db, owner_id=owner.id, chat_id=first.id,
              run_id='claim-run-first', work_key=KEY, summary='Do work')
   claim_work(db, owner_id=owner.id, chat_id=second.id,
              run_id='claim-run-second', work_key=KEY, summary='Follow')
-  db.get(models.ChatRun, 'claim-run-first').status = 'failed'
+  db.get(models.ChatRun, 'claim-run-first').status = ended_status
   db.commit()
   assert stage_reconcile_claim_sources(db) == 1
   db.commit()
@@ -609,3 +610,251 @@ def test_goal_less_completed_source_does_not_promise_future_progress(db):
   db.commit()
   assert stage_reconcile_claim_sources(db) == 1
   assert db.query(models.GoalDependency).one().outcome_json['kind'] == 'owner_not_progressing'
+
+
+def _third_executor(db):
+  third = create_chat(id="claim-third", title="Third executor", messages=[])
+  db.add(third)
+  db.add(models.ChatGoal(id="claim-goal-third", chat_id=third.id, objective="Third work"))
+  db.add(models.ChatRun(id="claim-run-third", root_run_id="claim-run-third",
+    chat_id=third.id, goal_id="claim-goal-third", status="running", provider="codex"))
+  db.commit()
+  return third
+
+
+def test_two_transfers_preserve_acquisition_and_all_exact_followers(db):
+  owner, first, second = _fixture(db)
+  third = _third_executor(db)
+  original = claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first",
+    work_key=KEY, summary="Action")
+  for old, new, run in ((first, second, "claim-run-second"), (second, third, "claim-run-third")):
+    moved = claim_work(db, owner_id=owner.id, chat_id=new.id, run_id=run,
+      work_key=KEY, summary="Action", expected_owner_chat_id=old.id,
+      takeover_reason="Accepted ownership of this exact action")
+    assert moved["acquisition_id"] == original["acquisition_id"]
+    assert moved["previous_follow_status"] == "followed"
+  finish_work(db, owner_id=owner.id, chat_id=third.id, work_key=KEY, outcome="Done", release=False)
+  rows = db.query(models.GoalDependency).all()
+  assert {row.waiting_goal_id for row in rows} == {"claim-goal-first", "claim-goal-second"}
+  assert all(row.outcome_json["kind"] == "completed" and row.outcome_json["source_chat_id"] == third.id for row in rows)
+
+
+def test_transfer_rejects_cycle_created_for_an_existing_follower(db):
+  owner, first, second = _fixture(db)
+  third = _third_executor(db)
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="First action")
+  other = "platform:second-action"
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=other, summary="Second action")
+  # second -> first; third -> second. Moving first's action to third would
+  # create second <-> third although the former owner is first.
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY, summary="Follow")
+  claim_work(db, owner_id=owner.id, chat_id=third.id, run_id="claim-run-third", work_key=other, summary="Follow")
+  with pytest.raises(ValueError, match="direct Goal dependency cycle"):
+    claim_work(db, owner_id=owner.id, chat_id=third.id, run_id="claim-run-third", work_key=KEY,
+      summary="Transfer", expected_owner_chat_id=first.id, takeover_reason="Accepted exact action from original executor")
+  assert _claim_row(db).owner_chat_id == first.id
+
+
+def test_transfer_quota_failure_rolls_back_instead_of_losing_former_goal_follow(db, monkeypatch):
+  from app import goal_dependency_sources
+  owner, first, second = _fixture(db)
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="Action")
+  monkeypatch.setattr(goal_dependency_sources, "MAX_CLAIM_DEPENDENCIES_PER_GOAL", 0)
+  with pytest.raises(ValueError, match="former Goal's follow: dependency_limit"):
+    claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY,
+      summary="Transfer", expected_owner_chat_id=first.id, takeover_reason="Accepted exact action from original executor")
+  assert _claim_row(db).owner_chat_id == first.id
+  assert db.query(models.GoalDependency).count() == 0
+
+
+def test_transfer_follow_uses_claims_exact_former_goal_even_if_run_rebound(db):
+  owner, first, second = _fixture(db)
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="Action")
+  db.add(models.ChatGoal(id="successor-goal", chat_id=first.id, objective="Unrelated work"))
+  db.get(models.ChatRun, "claim-run-first").goal_id = "successor-goal"
+  db.commit()
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY,
+    summary="Transfer", expected_owner_chat_id=first.id, takeover_reason="Accepted exact action from original executor")
+  row = db.query(models.GoalDependency).one()
+  assert row.waiting_goal_id == "claim-goal-first" and row.created_by_run_id is None
+
+
+def test_nine_dependencies_do_not_consume_the_eight_monitor_quota(db):
+  from app.chat_waits import declare_wait
+  owner, first, second = _fixture(db)
+  for index in range(8):
+    declare_wait(db, chat_id=second.id, description=f"Timer {index}", kind="timer",
+      delay_secs=60, created_by_run_id="claim-run-second")
+  for index in range(9):
+    key = f"platform:action:{index}"
+    claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=key, summary="Action")
+    followed = claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=key, summary="Follow")
+    assert followed["follow_status"] == "followed"
+  assert db.query(models.GoalDependency).count() == 9
+  assert db.query(models.ChatWait).count() == 8
+
+
+@pytest.mark.parametrize("goal_less", [False, True])
+def test_source_failure_is_not_hidden_by_another_goal_in_its_chat(db, goal_less):
+  from app.goal_dependency_sources import stage_reconcile_claim_sources
+  owner, first, second = _fixture(db)
+  if goal_less:
+    db.get(models.ChatRun, "claim-run-first").goal_id = None
+    db.commit()
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="Action")
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY, summary="Follow")
+  db.get(models.ChatRun, "claim-run-first").status = "failed"
+  db.add(models.ChatGoal(id="other-source-goal", chat_id=first.id, objective="Other"))
+  db.add(models.ChatRun(id="other-source-run", chat_id=first.id, goal_id="other-source-goal", status="running"))
+  first.pending_question_id = "other-goals-card"
+  db.commit()
+  assert stage_reconcile_claim_sources(db) == 1
+  db.commit()
+  assert db.query(models.GoalDependency).one().outcome_json["kind"] == "owner_not_progressing"
+
+
+def test_longer_stalled_cycle_is_recovery_not_an_automatic_handoff(db):
+  from app.goal_dependency_sources import dependency_source_blocker, stage_reconcile_claim_sources
+  owner, first, second = _fixture(db)
+  third = _third_executor(db)
+  executors = [(first, "claim-run-first"), (second, "claim-run-second"), (third, "claim-run-third")]
+  for index, (chat, run_id) in enumerate(executors):
+    claim_work(db, owner_id=owner.id, chat_id=chat.id, run_id=run_id,
+      work_key=f"platform:cycle:{index}", summary="Exact action")
+  for index, (chat, run_id) in enumerate(executors):
+    result = claim_work(db, owner_id=owner.id, chat_id=chat.id, run_id=run_id,
+      work_key=f"platform:cycle:{(index+1)%3}", summary="Follow next action")
+    assert result["follow_status"] == "followed"
+    db.get(models.ChatRun, run_id).status = "failed"
+  db.commit()
+  rows = db.query(models.GoalDependency).all()
+  assert all(dependency_source_blocker(db, row) == "owner_not_progressing" for row in rows)
+  # Breaking the cycle with one factual result gives its waiting Goal a real
+  # automatic next step; reconciliation does not invent takeover authority.
+  assert stage_reconcile_claim_sources(db) >= 1
+  db.commit()
+  assert any(row.outcome_json and row.outcome_json["kind"] == "owner_not_progressing"
+             for row in db.query(models.GoalDependency).all())
+
+
+@pytest.mark.parametrize("ineligible", ["helper", "goalless", "held", "deleted"])
+def test_ineligible_follower_and_approval_never_claim_a_follow(db, ineligible):
+  from app.routes.owner_approvals import _approval_follower_result
+  owner, first, second = _fixture(db)
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="Action")
+  if ineligible == "helper":
+    db.add(models.Delegation(id="helper-follow", parent_chat_id=first.id,
+      parent_root_run_id="claim-run-first", child_chat_id=second.id, task_key="follow",
+      provider="codex", scope="write", cwd="/data", prompt_sha256="digest"))
+  elif ineligible == "deleted":
+    second.deleted_at = now_naive_utc()
+  elif ineligible == "goalless":
+    db.get(models.ChatRun, "claim-run-second").goal_id = None
+  else:
+    db.get(models.ChatGoal, "claim-goal-second").status = "stopped"
+  db.commit()
+  result = claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY, summary="Follow")
+  assert result["follow_status"] == "no_open_top_level_goal"
+  assert db.query(models.GoalDependency).count() == 0
+  approval = _approval_follower_result(result)
+  assert "No Goal follow was created" in approval["next_action"]
+  assert "will receive its result" not in approval["next_action"]
+
+
+def test_stop_cannot_commit_without_atomic_dependency_outcome(db, monkeypatch):
+  from app import agent_work_claims
+  from app.chat_writer import PrepareChatStop, get_writer
+  owner, first, second = _owned_goal_claim(db, task_status="running")
+  def fail_stamp(*args, **kwargs):
+    raise RuntimeError("Injected outcome storage failure")
+  monkeypatch.setattr(agent_work_claims, "stage_stamp_claim_outcome", fail_stamp)
+  with pytest.raises(RuntimeError, match="Injected outcome storage failure"):
+    get_writer().submit(PrepareChatStop(chat_id=first.id, actor="owner")).result(timeout=5)
+  db.expire_all()
+  assert db.get(models.ChatGoal, "claim-goal-first").status == "open"
+  assert _claim_row(db).released_at is None
+  assert db.query(models.GoalDependency).one().outcome_json is None
+
+
+@pytest.mark.parametrize("release", [False, True])
+def test_settlement_winning_registration_gap_cannot_leave_a_pending_old_follow(db, monkeypatch, release):
+  from app import agent_work_claims
+  from app.database import SessionLocal
+  owner, first, second = _fixture(db)
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="Action")
+  original_follow = agent_work_claims._follow
+  def settle_before_follow(session, claim, **kwargs):
+    # A competing source transaction commits after the collision read but
+    # before registration's write fence. Its immutable revision must win.
+    with SessionLocal() as other:
+      finish_work(other, owner_id=owner.id, chat_id=first.id, work_key=KEY,
+        outcome="Concurrent source settlement", release=release)
+    return original_follow(session, claim, **kwargs)
+  monkeypatch.setattr(agent_work_claims, "_follow", settle_before_follow)
+  with pytest.raises(ValueError, match="claim changed while following"):
+    claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY, summary="Follow")
+  db.rollback()
+  assert db.query(models.GoalDependency).count() == 0
+  row = _claim_row(db)
+  assert (row.released_at if release else row.completed_at) is not None
+
+
+@pytest.mark.parametrize("completed_before_delete", [False, True])
+def test_source_hard_purge_preserves_the_exact_acquisitions_immutable_outcome(db, monkeypatch, completed_before_delete):
+  from datetime import timedelta
+  from app import chat_retention
+  owner, first, second = _owned_goal_claim(db)
+  if completed_before_delete:
+    finish_work(db, owner_id=owner.id, chat_id=first.id, work_key=KEY,
+      outcome="Completed before deletion", release=False)
+  first.deleted_at = now_naive_utc() - timedelta(days=8)
+  db.get(models.ChatRun, "claim-run-first").status = "stopped"
+  db.commit()
+  # The fixture must never touch a real chat's storage.
+  monkeypatch.setattr(chat_retention, "_purge_chat_storage", lambda chat_id: None)
+  source_id = first.id
+  assert chat_retention.purge_expired_chat_tombstones(db) == [source_id]
+  db.expire_all()
+  row = db.query(models.GoalDependency).one()
+  assert row.outcome_json["kind"] == ("completed" if completed_before_delete else "owner_deleted")
+  assert row.outcome_json["source_chat_title"] == "Original integrator"
+  assert row.result_disposition is None and row.received_run_id is None
+
+
+def test_same_chat_goal_ownership_refresh_cannot_create_a_direct_cycle(db):
+  owner, first, second = _fixture(db)
+  db.add(models.ChatGoal(id="same-chat-new-goal", chat_id=first.id, objective="New work"))
+  db.add(models.ChatRun(id="same-chat-new-run", chat_id=first.id, goal_id="same-chat-new-goal", status="running"))
+  db.commit()
+  other_key = "platform:other-refresh-action"
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="Original action")
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=other_key, summary="Second action")
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY, summary="Follow original")
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="same-chat-new-run", work_key=other_key, summary="Follow second")
+  with pytest.raises(ValueError, match="refresh would create a direct Goal dependency cycle"):
+    claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="same-chat-new-run", work_key=KEY, summary="Refresh under new Goal")
+  assert _claim_row(db).owner_goal_id == "claim-goal-first"
+
+
+def test_self_follow_registration_is_rejected_without_a_dependency(db):
+  from app.goal_dependency_sources import stage_follow_claim
+  owner, first, _ = _fixture(db)
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="Action")
+  assert stage_follow_claim(db, _claim_row(db), chat_id=first.id,
+    run_id="claim-run-first") == "self_dependency"
+  assert db.query(models.GoalDependency).count() == 0
+
+
+def test_two_goals_in_one_chat_register_independent_follows_of_one_acquisition(db):
+  owner, first, second = _fixture(db)
+  db.add(models.ChatGoal(id="second-follower-goal", chat_id=second.id, objective="Other dependent work"))
+  db.add(models.ChatRun(id="second-follower-run", chat_id=second.id,
+    goal_id="second-follower-goal", status="running"))
+  db.commit()
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="Action")
+  for run_id in ["claim-run-second", "second-follower-run"]:
+    followed = claim_work(db, owner_id=owner.id, chat_id=second.id, run_id=run_id, work_key=KEY, summary="Follow")
+    assert followed["follow_status"] == "followed"
+  rows = db.query(models.GoalDependency).all()
+  assert {row.waiting_goal_id for row in rows} == {"claim-goal-second", "second-follower-goal"}
+  assert len({row.target_acquisition_id for row in rows}) == 1

@@ -880,8 +880,10 @@ def reconcile_startup_chats(
           safe_helper_answer_startup_writer_orphan,
           safe_parent_wake_startup_writer_orphan,
         )
+        from app.goal_dependencies import safe_dependency_startup_orphan
         if (
-          safe_parent_wake_startup_writer_orphan(
+          safe_dependency_startup_orphan(db, chat, running_runs[0])
+          or safe_parent_wake_startup_writer_orphan(
             db, chat, running_runs[0],
           )
           or safe_helper_answer_startup_writer_orphan(db, chat, running_runs[0])
@@ -1372,8 +1374,10 @@ async def sweep_wedged_runs(db: Session) -> list[str]:
               safe_parent_wake_startup_writer_orphan,
             )
             from app.chat_waits import safe_startup_writer_orphan
+            from app.goal_dependencies import safe_dependency_startup_orphan
             if (
-              safe_startup_writer_orphan(db, chat, physical)
+              safe_dependency_startup_orphan(db, chat, physical)
+              or safe_startup_writer_orphan(db, chat, physical)
               or safe_parent_wake_startup_writer_orphan(db, chat, physical)
               or safe_helper_answer_startup_writer_orphan(db, chat, physical)
               or safe_auto_resume_startup_orphan(db, chat, physical)
@@ -2913,6 +2917,7 @@ async def _admit_provider_execution(
   has_peer_context_delivery: bool = False,
   activity_results: tuple[tuple[str, str], ...] = (),
   wait_results: tuple[str, ...] = (),
+  dependency_results: tuple[str, ...] = (),
 ) -> bool:
   """Cross provider entry only while this exact turn still owns execution.
 
@@ -2929,6 +2934,7 @@ async def _admit_provider_execution(
       has_peer_context_delivery=has_peer_context_delivery,
       activity_results=activity_results,
       wait_results=wait_results,
+      dependency_results=dependency_results,
     )))
   except Exception:
     if not _run_generation_superseded(chat_id, run_gen):
@@ -5109,6 +5115,7 @@ _MEMORY_RECLAIM_DISPOSITIONS = frozenset({
 async def _acknowledge_provider_success(
   *, chat_id: str, run_token: str, delivered_through,
   wait_results: tuple[str, ...] = (),
+  dependency_results: tuple[str, ...] = (),
 ) -> None:
   """Best-effort provider-success and delivery acknowledgement.
 
@@ -5130,7 +5137,13 @@ async def _acknowledge_provider_success(
         delivered_through.message_id if delivered_through is not None else None
       ),
       wait_results=wait_results,
+      dependency_results=dependency_results,
     )))
+    if dependency_results:
+      from app.goal_dependencies import withdraw_disposed_dependency_notices
+      from app.goal_plans import publish_goal_changed
+      publish_goal_changed(chat_id)
+      await withdraw_disposed_dependency_notices(chat_id)
     if wait_results:
       from app.chat_waits import (
         _broadcast_changed,
@@ -5727,7 +5740,14 @@ async def _run_chat_impl_with_db(
   # future condition to this parent instead. A result that lands after this
   # snapshot queues behind the live turn rather than mutating its request.
   wait_results: tuple[str, ...] = ()
+  dependency_results: tuple[str, ...] = ()
   if run_policy is None and chat_id:
+    from app.goal_dependencies import owed_dependency_results
+    dependency_text, dependency_results = owed_dependency_results(
+      db, chat_id, raw_user_message, run_id=run_token,
+    )
+    if dependency_text:
+      user_message = f"{dependency_text}\n\n{user_message}"
     from app.chat_waits import build_active_waits_context, owed_wait_results
     owed_waits_text, wait_results = owed_wait_results(
       db, chat_id, raw_user_message, run_id=run_token,
@@ -6171,6 +6191,7 @@ async def _run_chat_impl_with_db(
         has_peer_context_delivery=coordination_message_through is not None,
         activity_results=activity_results,
         wait_results=wait_results,
+        dependency_results=dependency_results,
       ):
         return await _complete_turn(
           bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,
@@ -6214,6 +6235,7 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
+          dependency_results=dependency_results,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(
@@ -6364,6 +6386,7 @@ async def _run_chat_impl_with_db(
         has_peer_context_delivery=coordination_message_through is not None,
         activity_results=activity_results,
         wait_results=wait_results,
+        dependency_results=dependency_results,
       ):
         return await _complete_turn(
           bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,
@@ -6410,6 +6433,7 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
+          dependency_results=dependency_results,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(

@@ -40,8 +40,21 @@ class GoalParkHandoff:
 
 
 @dataclass(frozen=True)
+class GoalDependencyHandoff:
+  id: str
+  target_kind: str
+  condition: str
+  source_chat_id: str | None
+  source_chat_title: str | None
+  automatic: bool
+  delivery_pending: bool
+  resume_blocker: str | None
+  outcome: dict | None
+
+
+@dataclass(frozen=True)
 class GoalHandoffs:
-  """Native handoffs only; future cross-chat dependencies join at this seam.
+  """Exact native and cross-chat handoffs share this read-side seam.
 
   This is a read-side projection, not permission to admit or deliver a turn.
   The writer must still check its own queue, run and Goal authority.
@@ -51,7 +64,7 @@ class GoalHandoffs:
   running: bool
   waits: tuple[GoalWaitHandoff, ...]
   helpers: tuple[GoalHelperHandoff, ...]
-  dependencies: tuple[dict, ...]
+  dependencies: tuple[GoalDependencyHandoff, ...]
   park: GoalParkHandoff | None
   failed_attempt: bool
 
@@ -72,8 +85,8 @@ class GoalHandoffs:
   def prevents_settlement(self) -> bool:
     """A native owner still owes this Goal a next step or result."""
     return (self.owner_input or bool(self.waits) or bool(self.helpers)
-            or any(dep["automatic"] and (
-              dep["outcome"] is None or dep["delivery_pending"]
+            or any(dep.automatic and (
+              dep.outcome is None or dep.delivery_pending
             ) for dep in self.dependencies)
             or (self.park is not None and self.park.kind in {"automatic", "owner_input"}))
 
@@ -133,7 +146,7 @@ def goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
     running=bool(owns_chat_attempt and latest.status == "running"),
     waits=waits,
     helpers=helpers,
-    dependencies=tuple(goal_dependency_handoffs(db, goal)),
+    dependencies=tuple(GoalDependencyHandoff(**item) for item in goal_dependency_handoffs(db, goal)),
     park=park,
     failed_attempt=bool(owns_chat_attempt and latest.status in {"failed", "interrupted"}),
   )

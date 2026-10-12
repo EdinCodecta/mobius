@@ -13,11 +13,20 @@ from app import models
 from app.timeutil import now_naive_utc
 
 
-def _eligible_goal(db: Session, chat_id: str, run_id: str):
+def _eligible_goal(db: Session, chat_id: str, run_id: str, waiting_goal_id=None):
+  if db.query(models.Chat.id).filter(
+    models.Chat.id == chat_id, models.Chat.deleted_at.is_(None),
+  ).first() is None:
+    return None
   if db.query(models.Delegation.id).filter(
     models.Delegation.child_chat_id == chat_id,
   ).first():
     return None
+  if waiting_goal_id is not None:
+    return db.query(models.ChatGoal).filter(
+      models.ChatGoal.id == waiting_goal_id, models.ChatGoal.chat_id == chat_id,
+      models.ChatGoal.status == 'open',
+    ).first()
   return db.query(models.ChatGoal).join(
     models.ChatRun, models.ChatRun.goal_id == models.ChatGoal.id,
   ).filter(
@@ -51,7 +60,7 @@ MAX_CLAIM_DEPENDENCIES_PER_GOAL = 64
 
 
 def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
-                       chat_id: str, run_id: str) -> str:
+                       chat_id: str, run_id: str, waiting_goal_id=None) -> str:
   """Register under the claim's write lock; return followed or a truthful reason.
 
   The CAS write serializes with settlement/transfer, including on SQLite where
@@ -62,7 +71,7 @@ def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
   db.query(models.Owner).filter(models.Owner.id == claim.owner_id).update(
     {models.Owner.username: models.Owner.username}, synchronize_session=False,
   )
-  goal = _eligible_goal(db, chat_id, run_id)
+  goal = _eligible_goal(db, chat_id, run_id, waiting_goal_id)
   if goal is None:
     return 'no_open_top_level_goal'
   if claim.owner_chat_id == chat_id or claim.owner_goal_id == goal.id:
@@ -103,9 +112,12 @@ def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
     raise ValueError('The claim changed while following; inspect it before retrying.')
   if _direct_cycle(db, waiting_goal_id=goal.id, source_goal_id=claim.owner_goal_id):
     return 'direct_cycle'
+  source_run = db.get(models.ChatRun, run_id)
+  created_by_run_id = (run_id if source_run is not None and source_run.chat_id == chat_id
+    and source_run.goal_id == goal.id else None)
   db.add(models.GoalDependency(
     id=str(uuid4()), waiting_goal_id=goal.id, waiting_chat_id=chat_id,
-    created_by_run_id=run_id, target_kind='claim_acquisition',
+    created_by_run_id=created_by_run_id, target_kind='claim_acquisition',
     target_key=target_key, target_claim_id=claim.id,
     target_acquisition_id=claim.acquisition_id,
     target_chat_id=claim.owner_chat_id,
@@ -136,7 +148,7 @@ def stage_stamp_claim_outcome(db: Session, row: models.AgentWorkClaim,
             models.GoalDependency.resolved_at: now}, synchronize_session=False)
 
 
-def dependency_source_blocker(db: Session, row: models.GoalDependency) -> str | None:
+def dependency_source_blocker(db: Session, row: models.GoalDependency, *, _seen=None) -> str | None:
   """Report why a pending claim source cannot be trusted to progress.
 
   This is observational, not a polling or takeover operation. Resolved and
@@ -162,37 +174,73 @@ def dependency_source_blocker(db: Session, row: models.GoalDependency) -> str | 
       return 'source_held' if goal is not None and goal.status == 'stopped' else 'source_failed'
     latest = db.query(models.ChatRun).filter(
       models.ChatRun.chat_id == claim.owner_chat_id,
+      models.ChatRun.goal_id == goal.id,
     ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).first()
-    if latest is not None and latest.goal_id == goal.id and latest.status in (
-      'failed', 'stopped', 'interrupted',
-    ):
-      from app.chat_waits import _FIRED_UNDELIVERED, _goal_waits
+    if latest is None:
+      return 'owner_not_progressing'
+    if latest.status in ('failed', 'stopped', 'interrupted', 'completed',
+                         'parked', 'resume_pending', 'parked_notified'):
+      from app.chat_waits import _FIRED_UNDELIVERED, _goal_waits, wait_resume_blocker
       from app.delegations import _self_resuming_helper_rows
-      if chat.pending_question_id is not None:
-        return None
-      if _goal_waits(db, chat.id, goal.id).filter(
+      latest_chat_id = db.query(models.ChatRun.id).filter(
+        models.ChatRun.chat_id == chat.id,
+      ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).limit(1).scalar()
+      if latest_chat_id == latest.id:
+        if chat.pending_question_id is not None:
+          return None
+        if latest.status in models.CONTINUATION_RUN_STATUSES:
+          from app.chat import continuation_handoff_for_chat
+          if continuation_handoff_for_chat(db, chat.id)['kind'] in {'automatic', 'owner_input'}:
+            return None
+      for wait in _goal_waits(db, chat.id, goal.id).filter(
         (models.ChatWait.status == 'armed') | _FIRED_UNDELIVERED,
-      ).first():
+      ).all():
+        if wait.status == 'armed' or wait_resume_blocker(db, wait) not in {
+          'manual_resume', 'resume_failed', 'restart',
+        }:
+          return None
+      if any(helper.goal_id == goal.id for helper, _ in
+             _self_resuming_helper_rows(db, {chat.id})):
         return None
-      if any(
-        helper.goal_id == goal.id for helper, _ in
-        _self_resuming_helper_rows(db, {chat.id})
-      ):
-        return None
-      if db.query(models.GoalDependency.id).filter(
+      # Follow a finite chain of real sources, not the existence of a stale row.
+      # Direct cycles are rejected on writes. Longer cycles remain representable,
+      # but a detected chain of stalled executors is recovery, not automatic work.
+      seen = set(_seen or ())
+      if row.id in seen:
+        return 'owner_not_progressing'
+      seen.add(row.id)
+      from app.goal_dependencies import dependency_resume_blocker
+      for dependency in db.query(models.GoalDependency).filter(
         models.GoalDependency.waiting_goal_id == goal.id,
         models.GoalDependency.result_disposition.is_(None),
         models.GoalDependency.withdrawn_at.is_(None),
-      ).first():
-        return None
+      ).all():
+        if dependency.resolved_at is not None:
+          if dependency_resume_blocker(db, dependency) not in {
+            'manual_resume', 'goal_closed', 'goal_held', 'chat_deleted', 'disposed', 'restart',
+          }:
+            return None
+        elif dependency_source_blocker(db, dependency, _seen=seen) is None:
+          return None
       return 'owner_not_progressing'
+
   else:
     run = db.get(models.ChatRun, claim.owner_run_id)
     if run is None:
       return 'owner_not_progressing'
-    if run.status in ('failed', 'stopped', 'interrupted', 'completed'):
-      if chat.pending_question_id is None:
-        return 'owner_not_progressing'
+    if run.status in ('failed', 'stopped', 'interrupted', 'completed',
+                      'parked', 'resume_pending', 'parked_notified'):
+      latest_chat_id = db.query(models.ChatRun.id).filter(
+        models.ChatRun.chat_id == chat.id,
+      ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).limit(1).scalar()
+      if latest_chat_id == run.id:
+        if chat.pending_question_id is not None:
+          return None
+        if run.status in models.CONTINUATION_RUN_STATUSES:
+          from app.chat import continuation_handoff_for_chat
+          if continuation_handoff_for_chat(db, chat.id)['kind'] in {'automatic', 'owner_input'}:
+            return None
+      return 'owner_not_progressing'
   return None
 
 
@@ -238,6 +286,60 @@ def stage_reconcile_claim_sources(db: Session) -> int:
     ).update({models.GoalDependency.outcome_json: {
         'kind': 'owner_not_progressing', 'reason': blocker,
         'target_acquisition_id': row.target_acquisition_id,
+        'source_chat_id': claim.owner_chat_id if claim else row.target_chat_id,
+        'source_chat_title': (db.query(models.Chat.title).filter(
+          models.Chat.id == claim.owner_chat_id).scalar() if claim else None),
+        'summary': claim.summary if claim else 'Shared work',
+        'work_key': claim.work_key if claim else None,
       }, models.GoalDependency.resolved_at: now_naive_utc()},
       synchronize_session=False)
   return settled
+
+
+def obsolete_claim_notice_carrier(db, chat_id, message):
+  """Retire only proven old completion/release wake reservations at cutover.
+
+  Claim transfer and completion used the same notice kind. Only the exact
+  current terminal revision proves which event an old notice represents; older
+  ambiguous revisions remain untouched. Message bodies never supply authority.
+  Dropping a reservation does not acknowledge its peer cursor: the durable
+  notes remain available as ordinary context on the next authorized turn.
+  """
+  import json
+  if not (message.get('kind') == 'peer_message' and message.get('hidden') is True
+      and isinstance(message.get('peer_message_through'), dict)):
+    return False
+  content = message.get('content') or ''
+  if not isinstance(content, str):
+    return False
+  before, marker, tail = content.partition('<agent_coordination>')
+  if not marker:
+    return False
+  encoded, close, _ = tail.partition('</agent_coordination>')
+  if not close:
+    return False
+  try:
+    data = json.loads(encoded)
+    entries = data['messages']
+  except (ValueError, TypeError, KeyError):
+    return False
+  if not isinstance(entries, list) or not entries or data.get('self_chat_id') != chat_id:
+    return False
+  ids = [item.get('id') for item in entries if isinstance(item, dict)]
+  if len(ids) != len(entries) or any(not isinstance(value, str) for value in ids):
+    return False
+  if ids[-1] != message['peer_message_through'].get('id'):
+    return False
+  obsolete = False
+  for identity in ids:
+    saved = db.get(models.AgentCoordinationMessage, identity)
+    if saved is None or saved.to_chat_id != chat_id:
+      return False
+    source = saved.from_run_id or ''
+    claim = db.get(models.AgentWorkClaim, source.removeprefix('work-claim:')) if source.startswith('work-claim:') else None
+    if (claim is not None and (claim.completed_at is not None or claim.released_at is not None)
+        and saved.send_id == f'revision:{claim.revision}'):
+      obsolete = True
+    elif saved.delivery == 'interrupt':
+      return False
+  return obsolete

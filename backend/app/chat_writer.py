@@ -435,6 +435,7 @@ class AdmitProviderExecution(_Command):
   # (Delegation id, child run id) pairs: the exact results in the context.
   activity_results: tuple[tuple[str, str], ...] = ()
   wait_results: tuple[str, ...] = ()
+  dependency_results: tuple[str, ...] = ()
 
 
 @dataclass
@@ -453,6 +454,7 @@ class AcknowledgeProviderSuccess(_Command):
   peer_message_through_created_at: datetime | None = None
   peer_message_through_id: str | None = None
   wait_results: tuple[str, ...] = ()
+  dependency_results: tuple[str, ...] = ()
 
 
 @dataclass
@@ -2759,6 +2761,18 @@ class ChatWriterActor:
     ).all()} if cmd.wait_results else set()
     if eligible_waits != set(cmd.wait_results):
       raise _PersistFailed("AdmitProviderExecution: Wait result is no longer receivable")
+    from app.goal_dependencies import receivable_dependency_results, dependency_delivery_blocker
+    if run.id.startswith("dependency-resume-"):
+      dependency = db.get(models.GoalDependency,
+        run.id.removeprefix("dependency-resume-").removesuffix(".retry"))
+      if (dependency is None or dependency.waiting_chat_id != cmd.chat_id
+          or dependency.waiting_goal_id != run.goal_id or dependency_delivery_blocker(db, dependency)):
+        raise _PersistFailed("AdmitProviderExecution: dependency continuation is no longer receivable")
+    eligible_dependencies = {row.id for row in receivable_dependency_results(db, cmd.chat_id, run.id).filter(
+      models.GoalDependency.id.in_(cmd.dependency_results),
+    ).all()} if cmd.dependency_results else set()
+    if eligible_dependencies != set(cmd.dependency_results):
+      raise _PersistFailed("AdmitProviderExecution: dependency result is no longer receivable")
     activity_results = dict(cmd.activity_results)
     activity_ids = tuple(activity_results)
     if (
@@ -2819,6 +2833,7 @@ class ChatWriterActor:
         raise _PersistFailed(
           "AdmitProviderExecution: activity delivery is no longer available"
         )
+    run.admitted_dependency_results_json = list(cmd.dependency_results)
     run.admitted_wait_results_json = list(cmd.wait_results)
     run.provider_execution_admitted = True
     run.peer_message_delivery_pending = bool(cmd.has_peer_context_delivery)
@@ -2887,6 +2902,8 @@ class ChatWriterActor:
     )
     from app.chat_waits import stage_wait_results_delivered
     stage_wait_results_delivered(db, cmd.chat_id, cmd.wait_results, run_id=run.id)
+    from app.goal_dependencies import stage_dependency_results_delivered
+    stage_dependency_results_delivered(db, cmd.chat_id, cmd.dependency_results, run_id=run.id)
     if not _commit_or_rollback(db):
       raise _PersistFailed("AcknowledgeProviderSuccess did not persist")
 
@@ -3449,6 +3466,9 @@ class ChatWriterActor:
     if chat is None:
       raise _PersistFailed("StartTurn: chat not found or deleted")
     from app.chat_waits import wait_result_message_blocker
+    from app.goal_dependencies import dependency_result_message_blocker
+    if dependency_result_message_blocker(db, cmd.chat_id, cmd.user_msg):
+      raise _PersistFailed("StartTurn: dependency result is no longer receivable")
     if wait_result_message_blocker(db, cmd.chat_id, cmd.user_msg):
       raise _PersistFailed("StartTurn: Wait result is no longer receivable")
     ensure_user_cid(cmd.user_msg)
@@ -3633,7 +3653,8 @@ class ChatWriterActor:
       # startup interruption alone must never authorize an automatic retry.
       for displaced in db.query(ChatRun).filter(
         ChatRun.chat_id == cmd.chat_id, ChatRun.status == "running",
-        ChatRun.id.startswith("wait-resume-"), ChatRun.goal_id.is_not(None),
+        or_(ChatRun.id.startswith("wait-resume-"), ChatRun.id.startswith("dependency-resume-")),
+        ChatRun.goal_id.is_not(None),
         ChatRun.provider_execution_admitted.is_(False),
       ).all():
         displaced.owner_superseded_by_run_id = cmd.run_token
@@ -3702,6 +3723,14 @@ class ChatWriterActor:
 
     from app.chat_waits import wait_result_message_blocker
     blocker = wait_result_message_blocker(db, cmd.chat_id, {
+      "kind": cmd.message_kind, "cid": cmd.cid, "source_work_id": cmd.source_work_id,
+    })
+    if blocker:
+      db.rollback()
+      return StartContinuationBlocked(blocker)
+
+    from app.goal_dependencies import dependency_result_message_blocker
+    blocker = dependency_result_message_blocker(db, cmd.chat_id, {
       "kind": cmd.message_kind, "cid": cmd.cid, "source_work_id": cmd.source_work_id,
     })
     if blocker:
@@ -5064,10 +5093,14 @@ class ChatWriterActor:
     pending = examined
     rejected = [row for row in pending if row.get("delivery_status") == "rejected"]
     from app.chat_waits import wait_result_message_blocker
+    from app.goal_dependencies import dependency_result_message_blocker
+    from app.goal_dependency_sources import obsolete_claim_notice_carrier
     runnable = [
       row for row in pending
       if row.get("delivery_status") != "rejected"
       if not wait_result_message_blocker(db, cmd.chat_id, row)
+      if not dependency_result_message_blocker(db, cmd.chat_id, row)
+      if not obsolete_claim_notice_carrier(db, cmd.chat_id, row)
       if not goal_clear_requested(str(row.get("content") or ""))
       and not is_retired_goal_handoff(row)
     ]
@@ -7154,26 +7187,21 @@ def _question_owner_run(db, chat, question_id):
 
 
 def _settle_ended_goal_claims(db, goal) -> None:
-  """Settle an ending Goal's open work claims inside the same writer commit.
+  """End source acquisitions and exact dependencies in the lifecycle txn.
 
-  Stop and dismissal release the claims so followers may take the exact action
-  over. A savepoint keeps a claim-table failure from failing the lifecycle
-  write itself; the post-commit seam (``settle_claims_with_owner``) repairs
-  any claim left open from the durable Goal status.
+  The outcome cannot be deferred to a post-commit notice: a crash followed by
+  reacquisition would overwrite the only source fact. Fail the transaction
+  rather than commit a Goal transition without its acquisition outcomes.
   """
   from app.agent_work_claims import stage_settle_goal_claims
+  from app.goal_dependencies import stage_retire_goal_dependencies
 
-  try:
-    with db.begin_nested():
-      stage_settle_goal_claims(
-        db, chat_id=goal.chat_id, goal_id=goal.id, status=goal.status,
-        result=goal.result,
-      )
-  except Exception:
-    log.warning(
-      "goal %s ended but its work claims were not settled in-commit",
-      goal.id, exc_info=True,
-    )
+  stage_settle_goal_claims(
+    db, chat_id=goal.chat_id, goal_id=goal.id, status=goal.status,
+    result=goal.result,
+  )
+  if goal.status not in {"open", "stopped"}:
+    stage_retire_goal_dependencies(db, goal.chat_id, goal.id)
 
 
 def _cancel_activation_owners(db, chat, *, goal_id: str | None = None) -> int:

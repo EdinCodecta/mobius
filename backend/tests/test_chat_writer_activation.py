@@ -311,7 +311,7 @@ def test_put_replace_transcript_broad_fences_stream_snapshot(client, auth, chat)
 # called `_complete_turn` directly could never have caught that, which is why
 # the original review missed it.
 def test_finalize_failure_via_run_chat_leaves_marker_for_reconciliation(
-  monkeypatch, tmp_path
+  monkeypatch, tmp_path, healthy_data_disk,
 ):
   """Through the real `run_chat` wrapper, a forced `Finalize` ack failure
   must leave the durable run marker SET after `run_chat` returns (so

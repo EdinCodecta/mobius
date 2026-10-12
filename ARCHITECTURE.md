@@ -1241,6 +1241,38 @@ without implying a polling deadline;
 chat-wide handoff guards conflicting actions without borrowing another task's
 question. Retired revision-budget columns remain inert historical schema.
 
+
+Claim follows are `GoalDependency` rows, separate from observable/timed Waits.
+A collision or approval de-duplication registers the exact open top-level Goal
+against the claim's **acquisition UUID**, atomically with the ownership decision.
+Transfers retain that UUID; release then reacquisition gets a new UUID. Helpers,
+Goal-less callers, self-follows and direct A↔B cycles receive explicit no-follow
+results. Transfer checks existing subscribers too and rolls back if the former
+open Goal cannot retain its follow. The policy is 64 outstanding claim follows
+per Goal, independent of the eight-Wait cap. Longer cycles are not forbidden by
+admission; a detected chain of stalled sources is recovery, not promised progress.
+
+`goal_dependency_sources` owns registration and immutable source outcomes. Finish,
+release, Goal hold/end and chat deletion stamp subscribed outcomes in the same
+transaction as the source transition. A failed or clean-ended source without an
+exact-Goal native continuation produces factual `owner_not_progressing`, never
+automatic takeover. Another Goal's run or card is not proof of source liveness.
+`goal_dependencies` owns selection and delivery through the existing continuation
+queue, writer and supervisor. Scheduling is not receipt: only successful provider
+execution of the exact waiting Goal acknowledges its admitted result set. Held
+Goals retain results without reopening; terminal Goals retire them; dependent
+chat deletion withdraws them even if the chat is restored. Exhausted/ambiguous
+carriers surface manual recovery; there is no unlimited retry or new runner.
+
+Migrations 0090/0091 retain `AgentWorkInterest` as historical storage and backfill
+only provable live acquisitions. Ambiguous, dismissed and unsafe old links are
+not adopted into the newest Goal, and resolved history never wakes old work.
+Runtime follows no longer read/write that table. At cutover, only proven terminal
+claim-notice reservations are retired without acknowledging their peer cursor;
+ordinary peer interrupts, transfer revocations and ambiguous historical messages
+remain intact. Saved-card dependencies and final legacy-table retirement belong
+to the later redesign stages.
+
 Persisted plans use the same task validation as plan writes. An unreadable
 plan keeps its Goal open, cannot authorize completion, and can be repaired
 through a fully validated, revision-checked replacement. Identical normalized

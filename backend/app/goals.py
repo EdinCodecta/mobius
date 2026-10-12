@@ -308,14 +308,15 @@ def compaction_brief_refresh(chat_id, run_id, *, delegated):
 async def settle_after_goal_completion(chat_id: str) -> None:
   """Finish what a committed terminal Goal outcome leaves for other owners.
 
-  Resume notices queued for Waits the completion took delivery of are
-  withdrawn, so they cannot start a turn for the finished Goal, and claim
-  followers wake with the settled outcome.
+  Retired Wait/dependency notices are withdrawn, so they cannot start a turn
+  for the finished Goal. Source claim results remain owed to exact followers.
   """
   from app.agent_coordination import settle_claims_with_owner
   from app.chat_waits import withdraw_delivered_resume_notices
 
+  from app.goal_dependencies import withdraw_disposed_dependency_notices
   await withdraw_delivered_resume_notices(chat_id)
+  await withdraw_disposed_dependency_notices(chat_id)
   await settle_claims_with_owner(chat_id)
 
 
@@ -464,6 +465,8 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
       )
     from app.chat_waits import stage_retire_fired_goal_waits
     consumed_waits = stage_retire_fired_goal_waits(db, goal.chat_id, goal.id)
+    from app.goal_dependencies import stage_retire_goal_dependencies
+    stage_retire_goal_dependencies(db, goal.chat_id, goal.id)
     values.update(status=status, result=outcome_text, next_action=None,
                   completed_at=datetime.now(UTC), completion_run_id=run.id)
   else:

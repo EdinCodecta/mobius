@@ -108,7 +108,7 @@ def test_claim_dependency_is_exact_goal_handoff_and_blocks_settlement(db, chat, 
   monkeypatch.setattr(goal_dependencies, "goal_dependency_handoffs", projection)
 
   native = goal_handoffs(db, goal_a)
-  assert native.prevents_settlement and native.dependencies[0]["id"] == "follow-a"
+  assert native.prevents_settlement and native.dependencies[0].id == "follow-a"
   assert not goal_handoffs(db, goal_b).prevents_settlement
   assert _goal_handoff(db, first, goal_a) == {"kind": "automatic", "reason": "dependency"}
   assert _goal_handoff(db, second, goal_b) == {"kind": "none", "reason": None}

@@ -663,3 +663,65 @@ def test_null_recovery_snapshot_cannot_hide_same_goal_or_broken_settlement_histo
                         if predecessor == "same-goal" else None))
   db.commit()
   assert recovery_attempted(db, run, reason="goal_settlement") is (predecessor != "goalless")
+
+
+@pytest.mark.parametrize("follow_kind", ["held_by_peer", "transferred_recovery"])
+@pytest.mark.parametrize("release", [False, True])
+def test_claim_follow_incidents_wait_without_banner_then_deliver_exact_goal_once(
+  db, chat, monkeypatch, follow_kind, release,
+):
+  """Oct-11 transferred executor and Oct-12 watcher retain real handoff ownership."""
+  import asyncio
+  from app import chat as chat_mod, goal_dependencies
+  from app.agent_work_claims import claim_work, finish_work
+  from app.chat_writer import AdmitProviderExecution, AcknowledgeProviderSuccess
+  _add_goal_run(db, chat)
+  owner = models.Owner(username="claim-incident-owner", hashed_password="unused")
+  peer = create_chat(id="incident-source", title="Watch the platform update", messages=[])
+  db.add_all([owner, peer])
+  db.add(models.ChatGoal(id="source-goal", chat_id=peer.id, objective="Host repair"))
+  db.add(models.ChatRun(id="source-run", root_run_id="source-run", chat_id=peer.id,
+    goal_id="source-goal", status="running", provider="codex"))
+  db.commit()
+  key = "platform:recovery:exact-action"
+  if follow_kind == "held_by_peer":
+    claim_work(db, owner_id=owner.id, chat_id=peer.id, run_id="source-run",
+      work_key=key, summary="Repair host")
+    result = claim_work(db, owner_id=owner.id, chat_id=chat.id, run_id="goal-run",
+      work_key=key, summary="Follow repair")
+    assert result["state"] == "held_by_peer"
+  else:
+    claim_work(db, owner_id=owner.id, chat_id=chat.id, run_id="goal-run",
+      work_key=key, summary="Repair host")
+    claim_work(db, owner_id=owner.id, chat_id=peer.id, run_id="source-run",
+      work_key=key, summary="Repair host", expected_owner_chat_id=chat.id,
+      takeover_reason="Accepted responsibility for the host repair decision")
+  dependency = db.query(models.GoalDependency).filter_by(waiting_goal_id="goal-run").one()
+  response = get_writer().submit(PromotePending(chat_id=chat.id, run_token="must-not-settle",
+    ending_run_token="goal-run", ending_status="completed")).result(timeout=5)
+  assert response["promoted"] is None
+  assert db.get(models.ChatRun, "must-not-settle") is None
+  assert not any("goal_settlement_unfinished" in str(message)
+    for message in transcript_rows.history(chat))
+  # The real terminal drain closes the physical attempt after the handoff
+  # predicate returns without settlement. Preserve that boundary in this test.
+  from app.chat_writer import FinishRun
+  get_writer().submit(FinishRun(chat_id=chat.id, run_token="goal-run",
+    terminal_status="completed")).result(timeout=5)
+  finish_work(db, owner_id=owner.id, chat_id=peer.id, work_key=key,
+    outcome="Verified repair" if not release else "Owner chose not to perform repair", release=release)
+  db.refresh(dependency)
+  assert dependency.outcome_json["kind"] == ("released" if release else "completed")
+  scheduled = []
+  monkeypatch.setattr(chat_mod, "_schedule_continuation", lambda **kw: scheduled.append(kw))
+  assert asyncio.run(goal_dependencies.deliver_dependency(dependency.id))
+  db.expire_all()
+  carrier = db.get(models.ChatRun, "dependency-resume-" + dependency.id)
+  assert carrier.goal_id == "goal-run" and len(scheduled) == 1
+  get_writer().submit(AdmitProviderExecution(chat_id=chat.id, run_token=carrier.id,
+    dependency_results=(dependency.id,))).result(timeout=5)
+  get_writer().submit(AcknowledgeProviderSuccess(chat_id=chat.id, run_token=carrier.id,
+    dependency_results=(dependency.id,))).result(timeout=5)
+  assert not asyncio.run(goal_dependencies.deliver_dependency(dependency.id))
+  db.refresh(dependency)
+  assert dependency.received_run_id == carrier.id and len(scheduled) == 1

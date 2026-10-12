@@ -1963,14 +1963,13 @@ async def notify_settled_claims(
 
 
 async def settle_claims_with_owner(chat_id: str) -> list[str]:
-  """Post-commit seam: settle and announce claims whose owner has ended.
+  """Post-commit legacy repair and exact-Goal result delivery nudge.
 
-  Lifecycle writes (Goal completion, Stop, dismissal, chat deletion) settle
-  claims atomically with the Goal or tombstone. This seam re-derives any
-  claim those writes could not settle, then delivers every notice this chat
-  still owes its followers. Returns the notified follower ids. It never
-  raises: a failure leaves durable state for the next seam, never a false
-  completion.
+  Lifecycle writes settle claims atomically with their Goal or tombstone.
+  This seam repairs source rows ended by older paths, then nudges dependency
+  reconciliation. No follower chat-wide interrupt is sent (the retained list
+  return is empty). Failure leaves durable outcomes for the next supervisor
+  pass, never a false receipt.
   """
   from app.agent_work_claims import (
     pending_settlement_notices,

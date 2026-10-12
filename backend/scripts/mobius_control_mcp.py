@@ -1957,7 +1957,7 @@ _TOOL_DEFINITIONS = {
       "(request_approval claims its own work_key). The first chat wins; a "
       "later caller gets the owner; a Goal follows that exact acquisition only "
       "when the response confirms a dependency was created. That Goal resumes "
-      "on completion or release without polling or a peer interrupt. A helper "
+      "when eligible on completion or release, without polling or a peer interrupt. A helper "
       "or Goal-less chat cannot own that automatic follow. Do not duplicate "
       "claimed work. "
       "Transfer only for a specific strong reason, naming the observed owner "
@@ -1979,8 +1979,9 @@ _TOOL_DEFINITIONS = {
   FINISH_AGENT_WORK_TOOL: {
     "name": FINISH_AGENT_WORK_TOOL,
     "description": (
-      "Complete or release a claim this chat owns; followers wake with the "
-      "outcome. Usually unnecessary inside a Goal: update_goal complete with "
+      "Complete or release a claim this chat owns; exact follower Goals receive "
+      "the outcome when eligible (held Goals keep it without reopening). "
+      "Usually unnecessary inside a Goal: update_goal complete with "
       "finished_claims completes the claims the Goal performed and "
       "releases the rest (for example, a declined approval), and Stop, "
       "dismissal, or chat deletion releases them. Call it to settle earlier "
