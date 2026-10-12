@@ -5,7 +5,7 @@ import { api } from '../../api/client.js'
 import { authQueries, modelQueries, settingsQueries } from '../../hooks/queries.js'
 import { detailToMessage } from '../../lib/errorDetail.js'
 
-export default function ProviderConnection({ provider, name, connected, onDisconnected, children }) {
+export default function ProviderConnection({ provider, name, connected, onDisconnected, disconnectDetail = '', children }) {
   const queryClient = useQueryClient()
   const [action, setAction] = useState('manage')
   const [busy, setBusy] = useState(false)
@@ -49,6 +49,7 @@ export default function ProviderConnection({ provider, name, connected, onDiscon
             Your chats and settings stay. New tasks using this provider will need
             a connection. Running tasks may keep their session until they finish.
             This does not cancel your subscription or sign out other devices.
+            {disconnectDetail && ` ${disconnectDetail}`}
           </p>
           <div className="provider-connection__actions">
             <button type="button" className="pa__btn pa__btn--sm" disabled={busy} onClick={() => { setAction('manage'); setError('') }}>Cancel</button>

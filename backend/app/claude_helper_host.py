@@ -610,6 +610,8 @@ def _host_options(
 ):
   """Build the host's Claude Code options once per host start."""
   from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions, HookMatcher
+  from app.config import get_settings
+  from app.providers import claude_cli_settings
   from app.claude_sdk_runner import (
     _CLAUDE_NATIVE_OWNER_INPUT_TOOLS,
     _CLAUDE_NATIVE_SCHEDULING_TOOLS,
@@ -677,7 +679,9 @@ def _host_options(
         "PreToolUse": [HookMatcher(matcher=None, hooks=[host.pre_tool_use])],
         "PostToolUse": [HookMatcher(matcher="SendMessage", hooks=[host.post_tool_use])],
       },
-      extra_args={"settings": json.dumps({"disableWorkflows": True})},
+      extra_args={"settings": claude_cli_settings(
+        get_settings().data_dir, {"disableWorkflows": True},
+      )},
     )
     if skills_enabled:
       options["skills"] = "all"

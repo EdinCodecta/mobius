@@ -91,7 +91,8 @@ _TEXT_RULES = (
   (ProviderErrorKind.USAGE_LIMIT, _is_usage_limit),
   (ProviderErrorKind.AUTH, re.compile(
     r"authentication_failed|authentication (?:failed|error)|"
-    r"invalid authentication credentials|invalid_api_key|unauthorized|"
+    r"invalid authentication credentials|invalid[_ ]api[_ ]key|"
+    r"invalid x-api-key|unauthorized|"
     r"login required|not logged in",
     re.IGNORECASE,
   ).search),

@@ -417,12 +417,13 @@ async def _run_claude_summarize_turn(
   from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
   from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
-  from app.providers import get_provider
+  from app.providers import claude_cli_settings, get_provider
 
   env = get_provider("claude").build_env(base_env={}, data_dir=data_dir)
   claude_effort = "xhigh" if effort == "ultracode" else effort
   options = ClaudeAgentOptions(
     env=env,
+    extra_args={"settings": claude_cli_settings(data_dir, {})},
     cli_path="/usr/local/bin/claude",
     include_partial_messages=False,
     tools=[],

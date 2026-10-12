@@ -1264,6 +1264,9 @@ async def _provider_snapshot(provider_id: str, data_dir: str) -> dict[str, Any]:
       "windows": [],
       "credit_balance": None,
     }
+  if provider_id == "claude" and providers.claude_auth_method(data_dir) == "api_key":
+    # API billing has no plan allowance windows to read.
+    return _unavailable(plan_label("api_key"))
   try:
     if provider_id == "claude":
       return await _fetch_claude_usage(data_dir)
@@ -1292,11 +1295,12 @@ def _configured_plan_label(provider_id: str, data_dir: str) -> str | None:
 
 def configured_plan_labels(data_dir: str) -> dict[str, str]:
   """Read the locally stored plan labels without contacting either provider."""
+  claude_subscription = (
+    "api_key" if providers.claude_auth_method(data_dir) == "api_key"
+    else providers.claude_subscription_type(data_dir)
+  )
   return {
-    "claude": (
-      plan_label(providers.claude_subscription_type(data_dir))
-      or "Claude plan"
-    ),
+    "claude": plan_label(claude_subscription) or "Claude plan",
     "codex": (
       plan_label(providers.codex_subscription_type(data_dir))
       or "Codex plan"

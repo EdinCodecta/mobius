@@ -43,6 +43,7 @@ from app.deps import (
   get_owner_or_delegated_owner_for_app_token, reject_cross_site,
   require_chat_embed_operation,
   require_installation_owner_control,
+  require_owner_input_principal,
 )
 from app.timeutil import now_naive_utc
 from app.routes.shell_install_pass import router as shell_install_pass_router
@@ -859,6 +860,97 @@ async def _exchange_claude_code(body: schemas.ProviderCodeRequest):
   return {"ok": True}
 
 
+class ClaudeApiKeyWrite(BaseModel):
+  # Unconstrained on purpose: a failed field constraint echoes the submitted
+  # value in the 422 body. normalize_api_key validates without echoing it.
+  api_key: str
+
+
+def _owner_supplying_credential(
+  principal: Principal = Depends(get_principal),
+) -> models.Owner:
+  """The installation owner typing into Settings; never an agent token.
+
+  An agent that could save a key would be handing a value it holds (and its
+  model has seen) to the account; the sealed path is the owner's own form.
+  """
+  owner = get_current_owner_for_lifecycle_control(principal)
+  require_owner_input_principal(principal)
+  return owner
+
+
+@router.put(
+  "/provider/claude/api-key", dependencies=[Depends(reject_cross_site)],
+)
+@_limiter.limit("5/minute")
+async def save_claude_api_key(
+  request: Request,
+  body: ClaudeApiKeyWrite,
+  _: models.Owner = Depends(_owner_supplying_credential),
+):
+  """Check and save the owner's Anthropic API key for Claude runs.
+
+  A usable Claude sign-in keeps precedence; the key is used when there is
+  none. The key is checked with Anthropic's free model listing first, so a
+  mistyped key is refused here rather than at the next chat.
+  """
+  return await _save_claude_api_key(get_settings().data_dir, body.api_key)
+
+
+async def _save_claude_api_key(data_dir: str, raw_key: str) -> dict:
+  from app import claude_api_key
+  from app.providers import claude_auth_method
+  try:
+    key = claude_api_key.normalize_api_key(raw_key)
+  except ValueError as exc:
+    raise HTTPException(status_code=400, detail=str(exc))
+  # The check runs inside the lock that Disconnect also takes: a Disconnect
+  # sent while the check is in flight then lands after this save, so it can
+  # never be undone by a save that started before it.
+  async with _provider_login_locks["claude"]:
+    try:
+      await claude_api_key.verify_api_key(key)
+    except ValueError as exc:
+      raise HTTPException(status_code=400, detail=str(exc))
+    except ConnectionError:
+      raise HTTPException(
+        status_code=502,
+        detail="Could not reach Anthropic to check the key. Try again shortly.",
+      )
+    try:
+      claude_api_key.save_api_key(data_dir, key)
+    except OSError:
+      log.exception("Could not save the Anthropic API key")
+      raise HTTPException(500, "Could not save the key. Please try again.")
+    await _provider_signin_changed("claude")
+  return {"ok": True, "auth_method": claude_auth_method(data_dir)}
+
+
+@router.delete(
+  "/provider/claude/api-key", dependencies=[Depends(reject_cross_site)],
+)
+async def remove_claude_api_key(
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+):
+  """Remove only the saved API key; a Claude sign-in is left in place.
+
+  Like Disconnect, this is a lifecycle control: the owner or a top-level
+  agent may remove the key (removal discloses nothing), while only the owner's
+  own Settings form may supply one.
+  """
+  from app import claude_api_key
+  data_dir = get_settings().data_dir
+  async with _provider_login_locks["claude"]:
+    try:
+      claude_api_key.remove_api_key(data_dir)
+    except OSError:
+      log.exception("Could not remove the Anthropic API key")
+      raise HTTPException(500, "Could not remove the key. Please try again.")
+    await _provider_signin_changed("claude")
+  from app.providers import claude_auth_method
+  return {"ok": True, "auth_method": claude_auth_method(data_dir)}
+
+
 @router.get("/providers/status")
 async def providers_status(
   principal: Principal = Depends(get_chat_view_principal),
@@ -894,6 +986,15 @@ async def providers_status(
       "error": error,
       "available": enabled,
     }
+    if pid == "claude":
+      # Which Claude credential runs use (see providers.claude_auth_method),
+      # and whether a key is saved even while a sign-in takes precedence.
+      from app.claude_api_key import api_key_path
+      from app.providers import claude_auth_method
+      out[pid]["auth_method"] = await run_in_threadpool(
+        claude_auth_method, data_dir,
+      )
+      out[pid]["api_key_saved"] = api_key_path(data_dir).exists()
     if pid == "mobius" and error is None and is_owner_caller:
       try:
         out[pid]["trial"] = await run_in_threadpool(provider.trial_status)
