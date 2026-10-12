@@ -219,21 +219,38 @@ Adding or lowering a route ceiling narrows the service in update review;
 removing, renaming or raising one widens it.
 
 Service exchange admission also bounds decoded resources independently of
-serialized bytes, in both directions: at most 262,144 structural marks (string
-openings, container openings, commas and colons outside strings), nesting
-depth 64, and a conservative 320 MiB decoded-resource estimate per direction.
-The estimate includes Unicode text, string storage and 256 bytes per
-structural mark. A bounded lexical scan checks these limits before the
+serialized bytes, in both directions: at most 524,288 structural marks (string
+openings, container openings, commas and colons outside strings, plus one per
+24 other characters outside strings, such as number text), nesting depth 128,
+and a conservative 320 MiB decoded-resource estimate per direction. Marks
+bound the standard-library parser's and renderer's uninterruptible work, so a
+larger transfer grant buys media bytes, not denser JSON; the depth stays well
+inside the platform's own encoders and response validation. The estimate
+is the largest of the phases the standard library actually goes through:
+decoding the whole body into Unicode (a buffer sized by its bytes, copied once
+per widening from ASCII to wider characters), parsing (that text plus
+per-kind allocation bounds for each string, list, object, element, member and
+number, including container growth and the parser's key memo), and, for a
+response, holding the decoded value while it is rendered (characters at the
+widest string's width, float expansion, and UTF-8 bytes beyond three stdout
+copies). A bounded lexical scan checks these limits before the
 standard-library JSON parser materializes either the HTTP request or service
 stdout; punctuation inside strings does not consume structural marks. String
 content (including escape-heavy input) is scanned in native bounded 64 KiB
 chunks with a cooperative cancellation/yield point per chunk, rather than a
 Python iteration per escape or an uninterrupted whole-body scan. JSON syntax
 and values remain exclusively authoritative in the standard-library parser. The
-complete request envelope, including tool and policy requests, also has the
-same depth and decoded-cost ceilings and at most 262,144 visited values/keys.
-Large base64 scalars, 20 MiB originals/downloads, and galleries fitting the
-reviewed 60 MiB serialized grant remain supported.
+complete request envelope, including tool and policy requests, has the same
+mark, depth and decoded-cost ceilings, counted on its compact JSON form with
+the envelope itself at depth 0; its retained estimate is each value's
+`sys.getsizeof` plus allocator slack. That walk and request serialization
+yield cooperatively. Large base64 scalars, 20 MiB originals/downloads, and
+galleries fitting the reviewed 60 MiB serialized grant remain supported. Wide
+text costs more: a request mixing a non-Latin character with an astral one
+(such as an emoji) decodes through six byte-sized copies, so it is limited to
+about 53 MiB, and a response containing an astral character renders at four
+bytes per character, so it is limited to about 45 MiB (binary responses
+included, because the estimate precedes parsing).
 
 One process-wide 512 MiB estimated exchange budget covers body/stdio reading,
 decoding, serialization, retained execution backlog and response handoff

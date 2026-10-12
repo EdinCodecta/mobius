@@ -17,6 +17,7 @@ import binascii
 import codecs
 import contextlib
 import io
+import itertools
 import json
 import logging
 import os
@@ -72,8 +73,20 @@ _app_slots: weakref.WeakValueDictionary[tuple[int, str], asyncio.Semaphore] = (
 # This is an exchange allocation budget, not another transfer grant. It is
 # shared by every lane and held through the execution queue and response
 # handoff. Exhaustion never buffers another body byte and never starts a process.
-MAX_JSON_STRUCTURE = 262_144
-MAX_JSON_DEPTH = 64
+#
+# Structural marks ('"', '{', '[', ',', ':' outside strings) bound the work of
+# the stdlib parser and renderer, which run as single uninterruptible C calls,
+# so larger transfer grants buy media bytes, not denser JSON. Depth stays well
+# inside every consumer: FastAPI's response validation of a tool result fails
+# near 255 levels, and the pure-Python request encoder needs one frame per level.
+MAX_JSON_STRUCTURE = 1 << 19
+# Parsing and rendering a number take time in proportion to its text: a
+# 17-digit float costs well over ten marks. Charging characters outside
+# strings this fraction of a mark makes the costliest float element
+# ("-1.2345678901234567e-300,") two marks, no denser than the predecessor's
+# 262,144-mark bound allowed.
+_JSON_NUMBER_CHARS_PER_MARK = 24
+MAX_JSON_DEPTH = 128
 MAX_JSON_DECODE_COST = 320 * 1024 * 1024
 MAX_ADMITTED_EXCHANGE_COST = 512 * 1024 * 1024
 MAX_PUBLIC_INGRESS_COST = 192 * 1024 * 1024
@@ -86,6 +99,38 @@ _JSON_RESOURCE_MARKS = re.compile(r'["\\{}\[\],:]')
 _JSON_STRING_CONTENT = re.compile(r'(?:[^"\\]+|\\[\s\S])*')
 _JSON_WIDE_TEXT = re.compile(r'[^\x00-\xff]')
 _JSON_ASTRAL_TEXT = re.compile(r'[^\x00-\uffff]')
+_JSON_BMP_TEXT = re.compile(r'[\u0100-\uffff]')
+# Upper bounds on what stdlib JSON allocates, for 64-bit CPython 3.12. Every
+# block may waste 23 bytes (pymalloc rounds to 16; malloc adds a chunk header).
+# A phase's allocations are summed, including transients it frees itself.
+# One document's fixed parser and decoder state (scanner, memo dict, buffer
+# headers), measured under 1.6 KiB.
+_JSON_DOCUMENT_COST = 4096
+# A list object (56 + GC rounding, 64) plus the constant part of an append
+# reallocation (old and new item arrays coexist; 6 spare slots; two blocks).
+_JSON_LIST_COST = 64 + 8 * 5 + 2 * 23
+# One element ('[' or ','): its pointer in the old array and in the 9/8 larger
+# new array, plus a bare number object (int up to 30 bits or float, 32).
+_JSON_ELEMENT_COST = 8 + 9 + 32
+# A dict object (64) plus old and new key tables' headers and blocks.
+_JSON_DICT_COST = 64 + 2 * 32 + 2 * 23
+# One member (':'). A resize from u members coexists the full old table
+# (1.5u four-byte indices, u 16-byte entries: 22u) with a new table of fewer
+# than 6u indices and 4u entries (88u). The parser's key memo dict grows the
+# same way per distinct key. Plus a bare number value (32).
+_JSON_MEMBER_COST = 2 * (22 + 88) + 32
+# A str object header (56 non-ASCII), terminator (up to 4) and block waste.
+_JSON_STRING_COST = 56 + 4 + 23
+# A character outside strings: a big int stores under half a byte per digit,
+# and parsing a number briefly holds a copy of its text.
+_JSON_BARE_CHAR_COST = 2
+# Each object costs at most sys.getsizeof plus its blocks' waste: one block, or
+# two for a container's separately allocated items/keys.
+_RETAINED_BLOCK_SLACK = 23
+# A cooperative yield after this many encoded parts or visited values keeps a
+# Python walk of a dense document from monopolizing the event loop.
+_COOPERATIVE_STEP = 16 * 1024
+_EXHAUSTED = object()
 
 
 def _json_text_width(text: str, start: int = 0, end: int | None = None) -> int:
@@ -222,12 +267,17 @@ class ServiceExchangeAdmission:
     pending_escape = False
     string_length = 0
     string_width = 1
+    string_escaped = False
+    string_content = 0
+    string_text = 0
+    string_chars = 0
     text_length = 0
     text_width = 1
-    structures = 0
+    value_width = 1
+    strings = lists = dicts = commas = members = 0
+    text_bmp = False
     depth = 0
-    decoded_cost = 0
-    cost = 64
+    cost = _JSON_DOCUMENT_COST
     for start in range(0, len(raw), 64 * 1024):
       # Bound uninterrupted scan work, not the media allowance. This yields
       # only while the raw body/stdio remains owned by the exchange lease.
@@ -245,6 +295,8 @@ class ServiceExchangeAdmission:
           # A final backslash can escape the first character of the next
           # incremental text chunk (also for UTF-16/32 inputs).
           if pending_escape:
+            if chunk[last] == "u":
+              string_width = 4
             string_length += 1
             last += 1
             pending_escape = False
@@ -254,80 +306,157 @@ class ServiceExchangeAdmission:
           string_length += end - last
           string_width = max(string_width, _json_text_width(chunk, last, end))
           if chunk.find("\\", last, end) != -1:
-            # Raw escape characters at width four conservatively cover any
-            # decoded Unicode value without interpreting or rewriting it.
-            string_width = 4
+            string_escaped = True
+            if chunk.find("\\u", last, end) != -1:
+              # A \u escape may decode to any scalar, astral included.
+              string_width = 4
           if end == len(chunk):
             break
           if chunk[end] == "\\":
             # Only an unpaired terminal backslash stops the content matcher.
             pending_escape = True
+            string_escaped = True
             string_length += 1
-            string_width = 4
           else:
             in_string = False
-            decoded_cost += 64 + string_length * string_width
+            string_content += _json_string_content(string_length, string_width, string_escaped)
+            string_text += string_length * string_width
+            string_chars += string_length + 2
+            value_width = max(value_width, string_width)
           last = end + 1
           continue
         mark = _JSON_RESOURCE_MARKS.search(chunk, last)
         if mark is None:
           break
-        index = mark.start()
         char = mark.group()
         if char == '"':
           in_string = True
           string_length = 0
           string_width = 1
-          structures += 1
-        elif char in "{[":
+          string_escaped = False
+          strings += 1
+        elif char == "[" or char == "{":
           depth += 1
-          structures += 1
-        elif char in "}]":
+          if depth > MAX_JSON_DEPTH:
+            self._reject(direction, "structural resource limit exceeded")
+          if char == "[":
+            lists += 1
+          else:
+            dicts += 1
+        elif char == ",":
+          commas += 1
+        elif char == ":":
+          members += 1
+        else:
           depth -= 1
-        elif char in ",:":
-          structures += 1
-        if structures > MAX_JSON_STRUCTURE or depth > MAX_JSON_DEPTH:
-          self._reject(direction, "structural resource limit exceeded")
-        last = index + 1
-      # 256 bytes per structural mark covers container entries, scalar
-      # objects and allocator overhead even for densely nested empty objects.
-      cost = decoded_cost + structures * 256 + text_length * text_width + 64
+        last = mark.end()
+      bare = text_length - string_chars - (string_length + 1 if in_string else 0)
+      # Marks only bound work done after the scan, so checking them per
+      # bounded chunk still rejects before the stdlib parser runs.
+      marks = strings + lists + dicts + commas + members
+      if marks + bare // _JSON_NUMBER_CHARS_PER_MARK > MAX_JSON_STRUCTURE:
+        self._reject(direction, "structural resource limit exceeded")
+      tree = (
+        strings * _JSON_STRING_COST
+        + lists * _JSON_LIST_COST + dicts * _JSON_DICT_COST
+        + (lists + commas) * _JSON_ELEMENT_COST + members * _JSON_MEMBER_COST
+        + bare * _JSON_BARE_CHAR_COST
+      )
+      building, built, widest = string_content, string_text, value_width
       if in_string:
-        cost += 64 + string_length * string_width
+        building += _json_string_content(string_length, string_width, string_escaped)
+        built += string_length * string_width
+        widest = max(widest, string_width)
+      # Phases free their transients before the next starts. json.loads first
+      # decodes the whole body into a buffer sized by its byte count; each
+      # widening (ASCII -> UCS1 -> UCS2 -> UCS4) copies it into a wider one.
+      # Parsing then builds strings beside that text; rendering a response
+      # holds only the built strings.
+      text_bmp = text_bmp or text_width > 1 and _JSON_BMP_TEXT.search(chunk) is not None
+      narrower = 2 if text_width == 4 and text_bmp else 1
+      phases = [len(raw) * (text_width + narrower), text_length * text_width + tree + building]
+      if direction == "response":
+        phases.append(tree + built + _json_render_excess(text_length, bare, widest, len(raw)))
+      cost = _JSON_DOCUMENT_COST + max(phases)
       if cost > MAX_JSON_DECODE_COST:
         self._reject(direction, "decoded resource limit exceeded")
     self._decoded_cost(cost, direction=direction)
-    return json.loads(raw, parse_constant=_reject_json_constant)
+    # The parse is one uninterruptible call; never run it back to back with
+    # the last scan chunk or the caller's next call (a render or retain walk).
+    await asyncio.sleep(0)
+    value = json.loads(raw, parse_constant=_reject_json_constant)
+    await asyncio.sleep(0)
+    return value
 
-  def retain(self, value):
+  async def retain(self, envelope):
     """Charge the decoded envelope as the only request copy awaiting execution.
 
     This applies the same resource boundary to already-materialized
     tool/policy JSON. An HTTP body's raw bytes are released by then, so a
     queued exchange holds only its actual bounded envelope, not a transfer
-    allowance.
+    allowance. The walk counts the structural marks of the envelope's compact
+    JSON text, the unit the lexical scan bounds, and the envelope itself is
+    depth 0, so a body nests exactly as it was sent. It is iterative and
+    yields cooperatively, like the scan. A bounded scalar check needs no
+    copy, so an oversize string fails before it waits; serialization itself
+    runs only after execution admission.
     """
-    nodes = 0
-    cost = 0
-
-    def visit(item, depth):
-      nonlocal nodes, cost
-      nodes += 1
-      if nodes > MAX_JSON_STRUCTURE or depth > MAX_JSON_DEPTH:
-        raise HTTPException(413, "App service request structural resource limit exceeded.")
-      cost += 256 + sys.getsizeof(item)
-      if cost > MAX_JSON_DECODE_COST:
-        raise HTTPException(413, "App service request decoded resource limit exceeded.")
+    marks = 0
+    cost = _JSON_DOCUMENT_COST
+    visited = 0
+    pending = [iter((envelope,))]
+    while pending:
+      item = next(pending[-1], _EXHAUSTED)
+      if item is _EXHAUSTED:
+        pending.pop()
+        continue
+      visited += 1
+      if visited % _COOPERATIVE_STEP == 0:
+        await asyncio.sleep(0)
+      children = None
       if isinstance(item, dict):
-        for key, child in item.items():
-          visit(key, depth + 1)
-          visit(child, depth + 1)
+        marks += max(2 * len(item), 1)
+        children = itertools.chain.from_iterable(item.items())
       elif isinstance(item, (list, tuple)):
-        for child in item:
-          visit(child, depth + 1)
-
-    visit(value, 0)
+        marks += max(len(item), 1)
+        children = iter(item)
+      elif isinstance(item, str):
+        marks += 1
+        _reject_oversize_json_string(item, self.max_bytes)
+      cost += sys.getsizeof(item) + _RETAINED_BLOCK_SLACK * (1 if children is None else 2)
+      depth = len(pending) - 1
+      if marks > MAX_JSON_STRUCTURE or (children is not None and depth > MAX_JSON_DEPTH):
+        self._reject("request", "structural resource limit exceeded")
+      if cost > MAX_JSON_DECODE_COST:
+        self._reject("request", "decoded resource limit exceeded")
+      if children is not None:
+        pending.append(children)
     self._hold("request", transfer=0, request=cost)
+
+
+def _json_render_excess(text_length: int, bare: int, width: int, raw_bytes: int) -> int:
+  """What rendering a decoded response can hold beyond its three stdout copies.
+
+  Rendering never adds characters except to floats, up to 3.5 per input
+  character ("1e15" -> "1000000000000000.0"); escapes and whitespace only
+  shrink. Its text has the widest decoded string's width: the encoder's
+  writer overallocates a quarter beside each escaped string copy (2.25x),
+  then the finished text coexists with its UTF-8 bytes (up to width + 1).
+  """
+  rendered = (text_length + bare * 7 // 2) * max(width * 9 // 4, 2 * width + 1)
+  return max(0, rendered - 3 * raw_bytes)
+
+
+def _json_string_content(length: int, width: int, escaped: bool) -> int:
+  """Bytes one decoded string can hold, beyond its counted header.
+
+  An unescaped string is an exact substring. An escaped one is built by a
+  writer that overallocates a quarter and coexists with its final or widened
+  copy (2.25 times, plus a second header).
+  """
+  if escaped:
+    return _JSON_STRING_COST + length * width * 9 // 4
+  return length * width
 
 
 def _reject_json_constant(value: str):
@@ -388,49 +517,45 @@ def exchange_max_bytes(service: dict, method, path) -> int:
   return routes.get((method, service_route_key(path)), ceiling)
 
 
-def _reject_oversize_json_strings(value, max_bytes: int) -> None:
+def _reject_oversize_json_string(value: str, max_bytes: int) -> None:
   """Reject a scalar before JSONEncoder can materialize its entire escaped form.
 
   Structural overhead and the sum of small scalars are still counted by the
   streaming encoder. Six UTF-8 bytes per character is a safe upper bound for
   one JSON string character with ensure_ascii=False.
   """
-  if isinstance(value, str):
-    if len(value) > max_bytes:
-      raise HTTPException(413, "App service request is too large.")
-    if len(value) * 6 + 2 <= max_bytes:
-      return
-    size = 2  # JSON quotes
-    for start in range(0, len(value), 64 * 1024):
-      # The standard encoder's escaping, applied in bounded slices, has the
-      # same result for a string regardless of where it is split.
-      part = json.encoder.encode_basestring(value[start:start + 64 * 1024])
-      size += len(part[1:-1].encode("utf-8"))
-      if size > max_bytes:
-        raise HTTPException(413, "App service request is too large.")
+  if len(value) > max_bytes:
+    raise HTTPException(413, "App service request is too large.")
+  if len(value) * 6 + 2 <= max_bytes:
+    return
+  size = 2  # JSON quotes
+  for start in range(0, len(value), 64 * 1024):
+    # The standard encoder's escaping, applied in bounded slices, has the
+    # same result for a string regardless of where it is split.
+    part = json.encoder.encode_basestring(value[start:start + 64 * 1024])
+    size += len(part[1:-1].encode("utf-8"))
     if size > max_bytes:
       raise HTTPException(413, "App service request is too large.")
-  elif isinstance(value, dict):
-    for key, item in value.items():
-      _reject_oversize_json_strings(key, max_bytes)
-      _reject_oversize_json_strings(item, max_bytes)
-  elif isinstance(value, (list, tuple)):
-    for item in value:
-      _reject_oversize_json_strings(item, max_bytes)
+  if size > max_bytes:
+    raise HTTPException(413, "App service request is too large.")
 
 
-def _serialize_request(request_envelope: dict, max_bytes: int) -> bytes:
+async def _serialize_request(request_envelope: dict, max_bytes: int) -> bytes:
   """Encode the stdin request without building more than ``max_bytes`` of it.
 
   Tool and policy calls bypass HTTP body reads, so this bounds their
   serialization too rather than building an arbitrarily large request first.
+  The pure-Python encoder yields cooperatively between bounded runs of parts.
   """
   try:
     buffer = io.BytesIO()
     size = 0
-    for part in json.JSONEncoder(
+    parts = json.JSONEncoder(
       ensure_ascii=False, separators=(",", ":"), allow_nan=False,
-    ).iterencode(request_envelope):
+    ).iterencode(request_envelope)
+    for count, part in enumerate(parts, 1):
+      if count % _COOPERATIVE_STEP == 0:
+        await asyncio.sleep(0)
       encoded = part.encode("utf-8")
       size += len(encoded)
       if size > max_bytes:
@@ -692,7 +817,7 @@ async def invoke_service(
     with boundary as admitted:
       # The envelope, with its metadata, is the only request copy retained
       # while queued; non-HTTP callers get the same structural boundary.
-      admitted.retain(request_envelope)
+      await admitted.retain(request_envelope)
       return await _invoke_admitted_service(
         app, owner, request_envelope, timeout_seconds=timeout_seconds, lane=lane,
         admission=admitted,
@@ -722,10 +847,6 @@ async def _invoke_admitted_service(
   max_bytes = min(admission.max_bytes, exchange_max_bytes(
     service, request_envelope.get("method"), request_envelope.get("path"),
   ))
-  # A bounded scalar check needs no copy, so an oversize request fails before
-  # it waits. Serialization itself runs only after execution admission.
-  _reject_oversize_json_strings(request_envelope, max_bytes)
-
   # A service owns its persistence semantics. Serialize one app's private
   # requests so simple file-backed services do not need a platform-specific
   # lock API, and serialize its public requests on a separate lane. A private
@@ -763,7 +884,7 @@ async def _invoke_admitted_service(
       # is reserved here, before serialization or any process start, so
       # exhaustion is a side-effect-free retryable 503.
       admission.admit_execution(max_bytes)
-      request_bytes = _serialize_request(request_envelope, max_bytes)
+      request_bytes = await _serialize_request(request_envelope, max_bytes)
       entry = service_entry(app, service)
       python_env = service_python_env(app, entry)
       python = app_python_env.python_for(python_env)
