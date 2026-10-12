@@ -2531,6 +2531,8 @@ def parent_wake_blocker(
   parent_helper = db.query(models.Delegation).filter(
     models.Delegation.child_chat_id == parent_chat_id,
   ).first()
+  if parent_helper is not None and parent_helper.cancelled_at is not None:
+    return "parent_cancelled", None
   if parent_helper is not None and (
     parent_helper.scope != "write"
     or parent_helper.interrupted_at is not None

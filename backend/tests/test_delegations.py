@@ -1258,6 +1258,38 @@ def test_background_helper_projection_owns_waiting_until_parent_wake(
   assert serialize_background_helpers(db, parent_id) == {"count": 0, "items": []}
 
 
+def test_failed_followup_after_closed_goal_never_asks_the_owner(
+  client, owner_token, db,
+):
+  """Helper failures belong to agents, never owner cards. Current work cannot
+  reach this state (follow-ups after a closed Goal are refused, and completion
+  waits for undelivered results); a pre-existing row stays readable history
+  through the helper's own record."""
+  from datetime import timedelta
+
+  parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix="closed-goal-followup", child_status="failed",
+  )
+  goal = models.ChatGoal(
+    id="closed-goal-followup-goal", chat_id=parent_id,
+    objective="Original work", status="completed",
+    completed_at=now_naive_utc() - timedelta(minutes=1),
+  )
+  db.add(goal)
+  db.get(models.Delegation, delegation_id).goal_id = goal.id
+  db.commit()
+
+  assert background_helper_chat_ids(db, [parent_id]) == set()
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  summary = next(row for row in client.get("/api/chats", headers=auth).json()
+                 if row["id"] == parent_id)
+  detail = client.get(f"/api/chats/{parent_id}", headers=auth).json()
+  runtime = client.get(f"/api/chats/{parent_id}/runtime", headers=auth).json()
+  for row in (summary, detail, runtime):
+    assert row["handoff"] == {"kind": "none", "reason": None}
+    assert "stranded_helper_followup" not in row
+
+
 def test_background_helper_wait_event_is_parent_scoped_and_best_effort(
   monkeypatch,
 ):
