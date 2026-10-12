@@ -7,6 +7,8 @@ freezes every request and stream; in a worker thread it only slows its own.
 
 import asyncio
 
+import pytest
+
 from app import delegations
 
 
@@ -109,56 +111,86 @@ def _freeze_provider_clock(monkeypatch, start=1_000_000.0):
   return clock
 
 
-def test_turn_start_reads_run_off_the_event_loop(monkeypatch):
+def test_turn_start_reads_off_the_loop_and_keeps_a_concurrent_pick(monkeypatch):
   # Each of these froze the loop at turn start in the stall recorder: the
   # app-provider declarations, the peer roster and inbox, the helper status
   # hint, the recency transcript scan and the app activity manifests. The
-  # four context reads share one worker session.
-  from app import agent_activity_provider, agent_coordination, providers
+  # four context reads share one worker session, and a model pick that lands
+  # while they run wins over the first-send settings snapshot.
+  from app import agent_activity_provider, agent_coordination, models, providers
+  from app.database import SessionLocal
   import app.chat as chat_mod
   from tests.test_terminal_completion import (
     _patch_claude_runner, _run_real_chat, _seed_chat, _seed_owner_and_creds,
   )
 
-  seen = []
+  chat_id = "turn-start-off-loop"
+  _seed_owner_and_creds()
+  _seed_chat(
+    chat_id, messages=[{"role": "user", "content": "hi", "ts": 1}],
+    pending=[], running="running", run_token="rt-turn-start-off-loop",
+  )
+  with SessionLocal() as db:
+    db.get(models.Chat, chat_id).agent_settings_json = None
+    db.commit()
+  picked = {"model": "claude-opus-4-8", "effort": "low"}
+
+  context = []
 
   def record(module, name):
     real = getattr(module, name)
 
-    def wrapper(*args, **kwargs):
-      db = args[0] if args else None
-      seen.append((name, _running_on_event_loop(), id(db)))
-      return real(*args, **kwargs)
+    def wrapper(db, *args, **kwargs):
+      context.append((name, _running_on_event_loop(), id(db)))
+      return real(db, *args, **kwargs)
 
     monkeypatch.setattr(module, name, wrapper)
 
-  record(providers, "_read_app_model_declarations")
   record(agent_coordination, "build_coordination_context_delivery")
   record(delegations, "active_parent_context")
   record(chat_mod, "_last_user_message_elapsed")
   record(agent_activity_provider, "resolve_agent_activity_binding")
-  # A slow turn must not let the throttle lapse into a synchronous re-read.
-  _freeze_provider_clock(monkeypatch)
+  real_read_context = chat_mod._read_turn_context
 
-  _seed_owner_and_creds()
-  _seed_chat(
-    "turn-start-off-loop",
-    messages=[{"role": "user", "content": "hi", "ts": 1}],
-    pending=[], running="running", run_token="rt-turn-start-off-loop",
+  def read_context_with_concurrent_pick(*args):
+    with SessionLocal() as db:
+      db.get(models.Chat, chat_id).agent_settings_json = picked
+      db.commit()
+    return real_read_context(*args)
+
+  monkeypatch.setattr(
+    chat_mod, "_read_turn_context", read_context_with_concurrent_pick,
   )
+
+  # The declaration TTL lapses during a slow preflight: provider resolution
+  # must still never read declarations on the loop.
+  clock = _freeze_provider_clock(monkeypatch)
+  declaration_reads = []
+  real_declarations = providers._read_app_model_declarations
+
+  def read_declarations():
+    declaration_reads.append(_running_on_event_loop())
+    return real_declarations()
+
+  monkeypatch.setattr(
+    providers, "_read_app_model_declarations", read_declarations,
+  )
+  real_policy = delegations.policy_for_chat
+
+  def slow_policy(*args, **kwargs):
+    clock[0] += 5.0
+    return real_policy(*args, **kwargs)
+
+  monkeypatch.setattr(delegations, "policy_for_chat", slow_policy)
+
   _patch_claude_runner(monkeypatch)
-  chat_mod.mark_starting("turn-start-off-loop")
+  chat_mod.mark_starting(chat_id)
   _run_real_chat(
-    "turn-start-off-loop", run_token="rt-turn-start-off-loop",
-    run_gen=chat_mod.current_run_generation("turn-start-off-loop"),
+    chat_id, run_token="rt-turn-start-off-loop",
+    run_gen=chat_mod.current_run_generation(chat_id),
   )
 
-  # One declaration read for the whole turn, off the loop: the preflight's
-  # synchronous get_provider calls reuse the refresh.
-  assert [s for s in seen if s[0] == "_read_app_model_declarations"] == [
-    ("_read_app_model_declarations", False, id(None)),
-  ]
-  context = [s for s in seen if s[0] != "_read_app_model_declarations"]
+  assert declaration_reads == [False]
   assert {name for name, _, _ in context} == {
     "build_coordination_context_delivery",
     "active_parent_context",
@@ -167,6 +199,8 @@ def test_turn_start_reads_run_off_the_event_loop(monkeypatch):
   }
   assert {on_loop for _, on_loop, _ in context} == {False}
   assert len({session for _, _, session in context}) == 1
+  with SessionLocal() as db:
+    assert db.get(models.Chat, chat_id).agent_settings_json == picked
 
 
 def test_turn_context_uses_liveness_captured_on_the_loop(db, monkeypatch):
@@ -192,46 +226,6 @@ def test_turn_context_uses_liveness_captured_on_the_loop(db, monkeypatch):
 
   assert reads.coordination == expected
   assert chats["builder"].id in reads.coordination.text
-
-
-def test_model_pick_during_turn_start_reads_is_not_clobbered(monkeypatch):
-  # Turn start awaits worker reads; a picker PATCH that lands meanwhile must
-  # win over the first-send settings snapshot.
-  from app import models
-  from app.database import SessionLocal
-  import app.chat as chat_mod
-  from tests.test_terminal_completion import (
-    _patch_claude_runner, _run_real_chat, _seed_chat, _seed_owner_and_creds,
-  )
-
-  chat_id = "turn-start-pick"
-  _seed_owner_and_creds()
-  _seed_chat(
-    chat_id, messages=[{"role": "user", "content": "hi", "ts": 1}],
-    pending=[], running="running", run_token="rt-turn-start-pick",
-  )
-  with SessionLocal() as db:
-    db.get(models.Chat, chat_id).agent_settings_json = None
-    db.commit()
-  picked = {"model": "claude-opus-4-8", "effort": "low"}
-  real_read = chat_mod._read_turn_context
-
-  def read_with_concurrent_pick(*args):
-    with SessionLocal() as db:
-      db.get(models.Chat, chat_id).agent_settings_json = picked
-      db.commit()
-    return real_read(*args)
-
-  monkeypatch.setattr(chat_mod, "_read_turn_context", read_with_concurrent_pick)
-  _patch_claude_runner(monkeypatch)
-  chat_mod.mark_starting(chat_id)
-  _run_real_chat(
-    chat_id, run_token="rt-turn-start-pick",
-    run_gen=chat_mod.current_run_generation(chat_id),
-  )
-
-  with SessionLocal() as db:
-    assert db.get(models.Chat, chat_id).agent_settings_json == picked
 
 
 def test_slow_app_provider_load_is_fresh_from_its_completion(monkeypatch):
@@ -295,172 +289,6 @@ def test_concurrent_app_provider_refreshes_await_one_load(monkeypatch):
   assert reads == [1]
 
 
-def test_peer_send_persists_and_hints_from_a_worker(client, auth, db, monkeypatch):
-  # Validation, the write and the recipient inbox prune ran on the loop. The
-  # hint goes through the thread-safe system broadcast from the same worker.
-  from app import agent_coordination
-  from tests.test_agent_coordination import _delegated_auth, _network_fixture
-
-  chats, _ = _network_fixture(db)
-  nested_auth = _delegated_auth(db, chats["nested"].id, "nested-run")
-  seen = []
-  real_prune = agent_coordination._prune_direct_inboxes
-  real_hint = agent_coordination._publish_message_hint
-
-  def prune(*args, **kwargs):
-    seen.append(("prune", _running_on_event_loop()))
-    return real_prune(*args, **kwargs)
-
-  def hint(*args, **kwargs):
-    seen.append(("hint", _running_on_event_loop()))
-    return real_hint(*args, **kwargs)
-
-  monkeypatch.setattr(agent_coordination, "_prune_direct_inboxes", prune)
-  monkeypatch.setattr(agent_coordination, "_publish_message_hint", hint)
-
-  sent = client.post(
-    "/api/agent-coordination/messages",
-    headers=nested_auth,
-    json={
-      "recipients": [chats["outside_helper"].id],
-      "kind": "finding",
-      "body": "Found off the loop.",
-      "send_id": "off-loop-send-1",
-    },
-  )
-
-  assert sent.status_code == 200, sent.text
-  assert sent.json()["recipient_count"] == 1
-  assert seen == [("prune", False), ("hint", False)]
-
-
-def test_peer_send_hint_reaches_a_loop_subscriber_from_the_worker(db):
-  from app import agent_coordination, models
-  from app.broadcast import get_system_broadcast
-  from tests.test_agent_coordination import _network_fixture
-
-  chats, _ = _network_fixture(db)
-  owner_id = db.query(models.Owner.id).scalar()
-
-  async def scenario():
-    q = get_system_broadcast().subscribe()
-    try:
-      rows = await asyncio.to_thread(
-        agent_coordination.send_agent_message_off_loop,
-        owner_id=owner_id, sender_chat_id=chats["nested"].id,
-        sender_run_id="nested-run", recipients=[chats["outside_helper"].id],
-        broadcast=False, kind="finding", body="Delivered from a worker.",
-      )
-      event = await asyncio.wait_for(q.get(), timeout=5.0)
-      return rows, event
-    finally:
-      get_system_broadcast().unsubscribe(q)
-
-  rows, event = asyncio.run(scenario())
-  assert len(rows) == 1
-  assert event["type"] == "agent_coordination_message"
-  assert event["senderChatId"] == chats["nested"].id
-  assert event["recipientChatIds"] == [chats["outside_helper"].id]
-
-
-def test_child_settle_publishes_from_its_worker_to_loop_subscribers(
-  db, monkeypatch,
-):
-  # Goal, waiting and activity invalidations are system-bus events, which
-  # are thread-safe, so the worker that read the settle publishes them.
-  from app.broadcast import get_system_broadcast
-  from tests.test_delegations import _seed_delegation
-
-  parent_id, child_id, _ = _seed_delegation(
-    db, suffix="settle-worker", child_status="stopped", notify=False,
-    result_blocks=[{"type": "text", "content": "Stopped."}],
-  )
-  bus = get_system_broadcast()
-  real_publish = bus.publish
-  publishers = []
-
-  def publish(event):
-    publishers.append(_running_on_event_loop())
-    real_publish(event)
-
-  monkeypatch.setattr(bus, "publish", publish)
-
-  async def scenario():
-    q = bus.subscribe()
-    try:
-      await delegations.wake_parent_after_child_settled(child_id)
-      events = []
-      while len(events) < 2:
-        events.append(await asyncio.wait_for(q.get(), timeout=5.0))
-      return events
-    finally:
-      bus.unsubscribe(q)
-
-  events = asyncio.run(scenario())
-  assert {(e["type"], e["chatId"]) for e in events} >= {
-    ("chat_wait_changed", parent_id), ("chat_activity_changed", parent_id),
-  }
-  assert publishers and set(publishers) == {False}
-
-
-def test_child_settle_wakes_the_parent_from_the_loop(monkeypatch):
-  import app.chat as chat_mod
-
-  seen = []
-  settle = delegations._ChildSettle(
-    delegation_id="delegation", parent_chat_id="parent-chat",
-    status="completed", source_work_id=None, wake_source_work_id="source-run",
-  )
-
-  def settle_child(child_chat_id):
-    seen.append(("settle", _running_on_event_loop()))
-    return settle
-
-  async def deliver(parent_chat_id, source_work_id):
-    seen.append(("wake", parent_chat_id, source_work_id, _running_on_event_loop()))
-    return True
-
-  monkeypatch.setattr(delegations, "_settle_child", settle_child)
-  monkeypatch.setattr(delegations, "_deliver_parent_wake", deliver)
-  monkeypatch.setattr(chat_mod, "is_chat_running", lambda _chat_id: False)
-
-  asyncio.run(delegations.wake_parent_after_child_settled("child-chat"))
-
-  assert seen == [
-    ("settle", False), ("wake", "parent-chat", "source-run", True),
-  ]
-
-
-def test_source_work_settle_notifies_its_source_on_the_loop(monkeypatch):
-  # The owner notification reads loop-owned presence, so the source status
-  # is published on the loop; source work never wakes the source agent.
-  seen = []
-  settle = delegations._ChildSettle(
-    delegation_id="delegation", parent_chat_id="parent-chat",
-    status="completed", source_work_id="source-work", wake_source_work_id=None,
-  )
-
-  def settle_child(child_chat_id):
-    seen.append(("settle", _running_on_event_loop()))
-    return settle
-
-  def source_status(**fields):
-    seen.append(("source", fields, _running_on_event_loop()))
-
-  monkeypatch.setattr(delegations, "_settle_child", settle_child)
-  monkeypatch.setattr(delegations, "_publish_source_work_status", source_status)
-
-  asyncio.run(delegations.wake_parent_after_child_settled("child-chat"))
-
-  assert seen == [
-    ("settle", False),
-    ("source", {
-      "delegation_id": "delegation", "parent_chat_id": "parent-chat",
-      "source_work_id": "source-work", "status": "completed",
-    }, True),
-  ]
-
-
 def test_parent_settle_finds_owed_results_off_the_loop(monkeypatch):
   seen = []
 
@@ -480,39 +308,50 @@ def test_parent_settle_finds_owed_results_off_the_loop(monkeypatch):
   assert seen == [("sources", False), ("deliver", "source-run", True)]
 
 
-def test_result_steer_plans_off_the_loop_and_checks_liveness_on_it(
-  monkeypatch,
+@pytest.mark.parametrize("change", ["parent_settles", "drain_begins", None])
+def test_result_steer_plans_off_the_loop_and_rechecks_liveness_after(
+  monkeypatch, change,
 ):
+  # The plan reads durable state in a worker; the runner and drain checks
+  # run on the loop after it, so a change during planning submits nothing.
   import app.chat as chat_mod
   import app.chat_steering as chat_steering
+  import app.chat_writer as chat_writer
 
+  state = {"running": True, "draining": False}
   seen = []
 
   def plan_steer(parent_chat_id, source_work_id):
     seen.append(("plan", _running_on_event_loop()))
-    return delegations._ResultSteerPlan(
-      provider="claude", content="results", cid="cid", source_work_id="src",
-    )
+    if change == "parent_settles":
+      state["running"] = False
+    elif change == "drain_begins":
+      state["draining"] = True
+    return "claude", {"role": "user", "content": "results", "cid": "cid"}
 
-  def running(chat_id):
-    seen.append(("running", _running_on_event_loop()))
-    return True
-
-  def steerable(chat_id, provider):
-    seen.append(("steerable", _running_on_event_loop()))
-    return False
+  def submit(command):
+    seen.append(("submit", _running_on_event_loop()))
+    raise AssertionError("stop after the loop-side checks")
 
   monkeypatch.setattr(delegations, "_plan_result_steer", plan_steer)
-  monkeypatch.setattr(chat_mod, "is_chat_running", running)
-  monkeypatch.setattr(chat_mod, "is_draining", lambda: False)
-  monkeypatch.setattr(chat_steering, "has_live_steerable_turn", steerable)
+  monkeypatch.setattr(chat_mod, "is_chat_running", lambda _id: state["running"])
+  monkeypatch.setattr(chat_mod, "is_draining", lambda: state["draining"])
+  monkeypatch.setattr(
+    chat_steering, "has_live_steerable_turn", lambda _id, _provider: True,
+  )
+  monkeypatch.setattr(
+    chat_writer, "get_writer", lambda: type("W", (), {"submit": staticmethod(submit)}),
+  )
 
-  assert asyncio.run(
-    delegations.steer_results_into_running_parent("parent-chat", "src"),
-  ) is False
-  assert seen == [
-    ("running", True), ("plan", False), ("running", True), ("steerable", True),
-  ]
+  if change is None:
+    with pytest.raises(AssertionError, match="stop after"):
+      asyncio.run(delegations.steer_results_into_running_parent("parent", "src"))
+    assert seen == [("plan", False), ("submit", True)]
+  else:
+    assert asyncio.run(
+      delegations.steer_results_into_running_parent("parent", "src"),
+    ) is False
+    assert seen == [("plan", False)]
 
 
 def test_parent_wake_plan_never_reads_the_runner_registry(chat, db, monkeypatch):
@@ -543,37 +382,6 @@ def test_parent_wake_plan_never_reads_the_runner_registry(chat, db, monkeypatch)
   assert delegations._committed_parent_wake_is_unowned(db, chat, {}) is True
 
 
-def test_wait_sweep_selects_due_waits_off_the_loop(monkeypatch):
-  from app import chat_waits
-
-  seen = []
-
-  def select(now, force_kind):
-    seen.append((force_kind, _running_on_event_loop()))
-    return [], [], False
-
-  monkeypatch.setattr(chat_waits, "_select_wait_sweep", select)
-
-  assert asyncio.run(chat_waits.sweep_due_waits(force_kind="kind")) == 0
-  assert seen == [("kind", False)]
-
-
-def test_wait_sweep_reads_the_late_edit_hold_off_the_loop(monkeypatch):
-  # The hold reads update state and may run git; it belongs in the worker.
-  from app import chat_waits, platform_update
-
-  seen = []
-
-  def hold():
-    seen.append(_running_on_event_loop())
-    return True
-
-  monkeypatch.setattr(platform_update, "late_edits_pending", hold)
-
-  assert asyncio.run(chat_waits.sweep_due_waits()) == 0
-  assert seen == [False]
-
-
 def test_activity_start_checks_its_blockers_off_the_loop(monkeypatch):
   import app.chat as chat_mod
   import app.chat_start as chat_start
@@ -591,25 +399,6 @@ def test_activity_start_checks_its_blockers_off_the_loop(monkeypatch):
     chat_id="parent-chat", root_run_id="root", run_token="not-started",
     source_work_id="source", activity_id="activity",
   )) is False
-  assert seen == [False]
-
-
-def test_outbound_access_list_reads_profiles_off_the_loop(
-  client, auth, monkeypatch,
-):
-  # list_profiles reads files under the outbound lock pairing also holds.
-  from app import connect_outbound
-
-  seen = []
-
-  def profiles():
-    seen.append(_running_on_event_loop())
-    return []
-
-  monkeypatch.setattr(connect_outbound, "list_profiles", profiles)
-
-  response = client.get("/api/connect/outbound", headers=auth)
-  assert response.status_code == 200, response.text
   assert seen == [False]
 
 

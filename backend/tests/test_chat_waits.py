@@ -5,6 +5,7 @@ from app.chat_writer import create_chat
 import asyncio
 from datetime import UTC, datetime, timedelta
 import hashlib
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -630,7 +631,14 @@ def test_met_wait_resumes_only_after_late_update_edits_are_back(
   db.commit()
   starts = _capture_starts(monkeypatch, running=False)
   pending = [True]
-  monkeypatch.setattr(platform_update, "late_edits_pending", lambda: pending[0])
+  hold_reads = set()
+
+  def late_edits_pending():
+    # The hold check reads update state (and may run git): never on the loop.
+    hold_reads.add(threading.current_thread() is threading.main_thread())
+    return pending[0]
+
+  monkeypatch.setattr(platform_update, "late_edits_pending", late_edits_pending)
 
   assert asyncio.run(sweep_due_waits()) == 0
   assert starts == []
@@ -641,6 +649,7 @@ def test_met_wait_resumes_only_after_late_update_edits_are_back(
   pending[0] = False
   assert asyncio.run(sweep_due_waits()) == 1
   assert len(starts) == 1 and starts[0]["chat_id"] == chat_id
+  assert hold_reads == {False}
 
 
 def test_unmet_command_wait_reschedules(client, owner_token, db, monkeypatch):

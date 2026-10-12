@@ -212,7 +212,7 @@ def _seed_provider_turn(monkeypatch, provider_id, cid, token):
   # Provider objects are process singletons. Patch their class, not a bound
   # instance method: restoring an instance override would shadow later tests'
   # class patches after this test's teardown.
-  provider_type = type(chat_mod.get_provider(provider_id))
+  provider_type = type(chat_mod.registered_provider(provider_id))
   monkeypatch.setattr(provider_type, "check_auth", lambda self, _data_dir: None)
 
   async def ready(self, _data_dir):
@@ -983,7 +983,7 @@ def test_unsupported_provider_cleanup_clears_marker_and_pending(monkeypatch, sup
     running="running",
   )
 
-  # Force an unsupported provider: stub get_provider to return a provider
+  # Force an unsupported provider: stub registered_provider to return a provider
   # whose name matches neither SDK branch and whose check_auth passes.
   auth_checked = []
   class _Unsupported:
@@ -996,7 +996,7 @@ def test_unsupported_provider_cleanup_clears_marker_and_pending(monkeypatch, sup
     def build_env(self, **kwargs):
       return {}
 
-  monkeypatch.setattr(chat_mod, "get_provider", lambda pid: _Unsupported())
+  monkeypatch.setattr(chat_mod, "registered_provider", lambda pid: _Unsupported())
 
   def runtime_kind(_provider):
     if superseded == "before_close" and auth_checked:
@@ -2066,13 +2066,13 @@ def test_stop_during_provider_setup_does_not_dispatch_runner(
     async def stopping_ensure_auth(self, data_dir):
       await stop()
 
-    monkeypatch.setattr(type(chat_mod.get_provider(provider_id)), "ensure_auth", stopping_ensure_auth)
+    monkeypatch.setattr(type(chat_mod.registered_provider(provider_id)), "ensure_auth", stopping_ensure_auth)
   elif stop_during == "check_auth":
     real_in_threadpool = chat_mod.run_in_threadpool
 
     async def stopping_check_auth(function, *args, **kwargs):
       result = await real_in_threadpool(function, *args, **kwargs)
-      if getattr(function, "__self__", None) is chat_mod.get_provider(provider_id):
+      if getattr(function, "__self__", None) is chat_mod.registered_provider(provider_id):
         await stop()
       return result
 

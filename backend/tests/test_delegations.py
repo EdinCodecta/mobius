@@ -1295,9 +1295,12 @@ def test_terminal_helper_publishes_one_exact_chat_activity_hint(
     result_blocks=[{"type": "text", "content": "Stopped result."}],
   )
   events = []
+  publishers = set()
 
   class Broadcast:
     def publish(self, event):
+      # The thread-safe system bus is published from the settle's worker.
+      publishers.add(threading.current_thread() is threading.main_thread())
       events.append(event)
 
   monkeypatch.setattr("app.broadcast.get_system_broadcast", lambda: Broadcast())
@@ -1308,6 +1311,11 @@ def test_terminal_helper_publishes_one_exact_chat_activity_hint(
     "type": "chat_activity_changed",
     "chatId": parent_id,
   }]
+  assert {
+    "type": "chat_wait_changed", "chatId": parent_id,
+    "source": "background_helpers",
+  } in events
+  assert publishers == {False}
 
 
 def _current_result(db, delegation_id):
@@ -1359,6 +1367,8 @@ def _capture_activity_starts(monkeypatch):
   starts = []
 
   async def fake_start(**kwargs):
+    # The settle's durable half runs in a worker; starting is the loop's.
+    assert threading.current_thread() is threading.main_thread()
     starts.append(kwargs)
     return True
 
@@ -2047,7 +2057,7 @@ def _drive_parent_turn(
     }
 
   monkeypatch.setattr(
-    chat_mod, "get_provider", lambda _id: _ActivityCheckpointProvider(provider_id),
+    chat_mod, "registered_provider", lambda _id: _ActivityCheckpointProvider(provider_id),
   )
   monkeypatch.setattr(
     f"app.{provider_id}_sdk_runner.run_{provider_id}_sdk_turn", provider_turn,
@@ -2116,7 +2126,7 @@ def test_delegated_prompt_keeps_a_leading_goal_command_verbatim(db, monkeypatch)
     return None
 
   monkeypatch.setattr(
-    chat_mod, "get_provider", lambda _id: _ActivityCheckpointProvider("claude"),
+    chat_mod, "registered_provider", lambda _id: _ActivityCheckpointProvider("claude"),
   )
   # A helper's Claude turn may run in the parent's shared helper host; either
   # way the provider receives the same assembled prompt.

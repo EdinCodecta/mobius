@@ -126,12 +126,13 @@ from app.events import (
 )
 from app.providers import (
   DEFAULT_PROVIDER,
+  BaseProvider,
   authenticated_provider_ids,
   claude_auth_method,
   effective_agent_settings,
-  get_provider,
   get_skill_path,
   provider_runtime_kind,
+  registered_provider,
 )
 from app.runner_registry import registry
 from app.session_links import resume_retired
@@ -5362,7 +5363,8 @@ def _helper_host_key(db, run_policy, *, provider_id: str, connector_plan):
     }
   # Claude fixes a helper's model on the host's helper definitions, so its
   # hosts are also per model; a Codex thread chooses its model per turn.
-  claude = provider_runtime_kind(get_provider(provider_id)) == "claude_sdk"
+  # The turn refreshed the registry at its start; this lookup reads no storage.
+  claude = provider_runtime_kind(registered_provider(provider_id)) == "claude_sdk"
   model = run_policy.model if claude else None
   # A Claude host fixes its credential method (sign-in or API key) at start,
   # so a changed method must start a new host rather than keep billing the
@@ -5415,27 +5417,27 @@ async def _run_chat_impl(
   if run_token is None:
     run_token = alloc_run_token()
 
-  # Turn-start reads that froze the loop on a busy disk, in one worker
-  # session. They run before the preflight session loads the chat row and
-  # settings, so that snapshot spans no await a model pick could slip into.
-  turn_reads = await asyncio.to_thread(
-    _read_turn_context, chat_id, run_token,
-    frozenset(registry.all_alive_chat_ids()),
-  )
-  # Refresh app-declared model providers off the loop last: no await
-  # separates it from the preflight's synchronous get_provider calls, which
-  # then reuse it inside the throttle window instead of reading again.
-  from app.providers import refresh_app_model_providers
-  await refresh_app_model_providers(get_settings().data_dir)
+  with tracing.span("agent.turn", {
+    "mobius.chat_id": chat_id,
+    "mobius.provider": provider_id,
+    "mobius.resumed_session": bool(session_id),
+  }) as turn_span:
+    # Turn-start reads that froze the loop on a busy disk, in one worker
+    # session. They run before the preflight session loads the chat row and
+    # settings, so that snapshot spans no await a model pick could slip into.
+    turn_reads = await asyncio.to_thread(
+      _read_turn_context, chat_id, run_token,
+      frozenset(registry.all_alive_chat_ids()),
+    )
+    # Refresh app-declared model providers off the loop, then resolve this
+    # turn's provider from the registry without touching storage.
+    from app.providers import refresh_app_model_providers
+    await refresh_app_model_providers(get_settings().data_dir)
+    provider = registered_provider(provider_id)
 
-  from app.database import SessionLocal
-  db = SessionLocal()
-  try:
-    with tracing.span("agent.turn", {
-      "mobius.chat_id": chat_id,
-      "mobius.provider": provider_id,
-      "mobius.resumed_session": bool(session_id),
-    }) as turn_span:
+    from app.database import SessionLocal
+    db = SessionLocal()
+    try:
       disposition = await _run_chat_impl_with_db(
         messages=messages,
         chat_id=chat_id,
@@ -5448,15 +5450,16 @@ async def _run_chat_impl(
         run_token=run_token,
         db=db,
         turn_reads=turn_reads,
+        provider=provider,
       )
       tracing.annotate(turn_span, {"mobius.disposition": str(disposition)})
       return disposition
-  finally:
-    # Several setup paths can raise before reaching their explicit terminal
-    # cleanup.  A single outer owner guarantees the request's checkout is
-    # returned even for those unexpected failures.  close() is idempotent,
-    # so the terminal helpers may still release it as soon as they finish.
-    db.close()
+    finally:
+      # Several setup paths can raise before reaching their explicit terminal
+      # cleanup.  A single outer owner guarantees the request's checkout is
+      # returned even for those unexpected failures.  close() is idempotent,
+      # so the terminal helpers may still release it as soon as they finish.
+      db.close()
 
 
 def _should_inject_peer_context(
@@ -5575,6 +5578,7 @@ async def _run_chat_impl_with_db(
   *,
   db: Session,
   turn_reads: _TurnContextReads,
+  provider: BaseProvider,
 ) -> chat_queue.TerminalDisposition:
   """Run a turn with a session whose lifetime is owned by the wrapper."""
   log = _get_logger()
@@ -5599,7 +5603,6 @@ async def _run_chat_impl_with_db(
       )
   from app.delegations import policy_for_chat
   run_policy = policy_for_chat(db, chat_id) if chat_row is not None else None
-  provider = get_provider(provider_id)
   # A retired session is not resumed: its own history would keep the model
   # following a withdrawn instruction. A top-level chat starts fresh and is
   # reseeded from its transcript, exactly as for a lost session. (A retired

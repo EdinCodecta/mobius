@@ -1256,10 +1256,14 @@ PROVIDERS: dict[str, BaseProvider] = {
 PROVIDER_NAMES: frozenset[str] = frozenset(PROVIDERS)
 
 _app_provider_ids: set[str] = set()
-# When the last app-provider load finished (monotonic), and the async load in
-# flight, which concurrent async refreshes join instead of returning early.
+# When the last app-provider load finished (monotonic). Async refreshes share
+# one lock, so a concurrent refresh waits for the load already in flight.
 _app_provider_sync_at = 0.0
-_app_provider_refresh: asyncio.Future | None = None
+_app_provider_refresh_lock = asyncio.Lock()
+
+
+def _app_providers_fresh() -> bool:
+  return time.monotonic() - _app_provider_sync_at < 1.0
 
 
 def sync_app_model_providers(data_dir: str, *, force: bool = False) -> None:
@@ -1269,7 +1273,7 @@ def sync_app_model_providers(data_dir: str, *, force: bool = False) -> None:
   read throttle avoids adding one app query to every model/agent decision while
   still making install, update and uninstall visible without a server restart.
   """
-  if force or time.monotonic() - _app_provider_sync_at >= 1.0:
+  if force or not _app_providers_fresh():
     _apply_app_model_declarations(_read_app_model_declarations())
 
 
@@ -1278,28 +1282,13 @@ async def refresh_app_model_providers(data_dir: str) -> None:
 
   The declaration query froze the event loop for seconds on a saturated disk.
   It runs in a worker with its own session and the registry is updated back
-  on the loop. Concurrent callers await the same load, and synchronous calls
-  within the throttle window after it completes reuse it.
+  on the loop.
   """
-  global _app_provider_refresh
-  refresh = _app_provider_refresh
-  if refresh is None or refresh.get_loop() is not asyncio.get_running_loop():
-    if time.monotonic() - _app_provider_sync_at < 1.0:
-      return
-    refresh = _app_provider_refresh = asyncio.ensure_future(
-      _refresh_app_model_providers(),
-    )
-  await asyncio.shield(refresh)
-
-
-async def _refresh_app_model_providers() -> None:
-  global _app_provider_refresh
-  try:
-    _apply_app_model_declarations(
-      await asyncio.to_thread(_read_app_model_declarations),
-    )
-  finally:
-    _app_provider_refresh = None
+  async with _app_provider_refresh_lock:
+    if not _app_providers_fresh():
+      _apply_app_model_declarations(
+        await asyncio.to_thread(_read_app_model_declarations),
+      )
 
 
 def _read_app_model_declarations() -> list[tuple[Any, dict]] | None:
@@ -1542,6 +1531,14 @@ def get_provider(
     from app.config import get_settings
     data_dir = get_settings().data_dir
   sync_app_model_providers(data_dir)
+  return registered_provider(provider_id)
+
+
+def registered_provider(provider_id: str | None = None) -> BaseProvider:
+  """``get_provider`` from the registry as it stands; never reads storage.
+
+  An async caller refreshes with ``refresh_app_model_providers`` first.
+  """
   selected = provider_id or DEFAULT_PROVIDER
   if selected not in PROVIDERS:
     raise ValueError(f"Provider {selected!r} is not installed.")

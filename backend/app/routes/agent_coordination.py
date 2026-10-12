@@ -20,7 +20,7 @@ from app.agent_coordination import (
   model_message,
   owner_chat_snapshot,
   owner_project_snapshot,
-  send_agent_message_off_loop,
+  send_agent_message,
   send_work_claim_notice,
   visible_peer_messages,
 )
@@ -231,7 +231,7 @@ async def send_current_message(
   # worker with its own session.
   try:
     rows = await asyncio.to_thread(
-      send_agent_message_off_loop,
+      send_agent_message,
       owner_id=principal.owner.id,
       sender_chat_id=principal.chat_id,
       sender_run_id=principal.run_id,

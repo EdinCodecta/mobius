@@ -3537,7 +3537,6 @@ async def steer_results_into_running_parent(
   from app.chat import is_chat_running, is_draining
   from app.chat_steering import has_live_steerable_turn, steer_into_active_turn
   from app.chat_writer import AppendPending, await_ack, get_writer
-  from app.continuations import DELEGATION_RESULT_MESSAGE_KIND
 
   async with chat_queue.get_lock(parent_chat_id):
     if not is_chat_running(parent_chat_id):
@@ -3545,27 +3544,18 @@ async def steer_results_into_running_parent(
     # The durable reads run in a worker; the runner, question and drain
     # registries are read here on the loop, after it, still under the queue
     # lock that orders this against queued sends.
-    plan = await asyncio.to_thread(
+    planned = await asyncio.to_thread(
       _plan_result_steer, parent_chat_id, source_work_id,
     )
-    if plan is None or not is_chat_running(parent_chat_id):
+    if planned is None or not is_chat_running(parent_chat_id):
       return False
     if is_draining() or questions.is_waiting(parent_chat_id):
       return False
-    provider = plan.provider
+    provider, carrier = planned
     if not has_live_steerable_turn(parent_chat_id, provider):
       return False
-    content = plan.content
-    cid = plan.cid
-    carrier = {
-      "role": "user",
-      "content": content,
-      "ts": int(datetime.now().timestamp() * 1000),
-      "cid": cid,
-      "hidden": True,
-      "kind": DELEGATION_RESULT_MESSAGE_KIND,
-      "source_work_id": plan.source_work_id,
-    }
+    content, cid = carrier["content"], carrier["cid"]
+    carrier["ts"] = int(datetime.now().timestamp() * 1000)
     stored = await await_ack(get_writer().submit(AppendPending(
       chat_id=parent_chat_id,
       run_token="",
@@ -3584,18 +3574,11 @@ async def steer_results_into_running_parent(
   return bool(accepted)
 
 
-@dataclass(frozen=True)
-class _ResultSteerPlan:
-  """Durable half of a result steer, decided in a worker thread."""
-  provider: str
-  content: str
-  cid: str
-  source_work_id: str
-
-
 def _plan_result_steer(
   parent_chat_id: str, source_work_id: str,
-) -> _ResultSteerPlan | None:
+) -> tuple[str, dict] | None:
+  """The parent's provider and the hidden result carrier, from a worker."""
+  from app.continuations import DELEGATION_RESULT_MESSAGE_KIND
   from app.database import SessionLocal
 
   with SessionLocal() as db:
@@ -3622,12 +3605,14 @@ def _plan_result_steer(
     if not rows:
       return None
     _run_id, cid = _parent_wake_delivery_identity(rows, results)
-    return _ResultSteerPlan(
-      provider=chat.provider or "claude",
-      content=_compose_wake_notice(db, rows, results),
-      cid=cid,
-      source_work_id=delegation_source_work_id(rows[0]),
-    )
+    return chat.provider or "claude", {
+      "role": "user",
+      "content": _compose_wake_notice(db, rows, results),
+      "cid": cid,
+      "hidden": True,
+      "kind": DELEGATION_RESULT_MESSAGE_KIND,
+      "source_work_id": delegation_source_work_id(rows[0]),
+    }
 
 
 async def deliver_results_after_parent_settled(parent_chat_id: str) -> None:

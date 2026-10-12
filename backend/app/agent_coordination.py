@@ -1522,60 +1522,6 @@ def send_owner_scope_message(
 
 
 def send_agent_message(
-  db: Session,
-  scope: CoordinationScope,
-  *,
-  owner_id: int,
-  sender_chat_id: str,
-  sender_run_id: str,
-  recipients: list[str],
-  broadcast: bool,
-  kind: str,
-  body: str,
-  delivery: str = DELIVERY_NEXT_TURN,
-  send_id: str | None = None,
-) -> list[dict[str, Any]]:
-  """Send a scope broadcast or global direct note from one exact live run."""
-  if broadcast:
-    return send_scope_message(
-      db,
-      scope,
-      sender_chat_id=sender_chat_id,
-      sender_run_id=sender_run_id,
-      recipients=recipients,
-      broadcast=True,
-      kind=kind,
-      delivery=delivery,
-      body=body,
-      send_id=send_id,
-    )
-
-  unique_recipients = list(dict.fromkeys(str(value) for value in recipients))
-  if not unique_recipients:
-    raise ValueError("Choose at least one recipient or broadcast to the scope.")
-  if sender_chat_id in unique_recipients:
-    raise ValueError("An agent cannot send a peer note to itself.")
-  addressable = _agent_chat_ids(db, set(unique_recipients))
-  if addressable != set(unique_recipients):
-    raise ValueError("A recipient is not an addressable Möbius peer.")
-  network = CoordinationScope(
-    kind="workspace", id=str(owner_id), root_chat_id=sender_chat_id,
-  )
-  return _persist_send(
-    db,
-    network,
-    sender_chat_id=sender_chat_id,
-    sender_run_id=sender_run_id,
-    recipients=unique_recipients,
-    broadcast=False,
-    kind=kind,
-    delivery=delivery,
-    body=body,
-    send_id=send_id,
-  )
-
-
-def send_agent_message_off_loop(
   *,
   owner_id: int,
   sender_chat_id: str,
@@ -1587,11 +1533,12 @@ def send_agent_message_off_loop(
   delivery: str = DELIVERY_NEXT_TURN,
   send_id: str | None = None,
 ) -> list[dict[str, Any]] | None:
-  """Resolve the sender's scope and send, with its own session, in a worker.
+  """Send a scope broadcast or global direct note from one exact live run.
 
-  Validation, the write and the recipient inbox prune froze the event loop on
-  a busy disk. The live hint goes through the thread-safe system broadcast.
-  Returns None when the run has no coordination scope.
+  Runs in a worker with its own session: validation, the write and the
+  recipient inbox prune froze the event loop on a busy disk. The live hint
+  goes through the thread-safe system broadcast. Returns None when the run
+  has no coordination scope.
   """
   from app.database import SessionLocal
 
@@ -1599,14 +1546,38 @@ def send_agent_message_off_loop(
     scope = scope_for_chat(db, sender_chat_id, sender_run_id)
     if scope is None:
       return None
-    return send_agent_message(
+    if broadcast:
+      return send_scope_message(
+        db,
+        scope,
+        sender_chat_id=sender_chat_id,
+        sender_run_id=sender_run_id,
+        recipients=recipients,
+        broadcast=True,
+        kind=kind,
+        delivery=delivery,
+        body=body,
+        send_id=send_id,
+      )
+
+    unique_recipients = list(dict.fromkeys(str(value) for value in recipients))
+    if not unique_recipients:
+      raise ValueError("Choose at least one recipient or broadcast to the scope.")
+    if sender_chat_id in unique_recipients:
+      raise ValueError("An agent cannot send a peer note to itself.")
+    addressable = _agent_chat_ids(db, set(unique_recipients))
+    if addressable != set(unique_recipients):
+      raise ValueError("A recipient is not an addressable Möbius peer.")
+    network = CoordinationScope(
+      kind="workspace", id=str(owner_id), root_chat_id=sender_chat_id,
+    )
+    return _persist_send(
       db,
-      scope,
-      owner_id=owner_id,
+      network,
       sender_chat_id=sender_chat_id,
       sender_run_id=sender_run_id,
-      recipients=recipients,
-      broadcast=broadcast,
+      recipients=unique_recipients,
+      broadcast=False,
       kind=kind,
       delivery=delivery,
       body=body,
