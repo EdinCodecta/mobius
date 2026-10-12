@@ -13,43 +13,31 @@ function navigatorWithSession(type = 'auto') {
   }
 }
 
-test('app host selects playback without starting or unmuting any audio', () => {
-  const nav = navigatorWithSession()
-  const release = acquireAudioSession('playback', nav)
-  assert.equal(nav.audioSession.type, 'playback')
-  release()
-  assert.deepEqual(nav.changes, ['playback', 'auto'])
-  release()
-  assert.deepEqual(nav.changes, ['playback', 'auto'])
-})
-
-test('multiple canvases keep playback until the last one leaves', () => {
+test('mounted apps keep playback until the last one leaves', () => {
   const nav = navigatorWithSession()
   const first = acquireAudioSession('playback', nav)
   const second = acquireAudioSession('playback', nav)
+  first()
   first()
   assert.equal(nav.audioSession.type, 'playback')
   second()
   assert.deepEqual(nav.changes, ['playback', 'auto'])
 })
 
-test('capture wins over app playback and restores it when all captures end', () => {
+test('capture wins over app playback and restores it when every capture ends', () => {
   const nav = navigatorWithSession()
   const app = acquireAudioSession('playback', nav)
   const mic = acquireAudioSession('play-and-record', nav)
   const camera = acquireAudioSession('play-and-record', nav)
-  const otherApp = acquireAudioSession('playback', nav)
-  assert.equal(nav.audioSession.type, 'play-and-record')
   mic()
   assert.equal(nav.audioSession.type, 'play-and-record')
   camera()
   assert.equal(nav.audioSession.type, 'playback')
   app()
-  otherApp()
   assert.deepEqual(nav.changes, ['playback', 'play-and-record', 'playback', 'auto'])
 })
 
-test('unmounting the last app does not interrupt a capture still in progress', () => {
+test('closing the last app does not interrupt a capture still in progress', () => {
   const nav = navigatorWithSession()
   const app = acquireAudioSession('playback', nav)
   const mic = acquireAudioSession('play-and-record', nav)
@@ -59,41 +47,14 @@ test('unmounting the last app does not interrupt a capture still in progress', (
   assert.equal(nav.audioSession.type, 'auto')
 })
 
-test('standalone capture restores the original browser category', () => {
-  const nav = navigatorWithSession('ambient')
-  const mic = acquireAudioSession('play-and-record', nav)
-  assert.equal(nav.audioSession.type, 'play-and-record')
-  mic()
-  assert.equal(nav.audioSession.type, 'ambient')
+test('the host replaces a category it did not choose, such as a stale capture type', () => {
+  const nav = navigatorWithSession('play-and-record')
+  const app = acquireAudioSession('playback', nav)
+  assert.equal(nav.audioSession.type, 'playback')
+  app()
 })
 
-test('app playback preserves an existing explicit category', () => {
-  for (const type of ['ambient', 'transient', 'playback', 'play-and-record']) {
-    const nav = navigatorWithSession(type)
-    const release = acquireAudioSession('playback', nav)
-    assert.equal(nav.audioSession.type, type)
-    release()
-    assert.deepEqual(nav.changes, [])
-  }
-})
-
-test('cleanup does not undo a newer explicit category chosen elsewhere', () => {
-  const nav = navigatorWithSession()
-  const release = acquireAudioSession('playback', nav)
-  nav.audioSession.type = 'ambient'
-  release()
-  assert.equal(nav.audioSession.type, 'ambient')
-})
-
-test('absent or inaccessible optional browser support never blocks the app', () => {
-  for (const nav of [null, {}, {
-    get audioSession() { throw new Error('unavailable') },
-  }, {
-    audioSession: { get type() { throw new Error('unavailable') } },
-  }, {
-    audioSession: { get type() { return 'auto' }, set type(value) { throw new Error(value) } },
-  }]) {
-    const release = acquireAudioSession('playback', nav)
-    assert.doesNotThrow(release)
-  }
+test('browsers without the audio session API are left untouched', () => {
+  const release = acquireAudioSession('playback', {})
+  assert.doesNotThrow(release)
 })

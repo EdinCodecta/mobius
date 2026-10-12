@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 
 import { startCameraCapture } from '../cameraCapture.js'
 
-test('camera audio selects recording and cancellation restores playback', async () => {
-  const navigator = { audioSession: { type: 'playback' } }
+test('camera audio holds the recording session until cancellation releases it', async () => {
+  const navigator = { audioSession: { type: 'auto' } }
   let resolveStream
   const stream = videoStream()
   const capture = startCameraCapture({
@@ -21,11 +21,11 @@ test('camera audio selects recording and cancellation restores playback', async 
   await Promise.resolve()
   capture.cancel()
   await assert.rejects(capture.done, { name: 'AbortError' })
-  assert.equal(navigator.audioSession.type, 'playback')
+  assert.equal(navigator.audioSession.type, 'auto')
   resolveStream(stream)
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(stream.stops, 1)
-  assert.equal(navigator.audioSession.type, 'playback')
+  assert.equal(navigator.audioSession.type, 'auto')
 })
 
 test('video-only capture leaves audio routing unchanged', async () => {
@@ -34,10 +34,14 @@ test('video-only capture leaves audio routing unchanged', async () => {
     navigator,
     audio: false,
     MediaRecorderCtor: class {},
-    mediaDevices: { async getUserMedia() { throw new Error('denied') } },
+    mediaDevices: {
+      async getUserMedia() {
+        assert.equal(navigator.audioSession.type, 'auto')
+        throw new Error('denied')
+      },
+    },
   })
   await assert.rejects(capture.done, /denied/)
-  assert.equal(navigator.audioSession.type, 'auto')
 })
 
 function videoStream({ width = 1920, height = 1080 } = {}) {

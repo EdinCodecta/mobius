@@ -1,46 +1,28 @@
-// Safari's audio session is page-wide. Opaque app frames cannot configure it
-// (WebKit gates that operation on microphone policy), so the trusted host owns
-// the default. Selecting a category does not start audio or unlock autoplay.
-// Capture temporarily takes priority; overlapping canvases/captures share it.
-const owners = new WeakMap()
-const noop = () => {}
+// Safari's audio session is page-wide, and WebKit ignores writes from frames
+// without microphone policy, so app frames cannot choose it themselves. Under
+// 'auto', Web Audio gets the ambient category that iPhone Silent Mode mutes,
+// so the host selects playback while an app is mounted. Any explicit type also
+// disables WebKit's automatic switch to recording, so every microphone user in
+// this page must hold play-and-record while it captures. Selecting a type
+// neither starts audio nor unlocks autoplay.
+const holds = { playback: 0, 'play-and-record': 0 }
+
+function selectType(session) {
+  const type = holds['play-and-record'] ? 'play-and-record'
+    : holds.playback ? 'playback' : 'auto'
+  if (session.type !== type) session.type = type
+}
 
 export function acquireAudioSession(type, nav = globalThis.navigator) {
-  let session
-  try { session = nav?.audioSession } catch { return noop }
-  if (!session) return noop
-
-  let owner = owners.get(session)
-  if (!owner) {
-    try {
-      owner = { original: session.type, applied: session.type, playback: 0, capture: 0 }
-    } catch { return noop }
-    owners.set(session, owner)
-  }
-  const key = type === 'play-and-record' ? 'capture' : 'playback'
-
-  function apply() {
-    try {
-      // Do not overwrite an explicit choice made by another audio feature.
-      if (session.type !== owner.applied) owner.original = session.type
-      const next = owner.capture ? 'play-and-record'
-        : owner.playback && owner.original === 'auto' ? 'playback'
-          : owner.original
-      if (session.type !== next) session.type = next
-      owner.applied = session.type
-    } catch {
-      // Optional browser support must not prevent app launch or recording.
-    }
-  }
-
-  owner[key] += 1
-  apply()
-  let released = false
+  const session = nav?.audioSession
+  if (!session) return () => {}
+  holds[type] += 1
+  selectType(session)
+  let held = true
   return () => {
-    if (released) return
-    released = true
-    owner[key] -= 1
-    apply()
-    if (!owner.capture && !owner.playback) owners.delete(session)
+    if (!held) return
+    held = false
+    holds[type] -= 1
+    selectType(session)
   }
 }

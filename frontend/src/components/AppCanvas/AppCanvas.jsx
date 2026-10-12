@@ -372,9 +372,7 @@ const AppCanvas = forwardRef(function AppCanvas({
   onAppFocus, onImmersive, onIntentDelivered, onAppError, onHostRequest,
   onMediaSession, onShellShortcut,
 }, hostRef) {
-  // Configure the page-wide session in the trusted host, before app code can
-  // play. Both workspace and installed app launches use this canvas. This
-  // changes routing only: app mute, autoplay and visibility still belong to apps.
+  // Before app code can play: app frames cannot set the page's audio session.
   useLayoutEffect(() => acquireAudioSession('playback'), [])
 
   const queryClient = useQueryClient()
