@@ -64,7 +64,9 @@ def test_app_notification_marks_list_unseen_and_open_acknowledges(
   assert row["has_unseen_activity"] is False
 
 
-def test_stale_or_missing_app_lifetime_cannot_clear_activity(client, auth, db):
+def test_stale_lifetime_is_rejected_and_pre_lifetime_shell_still_acknowledges(
+  client, auth, db,
+):
   app = _app(db)
   assert client.post("/api/notifications/send", headers=auth, json={
     "title": "Background work finished", "source_type": "app", "source_id": str(app.id),
@@ -76,12 +78,17 @@ def test_stale_or_missing_app_lifetime_cannot_clear_activity(client, auth, db):
     "app_created_at": "earlier-app-lifetime",
   })
   assert response.status_code == 409
-  missing = client.post(f"/api/apps/{app.id}/activity/seen", headers=auth, json={
-    "activity_version": state.activity_version,
-  })
-  assert missing.status_code == 422
   db.refresh(state)
   assert state.unseen is True
+  # A shell bundle from before lifetime-bound acknowledgements omits the
+  # lifetime and does not reload on a platform update. Rejecting it would make
+  # it clear, fail, refetch and resend forever, so the live app binds it.
+  legacy = client.post(f"/api/apps/{app.id}/activity/seen", headers=auth, json={
+    "activity_version": state.activity_version,
+  })
+  assert legacy.status_code == 204, legacy.text
+  db.refresh(state)
+  assert state.unseen is False
 
 
 def test_seen_write_rechecks_lifetime_after_route_read(client, auth, db):

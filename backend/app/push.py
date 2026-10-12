@@ -205,7 +205,7 @@ def _prepare_owner_notification(
   # to the app. Make that canonical completion edge own the drawer dot too,
   # rather than requiring every cron script to remember a parallel signal.
   from app.app_activity import mark_from_notification
-  activity_app_id = mark_from_notification(
+  activity = mark_from_notification(
     db, source_type=source_type, source_id=source_id,
   )
   try:
@@ -243,18 +243,17 @@ def _prepare_owner_notification(
       pass
     return notification_id, None
 
-  if activity_app_id is not None:
-    # The row above is durable. The replay-free event carries the committed
-    # marker version so a live shell marks that one app instead of
-    # re-downloading every app row; a reconnect/boot refetch recovers a missed
-    # event.
-    from app.app_activity import unseen_activity_marker
+  if activity is not None:
+    # The row above is durable. The replay-free event carries the marker
+    # version written in that transaction so a live shell marks that one app
+    # instead of re-downloading every app row; a reconnect/boot refetch
+    # recovers a missed event.
     from app.broadcast import get_system_broadcast
-    event = {"type": "app_activity", "appId": str(activity_app_id)}
-    marker = unseen_activity_marker(db, activity_app_id)
-    if marker is not None:
-      event["unseenActivityVersion"], event["appCreatedAt"] = marker
-    get_system_broadcast().publish(event)
+    get_system_broadcast().publish({
+      "type": "app_activity", "appId": str(activity.app_id),
+      "unseenActivityVersion": activity.version,
+      "appCreatedAt": activity.app_created_at,
+    })
 
   # Replay-free nudge so a live shell's bell badge refetches immediately;
   # an SSE-reconnect refetch recovers any missed event. Deliberately BEFORE
