@@ -1146,6 +1146,119 @@ async def test_number_split_across_scan_chunks_is_charged_as_one_token(monkeypat
   assert app_services._admitted_exchange_cost == 0
 
 
+@pytest.mark.asyncio
+async def test_minus_sign_split_from_its_float_at_a_chunk_end_still_charges_the_whole_token(monkeypatch):
+  token = b"-1.2345678901234567e-300"
+  size = app_services._JSON_SCAN_BYTES
+  raw = b"[" + b" " * (size - 2) + token + b"]"
+  assert raw[size - 1:size] == b"-"
+  units = 1 + len(raw) // app_services._JSON_BARE_CHARS_PER_UNIT
+  units += app_services._json_number_work(len(token), True)
+  monkeypatch.setattr(app_services, "MAX_JSON_STRUCTURE", units)
+  with app_services.ServiceExchangeAdmission(MIB) as admission:
+    assert await admission.decode(raw) == [-1.2345678901234567e-300]
+  monkeypatch.setattr(app_services, "MAX_JSON_STRUCTURE", units - 1)
+  with pytest.raises(HTTPException) as refused:
+    with app_services.ServiceExchangeAdmission(MIB) as admission:
+      await admission.decode(raw)
+  assert refused.value.status_code == 413
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pressure", ["exhausted", "walk-fits-sizing-does-not"])
+async def test_materialized_scalar_sizing_copies_only_after_admission(monkeypatch, pressure):
+  body = {"body": "x" * (2 * app_services._JSON_SCAN_BYTES)}
+  # Another exchange holds the rest of the budget.
+  other = app_services.MAX_ADMITTED_EXCHANGE_COST - (0 if pressure == "exhausted" else 64 * 1024)
+  monkeypatch.setattr(app_services, "_admitted_exchange_cost", other)
+  real_encode = app_services.json.encoder.encode_basestring
+  copied = []
+  monkeypatch.setattr(
+    app_services.json.encoder, "encode_basestring",
+    lambda value: copied.append(len(value)) or real_encode(value),
+  )
+  with pytest.raises(HTTPException) as refused:
+    with app_services.ServiceExchangeAdmission(8 * MIB) as admission:
+      await admission.retain(body)
+  assert refused.value.status_code == 413
+  assert refused.value.detail == "App service request admission budget is exhausted."
+  assert copied == [], "a sizing copy was made before its reservation"
+  assert app_services._admitted_exchange_cost == other
+
+
+@pytest.mark.asyncio
+async def test_materialized_sizing_failure_after_copies_releases_its_reservation():
+  # Measured slice by slice, the escaped form outgrows the ceiling midway.
+  body = {"body": "\x00" * (app_services._JSON_SCAN_BYTES * 3)}
+  with pytest.raises(HTTPException) as refused:
+    with app_services.ServiceExchangeAdmission(4 * app_services._JSON_SCAN_BYTES * 6 // 5) as admission:
+      await admission.retain(body)
+  assert refused.value.detail == "App service request is too large."
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_browser_revocation_cancels_a_rendering_http_response_before_handoff(db, auth, monkeypatch):
+  from app import service_preload
+  from app.routes import app_services as routes
+
+  app = _service_app(db)
+  owner = db.query(models.Owner).first()
+  monkeypatch.setattr(app_services, "_validate_browser_call", lambda *_: None)
+  monkeypatch.setattr(app_services, "_actor_browser", lambda _: SimpleNamespace(grant_id="grant", session_id="session"))
+  monkeypatch.setattr(app_services, "service_environment", lambda *_a, **_k: {})
+  monkeypatch.setattr(service_preload, "ready_host", lambda *_: None)
+
+  async def reply(*_args):
+    return b'{"body":{"ok":true}}', b"", 0
+
+  entered = asyncio.Event()
+
+  async def paused_render(_value):
+    entered.set()
+    await asyncio.Event().wait()
+
+  monkeypatch.setattr(app_services, "_run_spawned", reply)
+  monkeypatch.setattr(app_services, "render_json", paused_render)
+
+  async def http_exchange():
+    with app_services.ServiceExchangeAdmission(8 * MIB) as admission:
+      result = await app_services.invoke_service(app, owner, {"actor": {}}, admission=admission)
+      return await routes._response(*result)
+
+  task = asyncio.create_task(http_exchange())
+  await asyncio.wait_for(entered.wait(), 5)
+  assert task in app_services._browser_calls["grant"]
+  assert app_services.browser_grant_has_active_calls("grant")
+  await app_services.cancel_browser_grant_calls("grant")
+  assert task.cancelled()
+  assert "grant" not in app_services._browser_calls
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_tool_result_handoff_still_ends_its_browser_attribution(db, auth, monkeypatch):
+  from app import service_preload
+
+  app = _service_app(db)
+  owner = db.query(models.Owner).first()
+  monkeypatch.setattr(app_services, "_validate_browser_call", lambda *_: None)
+  monkeypatch.setattr(app_services, "_actor_browser", lambda _: SimpleNamespace(grant_id="grant", session_id="session"))
+  monkeypatch.setattr(app_services, "service_environment", lambda *_a, **_k: {})
+  monkeypatch.setattr(service_preload, "ready_host", lambda *_: None)
+
+  async def reply(*_args):
+    assert app_services.browser_grant_has_active_calls("grant")
+    return b'{"body":{"ok":true}}', b"", 0
+
+  monkeypatch.setattr(app_services, "_run_spawned", reply)
+  result = await app_services.invoke_service(app, owner, {"actor": {}}, lane="tools")
+  assert result[1] == {"ok": True}
+  assert "grant" not in app_services._browser_calls
+  assert app_services._admitted_exchange_cost == 0
+
+
 def _resource_corpus():
   n = 40_000
   return {

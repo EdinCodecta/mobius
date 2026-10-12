@@ -252,11 +252,16 @@ encoding; request serialization adds what exceeds three serialized copies to
 its execution allowance. The complete request envelope, including tool and
 policy requests, has the same unit, depth and decoded-cost ceilings, counted on
 its compact JSON form with the envelope itself at depth 0, so a compact body
-gets the same verdict over HTTP as when materialized; redundant raw text
-(whitespace, longer number spellings) is real parse work and costs more only
-over HTTP. Its retained estimate is each value's `sys.getsizeof` plus
-allocator slack, and that walk runs pinned to the accepted runtime and
-attributed to any browser grant. Large base64 scalars, 20 MiB
+gets the same verdict over HTTP as when materialized, except that an int
+beyond 64 bits is charged an upper bound of its digits (at most two more,
+without converting it) and can tip a body exactly at the limit; redundant raw
+text (whitespace, longer number spellings) is real parse work and costs more
+only over HTTP. Its retained estimate is each value's `sys.getsizeof` plus
+allocator slack, and that walk runs pinned to the accepted runtime. The walk
+reserves its own iterator stack, and every bounded copy it makes to size a long
+string, before making it. A browser grant's attribution belongs to the whole
+exchange, so revoking the grant also cancels an HTTP response that is still
+rendering. Large base64 scalars, 20 MiB
 originals/downloads, and galleries with Unicode captions fitting the reviewed
 60 MiB serialized grant remain supported in both directions. A single huge
 string containing a wide character is held at that width when decoded and

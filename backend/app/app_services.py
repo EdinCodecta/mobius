@@ -91,8 +91,9 @@ MAX_PUBLIC_INGRESS_COST = 192 * 1024 * 1024
 _admitted_exchange_cost = 0
 _public_ingress_cost = 0
 # Marks and number tokens outside strings. A '\\' outside a string is invalid
-# JSON; it is matched only so the scan never misreads it.
-_JSON_RESOURCE_MARKS = re.compile(r'["\\{}\[\],:]|-?[0-9]+([.eE][0-9.eE+-]*)?')
+# JSON; it is matched only so the scan never misreads it. A lone '-' is a
+# number's sign, which a chunk boundary can separate from its digits.
+_JSON_RESOURCE_MARKS = re.compile(r'["\\{}\[\],:]|-?[0-9]+([.eE][0-9.eE+-]*)?|-')
 _JSON_NUMBER_TAIL = re.compile(r'[0-9.eE+-]*')
 # Disjoint alternatives consume string content in native, bounded chunks,
 # including escaped quotes/backslashes. This only finds the end of a string;
@@ -137,6 +138,12 @@ _JSON_BARE_CHAR_COST = 2
 # two for a container's separately allocated items/keys.
 _RETAINED_BLOCK_SLACK = 23
 _RETAINED_ENVELOPE_COST = 4096
+# While walking: one pending iterator (a dict's items view, its iterator and
+# chain, or a list iterator) and list slots per open container, and a margin
+# for one number's text or the next container's iterator (measured under
+# 300 bytes).
+_RETAINED_WALK_LEVEL_COST = 512
+_RETAINED_WALK_HEADROOM = 2048
 # The pure-Python encoder's fixed state, and one suspended generator per
 # nesting level on the current path (measured under 3.8 KiB and 700 bytes).
 _JSON_ENCODER_COST = 4096
@@ -187,6 +194,7 @@ class ServiceExchangeAdmission:
     self.largest_part = 0
     self.encoded_bytes = 0
     self.encoded_depth = 0
+    self.attribution: tuple[str, asyncio.Task] | None = None
 
   def __enter__(self):
     return self
@@ -194,11 +202,30 @@ class ServiceExchangeAdmission:
   def __exit__(self, *_):
     global _admitted_exchange_cost
     self.finish_ingress()
+    if self.attribution is not None:
+      grant_id, task = self.attribution
+      self.attribution = None
+      calls = _browser_calls.get(grant_id)
+      if calls is not None:
+        calls.discard(task)
+        if not calls:
+          _browser_calls.pop(grant_id, None)
     _admitted_exchange_cost -= self.cost
     self.cost = 0
     self.transfer_cost = 0
     self.request_cost = 0
     self.response_cost = 0
+
+  def attribute(self, grant_id: str):
+    """Make the current task revocable with ``grant_id`` until the exchange ends.
+
+    The exchange, not one call inside it, owns the attribution: an HTTP
+    response still rendering under this reservation is cancelled by
+    revocation before it can be handed off (cancel_browser_grant_calls).
+    """
+    task = asyncio.current_task()
+    _browser_calls.setdefault(grant_id, set()).add(task)
+    self.attribution = (grant_id, task)
 
   def finish_ingress(self):
     """Transfer a completed public read without releasing its total reservation."""
@@ -501,7 +528,18 @@ class ServiceExchangeAdmission:
     deepest = 0
     cost = _RETAINED_ENVELOPE_COST
     visited = 0
-    pending = [iter((envelope,))]
+
+    def hold_walk(transient: int):
+      # The envelope already exists; what the walk adds (its iterator stack,
+      # one number's text, a sizing slice) is reserved before it is made, on
+      # top of the estimate so far, and never lowers a held decode cost.
+      needed = cost + _RETAINED_WALK_LEVEL_COST * len(pending) + transient
+      if needed > self.request_cost:
+        self._hold("request", request=needed + _RETAINED_WALK_HEADROOM)
+
+    pending = []
+    hold_walk(_RETAINED_WALK_HEADROOM)
+    pending.append(iter((envelope,)))
     in_list = [False]
     while pending:
       item = next(pending[-1], _EXHAUSTED)
@@ -512,6 +550,7 @@ class ServiceExchangeAdmission:
       visited += 1
       if visited % _COOPERATIVE_STEP == 0:
         await asyncio.sleep(0)
+      hold_walk(_RETAINED_WALK_HEADROOM)
       children = None
       if isinstance(item, dict):
         marks += max(2 * len(item), 1)
@@ -523,7 +562,7 @@ class ServiceExchangeAdmission:
         children = iter(item)
       elif isinstance(item, str):
         marks += 1
-        part, size = _json_string_part(item, self.max_bytes, in_list[-1])
+        part, size = _json_string_part(item, self.max_bytes, in_list[-1], hold_walk)
         largest_part = max(largest_part, part)
         string_bytes += size
       elif item is True or item is None:
@@ -586,7 +625,8 @@ _JSON_LINEAR_DIGITS = 83
 
 
 def _json_int_length(value: int) -> int:
-  """Compact decimal length of an int; an upper bound past 64 bits."""
+  """Compact decimal length of an int; past 64 bits an upper bound (at most
+  two over), because converting a big int is itself quadratic work."""
   if value.bit_length() <= 64:
     return len(str(value))
   # log10(2) < 0.30103; one more for rounding, one for a sign.
@@ -696,32 +736,44 @@ def exchange_max_bytes(service: dict, method, path) -> int:
   return routes.get((method, service_route_key(path)), ceiling)
 
 
-def _json_string_part(value: str, max_bytes: int, list_item: bool) -> tuple[int, int]:
+def _json_string_part(
+  value: str, max_bytes: int, list_item: bool, reserve_sizing,
+) -> tuple[int, int]:
   """Reject a scalar before JSONEncoder can materialize its entire escaped form.
 
   Returns what encoding it will briefly hold (``_json_part_peak``) and its
   quoted UTF-8 size. Six UTF-8 bytes per character is a safe upper bound for
   one JSON string character with ensure_ascii=False; a longer string is
-  measured exactly.
+  measured exactly in bounded slices, whose copies ``reserve_sizing`` admits
+  before the first is made.
   """
   if len(value) > max_bytes:
     raise HTTPException(413, "App service request is too large.")
   # The str header is 56 bytes when not ASCII; a cached UTF-8 copy only
   # overstates the width, which the clamp keeps a valid kind bound.
-  width = 1 if value.isascii() else min(4, (sys.getsizeof(value) - 56) // (len(value) + 1))
+  ascii_only = value.isascii()
+  width = 1 if ascii_only else min(4, (sys.getsizeof(value) - 56) // (len(value) + 1))
   chars = len(value) * 6 + 2
   if chars <= max_bytes and len(value) <= _JSON_SCAN_BYTES:
-    return _json_part_peak(chars, width, value.isascii(), list_item), chars
+    return _json_part_peak(chars, width, ascii_only, list_item), chars
+  # One slice, its escaped form (up to six characters each) and that form's
+  # UTF-8 encoder buffer exist at once.
+  escaped = 6 * _JSON_SCAN_BYTES + 2
+  reserve_sizing(
+    _JSON_SCAN_BYTES * width + escaped * width + escaped * min(width + 1, 4)
+    + 3 * _JSON_STRING_COST,
+  )
   chars = size = 2  # JSON quotes
   for start in range(0, len(value), _JSON_SCAN_BYTES):
     # The standard encoder's escaping, applied in bounded slices, has the
     # same result for a string regardless of where it is split.
     part = json.encoder.encode_basestring(value[start:start + _JSON_SCAN_BYTES])
     chars += len(part) - 2
-    size += len(part[1:-1].encode("utf-8"))
+    size += len(part.encode("utf-8")) - 2
+    del part
     if size > max_bytes:
       raise HTTPException(413, "App service request is too large.")
-  return _json_part_peak(chars, width, value.isascii(), list_item), size
+  return _json_part_peak(chars, width, ascii_only, list_item), size
 
 
 async def render_json(value) -> bytes:
@@ -1015,23 +1067,14 @@ async def invoke_service(
       service, request_envelope.get("method"), request_envelope.get("path"),
     ))
   )
-  browser = _actor_browser(request_envelope.get("actor") or {})
-  grant_id = browser.grant_id if browser is not None else None
-  try:
-    with boundary as admitted:
-      return await _invoke_admitted_service(
-        app, owner, request_envelope, timeout_seconds=timeout_seconds, lane=lane,
-        admission=admitted,
-      )
-  finally:
-    # Attribution includes cooperative response scanning, not just execution.
-    # Revocation must still cancel a result that has not been handed off.
-    if grant_id is not None:
-      calls = _browser_calls.get(grant_id)
-      if calls is not None:
-        calls.discard(asyncio.current_task())
-        if not calls:
-          _browser_calls.pop(grant_id, None)
+  # Attribution includes cooperative response scanning and, for HTTP callers
+  # holding their own admission, rendering: revocation must still cancel a
+  # result that has not been handed off. The admission releases it.
+  with boundary as admitted:
+    return await _invoke_admitted_service(
+      app, owner, request_envelope, timeout_seconds=timeout_seconds, lane=lane,
+      admission=admitted,
+    )
 
 
 async def _invoke_admitted_service(
@@ -1074,10 +1117,9 @@ async def _invoke_admitted_service(
   browser = _actor_browser(request_envelope.get("actor") or {})
   _validate_browser_call(owner, browser)
   grant_id = browser.grant_id if browser is not None else None
-  task = asyncio.current_task()
   pin = hold_runtime(app.id)
   if grant_id is not None:
-    _browser_calls.setdefault(grant_id, set()).add(task)
+    admission.attribute(grant_id)
   try:
     # The envelope, with its metadata, is the only request copy retained
     # while queued; non-HTTP callers get the same structural boundary. Its
