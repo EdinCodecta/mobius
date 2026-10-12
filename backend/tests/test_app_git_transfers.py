@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -332,8 +333,8 @@ def test_bootstrap_transfers_before_installing(git_server, transfers, db, monkey
   staged = []
 
   async def install_from_manifest(_db, **kwargs):
-    staged.append(kwargs["staged_clone"])
-    assert kwargs["staged_clone"].path.is_dir()
+    staged.append(kwargs["prepared"].staged_clone)
+    assert staged[-1].path.is_dir()
     raise RuntimeError("stop after the transfer")
 
   monkeypatch.setattr(bootstrap, "install_from_manifest", install_from_manifest)
@@ -913,3 +914,204 @@ def test_history_falls_back_to_the_origin_branch(
   assert requested == [v2, "main"]
   assert not (repo / ".git" / "shallow").exists()
   app_git.require_merge_history(repo)
+
+
+def test_git_install_fetches_no_package_file_over_http_or_under_the_lock(
+  client, auth, git_server, bypass_url_validation, monkeypatch,
+):
+  """The package is read from the staged clone: only the pre-clone manifest
+  check and the identity lookup use HTTP, and neither holds the lock."""
+  name = "one-download"
+  git_server.publish(name)
+  manifest = {
+    "id": name, "name": "One Download", "version": "1.0.0",
+    "description": "Downloaded once", "entry": "index.jsx",
+    "package_id": "urn:uuid:4c5d8a2e-0f43-5d0e-9b1a-6e2f7c3d9a10",
+  }
+  git_server.commit(name, manifest, JSX, push=True)
+  requests = []
+  real_get = install._http_get
+
+  async def recorded(client_, url, *args, **kwargs):
+    requests.append((url, fs_locks._lifecycle_lock.locked()))
+    return await real_get(client_, url, *args, **kwargs)
+
+  monkeypatch.setattr(install, "_http_get", recorded)
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client({
+    **_responses(name, manifest),
+    f"https://api.github.com/repos/test/{name}": (
+      200, json.dumps({"id": 102, "full_name": f"test/{name}"}).encode(),
+    ),
+  })):
+    response = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base(name) + "mobius.json",
+    })
+  assert response.status_code == 201, response.text
+  assert [url for url, _locked in requests] == [
+    _base(name) + "mobius.json", f"https://api.github.com/repos/test/{name}",
+  ]
+  assert not any(locked for _url, locked in requests)
+  assert response.json()["package_id"] == manifest["package_id"]
+
+
+def test_push_between_staging_and_install_installs_the_staged_commit(
+  client, auth, git_server, bypass_url_validation, monkeypatch,
+):
+  """Raw file caches may already serve a newer push; the clone still decides."""
+  name = "pushed-meanwhile"
+  manifest = git_server.publish(name)
+  staged_head = app_git.head_sha(git_server.root / f"{name}.git", "main")
+  v2 = {**manifest, "version": "2.0.0"}
+  real_stage = install._stage
+
+  async def stage_then_push(*args):
+    staged = await real_stage(*args)
+    git_server.commit(name, v2, JSX.replace("ok", "pushed"), push=True)
+    return staged
+
+  monkeypatch.setattr(install, "_stage", stage_then_push)
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(
+    _responses(name, v2, JSX.replace("ok", "pushed")),
+  )):
+    response = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base(name) + "mobius.json",
+    })
+  assert response.status_code == 201, response.text
+  assert response.json()["version"] == "1.0.0"
+  repo = _repo(name)
+  assert app_git.head_sha(repo, app_git.UPSTREAM_BRANCH) == staged_head
+  assert (repo / "index.jsx").read_text() == JSX
+  assert _no_leftovers()
+
+
+@pytest.mark.parametrize("missing", ["repository", "branch"])
+def test_permanent_fetch_failures_are_not_retryable(
+  client, auth, git_server, bypass_url_validation, monkeypatch, missing,
+):
+  name = f"permanent-{missing}"
+  manifest = git_server.publish(name)
+  if missing == "repository":
+    monkeypatch.setattr(install, "_derive_repo_ref", lambda _url: (
+      git_server.url("no-such-repository"), "main",
+    ))
+  else:
+    monkeypatch.setattr(install, "_derive_repo_ref", lambda _url: (
+      git_server.url(name), "no-such-branch",
+    ))
+  with pytest.raises(app_git.GitTransferFailed) as raised:
+    asyncio.run(_stage_clone(*install._derive_repo_ref("")))
+  assert raised.value.transient is False
+  assert install.transient_failure(raised.value) == (False, None)
+
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(
+    _responses(name, manifest),
+  )):
+    failed = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base(name) + "mobius.json",
+    })
+  assert failed.status_code == 409, failed.text
+  assert failed.json()["detail"]["code"] == "git_install_unavailable"
+  assert failed.json()["detail"]["retryable"] is False
+  assert _no_leftovers()
+
+
+def test_unreachable_and_stalled_transfers_stay_retryable(git_server, monkeypatch):
+  with socket.socket() as closed:
+    closed.bind(("127.0.0.1", 0))
+    port = closed.getsockname()[1]
+  with pytest.raises(app_git.GitTransferFailed) as refused:
+    asyncio.run(_stage_clone(f"http://127.0.0.1:{port}/gone.git"))
+  assert install.transient_failure(refused.value) == (True, None)
+
+  git_server.publish("stalls", big=True)
+  monkeypatch.setattr(app_git, "_GIT_LOW_SPEED_TIME", 2)
+  git_server.pause("stalls")
+  with pytest.raises(app_git.GitTransferFailed) as stalled:
+    asyncio.run(_stage_clone(git_server.url("stalls")))
+  assert install.transient_failure(stalled.value) == (True, None)
+  assert _no_leftovers()
+
+
+@pytest.mark.parametrize(("stderr", "transient"), [
+  ("fatal: couldn't find remote ref refs/heads/gone", False),
+  ("remote: Repository not found.\nfatal: repository 'x' not found", False),
+  ("fatal: could not read Username for 'https://github.com': "
+   "terminal prompts disabled", False),
+  ("fatal: unable to access 'x': The requested URL returned error: 404", False),
+  ("fatal: write error: No space left on device", False),
+  ("fatal: unable to access 'x': The requested URL returned error: 503", True),
+  ("fatal: unable to access 'x': Failed to connect to host port 443", True),
+  ("error: RPC failed; curl 56 Recv failure: Connection reset by peer", True),
+])
+def test_fetch_errors_are_classified_from_git_text(stderr, transient):
+  assert app_git._transient_fetch_error(stderr) is transient
+
+
+@pytest.mark.parametrize(("errno_", "transient"), [
+  (socket.EAI_AGAIN, True), (socket.EAI_NONAME, False),
+])
+def test_unresolved_git_host_is_transient_only_while_the_resolver_fails(
+  monkeypatch, errno_, transient,
+):
+  def resolve(*_args):
+    raise socket.gaierror(errno_, "name resolution failed")
+
+  monkeypatch.setattr(app_git.socket, "getaddrinfo", resolve)
+  stderr = "fatal: unable to access 'x': Could not resolve host: example.test"
+  assert app_git._transient_fetch_error(stderr) is transient
+
+
+def test_changed_capabilities_refuse_a_git_install_before_any_transfer(
+  client, auth, git_server, transfers, bypass_url_validation,
+):
+  name = "capabilities-first"
+  manifest = git_server.publish(name)
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(
+    _responses(name, manifest),
+  )):
+    refused = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base(name) + "mobius.json",
+      "reviewed_capability_digest": "0" * 64,
+    })
+  assert refused.status_code == 409, refused.text
+  assert refused.json()["detail"]["code"] == "capability_changed"
+  assert transfers == []
+
+
+def test_present_commit_check_accepts_the_same_package_and_names_a_mismatch(
+  tmp_path, caplog,
+):
+  """A package fetched over HTTP (a publication handoff) is adopted from a
+  present Git commit only when that commit holds the same package."""
+  from fastapi import HTTPException
+
+  base = "https://raw.githubusercontent.com/test/present/main/"
+  repo = tmp_path / "present"
+  subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+  manifest = {
+    "id": "present", "name": "Present", "version": "1.0.0",
+    "description": "Present commit", "entry": "index.jsx",
+  }
+
+  def commit(manifest_text: str, jsx: str) -> str:
+    (repo / "mobius.json").write_text(manifest_text)
+    (repo / "index.jsx").write_text(jsx)
+    return _fixture_commit(repo, "c")
+
+  same = commit(json.dumps(manifest), JSX)
+  candidate = install.read_git_install_candidate(
+    repo, same, base + "mobius.json",
+  ).candidate
+  install._require_git_candidate(repo, same, candidate)
+
+  for changed, reason in (
+    (commit(json.dumps(manifest), JSX.replace("ok", "drift")), "package files changed"),
+    (commit(json.dumps({**manifest, "version": "2.0.0"}), JSX), "manifest changed"),
+    (commit(json.dumps({"id": "present"}), JSX), "invalid mobius.json"),
+  ):
+    with pytest.raises(HTTPException) as refused:
+      install._require_git_candidate(repo, changed, candidate)
+    assert refused.value.status_code == 409
+    assert refused.value.detail["code"] == "git_source_mismatch"
+    assert refused.value.detail["reason"].startswith(reason)
+    assert reason in caplog.text

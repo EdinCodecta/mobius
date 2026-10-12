@@ -5523,6 +5523,7 @@ async def connect_published_app(
         source="publication_handoff",
         reviewed_capability_digest=spec.capability_digest,
         publication_handoff_app_id=spec.target_app_id,
+        prepared=install.PreparedPackage(candidate),
       )
       connected_app = result.app
       mode = result.mode
