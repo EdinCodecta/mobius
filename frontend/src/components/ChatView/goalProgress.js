@@ -68,6 +68,7 @@ export function normalizeGoalPresentation(goal) {
     status: goal.status,
     resumable: goal.resumable === true,
     plan: goal.plan || null,
+    ...(Array.isArray(goal.dependencies) && goal.dependencies.length ? { dependencies: goal.dependencies } : {}),
     ...(goal.status === 'paused' && ['owner', 'agent', 'unknown', 'deferred'].includes(goal.pause_reason)
       ? { pause_reason: goal.pause_reason } : {}),
     ...(goal.status === 'paused' && goal.pause_reason === 'deferred' && typeof goal.hold_reason === 'string'
@@ -75,6 +76,13 @@ export function normalizeGoalPresentation(goal) {
     ...(goal.handoff?.kind ? { handoff: goal.handoff } : {}),
     ...(goal.result ? { result: goal.result } : {}),
   }
+}
+
+/** A claim follow is not a monitor: do not invent checks or a deadline. */
+export function goalDependencyLabel(dependency) {
+  const work = String(dependency?.condition || 'shared work').trim()
+  const chat = String(dependency?.source_chat_title || 'another chat').trim()
+  return `Waiting · ${work} in ${chat}`
 }
 
 /** One status vocabulary for the Goal rail and its accessible announcement.

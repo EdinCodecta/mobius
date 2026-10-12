@@ -6,6 +6,7 @@ import {
   canResumeGoal, goalStatusLabel, compactGoalObjective, draftGoalObjective,
   goalMessageObjectiveFromText, goalPresentationFromRuntime, goalTaskDisplayStatus,
   normalizeGoalPresentation, progressRailViewModel, visibleGoalTasks,
+  goalDependencyLabel,
 } from '../goalProgress.js'
 const chatView = readFileSync(new URL('../ChatView.jsx', import.meta.url), 'utf8')
 const streamConnection = readFileSync(new URL('../useStreamConnection.js', import.meta.url), 'utf8')
@@ -38,6 +39,14 @@ test('runtime is authoritative including explicit clear and ordinary absence', (
   assert.equal(goalPresentationFromRuntime({ goal: null }), null)
   assert.equal(goalPresentationFromRuntime({ running: true, active_goal_objective: 'obsolete' }), null)
   assert.doesNotMatch(chatView, /goal_activated|goal_plan_updated|goal_cleared|activeGoalPlan|newestGoalPlan|planForGoal|\/goal-plan/)
+})
+
+test('claim follow copy names the work and source without invented checks', () => {
+  const dependency = { id: 'dep', condition: 'Host repair', source_chat_title: 'Watch platform update', automatic: true }
+  assert.equal(goalDependencyLabel(dependency), 'Waiting · Host repair in Watch platform update')
+  assert.deepEqual(goalPresentationFromRuntime({ goal: { ...goal, dependencies: [dependency] } }).dependencies, [dependency])
+  assert.match(goalPlanDetails, /Source not progressing · manual recovery needed/)
+  assert.doesNotMatch(goalDependencyLabel(dependency), /deadline|check|poll/i)
 })
 
 test('same Goal reattachment keeps its plan and disclosure identity until a new snapshot arrives', () => {

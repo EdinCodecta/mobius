@@ -51,6 +51,7 @@ class GoalHandoffs:
   running: bool
   waits: tuple[GoalWaitHandoff, ...]
   helpers: tuple[GoalHelperHandoff, ...]
+  dependencies: tuple[dict, ...]
   park: GoalParkHandoff | None
   failed_attempt: bool
 
@@ -71,6 +72,9 @@ class GoalHandoffs:
   def prevents_settlement(self) -> bool:
     """A native owner still owes this Goal a next step or result."""
     return (self.owner_input or bool(self.waits) or bool(self.helpers)
+            or any(dep["automatic"] and (
+              dep["outcome"] is None or dep["delivery_pending"]
+            ) for dep in self.dependencies)
             or (self.park is not None and self.park.kind in {"automatic", "owner_input"}))
 
 
@@ -84,6 +88,7 @@ def goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
   from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED, serialize_wait
   from app.delegations import _self_resuming_helper_rows
   from app.chat import continuation_handoff_for_chat
+  from app.goal_dependencies import goal_dependency_handoffs
 
   latest = db.query(models.ChatRun.id, models.ChatRun.goal_id, models.ChatRun.status).filter(
     models.ChatRun.chat_id == goal.chat_id,
@@ -128,6 +133,7 @@ def goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
     running=bool(owns_chat_attempt and latest.status == "running"),
     waits=waits,
     helpers=helpers,
+    dependencies=tuple(goal_dependency_handoffs(db, goal)),
     park=park,
     failed_attempt=bool(owns_chat_attempt and latest.status in {"failed", "interrupted"}),
   )

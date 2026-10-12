@@ -95,3 +95,46 @@ def test_owner_hold_presentation_does_not_become_an_automatic_handoff(db, chat):
   }
   db.commit()
   assert _goal_handoff(db, run, goal) == {"kind": "owner_hold", "reason": "owner"}
+
+
+def test_claim_dependency_is_exact_goal_handoff_and_blocks_settlement(db, chat, monkeypatch):
+  from app import goal_dependencies
+  first, goal_a = _run(db, chat, "dependency-first", "dependency-a")
+  second, goal_b = _run(db, chat, "dependency-second", "dependency-b")
+  def projection(_db, goal):
+    return [{"id": "follow-a", "target_kind": "claim_acquisition", "condition": "Host repair",
+      "source_chat_id": "source-chat", "source_chat_title": "Watch platform update",
+      "automatic": True, "delivery_pending": False, "resume_blocker": None, "outcome": None}] if goal.id == goal_a.id else []
+  monkeypatch.setattr(goal_dependencies, "goal_dependency_handoffs", projection)
+
+  native = goal_handoffs(db, goal_a)
+  assert native.prevents_settlement and native.dependencies[0]["id"] == "follow-a"
+  assert not goal_handoffs(db, goal_b).prevents_settlement
+  assert _goal_handoff(db, first, goal_a) == {"kind": "automatic", "reason": "dependency"}
+  assert _goal_handoff(db, second, goal_b) == {"kind": "none", "reason": None}
+
+
+def test_lost_claim_source_is_recovery_not_healthy_handoff(db, chat, monkeypatch):
+  from app import goal_dependencies
+  run, goal = _run(db, chat, "dependency-lost", "dependency-lost-goal")
+  monkeypatch.setattr(goal_dependencies, "goal_dependency_handoffs", lambda *_: [{
+    "id": "lost", "target_kind": "claim_acquisition", "condition": "Host repair",
+    "source_chat_id": None, "source_chat_title": None, "automatic": False,
+    "delivery_pending": False, "resume_blocker": "source_missing", "outcome": None,
+  }])
+  assert not goal_handoffs(db, goal).prevents_settlement
+  assert _goal_handoff(db, run, goal) == {"kind": "recovery", "reason": "dependency_source"}
+
+
+def test_owed_claim_result_remains_a_handoff_until_receipt(db, chat, monkeypatch):
+  from app import goal_dependencies
+  run, goal = _run(db, chat, "dependency-owed", "dependency-owed-goal")
+  row = {"id": "owed", "target_kind": "claim_acquisition", "condition": "Host repair",
+    "source_chat_id": "source", "source_chat_title": "Watch platform update",
+    "automatic": True, "delivery_pending": True, "resume_blocker": None,
+    "outcome": {"kind": "completed"}}
+  monkeypatch.setattr(goal_dependencies, "goal_dependency_handoffs", lambda *_: [row])
+  assert goal_handoffs(db, goal).prevents_settlement
+  assert _goal_handoff(db, run, goal) == {"kind": "automatic", "reason": "dependency"}
+  row["delivery_pending"] = False
+  assert not goal_handoffs(db, goal).prevents_settlement

@@ -768,12 +768,15 @@ def _goal_presentation(
       presentation.update(pause_reason="deferred", hold_reason=hold["reason"])
     else:
       presentation["pause_reason"] = hold["actor"] if hold else "unknown"
-  presentation["handoff"] = _goal_handoff(db, physical, root)
+  from app.chat_handoffs import goal_handoffs
+  native = goal_handoffs(db, root)
+  presentation["handoff"] = _goal_handoff(db, physical, root, native=native)
+  presentation["dependencies"] = list(native.dependencies)
   presentation["plan"] = plan
   return presentation
 
 
-def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal) -> dict:
+def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal, *, native=None) -> dict:
   from app.chat_handoffs import goal_handoffs, project_handoff
   none = {"kind": "none", "reason": None}
   if goal.status == "stopped":
@@ -787,7 +790,7 @@ def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal) 
     return {"kind": "recovery", "reason": "agent_pause" if actor == "agent" else "unknown_stop"}
   if goal.status != "open":
     return none
-  native = goal_handoffs(db, goal)
+  native = native if native is not None else goal_handoffs(db, goal)
   if native.owner_input:
     return {"kind": "owner_input", "reason": "saved_card"}
   if native.running:
@@ -798,7 +801,18 @@ def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal) 
     waits=[{"delivery_pending": wait.delivery_pending,
             "resume_blocker": wait.resume_blocker} for wait in native.waits],
     helper_count=native.helper_count, park=native.park_presentation)
-  if handoff["kind"] == "none" and native.failed_attempt:
+  if handoff["kind"] != "none":
+    return handoff
+  # A foreign claim is a handoff only while its source can progress or its
+  # result is owed automatically. A lost/failed source needs explicit recovery.
+  if any(not dep["automatic"] for dep in native.dependencies):
+    return {"kind": "recovery", "reason": "dependency_source"}
+  if any(
+    dep["automatic"] and (dep["outcome"] is None or dep["delivery_pending"])
+    for dep in native.dependencies
+  ):
+    return {"kind": "automatic", "reason": "dependency"}
+  if native.failed_attempt:
     return {"kind": "recovery", "reason": "execution"}
   return handoff
 

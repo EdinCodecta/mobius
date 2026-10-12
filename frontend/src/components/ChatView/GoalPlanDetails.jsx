@@ -1,7 +1,7 @@
 /* GoalPlanDetails renders the expanded dependency-aware todo list. */
 
 import { Check } from '@openai/apps-sdk-ui/components/Icon'
-import { goalTaskDisplayStatus } from './goalProgress'
+import { goalTaskDisplayStatus, goalDependencyLabel } from './goalProgress'
 import { goalHelpers } from './goalHelpers'
 import {
   HELPER_AWAITING_PARENT_LABEL, isHelperAwaitingParent, isWorkingHelperStatus,
@@ -84,10 +84,10 @@ function GoalPlanRow({ title, status, meta, depth, emphasized, children }) {
   )
 }
 
-export default function GoalPlanDetails({ plan, holdReason = null }) {
+export default function GoalPlanDetails({ plan, holdReason = null, dependencies = [] }) {
   const reason = typeof holdReason === 'string' ? holdReason.trim() : ''
   const tasks = Array.isArray(plan?.tasks) ? plan.tasks : []
-  if (!tasks.length && !plan?.delegations?.length && !reason) return null
+  if (!tasks.length && !plan?.delegations?.length && !reason && !dependencies.length) return null
   const tasksById = new Map(tasks.map(task => [task.id, task]))
   const delegations = Array.isArray(plan?.delegations) ? plan.delegations : []
   // Execution is evidence for task status, never another checklist step.
@@ -123,6 +123,16 @@ export default function GoalPlanDetails({ plan, holdReason = null }) {
   return (
     <div className="chat__goal-plan" role="region" aria-label="Goal details" tabIndex={0}>
       {reason && <p className="chat__goal-result">{reason}</p>}
+      {!!dependencies.length && <div role="list" aria-label="Work in other chats">
+        {dependencies.map(dependency => <div role="listitem" key={dependency.id} className="chat__goal-task">
+          <span className="chat__goal-task-copy">
+            <span className="chat__goal-task-title">{goalDependencyLabel(dependency)}</span>
+            <span className="chat__goal-task-meta">{['source_missing', 'source_failed', 'source_deleted', 'source_held', 'source_goal_missing', 'owner_not_progressing'].includes(dependency.resume_blocker)
+              ? 'Source not progressing · manual recovery needed'
+              : dependency.automatic ? 'Continues automatically when the result arrives' : 'Manual follow-up needed'}</span>
+          </span>
+        </div>)}
+      </div>}
       <div className="chat__goal-plan-tasks" role="list" aria-label="Full goal todo list">
         {(childrenByParent.get(null) || []).map(task => renderBranch(task))}
       </div>

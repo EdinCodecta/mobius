@@ -1233,7 +1233,11 @@ admits one bounded settlement pass after a clean unhanded ending; another such
 ending records a visible technical recovery failure, not a fabricated outcome.
 No separate Goal worker, unlimited retry, or automatic crash/Stop recovery exists.
 Settlement and Goal labels share `chat_handoffs.goal_handoffs`: typed records
-for that exact Goal's cards, Waits, self-resuming helpers and eligible parks;
+for that exact Goal's cards, Waits, self-resuming helpers, claim dependencies,
+and eligible parks. A viable pending claim follow or owed automatic outcome
+prevents settlement; a missing or failed source is manual recovery, not a
+healthy handoff. The Goal presentation names the source chat and condition
+without implying a polling deadline;
 chat-wide handoff guards conflicting actions without borrowing another task's
 question. Retired revision-budget columns remain inert historical schema.
 
