@@ -1154,7 +1154,8 @@ def test_known_git_origin_clone_failure_rolls_back_instead_of_importing_http(
   with patch(
     "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
   ), patch(
-    "app.install.app_git.stage_clone", side_effect=RuntimeError("offline"),
+    "app.install.app_git.stage_clone",
+    side_effect=app_git.GitTransferFailed("Could not resolve host"),
   ):
     failed = client.post("/api/apps/install", headers=auth, json={
       "manifest_url": base + "mobius.json",
@@ -1176,6 +1177,36 @@ def test_known_git_origin_clone_failure_rolls_back_instead_of_importing_http(
   assert retry.status_code == 201, retry.text
   assert app_git.origin_url(source_dir) == bare.as_uri()
   assert app_git.head_sha(source_dir, "upstream") == commit
+
+
+def test_clone_failure_on_a_full_disk_is_not_retryable(
+  client, auth, db, bypass_url_validation,
+):
+  """Only a transient failure is marked retryable; a full disk fails again."""
+  import errno
+
+  base = "https://raw.githubusercontent.com/acme/full-disk/main/"
+  manifest = {
+    "id": "full-disk", "name": "Full Disk", "version": "1.0.0",
+    "description": "Staging fails locally", "entry": "index.jsx",
+  }
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  with patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
+  ), patch(
+    "app.install.app_git.stage_clone",
+    side_effect=OSError(errno.ENOSPC, "No space left on device"),
+  ):
+    failed = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert failed.status_code == 409, failed.text
+  assert failed.json()["detail"]["code"] == "git_install_unavailable"
+  assert failed.json()["detail"]["retryable"] is False
+  assert db.query(models.App).filter_by(slug="full-disk").first() is None
 
 
 def test_fresh_clone_cannot_replace_owner_reviewed_source(

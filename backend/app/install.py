@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -2837,31 +2838,62 @@ def read_git_package_summary(
     )
 
 
+_TRANSIENT_STATUS_CODES = frozenset({429, 502, 503, 504})
+
+
+def transient_failure(exc: BaseException) -> tuple[bool, int | None]:
+  """Whether the same request may later get past ``exc`` unchanged, and any wait.
+
+  The one rule for install, update and bootstrap retries: a Git transfer that
+  failed or timed out, incomplete Git history, a host that did not resolve,
+  and an upstream rate limit or gateway failure. A failure the installer has
+  already classified carries ``retryable`` in its detail. Anything else, such
+  as a full disk or an invalid package, will fail the same way again.
+  """
+  if isinstance(exc, (
+    app_git.GitTransferFailed, app_git.HistoryIncomplete, socket.gaierror,
+  )):
+    return True, None
+  if not isinstance(exc, HTTPException):
+    return False, None
+  if isinstance(exc.__cause__, socket.gaierror):
+    return True, None
+  detail = exc.detail
+  if exc.status_code not in _TRANSIENT_STATUS_CODES and not (
+    isinstance(detail, dict) and detail.get("retryable") is True
+  ):
+    return False, None
+  try:
+    wait = int((exc.headers or {}).get("Retry-After") or 0)
+  except ValueError:
+    wait = 0
+  return True, wait or None
+
+
 def git_source_error(
   outcome: str, exc: BaseException, *,
   code: str = "git_update_unavailable", failure: str = "",
-  retryable: bool = False,
 ) -> HTTPException:
   """The owner-facing 409 for a Git source that could not be used.
 
   A transfer exceeding its wall-clock ceiling is reported as a timeout,
   distinct from a missing or unverifiable source. ``retryable`` marks a
-  failure the same request may later get past unchanged; bootstrap retries it.
+  failure the same request may later get past unchanged (``transient_failure``);
+  bootstrap retries it.
   """
   if isinstance(exc, app_git.GitTransferTimeout):
     code = "git_transfer_timeout"
     failure = f"The app's Git transfer timed out: {exc}."
     outcome = f"{outcome} Retrying on a steadier connection may help."
-    retryable = True
   elif isinstance(exc, app_git.HistoryIncomplete):
     log.warning("install: %s", exc)  # Names the refs; the owner text does not.
     failure = (
       "The app's Git history is incomplete, so the update can't be merged "
       "safely; retry when its source is reachable."
     )
-    retryable = True
   return HTTPException(409, detail={
-    "code": code, "message": f"{failure} {outcome}".strip(), "retryable": retryable,
+    "code": code, "message": f"{failure} {outcome}".strip(),
+    "retryable": transient_failure(exc)[0],
   })
 
 
@@ -5146,7 +5178,6 @@ async def _install_candidate(
               code="git_install_unavailable",
               failure="The app's Git repository could not be cloned or verified; "
               "retry when its source is available.",
-              retryable=True,
             ) from exc
         if not cloned_install:
           # record the pristine source tree on `upstream`, then align the

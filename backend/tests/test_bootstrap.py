@@ -5,6 +5,7 @@ identity, per-app uninstall policy, and failure isolation.
 """
 
 import asyncio
+import errno
 from datetime import datetime, timezone
 import re
 import socket
@@ -794,6 +795,11 @@ async def test_rate_limited_store_is_retried_and_takes_its_default_pin(
   HTTPException(422, "App failed to compile."),
   HTTPException(404, "Not found"),
   install.git_source_error("Nothing changed.", RuntimeError("bad origin")),
+  # A full disk fails the same way on every retry.
+  install.git_source_error(
+    "Nothing was installed.", OSError(errno.ENOSPC, "No space left on device"),
+    code="git_install_unavailable",
+  ),
   ValueError("unexpected"),
 ])
 async def test_non_transient_failure_schedules_no_retry(db, monkeypatch, exc):
@@ -816,20 +822,30 @@ def _unresolvable_host():
 
 @pytest.mark.parametrize("exc", [
   HTTPException(502, "Upstream 500"),
+  HTTPException(503, "Unavailable"),
   HTTPException(504, "Timeout"),
   install.git_source_error("Nothing changed.", app_git.GitTransferTimeout("slow")),
   install.git_source_error(
-    "Nothing was installed.", RuntimeError("offline"),
-    code="git_install_unavailable", retryable=True,
+    "Nothing was installed.", app_git.GitTransferFailed("offline"),
+    code="git_install_unavailable",
+  ),
+  install.git_source_error(
+    "Nothing changed.", app_git.HistoryIncomplete("merge base hidden"),
   ),
   HTTPException(409, {"code": "git_source_mismatch", "retryable": True}),
+  app_git.GitTransferFailed("could not resolve host"),
   app_git.GitTransferTimeout("clone exceeded its ceiling"),
+  app_git.HistoryIncomplete("merge base hidden"),
+  socket.gaierror(-3, "Temporary failure in name resolution"),
   _unresolvable_host(),
 ])
 def test_gateway_and_transfer_timeouts_are_transient(exc):
-  from app.bootstrap import _transient_failure
+  assert install.transient_failure(exc) == (True, None)
 
-  assert _transient_failure(exc) == (True, None)
+
+def test_rate_limit_is_transient_with_its_upstream_wait():
+  exc = HTTPException(429, "Rate limited", headers={"Retry-After": "120"})
+  assert install.transient_failure(exc) == (True, 120)
 
 
 @pytest.mark.asyncio
