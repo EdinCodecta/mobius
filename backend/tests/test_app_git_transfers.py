@@ -769,6 +769,49 @@ def test_transfers_keep_origin_branch_for_source_status(
   assert current["state"] == "aligned"
 
 
+def test_git_app_with_a_missing_icon_keeps_its_updates_available(
+  client, auth, git_server, bypass_url_validation,
+):
+  """A declared icon the package lacks warns in discovery as it does in install."""
+  name = "iconless"
+  git_server.publish(name)
+  manifest = {
+    "id": name, "name": "Iconless", "version": "1.0.0",
+    "description": "Declares an icon it does not ship", "entry": "index.jsx",
+    "icon": "icon.png",
+  }
+  git_server.commit(name, manifest, JSX, push=True)
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(
+    _responses(name, manifest),
+  )):
+    installed = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base(name) + "mobius.json",
+    })
+  assert installed.status_code == 201, installed.text
+  assert any("icon" in warning for warning in installed.json()["warnings"])
+  app_id = installed.json()["id"]
+
+  v2 = {**manifest, "version": "2.0.0"}
+  head = git_server.commit(name, v2, JSX.replace("ok", "v2"), push=True)
+  checked = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
+  assert checked.status_code == 200, checked.text
+  assert checked.json()["update_available"] is True
+  preview = client.get(f"/api/apps/{app_id}/update-candidate-preview", headers=auth)
+  assert preview.status_code == 200, preview.text
+  assert preview.json()["upstream_commit"] == head
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(
+    _responses(name, v2, JSX.replace("ok", "v2")),
+  )):
+    reviewed = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _base(name) + "mobius.json",
+      "update_app_id": app_id,
+      "reviewed_upstream_commit": head,
+      "reviewed_source_digest": preview.json()["source_digest"],
+    })
+  assert reviewed.status_code == 201, reviewed.text
+  assert app_git.head_sha(_repo(name), app_git.UPSTREAM_BRANCH) == head
+
+
 def test_concurrent_fetches_share_one_transfer(
   client, auth, git_server, transfers, bypass_url_validation,
 ):

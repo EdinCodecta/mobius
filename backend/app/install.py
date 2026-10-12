@@ -2684,10 +2684,15 @@ def _read_git_package_inputs(
 
   icon_processed = None
   icon_warning = None
-  if manifest.get("icon"):
+  icon = manifest.get("icon")
+  if icon and icon not in tree:
+    # As over HTTP, an optional icon the package lacks is only a warning. A
+    # listed but unreadable object still fails closed like any other input.
+    icon_warning = f"icon: candidate Git tree is missing icon {icon}"
+  elif icon:
     try:
       icon_processed = icon_assets.normalize_icon(
-        _package_input_bytes(required(manifest["icon"], "icon")),
+        _package_input_bytes(required(icon, "icon")),
       )
     except icon_assets.InvalidIcon as exc:
       icon_warning = f"icon: {exc}"
