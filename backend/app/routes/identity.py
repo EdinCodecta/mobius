@@ -1033,7 +1033,7 @@ def _railway_workspace_plan_projection(item: object) -> dict | None:
     or not set(_RAILWAY_WORKSPACE_PLAN_KEYS) <= set(item)
     or not isinstance(item["id"], str) or not 0 < len(item["id"]) <= 128
     or not isinstance(item["name"], str) or not 0 < len(item["name"]) <= 128
-    or item["plan"] not in _RAILWAY_PLANS
+    or not isinstance(item["plan"], str) or item["plan"] not in _RAILWAY_PLANS
     or not isinstance(item["deploy_blocked"], str) or len(item["deploy_blocked"]) > 1000
   ):
     return None
