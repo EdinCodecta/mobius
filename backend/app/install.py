@@ -4010,9 +4010,7 @@ async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPyth
   """Build or reuse the env and smoke-run the exact reconciled tree, unlocked."""
   data_dir = Path(get_settings().data_dir)
   try:
-    # The caller holds the lifecycle lock; a cancelled update (a batch at
-    # shutdown) must not release it while the env build is still writing.
-    env = await _to_completion(
+    env = await asyncio.to_thread(
       app_python_env.prepare_env, data_dir, pending.app_id, pending.runtime.root,
     )
   except app_python_env.PythonEnvBuildError as exc:
