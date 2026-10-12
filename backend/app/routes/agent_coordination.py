@@ -175,36 +175,17 @@ async def finish_current_work(
     )
   except ValueError as exc:
     raise HTTPException(409, str(exc)) from exc
-  recipients = finished.interested_chat_ids
-  delivery = None
-  woken: list[str] = []
-  if recipients:
-    send_work_claim_notice(
-      db,
-      owner_id=principal.owner.id,
-      claim_id=finished.claim["id"],
-      revision=finished.claim["revision"],
-      sender_chat_id=principal.chat_id,
-      recipients=recipients,
-      body=work_claim_notice_body(
-        finished.claim["work_key"], finished.claim["state"],
-        finished.claim.get("outcome") or "",
-      ),
-    )
-    delivery = await deliver_peer_recipients(
-      recipients=recipients, delivery=DELIVERY_INTERRUPT, kind="handoff",
-      sender_chat_id=principal.chat_id,
-    )
-    woken = delivery.woken
+  # Source outcome was stamped in the finish transaction. The delivery pass
+  # only reduces latency; it never makes the result durable.
+  from app.goal_dependencies import deliver_pending_dependencies
+  delivery = await deliver_pending_dependencies()
   acknowledge_notice(
     db, claim_id=finished.claim["id"], revision=finished.claim["revision"],
-    resolve_interests=True,
+    resolve_interests=False,
   )
   return {
     **finished.claim, "notification_pending": False,
-    "notified": recipients, "steered": delivery.steered if recipients else [],
-    "woken": woken, "queued": delivery.queued if recipients else [],
-    "unreachable": delivery.unreachable if recipients else [],
+    "dependency_delivery": delivery,
   }
 
 

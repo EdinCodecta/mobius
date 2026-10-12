@@ -1949,57 +1949,17 @@ async def deliver_peer_recipients(
 async def notify_settled_claims(
   db: Session, *, owner_id: int, sender_chat_id: str, settled: list[Any],
 ) -> list[str]:
-  """Notify and wake followers of claims settled with their owner.
+  """Nudge exact-Goal dependency delivery after a claim settlement commit."""
+  from app.agent_work_claims import acknowledge_notice
+  from app.goal_dependencies import deliver_pending_dependencies
 
-  Each notice is persisted idempotently (``send_id`` is the claim revision),
-  then one interrupting delivery wakes every follower, and only then is each
-  retry latch acknowledged. A crash before acknowledgement leaves the claim's
-  notice pending for the next lifecycle seam; one failing claim cannot
-  suppress fanout for the others. Returns the notified follower ids.
-  """
-  from app.agent_work_claims import acknowledge_notice, work_claim_notice_body
-
-  recipients: list[str] = []
-  noticed = []
+  await deliver_pending_dependencies()
   for item in settled:
-    try:
-      if item.interested_chat_ids:
-        send_work_claim_notice(
-          db,
-          owner_id=owner_id,
-          claim_id=item.claim_id,
-          revision=item.revision,
-          sender_chat_id=sender_chat_id,
-          recipients=item.interested_chat_ids,
-          body=work_claim_notice_body(item.work_key, item.state, item.outcome),
-        )
-        recipients.extend(item.interested_chat_ids)
-      noticed.append(item)
-    except Exception:
-      db.rollback()
-      log.exception(
-        "claim %s settled with chat %s but followers were not notified",
-        item.claim_id, sender_chat_id,
-      )
-  recipients = list(dict.fromkeys(recipients))
-  if recipients:
-    await deliver_peer_recipients(
-      recipients=recipients, delivery=DELIVERY_INTERRUPT, kind="handoff",
-      sender_chat_id=sender_chat_id,
+    acknowledge_notice(
+      db, claim_id=item.claim_id, revision=item.revision,
+      resolve_interests=False,
     )
-  for item in noticed:
-    try:
-      acknowledge_notice(
-        db, claim_id=item.claim_id, revision=item.revision,
-        resolve_interests=True,
-      )
-    except Exception:
-      db.rollback()
-      log.warning(
-        "claim %s notice delivered but not acknowledged", item.claim_id,
-        exc_info=True,
-      )
-  return recipients
+  return []
 
 
 async def settle_claims_with_owner(chat_id: str) -> list[str]:

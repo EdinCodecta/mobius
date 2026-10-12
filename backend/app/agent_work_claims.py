@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.timeutil import now_naive_utc
+from app.goal_dependency_sources import stage_follow_claim, stage_stamp_claim_outcome
 
 
 # `#` and `+` appear naturally in PR references such as `mobius-os/mobius#1365`.
@@ -53,6 +54,7 @@ def _serialize(db: Session, row: models.AgentWorkClaim, state: str) -> dict:
     "owner_name": title or row.owner_chat_id or "Deleted chat",
     "owner_goal_id": row.owner_goal_id,
     "revision": row.revision,
+    "acquisition_id": row.acquisition_id,
     "notification_pending": row.notification_revision < row.revision,
     "takeover_reason": row.takeover_reason,
     "completed_at": row.completed_at.isoformat() if row.completed_at else None,
@@ -68,22 +70,9 @@ def _serialize(db: Session, row: models.AgentWorkClaim, state: str) -> dict:
   return result
 
 
-def _follow(
-  db: Session, row: models.AgentWorkClaim, *, chat_id: str, goal_id: str | None,
-) -> None:
-  if not goal_id or row.owner_chat_id == chat_id:
-    return
-  existing = db.query(models.AgentWorkInterest).filter(
-    models.AgentWorkInterest.claim_id == row.id,
-    models.AgentWorkInterest.chat_id == chat_id,
-    models.AgentWorkInterest.goal_id == goal_id,
-  ).first()
-  if existing is None:
-    db.add(models.AgentWorkInterest(
-      id=str(uuid.uuid4()), claim_id=row.id, chat_id=chat_id, goal_id=goal_id,
-    ))
-  elif existing.resolved_at is not None:
-    existing.resolved_at = None
+def _follow(db: Session, row: models.AgentWorkClaim, *, chat_id: str,
+            run_id: str) -> str:
+  return stage_follow_claim(db, row, chat_id=chat_id, run_id=run_id)
 
 
 def claim_work(
@@ -115,7 +104,7 @@ def claim_work(
     row = models.AgentWorkClaim(
       id=str(uuid.uuid4()), owner_id=owner_id, work_key=key,
       summary=clean_summary, owner_chat_id=chat_id, owner_run_id=run_id,
-      owner_goal_id=goal_id,
+      owner_goal_id=goal_id, acquisition_id=str(uuid.uuid4()),
     )
     db.add(row)
     try:
@@ -150,6 +139,7 @@ def claim_work(
       models.AgentWorkClaim.takeover_reason: None,
       models.AgentWorkClaim.released_at: None,
       models.AgentWorkClaim.outcome: None,
+      models.AgentWorkClaim.acquisition_id: str(uuid.uuid4()),
       models.AgentWorkClaim.claimed_at: now,
       models.AgentWorkClaim.updated_at: now,
       models.AgentWorkClaim.revision: next_revision,
@@ -191,10 +181,23 @@ def claim_work(
       result["previous_owner_chat_id"] = row.previous_owner_chat_id
     return result
   if reason is None:
-    _follow(db, row, chat_id=chat_id, goal_id=goal_id)
+    follow_status = _follow(db, row, chat_id=chat_id, run_id=run_id)
     db.commit()
     db.refresh(row)
-    return _serialize(db, row, "held_by_peer")
+    result = _serialize(db, row, "held_by_peer")
+    result["follow_status"] = follow_status
+    if follow_status == "result_owed":
+      result["next_action"] = (
+        "Do not duplicate this exact action. Your Goal already follows this "
+        "acquisition; its result is owed and may be incorporated on its next turn."
+      )
+    elif follow_status != "followed":
+      result["next_action"] = (
+        "Do not duplicate this exact action. No new Goal follow was created "
+        f"({follow_status}); report the blocker to your coordinator or "
+        "reconcile your own work."
+      )
+    return result
   if expected_owner_chat_id != row.owner_chat_id:
     raise ValueError(
       "The expected owner changed; inspect the current claim before transfer."
@@ -204,6 +207,23 @@ def claim_work(
   previous_goal_id = row.owner_goal_id
   previous_revision = row.revision
   now = now_naive_utc()
+  # Transfer makes the former owner a follower. Reject an existing reverse
+  # dependency from the new owner's Goal to the former owner's chat, except
+  # the self-follow on this acquisition which is withdrawn below.
+  if goal_id and previous_goal_id and db.query(models.GoalDependency.id).join(
+    models.AgentWorkClaim,
+    models.AgentWorkClaim.id == models.GoalDependency.target_claim_id,
+  ).filter(
+    models.GoalDependency.waiting_goal_id == goal_id,
+    models.GoalDependency.target_kind == "claim_acquisition",
+    models.AgentWorkClaim.owner_goal_id == previous_goal_id,
+    models.AgentWorkClaim.acquisition_id == models.GoalDependency.target_acquisition_id,
+    models.GoalDependency.target_acquisition_id != row.acquisition_id,
+    models.GoalDependency.resolved_at.is_(None),
+    models.GoalDependency.result_disposition.is_(None),
+    models.GoalDependency.withdrawn_at.is_(None),
+  ).first():
+    raise ValueError("Transfer would create a direct Goal dependency cycle.")
   changed = db.query(models.AgentWorkClaim).filter(
     models.AgentWorkClaim.id == row.id,
     models.AgentWorkClaim.owner_chat_id == expected_owner_chat_id,
@@ -225,12 +245,20 @@ def claim_work(
     raise ValueError("The claim changed during transfer; inspect it before retrying.")
   db.expire(row)
   db.refresh(row)
-  _follow(db, row, chat_id=previous, goal_id=previous_goal_id)
-  db.query(models.AgentWorkInterest).filter(
-    models.AgentWorkInterest.claim_id == row.id,
-    models.AgentWorkInterest.chat_id == chat_id,
-    models.AgentWorkInterest.resolved_at.is_(None),
-  ).update({models.AgentWorkInterest.resolved_at: now_naive_utc()})
+  # A new owner must not keep a self-follow on its own acquisition.
+  db.query(models.GoalDependency).filter(
+    models.GoalDependency.target_acquisition_id == row.acquisition_id,
+    models.GoalDependency.waiting_chat_id == chat_id,
+    models.GoalDependency.resolved_at.is_(None),
+    models.GoalDependency.withdrawn_at.is_(None),
+  ).update({models.GoalDependency.withdrawn_at: now}, synchronize_session=False)
+  if previous_goal_id and previous != chat_id:
+    previous_run_id = db.query(models.ChatRun.id).filter(
+      models.ChatRun.goal_id == previous_goal_id,
+      models.ChatRun.chat_id == previous,
+    ).order_by(models.ChatRun.created_at.desc()).scalar()
+    if previous_run_id:
+      _follow(db, row, chat_id=previous, run_id=previous_run_id)
   db.commit()
   db.refresh(row)
   result = _serialize(db, row, "transferred")
@@ -268,20 +296,10 @@ def work_claim_notice_body(work_key: str, state: str, outcome: str) -> str:
   return body
 
 
-def _live_follower_ids(
-  db: Session, claim_id: str, owner_chat_id: str,
-) -> list[str]:
-  return list(dict.fromkeys(
-    interest.chat_id
-    for interest in db.query(models.AgentWorkInterest).join(
-      models.Chat, models.Chat.id == models.AgentWorkInterest.chat_id,
-    ).filter(
-      models.AgentWorkInterest.claim_id == claim_id,
-      models.AgentWorkInterest.resolved_at.is_(None),
-      models.AgentWorkInterest.chat_id != owner_chat_id,
-      models.Chat.deleted_at.is_(None),
-    ).all()
-  ))
+def _live_follower_ids(db: Session, claim_id: str,
+                       owner_chat_id: str) -> list[str]:
+  # Exact-Goal delivery now owns follower notification; no chat-wide peer wake.
+  return []
 
 
 def _stage_settle(
@@ -313,6 +331,9 @@ def _stage_settle(
   }, synchronize_session=False)
   if changed != 1:
     return None
+  stage_stamp_claim_outcome(
+    db, row, "completed" if complete else "released", outcome[:1000],
+  )
   db.expire(row)
   return ReleasedClaim(
     claim_id=claim_id,
@@ -561,9 +582,4 @@ def acknowledge_notice(
     return
   if row.notification_revision < revision:
     row.notification_revision = revision
-  if resolve_interests:
-    db.query(models.AgentWorkInterest).filter(
-      models.AgentWorkInterest.claim_id == claim_id,
-      models.AgentWorkInterest.resolved_at.is_(None),
-    ).update({models.AgentWorkInterest.resolved_at: now_naive_utc()})
   db.commit()

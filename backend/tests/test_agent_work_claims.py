@@ -58,8 +58,8 @@ def test_first_claim_wins_and_loser_follows_without_duplicate_ownership(db):
   assert lost["state"] == "held_by_peer"
   assert lost["owner_chat_id"] == first.id
   assert db.query(models.AgentWorkClaim).count() == 1
-  interest = db.query(models.AgentWorkInterest).one()
-  assert (interest.chat_id, interest.goal_id) == (
+  interest = db.query(models.GoalDependency).one()
+  assert (interest.waiting_chat_id, interest.waiting_goal_id) == (
     second.id, "claim-goal-second",
   )
   assert "does not transfer ownership of your whole Goal" in lost["next_action"]
@@ -126,7 +126,8 @@ def test_completion_resolves_followers_and_same_key_cannot_be_reclaimed(db):
     outcome="Merged as 0b44dc9d", release=False,
   )
 
-  assert finished.interested_chat_ids == [second.id]
+  assert finished.interested_chat_ids == []
+  assert db.query(models.GoalDependency).one().outcome_json["kind"] == "completed"
   assert finished.claim["state"] == "completed"
   acknowledge_notice(
     db, claim_id=finished.claim["id"], revision=finished.claim["revision"],
@@ -164,7 +165,8 @@ def test_deleted_follower_cannot_suppress_live_follower_notification(db):
   finished = finish_work(db, owner_id=owner.id, chat_id=first.id,
                          work_key=key, outcome="Done", release=False)
 
-  assert finished.interested_chat_ids == [live.id]
+  assert finished.interested_chat_ids == []
+  assert db.query(models.GoalDependency).filter_by(waiting_chat_id=live.id).one().resolved_at is not None
 
 
 def test_deleting_owner_releases_only_unfinished_exact_action(db):
@@ -183,7 +185,8 @@ def test_deleting_owner_releases_only_unfinished_exact_action(db):
   db.commit()
 
   assert len(released) == 1
-  assert released[0].interested_chat_ids == [second.id]
+  assert released[0].interested_chat_ids == []
+  assert db.query(models.GoalDependency).one().outcome_json["kind"] == "released"
   row = db.query(models.AgentWorkClaim).one()
   assert row.released_at is not None
   assert "deleted" in row.outcome
@@ -244,9 +247,8 @@ def test_goal_completion_completes_the_claims_it_names(db, complete, expected):
   assert row.outcome == expected
   # The follower notice is owed durably until a seam delivers it.
   [pending] = pending_settlement_notices(db, first.id)
-  assert (pending.state, pending.interested_chat_ids) == (
-    "completed", [second.id],
-  )
+  assert (pending.state, pending.interested_chat_ids) == ("completed", [])
+  assert db.query(models.GoalDependency).one().outcome_json["kind"] == "completed"
   again = claim_work(
     db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second",
     work_key=KEY, summary="Try the finished merge again",
@@ -332,9 +334,7 @@ def test_post_commit_seam_repairs_claims_of_a_goal_ended_elsewhere(db):
 
   [settled] = stage_settle_claims_with_owner(db, first.id)
   db.commit()
-  assert (settled.state, settled.interested_chat_ids) == (
-    "released", [second.id],
-  )
+  assert (settled.state, settled.interested_chat_ids) == ("released", [])
   assert stage_settle_claims_with_owner(db, first.id) == []
 
 
@@ -410,7 +410,7 @@ def test_racing_first_claims_leave_one_owner_and_one_follower(db):
   assert raced == [True]
   assert (lost["state"], lost["owner_chat_id"]) == ("held_by_peer", first.id)
   assert db.query(models.AgentWorkClaim).count() == 1
-  assert db.query(models.AgentWorkInterest).one().chat_id == second.id
+  assert db.query(models.GoalDependency).one().waiting_chat_id == second.id
 
 
 def test_goal_completion_releases_a_declined_action_it_did_not_name(db):
@@ -500,3 +500,52 @@ def test_work_keys_accept_pr_references_with_hash_and_plus():
   assert clean_work_key(key) == key
   with pytest.raises(ValueError, match="# \\+"):
     clean_work_key("Has Spaces")
+
+
+def test_follow_is_one_dependency_per_goal_and_acquisition(db):
+  owner, first, second = _fixture(db)
+  won = claim_work(db, owner_id=owner.id, chat_id=first.id,
+                   run_id='claim-run-first', work_key=KEY, summary='Do work')
+  first_follow = claim_work(db, owner_id=owner.id, chat_id=second.id,
+                            run_id='claim-run-second', work_key=KEY, summary='Follow')
+  second_follow = claim_work(db, owner_id=owner.id, chat_id=second.id,
+                             run_id='claim-run-second', work_key=KEY, summary='Follow')
+  assert first_follow['follow_status'] == second_follow['follow_status'] == 'followed'
+  [dependency] = db.query(models.GoalDependency).all()
+  assert dependency.target_key == f"claim:{won['acquisition_id']}"
+  assert dependency.target_acquisition_id == won['acquisition_id']
+
+
+def test_release_stamps_old_acquisition_before_reclaim(db):
+  owner, first, second = _fixture(db)
+  won = claim_work(db, owner_id=owner.id, chat_id=first.id,
+                   run_id='claim-run-first', work_key=KEY, summary='Do work')
+  claim_work(db, owner_id=owner.id, chat_id=second.id,
+             run_id='claim-run-second', work_key=KEY, summary='Follow')
+  finish_work(db, owner_id=owner.id, chat_id=first.id,
+              work_key=KEY, outcome='Not done', release=True)
+  [old] = db.query(models.GoalDependency).all()
+  assert old.resolved_at is not None
+  assert old.outcome_json['kind'] == 'released'
+  reclaimed = claim_work(db, owner_id=owner.id, chat_id=second.id,
+                         run_id='claim-run-second', work_key=KEY, summary='Retry')
+  assert reclaimed['acquisition_id'] != won['acquisition_id']
+  assert old.target_acquisition_id == won['acquisition_id']
+  assert old.outcome_json['outcome'] == 'Not done'
+
+
+def test_transfer_keeps_acquisition_and_withdraws_new_owner_self_follow(db):
+  owner, first, second = _fixture(db)
+  won = claim_work(db, owner_id=owner.id, chat_id=first.id,
+                   run_id='claim-run-first', work_key=KEY, summary='Do work')
+  claim_work(db, owner_id=owner.id, chat_id=second.id,
+             run_id='claim-run-second', work_key=KEY, summary='Follow')
+  moved = claim_work(db, owner_id=owner.id, chat_id=second.id,
+                     run_id='claim-run-second', work_key=KEY, summary='Take over',
+                     takeover_reason='Former owner asked me to take over.',
+                     expected_owner_chat_id=first.id)
+  assert moved['acquisition_id'] == won['acquisition_id']
+  deps = db.query(models.GoalDependency).all()
+  assert len(deps) == 2
+  assert next(d for d in deps if d.waiting_chat_id == second.id).withdrawn_at
+  assert next(d for d in deps if d.waiting_chat_id == first.id).withdrawn_at is None
