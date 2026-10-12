@@ -1734,6 +1734,23 @@ async def update_candidate_preview(
       previous_source = await asyncio.to_thread(
         install.read_recorded_update_source, repo, candidate.runtime_tree,
       )
+      # Read the pending receipt under the same source lock so state is
+      # consistent with the candidate and tree we just read.
+      current_upstream_sha = await asyncio.to_thread(
+        app_git.head_sha, repo, app_git.UPSTREAM_BRANCH,
+      )
+      pending_receipt = await asyncio.to_thread(
+        install.read_pending_conflict_update_receipt,
+        repo,
+        app_id=app_id,
+        upstream_commit=current_upstream_sha,
+      )
+      if pending_receipt is not None:
+        pending_state = _pending_update_state(
+          repo, pending_receipt["upstream_commit"],
+        )
+      else:
+        pending_state = "none"
     except HTTPException:
       raise
     except install.PackageTooLarge as exc:
@@ -1765,6 +1782,7 @@ async def update_candidate_preview(
     upstream_commit=candidate.commit,
     upstream_diff=upstream_diff,
     source_digest=candidate.source_digest,
+    pending_update_state=pending_state,
   )
 
 
