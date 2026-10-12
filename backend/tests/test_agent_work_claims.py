@@ -577,3 +577,19 @@ def test_failed_source_with_saved_card_remains_pending(db):
   db.commit()
   assert stage_reconcile_claim_sources(db) == 0
   assert db.query(models.GoalDependency).one().resolved_at is None
+
+
+def test_direct_cycle_is_not_registered(db):
+  owner, first, second = _fixture(db)
+  other_key = 'platform:other-exact-action'
+  claim_work(db, owner_id=owner.id, chat_id=first.id,
+             run_id='claim-run-first', work_key=KEY, summary='First action')
+  claim_work(db, owner_id=owner.id, chat_id=second.id,
+             run_id='claim-run-second', work_key=other_key, summary='Second action')
+  followed = claim_work(db, owner_id=owner.id, chat_id=second.id,
+                        run_id='claim-run-second', work_key=KEY, summary='Follow first')
+  blocked = claim_work(db, owner_id=owner.id, chat_id=first.id,
+                       run_id='claim-run-first', work_key=other_key, summary='Follow second')
+  assert followed['follow_status'] == 'followed'
+  assert blocked['follow_status'] == 'direct_cycle'
+  assert db.query(models.GoalDependency).count() == 1
