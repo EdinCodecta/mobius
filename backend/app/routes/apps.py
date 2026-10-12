@@ -834,9 +834,9 @@ async def install_app(
   # routes/apps.py at module top.
   from app import install
 
-  # Git transfers finish before the lifecycle lock, so one slow repository
+  # Network transfers finish before the lifecycle lock, so one slow package
   # never holds up other apps' installs, updates or uninstalls.
-  staged_clone = None
+  prepared = None
   try:
     if body.update_app_id is not None and body.reviewed_upstream_commit is not None:
       reviewed = db.get(models.App, body.update_app_id)
@@ -855,17 +855,11 @@ async def install_app(
             code="update_changed",
             failure="The reviewed Git update is no longer available.",
           ) from exc
-    elif body.update_app_id is None and body.manifest_url is not None:
-      try:
-        staged_clone = await install.stage_package_clone(body.manifest_url, db=db)
-      except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-        raise install.git_source_error(
-          "Nothing was installed.",
-          exc,
-          code="git_install_unavailable",
-          failure="The app's Git repository could not be cloned or verified; "
-          "retry when its source is available.",
-        ) from exc
+    elif body.update_app_id is None:
+      prepared = await install.prepare_package(
+        body.manifest_url, body.manifest, body.raw_base,
+        reviewed_capability_digest=body.reviewed_capability_digest, db=db,
+      )
     # Serialize the whole install against any concurrent uninstall — both are
     # app-lifecycle operations over the same /data/apps trees, and letting them
     # overlap lets one delete what the other just wrote
@@ -881,10 +875,11 @@ async def install_app(
         reviewed_source_digest=body.reviewed_source_digest,
         reviewed_app_id=body.update_app_id,
         reviewed_upstream_commit=body.reviewed_upstream_commit,
-        staged_clone=staged_clone,
+        prepared=prepared,
       )
   finally:
-    await asyncio.to_thread(install.discard_staged, staged_clone)
+    if prepared is not None:
+      await asyncio.to_thread(install.discard_staged, prepared.staged_clone)
   app = result.app
   mode = result.mode
   warnings = result.warnings

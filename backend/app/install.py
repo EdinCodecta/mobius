@@ -1725,108 +1725,29 @@ def read_recorded_update_source(
     }
 
 
-def _git_runtime_source_tree(
-  source_dir: str | Path,
-  commit: str,
-  manifest: dict,
-) -> dict[str, bytes]:
-  """Project one repository commit onto the manifest's executable sources."""
-  repo = Path(source_dir)
-
-  def required(path: str) -> bytes:
-    value = app_git.read_blob(repo, commit, path)
-    if value is None:
-      raise RuntimeError(f"Git package is missing declared source {path}")
-    return value
-
-  tree = {"index.jsx": required(manifest["entry"])}
-  tree.update({
-    rel: required(rel) for rel in manifest.get("source_files") or []
-  })
-  schedule = manifest.get("schedule")
-  if isinstance(schedule, dict) and schedule.get("job"):
-    tree[schedule["job"]] = required(schedule["job"])
-  return tree
-
-
-def _verify_git_install_candidate(
-  source_dir: str | Path,
-  commit: str,
-  candidate: InstallCandidate,
+def _require_git_candidate(
+  source_dir: str | Path, commit: str, candidate: InstallCandidate,
 ) -> None:
-  """Prove that one Git commit is the complete package reviewed over HTTP."""
-  repo = Path(source_dir)
+  """Prove that a present Git commit holds the package fetched over HTTP.
 
-  def mismatch(reason: str) -> None:
-    raise HTTPException(
-      409,
-      detail={
-        "code": "git_source_mismatch",
-        "message": (
-          "The fetched Git commit does not match the package bytes that were "
-          "reviewed. Refresh the update and try again."
-        ),
-        "reason": reason,
-        "retryable": True,
-      },
-    )
-
-  manifest_bytes = app_git.read_blob(repo, commit, "mobius.json")
-  if manifest_bytes is not None:
-    try:
-      git_manifest = json.loads(manifest_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-      mismatch("invalid mobius.json")
-    if git_manifest != candidate.manifest:
-      mismatch("manifest changed")
-
-  expected_runtime = {
-    "index.jsx": candidate.entry_bytes,
-    **candidate.source_files,
-  }
-  if candidate.bundled_job is not None:
-    expected_runtime[candidate.manifest["schedule"]["job"]] = (
-      candidate.bundled_job
-    )
+  A prepared install reads its package from the very commit it adopts; only a
+  caller that fetched over HTTP, such as a publication handoff, needs this.
+  """
   try:
-    actual_runtime = _git_runtime_source_tree(
-      repo, commit, candidate.manifest,
-    )
-  except (OSError, RuntimeError, ValueError) as exc:
-    mismatch(str(exc))
-  if actual_runtime != expected_runtime:
-    mismatch("runtime source changed")
-
-  def required(path: str, field: str) -> bytes:
-    data = app_git.read_blob(repo, commit, path)
-    if data is None:
-      mismatch(f"missing declared {field} {path}")
-    return data
-
-  for destination, relative in static_asset_entries(
-    candidate.manifest.get("static_assets") or {},
-  ).items():
-    if required(relative, "static asset") != candidate.static_assets.get(
-      destination
-    ):
-      mismatch(f"static asset changed: {relative}")
-
-  for destination, declared in (
-    candidate.manifest.get("storage_seeds") or {}
-  ).items():
-    if _seed_value_is_inline(declared):
-      continue
-    if required(declared, "storage seed") != candidate.seeds.get(destination):
-      mismatch(f"storage seed changed: {declared}")
-
-  if candidate.icon_processed is not None and candidate.manifest.get("icon"):
-    icon_raw = required(candidate.manifest["icon"], "icon")
-    try:
-      icon_processed = icon_assets.normalize_icon(icon_raw)
-    except icon_assets.InvalidIcon:
-      mismatch("invalid icon")
-    if icon_processed != candidate.icon_processed:
-      mismatch("icon changed")
+    actual = read_git_install_candidate(
+      source_dir, commit, candidate.raw_base + "mobius.json",
+    ).candidate.source_review_digest
+  except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+    actual = str(exc)
+  if actual != candidate.source_review_digest:
+    raise HTTPException(409, detail={
+      "code": "git_source_mismatch",
+      "message": (
+        "The fetched Git commit does not match the package bytes that were "
+        "reviewed. Refresh the update and try again."
+      ),
+      "retryable": True,
+    })
 
 
 async def clear_pending_conflict_update(db: Session, app: models.App) -> None:
@@ -2538,6 +2459,71 @@ class InstallCandidate:
   canonical_source_url: str = ""
 
 
+def _new_candidate(
+  *,
+  manifest: dict,
+  raw_base: str,
+  entry_bytes: bytes,
+  icon_processed: bytes | None,
+  icon_warning: str | None,
+  bundled_job: bytes | None,
+  static_assets: dict[str, bytes],
+  source_files: dict[str, bytes],
+  seeds: dict[str, bytes],
+  source_review_digest: str | None = None,
+  source_identity: str | None = None,
+  predecessor_source_identity: str | None = None,
+  canonical_source_url: str | None = None,
+) -> InstallCandidate:
+  """Bind one package's bytes and source identities into its digests."""
+  package = dict(
+    manifest=manifest,
+    entry_bytes=entry_bytes,
+    icon_processed=icon_processed,
+    bundled_job=bundled_job,
+    static_assets=static_assets,
+    source_files=source_files,
+    seeds=seeds,
+  )
+  identity = dict(
+    source_identity=source_identity,
+    predecessor_source_identity=predecessor_source_identity,
+    canonical_source_url=canonical_source_url or raw_base,
+  )
+  capability_contract, capability_digest = contract_and_digest(manifest)
+  return InstallCandidate(
+    **package,
+    **identity,
+    raw_base=raw_base,
+    icon_warning=icon_warning,
+    capability_contract=capability_contract,
+    capability_digest=capability_digest,
+    candidate_digest=_install_candidate_digest(
+      raw_base=raw_base, **package, **identity,
+    ),
+    source_review_digest=(
+      source_review_digest or package_content_digest(**package)
+    ),
+  )
+
+
+async def _resolve_package_identity(
+  client: httpx.AsyncClient, manifest: dict, source_url: str,
+) -> tuple[str | None, str | None, str | None]:
+  """Source, predecessor and canonical URL of a permanent-identity package."""
+  if not manifest.get("package_id"):
+    return None, None, None
+  source_identity, canonical_source_url = await _resolve_source_identity(
+    client, source_url,
+  )
+  predecessor_source_identity = None
+  if manifest.get("previous_manifest_url"):
+    predecessor_source_identity, _ = await _resolve_source_identity(
+      client, manifest["previous_manifest_url"],
+    )
+  return source_identity, predecessor_source_identity, canonical_source_url
+
+
 class PackageTooLarge(ValueError):
   """A Git package exceeds its manifest or declared-input size bound.
 
@@ -2754,10 +2740,6 @@ def read_git_install_candidate(
     }
     content_digest = inputs.content_digest()
   manifest = inputs.manifest
-  icon_processed = inputs.icon_processed
-  icon_warning = inputs.icon_warning
-  bundled_job = inputs.bundled_job
-
   raw_base = _normalize_raw_base(
     source_url.rsplit("/mobius.json", 1)[0]
     if "/mobius.json" in source_url else source_url
@@ -2771,39 +2753,22 @@ def read_git_install_candidate(
     == _github_root_manifest_identity(source_url)
   ):
     predecessor_source_identity = source_identity
-  capability_contract, capability_digest = contract_and_digest(manifest)
-  candidate_digest = _install_candidate_digest(
-    manifest=manifest,
-    raw_base=raw_base,
-    source_identity=source_identity,
-    predecessor_source_identity=predecessor_source_identity,
-    canonical_source_url=source_url if source_identity else raw_base,
-    entry_bytes=entry_bytes,
-    icon_processed=icon_processed,
-    bundled_job=bundled_job,
-    static_assets=static_assets,
-    source_files=source_files,
-    seeds=seeds,
-  )
   return GitInstallCandidate(
     commit=resolved,
-    candidate=InstallCandidate(
+    candidate=_new_candidate(
       manifest=manifest,
       raw_base=raw_base,
       entry_bytes=entry_bytes,
-      icon_processed=icon_processed,
-      icon_warning=icon_warning,
-      bundled_job=bundled_job,
+      icon_processed=inputs.icon_processed,
+      icon_warning=inputs.icon_warning,
+      bundled_job=inputs.bundled_job,
       static_assets=static_assets,
       source_files=source_files,
       seeds=seeds,
-      capability_contract=capability_contract,
-      capability_digest=capability_digest,
-      candidate_digest=candidate_digest,
       source_review_digest=content_digest,
       source_identity=source_identity,
       predecessor_source_identity=predecessor_source_identity,
-      canonical_source_url=source_url if source_identity else raw_base,
+      canonical_source_url=source_url if source_identity else None,
     ),
   )
 
@@ -2846,19 +2811,24 @@ def transient_failure(exc: BaseException) -> tuple[bool, int | None]:
   """Whether the same request may later get past ``exc`` unchanged, and any wait.
 
   The one rule for install, update and bootstrap retries: a Git transfer that
-  failed or timed out, incomplete Git history, a host that did not resolve,
-  and an upstream rate limit or gateway failure. A failure the installer has
-  already classified carries ``retryable`` in its detail. Anything else, such
-  as a full disk or an invalid package, will fail the same way again.
+  timed out or lost its connection (``app_git`` classifies its failures),
+  incomplete Git history, a resolver that could not answer, and an upstream
+  rate limit or gateway failure. A failure the installer has already
+  classified carries ``retryable`` in its detail. Anything else, such as a
+  missing repository, a full disk or an invalid package, will fail again.
   """
-  if isinstance(exc, (
-    app_git.GitTransferFailed, app_git.HistoryIncomplete, socket.gaierror,
-  )):
+  if isinstance(exc, app_git.GitTransferFailed):
+    return exc.transient, None
+  if isinstance(exc, app_git.HistoryIncomplete):
     return True, None
+  # Only a resolver that could not answer may answer later; a name that does
+  # not exist stays missing.
+  if isinstance(exc, HTTPException) and isinstance(exc.__cause__, socket.gaierror):
+    exc = exc.__cause__
+  if isinstance(exc, socket.gaierror):
+    return exc.errno == socket.EAI_AGAIN, None
   if not isinstance(exc, HTTPException):
     return False, None
-  if isinstance(exc.__cause__, socket.gaierror):
-    return True, None
   detail = exc.detail
   if exc.status_code not in _TRANSIENT_STATUS_CODES and not (
     isinstance(detail, dict) and detail.get("retryable") is True
@@ -2974,7 +2944,9 @@ async def _settle_before_cancel(
 
 
 async def stage_package_clone(
-  manifest_url: str, *, db: Session | None = None,
+  manifest_url: str, *,
+  reviewed_capability_digest: str | None = None,
+  db: Session | None = None,
 ) -> app_git.Staged | None:
   """The pre-lock Git step of a URL install: clone the package's repository.
 
@@ -2988,10 +2960,11 @@ async def stage_package_clone(
   if repo_ref is None:
     return None
   if db is not None:
-    await preview_manifest_capabilities(
+    previewed, *_ = await preview_manifest_capabilities(
       manifest_url=manifest_url, manifest=None, raw_base=None, db=db,
     )
     db.rollback()
+    _require_reviewed_capabilities(previewed, reviewed_capability_digest)
   return await _stage(app_git.stage_clone, *repo_ref, git_transfer_root())
 
 
@@ -3142,14 +3115,10 @@ async def _fetch_install_candidate(
   manifest_url: str | None,
   manifest: dict | None,
   raw_base: str | None,
-  reviewed_capability_digest: str | None,
-  reviewed_source_digest: str | None,
-  expected_app_id: int | None,
-  expected_upstream_commit: str | None,
-  expected_candidate_digest: str | None,
+  reviewed_capability_digest: str | None = None,
   db: Session | None = None,
 ) -> InstallCandidate:
-  """Fetch every install input once and enforce all review/replay guards."""
+  """Fetch every install input of a package over HTTP, once."""
   async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
     manifest, raw_base = await _fetch_and_validate_manifest(
       cli,
@@ -3158,40 +3127,14 @@ async def _fetch_install_candidate(
       raw_base=raw_base,
       db=db,
     )
-    source_url = (
-      requested_manifest_source(manifest_url)[0] if manifest_url else raw_base
+    _require_reviewed_capabilities(manifest, reviewed_capability_digest)
+    source_identity, predecessor_source_identity, canonical_source_url = (
+      await _resolve_package_identity(
+        cli,
+        manifest,
+        requested_manifest_source(manifest_url)[0] if manifest_url else raw_base,
+      )
     )
-    source_identity = None
-    predecessor_source_identity = None
-    canonical_source_url = raw_base
-    if manifest.get("package_id"):
-      source_identity, canonical_source_url = await _resolve_source_identity(
-        cli, source_url,
-      )
-      previous_source = manifest.get("previous_manifest_url")
-      if previous_source:
-        predecessor_source_identity, _ = await _resolve_source_identity(
-          cli, previous_source,
-        )
-    capability_contract, capability_digest = contract_and_digest(manifest)
-    if (
-      reviewed_capability_digest is not None
-      and reviewed_capability_digest != capability_digest
-    ):
-      raise HTTPException(
-        409,
-        {
-          "code": "capability_changed",
-          "message": (
-            "The app's capabilities changed after they were reviewed. "
-            "Review the current manifest and try again."
-          ),
-          "manifest": manifest,
-          "capability_contract": capability_contract,
-          "capability_digest": capability_digest,
-        },
-      )
-
     package = _PackageDownload(cli, raw_base)
     entry_bytes = await package.read(manifest["entry"])
 
@@ -3242,67 +3185,7 @@ async def _fetch_install_candidate(
       else:
         seeds[sub] = await package.read(value)
 
-  candidate_digest = _install_candidate_digest(
-    manifest=manifest,
-    raw_base=raw_base,
-    source_identity=source_identity,
-    predecessor_source_identity=predecessor_source_identity,
-    canonical_source_url=canonical_source_url,
-    entry_bytes=entry_bytes,
-    icon_processed=icon_processed,
-    bundled_job=bundled_job,
-    static_assets=static_assets,
-    source_files=source_files,
-    seeds=seeds,
-  )
-  source_review_digest = package_content_digest(
-    manifest=manifest,
-    entry_bytes=entry_bytes,
-    icon_processed=icon_processed,
-    bundled_job=bundled_job,
-    static_assets=static_assets,
-    source_files=source_files,
-    seeds=seeds,
-  )
-  if (
-    reviewed_source_digest is not None
-    and source_review_digest != reviewed_source_digest
-  ):
-    raise HTTPException(
-      409,
-      {
-        "code": "update_changed",
-        "message": (
-          "The app source changed after it was reviewed. "
-          "Refresh the update preview and try again."
-        ),
-      },
-    )
-  replay_fields = (
-    expected_app_id,
-    expected_upstream_commit,
-    expected_candidate_digest,
-  )
-  if any(value is not None for value in replay_fields) and not all(
-    value is not None for value in replay_fields
-  ):
-    raise RuntimeError("resolved update replay identity is incomplete")
-  if (
-    expected_candidate_digest is not None
-    and candidate_digest != expected_candidate_digest
-  ):
-    raise HTTPException(
-      409,
-      {
-        "code": "pending_update_changed",
-        "message": (
-          "The pending update changed upstream. "
-          "Review the latest update and start again."
-        ),
-      },
-    )
-
-  return InstallCandidate(
+  return _new_candidate(
     manifest=manifest,
     raw_base=raw_base,
     entry_bytes=entry_bytes,
@@ -3312,10 +3195,6 @@ async def _fetch_install_candidate(
     static_assets=static_assets,
     source_files=source_files,
     seeds=seeds,
-    capability_contract=capability_contract,
-    capability_digest=capability_digest,
-    candidate_digest=candidate_digest,
-    source_review_digest=source_review_digest,
     source_identity=source_identity,
     predecessor_source_identity=predecessor_source_identity,
     canonical_source_url=canonical_source_url,
@@ -3327,16 +3206,159 @@ async def fetch_install_candidate(
 ) -> InstallCandidate:
   """Fetch the exact package the installer would use, without installing it."""
   return await _fetch_install_candidate(
-    manifest_url=manifest_url,
-    manifest=None,
-    raw_base=None,
-    reviewed_capability_digest=None,
-    reviewed_source_digest=None,
-    expected_app_id=None,
-    expected_upstream_commit=None,
-    expected_candidate_digest=None,
-    db=db,
+    manifest_url=manifest_url, manifest=None, raw_base=None, db=db,
   )
+
+
+@dataclass(frozen=True)
+class PreparedPackage:
+  """A fresh install's package, fetched before the lifecycle lock.
+
+  A root Git package is read from its staged clone, so the installer adopts
+  exactly the commit it reviewed and downloads the package only once. The
+  caller owns ``staged_clone`` and discards it once the install is over.
+  """
+
+  candidate: InstallCandidate
+  staged_clone: app_git.Staged | None = None
+
+
+async def prepare_package(
+  manifest_url: str | None,
+  manifest: dict | None = None,
+  raw_base: str | None = None,
+  *,
+  reviewed_capability_digest: str | None = None,
+  db: Session | None = None,
+) -> PreparedPackage:
+  """The network half of a fresh install; run it holding no lock.
+
+  Changed capabilities are refused from the manifest alone, before any code
+  or history is downloaded.
+  """
+  staged = None
+  try:
+    if manifest_url is not None:
+      staged = await stage_package_clone(
+        manifest_url, reviewed_capability_digest=reviewed_capability_digest,
+        db=db,
+      )
+  except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+    raise git_source_error(
+      "Nothing was installed.",
+      exc,
+      code="git_install_unavailable",
+      failure="The app's Git repository could not be cloned or verified; "
+      "retry when its source is available.",
+    ) from exc
+  if staged is None:
+    candidate = await _fetch_install_candidate(
+      manifest_url=manifest_url, manifest=manifest, raw_base=raw_base,
+      reviewed_capability_digest=reviewed_capability_digest, db=db,
+    )
+    if db is not None:
+      db.rollback()  # No connection is held while the caller waits for a lock.
+    return PreparedPackage(candidate)
+  try:
+    return PreparedPackage(
+      await _staged_clone_candidate(manifest_url, staged, db=db), staged,
+    )
+  except BaseException:
+    await asyncio.to_thread(discard_staged, staged)
+    raise
+
+
+async def _staged_clone_candidate(
+  manifest_url: str, staged: app_git.Staged, *, db: Session | None,
+) -> InstallCandidate:
+  """Read a root Git package from its staged clone, binding its identity."""
+  source_url = requested_manifest_source(manifest_url)[0]
+  try:
+    candidate = (await asyncio.to_thread(
+      read_git_install_candidate, staged.path, staged.sha, source_url,
+    )).candidate
+  except PackageTooLarge as exc:
+    raise HTTPException(
+      413, detail={"code": "package_too_large", "message": str(exc)},
+    ) from exc
+  except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+    raise HTTPException(422, f"The app's Git package is unusable: {exc}") from exc
+  validate_manifest_address(candidate.manifest, manifest_url, db=db)
+  if db is not None:
+    db.rollback()
+  if not candidate.manifest.get("package_id"):
+    return candidate
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
+    source_identity, predecessor, canonical = await _resolve_package_identity(
+      cli, candidate.manifest, source_url,
+    )
+  return _new_candidate(
+    **{
+      name: getattr(candidate, name) for name in (
+        "manifest", "raw_base", "entry_bytes", "icon_processed",
+        "icon_warning", "bundled_job", "static_assets", "source_files",
+        "seeds", "source_review_digest",
+      )
+    },
+    source_identity=source_identity,
+    predecessor_source_identity=predecessor,
+    canonical_source_url=canonical,
+  )
+
+
+def _require_reviewed_capabilities(
+  manifest: dict, reviewed_capability_digest: str | None,
+) -> None:
+  if reviewed_capability_digest is None:
+    return
+  capability_contract, capability_digest = contract_and_digest(manifest)
+  if capability_digest != reviewed_capability_digest:
+    raise HTTPException(409, detail={
+      "code": "capability_changed",
+      "message": (
+        "The app's capabilities changed after they were reviewed. "
+        "Review the current manifest and try again."
+      ),
+      "manifest": manifest,
+      "capability_contract": capability_contract,
+      "capability_digest": capability_digest,
+    })
+
+
+def _require_reviewed_candidate(
+  candidate: InstallCandidate,
+  *,
+  manifest: dict | None,
+  reviewed_capability_digest: str | None,
+  reviewed_source_digest: str | None,
+  expected_candidate_digest: str | None,
+) -> None:
+  """Refuse a candidate that is not the package the owner reviewed."""
+  if manifest is not None and manifest != candidate.manifest:
+    raise HTTPException(409, "Pending update manifest changed.")
+  _require_reviewed_capabilities(candidate.manifest, reviewed_capability_digest)
+  if (
+    reviewed_source_digest is not None
+    and reviewed_source_digest != candidate.source_review_digest
+  ):
+    raise HTTPException(409, detail={
+      "code": "update_changed",
+      "message": (
+        "The app source changed after it was reviewed. "
+        "Refresh the update preview and try again."
+      ),
+    })
+  if (
+    expected_candidate_digest is not None
+    and expected_candidate_digest != candidate.candidate_digest
+  ):
+    raise HTTPException(409, detail={
+      "code": "pending_update_changed",
+      "message": (
+        "The pending update changed upstream. "
+        "Review the latest update and start again."
+      ),
+    })
 
 
 async def _authorize_source_handoff(
@@ -4339,7 +4361,7 @@ async def install_from_manifest(
   expected_upstream_commit: str | None = None,
   expected_candidate_digest: str | None = None,
   publication_handoff_app_id: int | None = None,
-  staged_clone: app_git.Staged | None = None,
+  prepared: PreparedPackage | None = None,
 ) -> InstallResult:
   """Return a structured durable install/update/conflict outcome.
 
@@ -4364,9 +4386,10 @@ async def install_from_manifest(
 
   The per-app git model is unconditional. Every installed app has a canonical
   source directory and repository; updates never overwrite source blindly.
-  Callers hold the lifecycle lock, so this never touches the network: a root
-  Git package arrives as ``staged_clone`` (from ``stage_package_clone``) or as a
-  commit already made present by ``fetch_app_commit``.
+  Callers hold the lifecycle lock, so a fresh install arrives ``prepared`` (by
+  ``prepare_package``) and a reviewed update as a commit already made present
+  by ``fetch_app_commit``. Only a call with neither, such as a publication
+  handoff or a legacy conflict replay, still fetches its package here.
 
   Failure modes:
     - Pre-commit failures (manifest fetch, validation, JSX compile,
@@ -4400,6 +4423,13 @@ async def install_from_manifest(
     value is not None for value in reviewed_update_fields
   ):
     raise ValueError("reviewed update identity is incomplete")
+  replay_fields = (
+    expected_app_id, expected_upstream_commit, expected_candidate_digest,
+  )
+  if any(value is not None for value in replay_fields) and not all(
+    value is not None for value in replay_fields
+  ):
+    raise RuntimeError("resolved update replay identity is incomplete")
   if publication_handoff_app_id is not None:
     if source != "publication_handoff":
       raise ValueError("publication handoff requires its dedicated source")
@@ -4441,26 +4471,18 @@ async def install_from_manifest(
     # migration population disappears.
     if not has_manifest and expected_upstream_commit:
       candidate = await _fetch_install_candidate(
-        manifest_url=manifest_url,
-        manifest=manifest,
-        raw_base=raw_base,
-        reviewed_capability_digest=reviewed_capability_digest,
-        reviewed_source_digest=reviewed_source_digest,
-        expected_app_id=expected_app_id,
-        expected_upstream_commit=expected_upstream_commit,
-        expected_candidate_digest=expected_candidate_digest,
-        db=db,
+        manifest_url=manifest_url, manifest=manifest, raw_base=raw_base,
+        reviewed_capability_digest=reviewed_capability_digest, db=db,
       )
-      git_candidate = None
     else:
       try:
-        git_candidate = await asyncio.to_thread(
+        candidate = (await asyncio.to_thread(
           read_git_install_candidate,
           reviewed_app.source_dir,
           reviewed_commit,
           reviewed_source_url,
           source_identity=reviewed_app.source_identity,
-        )
+        )).candidate
       except PackageTooLarge as exc:
         raise HTTPException(
           413, detail={"code": "package_too_large", "message": str(exc)},
@@ -4476,61 +4498,22 @@ async def install_from_manifest(
             ),
           },
         ) from exc
-      candidate = git_candidate.candidate
       validate_manifest_address(candidate.manifest, manifest_url, db=db)
-    if git_candidate is not None and manifest is not None and manifest != candidate.manifest:
-      raise HTTPException(409, "Pending update manifest changed.")
-    if (
-      git_candidate is not None
-      and reviewed_capability_digest is not None
-      and reviewed_capability_digest != candidate.capability_digest
-    ):
-      raise HTTPException(
-        409,
-        detail={
-          "code": "capability_changed",
-          "message": "The app's capabilities changed after review.",
-          "manifest": candidate.manifest,
-          "capability_contract": candidate.capability_contract,
-          "capability_digest": candidate.capability_digest,
-        },
-      )
-    if (
-      git_candidate is not None
-      and reviewed_source_digest is not None
-      and reviewed_source_digest != candidate.source_review_digest
-    ):
-      raise HTTPException(
-        409,
-        detail={
-          "code": "update_changed",
-          "message": "The app source changed after review.",
-        },
-      )
-    if (
-      git_candidate is not None
-      and expected_candidate_digest is not None
-      and expected_candidate_digest != candidate.candidate_digest
-    ):
-      raise HTTPException(
-        409,
-        detail={
-          "code": "pending_update_changed",
-          "message": "The pending update changed upstream.",
-        },
-      )
+  elif prepared is not None:
+    candidate = prepared.candidate
+    validate_manifest_address(candidate.manifest, manifest_url, db=db)
   else:
     candidate = await _fetch_install_candidate(
-      manifest_url=manifest_url,
-      manifest=manifest,
-      raw_base=raw_base,
-      reviewed_capability_digest=reviewed_capability_digest,
-      reviewed_source_digest=reviewed_source_digest,
-      expected_app_id=expected_app_id,
-      expected_upstream_commit=expected_upstream_commit,
-      expected_candidate_digest=expected_candidate_digest,
-      db=db,
+      manifest_url=manifest_url, manifest=manifest, raw_base=raw_base,
+      reviewed_capability_digest=reviewed_capability_digest, db=db,
     )
+  _require_reviewed_candidate(
+    candidate,
+    manifest=manifest,
+    reviewed_capability_digest=reviewed_capability_digest,
+    reviewed_source_digest=reviewed_source_digest,
+    expected_candidate_digest=expected_candidate_digest,
+  )
 
   # Phase 2: immutable identity/update decision. No writes occur here.
   target = _select_install_target(
@@ -4557,7 +4540,7 @@ async def install_from_manifest(
     reviewed_upstream_commit=reviewed_upstream_commit,
     expected_upstream_commit=expected_upstream_commit,
     publication_handoff_app_id=publication_handoff_app_id,
-    staged_clone=staged_clone,
+    staged_clone=prepared.staged_clone if prepared is not None else None,
   )
   # Each pass holds the source lock across many Git threads and rolls back on
   # failure, and the env check runs threads from the handed-out runtime, all
@@ -4869,10 +4852,10 @@ async def _install_candidate(
               upstream_sha = await _to_completion(
                 _url_update_commit, git_source_dir, repo_ref[1], staged_clone,
               )
-              await asyncio.to_thread(
-                _verify_git_install_candidate,
-                git_source_dir, upstream_sha, candidate,
-              )
+              if staged_clone is None:
+                await asyncio.to_thread(
+                  _require_git_candidate, git_source_dir, upstream_sha, candidate,
+                )
             previous_tree = await asyncio.to_thread(
               app_git.read_ref_tree,
               git_source_dir,
@@ -5162,10 +5145,6 @@ async def _install_candidate(
               app_git.adopt_clone, staged_clone, git_source_dir,
             ))
             app.upstream_commit = staged_clone.sha
-            await asyncio.to_thread(
-              _verify_git_install_candidate,
-              git_source_dir, app.upstream_commit, candidate,
-            )
             entry_bytes = (git_source_dir / "index.jsx").read_bytes()
             upstream_jsx_sha = hashlib.sha256(entry_bytes).hexdigest()
             source_tree = {"index.jsx": entry_bytes}
