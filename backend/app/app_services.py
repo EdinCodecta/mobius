@@ -217,6 +217,9 @@ async def _stop_spawned(spawn: asyncio.Task) -> None:
     process = await spawn
   except OSError:
     return
+  except Exception:
+    log.exception("An app service whose request was cancelled failed to start")
+    return
   try:
     await _stop_process(process)
   except Exception:
