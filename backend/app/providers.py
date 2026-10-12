@@ -1256,7 +1256,10 @@ PROVIDERS: dict[str, BaseProvider] = {
 PROVIDER_NAMES: frozenset[str] = frozenset(PROVIDERS)
 
 _app_provider_ids: set[str] = set()
+# When the last app-provider load finished (monotonic), and the async load in
+# flight, which concurrent async refreshes join instead of returning early.
 _app_provider_sync_at = 0.0
+_app_provider_refresh: asyncio.Future | None = None
 
 
 def sync_app_model_providers(data_dir: str, *, force: bool = False) -> None:
@@ -1266,38 +1269,37 @@ def sync_app_model_providers(data_dir: str, *, force: bool = False) -> None:
   read throttle avoids adding one app query to every model/agent decision while
   still making install, update and uninstall visible without a server restart.
   """
-  if not _claim_app_provider_sync(force):
-    return
-  declarations = _read_app_model_declarations()
-  if declarations is not None:
-    _apply_app_model_declarations(declarations)
+  if force or time.monotonic() - _app_provider_sync_at >= 1.0:
+    _apply_app_model_declarations(_read_app_model_declarations())
 
 
-async def refresh_app_model_providers(
-  data_dir: str, *, force: bool = False,
-) -> None:
+async def refresh_app_model_providers(data_dir: str) -> None:
   """``sync_app_model_providers`` for async callers, with the read off-loop.
 
-  The declaration query is the only slow part, and on a saturated disk it
-  froze the event loop for seconds at every turn start. It runs in a worker
-  thread with its own session; the registry itself is updated back on the
-  calling loop. A sync caller inside the same throttle window reuses this
-  refresh instead of reading again.
+  The declaration query froze the event loop for seconds on a saturated disk.
+  It runs in a worker with its own session and the registry is updated back
+  on the loop. Concurrent callers await the same load, and synchronous calls
+  within the throttle window after it completes reuse it.
   """
-  if not _claim_app_provider_sync(force):
-    return
-  declarations = await asyncio.to_thread(_read_app_model_declarations)
-  if declarations is not None:
-    _apply_app_model_declarations(declarations)
+  global _app_provider_refresh
+  refresh = _app_provider_refresh
+  if refresh is None or refresh.get_loop() is not asyncio.get_running_loop():
+    if time.monotonic() - _app_provider_sync_at < 1.0:
+      return
+    refresh = _app_provider_refresh = asyncio.ensure_future(
+      _refresh_app_model_providers(),
+    )
+  await asyncio.shield(refresh)
 
 
-def _claim_app_provider_sync(force: bool) -> bool:
-  global _app_provider_sync_at
-  now = time.monotonic()
-  if not force and now - _app_provider_sync_at < 1.0:
-    return False
-  _app_provider_sync_at = now
-  return True
+async def _refresh_app_model_providers() -> None:
+  global _app_provider_refresh
+  try:
+    _apply_app_model_declarations(
+      await asyncio.to_thread(_read_app_model_declarations),
+    )
+  finally:
+    _app_provider_refresh = None
 
 
 def _read_app_model_declarations() -> list[tuple[Any, dict]] | None:
@@ -1318,7 +1320,14 @@ def _read_app_model_declarations() -> list[tuple[Any, dict]] | None:
     return None
 
 
-def _apply_app_model_declarations(declarations: list[tuple[Any, dict]]) -> None:
+def _apply_app_model_declarations(
+  declarations: list[tuple[Any, dict]] | None,
+) -> None:
+  """Apply one completed load; a failed read keeps the current registry."""
+  global _app_provider_sync_at
+  _app_provider_sync_at = time.monotonic()
+  if declarations is None:
+    return
   next_ids: set[str] = set()
   native_match = next(((app_id, declaration) for app_id, declaration in declarations
                        if declaration.get("transport") == "identity_broker"), None)

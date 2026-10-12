@@ -87,16 +87,3 @@ def resolve_agent_activity_binding(db: Session) -> AgentActivityBinding:
   except Exception:
     log.exception("app activity binding unavailable; activity cards disabled")
     return EMPTY_AGENT_ACTIVITY_BINDING
-
-
-def resolve_agent_activity_binding_off_loop() -> AgentActivityBinding:
-  """Resolve the binding in a worker thread with its own short session.
-
-  It loads every installed app row and reads each applied manifest from disk,
-  which stalled the event loop at turn start. The binding is frozen plain
-  data, and the session closes before the provider turn begins.
-  """
-  from app.database import SessionLocal
-
-  with SessionLocal() as db:
-    return resolve_agent_activity_binding(db)

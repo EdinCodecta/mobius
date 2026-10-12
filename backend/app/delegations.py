@@ -2029,16 +2029,6 @@ def active_parent_context(
   )
 
 
-def active_parent_context_off_loop(
-  parent_chat_id: str, physical_run_id: str,
-) -> str:
-  """``active_parent_context`` with its own session, for a worker thread."""
-  from app.database import SessionLocal
-
-  with SessionLocal() as db:
-    return active_parent_context(db, parent_chat_id, physical_run_id)
-
-
 def delegation_execution_token(
   db: Session,
   policy: RunPolicy,
@@ -3832,22 +3822,26 @@ def _chat_has_running_run(db: Session, chat_id: str) -> bool:
 
 
 @dataclass(frozen=True)
-class _ChildSettlePlan:
-  """What a child's settle should publish and whether it wakes its parent."""
+class _ChildSettle:
+  """What the loop finishes after a child's settle was recorded in a worker."""
   delegation_id: str
   parent_chat_id: str
   status: str
-  # Set for source-attached work, which only refreshes its source surfaces.
+  # Source-attached work: the loop publishes its status, whose owner
+  # notification reads loop-owned presence.
   source_work_id: str | None
-  goal_chat_ids: tuple[str, ...]
-  activity_changed: bool
+  # An opted-in, unwoken, wake-eligible result: the loop wakes the parent.
   wake_source_work_id: str | None
 
 
-def _plan_child_settle(child_chat_id: str) -> _ChildSettlePlan | None:
-  """Durable half of a child's settle; runs in a worker thread."""
+def _settle_child(child_chat_id: str) -> _ChildSettle | None:
+  """Durable half of a child's settle, in a worker with its own session.
+
+  Records source-work lifecycle and publishes the Goal, waiting and activity
+  invalidations through the thread-safe system broadcast.
+  """
   from app.database import SessionLocal
-  from app.goal_plans import plan_change_chat_ids
+  from app.goal_plans import publish_plan_for_delegation
 
   with SessionLocal() as db:
     row = (
@@ -3858,36 +3852,32 @@ def _plan_child_settle(child_chat_id: str) -> _ChildSettlePlan | None:
     if row is None:
       return None
     status, _, _ = derived_status(db, row, load_result=False)
+    settle = _ChildSettle(
+      delegation_id=str(row.id),
+      parent_chat_id=str(row.parent_chat_id),
+      status=status,
+      source_work_id=row.source_work_id,
+      wake_source_work_id=None,
+    )
     if row.source_work_id is not None:
-      plan = _ChildSettlePlan(
-        delegation_id=str(row.id),
-        parent_chat_id=str(row.parent_chat_id),
-        status=status,
-        source_work_id=str(row.source_work_id),
-        goal_chat_ids=(),
-        activity_changed=True,
-        wake_source_work_id=None,
-      )
       if status in TERMINAL_DELEGATION_STATUSES:
         row.source_work_active_chat_id = None
       _record_lifecycle(db, row, status)
       db.commit()
-      return plan
-    wakes = (
-      row.notify_parent_on_complete
-      and row.cancelled_at is None
-      and not current_result_delivered(db, row)
-      and status in WAKE_ELIGIBLE_STATUSES
-    )
-    return _ChildSettlePlan(
-      delegation_id=str(row.id),
-      parent_chat_id=str(row.parent_chat_id),
-      status=status,
-      source_work_id=None,
-      goal_chat_ids=plan_change_chat_ids(db, row),
-      activity_changed=status in TERMINAL_DELEGATION_STATUSES,
-      wake_source_work_id=delegation_source_work_id(row) if wakes else None,
-    )
+      publish_chat_activity_changed(settle.parent_chat_id)
+      return settle
+    publish_plan_for_delegation(db, row)
+    publish_parent_waiting_changed(row.parent_chat_id)
+    if status in TERMINAL_DELEGATION_STATUSES:
+      publish_chat_activity_changed(row.parent_chat_id)
+    if (
+      not row.notify_parent_on_complete
+      or row.cancelled_at is not None
+      or current_result_delivered(db, row)
+      or status not in WAKE_ELIGIBLE_STATUSES
+    ):
+      return settle
+    return replace(settle, wake_source_work_id=delegation_source_work_id(row))
 
 
 async def wake_parent_after_child_settled(child_chat_id: str) -> None:
@@ -3897,32 +3887,22 @@ async def wake_parent_after_child_settled(child_chat_id: str) -> None:
   terminal result records the parent's live frontier once and refreshes the
   parent's activity surfaces; only an opted-in, unwoken, wake-eligible result
   also wakes the parent."""
-  from app.goal_plans import publish_goal_changed
-
   try:
-    # Durable reads (and the source-work lifecycle write) run in a worker;
-    # every broadcast and registry read stays here on the loop.
-    plan = await asyncio.to_thread(_plan_child_settle, child_chat_id)
-    if plan is None:
+    settle = await asyncio.to_thread(_settle_child, child_chat_id)
+    if settle is None:
       return
-    if plan.source_work_id is not None:
-      publish_chat_activity_changed(plan.parent_chat_id)
+    if settle.source_work_id is not None:
       _publish_source_work_status(
-        delegation_id=plan.delegation_id,
-        parent_chat_id=plan.parent_chat_id,
-        source_work_id=plan.source_work_id,
-        status=plan.status,
+        delegation_id=settle.delegation_id,
+        parent_chat_id=settle.parent_chat_id,
+        source_work_id=settle.source_work_id,
+        status=settle.status,
       )
       return
-    for chat_id in plan.goal_chat_ids:
-      publish_goal_changed(chat_id)
-    publish_parent_waiting_changed(plan.parent_chat_id)
-    if plan.activity_changed:
-      publish_chat_activity_changed(plan.parent_chat_id)
-    if plan.wake_source_work_id is None:
+    if settle.wake_source_work_id is None:
       return
-    parent_chat_id = plan.parent_chat_id
-    source_work_id = plan.wake_source_work_id
+    parent_chat_id = settle.parent_chat_id
+    source_work_id = settle.wake_source_work_id
     from app.chat import is_chat_running
     if is_chat_running(parent_chat_id):
       await steer_results_into_running_parent(parent_chat_id, source_work_id)

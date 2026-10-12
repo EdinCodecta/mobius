@@ -572,32 +572,19 @@ def publish_plan_for_delegation(
   db: Session, row: models.Delegation,
 ) -> None:
   """Invalidate the Goal owner and this helper's direct parent after a commit."""
-  for chat_id in plan_change_chat_ids(db, row):
-    publish_goal_changed(chat_id)
-
-
-def plan_change_chat_ids(
-  db: Session, row: models.Delegation,
-) -> tuple[str, ...]:
-  """Chats whose Goal surface a change to ``row`` invalidates, in order.
-
-  Pure reads, so a worker thread can resolve them and leave publishing to
-  the event loop.
-  """
   if row.app_id is not None or row.source_work_id is not None:
-    return ()
-  targets = [row.parent_chat_id]
+    return
+  publish_goal_changed(row.parent_chat_id)
   if row.goal_id is not None:
     owner = db.query(models.ChatGoal.chat_id).filter(
       models.ChatGoal.id == row.goal_id,
     ).scalar()
     if owner and owner != row.parent_chat_id:
-      targets.append(owner)
-    return tuple(targets)
+      publish_goal_changed(owner)
+    return
   assignment = goal_assignment(db, row.child_chat_id)
   if assignment is not None and assignment.goal.chat_id != row.parent_chat_id:
-    targets.append(assignment.goal.chat_id)
-  return tuple(targets)
+    publish_goal_changed(assignment.goal.chat_id)
 
 
 def publish_goal_changed(chat_id: str) -> None:

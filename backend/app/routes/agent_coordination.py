@@ -20,7 +20,6 @@ from app.agent_coordination import (
   model_message,
   owner_chat_snapshot,
   owner_project_snapshot,
-  publish_message_hint,
   send_agent_message_off_loop,
   send_work_claim_notice,
   visible_peer_messages,
@@ -229,9 +228,9 @@ async def send_current_message(
   if principal.chat_id is None or principal.run_id is None:
     raise HTTPException(403, "Current chat-bound agent run required.")
   # Scope resolution, validation, the write and the inbox prune run in a
-  # worker with their own session; the live hint is published here.
+  # worker with its own session.
   try:
-    sent = await asyncio.to_thread(
+    rows = await asyncio.to_thread(
       send_agent_message_off_loop,
       owner_id=principal.owner.id,
       sender_chat_id=principal.chat_id,
@@ -245,11 +244,8 @@ async def send_current_message(
     )
   except ValueError as exc:
     raise HTTPException(422, str(exc)) from exc
-  if sent is None:
+  if rows is None:
     raise HTTPException(409, "This agent does not have a coordination scope.")
-  for hint in sent.hints:
-    publish_message_hint(hint)
-  rows = sent.rows
   # Meaning and delivery are independent. A direct interrupt steers a live
   # recipient or wakes its idle unfinished Goal; next_turn and every broadcast
   # stay quiet so one broad note cannot manufacture a wave of model work.

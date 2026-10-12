@@ -1311,16 +1311,6 @@ def _prune_direct_inboxes(
       db.delete(row)
 
 
-def publish_message_hint(hint: dict[str, Any]) -> None:
-  """Publish one hint collected by ``_persist_send``; event loop only."""
-  _publish_message_hint(
-    hint["channel"],
-    sender_chat_id=hint["sender_chat_id"],
-    recipients=hint["recipients"],
-    broadcast=hint["broadcast"],
-  )
-
-
 def _publish_message_hint(
   channel: CoordinationScope,
   *,
@@ -1358,13 +1348,7 @@ def _persist_send(
   delivery: str,
   body: str,
   send_id: str | None,
-  hints: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-  """Persist one send; ``hints`` collects the live hint instead of publishing.
-
-  A worker-thread caller passes ``hints`` and publishes them on the event
-  loop, which owns the system broadcast.
-  """
   clean_body = _clean_message(kind, body)
   clean_delivery = _clean_delivery(delivery, broadcast=broadcast)
   requested_send_id = _clean_send_id(send_id)
@@ -1436,16 +1420,12 @@ def _persist_send(
     raise
   for row in rows:
     db.refresh(row)
-  hint = {
-    "channel": channel,
-    "sender_chat_id": sender_chat_id,
-    "recipients": recipients,
-    "broadcast": broadcast,
-  }
-  if hints is None:
-    publish_message_hint(hint)
-  else:
-    hints.append(hint)
+  _publish_message_hint(
+    channel,
+    sender_chat_id=sender_chat_id,
+    recipients=recipients,
+    broadcast=broadcast,
+  )
   return serialize_messages(db, rows)
 
 
@@ -1461,7 +1441,6 @@ def send_scope_message(
   body: str,
   delivery: str = DELIVERY_NEXT_TURN,
   send_id: str | None = None,
-  hints: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
   """Persist one scope-confined broadcast or legacy directed note."""
   member_ids = set(_scope_membership(db, scope, limit=None)[0])
@@ -1487,7 +1466,6 @@ def send_scope_message(
     delivery=delivery,
     body=body,
     send_id=send_id,
-    hints=hints,
   )
 
 
@@ -1556,7 +1534,6 @@ def send_agent_message(
   body: str,
   delivery: str = DELIVERY_NEXT_TURN,
   send_id: str | None = None,
-  hints: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
   """Send a scope broadcast or global direct note from one exact live run."""
   if broadcast:
@@ -1571,7 +1548,6 @@ def send_agent_message(
       delivery=delivery,
       body=body,
       send_id=send_id,
-      hints=hints,
     )
 
   unique_recipients = list(dict.fromkeys(str(value) for value in recipients))
@@ -1596,16 +1572,7 @@ def send_agent_message(
     delivery=delivery,
     body=body,
     send_id=send_id,
-    hints=hints,
   )
-
-
-@dataclass(frozen=True)
-class AgentSendResult:
-  """A run's persisted send, as plain data, for the event loop to finish."""
-
-  rows: list[dict[str, Any]]
-  hints: list[dict[str, Any]]
 
 
 def send_agent_message_off_loop(
@@ -1619,12 +1586,12 @@ def send_agent_message_off_loop(
   body: str,
   delivery: str = DELIVERY_NEXT_TURN,
   send_id: str | None = None,
-) -> AgentSendResult | None:
-  """Resolve the sender's scope and persist one send in a worker thread.
+) -> list[dict[str, Any]] | None:
+  """Resolve the sender's scope and send, with its own session, in a worker.
 
-  The send validates recipients, writes, and prunes the recipient inbox; on a
-  busy disk that froze the event loop for seconds. Returns None when the run
-  has no coordination scope. The caller publishes ``hints`` on the loop.
+  Validation, the write and the recipient inbox prune froze the event loop on
+  a busy disk. The live hint goes through the thread-safe system broadcast.
+  Returns None when the run has no coordination scope.
   """
   from app.database import SessionLocal
 
@@ -1632,8 +1599,7 @@ def send_agent_message_off_loop(
     scope = scope_for_chat(db, sender_chat_id, sender_run_id)
     if scope is None:
       return None
-    hints: list[dict[str, Any]] = []
-    rows = send_agent_message(
+    return send_agent_message(
       db,
       scope,
       owner_id=owner_id,
@@ -1645,9 +1611,7 @@ def send_agent_message_off_loop(
       delivery=delivery,
       body=body,
       send_id=send_id,
-      hints=hints,
     )
-    return AgentSendResult(rows=rows, hints=hints)
 
 
 def send_work_claim_notice(
@@ -2239,27 +2203,6 @@ def build_coordination_context_delivery(
   return CoordinationContextDelivery(
     text=text, delivered_through=delivered_through,
   )
-
-
-def build_coordination_context_delivery_off_loop(
-  chat_id: str,
-  physical_run_id: str | None,
-  alive_chat_ids: frozenset[str],
-) -> CoordinationContextDelivery:
-  """Build a turn's peer context in a worker thread with its own session.
-
-  The run-start path calls this through ``asyncio.to_thread``: the roster,
-  inbox window and carrier scan are several reads (and a transcript decode)
-  that froze the event loop for seconds on a busy disk. ``alive_chat_ids`` is
-  the runner registry captured on the loop; the result is plain data.
-  """
-  from app.database import SessionLocal
-
-  with SessionLocal() as db:
-    chat = db.query(models.Chat).filter(models.Chat.id == chat_id).first()
-    return build_coordination_context_delivery(
-      db, chat_id, physical_run_id, chat=chat, alive_chat_ids=alive_chat_ids,
-    )
 
 
 def build_coordination_context(

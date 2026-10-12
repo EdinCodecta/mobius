@@ -8,7 +8,6 @@ clients can subscribe.  Provider env / auth wiring lives in
 """
 
 import asyncio
-import gc
 import hashlib
 import json
 import math
@@ -21,6 +20,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from sqlalchemy import Text, cast, literal_column, or_, text
 from sqlalchemy.orm import Session, load_only
@@ -71,7 +71,7 @@ from app.chat_context import (
   _custom_system_prompt,
   _goal_objective,
   _human_elapsed,
-  _last_user_message_elapsed_off_loop,
+  _last_user_message_elapsed,
   _latest_compaction_brief,
   _strip_report_html,
   recent_chat_summary_order,
@@ -5076,15 +5076,10 @@ async def run_chat(
     if runtime_settled and disposition in _MEMORY_RECLAIM_DISPOSITIONS:
       # Release settled tool/source pages and allocator arenas. Source sweeps
       # protect live mappings and exclude owner data; tool advice may release
-      # unused pages of shared executables.
-      #
-      # A full collection walks every tracked object while holding the GIL,
-      # so no thread can hide it (about 1.4 s of frozen loop was measured per
-      # settled turn). It runs only when no turn is active; otherwise only
-      # the young generations are collected. The allocator trim and
-      # page-cache advice follow in the worker.
+      # unused pages of shared executables. Both run in a worker. There is
+      # no explicit collection: a full one holds the GIL (about 1.4 s of
+      # frozen loop per settled turn) and automatic GC already runs.
       try:
-        gc.collect(2 if not registry.all_alive_chat_ids() else 1)
         await asyncio.to_thread(
           _reclaim_settled_memory, get_settings().data_dir, chat_id,
         )
@@ -5411,8 +5406,25 @@ async def _run_chat_impl(
     _log_superseded_run(chat_id, "entry")
     return chat_queue.TerminalDisposition.STALE_NO_ACTION
 
-  # Refresh app-declared model providers with the read off the loop; the
-  # turn's synchronous get_provider calls then reuse it inside the throttle.
+  # The per-turn run token is allocated by the scheduler (the route /
+  # continuation / stale-pending drain) and passed in, so the SAME token
+  # that keys the turn's writer-actor commands is the one the sink +
+  # runner use for streaming/terminal writes. A None token (legacy/test
+  # caller bypassing the actor) gets a last-resort allocation so the sink
+  # always has a non-None key.
+  if run_token is None:
+    run_token = alloc_run_token()
+
+  # Turn-start reads that froze the loop on a busy disk, in one worker
+  # session. They run before the preflight session loads the chat row and
+  # settings, so that snapshot spans no await a model pick could slip into.
+  turn_reads = await asyncio.to_thread(
+    _read_turn_context, chat_id, run_token,
+    frozenset(registry.all_alive_chat_ids()),
+  )
+  # Refresh app-declared model providers off the loop last: no await
+  # separates it from the preflight's synchronous get_provider calls, which
+  # then reuse it inside the throttle window instead of reading again.
   from app.providers import refresh_app_model_providers
   await refresh_app_model_providers(get_settings().data_dir)
 
@@ -5435,6 +5447,7 @@ async def _run_chat_impl(
         viewport=viewport,
         run_token=run_token,
         db=db,
+        turn_reads=turn_reads,
       )
       tracing.annotate(turn_span, {"mobius.disposition": str(disposition)})
       return disposition
@@ -5452,6 +5465,49 @@ def _should_inject_peer_context(
 ) -> bool:
   """Inject peer context only for a physical chat run."""
   return bool(chat_id and run_token)
+
+
+if TYPE_CHECKING:
+  from app.agent_activity_provider import AgentActivityBinding
+  from app.agent_coordination import CoordinationContextDelivery
+
+
+@dataclass(frozen=True)
+class _TurnContextReads:
+  """Plain-data turn-start context read in a worker thread."""
+  coordination: "CoordinationContextDelivery | None"
+  helper_context: str
+  last_user_elapsed: str | None
+  activity_binding: "AgentActivityBinding"
+
+
+def _read_turn_context(
+  chat_id: str, run_token: str, alive_chat_ids: frozenset[str],
+) -> _TurnContextReads:
+  """Peer context, helper status, recency and the app activity binding.
+
+  Runs in a worker with its own short session. ``alive_chat_ids`` is the
+  runner registry captured on the loop, which the worker never reads.
+  """
+  from app.agent_activity_provider import resolve_agent_activity_binding
+  from app.agent_coordination import build_coordination_context_delivery
+  from app.database import SessionLocal
+  from app.delegations import active_parent_context
+
+  with SessionLocal() as db:
+    return _TurnContextReads(
+      coordination=(
+        build_coordination_context_delivery(
+          db, chat_id, run_token, alive_chat_ids=alive_chat_ids,
+        )
+        if _should_inject_peer_context(chat_id, run_token) else None
+      ),
+      helper_context=(
+        active_parent_context(db, chat_id, run_token) if chat_id else ""
+      ),
+      last_user_elapsed=_last_user_message_elapsed(db, chat_id),
+      activity_binding=resolve_agent_activity_binding(db),
+    )
 
 
 def _should_enable_coordination_tools(
@@ -5518,6 +5574,7 @@ async def _run_chat_impl_with_db(
   run_token: str | None = None,
   *,
   db: Session,
+  turn_reads: _TurnContextReads,
 ) -> chat_queue.TerminalDisposition:
   """Run a turn with a session whose lifetime is owned by the wrapper."""
   log = _get_logger()
@@ -5525,15 +5582,6 @@ async def _run_chat_impl_with_db(
   raw_user_message = messages[-1].content
   user_message = raw_user_message
   historical_goal_mode = _chat_has_goal_intent(messages)
-
-  # The per-turn run token is allocated by the scheduler (the route /
-  # continuation / stale-pending drain) and passed in, so the SAME token
-  # that keys the turn's writer-actor commands is the one the sink +
-  # runner use for streaming/terminal writes. A None token (legacy/test
-  # caller bypassing the actor) gets a last-resort allocation so the sink
-  # always has a non-None key.
-  if run_token is None:
-    run_token = alloc_run_token()
 
   app_context_block = ""
   app_context_env: dict[str, str] = {}
@@ -5687,14 +5735,8 @@ async def _run_chat_impl_with_db(
   # Every durable child has its own chat address.
   coordination_context = ""
   coordination_message_through = None
-  if _should_inject_peer_context(chat_id, run_token):
-    from app.agent_coordination import (
-      build_coordination_context_delivery_off_loop,
-    )
-    coordination_delivery = await asyncio.to_thread(
-      build_coordination_context_delivery_off_loop,
-      chat_id, run_token, frozenset(registry.all_alive_chat_ids()),
-    )
+  coordination_delivery = turn_reads.coordination
+  if coordination_delivery is not None:
     coordination_context = coordination_delivery.text
     coordination_message_through = coordination_delivery.delivered_through
     if coordination_context:
@@ -5760,13 +5802,8 @@ async def _run_chat_impl_with_db(
   # ordinary parent turn so a resumed agent waits on the existing child rather
   # than launching a duplicate. Delegated children attach to their own
   # descendants through their delegated assignment instead of inheriting this block.
-  if chat_id and run_token:
-    from app.delegations import active_parent_context_off_loop
-    delegation_context = await asyncio.to_thread(
-      active_parent_context_off_loop, chat_id, run_token,
-    )
-    if delegation_context:
-      user_message = f"{delegation_context}\n\n{user_message}"
+  if turn_reads.helper_context:
+    user_message = f"{turn_reads.helper_context}\n\n{user_message}"
 
   # Waiting is not a lock: owner messages do not cancel an armed condition.
   # Only the top-level chat owns durable waits; delegated children return any
@@ -5799,10 +5836,7 @@ async def _run_chat_impl_with_db(
   # clock + a sense of recency (how long since the user last wrote). Prepended
   # last so it leads the message the agent sees; only the agent's copy is
   # touched here, never the persisted/displayed user text.
-  time_context = _build_time_context(
-    timezone,
-    await asyncio.to_thread(_last_user_message_elapsed_off_loop, chat_id),
-  )
+  time_context = _build_time_context(timezone, turn_reads.last_user_elapsed)
   user_message = f"{time_context}\n\n{user_message}"
 
   bc = get_broadcast(chat_id)
@@ -5953,18 +5987,8 @@ async def _run_chat_impl_with_db(
   # Invariant: keep this block await-free through the commit below. A
   # picker PATCH from another coroutine can only interleave at await
   # points; if one is added here, a concurrent PATCH could clobber the
-  # user's pick. Turn setup above awaits worker-thread reads, so re-read
-  # the column first: a pick that landed meanwhile wins and applies from
-  # the next turn (this turn's settings were already resolved).
+  # user's pick. Turn-start worker reads finish before chat_row is loaded.
   if run_policy is None and chat_row is not None and chat_overrides is None:
-    try:
-      db.refresh(chat_row, attribute_names=["agent_settings_json"])
-    except Exception:
-      log.debug("agent_settings re-read failed chat_id=%s", chat_id, exc_info=True)
-  if (
-    run_policy is None and chat_row is not None and chat_overrides is None
-    and _chat_settings_dict(chat_row) is None
-  ):
     snapshot = {}
     for k in ("model", "effort", "effort_by_provider"):
       if k not in agent_settings:
@@ -6024,18 +6048,11 @@ async def _run_chat_impl_with_db(
     db.close()
     return disposition
 
-  # Bind manifest-declared app activities before the db.close() below:
-  # resolving it lazily at a sink site would check out a connection during the
-  # turn, which is precisely the pool exhaustion that close is there to
-  # prevent. It is also the semantically right moment — the recognizer is
-  # bound at the instant the agent is told the provider's path. The app rows
-  # and manifest files are read in a worker with its own short session.
-  from app.agent_activity_provider import (
-    resolve_agent_activity_binding_off_loop,
-  )
-  agent_activity_binding = await asyncio.to_thread(
-    resolve_agent_activity_binding_off_loop,
-  )
+  # Manifest-declared app activities were bound at turn start, in the
+  # worker: resolving them lazily at a sink site would check out a connection
+  # during the turn, which is precisely the pool exhaustion the db.close()
+  # below is there to prevent.
+  agent_activity_binding = turn_reads.activity_binding
 
   # Snapshot owner-managed MCP connections while this request session is still
   # live. Provider turns can wait for hours, so neither runner may query the
