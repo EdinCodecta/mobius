@@ -184,11 +184,7 @@ export default function QuestionCard({
   const preparedSubmissionRef = useRef(null)
   const fileInputRef = useRef(null)
   const initialFilesRef = useRef(null)
-  // Tagged files belong to their answer. Older untagged draft files were
-  // card-level; the old paperclip's position did not establish ownership.
-  if (initialFilesRef.current === null) {
-    initialFilesRef.current = readQuestionDraft(draftKey).files
-  }
+  if (initialFilesRef.current === null) initialFilesRef.current = readQuestionDraft(draftKey).files
   const attachTargetRef = useRef(null)
   const { files, addFiles, removeFile, clearFiles, discardFiles } = useFileUpload({ chatId, initialFiles: initialFilesRef.current })
   const readyFiles = files.filter(file => file.status === 'done')
@@ -373,21 +369,19 @@ export default function QuestionCard({
   if (locallyQueued) submitLabel = localAnswer.deliveryOutcome === 'delivered'
     ? 'Confirming answer…' : 'Queued on this device'
 
-  // Files sit inside their answer box. On grouped cards, older untagged files
-  // stay in a shared lane; only a single-question card can own them unambiguously.
+  // Files sit inside the answer they belong to. Untagged files predate that:
+  // a grouped card keeps them card-level, below the answers.
   const sentAttachments = attachments || localAnswer?.body?.attachments || submitted?.attachments || []
-  const answerFiles = question => platformAction ? null : (
-    <div className="qcard__answer-files" role="group" aria-label="Files for this answer">
+  const fileTray = (owns, label) => platformAction ? null : (
+    <div className="qcard__answer-files" role="group" aria-label={label}>
       {selectionLocked
-        ? <Attachments attachments={sentAttachments.filter(file => fileBelongsToQuestion(file.question, question, questions.length))} chatId={chatId} />
-        : <FileChips files={files.filter(file => fileBelongsToQuestion(file.group, question, questions.length))} onRemove={removeFile} chatId={chatId} disabled={submitting || disabled} />}
+        ? <Attachments attachments={sentAttachments.filter(file => owns(file.question))} chatId={chatId} />
+        : <FileChips files={files.filter(file => owns(file.group))} onRemove={removeFile} chatId={chatId} disabled={submitting || disabled} />}
     </div>
   )
-  const sharedFiles = grouped
-    ? (selectionLocked
-      ? sentAttachments.filter(file => file.question == null)
-      : files.filter(file => file.group == null))
-    : []
+  const hasCardFiles = grouped && (selectionLocked
+    ? sentAttachments.some(file => file.question == null)
+    : files.some(file => file.group == null))
 
   return (
     <div
@@ -560,7 +554,7 @@ export default function QuestionCard({
                   </button>
                 )}
                 <div className={`qcard__composer${isOtherSelected || answeredWithOther ? ' qcard__composer--active' : ''}`}>
-                  {answerFiles(q.question)}
+                  {fileTray(tag => fileBelongsToQuestion(tag, q.question, questions.length), 'Files for this answer')}
                   <CustomAnswerArea
                     answered={selectionLocked}
                     canSubmit={canSubmit}
@@ -585,14 +579,7 @@ export default function QuestionCard({
         )
         })}
       </div>
-      {!platformAction && sharedFiles.length > 0 && (
-        <div className="qcard__shared-files" role="group" aria-label="Shared card files">
-          <div className="qcard__shared-files-label">Shared files · not assigned to a question</div>
-          {selectionLocked
-            ? <Attachments attachments={sharedFiles} chatId={chatId} />
-            : <FileChips files={sharedFiles} onRemove={removeFile} chatId={chatId} disabled={submitting || disabled} />}
-        </div>
-      )}
+      {hasCardFiles && fileTray(tag => tag == null, 'Files for all answers')}
       {!platformAction && (answered || !disabled) && (
         <input ref={fileInputRef} type="file" multiple className="qcard__file-input"
           disabled={attachLocked}
@@ -600,7 +587,7 @@ export default function QuestionCard({
           onChange={e => {
             const selected = Array.from(e.target.files || [])
             e.target.value = ''
-            if (!attachLocked && attachTargetRef.current) addAnswerFiles(selected, attachTargetRef.current)
+            if (!attachLocked) addAnswerFiles(selected, attachTargetRef.current)
           }} />
       )}
       {!completedAction && (answered || !disabled) && (

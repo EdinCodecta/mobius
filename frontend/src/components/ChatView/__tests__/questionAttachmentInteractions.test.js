@@ -3,7 +3,7 @@ import { after, test } from 'node:test'
 import { createServer } from 'vite'
 import { createFileDragHandlers } from '../dragUpload.js'
 import { questionAnswerPatch, questionAnswersReady } from '../questionSubmission.js'
-import { questionDraftKey, writeQuestionDraft, readQuestionDraft } from '../questionDraft.js'
+import { questionDraftKey, writeQuestionDraft } from '../questionDraft.js'
 
 // Exercise the component's event handlers and actual upload hook without a DOM.
 // Only these two modules use the existing hook harness; children remain React
@@ -24,7 +24,7 @@ const vite = await createServer({
       if (id === 'question-card-hooks') return '\0question-card-hooks'
     },
     load(id) {
-      if (id === '\0question-card-hooks') return `export * from '${hooksPath}'; export const useContext = () => globalThis.__questionLocalAnswers || null;`
+      if (id === '\0question-card-hooks') return `export * from '${hooksPath}'; export const useContext = () => null;`
     },
   }],
 })
@@ -194,7 +194,7 @@ test('files answer only the question they were attached to', () => {
 })
 
 
-test('legacy card-level files stay visible outside answer boxes after submission', () => {
+test('legacy untagged files stay card-level on a grouped card after submission', () => {
   const card = renderHook(QuestionCard, {
     chatId: 'legacy-chat', questionId: 'legacy-card', questions,
     answeredMap: { 'First?': 'A', 'Second?': 'B' },
@@ -205,7 +205,7 @@ test('legacy card-level files stay visible outside answer boxes after submission
   } finally { card.unmount() }
 })
 
-test('restored shared draft files cannot answer a blank grouped question, but remain shared when sent', async () => {
+test('a restored draft keeps each file with its answer and legacy untagged files card-level', async () => {
   const storage = {
     values: new Map(),
     getItem(key) { return this.values.get(key) || null },
@@ -214,67 +214,23 @@ test('restored shared draft files cannot answer a blank grouped question, but re
   }
   const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage })
-  const key = questionDraftKey('legacy-draft', 'legacy-q', questions)
-  writeQuestionDraft(key, { answers: { 'First?': 'A' }, otherTexts: {}, files: [
-    { name: 'shared.txt', size: 1, mime_type: 'text/plain', status: 'done' },
+  writeQuestionDraft(questionDraftKey('draft-chat', 'draft-q', questions), { answers: { 'First?': 'A' }, otherTexts: {}, files: [
+    { name: 'mine.txt', group: 'Second?', size: 1, mime_type: 'text/plain', status: 'done' },
+    { name: 'old.txt', size: 1, mime_type: 'text/plain', status: 'done' },
   ] }, storage)
   let posted
-  const card = renderHook(QuestionCard, { chatId: 'legacy-draft', questionId: 'legacy-q', questions,
+  const card = renderHook(QuestionCard, { chatId: 'draft-chat', questionId: 'draft-q', questions,
     onAnswer: async (...args) => { posted = args; return true } })
   try {
-    assert.equal(submit(card.result.current).props.disabled, true)
-    assert.deepEqual(chipSets(card.result.current).map(set => set.props.files.map(f => f.name)), [[], [], ['shared.txt']])
-    assert.equal(readQuestionDraft(key, storage).files[0].group, undefined)
-    editor(card.result.current, 'Second?').props.onChange('B')
+    assert.deepEqual(chipSets(card.result.current).map(set => set.props.files.map(f => f.name)), [[], ['mine.txt'], ['old.txt']])
     assert.equal(submit(card.result.current).props.disabled, false)
     submit(card.result.current).props.onClick({ currentTarget: { closest: () => null } })
     await tick()
-    assert.equal(posted[1]['Second?'], 'B')
-    assert.deepEqual(posted[3].attachments, [{ name: 'shared.txt', size: 1, mime_type: 'text/plain' }])
-    assert.deepEqual(sentSets(card.result.current).map(set => set.props.attachments.map(f => f.name)), [[], [], ['shared.txt']])
-  } finally {
-    card.unmount()
-    if (original) Object.defineProperty(globalThis, 'localStorage', original)
-    else delete globalThis.localStorage
-  }
-})
-
-test('queued legacy card-level files remain shared after reload', () => {
-  globalThis.__questionLocalAnswers = [{
-    chatId: 'legacy-queue',
-    body: { question_id: 'legacy-q', answers: { 'First?': 'A', 'Second?': 'B' },
-      attachments: [{ name: 'queued.txt', size: 1, mime_type: 'text/plain' }] },
-  }]
-  const card = renderHook(QuestionCard, { chatId: 'legacy-queue', questionId: 'legacy-q', questions })
-  try {
-    assert.deepEqual(sentSets(card.result.current).map(set => set.props.attachments.map(f => f.name)), [[], [], ['queued.txt']])
-    assert.equal(submit(card.result.current).props.disabled, true)
-  } finally { card.unmount(); delete globalThis.__questionLocalAnswers }
-})
-
-test('the model-facing answer prose names a reused upload under each tagged question', async () => {
-  const storage = {
-    values: new Map(),
-    getItem(key) { return this.values.get(key) || null },
-    setItem(key, value) { this.values.set(key, value) },
-    removeItem(key) { this.values.delete(key) },
-  }
-  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
-  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage })
-  const key = questionDraftKey('same-upload', 'same-card', questions)
-  writeQuestionDraft(key, { answers: {}, otherTexts: {}, files: [
-    { name: 'same.txt', group: 'First?', size: 1, mime_type: 'text/plain', status: 'done' },
-    { name: 'same.txt', group: 'Second?', size: 1, mime_type: 'text/plain', status: 'done' },
-  ] }, storage)
-  let posted
-  const card = renderHook(QuestionCard, { chatId: 'same-upload', questionId: 'same-card', questions,
-    onAnswer: async (...args) => { posted = args; return true } })
-  try {
-    assert.equal(submit(card.result.current).props.disabled, false)
-    submit(card.result.current).props.onClick({ currentTarget: { closest: () => null } })
-    await tick()
-    assert.equal(posted[0], '- First?: Attached 1 file\n  Files: same.txt\n- Second?: Attached 1 file\n  Files: same.txt')
-    assert.deepEqual(posted[3].attachments.map(file => file.question), ['First?', 'Second?'])
+    assert.equal(posted[0], '- First?: A\n- Second?: Attached 1 file\n  Files: mine.txt')
+    assert.deepEqual(posted[3].attachments, [
+      { name: 'mine.txt', size: 1, mime_type: 'text/plain', question: 'Second?' },
+      { name: 'old.txt', size: 1, mime_type: 'text/plain' },
+    ])
   } finally {
     card.unmount()
     if (original) Object.defineProperty(globalThis, 'localStorage', original)

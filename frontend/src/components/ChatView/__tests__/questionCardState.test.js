@@ -45,7 +45,7 @@ test('a file-only question answer can submit and ordinary cards offer upload', (
       chatId: 'file-only', questionId: 'file-only-q', questions,
     }))
     assert.match(html, /Attach a photo or file/)
-    assert.match(html, /class="qcard__submit">Submit</)
+    assert.match(html, /class="qcard__submit"[^>]*>Submit</)
     assert.equal((html.match(/aria-label="Files for this answer"/g) || []).length, 1)
     const submitted = renderToStaticMarkup(createElement(QuestionCard, {
       chatId: 'file-only', questionId: 'file-only-q', questions,
@@ -54,7 +54,7 @@ test('a file-only question answer can submit and ordinary cards offer upload', (
     }))
     assert.match(submitted, /aria-label="Files for this answer"/)
     assert.match(submitted, /chat__attachments/)
-    assert.doesNotMatch(submitted, /Shared card files/)
+    assert.doesNotMatch(submitted, /Files for all answers/)
     // The attach row stays with the Submitted action row, so answering never
     // moves the card; it only stops taking files.
     assert.match(submitted, /class="qcard__attach"[^>]*disabled=""/)
