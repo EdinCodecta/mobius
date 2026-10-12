@@ -18,18 +18,12 @@ import asyncio
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-import http.cookiejar
 import threading
 
 import httpx
 from fastapi import HTTPException
 
-
-def _refuse_all_cookies() -> http.cookiejar.CookieJar:
-  """A cookie jar whose policy accepts no cookie from any domain."""
-  return http.cookiejar.CookieJar(
-    policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[]),
-  )
+from app.net_utils import pinned_client
 
 
 @dataclass
@@ -118,13 +112,7 @@ class PinnedHostClientPool:
       async with self._lock:
         entry = self._clients.pop(key, None)
         if entry is None:
-          entry = _PooledClient(httpx.AsyncClient(
-            # Pooled clients outlive one request and serve every caller that
-            # reaches this host (the owner and every app token), so they must
-            # never keep upstream cookies: a session set for one caller would
-            # otherwise ride along on the next caller's request.
-            cookies=_refuse_all_cookies(),
-            follow_redirects=False,
+          entry = _PooledClient(pinned_client(
             # No pool timeout: see the class docstring for what bounds the
             # wait for one of this host's connections.
             timeout=httpx.Timeout(self.io_timeout, pool=None),

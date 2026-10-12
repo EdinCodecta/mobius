@@ -25,7 +25,9 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.deps import authorize_current_owner_or_app_detached, reject_cross_site
-from app.net_utils import MAX_REDIRECTS as _MAX_REDIRECTS, validate_url_safe
+from app.net_utils import (
+  MAX_REDIRECTS as _MAX_REDIRECTS, pinned_client, validate_url_safe,
+)
 from app.pinned_http_clients import PinnedHostClientPool
 
 router = APIRouter(prefix="/api/proxy", tags=["proxy"])
@@ -517,7 +519,7 @@ async def proxy_favicon(
   first tries conventional root icons with safe redirect handling. Only sites
   that need it pay for a bounded HTML read and declared-icon discovery.
   """
-  async with httpx.AsyncClient(follow_redirects=False, timeout=15) as client:
+  async with pinned_client(timeout=15) as client:
     icon = await _first_supported_icon(
       client, _canonical_root_icon_urls(url),
     )
