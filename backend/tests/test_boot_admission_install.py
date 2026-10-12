@@ -363,7 +363,7 @@ def _wrapped_identity(tmp_path, *, deployment="original-app-1", source="generate
               "Cmd": app["command"], "Labels": {**labels,
               "com.docker.compose.project": attempt_project, "com.docker.compose.service": "app",
               "com.docker.compose.container-number": "1", "com.docker.compose.oneoff": "False",
-              "com.docker.compose.project.working_dir": str(frozen),
+              "com.docker.compose.project.working_dir": str(attempts),
               "com.docker.compose.project.config_files": str(attempt)},
               "Mounts": [
                   {"Destination": "/run/mobius-boot-admission.py", "Source": "/usr/local/libexec/mobius-boot-admission.py", "Type": "bind", "RW": False},
@@ -384,7 +384,7 @@ def _wrapped_identity(tmp_path, *, deployment="original-app-1", source="generate
                                      "immutable_writable", "immutable_directory_symlink", "config_v3",
                                      "name_source", "live_renamed", "token_derived_name",
                                      "attempt_shares_original_project", "frozen_name_changed",
-                                     "stable_spelling", "frozen_data_dir"])
+                                     "stable_spelling", "frozen_data_dir", "working_dir"])
 def test_wrapped_reinstall_requires_frozen_identity_and_immutable_attempt(tmp_path, mutation):
     frozen, attempt, actual, code, cid = _wrapped_identity(tmp_path)
     configuration = json.loads((frozen / "config.v4.json").read_text())
@@ -432,6 +432,9 @@ def test_wrapped_reinstall_requires_frozen_identity_and_immutable_attempt(tmp_pa
         actual["Mounts"][2]["Source"] = "/wrong-data"
     elif mutation == "duplicate_mount":
         actual["Mounts"].append(actual["Mounts"][0])
+    elif mutation == "working_dir":
+        # Not where Compose put this attempt's project (the worker's cwd).
+        actual["Labels"]["com.docker.compose.project.working_dir"] = str(frozen)
     elif mutation == "config_files":
         actual["Labels"]["com.docker.compose.project.config_files"] = "/arbitrary/label/path"
     elif mutation == "immutable_changed":

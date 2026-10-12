@@ -151,7 +151,9 @@ prefix = ["python3", "-I", "-S", "/run/mobius-boot-admission.py", "enter",
 
 def require(condition):
     if not condition:
-        raise SystemExit("Running admission container does not match the root-frozen owning identity")
+        # Name the failing check: the operator sees only this one line.
+        raise SystemExit("Running admission container does not match the root-frozen owning identity "
+                         f"(PY_ADMISSION check at line {sys._getframe(1).f_lineno})")
 
 require(configuration.get("version") == 4 and configuration.get("project") == project)
 # The frozen data_dir names this app's persistent /data: its stable source, or
@@ -174,7 +176,9 @@ for key in ("project", "operation", "role", "token"):
     require(observed_labels.get("io.mobius.admission." + key) == labels["io.mobius.admission." + key])
 require(observed_labels.get("com.docker.compose.project") == attempt_project)
 require(observed_labels.get("com.docker.compose.service") == "app")
-require(observed_labels.get("com.docker.compose.project.working_dir") == "/etc/mobius-rebuild")
+# Compose records the directory of the attempt file it was given, not the
+# worker's cwd (confirmed with Compose v5 on a never-started container).
+require(observed_labels.get("com.docker.compose.project.working_dir") == "/etc/mobius-rebuild/attempts")
 attempt_path = Path("/etc/mobius-rebuild/attempts") / (token + ".json")
 require(observed_labels.get("com.docker.compose.project.config_files") == str(attempt_path))
 # Derive the path from the validated token, never open an arbitrary label path.
