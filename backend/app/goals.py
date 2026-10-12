@@ -326,6 +326,41 @@ def cannot_complete_result(details: dict[str, str]) -> str:
   )
 
 
+def _helper_blockers(db, run, goal) -> list[str]:
+  """Helpers a Goal cannot settle past: still working, or owed to an agent.
+
+  A helper result that has not reached its parent agent yet (for example a
+  failure that landed just before settlement, at any depth of the Goal's
+  helper tree) would otherwise be stranded: a closed Goal cannot wake that
+  agent. The owning agent reads it with list_agents, or its pending wake
+  delivers it; either records receipt and clears the blocker. App-owned
+  helpers report to their app and never hold a chat Goal open. A result
+  owed to a helper that itself failed or stopped is not counted: that helper
+  is never woken again, only it may read the result, and its own outcome is
+  what reaches the coordinator, so blocking would be uncleared forever.
+  """
+  from app.delegations import _self_resuming_helper_rows
+  from app.goal_plans import _delegation_tree, active_goal_helpers
+
+  tree_ids, owners, frontier = set(), {goal.chat_id}, _delegation_tree(
+    db, run, goal, all_attempts=True,
+  )
+  while frontier:
+    node = frontier.pop()
+    tree_ids.add(node["id"])
+    frontier.extend(node.get("children") or [])
+  owners |= {row.child_chat_id for row in db.query(models.Delegation.child_chat_id)
+             .filter(models.Delegation.id.in_(tree_ids))} if tree_ids else set()
+  return active_goal_helpers(db, run, goal) + [
+    "helper:" + row.id
+    for row, _status in _self_resuming_helper_rows(db, owners)
+    if row.app_id is None and (
+      row.id in tree_ids
+      or (row.parent_chat_id == goal.chat_id and row.goal_id == goal.id)
+    )
+  ]
+
+
 def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
                        next_action=None, complete=None, cannot_complete=None,
                        cancel=None, defer=None, tasks=None, finished_claims=()):
@@ -412,11 +447,7 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
     # A deliberate hold must not silently abandon a real handoff. Resolve its
     # owner first; this operation never cancels helpers, cards, or Waits.
     from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED
-    from app.delegations import _self_resuming_helper_rows
-    blockers = active_goal_helpers(db, run, goal)
-    blockers += ["helper:" + row.id
-      for row, _status in _self_resuming_helper_rows(db, {goal.chat_id})
-      if row.goal_id == goal.id]
+    blockers = _helper_blockers(db, run, goal)
     blockers += ["wait:" + row.id for row in _goal_waits(db, goal.chat_id, goal.id).filter(
       (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
     ).all()]
@@ -447,11 +478,13 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
       blockers += [task["id"] for task in plan_tasks if task["status"] in {
         "failed", "blocked", "cancelled",
       } and not (task.get("note") or task.get("result"))]
-    blockers += active_goal_helpers(db, run, goal)
+    blockers += _helper_blockers(db, run, goal)
     blockers = list(dict.fromkeys(blockers))
     if blockers:
       raise GoalPlanError(
-        "Goal has unfinished tasks, unexplained settlements, or active delegations: " + ", ".join(blockers),
+        "Goal has unfinished tasks, unexplained settlements, active delegations, "
+        "or helper results it has not received yet (read one with list_agents): "
+        + ", ".join(blockers),
         code="goal_completion_blocked", completion_blockers=blockers,
       )
     from app.agent_work_claims import held_claims_hint, open_claim_keys

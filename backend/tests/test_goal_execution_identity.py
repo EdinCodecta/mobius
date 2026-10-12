@@ -117,7 +117,8 @@ def test_rebind_to_named_open_goal_does_not_hide_another_open_goal(db, chat):
 def test_completed_goal_can_promote_successor_and_reuse_helper_name_without_old_waits(db, chat):
   from app.chat_waits import declare_wait, _goal_waits
   from app.delegations import (DelegationIntent, create_or_attach_delegation,
-                              own_helper_statuses, parent_wake_blocker)
+                              own_helper_statuses, parent_wake_blocker,
+                              record_result_read_by_parent)
   from app.goal_plans import _delegation_tree
   run = models.ChatRun(id="shared-physical", root_run_id="shared-physical",
                        chat_id=chat.id, status="running")
@@ -133,6 +134,9 @@ def test_completed_goal_can_promote_successor_and_reuse_helper_name_without_old_
   db.commit()
   wait = declare_wait(db, chat_id=chat.id, created_by_run_id=run.id,
                       description="A condition", kind="timer", delay_secs=60)
+  # Completion waits for helper results the agent has not received yet.
+  assert record_result_read_by_parent(db, helper_a)
+  db.commit()
   update_goal_record(db, run, goal_a, goal_a.revision, complete=True)
   goal_b = db.get(models.ChatGoal, promote(db, chat, run, "Goal B")["goal_id"])
   helper_b, attached = create_or_attach_delegation(db, DelegationIntent(**intent, goal_id=goal_b.id))
@@ -184,5 +188,5 @@ def test_promotion_adopts_only_this_runs_unowned_helpers_and_nested_descendants(
   assert [item["id"] for item in own_helper_statuses(db, chat.id, run.id)] == [scout.id]
   assert [item["id"] for item in _delegation_tree(db, run, goal)] == [scout.id]
   assert active_goal_helpers(db, run, goal)
-  with pytest.raises(GoalPlanError, match="active delegations: scout"):
+  with pytest.raises(GoalPlanError, match=r"active delegations.*: scout"):
     update_goal_record(db, run, goal, goal.revision, complete=True)

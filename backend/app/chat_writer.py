@@ -4158,10 +4158,12 @@ class ChatWriterActor:
     if blocker is not None:
       db.rollback()
       return StartContinuationBlocked(blocker)
+    goal_id = delegation_goal_id(db, trigger)
+    # A nested helper works in its coordinator's Goal, but this physical run
+    # belongs to the helper chat: bind only an open Goal this chat owns. The
+    # shared Goal stays in the activity source and the assignment chain.
     from app.run_state import open_goal_identity_for_chat
-    goal_objective, goal_id = open_goal_identity_for_chat(
-      db, cmd.chat_id, delegation_goal_id(db, trigger),
-    )
+    goal_objective, goal_id = open_goal_identity_for_chat(db, cmd.chat_id, goal_id)
 
     existing = transcript_rows.read_all(db, chat)
     try:
