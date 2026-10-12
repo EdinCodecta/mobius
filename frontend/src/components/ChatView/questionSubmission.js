@@ -8,18 +8,30 @@ export function resolveQuestionAnswer(answer, otherText) {
   return answer || ''
 }
 
+/**
+ * The group of a restored draft file whose question the card no longer asks.
+ * It stays card-level and is sent untagged, but never answers a question, not
+ * even a single-question card's. NUL keeps it apart from any question text.
+ */
+export const ORPHANED_FILE_GROUP = '\u0000orphaned'
+
 /** An untagged legacy file has an unambiguous answer only on a single-question card. */
 export function fileBelongsToQuestion(tag, question, questionCount) {
   return tag === question || (questionCount === 1 && tag == null)
 }
 
+/** The server `question` tag for a file group; orphaned and legacy files have none. */
+export function fileQuestionTag(group) {
+  return group == null || group === ORPHANED_FILE_GROUP ? undefined : group
+}
+
 /**
  * A restored draft file tagged for a question the card no longer asks would be
- * hidden yet still submitted, and the server refuses it; keep it card-level.
+ * hidden yet still submitted, and the server refuses it; mark it orphaned.
  */
 export function restoredQuestionFiles(files, questions) {
   const asked = new Set(questions.map(question => question.question))
-  return files.map(file => (file.group == null || asked.has(file.group) ? file : { ...file, group: undefined }))
+  return files.map(file => (file.group == null || asked.has(file.group) ? file : { ...file, group: ORPHANED_FILE_GROUP }))
 }
 
 /**

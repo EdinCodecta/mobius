@@ -266,6 +266,40 @@ test('a restored draft file for a question the card no longer asks stays visible
   }
 })
 
+test('a restored draft file for a replaced sole question never answers the new question', async () => {
+  const storage = {
+    values: new Map(),
+    getItem(key) { return this.values.get(key) || null },
+    setItem(key, value) { this.values.set(key, value) },
+    removeItem(key) { this.values.delete(key) },
+  }
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage })
+  const replaced = [{ question: 'New question?', options: [] }]
+  writeQuestionDraft(questionDraftKey('sole-chat', 'sole-q', replaced), { answers: {}, otherTexts: {}, files: [
+    { name: 'gone.txt', group: 'Old question?', size: 1, mime_type: 'text/plain', status: 'done' },
+  ] }, storage)
+  let posted
+  const card = renderHook(QuestionCard, { chatId: 'sole-chat', questionId: 'sole-q', questions: replaced,
+    onAnswer: async (...args) => { posted = args; return true } })
+  try {
+    const trays = () => elements(card.result.current).filter(node => node.props?.role === 'group')
+      .map(tray => [tray.props['aria-label'], chips({ props: { children: tray.props.children } }).props.files.map(f => f.name)])
+    assert.deepEqual(trays(), [['Files for this answer', []], ['Files for all answers', ['gone.txt']]])
+    assert.equal(submit(card.result.current).props.disabled, true)
+    editor(card.result.current, 'New question?').props.onChange('typed answer')
+    assert.equal(submit(card.result.current).props.disabled, false)
+    submit(card.result.current).props.onClick({ currentTarget: { closest: () => null } })
+    await tick()
+    assert.equal(posted[0], '- New question?: typed answer')
+    assert.deepEqual(posted[3].attachments, [{ name: 'gone.txt', size: 1, mime_type: 'text/plain' }])
+  } finally {
+    card.unmount()
+    if (original) Object.defineProperty(globalThis, 'localStorage', original)
+    else delete globalThis.localStorage
+  }
+})
+
 
 test('answer paste matches the composer: Markdown by default, plain on the shortcut, never once answered', () => {
   const clipboard = {

@@ -26,7 +26,7 @@ import FileChips from './FileChips.jsx'
 import Attachments from './Attachments.jsx'
 import { pastedFiles, filePasteNeedsDefaultPrevented } from './pasteUpload.js'
 import { Paperclip } from '@openai/apps-sdk-ui/components/Icon'
-import { fileBelongsToQuestion, restoredQuestionFiles, resolveQuestionAnswer, questionAnswersReady, questionOptionSubmission } from './questionSubmission.js'
+import { ORPHANED_FILE_GROUP, fileBelongsToQuestion, fileQuestionTag, restoredQuestionFiles, resolveQuestionAnswer, questionAnswersReady, questionOptionSubmission } from './questionSubmission.js'
 import {
   isRestartCardAction,
   restartCardSelectedOptions,
@@ -322,7 +322,7 @@ export default function QuestionCard({
       return `- ${q.question}: ${val.replace(/\n/g, '\n  ')}${filesLine}`
     })
     const answerAttachments = readyFiles.map(({ name, size, mime_type, group }) => ({
-      name, size, mime_type, ...(group != null ? { question: group } : {}),
+      name, size, mime_type, ...(fileQuestionTag(group) != null ? { question: group } : {}),
     }))
     setSubmitError('')
     setSubmitting(true)
@@ -369,8 +369,9 @@ export default function QuestionCard({
   if (locallyQueued) submitLabel = localAnswer.deliveryOutcome === 'delivered'
     ? 'Confirming answer…' : 'Queued on this device'
 
-  // Files sit inside the answer they belong to. Untagged files predate that:
-  // a grouped card keeps them card-level, below the answers.
+  // Files sit inside the answer they belong to. Card-level files sit below the
+  // answers: untagged ones on a grouped card (they predate per-answer files)
+  // and restored draft files whose question left the card.
   const sentAttachments = attachments || localAnswer?.body?.attachments || submitted?.attachments || []
   const fileTray = (owns, label) => platformAction ? null : (
     <div className="qcard__answer-files" role="group" aria-label={label}>
@@ -379,9 +380,10 @@ export default function QuestionCard({
         : <FileChips files={files.filter(file => owns(file.group))} onRemove={removeFile} chatId={chatId} disabled={submitting || disabled} />}
     </div>
   )
-  const hasCardFiles = grouped && (selectionLocked
-    ? sentAttachments.some(file => file.question == null)
-    : files.some(file => file.group == null))
+  const cardLevel = tag => tag === ORPHANED_FILE_GROUP || (grouped && tag == null)
+  const hasCardFiles = selectionLocked
+    ? sentAttachments.some(file => cardLevel(file.question))
+    : files.some(file => cardLevel(file.group))
 
   return (
     <div
@@ -579,7 +581,7 @@ export default function QuestionCard({
         )
         })}
       </div>
-      {hasCardFiles && fileTray(tag => tag == null, 'Files for all answers')}
+      {hasCardFiles && fileTray(cardLevel, 'Files for all answers')}
       {!platformAction && (answered || !disabled) && (
         <input ref={fileInputRef} type="file" multiple className="qcard__file-input"
           disabled={attachLocked}
