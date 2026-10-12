@@ -64,6 +64,7 @@ from app import (
 from app import app_cron
 from app.build_admission import BuildLeaseUnavailable
 from app.app_capabilities import contract_and_digest
+from app.app_compile_contract import RolldownStalled
 from app.app_source_check import SourceCheckResult, check_app_source
 from app.compiler import (
   CompileError,
@@ -1417,6 +1418,9 @@ async def _kept_local_bundle_unchanged(
       return kept_bundle == await asyncio.to_thread(output.read_bytes)
     except BuildLeaseUnavailable as exc:
       raise HTTPException(503, "JavaScript builder is busy; retry the update.") from exc
+    except RolldownStalled as exc:
+      # A stall says nothing about whether the trees differ.
+      raise HTTPException(503, exc.detail()) from exc
     except (RuntimeError, OSError, UnicodeError, KeyError, HTTPException):
       return False
   finally:
@@ -5331,6 +5335,10 @@ async def _install_candidate(
     db.rollback()
     journal.rollback_materialization()
     raise HTTPException(422, _compile_error_detail(app_name, exc))
+  except RolldownStalled as exc:
+    db.rollback()
+    journal.rollback_materialization()
+    raise HTTPException(503, exc.detail()) from exc
   except app_git.HistoryIncomplete as exc:
     db.rollback()
     journal.rollback_materialization()

@@ -58,6 +58,7 @@ from app.terminal_output import readable_output
 from app.app_capabilities import (
   contract_and_digest, contract_from_manifest, diff_contracts,
 )
+from app.app_compile_contract import RolldownStalled
 from app.broadcast import get_system_broadcast
 from app.recovery_notifications import (
   complete_recovery_action,
@@ -2159,6 +2160,9 @@ async def apply_app_source(
       if stderr:
         detail["stderr"] = stderr
       raise HTTPException(status_code=422, detail=detail) from exc
+    except RolldownStalled as exc:
+      # Distinct from compile_failed: the source was not judged.
+      raise HTTPException(status_code=503, detail=exc.detail()) from exc
 
   async with fs_locks.install_uninstall_lock():
     matched = (

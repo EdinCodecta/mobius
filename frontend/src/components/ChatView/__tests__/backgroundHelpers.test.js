@@ -12,16 +12,21 @@ import {
 test('idle waking helpers own one visible automatic Waiting handoff', () => {
   const helpers = {
     count: 2,
-    items: [{ task_key: 'review_copy' }, { task_key: 'verify-build' }],
+    items: [
+      { task_key: 'review-copy', title: 'review-copy' },
+      { task_key: 'verify-build', title: 'verify-build' },
+    ],
   }
   assert.equal(classifyChatHandoff({ backgroundHelpers: helpers }), 'automatic')
-  assert.deepEqual(helperPresentation(helpers), {
+  assert.deepEqual(helperPresentation(helpers, { kind: 'automatic' }), {
     count: 2,
-    tasks: ['Review copy', 'Verify build'],
+    tasks: ['review-copy', 'verify-build'],
     summary: 'Waiting on 2 helpers',
     owner: '2 helper agents',
-    usage: 'Helpers use their own turns · no separate monitor is polling',
+    automatic: true,
+    usage: 'Usage unknown',
   })
+  assert.equal(helperPresentation(helpers, { kind: 'recovery' }).automatic, false)
 })
 
 test('declared waits stay compact and disclose ownership, deadline, and cost', () => {

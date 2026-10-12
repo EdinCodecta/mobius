@@ -294,6 +294,9 @@ Run validation once:
 python "$SCRIPTS_DIR/validate-app.py" /data/apps/<slug>
 ```
 
+`INCONCLUSIVE` (exit 3) or an apply `build_stalled` means the machine was too
+busy to finish the build, not a source error: retry later instead of editing.
+
 Do not run `git add` or `git commit`. `apply_app` owns every accepted source
 commit and leaves later edits as an unpublished draft until the next apply.
 Repository status is diagnostic: a clean tree confirms the applied revision,
