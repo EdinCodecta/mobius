@@ -5238,9 +5238,9 @@ export default function ChatView({
           if (!cancelled && runtime) ensureRuntimeStreamConnected(runtime)
         })
     }
-    // Tick fast, but while the chat stream is demonstrably delivering read only
-    // at the safety cadence. A delivering stream just (re)attached with its own
-    // catch-up, so it needs no immediate read either.
+    // Tick fast, but while the chat stream is demonstrably delivering, read
+    // only at the safety cadence (and not at once): the stream already carries
+    // the run, question, steer, and queue-promotion state this read fetches.
     const delivering = () => runtimeStreamDelivering({
       isStreaming, connectionError, lastReadAt: streamLastReadAtRef.current,
     })
