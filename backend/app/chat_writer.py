@@ -1312,6 +1312,21 @@ class ResolvePark(_Command):
 
 
 @dataclass
+class PostponeResourcePark(_Command):
+  """Move a still-short memory/storage park's next check to ``parked_until``.
+
+  The reset sweep checks admission before resuming a resource park. While the
+  resource is still short, the same parked run simply waits longer: starting a
+  continuation would only re-park and append another identical waiting card.
+  Idempotent; a run no longer parked for a resource is left alone.
+  """
+
+  chat_id: str = ""
+  run_token: str = ""
+  parked_until: object = None
+
+
+@dataclass
 class PrepareAutoResume(_Command):
   """Durably mark a due park as notified but still awaiting auto-resume.
 
@@ -1407,6 +1422,7 @@ _FENCE_COMMANDS = (
   RecoverWedgedRun,
   ParkRun,
   ResolvePark,
+  PostponeResourcePark,
   PrepareAutoResume,
 )
 
@@ -2246,6 +2262,8 @@ class ChatWriterActor:
       return self._prepare_restart_intents(db, cmd)
     if isinstance(cmd, ResolvePark):
       return self._resolve_park(db, cmd)
+    if isinstance(cmd, PostponeResourcePark):
+      return self._postpone_resource_park(db, cmd)
     if isinstance(cmd, PrepareAutoResume):
       return self._prepare_auto_resume(db, cmd)
     raise NotImplementedError(type(cmd).__name__)
@@ -6036,6 +6054,26 @@ class ChatWriterActor:
       run.ended_at = datetime.now(UTC)
     if not _commit_or_rollback(db):
       raise _PersistFailed("ResolvePark did not persist")
+    return True
+
+  def _postpone_resource_park(self, db, cmd: PostponeResourcePark):
+    """Push a resource park's due time later; True when it moved."""
+    from app.models import RESOURCE_PARK_REASONS, ChatRun
+
+    run = db.query(ChatRun).filter(
+      ChatRun.id == cmd.run_token,
+      ChatRun.chat_id == cmd.chat_id,
+    ).first()
+    if (
+      run is None
+      or run.status not in ("parked", "resume_pending")
+      or run.park_reason not in RESOURCE_PARK_REASONS
+      or not self._run_is_latest(db, run)
+    ):
+      return False
+    run.parked_until = cmd.parked_until
+    if not _commit_or_rollback(db):
+      raise _PersistFailed("PostponeResourcePark did not persist")
     return True
 
   def _prepare_auto_resume(self, db, cmd: PrepareAutoResume):

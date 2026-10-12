@@ -29,6 +29,39 @@ from app.resource_pressure import GIB, MIB
 )
 def test_data_alert_tier(free, expected):
   assert capacity.data_alert_tier(free) == expected
+  # A large volume keeps the absolute bands unchanged.
+  assert capacity.data_alert_tier(free, 45 * GIB) == expected
+
+
+@pytest.mark.parametrize(
+  "free,expected",
+  [
+    (4 * GIB, None),
+    (2 * GIB, "notice"),       # below 30% of 8 GiB
+    (1 * GIB, "warning"),      # below 20%
+    (500 * MIB, "critical"),   # below 10%, still above admission's 5% floor
+  ],
+)
+def test_small_volume_alert_tiers_scale_so_running_out_still_alerts(free, expected):
+  """Absolute 8/5/2 GiB bands put a small disk permanently inside a tier it had
+  already announced, so filling it up raised no alert. Each band is capped by a
+  share of the volume, and the critical alert precedes paused chats."""
+  assert capacity.data_alert_tier(free, 8 * GIB) == expected
+  ladder = capacity.data_alert_ladder(8 * GIB)
+  assert ladder["critical"] > int(8 * GIB * 0.05)
+
+
+def test_alert_body_names_the_pause_floor_in_plain_words():
+  snap = {
+    "data_free_bytes": 600 * MIB,
+    "data_total_bytes": 8 * GIB,
+    "mounts": {"data": {"critical_below_bytes": 410 * MIB}},
+  }
+  body = capacity_history.alert_body(snap, None)
+  assert body == (
+    "Möbius has 600 MB of 8.0 GB storage left. Chats pause automatically "
+    "below 410 MB. Ask Möbius in a chat to free up space, or grow the volume."
+  )
 
 
 # --- capacity.py: bounded, symlink-safe, size-only dir walk -----------------
@@ -255,7 +288,8 @@ def test_alert_body_includes_top_domain_and_forecast():
     },
   }
   body = capacity_history.alert_body(snap, {"time_to_exhaustion_seconds": 3600})
-  assert "critical" in body
+  assert body.startswith("Möbius has 1.5 GB of storage left.")
+  assert "free up space" in body
   assert "provider_telemetry_codex" in body  # the largest domain
   assert "1.0h" in body
 

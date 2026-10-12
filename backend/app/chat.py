@@ -48,7 +48,11 @@ from app.broadcast import (
   has_running_chat_broadcast,
   set_active_broadcast,
 )
-from app.agent_admission import AgentTurnDeferred, require_agent_turn_admission
+from app.agent_admission import (
+  AgentTurnDeferred,
+  agent_turn_deferral,
+  require_agent_turn_admission,
+)
 from app.chat_event_sink import (
   ChatEventSink as _ChatEventSink,
   _pause_note,
@@ -104,6 +108,7 @@ from app.chat_writer import (
   RecordRunMetrics,
   ReconcileStartupChat,
   RecoverWedgedRun,
+  PostponeResourcePark,
   ResolvePark,
   StartContinuation,
   StartContinuationAttached,
@@ -1873,6 +1878,7 @@ async def prepare_restart_intents(
 LIMIT_RETRY_NOTIFY_TITLE = "Your paused chat is ready to retry"
 LIMIT_RETRY_NOTIFY_BODY = "The retry check is due. The provider may still be limited."
 CONTINUATION_SWEEP_BATCH_SIZE = 100
+_RESOURCE_HOLD_UNCHECKED = object()
 # Start due provider-limit continuations gradually. Unrelated live work must
 # not delay an opted-in chat after its retry check, but a bad/early timestamp
 # also must not launch a whole parked batch in one burst.
@@ -2602,11 +2608,41 @@ async def sweep_reset_parks(
   def wants_auto_resume(chat, run) -> bool:
     return auto_resume_rejection(chat, run) is None
 
+  # Measured at most once per pass: every resource park asks the same question.
+  resource_hold: AgentTurnDeferred | None | object = _RESOURCE_HOLD_UNCHECKED
+
   for run in due:
     chat_id = run.chat_id
     chat = chats.get(chat_id)
     chat_gone = chat is None or chat.deleted_at is not None
     auto_resume = wants_auto_resume(chat, run)
+    if auto_resume and run.park_reason in RESOURCE_PARK_REASONS:
+      # A continuation started while memory or storage is still short only
+      # re-parks and saves another identical waiting card (dozens per chat
+      # during one low-disk episode). Keep the one parked run and its one card,
+      # and check again later; the turn resumes once admission would succeed.
+      if resource_hold is _RESOURCE_HOLD_UNCHECKED:
+        try:
+          resource_hold = await agent_turn_deferral(get_settings().data_dir)
+        except Exception:
+          log.warning(
+            "sweep_reset_parks: resource check failed; resuming normally",
+            exc_info=True,
+          )
+          resource_hold = None
+      if resource_hold is not None:
+        try:
+          await _await_ack(get_writer().submit(PostponeResourcePark(
+            chat_id=chat_id,
+            run_token=run.id,
+            parked_until=now + _PARK_MIN_DELAY,
+          )))
+        except Exception:
+          log.warning(
+            "sweep_reset_parks: resource postpone failed chat_id=%s",
+            chat_id, exc_info=True,
+          )
+        continue
     restart_auto_resume = auto_resume and run.park_reason == "restart"
     if run.park_reason == "restart" and not auto_resume:
       log.info(
@@ -3953,7 +3989,7 @@ def _parse_reset_text(text: str, now: datetime) -> datetime | None:
 # `chat_run_finished` wake-ups. These parks always continue: the platform
 # interrupted the turn, not a provider quota, so the paid-retry opt-in for
 # limits does not apply.
-RESOURCE_PARK_REASONS = frozenset({"memory", "storage"})
+RESOURCE_PARK_REASONS = models.RESOURCE_PARK_REASONS
 # These recoveries belong to the interrupted turn rather than the paid-limit
 # preference. Compaction is admitted only after one bounded synthesis succeeds;
 # the saved attempt flag prevents repeated synthesis/retry on the same root.
@@ -4029,6 +4065,40 @@ def _limit_park_fields(
       "limit-park reset parse failed; using fallback", exc_info=True,
     )
     return LimitParkTiming(now + PARK_FALLBACK_DELAY, "rate_limit")
+
+
+TURN_STOPPED_MESSAGE = (
+  "The agent stopped before finishing this turn. Your work so far is saved; "
+  "tap Resume to continue."
+)
+PROCESS_DIED_MESSAGE = (
+  "The agent's process was shut down unexpectedly, usually because it ran out "
+  "of memory or time. Your work so far is saved; tap Resume to try again."
+)
+# A provider CLI killed by a signal reports a negative exit status, and the SDK
+# adds this placeholder when the process died before writing any output.
+_PROCESS_DIED_RE = re.compile(
+  r"exit code:? -\d+|no stderr captured", re.IGNORECASE,
+)
+
+
+def turn_failure_block(error_text: str) -> dict:
+  """The transcript card for a provider turn that ended with an error.
+
+  Provider failure text is written for developers. Known process-level
+  failures get a plain sentence and a Resume affordance; their raw text goes
+  to the server log, as for setup failures, so the error block keeps its
+  two-key passthrough (events.ERROR_PASSTHROUGH_FIELDS). Any other provider
+  message is shown as-is: it is often the only useful explanation (an auth
+  problem, a refused request), and guessing would hide it.
+  """
+  text = error_text.strip()
+  if text == "Execution interrupted.":
+    return {"type": "error", "message": TURN_STOPPED_MESSAGE, "resumable": True}
+  if _PROCESS_DIED_RE.search(text):
+    _get_logger().warning("agent process ended unexpectedly: %s", text[-2000:])
+    return {"type": "error", "message": PROCESS_DIED_MESSAGE, "resumable": True}
+  return {"type": "error", "message": error_text}
 
 
 def _park_event(
@@ -4223,7 +4293,7 @@ def _park_exit(
       ))
       return {"parked": False}
     if error_text:
-      sink.publish({"type": "error", "message": error_text})
+      sink.publish(turn_failure_block(error_text))
     elif runner_result is None:
       # An EXCEPTION exit must always persist an error block. A bare
       # exception (e.g. `TimeoutError()`) stringifies to "" — publishing

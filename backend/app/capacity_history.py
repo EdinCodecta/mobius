@@ -191,11 +191,23 @@ def alert_notification_id(tier: str, *, day: str | None = None) -> str:
   return f"capacity-{tier}-{day}"
 
 
+def _size(value: int) -> str:
+  return f"{value / GIB:.1f} GB" if value >= GIB else f"{value // (1024 * 1024)} MB"
+
+
 def alert_body(snapshot: dict[str, Any], forecast_result: dict[str, Any] | None) -> str:
+  """The owner-facing alert: how much is left, what happens next, what to do."""
   free = snapshot.get("data_free_bytes")
-  tier = snapshot.get("alert_tier") or "notice"
-  free_str = f"{free / GIB:.2f} GiB" if isinstance(free, int) else "an unknown amount"
-  parts = [f"/data has {free_str} free (alert: {tier})."]
+  total = snapshot.get("data_total_bytes")
+  if isinstance(free, int) and isinstance(total, int) and total > 0:
+    parts = [f"Möbius has {_size(free)} of {_size(total)} storage left."]
+  elif isinstance(free, int):
+    parts = [f"Möbius has {_size(free)} of storage left."]
+  else:
+    parts = ["Möbius storage is running low."]
+  floor = ((snapshot.get("mounts") or {}).get("data") or {}).get("critical_below_bytes")
+  if isinstance(floor, int) and floor > 0:
+    parts.append(f"Chats pause automatically below {_size(floor)}.")
   domains = snapshot.get("domains") or {}
   sized = [
     (name, d.get("bytes", 0))
@@ -208,16 +220,17 @@ def alert_body(snapshot: dict[str, Any], forecast_result: dict[str, Any] | None)
   )
   if sized and not incomplete:
     name, size = max(sized, key=lambda kv: kv[1])
-    parts.append(f"Largest domain: {name} ({size / GIB:.2f} GiB).")
+    parts.append(f"The largest use is {name} ({_size(size)}).")
   elif incomplete:
+    # Partial totals must not be used to name a largest owner.
     parts.append(
-      "Domain attribution was scan-limited; partial totals must not be used "
-      "to name a largest owner. Incomplete: " + ", ".join(incomplete) + "."
+      "Sizes were only partly measured (scan-limited: "
+      + ", ".join(incomplete) + ")."
     )
   tte = (forecast_result or {}).get("time_to_exhaustion_seconds")
   if isinstance(tte, (int, float)) and tte > 0:
-    parts.append(f"~{tte / 3600:.1f}h to exhaustion at the current rate.")
-  parts.append("Reclaim space or grow the volume.")
+    parts.append(f"At the current rate it fills in about {tte / 3600:.1f}h.")
+  parts.append("Ask Möbius in a chat to free up space, or grow the volume.")
   return " ".join(parts)
 
 
