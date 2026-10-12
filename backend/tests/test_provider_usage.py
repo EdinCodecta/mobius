@@ -2,7 +2,9 @@
 
 import asyncio
 import base64
+import copy
 import json
+import os
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -2895,3 +2897,106 @@ def test_late_success_keeps_refusal_backoff_through_an_ordinary_concurrent_failu
   path = provider_usage._last_reading_path(data_dir, "codex")
   assert json.loads(path.read_bytes())["snapshot"] == ready
   assert list(path.parent.glob("*.tmp")) == []
+
+
+@pytest.mark.parametrize("older_state", ["unavailable", "refused", "disconnected"])
+@pytest.mark.parametrize("newer_state", ["unavailable", "refused", "disconnected"])
+def test_older_failure_cannot_override_a_newer_failure_or_disconnect(
+  monkeypatch, tmp_path, older_state, newer_state,
+):
+  """Two overlapping unsuccessful probes: the later-started one publishes
+  first, and the older result neither replaces nor clears it."""
+  from app import provider_usage
+
+  data_dir = str(tmp_path)
+  key = provider_usage._cache_key("codex", data_dir)
+  started = threading.Event()
+  resume = threading.Event()
+  old_thread = None
+
+  async def snapshot(_provider_id, _data_dir):
+    state = newer_state
+    if threading.get_ident() == old_thread:
+      started.set()
+      assert await asyncio.to_thread(resume.wait, 5)
+      state = older_state
+    if state == "refused":
+      raise provider_usage.ProviderUsageRefused("codex", None)
+    return {**WEEKLY_READY, "state": state}
+
+  def older_read():
+    nonlocal old_thread
+    old_thread = threading.get_ident()
+    return asyncio.run(provider_usage.read_provider_usage("codex", data_dir))
+
+  monkeypatch.setattr(provider_usage, "_provider_snapshot", snapshot)
+  with ThreadPoolExecutor(max_workers=1) as pool:
+    older = pool.submit(older_read)
+    try:
+      assert started.wait(5)
+      newer = asyncio.run(provider_usage.read_provider_usage("codex", data_dir))
+      published = copy.deepcopy(provider_usage._provider_usage_cache.get(key))
+    finally:
+      resume.set()
+    older_result = older.result(timeout=5)
+
+  assert newer["state"] == (
+    "disconnected" if newer_state == "disconnected" else "unavailable"
+  )
+  assert older_result["state"] == "unavailable"
+  assert provider_usage._provider_usage_cache.get(key) == published
+  if newer_state == "refused":
+    assert published.consecutive_refusals == 1
+  assert not provider_usage._last_reading_path(data_dir, "codex").exists()
+
+
+def test_usage_lock_map_drops_closed_event_loops(monkeypatch, tmp_path):
+  """Each sync caller's asyncio.run leaves a closed loop behind; its locks
+  must not accumulate for the life of the process."""
+  from app import provider_usage
+
+  provider_usage._provider_usage_locks.clear()
+  loops = []
+
+  async def snapshot(_provider_id, _data_dir):
+    return WEEKLY_READY
+
+  async def read():
+    loops.append(asyncio.get_running_loop())
+    return await provider_usage.read_provider_usage(
+      "codex", str(tmp_path), force_refresh=True,
+    )
+
+  monkeypatch.setattr(provider_usage, "_provider_snapshot", snapshot)
+  for _ in range(3):
+    assert asyncio.run(read())["state"] == "ready"
+
+  assert list(provider_usage._provider_usage_locks) == [loops[-1]]
+
+
+def test_abandoned_staged_reading_is_removed_by_the_next_stage(monkeypatch, tmp_path):
+  """A crash between mkstemp and os.replace leaves a .tmp stage; the next
+  successful reading removes it but leaves a concurrent probe's live stage."""
+  from app import provider_usage
+
+  data_dir = str(tmp_path)
+  path = provider_usage._last_reading_path(data_dir, "codex")
+  path.parent.mkdir(parents=True)
+  abandoned = path.parent / f".{path.name}.crashed.tmp"
+  live = path.parent / f".{path.name}.inflight.tmp"
+  other_provider = path.parent / ".claude-last-reading.json.crashed.tmp"
+  for staged in (abandoned, live, other_provider):
+    staged.write_text("{}")
+  old = provider_usage.time.time() - provider_usage._STAGED_READING_ABANDONED_SECONDS - 1
+  os.utime(abandoned, (old, old))
+  os.utime(other_provider, (old, old))
+
+  async def snapshot(_provider_id, _data_dir):
+    return WEEKLY_READY
+
+  monkeypatch.setattr(provider_usage, "_provider_snapshot", snapshot)
+  assert asyncio.run(provider_usage.read_provider_usage("codex", data_dir))["state"] == "ready"
+
+  assert not abandoned.exists()
+  assert live.exists() and other_provider.exists()
+  assert json.loads(path.read_bytes())["snapshot"]["state"] == "ready"

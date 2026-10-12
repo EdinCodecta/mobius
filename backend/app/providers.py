@@ -1520,12 +1520,16 @@ def detect_available() -> list[str]:
 # entry doesn't block the other's refresh.
 #
 # Fallback: if an upstream fetch raises (network, auth, rate limit),
-# we return KNOWN_MODELS[provider] for THAT provider. The other
+# we keep THAT provider's last live catalog (retrying sooner) or, with
+# none, return KNOWN_MODELS[provider]. The other
 # provider's live data still flows. This is the "reversibility over
 # prevention" axis applied to the picker — a transient outage
 # shouldn't break the chat-creation surface.
 
 _MODEL_CACHE_TTL_SECONDS = 5 * 60
+# A failed refresh keeps the last live catalog and retries after this, rather
+# than downgrading to KNOWN_MODELS for a full TTL.
+_MODEL_REFRESH_RETRY_SECONDS = 30.0
 
 # In-process cache. Single-process FastAPI means a dict is enough; if
 # we ever scale out we'll need a shared cache, but that's not the
@@ -2115,7 +2119,9 @@ def _served_model_entries(
     return None
   if time.monotonic() - cached[0] >= _MODEL_CACHE_TTL_SECONDS:
     running = _model_refresh_tasks.get(provider_id)
-    if (running is None or running.done()) and provider_id in _model_registry_locks:
+    # A task whose loop closed never reports done(); it must not block refreshes.
+    idle = running is None or running.done() or running.get_loop().is_closed()
+    if idle and provider_id in _model_registry_locks:
       task = asyncio.create_task(
         _fetch_model_entries(data_dir, provider_id),
         name=f"model-catalog-refresh:{provider_id}",
@@ -2149,11 +2155,20 @@ async def _fetch_model_entries(
       live_models = await PROVIDERS[provider_id].fetch_models(data_dir)
       entries = _live_model_entries(provider_id, live_models)
     except Exception as exc:  # noqa: BLE001 — fallback is the contract
-      _model_registry_log.warning(
-        "model registry fetch failed for %s: %s; using KNOWN_MODELS",
-        provider_id, exc,
-      )
+      prior = _model_registry_cache.get(provider_id)
       entries = _fallback_models(provider_id)
+      keep_live = prior is not None and prior[1] != entries
+      _model_registry_log.warning(
+        "model registry fetch failed for %s: %s; %s", provider_id, exc,
+        "keeping the last live catalog" if keep_live else "using KNOWN_MODELS",
+      )
+      if keep_live:
+        # Stamp it so it expires after the retry interval, not a full TTL.
+        _model_registry_cache[provider_id] = (
+          time.monotonic() - _MODEL_CACHE_TTL_SECONDS + _MODEL_REFRESH_RETRY_SECONDS,
+          prior[1],
+        )
+        return provider_id, prior[1]
     _model_registry_cache[provider_id] = (time.monotonic(), entries)
     return provider_id, entries
 
@@ -2167,8 +2182,8 @@ async def list_models(
   Cache TTL is 5 minutes per provider; an expired catalog is served
   at once while one background refresh replaces it, so only a provider
   with no cached catalog blocks its caller. On upstream failure for a
-  given provider we serve KNOWN_MODELS for THAT provider (the live
-  data from the other provider still flows). `force_refresh=True`
+  given provider we keep its last live catalog, or serve KNOWN_MODELS
+  for THAT provider (the live data from the other provider still flows). `force_refresh=True`
   bypasses the cache — used by the manage-models modal's refresh
   button so the user can pull a just-released model on demand.
 
@@ -2209,9 +2224,10 @@ async def list_models(
 async def model_supports_effort(data_dir: str, model: str | None) -> bool:
   """Use a current Claude capability at execution, not a stale picker row.
 
-  Display lists may be stale-while-revalidate, but a saved effort sent to a
-  newly effortless model is rejected by Claude. Refresh only this provider
-  when its catalog has expired; unrelated discovery never belongs here.
+  Unlike list_models, this does not serve an expired catalog: a saved effort
+  sent to a newly effortless model is rejected by Claude, so an expired
+  Claude catalog is refreshed (only Claude) before answering. A fresh catalog
+  answers without I/O; unrelated discovery never belongs here.
   """
   if not model:
     return True

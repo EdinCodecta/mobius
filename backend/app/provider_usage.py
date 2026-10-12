@@ -67,6 +67,9 @@ _PROVIDER_USAGE_REFUSED_BACKOFF_SECONDS = 60.0
 # observed cold-read failure; Codex already owns a bounded protocol timeout and
 # Möbius can truthfully have no measurable balance yet.
 _CLAUDE_COLD_RETRY_DELAYS = (0.25, 0.75)
+# A staged restart reading older than this was abandoned by a crash before
+# os.replace; a live stage is published or unlinked within its own probe.
+_STAGED_READING_ABANDONED_SECONDS = 5 * 60.0
 
 # One browser query is shared across panes, but several browser sessions can
 # still open the same provider at once. Keep the external probe single-flight
@@ -110,7 +113,10 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
 
 
 _provider_usage_cache: dict[tuple[str, str], _CachedProviderUsage] = {}
-_provider_usage_locks: dict[tuple[tuple[str, str], asyncio.AbstractEventLoop], asyncio.Lock] = {}
+# Probe coalescing locks, per event loop (see _provider_usage_lock).
+_provider_usage_locks: dict[
+  asyncio.AbstractEventLoop, dict[tuple[str, str], asyncio.Lock]
+] = {}
 _provider_usage_generation: dict[tuple[str, str], int] = {}
 _provider_usage_publication: dict[tuple[str, str], _ProviderUsagePublication] = {}
 _provider_usage_probe_ids = itertools.count(1)
@@ -1204,6 +1210,7 @@ def _prepare_reading(provider_id: str, data_dir: str, snapshot: dict) -> Path | 
   name = None
   try:
     path.parent.mkdir(parents=True, exist_ok=True)
+    _discard_abandoned_stages(path)
     fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as staged:
       json.dump({"observed_at": time.time(), "snapshot": snapshot}, staged)
@@ -1216,6 +1223,15 @@ def _prepare_reading(provider_id: str, data_dir: str, snapshot: dict) -> Path | 
       Path(name).unlink(missing_ok=True)
     log.debug("%s usage reading not persisted", provider_id, exc_info=True)
     return None
+
+
+def _discard_abandoned_stages(path: Path) -> None:
+  """Remove staged readings a crash left between mkstemp and os.replace."""
+  cutoff = time.time() - _STAGED_READING_ABANDONED_SECONDS
+  for staged in path.parent.glob(f".{path.name}.*.tmp"):
+    with suppress(OSError):
+      if staged.stat().st_mtime < cutoff:
+        staged.unlink()
 
 
 def _restored_reading(
@@ -1248,6 +1264,24 @@ def _stale_reading_is_servable(cached: _CachedProviderUsage, now: float) -> bool
     and now - cached.observed_at <= _PROVIDER_USAGE_STALE_SECONDS
     and _snapshot_resets_are_current(cached.snapshot)
   )
+
+
+def _provider_usage_lock(key: tuple[str, str]) -> asyncio.Lock:
+  """This loop's probe-coalescing lock for one provider account.
+
+  asyncio.Lock cannot safely wake a waiter on another thread's loop, so
+  probes coalesce within each loop and the authority lock handles cross-loop
+  invalidation and publication. Closed loops (each sync caller's asyncio.run)
+  are dropped whenever a new loop arrives, so the map stays bounded.
+  """
+  loop = asyncio.get_running_loop()
+  with _provider_usage_authority_lock:
+    locks = _provider_usage_locks.get(loop)
+    if locks is None:
+      for closed in [held for held in _provider_usage_locks if held.is_closed()]:
+        del _provider_usage_locks[closed]
+      locks = _provider_usage_locks[loop] = {}
+    return locks.setdefault(key, asyncio.Lock())
 
 
 def _held_usage(key: tuple[str, str]) -> dict[str, Any] | None:
@@ -1354,11 +1388,7 @@ async def read_provider_usage(
   if held is not None:
     return held
 
-  # asyncio.Lock cannot safely wake a waiter on another thread's loop.
-  # Coalesce within each loop; the authority lock below handles cross-loop
-  # invalidation and publication.
-  lock = _provider_usage_locks.setdefault((key, asyncio.get_running_loop()), asyncio.Lock())
-  async with lock:
+  async with _provider_usage_lock(key):
     # Another request may have refreshed while this one waited.
     held = None if force_refresh else _held_usage(key)
     if held is not None:

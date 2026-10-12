@@ -19,6 +19,7 @@ import asyncio
 import json
 import stat
 import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -342,6 +343,77 @@ async def test_model_list_with_no_catalog_waits_for_discovery(monkeypatch, tmp_p
   result = await providers.list_models(str(tmp_path))
   assert [row["id"] for row in result["codex"]] == ["gpt-new"]
   assert providers._model_refresh_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_background_refresh_keeps_the_live_catalog_and_retries_sooner(
+  monkeypatch, tmp_path,
+):
+  """A refresh failure must not downgrade a live catalog to KNOWN_MODELS for
+  a full TTL; the live rows stay and the next refresh comes sooner."""
+  monkeypatch.setattr(providers, "_model_registry_cache", {})
+  monkeypatch.setattr(providers, "_model_refresh_tasks", {})
+  monkeypatch.setattr(providers, "sync_app_model_providers", lambda *_a, **_kw: None)
+  monkeypatch.setattr(providers, "provider_selectable", lambda _d, pid: pid == "codex")
+  live = [{"id": "gpt-live", "label": "Live"}]
+  monkeypatch.setitem(
+    providers._model_registry_cache, "codex", (time.monotonic() - 10_000, live),
+  )
+
+  async def failing_codex_models(_data_dir):
+    raise RuntimeError("discovery down")
+
+  monkeypatch.setattr(providers.PROVIDERS["codex"], "fetch_models", failing_codex_models)
+  data_dir = str(tmp_path)
+  assert (await providers.list_models(data_dir))["codex"] == live
+  await asyncio.gather(
+    providers._model_refresh_tasks["codex"], return_exceptions=True,
+  )
+
+  stamped_at, entries = providers._model_registry_cache["codex"]
+  assert entries == live
+  remaining = providers._MODEL_CACHE_TTL_SECONDS - (time.monotonic() - stamped_at)
+  assert 0 < remaining <= providers._MODEL_REFRESH_RETRY_SECONDS
+  assert (await providers.list_models(data_dir))["codex"] == live
+
+
+@pytest.mark.asyncio
+async def test_cold_refresh_failure_still_serves_known_models(monkeypatch, tmp_path):
+  monkeypatch.setattr(providers, "_model_registry_cache", {})
+
+  async def failing_codex_models(_data_dir):
+    raise RuntimeError("discovery down")
+
+  monkeypatch.setattr(providers.PROVIDERS["codex"], "fetch_models", failing_codex_models)
+  _, entries = await providers._fetch_model_entries(str(tmp_path), "codex")
+  assert entries == providers._fallback_models("codex")
+  assert providers._fresh_model_entries("codex") == entries
+
+
+@pytest.mark.asyncio
+async def test_refresh_task_on_a_closed_loop_does_not_block_new_refreshes(
+  monkeypatch, tmp_path,
+):
+  """A task whose loop closed never reports done(); refreshes must resume."""
+  monkeypatch.setattr(providers, "_model_registry_cache", {})
+  dead_loop = asyncio.new_event_loop()
+  dead_loop.close()
+  orphan = SimpleNamespace(done=lambda: False, get_loop=lambda: dead_loop)
+  monkeypatch.setattr(providers, "_model_refresh_tasks", {"codex": orphan})
+  stale = [{"id": "gpt-old", "label": "Old"}]
+  monkeypatch.setitem(
+    providers._model_registry_cache, "codex", (time.monotonic() - 10_000, stale),
+  )
+
+  async def codex_models(_data_dir):
+    return [{"id": "gpt-new", "label": "New"}]
+
+  monkeypatch.setattr(providers.PROVIDERS["codex"], "fetch_models", codex_models)
+  assert providers._served_model_entries(str(tmp_path), "codex") == stale
+  refresh = providers._model_refresh_tasks["codex"]
+  assert refresh is not orphan
+  await refresh
+  assert [row["id"] for row in providers._model_registry_cache["codex"][1]] == ["gpt-new"]
 
 
 def test_mobius_effort_scale_uses_the_public_product_model():
