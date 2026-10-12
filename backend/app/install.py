@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -782,7 +783,8 @@ async def _http_get(
     raise HTTPException(
       502, f"Too many redirects (>{_MAX_REDIRECTS}) starting from {url}",
     )
-  pinned_url, host_header, sni_host = _validate_url_safe(url)
+  # getaddrinfo blocks; resolve off the event loop.
+  pinned_url, host_header, sni_host = await asyncio.to_thread(_validate_url_safe, url)
   try:
     async with client.stream(
       "GET", pinned_url,
@@ -2684,10 +2686,15 @@ def _read_git_package_inputs(
 
   icon_processed = None
   icon_warning = None
-  if manifest.get("icon"):
+  icon = manifest.get("icon")
+  if icon and icon not in tree:
+    # As over HTTP, an optional icon the package lacks is only a warning. A
+    # listed but unreadable object still fails closed like any other input.
+    icon_warning = f"icon: candidate Git tree is missing icon {icon}"
+  elif icon:
     try:
       icon_processed = icon_assets.normalize_icon(
-        _package_input_bytes(required(manifest["icon"], "icon")),
+        _package_input_bytes(required(icon, "icon")),
       )
     except icon_assets.InvalidIcon as exc:
       icon_warning = f"icon: {exc}"
@@ -2832,31 +2839,62 @@ def read_git_package_summary(
     )
 
 
+_TRANSIENT_STATUS_CODES = frozenset({429, 502, 503, 504})
+
+
+def transient_failure(exc: BaseException) -> tuple[bool, int | None]:
+  """Whether the same request may later get past ``exc`` unchanged, and any wait.
+
+  The one rule for install, update and bootstrap retries: a Git transfer that
+  failed or timed out, incomplete Git history, a host that did not resolve,
+  and an upstream rate limit or gateway failure. A failure the installer has
+  already classified carries ``retryable`` in its detail. Anything else, such
+  as a full disk or an invalid package, will fail the same way again.
+  """
+  if isinstance(exc, (
+    app_git.GitTransferFailed, app_git.HistoryIncomplete, socket.gaierror,
+  )):
+    return True, None
+  if not isinstance(exc, HTTPException):
+    return False, None
+  if isinstance(exc.__cause__, socket.gaierror):
+    return True, None
+  detail = exc.detail
+  if exc.status_code not in _TRANSIENT_STATUS_CODES and not (
+    isinstance(detail, dict) and detail.get("retryable") is True
+  ):
+    return False, None
+  try:
+    wait = int((exc.headers or {}).get("Retry-After") or 0)
+  except ValueError:
+    wait = 0
+  return True, wait or None
+
+
 def git_source_error(
   outcome: str, exc: BaseException, *,
   code: str = "git_update_unavailable", failure: str = "",
-  retryable: bool = False,
 ) -> HTTPException:
   """The owner-facing 409 for a Git source that could not be used.
 
   A transfer exceeding its wall-clock ceiling is reported as a timeout,
   distinct from a missing or unverifiable source. ``retryable`` marks a
-  failure the same request may later get past unchanged; bootstrap retries it.
+  failure the same request may later get past unchanged (``transient_failure``);
+  bootstrap retries it.
   """
   if isinstance(exc, app_git.GitTransferTimeout):
     code = "git_transfer_timeout"
     failure = f"The app's Git transfer timed out: {exc}."
     outcome = f"{outcome} Retrying on a steadier connection may help."
-    retryable = True
   elif isinstance(exc, app_git.HistoryIncomplete):
     log.warning("install: %s", exc)  # Names the refs; the owner text does not.
     failure = (
       "The app's Git history is incomplete, so the update can't be merged "
       "safely; retry when its source is reachable."
     )
-    retryable = True
   return HTTPException(409, detail={
-    "code": code, "message": f"{failure} {outcome}".strip(), "retryable": retryable,
+    "code": code, "message": f"{failure} {outcome}".strip(),
+    "retryable": transient_failure(exc)[0],
   })
 
 
@@ -2903,12 +2941,15 @@ async def _to_completion(function: Callable, *args):
   return await _settle_before_cancel(asyncio.to_thread(function, *args))
 
 
-async def _settle_before_cancel(work: Awaitable):
+async def _settle_before_cancel(
+  work: Awaitable, *, abandoned: asyncio.Event | None = None,
+):
   """Await ``work`` to its end even if the caller is cancelled meanwhile.
 
   Cancelling an ``asyncio.to_thread`` await does not stop its thread. A
   cancelled caller re-raises only once ``work`` settles, so it never releases a
-  lock or rolls back under writes that are still running.
+  lock or rolls back under writes that are still running. ``abandoned`` is set
+  on the first cancellation, so multi-step work can stop at its next safe point.
   """
   work = asyncio.ensure_future(work)
   cancelled = False
@@ -2917,12 +2958,12 @@ async def _settle_before_cancel(work: Awaitable):
       await asyncio.wait({work})
     except asyncio.CancelledError:
       cancelled = True
+      if abandoned is not None:
+        abandoned.set()
   if cancelled:
     # The caller's outcome is its cancellation, so nobody takes ``work``'s.
     outcome = None if work.cancelled() else work.exception()
-    if isinstance(outcome, _UncheckedPythonTree):
-      outcome.discard()  # An install's hand-off that will never be checked.
-    elif isinstance(outcome, HTTPException):
+    if isinstance(outcome, HTTPException):
       log.info("Work refused after its caller was cancelled: %s", outcome.detail)
     elif outcome is not None:
       log.error(
@@ -4330,7 +4371,6 @@ async def install_requested_app(
           code="git_install_unavailable",
           failure="The app's Git repository could not be cloned or verified; "
           "retry when its source is available.",
-          retryable=True,
         ) from exc
     async with fs_locks.install_uninstall_lock():
       return await install_from_manifest(
@@ -4584,13 +4624,33 @@ async def install_from_manifest(
     staged_clone=staged_clone,
   )
   # Each pass holds the source lock across many Git threads and rolls back on
-  # failure, so a cancelled caller waits for the pass to settle on its own.
+  # failure, and the env check runs threads from the handed-out runtime, all
+  # under the caller's lifecycle lock. So the passes and the check settle as
+  # one unit: a cancelled caller waits for the step in flight, which then
+  # stops at its next safe point.
+  abandoned = asyncio.Event()
+  return await _settle_before_cancel(
+    _install_in_passes(install_candidate, abandoned), abandoned=abandoned,
+  )
+
+
+async def _install_in_passes(
+  install_candidate: Callable[..., Awaitable[InstallResult]],
+  abandoned: asyncio.Event,
+) -> InstallResult:
+  """Run the install's passes; once ``abandoned``, discard and stop between steps."""
   try:
-    return await _settle_before_cancel(install_candidate(python_check=None))
+    return await install_candidate(python_check=None)
   except _UncheckedPythonTree as unchecked:
     pending = unchecked
+  if abandoned.is_set():
+    pending.discard()
+    raise asyncio.CancelledError
   python_check = await _check_reconciled_python(pending)
-  return await _settle_before_cancel(install_candidate(python_check=python_check))
+  if abandoned.is_set():
+    app_python_env.discard_env(python_check.env)
+    raise asyncio.CancelledError
+  return await install_candidate(python_check=python_check)
 
 
 async def _install_candidate(
@@ -5183,7 +5243,6 @@ async def _install_candidate(
               code="git_install_unavailable",
               failure="The app's Git repository could not be cloned or verified; "
               "retry when its source is available.",
-              retryable=True,
             ) from exc
         if not cloned_install:
           # record the pristine source tree on `upstream`, then align the

@@ -22,7 +22,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import socket
 import time
 import uuid
 from dataclasses import dataclass
@@ -34,7 +33,7 @@ from app import app_git, fs_locks, models
 from app.broadcast import get_system_broadcast
 from app.manifest_identity import canonical_manifest_identity_key
 from app.install import (
-  discard_staged, install_from_manifest, stage_package_clone,
+  discard_staged, install_from_manifest, stage_package_clone, transient_failure,
 )
 from app.timeutil import now_naive_utc
 
@@ -133,29 +132,6 @@ class BootstrapOutcome:
   pending: tuple[str, ...] = ()
   rate_limited: bool = False
   retry_after: int | None = None
-
-
-def _transient_failure(exc: Exception) -> tuple[bool, int | None]:
-  """Whether an install failure is worth retrying, and any upstream wait."""
-  if isinstance(exc, app_git.GitTransferFailed):
-    # Staging a clone is the first network step; a failure there, including
-    # an unreachable host, is the network until proven otherwise.
-    return True, None
-  if not isinstance(exc, HTTPException):
-    return False, None
-  if isinstance(exc.__cause__, socket.gaierror):
-    # The catalog hosts are fixed, so failing to resolve one is the network.
-    return True, None
-  detail = exc.detail
-  if exc.status_code not in (429, 502, 504) and not (
-    isinstance(detail, dict) and detail.get("retryable") is True
-  ):
-    return False, None
-  try:
-    wait = int((exc.headers or {}).get("Retry-After") or 0)
-  except ValueError:
-    wait = 0
-  return True, wait or None
 
 
 def _default_store_pin_pending(db: Session) -> bool:
@@ -361,7 +337,7 @@ async def ensure_bootstrap_apps_installed(
           log.exception(
             "bootstrap: %s install failed — %s", bootstrap_app.manifest_id, exc,
           )
-          transient, wait = _transient_failure(exc)
+          transient, wait = transient_failure(exc)
           if transient:
             pending.append(bootstrap_app.manifest_id)
             rate_limited = rate_limited or (
@@ -450,7 +426,7 @@ async def _notify_owner_pending(
     names[0] if len(names) == 1
     else ", ".join(names[:-1]) + " and " + names[-1]
   )
-  cause = "GitHub rate limit" if outcome.rate_limited else "network problem"
+  cause = "GitHub rate limit" if outcome.rate_limited else "temporary problem"
   try:
     with SessionLocal() as db:
       owner = db.query(models.Owner.id).first()

@@ -199,6 +199,25 @@ def test_install_rejects_a_scheduled_job_without_runtime_declaration(
   assert response.json()["detail"] == "Schedule job is missing a shebang."
 
 
+def test_package_fetch_resolves_its_host_off_the_event_loop(monkeypatch):
+  """getaddrinfo blocks, so a fetch must not resolve on the server's loop."""
+  url = "https://x.test/repo/mobius.json"
+  on_loop = []
+
+  def validate(target):
+    try:
+      asyncio.get_running_loop()
+      on_loop.append(True)
+    except RuntimeError:
+      on_loop.append(False)
+    return target, "x.test", "x.test"
+
+  monkeypatch.setattr(install, "_validate_url_safe", validate)
+  client = _fake_async_client({url: (200, b"{}")})()
+  assert asyncio.run(install._http_get(client, url, 1024)) == b"{}"
+  assert on_loop == [False]
+
+
 def test_validate_url_safe_blocks_ipv6_embedded_ipv4():
   # SSRF: an IPv6 that embeds a blocked IPv4 must be rejected — IPv4-compatible
   # (::127.0.0.1), IPv4-mapped (::ffff:169.254.169.254), and well-known NAT64
@@ -1154,7 +1173,8 @@ def test_known_git_origin_clone_failure_rolls_back_instead_of_importing_http(
   with patch(
     "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
   ), patch(
-    "app.install.app_git.stage_clone", side_effect=RuntimeError("offline"),
+    "app.install.app_git.stage_clone",
+    side_effect=app_git.GitTransferFailed("Could not resolve host"),
   ):
     failed = client.post("/api/apps/install", headers=auth, json={
       "manifest_url": base + "mobius.json",
@@ -1176,6 +1196,36 @@ def test_known_git_origin_clone_failure_rolls_back_instead_of_importing_http(
   assert retry.status_code == 201, retry.text
   assert app_git.origin_url(source_dir) == bare.as_uri()
   assert app_git.head_sha(source_dir, "upstream") == commit
+
+
+def test_clone_failure_on_a_full_disk_is_not_retryable(
+  client, auth, db, bypass_url_validation,
+):
+  """Only a transient failure is marked retryable; a full disk fails again."""
+  import errno
+
+  base = "https://raw.githubusercontent.com/acme/full-disk/main/"
+  manifest = {
+    "id": "full-disk", "name": "Full Disk", "version": "1.0.0",
+    "description": "Staging fails locally", "entry": "index.jsx",
+  }
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  with patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
+  ), patch(
+    "app.install.app_git.stage_clone",
+    side_effect=OSError(errno.ENOSPC, "No space left on device"),
+  ):
+    failed = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert failed.status_code == 409, failed.text
+  assert failed.json()["detail"]["code"] == "git_install_unavailable"
+  assert failed.json()["detail"]["retryable"] is False
+  assert db.query(models.App).filter_by(slug="full-disk").first() is None
 
 
 def test_fresh_clone_cannot_replace_owner_reviewed_source(
@@ -10782,3 +10832,25 @@ async def test_ancillary_source_check_and_tree_writes_leave_event_loop(monkeypat
   assert len(checked) == 1 and checked[0] != event_loop_thread
   assert len(writes) == 3 and all(thread != event_loop_thread for thread in writes)
   assert len(entries) == 2 and entries[0] == entries[1]
+
+
+@pytest.mark.parametrize("candidate_package_id, expected", [
+  ("urn:uuid:6a1f0c2e-7b3d-5e4f-9a8b-1c2d3e4f5a6b", True),
+  ("urn:uuid:0b9e8d7c-6a5f-5e4d-8c3b-2a1f0e9d8c7b", False),
+  (None, False),
+])
+def test_update_match_requires_the_installed_package_id(
+  candidate_package_id, expected,
+):
+  """A packaged app matches only a candidate carrying its own package_id."""
+  from app.routes.apps import _update_candidate_matches_installed
+
+  manifest = {"id": "renamed"}
+  if candidate_package_id is not None:
+    manifest["package_id"] = candidate_package_id
+  assert _update_candidate_matches_installed(
+    "https://example.test/old/mobius.json",
+    "https://example.test/new/mobius.json",
+    manifest,
+    "urn:uuid:6a1f0c2e-7b3d-5e4f-9a8b-1c2d3e4f5a6b",
+  ) is expected
