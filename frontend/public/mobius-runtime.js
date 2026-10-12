@@ -4577,7 +4577,7 @@ function _seedOnline(next) {
 }
 if (typeof window !== "undefined") {
 	window.addEventListener("message", (e) => {
-		if (e.source !== window.parent) return;
+		if (e.origin !== window.location.origin) return;
 		const msg = e.data;
 		if (!msg || typeof msg !== "object") return;
 		if (msg.type === "moebius:online-status" && typeof msg.online === "boolean") {

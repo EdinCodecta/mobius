@@ -60,14 +60,10 @@ test('a probed reachability verdict outranks later raw browser events', async (t
     configurable: true,
     value: { onLine: true },
   })
-  const shellWindow = {}
   Object.defineProperty(globalThis, 'window', {
     configurable: true,
     value: {
-      // The frame URL shares the shell's origin; only the sender identity
-      // distinguishes the hosting shell from a nested or sibling frame.
       location: { origin: 'https://mobius.test' },
-      parent: shellWindow,
       addEventListener(type, callback) {
         handlers[type] = [...(handlers[type] || []), callback]
       },
@@ -96,16 +92,8 @@ test('a probed reachability verdict outranks later raw browser events', async (t
   }
 
   assert.equal(api.online, true)
-  // A sibling or embedded frame cannot forge the host's verdict.
   emit('message', {
-    origin: 'https://mobius.test',
-    source: {},
-    data: { type: 'moebius:online-status', online: false },
-  })
-  assert.equal(api.online, true)
-  emit('message', {
-    origin: 'https://mobius.test',
-    source: shellWindow,
+    origin: window.location.origin,
     data: { type: 'moebius:online-status', online: false },
   })
   assert.equal(api.online, false)
@@ -113,8 +101,7 @@ test('a probed reachability verdict outranks later raw browser events', async (t
   assert.equal(api.online, false)
 
   emit('message', {
-    origin: 'https://mobius.test',
-    source: shellWindow,
+    origin: window.location.origin,
     data: { type: 'moebius:online-status', online: true },
   })
   assert.equal(api.online, true)

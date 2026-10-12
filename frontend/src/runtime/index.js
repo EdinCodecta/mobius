@@ -154,9 +154,7 @@ function _seedOnline(next) {
 // Listen for the probed verdict from AppCanvas.
 if (typeof window !== 'undefined') {
   window.addEventListener('message', (e) => {
-    // Only the hosting shell window may set the verdict, the same sender rule
-    // visibility.js, immersive.js and navigation.js use.
-    if (e.source !== window.parent) return
+    if (e.origin !== window.location.origin) return
     const msg = e.data
     if (!msg || typeof msg !== 'object') return
     if (msg.type === 'moebius:online-status' && typeof msg.online === 'boolean') {

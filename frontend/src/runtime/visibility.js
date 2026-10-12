@@ -1,20 +1,13 @@
 // window.mobius.visible / onVisibilityChange — whether this app is on screen.
 //
-// The shell keeps recently used app frames mounted but hidden (see
-// Shell/appFrameCache.js). Hiding them with `visibility:hidden` on a shell
-// ancestor does NOT change the frame's own `document.hidden`, which only flips
-// when the whole browser tab is hidden. AppCanvas therefore posts
-// `moebius:frame-visibility` to every frame on load and on each foreground
-// change. This module combines the two signals: the app is visible only when
-// the shell says its frame is foreground AND the document itself is not hidden.
-// Apps use it to pause polling, animation, and audio while out of sight.
-//
-// Only the hosting shell window may set the verdict (`event.source ===
-// window.parent`, matching immersive.js and navigation.js). AppCanvas posts its
-// first verdict when the frame document loads, before this runtime evaluates,
-// so app-frame.html keeps the latest one and init() seeds it here via
-// `setFrameVisible`. Without any verdict the frame is assumed foreground, so an
-// app mounted outside AppCanvas keeps document semantics.
+// The shell hides inactive app frames with `visibility:hidden` on an ancestor,
+// which does not change the frame's own `document.hidden`, so AppCanvas posts
+// `moebius:frame-visibility` instead. The app is visible only while the shell
+// shows its frame AND the document is not hidden. Only the hosting window may
+// set the verdict. Its first verdict usually lands before this runtime runs,
+// so app-frame.html keeps it and init() seeds it through `setFrameVisible`.
+// Without any verdict the frame counts as foreground (plain document
+// semantics for hosts other than AppCanvas).
 
 export function makeVisibility({ win, doc } = {}) {
   let frameVisible = true

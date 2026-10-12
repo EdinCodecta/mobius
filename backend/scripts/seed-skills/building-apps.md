@@ -849,17 +849,13 @@ on the runtime's combined signal instead:
 ```jsx
 useEffect(() => {
   let timer = null
-  let run = 0 // bumped on every pause/resume so a stale loop stops itself
-  const loop = async (mine) => {
-    await refresh()
-    if (mine === run) timer = setTimeout(() => loop(mine), 5000)
-  }
   const stop = window.mobius.onVisibilityChange((visible) => {
-    clearTimeout(timer)
-    run += 1
-    if (visible) loop(run) // refresh at once on return, then resume the cadence
+    clearInterval(timer)
+    if (!visible) return
+    refresh() // catch up at once on return, then resume the cadence
+    timer = setInterval(refresh, 5000)
   })
-  return () => { run += 1; clearTimeout(timer); stop() }
+  return () => { clearInterval(timer); stop() }
 }, [])
 ```
 
