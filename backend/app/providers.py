@@ -33,7 +33,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from app import claude_api_key
 from app.storage_io import atomic_write
 
 
@@ -731,85 +730,6 @@ class BaseProvider:
     raise NotImplementedError
 
 
-def _claude_subscription_usable(data_dir: str) -> bool:
-  """Whether the stored Claude sign-in can authenticate a turn now.
-
-  A current access token, or a refresh token that has not expired, is
-  usable; a leftover credential shell (recovery can keep scopes and email
-  while clearing tokens) is not.
-  """
-  creds = Path(data_dir) / "cli-auth" / "claude" / ".credentials.json"
-  try:
-    raw = json.loads(creds.read_text())
-  except (json.JSONDecodeError, OSError, UnicodeError):
-    return False
-  oauth = raw.get("claudeAiOauth") if isinstance(raw, dict) else None
-  if not isinstance(oauth, dict):
-    return False
-  access_token = oauth.get("accessToken")
-  refresh_token = oauth.get("refreshToken")
-  expires_at = oauth.get("expiresAt")
-  refresh_expires_at = oauth.get("refreshTokenExpiresAt")
-  now_ms = time.time() * 1000
-  access_is_current = (
-    isinstance(access_token, str)
-    and bool(access_token.strip())
-    and isinstance(expires_at, (int, float))
-    and not isinstance(expires_at, bool)
-    and expires_at - now_ms >= _CLAUDE_TOKEN_REFRESH_MARGIN_MS
-  )
-  refresh_expiry_is_current = (
-    "refreshTokenExpiresAt" not in oauth
-    or (
-      isinstance(refresh_expires_at, (int, float))
-      and not isinstance(refresh_expires_at, bool)
-      and refresh_expires_at > now_ms
-    )
-  )
-  can_refresh = (
-    isinstance(refresh_token, str)
-    and bool(refresh_token.strip())
-    and refresh_expiry_is_current
-  )
-  return access_is_current or can_refresh
-
-
-ClaudeAuthMethod = Literal["subscription", "api_key"]
-
-
-def claude_auth_method(data_dir: str) -> ClaudeAuthMethod | None:
-  """Which credential a Claude run uses now, by fixed precedence.
-
-  A usable subscription sign-in always wins, so saving an API key never moves
-  an owner off a subscription onto per-use billing. A saved API key is used
-  only when no usable sign-in exists. ``build_env``, the pre-turn check, the
-  model listing and the status all read this one decision.
-  """
-  if _claude_subscription_usable(data_dir):
-    return "subscription"
-  try:
-    if claude_api_key.read_api_key(data_dir) is not None:
-      return "api_key"
-  except claude_api_key.ClaudeApiKeyUnreadable:
-    pass
-  return None
-
-
-def claude_cli_settings(data_dir: str, settings: dict[str, Any]) -> str:
-  """Inline ``--settings`` JSON for a Claude CLI run, with its API key route.
-
-  Every launch that uses ``ClaudeProvider.build_env`` passes its settings
-  through here (chat runner, helper host, compaction). On the API-key method
-  the CLI gets an ``apiKeyHelper`` that reads the saved key itself, so the key
-  stays out of the environment every Bash command, MCP server and package
-  script inherits. The helper outranks the subscription sign-in in the CLI, so
-  it is added only when the API key is the chosen method.
-  """
-  if claude_auth_method(data_dir) == "api_key":
-    settings = {**settings, "apiKeyHelper": claude_api_key.helper_command(data_dir)}
-  return json.dumps(settings)
-
-
 class ClaudeProvider(BaseProvider):
   """Claude Code via the Anthropic Agent SDK.
 
@@ -831,18 +751,45 @@ class ClaudeProvider(BaseProvider):
     return await _fetch_claude_models(data_dir)
 
   def check_auth(self, data_dir):
-    if claude_auth_method(data_dir) is not None:
-      return None
-    if claude_api_key.api_key_path(data_dir).exists():
+    creds = Path(data_dir) / "cli-auth" / "claude" / ".credentials.json"
+    if not creds.exists():
       return (
-        "Your saved Anthropic API key can no longer be read. Open Settings "
-        "and enter it again under Accounts, Claude Code."
+        "Not signed in. Open Settings and connect "
+        "under AI provider."
       )
-    if not (Path(data_dir) / "cli-auth" / "claude" / ".credentials.json").exists():
-      return (
-        "Not signed in. Open Settings and connect Claude Code under "
-        "Accounts: sign in with Claude or use an Anthropic API key."
+    try:
+      raw = json.loads(creds.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeError):
+      raw = None
+    oauth = raw.get("claudeAiOauth") if isinstance(raw, dict) else None
+    if isinstance(oauth, dict):
+      access_token = oauth.get("accessToken")
+      refresh_token = oauth.get("refreshToken")
+      expires_at = oauth.get("expiresAt")
+      refresh_expires_at = oauth.get("refreshTokenExpiresAt")
+      now_ms = time.time() * 1000
+      access_is_current = (
+        isinstance(access_token, str)
+        and bool(access_token.strip())
+        and isinstance(expires_at, (int, float))
+        and not isinstance(expires_at, bool)
+        and expires_at - now_ms >= _CLAUDE_TOKEN_REFRESH_MARGIN_MS
       )
+      refresh_expiry_is_current = (
+        "refreshTokenExpiresAt" not in oauth
+        or (
+          isinstance(refresh_expires_at, (int, float))
+          and not isinstance(refresh_expires_at, bool)
+          and refresh_expires_at > now_ms
+        )
+      )
+      can_refresh = (
+        isinstance(refresh_token, str)
+        and bool(refresh_token.strip())
+        and refresh_expiry_is_current
+      )
+      if access_is_current or can_refresh:
+        return None
     return (
       "Claude sign-in is incomplete or expired. Open Settings and "
       "reconnect under AI provider."
@@ -872,8 +819,6 @@ class ClaudeProvider(BaseProvider):
     normal turn-error path (which prompts the user to reconnect) rather
     than blocking every turn here.
     """
-    if claude_auth_method(data_dir) != "subscription":
-      return
     try:
       await claude_access_token(data_dir)
     except Exception as exc:  # noqa: BLE001 - best-effort; never block a turn
@@ -887,17 +832,8 @@ class ClaudeProvider(BaseProvider):
   ) -> dict[str, str]:
     env = dict(base_env)
     creds = Path(data_dir) / "cli-auth" / "claude" / ".credentials.json"
-    method = claude_auth_method(data_dir)
-    if creds.exists() or method == "api_key":
+    if creds.exists():
       env["CLAUDE_CONFIG_DIR"] = str(creds.parent)
-    # The CLI ranks ANTHROPIC_AUTH_TOKEN, then ANTHROPIC_API_KEY, above the
-    # subscription sign-in, and the SDK merges the server's environment under
-    # this mapping. Blank both so an ambient key can never silently take over
-    # a signed-in account and bill it. The owner's saved key never travels in
-    # the environment either: it reaches only the CLI, through the
-    # apiKeyHelper in claude_cli_settings, so no child process inherits it.
-    env["ANTHROPIC_AUTH_TOKEN"] = ""
-    env["ANTHROPIC_API_KEY"] = ""
     env.update(CLAUDE_CLI_POLICY_ENV)
     # Per-chat agent-browser session.  Every agent-browser invocation
     # spawned by the SDK runner picks up AGENT_BROWSER_SESSION via env,
@@ -1726,14 +1662,10 @@ async def disconnect_provider(data_dir: str, provider_id: str) -> None:
   prevents an in-flight model-registry refresh from restoring removed tokens.
   """
   if provider_id == "claude":
-    # Disconnecting Claude removes both of its credentials: leaving the API
-    # key would keep Claude connected, now billed per use, after the owner
-    # asked to disconnect it.
     async with _claude_refresh_lock:
       path = Path(data_dir) / "cli-auth" / "claude" / ".credentials.json"
       if path.exists():
         _write_claude_oauth(path, None)
-      claude_api_key.remove_api_key(data_dir)
   elif provider_id == "codex":
     (Path(data_dir) / "cli-auth" / "codex" / "auth.json").unlink(missing_ok=True)
   else:
@@ -1887,7 +1819,7 @@ def codex_subscription_type(data_dir: str) -> str | None:
 
 
 async def _fetch_claude_models(data_dir: str) -> list[dict[str, Any]]:
-  """Calls Anthropic's /v1/models with the credential Claude runs use.
+  """Calls Anthropic's /v1/models with the stored OAuth access token.
 
   Raises on any non-2xx or missing credentials so the caller can fall
   back to KNOWN_MODELS. The Claude Code OAuth flow grants the
@@ -1901,18 +1833,12 @@ async def _fetch_claude_models(data_dir: str) -> list[dict[str, Any]]:
   """
   import httpx  # local import — only the registry path needs it
 
-  if claude_auth_method(data_dir) == "api_key":
-    key = claude_api_key.read_api_key(data_dir)
-    if key is None:
-      raise RuntimeError("claude api key missing")
-    headers = claude_api_key.api_key_headers(key)
-  else:
-    token = await claude_access_token(data_dir)
-    headers = {
-      "Authorization": f"Bearer {token}",
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": "oauth-2025-04-20",
-    }
+  token = await claude_access_token(data_dir)
+  headers = {
+    "Authorization": f"Bearer {token}",
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "oauth-2025-04-20",
+  }
   async with httpx.AsyncClient(timeout=10.0) as client:
     resp = await client.get(
       "https://api.anthropic.com/v1/models?limit=200",
