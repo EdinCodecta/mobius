@@ -1206,6 +1206,8 @@ async def create_railway_deployment(
   # hosts still receive the original request when the app omits this field.
   if body.region is not None:
     settings["region"] = body.region
+  # The workspace is always sent: the account service has no default workspace
+  # and refuses a create without one, so an app that omits it cannot create.
   workspace_id = body.workspace_id.strip()
   if not workspace_id or len(workspace_id) > 128:
     raise HTTPException(422, "Choose a Railway workspace.")
