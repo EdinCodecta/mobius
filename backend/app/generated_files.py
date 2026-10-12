@@ -387,14 +387,21 @@ def add_inbox_file(data_dir: str, chat_id: str, name: str, content: bytes) -> No
     os.close(inbox_fd)
 
 
-async def publish_inbox_files(sink, *, data_dir: str, chat_id: str) -> set[str]:
-  """Freeze, persist, and consume a batch; return the published inbox names."""
+async def publish_inbox_files(
+  sink, *, data_dir: str, chat_id: str, names: list[str] | None = None,
+) -> set[str]:
+  """Freeze, persist, and consume a batch; return the published inbox names.
+
+  Every inbox file is a finished candidate only once the turn has ended. A
+  mid-turn caller passes ``names`` to publish just the files it wrote whole.
+  """
   published: set[str] = set()
   capacity = await sink.generated_file_capacity()
   if capacity <= 0:
     return published
-  names = (await asyncio.to_thread(_inbox_names, data_dir, chat_id))[:capacity]
-  for name in names:
+  if names is None:
+    names = await asyncio.to_thread(_inbox_names, data_dir, chat_id)
+  for name in names[:capacity]:
     captured = await asyncio.to_thread(_freeze_file, data_dir, chat_id, name)
     if captured is None:
       continue

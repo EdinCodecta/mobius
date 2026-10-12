@@ -175,7 +175,7 @@ async def _deliver_codex_generated_image(sink, data_dir: str, chat_id: str, resu
       return False
     name = await asyncio.to_thread(_stage_codex_generated_image, data_dir, chat_id, result)
     return name in await generated_files.publish_inbox_files(
-      sink, data_dir=data_dir, chat_id=chat_id,
+      sink, data_dir=data_dir, chat_id=chat_id, names=[name],
     )
   except (OSError, ValueError):
     log.warning("Codex generated-image capture failed chat_id=%s", chat_id, exc_info=True)

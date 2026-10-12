@@ -5408,6 +5408,20 @@ class _ImagePublicationSink:
     return event['name']
 
 
+def test_native_image_capture_does_not_publish_unfinished_inbox_files(tmp_path):
+  from app import generated_files
+
+  inbox = generated_files.output_dir(str(tmp_path), 'chat', create=True)
+  # The agent may still be writing its own deliverable when an image completes.
+  (inbox / 'report.pdf').write_bytes(b'%PDF-partial')
+  sink = _ImagePublicationSink()
+  assert asyncio.run(codex_sdk_runner._deliver_codex_generated_image(
+    sink, str(tmp_path), 'chat', _IMAGE_RESULT,
+  ))
+  assert [event['mime_type'] for event in sink.events] == ['image/png']
+  assert (inbox / 'report.pdf').read_bytes() == b'%PDF-partial'
+
+
 def test_generated_image_cancelled_capture_never_publishes_partial_bytes(tmp_path, monkeypatch):
   import base64
   import os
