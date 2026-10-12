@@ -1468,7 +1468,8 @@ def test_interrupt_delivery_wakes_an_idle_unfinished_goal_for_every_kind(
   monkeypatch.setattr(
     coordination, "paused_goal_run",
     lambda _db, chat_id: (
-      SimpleNamespace(id="builder-goal-run") if chat_id == builder.id else None
+      SimpleNamespace(id="builder-goal-run", goal_id=runs["builder"].goal_id)
+      if chat_id == builder.id else None
     ),
   )
   started = []
@@ -1498,6 +1499,9 @@ def test_interrupt_delivery_wakes_an_idle_unfinished_goal_for_every_kind(
   )
   assert interrupted.status_code == 200, interrupted.text
   assert interrupted.json()["woken"] == [builder.id]
+  # The wake resumes under the paused Goal, not as Goal-less work.
+  assert started[-1]["goal_id"] == runs["builder"].goal_id
+  assert started[-1]["source_work_id"] == "builder-goal-run"
   assert len(started) == 1
   wake = started[0]
   assert wake["chat_id"] == builder.id

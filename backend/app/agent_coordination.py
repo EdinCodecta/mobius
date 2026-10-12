@@ -1854,6 +1854,7 @@ async def _wake_idle_recipient(
         hidden=True,
         message_kind=PEER_MESSAGE_WAKE_KIND,
         source_work_id=goal_run.id,
+        goal_id=goal_run.goal_id,
       )
     except Exception:
       log.warning("peer wake failed chat=%s", chat_id, exc_info=True)
