@@ -17,7 +17,7 @@ import httpx
 from fastapi import HTTPException
 from fastapi.responses import Response
 
-from app.net_utils import validate_url_safe
+from app.net_utils import pinned_client, validate_url_safe
 from app.routes.proxy import _capped_response
 
 
@@ -88,8 +88,7 @@ class _PublicFetchClientPool:
       async with self._lock:
         entry = self._clients.pop(key, None)
         if entry is None:
-          entry = _PooledClient(httpx.AsyncClient(
-            follow_redirects=False,
+          entry = _PooledClient(pinned_client(
             timeout=15,
             limits=httpx.Limits(
               max_connections=16,
@@ -255,7 +254,7 @@ async def fetch_public_url(
       upstream.headers["host"] = host_header
       upstream.extensions["sni_hostname"] = sni_host
       response = await _capped_response(
-        client, upstream, forward_cache_headers=True,
+        client, upstream, url, forward_cache_headers=True,
       )
   except Exception:
     _record_usage(
