@@ -96,6 +96,8 @@ def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
   ).update({models.AgentWorkClaim.updated_at: now_naive_utc()}, synchronize_session=False)
   if changed != 1:
     raise ValueError('The claim changed while following; inspect it before retrying.')
+  if _direct_cycle(db, waiting_goal_id=goal.id, source_goal_id=claim.owner_goal_id):
+    return 'direct_cycle'
   db.add(models.GoalDependency(
     id=str(uuid4()), waiting_goal_id=goal.id, waiting_chat_id=chat_id,
     created_by_run_id=run_id, target_kind='claim_acquisition',

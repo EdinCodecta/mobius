@@ -246,6 +246,22 @@ def claim_work(
     raise ValueError("The claim changed during transfer; inspect it before retrying.")
   db.expire(row)
   db.refresh(row)
+  # Recheck after the ownership write fence before adding the reverse follow.
+  if goal_id and previous_goal_id and db.query(models.GoalDependency.id).join(
+    models.AgentWorkClaim,
+    models.AgentWorkClaim.id == models.GoalDependency.target_claim_id,
+  ).filter(
+    models.GoalDependency.waiting_goal_id == goal_id,
+    models.GoalDependency.target_kind == "claim_acquisition",
+    models.AgentWorkClaim.owner_goal_id == previous_goal_id,
+    models.AgentWorkClaim.acquisition_id == models.GoalDependency.target_acquisition_id,
+    models.GoalDependency.target_acquisition_id != row.acquisition_id,
+    models.GoalDependency.resolved_at.is_(None),
+    models.GoalDependency.result_disposition.is_(None),
+    models.GoalDependency.withdrawn_at.is_(None),
+  ).first():
+    db.rollback()
+    raise ValueError("Transfer would create a direct Goal dependency cycle.")
   # A new owner must not keep a self-follow on its own acquisition.
   db.query(models.GoalDependency).filter(
     models.GoalDependency.target_acquisition_id == row.acquisition_id,
