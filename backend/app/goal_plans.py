@@ -315,6 +315,13 @@ def helper_plan_task(
   tasks = list(((goal.plan_json or {}) if goal is not None else {}).get("tasks") or [])
   if requested is not None:
     ids = [str(task.get("id")) for task in tasks]
+    if assignment is not None and assignment.plan_task is None:
+      # An unfiled helper has no checklist-write scope, so it cannot grant
+      # one to a child by filing it under somebody else's task.
+      raise GoalPlanError(
+        f"plan_task {requested!r} cannot be assigned: this helper has no plan "
+        "task of its own, so its helpers stay unfiled"
+      )
     if assignment is not None and assignment.plan_task is not None:
       # A branch helper splits only its own branch, as its brief is scoped.
       parent_of = {str(task.get("id")): task.get("parent_id") for task in tasks}
