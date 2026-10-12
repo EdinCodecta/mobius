@@ -48,6 +48,32 @@ def test_question_attachments_keep_the_answer_they_belong_to(tmp_path, monkeypat
   assert exc.value.status_code == 422
 
 
+def test_one_upload_attached_to_two_answers_keeps_both_questions(tmp_path, monkeypatch):
+  monkeypatch.setattr(chats_stream, "get_settings", lambda: SimpleNamespace(data_dir=str(tmp_path)))
+  path = tmp_path / "a.png"
+  path.write_bytes(b"x")
+  chat = SimpleNamespace(uploads=[{"name": "a.png", "path": str(path), "size": 1, "mime_type": "image/png"}])
+  card = {"questions": [{"question": "First?"}, {"question": "Second?"}]}
+  resolved = chats_stream._canonical_question_attachments(chat, [
+    {"name": "a.png", "question": "First?"}, {"name": "a.png", "question": "Second?"},
+    {"name": "a.png", "question": "First?"},
+  ], card)
+  assert [f["question"] for f in resolved] == ["First?", "Second?"]
+
+
+def test_question_tag_without_a_saved_card_is_rejected(tmp_path, monkeypatch):
+  monkeypatch.setattr(chats_stream, "get_settings", lambda: SimpleNamespace(data_dir=str(tmp_path)))
+  path = tmp_path / "a.png"
+  path.write_bytes(b"x")
+  chat = SimpleNamespace(uploads=[{"name": "a.png", "path": str(path), "size": 1, "mime_type": "image/png"}])
+  with pytest.raises(HTTPException) as exc:
+    chats_stream._canonical_question_attachments(chat, [{"name": "a.png", "question": "First?"}])
+  assert exc.value.status_code == 422
+  assert chats_stream._canonical_question_attachments(chat, [{"name": "a.png"}]) == [
+    {"name": "a.png", "size": 1, "mime_type": "image/png"},
+  ]
+
+
 def test_question_attachments_are_bounded(tmp_path, monkeypatch):
   monkeypatch.setattr(chats_stream, "get_settings", lambda: SimpleNamespace(data_dir=str(tmp_path)))
   too_many = [{"name": f"f{i}.txt"} for i in range(chats_stream.MAX_QUESTION_ATTACHMENTS + 1)]

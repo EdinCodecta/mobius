@@ -26,7 +26,7 @@ import FileChips from './FileChips.jsx'
 import Attachments from './Attachments.jsx'
 import { pastedFiles, filePasteNeedsDefaultPrevented } from './pasteUpload.js'
 import { Paperclip } from '@openai/apps-sdk-ui/components/Icon'
-import { fileBelongsToQuestion, resolveQuestionAnswer, questionAnswersReady, questionOptionSubmission } from './questionSubmission.js'
+import { fileBelongsToQuestion, restoredQuestionFiles, resolveQuestionAnswer, questionAnswersReady, questionOptionSubmission } from './questionSubmission.js'
 import {
   isRestartCardAction,
   restartCardSelectedOptions,
@@ -184,7 +184,7 @@ export default function QuestionCard({
   const preparedSubmissionRef = useRef(null)
   const fileInputRef = useRef(null)
   const initialFilesRef = useRef(null)
-  if (initialFilesRef.current === null) initialFilesRef.current = readQuestionDraft(draftKey).files
+  if (initialFilesRef.current === null) initialFilesRef.current = restoredQuestionFiles(readQuestionDraft(draftKey).files, questions)
   const attachTargetRef = useRef(null)
   const { files, addFiles, removeFile, clearFiles, discardFiles } = useFileUpload({ chatId, initialFiles: initialFilesRef.current })
   const readyFiles = files.filter(file => file.status === 'done')

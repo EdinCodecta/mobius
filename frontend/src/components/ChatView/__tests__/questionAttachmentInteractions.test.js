@@ -239,6 +239,34 @@ test('a restored draft keeps each file with its answer and legacy untagged files
 })
 
 
+test('a restored draft file for a question the card no longer asks stays visible and submits card-level', async () => {
+  const storage = {
+    values: new Map(),
+    getItem(key) { return this.values.get(key) || null },
+    setItem(key, value) { this.values.set(key, value) },
+    removeItem(key) { this.values.delete(key) },
+  }
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage })
+  writeQuestionDraft(questionDraftKey('stale-chat', 'stale-q', questions), { answers: { 'First?': 'A', 'Second?': 'B' }, otherTexts: {}, files: [
+    { name: 'gone.txt', group: 'Removed?', size: 1, mime_type: 'text/plain', status: 'done' },
+  ] }, storage)
+  let posted
+  const card = renderHook(QuestionCard, { chatId: 'stale-chat', questionId: 'stale-q', questions,
+    onAnswer: async (...args) => { posted = args; return true } })
+  try {
+    assert.deepEqual(chipSets(card.result.current).map(set => set.props.files.map(f => f.name)), [[], [], ['gone.txt']])
+    submit(card.result.current).props.onClick({ currentTarget: { closest: () => null } })
+    await tick()
+    assert.deepEqual(posted[3].attachments, [{ name: 'gone.txt', size: 1, mime_type: 'text/plain' }])
+  } finally {
+    card.unmount()
+    if (original) Object.defineProperty(globalThis, 'localStorage', original)
+    else delete globalThis.localStorage
+  }
+})
+
+
 test('answer paste matches the composer: Markdown by default, plain on the shortcut, never once answered', () => {
   const clipboard = {
     files: [], items: [],

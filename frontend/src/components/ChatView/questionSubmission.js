@@ -14,6 +14,15 @@ export function fileBelongsToQuestion(tag, question, questionCount) {
 }
 
 /**
+ * A restored draft file tagged for a question the card no longer asks would be
+ * hidden yet still submitted, and the server refuses it; keep it card-level.
+ */
+export function restoredQuestionFiles(files, questions) {
+  const asked = new Set(questions.map(question => question.question))
+  return files.map(file => (file.group == null || asked.has(file.group) ? file : { ...file, group: undefined }))
+}
+
+/**
  * Every question needs its own answer: text, a choice, or files belonging to
  * that question. Untagged legacy files count only when there is one question.
  */

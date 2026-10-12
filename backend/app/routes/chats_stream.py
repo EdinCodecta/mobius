@@ -306,8 +306,8 @@ def _canonical_question_attachments(
 ) -> list[dict] | None:
   """Resolve an answer's file references once, before either answer path writes.
 
-  A file may name the card `question` it answers, so the card shows it under
-  that answer; untagged files (older clients) stay card-level.
+  A file may name the saved card's `question` it answers, so the card shows it
+  under that answer; untagged files (older clients) stay card-level.
   """
   if not attachments:
     return None
@@ -318,7 +318,7 @@ def _canonical_question_attachments(
     )
   uploads = {entry.get("name"): entry for entry in (chat.uploads or [])}
   asked = {q.get("question") for q in (card or {}).get("questions") or []}
-  canonical: dict[str, dict] = {}
+  canonical: dict[tuple[str, str | None], dict] = {}
   for attachment in attachments:
     name = attachment.get("name") if isinstance(attachment, dict) else None
     label = name if isinstance(name, str) and name else "An attached file"
@@ -329,15 +329,13 @@ def _canonical_question_attachments(
         detail=f"{label} is no longer available. Remove it and attach it again.",
       )
     question = attachment.get("question")
-    if question is not None and (
-      not isinstance(question, str) or (card is not None and question not in asked)
-    ):
+    if question is not None and (not isinstance(question, str) or question not in asked):
       raise HTTPException(
         status_code=422,
         detail=f"{label} is attached to a question this card does not ask.",
       )
     # Same shape as composer attachments: the file is addressed by name.
-    canonical.setdefault(name, {
+    canonical.setdefault((name, question), {
       "name": name,
       "size": entry.get("size", 0),
       "mime_type": entry.get("mime_type", "application/octet-stream"),
