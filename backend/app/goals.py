@@ -462,8 +462,8 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
         "Not an open work claim of this Goal: " + ", ".join(sorted(unknown))
         + ". " + held_claims_hint(held)
       )
-    from app.chat_waits import stage_consume_fired_goal_waits
-    consumed_waits = stage_consume_fired_goal_waits(db, goal.chat_id, goal.id)
+    from app.chat_waits import stage_retire_fired_goal_waits
+    consumed_waits = stage_retire_fired_goal_waits(db, goal.chat_id, goal.id)
     values.update(status=status, result=outcome_text, next_action=None,
                   completed_at=datetime.now(UTC), completion_run_id=run.id)
   else:

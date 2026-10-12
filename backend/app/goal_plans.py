@@ -774,7 +774,7 @@ def _goal_presentation(
 
 
 def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal) -> dict:
-  from app.chat_handoffs import project_handoff
+  from app.chat_handoffs import goal_handoffs, project_handoff
   none = {"kind": "none", "reason": None}
   if goal.status == "stopped":
     from app.goals import goal_hold
@@ -787,41 +787,18 @@ def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal) 
     return {"kind": "recovery", "reason": "agent_pause" if actor == "agent" else "unknown_stop"}
   if goal.status != "open":
     return none
-  latest = db.query(models.ChatRun.id, models.ChatRun.goal_id, models.ChatRun.status).filter(
-    models.ChatRun.chat_id == goal.chat_id,
-  ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).first()
-  owns_chat_attempt = latest is not None and latest.goal_id == goal.id
-  from app import questions
-  pending = questions.get(goal.chat_id)
-  pending_id = db.query(models.Chat.pending_question_id).filter(
-    models.Chat.id == goal.chat_id,
-  ).scalar()
-  # Saved-card admission prevents a successor until this marker is answered or
-  # cancelled. Its current physical attempt is therefore the exact owner;
-  # native in-turn questions additionally carry their explicit run identity.
-  owner_input = bool(owns_chat_attempt and (
-    pending_id or (pending is not None and pending.run_token == latest.id)
-  ))
-  if owner_input:
+  native = goal_handoffs(db, goal)
+  if native.owner_input:
     return {"kind": "owner_input", "reason": "saved_card"}
-  if owns_chat_attempt and latest.status == "running":
+  if native.running:
     return {"kind": "working", "reason": None}
-  from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED, serialize_wait
-  waits = [serialize_wait(row, db=db) for row in _goal_waits(db, goal.chat_id, goal.id).filter(
-    (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
-  ).all()]
-  if any(wait.get("resume_blocker") == "owner_input" for wait in waits):
+  if any(wait.resume_blocker == "owner_input" for wait in native.waits):
     return {"kind": "blocked", "reason": "other_work"}
-  from app.delegations import _self_resuming_helper_rows
-  roots = {goal.id}
-  helper_count = sum(row.goal_id == goal.id or (
-    row.goal_id is None and row.parent_root_run_id in roots)
-    for row, _status in _self_resuming_helper_rows(db, {goal.chat_id}))
-  from app.chat import continuation_handoff_for_chat
-  park = continuation_handoff_for_chat(db, goal.chat_id) if owns_chat_attempt else none
-  handoff = project_handoff(owner_input=False, running=False, waits=waits,
-    helper_count=helper_count, park=park)
-  if handoff["kind"] == "none" and owns_chat_attempt and latest.status in {"failed", "interrupted"}:
+  handoff = project_handoff(owner_input=False, running=False,
+    waits=[{"delivery_pending": wait.delivery_pending,
+            "resume_blocker": wait.resume_blocker} for wait in native.waits],
+    helper_count=native.helper_count, park=native.park_presentation)
+  if handoff["kind"] == "none" and native.failed_attempt:
     return {"kind": "recovery", "reason": "execution"}
   return handoff
 

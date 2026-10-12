@@ -180,7 +180,7 @@ def test_wake_enabled_exact_goal_helper_owns_handoff(db, chat, monkeypatch):
   from app import delegations
   _add_goal_run(db, chat)
   monkeypatch.setattr(delegations, "_self_resuming_helper_rows", lambda *_: [
-    (SimpleNamespace(parent_root_run_id="goal-run", goal_id="goal-run"), "running"),
+    (SimpleNamespace(id="helper-id", parent_root_run_id="goal-run", goal_id="goal-run"), "running"),
   ])
   response = get_writer().submit(PromotePending(
     chat_id=chat.id, run_token="not-needed", ending_run_token="goal-run",
@@ -198,7 +198,7 @@ def test_helper_from_an_earlier_attempt_of_this_goal_keeps_its_handoff(db, chat,
                         started_at=datetime(2000, 1, 1)))
   db.commit()
   monkeypatch.setattr(delegations, "_self_resuming_helper_rows", lambda *_: [
-    (SimpleNamespace(parent_root_run_id="middle-root", goal_id="goal-run"), "running"),
+    (SimpleNamespace(id="helper-id", parent_root_run_id="middle-root", goal_id="goal-run"), "running"),
   ])
   response = get_writer().submit(PromotePending(
     chat_id=chat.id, run_token="not-needed", ending_run_token="goal-run",
@@ -389,11 +389,11 @@ def _complete(db, result="Verified: checks green"):
 
 
 @pytest.mark.parametrize("outcome", ["met", "expired", "failed"])
-def test_verified_completion_takes_delivery_of_its_fired_wait(db, chat, outcome):
+def test_verified_completion_retires_its_fired_wait_without_provider_receipt(db, chat, outcome):
   """The running turn saw the outcome its Wait was watching for.
 
   The Wait's resume could only be delivered after this turn; the verified
-  completion is that delivery, so no resume later wakes the finished Goal.
+  completion retires it, so no resume later wakes the finished Goal.
   """
   from app import chat_waits
 
@@ -407,7 +407,8 @@ def test_verified_completion_takes_delivery_of_its_fired_wait(db, chat, outcome)
 
   assert _complete(db)["status"] == "completed"
   db.expire_all()
-  assert db.get(models.ChatWait, wait.id).resume_delivered_at is not None
+  assert db.get(models.ChatWait, wait.id).resume_delivered_at is None
+  assert db.get(models.ChatWait, wait.id).result_disposition == "retired_by_goal_outcome"
 
 
 def test_an_armed_wait_does_not_block_completion_and_keeps_watching(db, chat):
@@ -479,7 +480,8 @@ def test_completion_withdraws_the_queued_resume_of_its_fired_wait(db, chat):
   asyncio.run(settle_after_goal_completion(chat.id))
 
   db.expire_all()
-  assert db.get(models.ChatWait, wait.id).resume_delivered_at is not None
+  assert db.get(models.ChatWait, wait.id).resume_delivered_at is None
+  assert db.get(models.ChatWait, wait.id).result_disposition == "retired_by_goal_outcome"
   assert [m["cid"] for m in db.get(models.Chat, chat.id).pending_messages] == [
     "owner-1",
   ]

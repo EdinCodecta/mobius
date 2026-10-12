@@ -16,9 +16,10 @@ behind the live turn and the idle-pending sweep promotes it. The
 resume uses IDs derived from the durable wait row. A retry therefore
 reattaches to the exact physical continuation or deduplicates the exact queued
 message. ``resume_delivered_at`` advances only when a turn carrying the result
-succeeds (or a verified Goal completion takes delivery). A result whose turn
-never reached its provider stays owed and rides along with the chat's next
-turn, so a failed start cannot lose the wake.
+succeeds. Goal outcomes retire results separately, without claiming receipt.
+A result whose turn never reached its provider stays owed and rides along
+with its exact Goal's next turn (or any turn for an unowned Wait), so a failed
+start cannot lose the wake.
 
 Restart immunity is structural: rows are durable, the loop restarts with the
 server, and no part of a wait lives in the turn's process group.
@@ -78,8 +79,11 @@ def claim_scheduled_wait_result(chat_id: str, message: object) -> bool:
       models.ChatWait.kind == "platform_activation",
       models.ChatWait.status.in_(("met", "expired", "failed")),
       models.ChatWait.resume_delivered_at.is_(None),
+      models.ChatWait.result_disposition.is_(None),
     ).update(
-      {models.ChatWait.resume_delivered_at: now_naive_utc()},
+      {models.ChatWait.resume_delivered_at: now_naive_utc(),
+       models.ChatWait.result_disposition: "scheduled",
+       models.ChatWait.result_disposed_at: now_naive_utc()},
       synchronize_session=False,
     )
     db.commit()
@@ -88,21 +92,34 @@ def claim_scheduled_wait_result(chat_id: str, message: object) -> bool:
   return claimed == 1
 
 
-def owed_wait_results(
-  db: Session, chat_id: str, turn_message: str,
-) -> tuple[str, tuple[str, ...]]:
-  """The fired Wait results a turn carries: (context text, wait ids).
-
-  The ids are recorded delivered only when this turn's provider call succeeds
-  (stage_wait_results_delivered), exactly like its peer notes. A resume turn's
-  own notice is already its message, so the text never repeats it.
-  """
-  rows = db.query(models.ChatWait).filter(
+def _receivable_wait_results(db: Session, chat_id: str, run_id: str | None):
+  """Only this receiving run's Goal (plus unowned results) may ride along."""
+  run = db.get(models.ChatRun, run_id) if run_id else None
+  goal_id = run.goal_id if run is not None and run.chat_id == chat_id else None
+  open_goals = db.query(models.ChatGoal.id).filter(
+    models.ChatGoal.chat_id == chat_id, models.ChatGoal.status == "open",
+  )
+  return db.query(models.ChatWait).filter(
     models.ChatWait.chat_id == chat_id,
     models.ChatWait.kind != "platform_activation",
     _FIRED_UNDELIVERED,
-  ).order_by(models.ChatWait.created_at.asc()).all()
-  rows = [row for row in rows if not _closed_wait_goal(db, row) and not _held_wait_goal(db, row)]
+    models.ChatWait.goal_id.is_(None) | (
+      (models.ChatWait.goal_id == goal_id) & models.ChatWait.goal_id.in_(open_goals)
+    ),
+  )
+
+
+def owed_wait_results(
+  db: Session, chat_id: str, turn_message: str, *, run_id: str | None,
+) -> tuple[str, tuple[str, ...]]:
+  """Select exact-Goal context; provider success, not selection, receipts it.
+
+  Unowned waits retain chat-wide delivery. A resume's own notice is already
+  its message, so the text never repeats it. Held results remain owed.
+  """
+  rows = _receivable_wait_results(db, chat_id, run_id).order_by(
+    models.ChatWait.created_at.asc(),
+  ).all()
   notices = [
     notice for notice in (
       _compose_resume_notice(row, _OUTCOMES[row.status]) for row in rows
@@ -113,19 +130,53 @@ def owed_wait_results(
 
 
 def stage_wait_results_delivered(
-  db: Session, chat_id: str, wait_ids: tuple[str, ...],
+  db: Session, chat_id: str, wait_ids: tuple[str, ...], *, run_id: str,
 ) -> int:
-  """Record, in the caller's transaction, that a successful turn got these."""
+  """Receipt only what this admitted, successful exact-Goal run may receive.
+
+  Rechecking the Goal here preserves a hold/withdrawal that won after context
+  selection. Retirement is a different disposition, never provider receipt.
+  """
+  run = db.get(models.ChatRun, run_id)
+  if not wait_ids or run is None or run.chat_id != chat_id or not run.provider_execution_admitted:
+    return 0
+  admitted_ids = set(run.admitted_wait_results_json or ())
+  wait_ids = tuple(wait_id for wait_id in wait_ids if wait_id in admitted_ids)
   if not wait_ids:
     return 0
-  return db.query(models.ChatWait).filter(
-    models.ChatWait.chat_id == chat_id,
+  now = now_naive_utc()
+  return _receivable_wait_results(db, chat_id, run_id).filter(
     models.ChatWait.id.in_(wait_ids),
-    _FIRED_UNDELIVERED,
-  ).update(
-    {models.ChatWait.resume_delivered_at: now_naive_utc()},
-    synchronize_session=False,
-  )
+  ).update({
+    models.ChatWait.resume_delivered_at: now,
+    models.ChatWait.result_disposition: "delivered",
+    models.ChatWait.result_disposed_at: now,
+    models.ChatWait.received_run_id: run_id,
+  }, synchronize_session=False)
+
+
+def wait_delivery_blocker(db: Session, row: models.ChatWait) -> str | None:
+  """Durable admission check; a held Goal cannot degrade into Goal-less work."""
+  if row.status == "cancelled" or row.result_disposition == "withdrawn":
+    return "withdrawn"
+  if row.status not in _OUTCOMES:
+    return "not_fired"
+  if row.result_disposition is not None or row.resume_delivered_at is not None:
+    return "disposed"
+  if _closed_wait_goal(db, row):
+    return "goal_closed"
+  if _held_wait_goal(db, row):
+    return "goal_held"
+  return None
+
+
+def wait_result_message_blocker(db: Session, chat_id: str, message: dict) -> str | None:
+  """Recheck an ordinary queued/direct Wait notice at writer admission."""
+  if message.get("kind") != WAIT_RESULT_MESSAGE_KIND:
+    return None
+  from app.run_state import _wait_result_row
+  row = _wait_result_row(db, chat_id, message)
+  return wait_delivery_blocker(db, row) if row is not None else "wait_missing"
 
 
 MIN_INTERVAL_SECS = 60
@@ -152,7 +203,7 @@ def _closed_wait_goal(db: Session, row: models.ChatWait) -> bool:
   # Missing ownership is ambiguous, not an invitation to adopt the current
   # Goal. A stopped Goal is held, not terminal.
   return goal is None or goal.chat_id != row.chat_id or goal.status in (
-    "completed", "cancelled", "cannot_complete",
+    "completed", "cancelled", "cannot_complete", "dismissed",
   )
 
 
@@ -313,6 +364,8 @@ def cancel_wait(db: Session, row: models.ChatWait) -> models.ChatWait:
   if row.status == "armed":
     row.status = "cancelled"
     row.cancelled_at = now_naive_utc()
+    row.result_disposition = "withdrawn"
+    row.result_disposed_at = row.cancelled_at
     db.commit()
     db.refresh(row)
     _cancel_active_check(row.id)
@@ -335,6 +388,7 @@ def stage_cancel_waits_for_chat(db: Session, chat_id: str) -> int:
       (models.ChatWait.kind == "platform_activation")
       & models.ChatWait.status.in_(("met", "expired", "failed"))
       & models.ChatWait.resume_delivered_at.is_(None)
+      & models.ChatWait.result_disposition.is_(None)
     ),
   )
   wait_ids = [row_id for (row_id,) in query.with_entities(models.ChatWait.id)]
@@ -342,6 +396,8 @@ def stage_cancel_waits_for_chat(db: Session, chat_id: str) -> int:
     {
       models.ChatWait.status: "cancelled",
       models.ChatWait.cancelled_at: now_naive_utc(),
+      models.ChatWait.result_disposition: "withdrawn",
+      models.ChatWait.result_disposed_at: now_naive_utc(),
     },
     synchronize_session=False,
   )
@@ -391,8 +447,12 @@ def wait_resume_blocker(db: Session, row: models.ChatWait) -> str | None:
   if is_chat_running(row.chat_id):
     return "live_turn"
   retry = db.get(models.ChatRun, f"wait-resume-{row.id}{_RESUME_RETRY}")
-  if retry is not None and retry.status == "failed":
+  if retry is not None and retry.status in {"failed", "interrupted"}:
     return "resume_failed"
+  original = db.get(models.ChatRun, f"wait-resume-{row.id}") if row.goal_id else None
+  if (original is not None and original.status in {"stopped", "completed", "interrupted"}
+      and not _wait_carrier_can_retry(row, original)):
+    return "manual_resume"
   return None
 
 
@@ -408,13 +468,16 @@ def serialize_wait(row: models.ChatWait, *, db: Session) -> dict:
     "kind": row.kind,
     "command": row.command,
     "status": row.status,
-    "delivery_pending": row.status in _OUTCOMES and row.resume_delivered_at is None,
+    "delivery_pending": row.status in _OUTCOMES and row.resume_delivered_at is None and row.result_disposition is None,
+    "result_disposition": row.result_disposition,
+    "received_run_id": row.received_run_id,
+    "result_disposed_at": row.result_disposed_at.isoformat() if row.result_disposed_at else None,
     "resume_delivered_at": (
       row.resume_delivered_at.isoformat() if row.resume_delivered_at else None
     ),
     "resume_blocker": (
       wait_resume_blocker(db, row)
-      if row.status in _OUTCOMES and row.resume_delivered_at is None else None
+      if row.status in _OUTCOMES and row.resume_delivered_at is None and row.result_disposition is None else None
     ),
     "interval_secs": row.interval_secs,
     "due_at": row.due_at.isoformat() if row.due_at else None,
@@ -516,16 +579,15 @@ def terminal_wait_summaries_by_message_index(
       value = value.replace(tzinfo=UTC)
     return round(value.timestamp() * 1000)
 
-  # Delivery is acknowledged near provider completion, whereas an answer's
-  # timestamp marks its start. Join through the durable execution interval and
-  # exact sink identity instead of mistaking the next answer for the recipient.
+  # New receipts name their exact sink. Only legacy latches need execution
+  # intervals: acknowledgement timestamps are later than answer start times.
   answer_by_run_id: dict[str, int] = {}
   for index, _ts in assistant_rows:
     run_id = assistant_message_run_id(messages[index].get("id"))
     if run_id is not None:
       answer_by_run_id.setdefault(run_id, index)
   receiving_runs = []
-  if answer_by_run_id and any(row.resume_delivered_at for row in rows):
+  if answer_by_run_id and any(row.resume_delivered_at and not row.received_run_id for row in rows):
     receiving_runs = [
       (answer_by_run_id[run_id], epoch_ms(started_at), epoch_ms(ended_at))
       for run_id, started_at, ended_at in db.query(
@@ -564,7 +626,8 @@ def terminal_wait_summaries_by_message_index(
         and started_ms <= wake_ms
         and (ended_ms is None or wake_ms <= ended_ms)
       ]
-      candidate_index = recipients[0] if len(recipients) == 1 else None
+      candidate_index = (answer_by_run_id.get(row.received_run_id) if row.received_run_id
+                         else recipients[0] if len(recipients) == 1 else None)
       if candidate_index is None:
         # Preserve pre-run-ledger/id-less history and the temporary anchor of
         # results that have not reached a visible answer yet.
@@ -586,7 +649,7 @@ def terminal_wait_summaries_by_message_index(
       "description": row.description,
       "condition_owner": row.condition_owner,
       "status": row.status,
-      "delivery_pending": row.status in _OUTCOMES and row.resume_delivered_at is None,
+      "delivery_pending": row.status in _OUTCOMES and row.resume_delivered_at is None and row.result_disposition is None,
       "checks_count": int(row.checks_count or 0),
       "created_at": row.created_at.isoformat() if row.created_at else None,
       "settled_at": settled_at.isoformat(),
@@ -777,6 +840,7 @@ def safe_startup_writer_orphan(
     models.ChatWait.chat_id == chat.id,
     models.ChatWait.status.in_(("met", "expired", "failed")),
     models.ChatWait.resume_delivered_at.is_(None),
+    models.ChatWait.result_disposition.is_(None),
   ).first()
   if row is None or (row.kind == "platform_activation") != activation:
     return False
@@ -793,7 +857,7 @@ def safe_startup_writer_orphan(
   )
   if (physical.root_run_id or physical.id) != expected_root:
     return False
-  if not activation and _closed_wait_goal(db, row):
+  if not activation and (wait_delivery_blocker(db, row) or physical.goal_id != row.goal_id):
     return False
   outcome = _OUTCOMES[row.status]
   if activation:
@@ -822,6 +886,15 @@ def safe_startup_writer_orphan(
   )
 
 
+def _wait_carrier_can_retry(row: models.ChatWait, carrier: models.ChatRun) -> bool:
+  """Failure or proven owner supersession, never arbitrary crash repair."""
+  return carrier.status == "failed" or (
+    row.goal_id is not None and carrier.status == "interrupted"
+    and carrier.provider_execution_admitted is False
+    and carrier.owner_superseded_by_run_id is not None
+  )
+
+
 async def _deliver_resume(row_id: str) -> bool:
   """Deliver one met/expired wait's resume to its chat and stamp the latch."""
   import app.chat_queue as chat_queue
@@ -838,6 +911,7 @@ async def _deliver_resume(row_id: str) -> bool:
       row is None
       or row.status not in ("met", "expired", "failed")
       or row.resume_delivered_at is not None
+      or row.result_disposition is not None
     ):
       return False
     # The resume gate needs existence, not the potentially large transcript.
@@ -848,13 +922,23 @@ async def _deliver_resume(row_id: str) -> bool:
     if chat is None:
       row.status = "cancelled"
       row.cancelled_at = now_naive_utc()
+      row.result_disposition = "withdrawn"
+      row.result_disposed_at = row.cancelled_at
       db.commit()
       return False
     chat_id = row.chat_id
     outcome = _OUTCOMES[row.status]
     activation = row.kind == "platform_activation"
     if not activation and _closed_wait_goal(db, row):
-      row.resume_delivered_at = now_naive_utc()
+      goal = db.get(models.ChatGoal, row.goal_id)
+      disposition = (
+        "retired_by_goal_outcome" if goal is not None and goal.chat_id == row.chat_id
+        else "withdrawn"
+      )
+      db.query(models.ChatWait).filter(
+        models.ChatWait.id == row.id, _FIRED_UNDELIVERED,
+      ).update({models.ChatWait.result_disposition: disposition,
+                models.ChatWait.result_disposed_at: now_naive_utc()}, synchronize_session=False)
       db.commit()
       return False
     if not activation and _held_wait_goal(db, row):
@@ -884,11 +968,13 @@ async def _deliver_resume(row_id: str) -> bool:
     ).first()
     if (
       not activation and existing_resume is not None
-      and existing_resume.status == "failed"
+      and _wait_carrier_can_retry(row, existing_resume)
     ):
-      # A failed resume turn recorded nothing (only a successful provider call
-      # does), so it gets one retry identity, like a helper-result wake. A
-      # failed retry leaves the result to ride the next turn.
+      # An unrelated turn can supersede a committed resume before provider
+      # entry, but cannot adopt that Goal's result. Give this proven unentered
+      # carrier with proven owner supersession the same bounded retry as
+      # failure. Stop/held Goals never enter
+      # this path; ambiguous executed interruptions are not replayed.
       resume_run_id = f"wait-resume-{row_id}{_RESUME_RETRY}"
       existing_resume = db.query(models.ChatRun).filter(
         models.ChatRun.id == resume_run_id,
@@ -1040,6 +1126,7 @@ async def sweep_due_waits(*, force_kind: str | None = None) -> int:
         | (
           models.ChatWait.status.in_(("met", "expired", "failed"))
           & models.ChatWait.resume_delivered_at.is_(None)
+          & models.ChatWait.result_disposition.is_(None)
         )
       )
       .order_by(models.ChatWait.next_check_at.asc())
@@ -1220,35 +1307,30 @@ def _goal_waits(db: Session, chat_id: str, goal_id: str):
 _FIRED_UNDELIVERED = (
   models.ChatWait.status.in_(("met", "expired", "failed"))
   & models.ChatWait.resume_delivered_at.is_(None)
+  & models.ChatWait.result_disposition.is_(None)
 )
 
 
-def stage_consume_fired_goal_waits(
+def stage_retire_fired_goal_waits(
   db: Session, chat_id: str, goal_id: str,
 ) -> int:
-  """Let a verified Goal completion take delivery of its fired Waits.
+  """An explicit Goal outcome retires owed results without claiming receipt.
 
-  A Wait that already fired still holds its Goal until its resume is
-  delivered, so no second executor starts at turn end. The resume can only
-  be delivered after the running turn ends, though, and that turn may have
-  observed and verified the same outcome itself. Its completion is that
-  delivery: record it in the caller's transaction so the Goal can close now
-  and no resume wakes a finished Goal. Armed Waits are not touched.
+  Stop/hold never calls this. Armed Waits retain their existing lifecycle.
   """
-  rows = _goal_waits(db, chat_id, goal_id).filter(_FIRED_UNDELIVERED).all()
-  delivered_at = now_naive_utc()
-  for row in rows:
-    row.resume_delivered_at = delivered_at
-  return len(rows)
+  return _goal_waits(db, chat_id, goal_id).filter(_FIRED_UNDELIVERED).update({
+    models.ChatWait.result_disposition: "retired_by_goal_outcome",
+    models.ChatWait.result_disposed_at: now_naive_utc(),
+  }, synchronize_session=False)
 
 
 async def withdraw_delivered_resume_notices(chat_id: str) -> int:
-  """Drop queued resume notices for Waits whose delivery is already recorded.
+  """Drop queued resume notices for delivered, retired or withdrawn Waits.
 
   A Wait that fires while its chat is busy queues its resume notice at once
   and keeps its latch open until a turn carrying it succeeds. A verified Goal
-  completion (stage_consume_fired_goal_waits) or the live turn's own context
-  (owed_wait_results) can take delivery first; the queued notice is then
+  completion (stage_retire_fired_goal_waits) or the live turn's own context
+  (owed_wait_results) can settle the receipt first; the queued notice is then
   stale and would start a duplicate turn.
   """
   from sqlalchemy.orm import load_only
@@ -1275,7 +1357,7 @@ async def withdraw_delivered_resume_notices(chat_id: str) -> int:
       wait_id for (wait_id,) in db.query(models.ChatWait.id).filter(
         models.ChatWait.chat_id == chat_id,
         models.ChatWait.id.in_(queued),
-        models.ChatWait.resume_delivered_at.is_not(None),
+        models.ChatWait.resume_delivered_at.is_not(None) | models.ChatWait.result_disposition.is_not(None),
       ).all()
     }
   for wait_id in delivered:

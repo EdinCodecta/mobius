@@ -310,7 +310,8 @@ def test_completing_through_the_route_withdraws_its_fired_waits_resume(
   assert completed.status_code == 200, completed.text
   assert completed.json()["goal"]["status"] == "completed"
   db.expire_all()
-  assert db.get(models.ChatWait, wait.id).resume_delivered_at is not None
+  assert db.get(models.ChatWait, wait.id).resume_delivered_at is None
+  assert db.get(models.ChatWait, wait.id).result_disposition == "retired_by_goal_outcome"
   assert [m["cid"] for m in db.get(models.Chat, chat_id).pending_messages] == [
     "owner-1",
   ]

@@ -416,6 +416,12 @@ class ChatRun(Base):
   # ambiguous even with no transcript output. NULL preserves that ambiguity
   # for pre-admission-ledger runs upgraded from an older backend.
   provider_execution_admitted = Column(Boolean, nullable=True, default=False)
+  # The exact ordinary Wait result set verified at provider entry. Success
+  # cannot receipt a result that fired after this immutable prompt snapshot.
+  admitted_wait_results_json = Column(JSON, nullable=True, default=None)
+  # Proof that an owner send, rather than crash recovery, displaced this
+  # never-entered Wait carrier. Its exact Goal can safely retry once.
+  owner_superseded_by_run_id = Column(String(64), nullable=True, default=None)
   # Browser initiator, retained across physical recovery and delegation. NULL
   # means an ordinary local/owner run, never an implicit shared grant.
   # Upgraded databases may also keep a retired, unused browser_grant_epoch.
@@ -724,10 +730,13 @@ class ChatWait(Base):
   last_checked_at = Column(DateTime, nullable=True, default=None)
   met_at = Column(DateTime, nullable=True, default=None)
   cancelled_at = Column(DateTime, nullable=True, default=None)
-  # Retry latch for the resume, stamped after the wake turn starts or queues.
-  # At-least-once across a crash between transactions, matching delegations:
-  # a redelivered result beats a silently lost one.
+  # Ordinary results are acknowledged only by a successful exact-Goal run.
+  # Activation retains its separate scheduling receipt. Old ambiguous latches
+  # are preserved as legacy_consumed, never invented provider receipts.
   resume_delivered_at = Column(DateTime, nullable=True, default=None)
+  result_disposition = Column(String(32), nullable=True, default=None)
+  result_disposed_at = Column(DateTime, nullable=True, default=None)
+  received_run_id = Column(String(64), nullable=True, default=None)
   created_at = Column(DateTime, nullable=False, default=lambda: now_naive_utc())
 
 

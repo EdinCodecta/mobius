@@ -434,6 +434,7 @@ class AdmitProviderExecution(_Command):
   has_peer_context_delivery: bool = False
   # (Delegation id, child run id) pairs: the exact results in the context.
   activity_results: tuple[tuple[str, str], ...] = ()
+  wait_results: tuple[str, ...] = ()
 
 
 @dataclass
@@ -2633,7 +2634,7 @@ class ChatWriterActor:
     # Restart now, restart. A newer message or stopped Goal may retire the
     # continuation wait, but neither revokes the button that was already
     # offered. Legacy Not now remains scoped to the currently open question.
-    if wait.resume_delivered_at is not None or wait.status not in (
+    if wait.resume_delivered_at is not None or wait.result_disposition == "retired_by_goal_outcome" or wait.status not in (
       "armed", "met", "expired", "failed", "cancelled",
     ) or (not selected_restart and chat.pending_question_id != cmd.question_id):
       raise RestartCardStateChanged(
@@ -2746,6 +2747,18 @@ class ChatWriterActor:
       chat.pending_messages or chat.pending_question_id
     ):
       raise _PersistFailed("AdmitProviderExecution: owner input superseded compaction recovery")
+    from app.chat_waits import _receivable_wait_results, wait_delivery_blocker
+    if run.id.startswith("wait-resume-"):
+      wait_id = run.id.removeprefix("wait-resume-").removesuffix(".retry")
+      wait = db.get(models.ChatWait, wait_id)
+      if (wait is None or wait.chat_id != cmd.chat_id
+          or wait.goal_id != run.goal_id or wait_delivery_blocker(db, wait)):
+        raise _PersistFailed("AdmitProviderExecution: Wait continuation is no longer receivable")
+    eligible_waits = {row.id for row in _receivable_wait_results(db, cmd.chat_id, run.id).filter(
+      models.ChatWait.id.in_(cmd.wait_results),
+    ).all()} if cmd.wait_results else set()
+    if eligible_waits != set(cmd.wait_results):
+      raise _PersistFailed("AdmitProviderExecution: Wait result is no longer receivable")
     activity_results = dict(cmd.activity_results)
     activity_ids = tuple(activity_results)
     if (
@@ -2806,6 +2819,7 @@ class ChatWriterActor:
         raise _PersistFailed(
           "AdmitProviderExecution: activity delivery is no longer available"
         )
+    run.admitted_wait_results_json = list(cmd.wait_results)
     run.provider_execution_admitted = True
     run.peer_message_delivery_pending = bool(cmd.has_peer_context_delivery)
     delivery_envelope = (
@@ -2872,7 +2886,7 @@ class ChatWriterActor:
       db, run.provider, run.started_at,
     )
     from app.chat_waits import stage_wait_results_delivered
-    stage_wait_results_delivered(db, cmd.chat_id, cmd.wait_results)
+    stage_wait_results_delivered(db, cmd.chat_id, cmd.wait_results, run_id=run.id)
     if not _commit_or_rollback(db):
       raise _PersistFailed("AcknowledgeProviderSuccess did not persist")
 
@@ -3434,6 +3448,9 @@ class ChatWriterActor:
     chat = _active_chat(db, cmd.chat_id)
     if chat is None:
       raise _PersistFailed("StartTurn: chat not found or deleted")
+    from app.chat_waits import wait_result_message_blocker
+    if wait_result_message_blocker(db, cmd.chat_id, cmd.user_msg):
+      raise _PersistFailed("StartTurn: Wait result is no longer receivable")
     ensure_user_cid(cmd.user_msg)
     from app.continuations import continuation_reason
     resuming = continuation_reason(cmd.user_msg) == "manual"
@@ -3610,6 +3627,16 @@ class ChatWriterActor:
     goal_objective, goal_id = goal_identity_for_run_start(
       db, cmd.chat_id, provider_source,
     )
+    if cmd.owner_input:
+      # An unrelated owner turn cannot incorporate a Goal-owned Wait. Save
+      # exact supersession evidence before closing its unentered carrier;
+      # startup interruption alone must never authorize an automatic retry.
+      for displaced in db.query(ChatRun).filter(
+        ChatRun.chat_id == cmd.chat_id, ChatRun.status == "running",
+        ChatRun.id.startswith("wait-resume-"), ChatRun.goal_id.is_not(None),
+        ChatRun.provider_execution_admitted.is_(False),
+      ).all():
+        displaced.owner_superseded_by_run_id = cmd.run_token
     self._close_nonterminal_runs(db, cmd.chat_id, "interrupted")
     from app.continuations import continuation_control_envelope
     admit_goal(db, cmd.chat_id, goal_id, goal_objective, provider_source)
@@ -3673,6 +3700,14 @@ class ChatWriterActor:
     if chat is None:
       raise _PersistFailed("StartContinuation: chat not found or deleted")
 
+    from app.chat_waits import wait_result_message_blocker
+    blocker = wait_result_message_blocker(db, cmd.chat_id, {
+      "kind": cmd.message_kind, "cid": cmd.cid, "source_work_id": cmd.source_work_id,
+    })
+    if blocker:
+      db.rollback()
+      return StartContinuationBlocked(blocker)
+
     activation_wait = None
     if cmd.activation_wait_id is not None:
       from app.platform_restart import (
@@ -3685,6 +3720,7 @@ class ChatWriterActor:
         models.ChatWait.kind == ACTIVATION_WAIT_KIND,
         models.ChatWait.status.in_(("met", "expired", "failed")),
         models.ChatWait.resume_delivered_at.is_(None),
+        models.ChatWait.result_disposition.is_(None),
       ).first()
       if (
         activation_wait is None
@@ -5027,9 +5063,11 @@ class ChatWriterActor:
       examined.append(row)
     pending = examined
     rejected = [row for row in pending if row.get("delivery_status") == "rejected"]
+    from app.chat_waits import wait_result_message_blocker
     runnable = [
       row for row in pending
       if row.get("delivery_status") != "rejected"
+      if not wait_result_message_blocker(db, cmd.chat_id, row)
       if not goal_clear_requested(str(row.get("content") or ""))
       and not is_retired_goal_handoff(row)
     ]
@@ -5240,18 +5278,10 @@ class ChatWriterActor:
       or chat.dismissed_goal_id == goal.id
     ):
       return None
-    from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED
-    # A handoff must own this Goal. An unrelated monitor is not permission
-    # to abandon its responsibility.
-    if _goal_waits(db, chat.id, goal.id).filter(
-      (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
-    ).first() is not None:
-      return None
-    from app.delegations import _self_resuming_helper_rows
-    if any(
-      row.goal_id == goal.id
-      for row, _status in _self_resuming_helper_rows(db, {chat.id})
-    ):
+    from app.chat_handoffs import goal_handoffs
+    # Presentation and settlement share native ownership; admission remains
+    # authoritative here and at each receiving run's provider boundary.
+    if goal_handoffs(db, goal).prevents_settlement:
       return None
     from app.continuations import recovery_attempted, GOAL_SETTLEMENT_UNFINISHED_MESSAGE
     if recovery_attempted(db, prior, reason="goal_settlement"):
@@ -7154,6 +7184,7 @@ def _cancel_activation_owners(db, chat, *, goal_id: str | None = None) -> int:
     models.ChatWait.kind == "platform_activation",
     models.ChatWait.status.in_(("armed", "met", "expired", "failed")),
     models.ChatWait.resume_delivered_at.is_(None),
+    models.ChatWait.result_disposition.is_(None),
   )
   if goal_id is not None:
     query = query.filter(models.ChatWait.goal_id == goal_id)
@@ -7165,6 +7196,8 @@ def _cancel_activation_owners(db, chat, *, goal_id: str | None = None) -> int:
   for wait in waits:
     wait.status = "cancelled"
     wait.cancelled_at = now
+    wait.result_disposition = "withdrawn"
+    wait.result_disposed_at = now
 
   if chat.pending_question_id in linked:
     chat.pending_question_id = None
@@ -7240,6 +7273,7 @@ def _apply_platform_restart_feedback(
     models.ChatWait.linked_question_id == question_id,
     models.ChatWait.kind == ACTIVATION_WAIT_KIND,
     models.ChatWait.resume_delivered_at.is_(None),
+    models.ChatWait.result_disposition.is_(None),
   ).first()
   if (wait is None or wait.condition_json != action["requirement"]
       or wait.status not in ("armed", "met", "expired", "failed")):
@@ -7250,6 +7284,8 @@ def _apply_platform_restart_feedback(
   now = now_naive_utc()
   wait.status = "cancelled"
   wait.cancelled_at = now
+  wait.result_disposition = "withdrawn"
+  wait.result_disposed_at = now
   action["status"] = "responded"
   matched["answers"] = copy.deepcopy(answers)
   matched["selected_options"] = {}

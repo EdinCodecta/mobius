@@ -510,6 +510,7 @@ def programmatic_start_blocker(
       models.ChatWait.kind == ACTIVATION_WAIT_KIND,
       models.ChatWait.status.in_(("met", "expired", "failed")),
       models.ChatWait.resume_delivered_at.is_(None),
+      models.ChatWait.result_disposition.is_(None),
     ).first()
     if activation_wait is None:
       return "restart"
@@ -2911,6 +2912,7 @@ async def _admit_provider_execution(
   *,
   has_peer_context_delivery: bool = False,
   activity_results: tuple[tuple[str, str], ...] = (),
+  wait_results: tuple[str, ...] = (),
 ) -> bool:
   """Cross provider entry only while this exact turn still owns execution.
 
@@ -2926,6 +2928,7 @@ async def _admit_provider_execution(
       run_token=run_token,
       has_peer_context_delivery=has_peer_context_delivery,
       activity_results=activity_results,
+      wait_results=wait_results,
     )))
   except Exception:
     if not _run_generation_superseded(chat_id, run_gen):
@@ -5727,7 +5730,7 @@ async def _run_chat_impl_with_db(
   if run_policy is None and chat_id:
     from app.chat_waits import build_active_waits_context, owed_wait_results
     owed_waits_text, wait_results = owed_wait_results(
-      db, chat_id, raw_user_message,
+      db, chat_id, raw_user_message, run_id=run_token,
     )
     if owed_waits_text:
       user_message = f"{owed_waits_text}\n\n{user_message}"
@@ -6167,6 +6170,7 @@ async def _run_chat_impl_with_db(
         run_gen,
         has_peer_context_delivery=coordination_message_through is not None,
         activity_results=activity_results,
+        wait_results=wait_results,
       ):
         return await _complete_turn(
           bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,
@@ -6359,6 +6363,7 @@ async def _run_chat_impl_with_db(
         run_gen,
         has_peer_context_delivery=coordination_message_through is not None,
         activity_results=activity_results,
+        wait_results=wait_results,
       ):
         return await _complete_turn(
           bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,

@@ -6553,6 +6553,42 @@ def _add_chat_compaction_drafts(eng) -> None:
     )
 
 
+def _add_wait_result_receipts(eng) -> None:
+  """Separate receipt from retirement without inventing old receiving runs."""
+  from sqlalchemy import inspect, text
+
+  inspector = inspect(eng)
+  tables = set(inspector.get_table_names())
+  with eng.begin() as conn:
+    # Minimal historical databases may not have either table yet. Production
+    # create_all owns missing tables; this migration upgrades existing ones.
+    if "chat_runs" in tables:
+      columns = {column["name"] for column in inspector.get_columns("chat_runs")}
+      for name, sql_type in (
+        ("admitted_wait_results_json", "JSON"),
+        ("owner_superseded_by_run_id", "VARCHAR(64)"),
+      ):
+        if name not in columns:
+          conn.execute(text(f"ALTER TABLE chat_runs ADD COLUMN {name} {sql_type}"))
+    if "chat_waits" in tables:
+      columns = {column["name"] for column in inspector.get_columns("chat_waits")}
+      for name, sql_type in (
+        ("result_disposition", "VARCHAR(32)"),
+        ("result_disposed_at", "TIMESTAMP"),
+        ("received_run_id", "VARCHAR(64)"),
+      ):
+        if name not in columns:
+          conn.execute(text(f"ALTER TABLE chat_waits ADD COLUMN {name} {sql_type}"))
+      # A timestamp previously meant either provider success, scheduling, or
+      # Goal retirement. Preserve that uncertainty and suppress historic wakes.
+      conn.execute(text("UPDATE chat_waits SET result_disposition='legacy_consumed', "
+                        "result_disposed_at=resume_delivered_at "
+                        "WHERE result_disposition IS NULL AND resume_delivered_at IS NOT NULL"))
+      conn.execute(text("UPDATE chat_waits SET result_disposition='withdrawn', "
+                        "result_disposed_at=cancelled_at "
+                        "WHERE result_disposition IS NULL AND status='cancelled'"))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -6663,6 +6699,7 @@ _SCHEMA_MIGRATIONS = (
   # Released to instances under this id; kept unique and appended after
   # main's ledger so it runs once wherever it has not run.
   ("0086_goal_execution_identity", _goal_execution_identity),
+  ("0089_wait_result_receipts", _add_wait_result_receipts),
 )
 
 

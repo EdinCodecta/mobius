@@ -1232,7 +1232,8 @@ saved card, or genuine automatic wake. The existing writer/continuation runner
 admits one bounded settlement pass after a clean unhanded ending; another such
 ending records a visible technical recovery failure, not a fabricated outcome.
 No separate Goal worker, unlimited retry, or automatic crash/Stop recovery exists.
-Goal labels derive only from that Goal's cards, Waits, helpers and eligible parks;
+Settlement and Goal labels share `chat_handoffs.goal_handoffs`: typed records
+for that exact Goal's cards, Waits, self-resuming helpers and eligible parks;
 chat-wide handoff guards conflicting actions without borrowing another task's
 question. Retired revision-budget columns remain inert historical schema.
 
@@ -1256,8 +1257,8 @@ No model summarizer, delta cache, extra focus record,
 or duplicate copy of the incoming message is involved. Agents continue working
 in their current run rather than ending turns to refresh context. Task additions and updates operate on the existing record. Completion
 is an explicit revision-checked operation with verification evidence and no
-unfinished tasks or running helpers. It takes delivery of the Goal's fired
-Waits so they do not wake a finished Goal; an open card or armed Wait does not
+unfinished tasks or running helpers. It retires the Goal's fired
+Waits without claiming provider receipt, so they do not wake a finished Goal; an open card or armed Wait does not
 block it. A green plan alone is not completion.
 
 Workspace `AgentWorkClaim` rows are narrower: they serialize one shared action
@@ -1344,9 +1345,24 @@ admission, and process-group cleanup uses the session leader PID even after the
 shell has exited while children still hold output pipes.
 
 A terminal result has one deterministic message/run identity. Its delivery
-latch advances only after provider-task admission or proven adoption by a later
-completed owner turn, never merely after queue persistence. Fresh programmatic
-continuations share `programmatic_start_blocked`: saved Q&A/sealed input, usage
+receipt advances only after a successful provider call on the exact Goal's
+receiving run, never merely after admission or queue persistence. Unowned Waits
+retain chat-wide delivery. Selection, writer admission and acknowledgement all
+check the receiving run's Goal; admission freezes the carried IDs in
+`ChatRun.admitted_wait_results_json`, and `received_run_id` records the successful
+carrier. Success cannot receipt a result that fired after its prompt snapshot.
+The activation exception retains its earlier scheduling receipt (`scheduled`).
+New ordinary dispositions distinguish `delivered`, `retired_by_goal_outcome`
+and `withdrawn`; old ambiguous timestamps become `legacy_consumed`, with no
+fabricated receiving run and no historical wake storm. A Goal-owned carrier
+superseded before proven provider entry uses the existing single retry identity
+only with writer-stamped `owner_superseded_by_run_id` evidence;
+an unrelated turn cannot adopt its result. Stop/hold still blocks that wake.
+After the bounded retry fails or is interrupted, the result stays owed for the
+Goal's next authorized turn and presents recovery rather than a healthy wake.
+A crash after provider execution but before acknowledgement remains ambiguous:
+results stay owed, not proof of exactly-once model execution or external effects.
+Fresh programmatic continuations share `programmatic_start_blocked`: saved Q&A/sealed input, usage
 parks, and manual restart holds retain authority. Exact already-committed,
 empty continuations remain attachable; ambiguous partial execution is not
 blindly replayed. Legacy source-less Wait rows and stored `auto_continuation`
@@ -1357,13 +1373,28 @@ Goal completed. A warning means a failed check or unmet deadline, not necessaril
 failure of the external work. Goal recovery uses the declaring run and will not
 restore a stopped/dismissed Goal. The wait itself is independent: chat Stop ends
 a turn/questions/consumer but does not cancel armed monitors. Deletion cancels
-armed monitors. A remaining product decision is whether Stop should also dismiss
-terminal, queued wait results: currently their undelivered row can requeue a
-notice cleared by Stop, and the wait cancel action accepts only armed rows.
+armed monitors. For Goal-less waits, the existing undelivered row can still
+requeue a notice cleared by Stop; Goal-owned results remain blocked by their
+Goal's hold. The wait cancel action continues to accept only armed rows.
 Do not broaden Stop silently while cleaning up the implementation.
 
-History markers derive from durable wait rows, using assistant timestamps as
-temporary/final anchors; no duplicate outcomes are written into chat messages.
+The ordinary Wait lifecycle remains:
+
+| Event | Armed monitor | Fired, unreceived result |
+| --- | --- | --- |
+| Stop / owner hold | Keeps observing | Kept owed; no automatic Goal reopening |
+| Later owner continuation of that Goal | Unchanged | Eligible for that exact Goal's successful receipt |
+| Explicit Goal outcome | Keeps observing | Retired, not delivered |
+| Stop waiting | Withdrawn without a wake | Existing armed-only action does not apply |
+| Chat deletion | Withdrawn in lifecycle transaction | Existing supervisor cancels on observing deletion |
+
+Deletion/restore timing for ordinary results is unchanged: restore before the
+supervisor observes deletion can retain an owed result. Goal-less waits also
+retain their existing Stop behavior. Neither is a new cross-chat dependency
+policy; dependencies join the shared handoff seam in a later slice.
+
+History markers derive from durable wait rows, using exact receiving-run identity
+for new receipts and timestamps only for legacy or temporary anchors; no duplicate outcomes are written into chat messages.
 This currently scans terminal history and can move a temporary marker to the
 wake's answer. Measure before changing that projection or adding a history index.
 
