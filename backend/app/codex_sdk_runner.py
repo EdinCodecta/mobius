@@ -2500,14 +2500,39 @@ async def _run_codex_sdk_turn(
       "error": _codex_user_error(str(exc)),
     })
   finally:
-    try:
-      await generated_files.publish_inbox_files(
+    deferred_cancel: asyncio.CancelledError | None = None
+
+    async def finish_teardown_step(
+      work: Any, step: str, *, level: int = logging.ERROR,
+    ) -> None:
+      """Run one step to its end; defer a cancellation, log a failure."""
+      nonlocal deferred_cancel
+
+      async def logged() -> None:
+        try:
+          await work
+        except Exception:
+          log.log(
+            level, "Codex turn teardown: %s failed chat_id=%s", step, chat_id,
+            exc_info=True,
+          )
+
+      try:
+        await settled.settle(logged())
+      except asyncio.CancelledError as exc:
+        deferred_cancel = deferred_cancel or exc
+
+    # A cancellation landing in any step below is deferred, so it cannot skip
+    # the reap, unregister and executor close that follow.
+    await finish_teardown_step(
+      generated_files.publish_inbox_files(
         bc,
         data_dir=runtime_data_dir,
         chat_id=chat_id,
-      )
-    except Exception:
-      log.debug("generated-file turn capture failed", exc_info=True)
+      ),
+      "generated-file capture",
+      level=logging.DEBUG,
+    )
     if helper_progress_task is not None:
       helper_progress_task.cancel()
     if task_host_open and task_host_tool_use_id is not None:
@@ -2520,7 +2545,6 @@ async def _run_codex_sdk_turn(
         "type": "tool_end",
         "tool_use_id": task_host_tool_use_id,
       })
-    deferred_cancel: asyncio.CancelledError | None = None
     if process_group_capture_stop is not None:
       process_group_capture_stop.set()
     if process_group_capture_task is not None:
@@ -2569,21 +2593,6 @@ async def _run_codex_sdk_turn(
         )
       registry.unregister(chat_id, RunnerKind.CODEX_SDK)
       current.mark_finished()
-    async def finish_teardown_step(work: Any, step: str) -> None:
-      """Run one step to its end; defer a cancellation, log a failure."""
-      nonlocal deferred_cancel
-
-      async def logged() -> None:
-        try:
-          await work
-        except Exception:
-          log.exception("Codex turn teardown: %s failed chat_id=%s", step, chat_id)
-
-      try:
-        await settled.settle(logged())
-      except asyncio.CancelledError as exc:
-        deferred_cancel = deferred_cancel or exc
-
     if helper_host is not None:
       # Unload this helper's thread (its tool servers exit with it) before
       # ending its leftover commands; the host itself stays up.
