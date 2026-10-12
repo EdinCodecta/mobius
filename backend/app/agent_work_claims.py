@@ -204,6 +204,7 @@ def claim_work(
     )
 
   previous = row.owner_chat_id
+  previous_run_id = row.owner_run_id
   previous_goal_id = row.owner_goal_id
   previous_revision = row.revision
   now = now_naive_utc()
@@ -253,12 +254,7 @@ def claim_work(
     models.GoalDependency.withdrawn_at.is_(None),
   ).update({models.GoalDependency.withdrawn_at: now}, synchronize_session=False)
   if previous_goal_id and previous != chat_id:
-    previous_run_id = db.query(models.ChatRun.id).filter(
-      models.ChatRun.goal_id == previous_goal_id,
-      models.ChatRun.chat_id == previous,
-    ).order_by(models.ChatRun.created_at.desc()).scalar()
-    if previous_run_id:
-      _follow(db, row, chat_id=previous, run_id=previous_run_id)
+    _follow(db, row, chat_id=previous, run_id=previous_run_id)
   db.commit()
   db.refresh(row)
   result = _serialize(db, row, "transferred")
@@ -332,7 +328,9 @@ def _stage_settle(
   if changed != 1:
     return None
   stage_stamp_claim_outcome(
-    db, row, "completed" if complete else "released", outcome[:1000],
+    db, row, ("completed" if complete else
+              "owner_deleted" if outcome == _DELETED_OWNER_OUTCOME else "released"),
+    outcome[:1000],
   )
   db.expire(row)
   return ReleasedClaim(

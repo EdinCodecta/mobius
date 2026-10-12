@@ -155,22 +155,22 @@ def dependency_source_blocker(db: Session, row: models.GoalDependency) -> str | 
       return 'source_held' if goal is not None and goal.status == 'stopped' else 'source_failed'
     latest = db.query(models.ChatRun).filter(
       models.ChatRun.chat_id == claim.owner_chat_id,
-      models.ChatRun.goal_id == goal.id,
-    ).order_by(models.ChatRun.started_at.desc()).first()
-    if latest is not None and latest.status in ('failed', 'stopped', 'interrupted'):
-      # A card, Wait, helper or dependency can still own progress. Inspect
-      # only direct durable rows; never recurse across dependency graphs.
+    ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).first()
+    if latest is not None and latest.goal_id == goal.id and latest.status in (
+      'failed', 'stopped', 'interrupted',
+    ):
+      from app.chat_waits import _FIRED_UNDELIVERED, _goal_waits
+      from app.delegations import _self_resuming_helper_rows
       if chat.pending_question_id is not None:
         return None
-      if db.query(models.ChatWait.id).filter(
-        models.ChatWait.goal_id == goal.id,
-        models.ChatWait.status.in_(('armed', 'fired')),
+      if _goal_waits(db, chat.id, goal.id).filter(
+        (models.ChatWait.status == 'armed') | _FIRED_UNDELIVERED,
       ).first():
         return None
-      if db.query(models.Delegation.id).filter(
-        models.Delegation.goal_id == goal.id,
-        models.Delegation.cancelled_at.is_(None),
-      ).first():
+      if any(
+        helper.goal_id == goal.id for helper, _ in
+        _self_resuming_helper_rows(db, {chat.id})
+      ):
         return None
       if db.query(models.GoalDependency.id).filter(
         models.GoalDependency.waiting_goal_id == goal.id,
