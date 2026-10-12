@@ -37,6 +37,10 @@ def render_units(stage, *, prefix, worker, data_source, through="mobius-rebuild-
     return units
 
 
+def unit_property(unit, name):
+    return command("systemctl", "show", "--value", "-p", name, unit).stdout.strip()
+
+
 def mounted(path):
     """Kernel mount table, not os.path.ismount: a bind mount on the same
     filesystem keeps its parent's device and is invisible to ismount."""
@@ -88,6 +92,16 @@ if sys.argv[1] == "run":
             command("umount", str(volume))
             subprocess.run(["systemctl", "start", f"{prefix}.service"], check=False, timeout=15,
                            capture_output=True)
+            # systemd re-arms the watcher on a deferred event once the service
+            # is inactive again; remount only after that, as in production
+            # (where the next container started much later).
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not (
+                    unit_property(f"{prefix}.service", "ActiveState") == "inactive"
+                    and unit_property(f"{prefix}.path", "SubState") == "waiting"):
+                time.sleep(0.2)
+            assert unit_property(f"{prefix}.path", "SubState") == "waiting", "watcher did not re-arm"
+            time.sleep(1)
             # The replacement starts: the volume is mounted again and the app
             # queues the next request through it.
             command("mount", "--bind", str(stable), str(volume))
@@ -96,7 +110,13 @@ if sys.argv[1] == "run":
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline and not (root / "dispatched").exists():
                 time.sleep(0.2)
-            return (root / "dispatched").exists()
+            dispatched = (root / "dispatched").exists()
+            print(f"watcher on {'mountpoint' if watch_mountpoint else 'stable source'}: "
+                  f"dispatched={dispatched}")
+            print(subprocess.run(["journalctl", "--no-pager", "-o", "short-precise", "-n", "20",
+                                  "-u", f"{prefix}.path", "-u", f"{prefix}.service"],
+                                 capture_output=True, text=True, timeout=15).stdout)
+            return dispatched
         finally:
             try:
                 if installed:
