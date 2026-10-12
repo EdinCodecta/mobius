@@ -10832,3 +10832,25 @@ async def test_ancillary_source_check_and_tree_writes_leave_event_loop(monkeypat
   assert len(checked) == 1 and checked[0] != event_loop_thread
   assert len(writes) == 3 and all(thread != event_loop_thread for thread in writes)
   assert len(entries) == 2 and entries[0] == entries[1]
+
+
+@pytest.mark.parametrize("candidate_package_id, expected", [
+  ("urn:uuid:6a1f0c2e-7b3d-5e4f-9a8b-1c2d3e4f5a6b", True),
+  ("urn:uuid:0b9e8d7c-6a5f-5e4d-8c3b-2a1f0e9d8c7b", False),
+  (None, False),
+])
+def test_update_match_requires_the_installed_package_id(
+  candidate_package_id, expected,
+):
+  """A packaged app matches only a candidate carrying its own package_id."""
+  from app.routes.apps import _update_candidate_matches_installed
+
+  manifest = {"id": "renamed"}
+  if candidate_package_id is not None:
+    manifest["package_id"] = candidate_package_id
+  assert _update_candidate_matches_installed(
+    "https://example.test/old/mobius.json",
+    "https://example.test/new/mobius.json",
+    manifest,
+    "urn:uuid:6a1f0c2e-7b3d-5e4f-9a8b-1c2d3e4f5a6b",
+  ) is expected

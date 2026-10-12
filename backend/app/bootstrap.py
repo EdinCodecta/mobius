@@ -426,7 +426,7 @@ async def _notify_owner_pending(
     names[0] if len(names) == 1
     else ", ".join(names[:-1]) + " and " + names[-1]
   )
-  cause = "GitHub rate limit" if outcome.rate_limited else "network problem"
+  cause = "GitHub rate limit" if outcome.rate_limited else "temporary problem"
   try:
     with SessionLocal() as db:
       owner = db.query(models.Owner.id).first()

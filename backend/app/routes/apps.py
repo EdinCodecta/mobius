@@ -1402,13 +1402,12 @@ def _update_candidate_matches_installed(
   """Accept the installed package identity or its reviewed predecessor.
 
   A permanent `package_id` binds the package across manifest id renames, as
-  it does for install. Callers have already required the candidate to carry
-  it (``validate_manifest_address``), so a row that has one matches here.
+  it does for install, so a row that has one matches only that package.
   """
   from app import install
 
   if installed_package_id:
-    return True
+    return candidate_manifest.get("package_id") == installed_package_id
 
   predecessor_source, _ = install._reviewed_predecessor_source(
     candidate_manifest, candidate_manifest_url,
