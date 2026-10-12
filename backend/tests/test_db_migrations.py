@@ -107,6 +107,12 @@ def test_previous_release_database_upgrades_to_current_orm(tmp_path):
   assert [row["version"] for row in first_history] == [
     version for version, _migration in migrations._SCHEMA_MIGRATIONS
   ]
+  assert "0090_goal_dependencies" in {row["version"] for row in first_history}
+  assert "acquisition_id" in {c["name"] for c in inspect(eng).get_columns("agent_work_claims")}
+  assert "admitted_dependency_results_json" in {
+    c["name"] for c in inspect(eng).get_columns("chat_runs")
+  }
+  assert "goal_dependencies" in inspect(eng).get_table_names()
 
 
 @pytest.mark.parametrize("start", ["fresh", "schema_0013"])

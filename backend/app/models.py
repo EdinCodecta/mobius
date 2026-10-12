@@ -419,6 +419,8 @@ class ChatRun(Base):
   # The exact ordinary Wait result set verified at provider entry. Success
   # cannot receipt a result that fired after this immutable prompt snapshot.
   admitted_wait_results_json = Column(JSON, nullable=True, default=None)
+  # Exact dependency results admitted to this physical provider run.
+  admitted_dependency_results_json = Column(JSON, nullable=True, default=None)
   # Proof that an owner send, rather than crash recovery, displaced this
   # never-entered Wait carrier. Its exact Goal can safely retry once.
   owner_superseded_by_run_id = Column(String(64), nullable=True, default=None)
@@ -1605,6 +1607,10 @@ class AgentWorkClaim(Base):
   )
 
   id = Column(String(64), primary_key=True)
+  # Stable through transfer, new on reacquisition. Revision is ownership state,
+  # not acquisition identity.
+  acquisition_id = Column(String(64), nullable=True, index=True,
+                          default=lambda: secrets.token_hex(16))
   owner_id = Column(Integer, ForeignKey("owner.id", ondelete="CASCADE"),
                     nullable=False, index=True)
   work_key = Column(String(256), nullable=False)
@@ -1650,6 +1656,40 @@ class AgentWorkInterest(Base):
   goal_id = Column(String(64), nullable=False, index=True)
   created_at = Column(DateTime, nullable=False, default=now_naive_utc)
   resolved_at = Column(DateTime, nullable=True)
+
+
+class GoalDependency(Base):
+  """One Goal's durable subscription to an exact external acquisition/card.
+
+  Historical interests without provable acquisition identity use a legacy
+  target key only when already resolved; those rows are never owed results.
+  """
+
+  __tablename__ = "goal_dependencies"
+  __table_args__ = (
+    UniqueConstraint("waiting_goal_id", "target_key", name="uq_goal_dependency_target"),
+    Index("ix_goal_dependencies_owed", "waiting_goal_id", "resolved_at", "result_disposition"),
+    Index("ix_goal_dependencies_source", "target_kind", "target_acquisition_id", "resolved_at"),
+  )
+
+  id = Column(String(64), primary_key=True)
+  waiting_goal_id = Column(String(64), nullable=False, index=True)
+  waiting_chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
+  created_by_run_id = Column(String(64), nullable=True)
+  task_id = Column(String(64), nullable=True)
+  target_kind = Column(String(32), nullable=False)
+  target_key = Column(String(160), nullable=False)
+  target_claim_id = Column(String(64), nullable=True, index=True)
+  target_acquisition_id = Column(String(64), nullable=True)
+  target_chat_id = Column(String(64), nullable=True)
+  target_question_id = Column(String(64), nullable=True)
+  outcome_json = Column(JSON, nullable=True)
+  resolved_at = Column(DateTime, nullable=True)
+  result_disposition = Column(String(32), nullable=True)
+  result_disposed_at = Column(DateTime, nullable=True)
+  received_run_id = Column(String(64), nullable=True)
+  withdrawn_at = Column(DateTime, nullable=True)
+  created_at = Column(DateTime, nullable=False, default=now_naive_utc)
 
 
 class ProjectPresence(Base):

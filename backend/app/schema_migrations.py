@@ -6589,6 +6589,122 @@ def _add_wait_result_receipts(eng) -> None:
                         "WHERE result_disposition IS NULL AND status='cancelled'"))
 
 
+def _add_goal_dependencies(eng) -> None:
+  """Add acquisition identity and classify old follows without inventing receipt.
+
+  Old interests have no acquisition generation or receiving run. A pending
+  follow is recoverable only when its creation falls within the still-live
+  claim acquisition. Resolved follows retain a non-waking legacy trace. Other
+  uncertain rows stay in agent_work_interests for explicit reconciliation.
+  """
+  from sqlalchemy import inspect, text
+
+  inspector = inspect(eng)
+  tables = set(inspector.get_table_names())
+  with eng.begin() as conn:
+    if "chat_runs" in tables and "admitted_dependency_results_json" not in {
+      col["name"] for col in inspector.get_columns("chat_runs")
+    }:
+      conn.execute(text("ALTER TABLE chat_runs ADD COLUMN admitted_dependency_results_json JSON"))
+    if "agent_work_claims" in tables:
+      columns = {col["name"] for col in inspector.get_columns("agent_work_claims")}
+      if "acquisition_id" not in columns:
+        conn.execute(text("ALTER TABLE agent_work_claims ADD COLUMN acquisition_id VARCHAR(64)"))
+      for (claim_id,) in conn.execute(text(
+        "SELECT id FROM agent_work_claims WHERE acquisition_id IS NULL"
+      )):
+        conn.execute(text(
+          "UPDATE agent_work_claims SET acquisition_id=:acquisition_id "
+          "WHERE id=:id AND acquisition_id IS NULL"
+        ), {"id": claim_id, "acquisition_id": uuid.uuid4().hex})
+      conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_work_claims_acquisition_id "
+                        "ON agent_work_claims (acquisition_id)"))
+
+    conn.execute(text("""
+      CREATE TABLE IF NOT EXISTS goal_dependencies (
+        id VARCHAR(64) PRIMARY KEY,
+        waiting_goal_id VARCHAR(64) NOT NULL,
+        waiting_chat_id VARCHAR(64) NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        created_by_run_id VARCHAR(64), task_id VARCHAR(64),
+        target_kind VARCHAR(32) NOT NULL, target_key VARCHAR(160) NOT NULL,
+        target_claim_id VARCHAR(64), target_acquisition_id VARCHAR(64),
+        target_chat_id VARCHAR(64), target_question_id VARCHAR(64),
+        outcome_json JSON, resolved_at TIMESTAMP,
+        result_disposition VARCHAR(32), result_disposed_at TIMESTAMP,
+        received_run_id VARCHAR(64), withdrawn_at TIMESTAMP,
+        created_at TIMESTAMP NOT NULL,
+        CONSTRAINT uq_goal_dependency_target UNIQUE (waiting_goal_id, target_key)
+      )
+    """))
+    for name, columns in (
+      ("ix_goal_dependencies_waiting_goal_id", "waiting_goal_id"),
+      ("ix_goal_dependencies_waiting_chat_id", "waiting_chat_id"),
+      ("ix_goal_dependencies_target_claim_id", "target_claim_id"),
+      ("ix_goal_dependencies_owed", "waiting_goal_id, resolved_at, result_disposition"),
+      ("ix_goal_dependencies_source", "target_kind, target_acquisition_id, resolved_at"),
+    ):
+      conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON goal_dependencies ({columns})"))
+    if not {"agent_work_interests", "agent_work_claims", "chat_goals", "chats"}.issubset(tables):
+      return
+
+    rows = conn.execute(text("""
+      SELECT i.id, i.claim_id, i.chat_id, i.goal_id, i.created_at,
+             i.resolved_at, g.status, g.hold_json, g.chat_id,
+             h.deleted_at, c.acquisition_id, c.claimed_at,
+             c.released_at, c.completed_at
+      FROM agent_work_interests i
+      LEFT JOIN chat_goals g ON g.id=i.goal_id
+      LEFT JOIN chats h ON h.id=i.chat_id
+      LEFT JOIN agent_work_claims c ON c.id=i.claim_id
+    """)).all()
+    for (interest_id, claim_id, chat_id, goal_id, created_at, resolved_at,
+         goal_status, hold_json, goal_chat_id, deleted_at, acquisition_id,
+         claimed_at, released_at, completed_at) in rows:
+      # A stopped Goal is eligible only when explicitly held. Dismissed,
+      # deleted, terminal and cross-chat identities must not arm work.
+      hold = json.loads(hold_json) if isinstance(hold_json, str) else hold_json
+      if (goal_chat_id != chat_id or deleted_at is not None or
+          not (goal_status == "open" or
+               (goal_status == "stopped" and isinstance(hold, dict)))):
+        continue
+      if resolved_at is not None:
+        target_key = f"legacy-interest:{interest_id}"
+        disposition = "legacy_consumed"
+        outcome = json.dumps({"kind": "legacy_consumed", "source": "agent_work_interest"})
+      else:
+        # DateTime reflection gives strings on some SQLite drivers. ISO
+        # strings compare chronologically after normalizing via fromisoformat.
+        def as_dt(value):
+          return value if isinstance(value, datetime) else datetime.fromisoformat(value)
+        if (not acquisition_id or not claimed_at or released_at is not None or
+            completed_at is not None or as_dt(created_at) < as_dt(claimed_at)):
+          continue
+        target_key = f"claim:{acquisition_id}"
+        disposition = None
+        outcome = None
+      if conn.execute(text(
+        "SELECT 1 FROM goal_dependencies WHERE waiting_goal_id=:goal_id "
+        "AND target_key=:target_key"
+      ), {"goal_id": goal_id, "target_key": target_key}).first():
+        continue
+      conn.execute(text("""
+        INSERT INTO goal_dependencies
+          (id, waiting_goal_id, waiting_chat_id, target_kind, target_key,
+           target_claim_id, target_acquisition_id, outcome_json, resolved_at,
+           result_disposition, result_disposed_at, created_at)
+        VALUES (:id, :goal_id, :chat_id, 'claim_acquisition', :target_key,
+                :claim_id, :acquisition_id, :outcome, :resolved_at,
+                :disposition, :disposed_at, :created_at)
+      """), {
+        "id": uuid.uuid4().hex, "goal_id": goal_id, "chat_id": chat_id,
+        "target_key": target_key, "claim_id": claim_id,
+        "acquisition_id": acquisition_id if disposition is None else None,
+        "outcome": outcome, "resolved_at": resolved_at,
+        "disposition": disposition, "disposed_at": resolved_at,
+        "created_at": created_at,
+      })
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -6700,6 +6816,7 @@ _SCHEMA_MIGRATIONS = (
   # main's ledger so it runs once wherever it has not run.
   ("0086_goal_execution_identity", _goal_execution_identity),
   ("0089_wait_result_receipts", _add_wait_result_receipts),
+  ("0090_goal_dependencies", _add_goal_dependencies),
 )
 
 
