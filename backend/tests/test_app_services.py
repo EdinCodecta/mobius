@@ -1263,6 +1263,91 @@ async def test_tool_result_handoff_still_ends_its_browser_attribution(db, auth, 
   assert app_services._admitted_exchange_cost == 0
 
 
+_NEGATIVE_WORD = -123456789012345678
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ["request", "response", "materialized"])
+async def test_negative_machine_word_ints_are_accepted_in_every_direction(direction):
+  # 18 digits and a sign still fit the parser's machine-word path.
+  value = [_NEGATIVE_WORD] * 150_000
+  raw = _compact(value)
+  assert len(raw) < 8 * MIB
+  with app_services.ServiceExchangeAdmission(8 * MIB) as admission:
+    if direction == "materialized":
+      await admission.retain({"body": value})
+    else:
+      admission.admit_received(len(raw))
+      decoded = await (admission.decode(raw) if direction == "request" else admission.decode_response(raw))
+      assert decoded == value
+  assert app_services._admitted_exchange_cost == 0
+
+
+def _int_list_units(value):
+  raw = _compact(value)
+  work = sum(
+    app_services._json_number_work(len(str(item)), app_services._JSON_INT, item < 0)
+    for item in value
+  )
+  return raw, len(value) + len(raw) // app_services._JSON_BARE_CHARS_PER_UNIT + work
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("item", [
+  _NEGATIVE_WORD, -_NEGATIVE_WORD, -1234567890123456789, 1234567890123456789,
+  -int("9" * 40), int("9" * 40), -int("9" * 4300),
+], ids=["negative-word", "positive-word", "negative-19", "positive-19", "negative-40", "positive-40", "negative-4300"])
+@pytest.mark.parametrize("scan_bytes", [16 * 1024, 1, 2, 5, 10, 20])
+async def test_int_work_is_the_same_for_every_chunk_split_and_at_its_exact_bound(monkeypatch, item, scan_bytes):
+  # The sign costs its character only; digits decide the parse path. Every
+  # split of the token across chunks gets the verdict of the whole token.
+  raw, units = _int_list_units([item, item])
+  monkeypatch.setattr(app_services, "_JSON_SCAN_BYTES", scan_bytes)
+  monkeypatch.setattr(app_services, "MAX_JSON_STRUCTURE", units)
+  with app_services.ServiceExchangeAdmission(MIB) as admission:
+    assert await admission.decode(raw) == [item, item]
+  monkeypatch.setattr(app_services, "MAX_JSON_STRUCTURE", units - 1)
+  with pytest.raises(HTTPException) as refused:
+    with app_services.ServiceExchangeAdmission(MIB) as admission:
+      await admission.decode(raw)
+  assert refused.value.detail == "App service request structural resource limit exceeded."
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("item", [_NEGATIVE_WORD, -1234567890123456789, 1234567890123456789])
+async def test_int_work_verdict_matches_over_http_and_materialized_at_the_bound(monkeypatch, item):
+  value = [item] * 1000
+  _raw, units = _int_list_units(value)
+  for cap, expected in ((units, "accepted"), (units - 1, "App service request structural resource limit exceeded.")):
+    monkeypatch.setattr(app_services, "MAX_JSON_STRUCTURE", cap)
+    assert await _number_work_verdicts(value) == [expected, expected]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("item", [-int("9" * 4300), int("9" * 4300)])
+async def test_costly_big_ints_are_still_refused_and_cancellation_releases_their_scan(item):
+  raw = _compact([item] * 400)
+  with pytest.raises(HTTPException) as refused:
+    with app_services.ServiceExchangeAdmission(8 * MIB) as admission:
+      await admission.decode(raw)
+  assert refused.value.detail == "App service request structural resource limit exceeded."
+  started = asyncio.Event()
+
+  async def scan():
+    with app_services.ServiceExchangeAdmission(8 * MIB) as admission:
+      admission.admit_received(len(raw))
+      started.set()
+      await admission.decode(raw)
+
+  task = asyncio.create_task(scan())
+  await started.wait()
+  await asyncio.sleep(0)
+  task.cancel()
+  await asyncio.gather(task, return_exceptions=True)
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
 def _resource_corpus():
   n = 40_000
   return {

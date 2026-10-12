@@ -354,6 +354,7 @@ class ServiceExchangeAdmission:
     number_work = 0
     number_length = 0
     number_shape = _JSON_INT
+    number_signed = False
     # Whether the next chunk may start a value (the document's first, or one
     # after a separator and whitespace that ended the last chunk).
     value_pending = True
@@ -395,7 +396,7 @@ class ServiceExchangeAdmission:
         number_length += end
         number_shape = max(number_shape, _json_number_shape(chunk, 0, end))
         if end < len(chunk) or final:
-          number_work += _json_number_work(number_length, number_shape)
+          number_work += _json_number_work(number_length, number_shape, number_signed)
           number_length = 0
         last = end
       elif value_pending:
@@ -408,11 +409,13 @@ class ServiceExchangeAdmission:
           if value.start("number") != -1:
             index, end = value.span("number")
             shape = _json_number_shape(chunk, index, end)
+            signed = chunk[index] == "-"
             if end == len(chunk) and not final:
               number_length = end - index
               number_shape = shape
+              number_signed = signed
             else:
-              number_work += _json_number_work(end - index, shape)
+              number_work += _json_number_work(end - index, shape, signed)
           elif value.start("pending") != -1:
             value_pending = True
           value = None
@@ -498,7 +501,7 @@ class ServiceExchangeAdmission:
       units = (
         strings + lists + dicts + commas + members + number_work + stray
         + bare // _JSON_BARE_CHARS_PER_UNIT
-        + _json_number_work(number_length, number_shape)
+        + _json_number_work(number_length, number_shape, number_signed)
       )
       if units > MAX_JSON_STRUCTURE:
         self._reject(direction, "structural resource limit exceeded")
@@ -618,11 +621,11 @@ class ServiceExchangeAdmission:
       elif isinstance(item, int):
         length = _json_int_length(item)
         bare += length
-        number_work += _json_number_work(length, _JSON_INT)
+        number_work += _json_number_work(length, _JSON_INT, item < 0)
       elif isinstance(item, float):
         text = repr(item)
         bare += len(text)
-        number_work += _json_number_work(len(text), _json_number_shape(text, 0, len(text)))
+        number_work += _json_number_work(len(text), _json_number_shape(text, 0, len(text)), item < 0)
         del text
       cost += sys.getsizeof(item) + _RETAINED_BLOCK_SLACK * (1 if children is None else 2)
       depth = len(pending) - 1
@@ -658,7 +661,7 @@ def _json_number_shape(text: str, start: int, end: int) -> int:
   return _JSON_DECIMAL if text.find(".", start, end) != -1 else _JSON_INT
 
 
-def _json_number_work(length: int, shape: int) -> int:
+def _json_number_work(length: int, shape: int, signed: bool = False) -> int:
   """Parse work of one number token beyond its mark and characters, in units.
 
   Calibrated in thread CPU time against the per-element cost of a small int,
@@ -670,12 +673,15 @@ def _json_number_work(length: int, shape: int) -> int:
   near a halfway point ("2.2e-308" 13.3, "2.2250738585072014e-300" 15.5, and
   roughly 1.2 units per character past 40). Ints past 18 digits leave the
   machine-word path and grow quadratically (4300 digits, the stdlib's limit:
-  under 1,300 units).
+  under 1,300 units). An int is charged by its digits: a ``signed`` one's
+  minus sign changes neither path (measured within noise), so it costs only
+  its character, wherever a chunk boundary or materialization puts it.
   """
   if not length:
     return 0
   if shape == _JSON_INT:
-    return length * length // 7000 + 2 if length > _JSON_LINEAR_DIGITS else 0
+    digits = length - signed
+    return digits * digits // 7000 + 2 if digits > _JSON_LINEAR_DIGITS else 0
   if shape == _JSON_DECIMAL and length <= 16:
     return 2 + length // 8
   if shape == _JSON_DECIMAL and length <= 24:

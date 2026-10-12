@@ -226,8 +226,9 @@ colon outside strings), 24 other characters outside strings, or a number
 token's measured extra parse cost: a decimal without an exponent 2 plus an
 eighth of its length up to 16 characters and 2 plus half its length up to 24;
 an exponent or a longer decimal its length plus 12, plus its length beyond 24
-again; an int of more than 18 digits its length squared over 7,000, plus 2.
-Invalid marks no valid document repeats (a closer with no open container, a
+again; an int of more than 18 digits its digit count squared over 7,000,
+plus 2 (a minus sign costs only its character, wherever a chunk boundary or
+materialization puts it). Invalid marks no valid document repeats (a closer with no open container, a
 backslash outside strings) cost a unit each. Units bound the one
 uninterruptible standard-library call per document, the parse, so a larger
 transfer grant buys media bytes, not denser JSON; the depth stays well inside
