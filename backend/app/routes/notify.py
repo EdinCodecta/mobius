@@ -46,7 +46,7 @@ log = logging.getLogger(__name__)
 _KEEPALIVE_INTERVAL = 30
 
 
-class _SystemEventStreamingResponse(StreamingResponse):
+class ClosingStreamingResponse(StreamingResponse):
   """Close the event iterator when ASGI abandons an in-flight body send."""
 
   async def __call__(self, scope, receive, send):
@@ -455,7 +455,7 @@ async def stream_system_events(
     finally:
       broadcast.unsubscribe(queue)
 
-  return _SystemEventStreamingResponse(
+  return ClosingStreamingResponse(
     revocable_browser_stream(generate(), principal),
     media_type="text/event-stream",
     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

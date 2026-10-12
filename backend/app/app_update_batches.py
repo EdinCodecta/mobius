@@ -5,11 +5,14 @@ each one through the same path a single reviewed update takes
 (``install.install_requested_app``), independently of any browser. One JSON
 receipt per batch records every app's progress and result.
 
-Entries start together, so their Git transfers overlap; each local install
-then takes the app lifecycle lock in turn, like any other install. Recovery
-never replays an approval: an entry the server could not finish is settled
-from the app's durable row, which says whether the reviewed commit landed,
-stopped at a conflict, or did not happen.
+At most ``_RUNNING_ENTRIES`` entries run at once across all batches, so their
+Git transfers overlap without taking every shared transfer worker from
+interactive installs; the rest wait as ``queued``. Each local install then
+takes the app lifecycle lock in turn, like any other install.
+
+One rule says whether a reviewed update landed (``_settled_outcomes``), for
+restart, cancellation and later refreshes alike. Recovery never replays an
+approval.
 """
 
 from __future__ import annotations
@@ -34,14 +37,25 @@ from app.storage_io import atomic_write
 
 log = logging.getLogger(__name__)
 _ACTIVE = frozenset({"queued", "applying"})
+# Entries running at once across all batches. Each may hold a Git transfer on
+# the shared transfer workers; the rest stay free for interactive installs.
+_RUNNING_ENTRIES = 2
 # SSE transport heartbeat, not an update deadline. A long Python check can run
 # without a status change; keep proxies from mistaking that for a dead link.
 _STREAM_KEEPALIVE_SECONDS = 15
 # Finished receipts are audit and retry history, not state; bound their growth.
 _RETAIN_COMPLETE = timedelta(days=30)
-_INTERRUPTED = (
-  "The server stopped before this update finished, and it was not applied. "
-  "Check the app's update again before retrying."
+_NOT_APPLIED = (
+  "This update was not applied. Check the app's update again before retrying."
+)
+_UNREADABLE = (
+  "Saved update progress could not be read, so batch updates are paused; "
+  "this is retried on the next request. Apps can still be updated one at a "
+  "time. The saved progress is kept in app-update-batches/ for inspection."
+)
+_UNSAVED = (
+  "Update progress could not be saved, so batch updates are paused. Free disk "
+  "space and restart the server; apps can still be updated one at a time."
 )
 
 
@@ -87,55 +101,111 @@ async def install_reviewed_update(update: dict) -> dict:
       "status": "conflict" if result.mode == "conflict" else "updated",
       "version": result.app.version,
       "warnings": result.warnings,
-      "error": "",
     }
 
 
-def _settled_outcomes(reviewed: dict[int, str]) -> dict[int, dict]:
-  """Read what happened to updates whose worker stopped before recording it.
+def _reviewed_commit_landed(source_dir: str, reviewed_commit: str, source_commit: str | None) -> bool:
+  """The served revision contains the reviewed commit and nothing is pending.
 
-  ``reviewed`` maps app id to its reviewed upstream commit. The app row
-  commits in one transaction with the install, so its upstream commit says
-  whether the reviewed update landed; a pending-update receipt says it stopped
-  at a conflict. Anything else rolled back. Read-only: callers apply the
-  returned patches to their record on the event loop.
+  ``main`` can hold unapplied edits, and a conflicted update records the
+  reviewed commit as its upstream without serving it; only the accepted
+  ``source_commit`` is evidence.
+  """
+  from app.install import pending_conflict_update_receipt_present
+
+  return bool(source_commit) and not pending_conflict_update_receipt_present(source_dir) and (
+    app_git.ref_is_ancestor(source_dir, reviewed_commit, source_commit) is True
+  )
+
+
+def _settled_outcomes(reviewed: dict[int, str]) -> dict[int, dict]:
+  """The one "did it land" rule, from durable app state. Read-only, blocking.
+
+  ``reviewed`` maps app id to its reviewed upstream commit. For each app:
+  ``updated`` iff the accepted source contains that commit and no pending
+  update remains; ``conflict`` iff a pending-update receipt names that
+  commit (with the resolver chat opened for it); otherwise not applied.
+  Callers apply the returned patches to their record on the event loop.
   """
   from app import install
 
-  outcomes = {}
   with SessionLocal() as db:
     rows = {
-      row.id: row for row in db.query(models.App).filter(
+      row.id: (
+        row.source_dir, row.source_commit, row.version,
+        row.conflict_resolver_chat_id, row.conflict_resolver_upstream_commit,
+      )
+      for row in db.query(models.App).filter(
         models.App.id.in_(list(reviewed)),
         models.App.deleted_at.is_(None),
       )
     }
-    for app_id, commit in reviewed.items():
-      row = rows.get(app_id)
-      if row is None:
-        outcomes[app_id] = {"status": "failed", "error": "This app is no longer installed."}
-      elif row.upstream_commit == commit:
-        conflict = install.pending_conflict_update_receipt_present(row.source_dir)
+  outcomes = {}
+  for app_id, commit in reviewed.items():
+    row = rows.get(app_id)
+    if row is None:
+      outcomes[app_id] = {
+        "status": "failed", "error": "This app is no longer installed.",
+        "error_code": "app_not_found", "retryable": False, "resolver_chat_id": None,
+      }
+      continue
+    source_dir, source_commit, version, resolver, resolver_commit = row
+    try:
+      if _reviewed_commit_landed(source_dir, commit, source_commit):
         outcomes[app_id] = {
-          "status": "conflict" if conflict else "updated",
-          "version": row.version, "error": "",
+          "status": "updated", "version": version, "error": "",
+          "error_code": None, "retryable": False, "resolver_chat_id": None,
         }
-      else:
-        outcomes[app_id] = {"status": "failed", "error": _INTERRUPTED}
+        continue
+      pending = install.read_pending_conflict_update_receipt(
+        source_dir, app_id=app_id, upstream_commit=commit,
+      )
+    except (OSError, RuntimeError):
+      pending = None
+    if pending is not None:
+      outcomes[app_id] = {
+        "status": "conflict", "version": version, "error": "",
+        "error_code": None, "retryable": False,
+        "resolver_chat_id": resolver if resolver_commit == commit else None,
+      }
+    else:
+      outcomes[app_id] = {
+        "status": "failed", "error": _NOT_APPLIED,
+        "error_code": "update_not_applied", "retryable": False, "resolver_chat_id": None,
+      }
   return outcomes
 
 
-def _unfinished(record: dict, entries: list[dict]) -> dict[int, str]:
+def _unfinished(record: dict, entries: list[dict], statuses=_ACTIVE) -> dict[int, str]:
   commits = {u["app_id"]: u["upstream_commit"] for u in record["updates"]}
-  return {e["app_id"]: commits[e["app_id"]] for e in entries if e["status"] in _ACTIVE}
+  return {e["app_id"]: commits[e["app_id"]] for e in entries if e["status"] in statuses}
 
 
-def _resolution_is_accepted(source_dir: str, reviewed_commit: str, accepted_commit: str) -> bool:
-  from app.install import pending_conflict_update_receipt_present
+def _apply(record: dict, outcomes: dict[int, dict]) -> bool:
+  changed = False
+  for entry in record["entries"]:
+    patch = outcomes.get(entry["app_id"])
+    if patch and any(entry.get(k) != v for k, v in patch.items()):
+      entry.update(patch)
+      changed = True
+  return changed
 
-  return not pending_conflict_update_receipt_present(source_dir) and (
-    app_git.ref_is_ancestor(source_dir, reviewed_commit, accepted_commit) is True
-  )
+
+def _failure(exc: BaseException) -> dict:
+  """Keep the installer's code and retry verdict, as the single route does."""
+  from app import install
+
+  if isinstance(exc, HTTPException):
+    detail = exc.detail
+    message = detail.get("message", str(detail)) if isinstance(detail, dict) else str(detail)
+    code = detail.get("code") if isinstance(detail, dict) else None
+  else:
+    message = "This update could not finish. Check it again before retrying."
+    code = None
+  return {
+    "status": "failed", "error": message, "error_code": code,
+    "retryable": install.transient_failure(exc)[0],
+  }
 
 
 class AppUpdateBatches:
@@ -149,6 +219,8 @@ class AppUpdateBatches:
     self.listeners: dict[str, set[asyncio.Event]] = {}
     self.accepting = False
     self.failure: str | None = None
+    self._read_failed = False
+    self._slots: asyncio.Semaphore | None = None
 
   def _save(self, record: dict) -> None:
     record["updated_at"] = _now()
@@ -165,7 +237,7 @@ class AppUpdateBatches:
     except OSError:
       # Progress that cannot be recorded must not keep admitting work.
       self.accepting = False
-      self.failure = "Update progress could not be saved. Check the installed apps before retrying."
+      self.failure = _UNSAVED
       for listeners in self.listeners.values():
         for wake in listeners:
           wake.set()
@@ -175,17 +247,27 @@ class AppUpdateBatches:
       wake.set()
 
   async def start(self) -> None:
+    self._slots = asyncio.Semaphore(_RUNNING_ENTRIES)
+    self.records = {}
     try:
       await asyncio.to_thread(self._load_receipts)
     except Exception:
       # A damaged receipt or a failed settlement read (including a database
       # error) must not fail readiness for unrelated chats and apps. Disable
       # only this owner, visibly, and keep the evidence for repair.
-      self.failure = "Saved update progress could not be read. Check the installed apps before retrying."
+      self.failure = _UNREADABLE
+      self._read_failed = True
       self.accepting = False
       log.exception("app update progress could not be recovered")
       return
+    self.failure = None
+    self._read_failed = False
     self.accepting = True
+
+  async def retry_start(self) -> None:
+    """Retry a failed boot read; never after a failed write or at shutdown."""
+    if self._read_failed and not self.tasks:
+      await self.start()
 
   def _load_receipts(self) -> None:
     self.root.mkdir(parents=True, exist_ok=True)
@@ -203,9 +285,7 @@ class AppUpdateBatches:
       # Boot: nothing else runs yet, so this thread may apply the outcomes.
       unfinished = _unfinished(record, record["entries"])
       if unfinished:
-        outcomes = _settled_outcomes(unfinished)
-        for entry in record["entries"]:
-          entry.update(outcomes.get(entry["app_id"], {}))
+        _apply(record, _settled_outcomes(unfinished))
         self._save(record)
 
   async def stop(self) -> None:
@@ -215,6 +295,7 @@ class AppUpdateBatches:
     only once its threads end; each entry then records its settled outcome.
     """
     self.accepting = False
+    self._read_failed = False
     tasks = list(self.tasks.values())
     for task in tasks:
       task.cancel()
@@ -245,8 +326,8 @@ class AppUpdateBatches:
       app = live_app_or_404(db, item["app_id"])
       entries.append({
         "app_id": app.id, "name": app.name, "status": "queued",
-        "version": app.version, "error": "", "warnings": [],
-        "resolver_chat_id": None,
+        "version": app.version, "error": "", "error_code": None,
+        "retryable": False, "warnings": [], "resolver_chat_id": None,
       })
     record = {
       "id": key, "created_at": _now(), "updates": updates, "entries": entries,
@@ -291,53 +372,15 @@ class AppUpdateBatches:
       newer_apps.update(e["app_id"] for e in record["entries"])
     return visible
 
-  async def refresh_results(self, key: str, db) -> None:
-    """Project resolver progress from accepted source, not a browser guess."""
+  async def refresh_results(self, key: str, db=None) -> None:
+    """Re-read conflicted entries through the one "did it land" rule."""
     record = self.records.get(key)
     if record is None:
       raise HTTPException(404, "App update batch not found.")
-    conflicts = [e for e in record["entries"] if e["status"] == "conflict"]
-    if not conflicts:
-      return
-    rows = db.query(
-      models.App.id, models.App.source_dir, models.App.source_commit,
-      models.App.version, models.App.conflict_resolver_chat_id,
-      models.App.conflict_resolver_upstream_commit,
-    ).filter(
-      models.App.id.in_([e["app_id"] for e in conflicts]),
-      models.App.deleted_at.is_(None),
-    ).all()
-    current = {row.id: row._asdict() for row in rows}
-    db.rollback()  # release the read before Git work
-    updates = {u["app_id"]: u for u in record["updates"]}
-    changed = False
-    for entry in conflicts:
-      row = current.get(entry["app_id"])
-      if row is None:
-        entry.update(status="failed", error="This app is no longer installed.")
-        changed = True
-        continue
-      commit = updates[entry["app_id"]]["upstream_commit"]
-      resolver = (
-        row["conflict_resolver_chat_id"]
-        if row["conflict_resolver_upstream_commit"] == commit else None
-      )
-      if entry.get("resolver_chat_id") != resolver:
-        entry["resolver_chat_id"] = resolver
-        changed = True
-      # The accepted source commit names the served revision; `main` can hold
-      # unapplied edits and is therefore no evidence that resolution finished.
-      if row["source_commit"]:
-        try:
-          contained = await asyncio.to_thread(
-            _resolution_is_accepted, row["source_dir"], commit, row["source_commit"],
-          )
-        except (OSError, RuntimeError):
-          contained = False
-        if contained:
-          entry.update(status="updated", version=row["version"], error="", resolver_chat_id=None)
-          changed = True
-    if changed:
+    if db is not None:
+      db.rollback()  # release the request's read before blocking work
+    conflicts = _unfinished(record, record["entries"], {"conflict"})
+    if conflicts and _apply(record, await asyncio.to_thread(_settled_outcomes, conflicts)):
       self._save(record)
 
   async def snapshots(self, key: str):
@@ -363,34 +406,38 @@ class AppUpdateBatches:
 
   async def _run(self, record: dict) -> None:
     async def one(update, entry):
-      started = time.monotonic()
-      entry["status"] = "applying"
-      self._save(record)
       try:
-        outcome = await self.execute(update)
-        entry.update(outcome)
+        async with self._slots:
+          started = time.monotonic()
+          entry["status"] = "applying"
+          self._save(record)
+          try:
+            entry.update(await self.execute(update))
+            entry.update(error="", error_code=None, retryable=False)
+          except asyncio.CancelledError:
+            raise
+          except Exception as exc:
+            if not isinstance(exc, HTTPException):
+              log.exception("app update failed for %s", update["app_id"])
+            entry.update(_failure(exc))
+          entry["duration_ms"] = round((time.monotonic() - started) * 1000)
+          self._save(record)
       except asyncio.CancelledError:
-        # Shutdown: the installer has settled. Read what actually landed off
-        # the loop, then apply it here, where siblings also save this record.
-        outcomes = await asyncio.to_thread(_settled_outcomes, _unfinished(record, [entry]))
-        entry.update(outcomes.get(entry["app_id"], {}))
+        # Shutdown, queued or running: the installer has settled. Read what
+        # actually landed off the loop, then apply it here, where siblings
+        # also save this record.
+        _apply(record, await asyncio.to_thread(
+          _settled_outcomes, _unfinished(record, [entry]),
+        ))
         self._save(record)
         raise
-      except HTTPException as exc:
-        detail = exc.detail
-        entry.update(status="failed", error=(
-          detail.get("message", str(detail)) if isinstance(detail, dict) else str(detail)
-        ))
-      except Exception:
-        log.exception("app update failed for %s", update["app_id"])
-        entry.update(status="failed", error="This update could not finish. Check it again before retrying.")
-      entry["duration_ms"] = round((time.monotonic() - started) * 1000)
-      self._save(record)
       activity.log_event(
         "app_update_outcome", batch_id=record["id"], app_id=entry["app_id"],
         outcome=entry["status"], duration_ms=entry["duration_ms"],
       )
-      get_system_broadcast().publish({"type": "app_updated", "appId": str(entry["app_id"])})
+      if entry["status"] != "failed":
+        # As the single route: the durable row changed, refresh app lists.
+        get_system_broadcast().publish({"type": "app_updated", "appId": str(entry["app_id"])})
 
     # Independent owner-selected apps: one failure never stops its siblings.
     results = await asyncio.gather(

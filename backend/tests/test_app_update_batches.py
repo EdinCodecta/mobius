@@ -33,6 +33,24 @@ def lifecycle_lock(monkeypatch):
   monkeypatch.setattr(fs_locks, "_lifecycle_lock", asyncio.Lock())
 
 
+LANDED = "e" * 40  # an accepted source commit that contains COMMIT
+
+
+@pytest.fixture
+def git_state(monkeypatch):
+  """Durable Git facts per source dir: which pending receipts exist."""
+  pending = set()
+  monkeypatch.setattr(batches.app_git, "ref_is_ancestor",
+    lambda path, reviewed, accepted: reviewed == COMMIT and accepted == LANDED)
+  monkeypatch.setattr(install, "pending_conflict_update_receipt_present",
+    lambda path: str(path) in pending)
+  monkeypatch.setattr(install, "read_pending_conflict_update_receipt",
+    lambda path, *, app_id, upstream_commit:
+      {"upstream_commit": upstream_commit}
+      if str(path) in pending and upstream_commit == COMMIT else None)
+  return pending
+
+
 @pytest.fixture
 def app_rows(monkeypatch):
   monkeypatch.setattr(batches, "live_app_or_404", lambda db, app_id:
@@ -56,7 +74,7 @@ async def drain(owner):
 
 
 @pytest.mark.asyncio
-async def test_distinct_apps_start_together_and_keep_mixed_outcomes(tmp_path, app_rows):
+async def test_entries_run_two_at_a_time_and_keep_mixed_outcomes(tmp_path, app_rows, monkeypatch):
   entered = set()
   all_entered = asyncio.Event()
   release = asyncio.Event()
@@ -64,29 +82,49 @@ async def test_distinct_apps_start_together_and_keep_mixed_outcomes(tmp_path, ap
   async def execute(update):
     app_id = update["app_id"]
     entered.add(app_id)
-    if len(entered) == 4:
+    if len(entered) == batches._RUNNING_ENTRIES:
       all_entered.set()
     await release.wait()
     if app_id == 3:
       raise HTTPException(409, detail={"code": "update_changed", "message": "Review the changed candidate."})
     if app_id == 4:
       raise RuntimeError("test failure")
+    if app_id == 5:
+      raise HTTPException(409, detail={
+        "code": "git_transfer_timeout", "message": "Timed out.", "retryable": True,
+      })
     return {"status": "updated" if app_id == 1 else "conflict", "version": "2.0"}
 
+  published = []
+  monkeypatch.setattr(batches, "get_system_broadcast",
+    lambda: SimpleNamespace(publish=published.append))
   owner = batches.AppUpdateBatches(str(tmp_path), execute=execute)
   await owner.start()
-  body = request(1, 2, 3, 4)
+  body = request(1, 2, 3, 4, 5)
   first = owner.submit(body, None)
   await asyncio.wait_for(all_entered.wait(), timeout=2)
   assert first["phase"] == "applying"
+  # Only the transfer slots run; the rest are really queued.
+  await asyncio.sleep(0.01)
+  assert [e["status"] for e in owner.snapshot(first["id"])["entries"]] == [
+    "applying", "applying", "queued", "queued", "queued",
+  ]
+  assert entered == {1, 2}
   assert len(owner.tasks) == 1
   # The same id is the same approval: a retry attaches, never starts twice.
   assert owner.submit(body, None)["id"] == first["id"]
   release.set()
   await drain(owner)
   final = owner.snapshot(first["id"])
-  assert [e["status"] for e in final["entries"]] == ["updated", "conflict", "failed", "failed"]
-  assert final["entries"][2]["error"] == "Review the changed candidate."
+  assert [e["status"] for e in final["entries"]] == ["updated", "conflict", "failed", "failed", "failed"]
+  assert [(e["error"], e["error_code"], e["retryable"]) for e in final["entries"][2:]] == [
+    ("Review the changed candidate.", "update_changed", False),
+    ("This update could not finish. Check it again before retrying.", None, False),
+    ("Timed out.", "git_transfer_timeout", True),
+  ]
+  assert final["entries"][0]["error_code"] is None
+  # Like the single route: only durable changes refresh app lists.
+  assert sorted(event["appId"] for event in published) == ["1", "2"]
   assert final["phase"] == "complete"
   assert "updates" not in final
   assert json.loads((owner.root / f"{first['id']}.json").read_text())["phase"] == "complete"
@@ -180,12 +218,14 @@ async def test_closing_progress_does_not_cancel_approved_work(tmp_path, app_rows
 
 
 @pytest.mark.asyncio
-async def test_shutdown_settles_running_installs_and_records_what_landed(tmp_path, db):
+async def test_shutdown_settles_running_installs_and_records_what_landed(tmp_path, db, git_state, monkeypatch):
   """Cancellation waits for the install pass, then reads the durable row."""
   from app.runtime_supervisors import RuntimeSupervisors
 
   landed = add_app(db, tmp_path, "landed", version="1.0", upstream_commit="0" * 40)
   rolled_back = add_app(db, tmp_path, "rolled-back", version="1.0", upstream_commit="0" * 40)
+  queued = add_app(db, tmp_path, "queued", version="1.0", upstream_commit="0" * 40)
+  monkeypatch.setattr(batches, "_RUNNING_ENTRIES", 2)
   entered, release = asyncio.Event(), asyncio.Event()
   started = set()
   order = []
@@ -196,7 +236,7 @@ async def test_shutdown_settles_running_installs_and_records_what_landed(tmp_pat
     if app_id == landed:
       with batches.SessionLocal() as session:
         row = session.get(models.App, app_id)
-        row.upstream_commit, row.version = COMMIT, "2.0"
+        row.upstream_commit, row.source_commit, row.version = COMMIT, LANDED, "2.0"
         session.commit()
     order.append(f"settled {app_id}")
     return {"status": "updated"}
@@ -219,7 +259,7 @@ async def test_shutdown_settles_running_installs_and_records_what_landed(tmp_pat
   runtime.app_updates.execute = execute
   await runtime.app_updates.start()
   runtime._spawn("test-resident", resident())
-  accepted = runtime.app_updates.submit(request(landed, rolled_back), db)
+  accepted = runtime.app_updates.submit(request(landed, rolled_back, queued), db)
   await entered.wait()
   stopping = asyncio.create_task(runtime.stop())
   await asyncio.sleep(0.05)
@@ -230,8 +270,11 @@ async def test_shutdown_settles_running_installs_and_records_what_landed(tmp_pat
   await stopping
   assert order[-1] == "other owner stopped"
   entries = runtime.app_updates.snapshot(accepted["id"])["entries"]
-  assert [(e["status"], e["version"]) for e in entries] == [("updated", "2.0"), ("failed", "1.0")]
-  assert entries[1]["error"] == batches._INTERRUPTED
+  assert [(e["status"], e["version"]) for e in entries] == [
+    ("updated", "2.0"), ("failed", "1.0"), ("failed", "1.0"),
+  ]
+  assert entries[1]["error"] == entries[2]["error"] == batches._NOT_APPLIED
+  assert started == {landed, rolled_back}  # the queued entry never ran
   saved = json.loads((runtime.app_updates.root / f"{accepted['id']}.json").read_text())
   assert saved["phase"] == "complete"
   with pytest.raises(HTTPException) as closed:
@@ -264,17 +307,21 @@ async def test_batch_identity_and_running_app_cannot_be_repurposed(tmp_path, app
 
 
 @pytest.mark.asyncio
-async def test_restart_settles_unfinished_entries_from_durable_rows(tmp_path, db, monkeypatch):
-  """Boot never replays an approval; the app rows say what happened."""
-  landed = add_app(db, tmp_path, "landed", version="2.0", upstream_commit=COMMIT)
-  conflicted = add_app(db, tmp_path, "conflicted", version="1.0", upstream_commit=COMMIT)
-  untouched = add_app(db, tmp_path, "untouched", version="1.0", upstream_commit="0" * 40)
+async def test_restart_settles_unfinished_entries_from_durable_rows(tmp_path, db, git_state):
+  """Boot never replays an approval; the served source says what happened."""
+  landed = add_app(db, tmp_path, "landed", version="2.0", upstream_commit=COMMIT,
+    source_commit=LANDED)
+  conflicted = add_app(db, tmp_path, "conflicted", version="1.0", upstream_commit=COMMIT,
+    source_commit="1" * 40)
+  git_state.add(str(tmp_path / "conflicted"))
+  # A conflicted retry records the reviewed upstream; clearing its receipt
+  # never serves it. Upstream alone must not read as updated.
+  cleared = add_app(db, tmp_path, "cleared", version="1.0", upstream_commit=COMMIT,
+    source_commit="1" * 40)
   removed = add_app(db, tmp_path, "removed", version="1.0", upstream_commit=COMMIT,
     deleted_at=datetime.now(UTC).replace(tzinfo=None))
   finished = add_app(db, tmp_path, "finished", version="2.0", upstream_commit=COMMIT)
-  monkeypatch.setattr(install, "pending_conflict_update_receipt_present",
-    lambda source_dir: source_dir.endswith("conflicted"))
-  body = request(finished, landed, conflicted, untouched, removed)
+  body = request(finished, landed, conflicted, cleared, removed)
   key = str(body.id)
   owner = batches.AppUpdateBatches(str(tmp_path))
   await owner.start()
@@ -283,7 +330,7 @@ async def test_restart_settles_unfinished_entries_from_durable_rows(tmp_path, db
     "entries": [{"app_id": finished, "status": "updated", "version": "2.0", "error": ""}] + [
       {"app_id": app_id, "status": status, "version": "1.0", "error": ""}
       for app_id, status in [(landed, "applying"), (conflicted, "applying"),
-                             (untouched, "applying"), (removed, "queued")]
+                             (cleared, "applying"), (removed, "queued")]
     ]})
 
   async def forbidden(update):
@@ -297,7 +344,8 @@ async def test_restart_settles_unfinished_entries_from_durable_rows(tmp_path, db
     ("updated", "2.0"), ("updated", "2.0"), ("conflict", "1.0"),
     ("failed", "1.0"), ("failed", "1.0"),
   ]
-  assert result["entries"][3]["error"] == batches._INTERRUPTED
+  assert result["entries"][3]["error"] == batches._NOT_APPLIED
+  assert result["entries"][3]["error_code"] == "update_not_applied"
   assert result["entries"][4]["error"] == "This app is no longer installed."
   assert result["phase"] == "complete"
   assert reboot.tasks == {}
@@ -406,7 +454,9 @@ async def test_result_write_failure_lets_started_siblings_finish_and_closes_admi
 
 def test_batch_routes_require_manage_apps_and_owner_control(client, owner_token, monkeypatch):
   owner = SimpleNamespace(recent=lambda: [])
-  monkeypatch.setattr("app.routes.app_update_batches.batches", lambda request: owner)
+  async def batches_owner(request):
+    return owner
+  monkeypatch.setattr("app.routes.app_update_batches.batches", batches_owner)
   assert client.get("/api/apps/update-batches").status_code == 401
   response = client.get("/api/apps/update-batches", headers={"Authorization": f"Bearer {owner_token}"})
   assert response.status_code == 200
@@ -457,8 +507,9 @@ def test_store_permission_admits_exact_review_but_never_incomplete_consent(clien
     admitted.append(body.model_dump(mode="json"))
     return {"id": str(body.id), "phase": "applying"}
 
-  monkeypatch.setattr("app.routes.app_update_batches.batches",
-    lambda request: SimpleNamespace(submit=submit))
+  async def batches_owner(request):
+    return SimpleNamespace(submit=submit)
+  monkeypatch.setattr("app.routes.app_update_batches.batches", batches_owner)
   body = request(store.id).model_dump(mode="json")
   response = client.post("/api/apps/update-batches", headers=headers, json=body)
   assert response.status_code == 200, response.text
@@ -489,11 +540,13 @@ async def test_progress_stream_coalesces_to_latest_result(tmp_path, app_rows):
 
 
 @pytest.mark.asyncio
-async def test_conflicted_entry_follows_its_resolver_until_the_answer_is_applied(tmp_path, db, monkeypatch):
-  app_id = add_app(db, tmp_path, "resolved", version="1.0", source_commit="d" * 40)
+async def test_conflicted_entry_follows_its_resolver_until_the_answer_is_applied(tmp_path, db, git_state):
+  app_id = add_app(db, tmp_path, "resolved", version="1.0", source_commit="d" * 40,
+    upstream_commit=COMMIT)
+  git_state.add(str(tmp_path / "resolved"))
 
   async def execute(update):
-    return {"status": "conflict", "version": "1.0", "warnings": [], "error": ""}
+    return {"status": "conflict", "version": "1.0", "warnings": []}
 
   owner = batches.AppUpdateBatches(str(tmp_path), execute=execute)
   await owner.start()
@@ -508,26 +561,59 @@ async def test_conflicted_entry_follows_its_resolver_until_the_answer_is_applied
   row.conflict_resolver_chat_id = "resolver-chat"
   row.conflict_resolver_upstream_commit = COMMIT
   db.commit()
-  seen = []
-  def contains(path, upstream, accepted):
-    seen.append((upstream, accepted))
-    return True
-  monkeypatch.setattr(batches.app_git, "ref_is_ancestor", contains)
-  monkeypatch.setattr(install, "pending_conflict_update_receipt_present", lambda path: True)
   await owner.refresh_results(key, db)
   entry = owner.snapshot(key)["entries"][0]
   assert (entry["status"], entry["resolver_chat_id"]) == ("conflict", "resolver-chat")
-  assert seen == []
 
   # Only the applied answer, with its pending receipt gone, finishes the entry.
   row = db.get(models.App, app_id)
-  row.version = "2.0"
+  row.version, row.source_commit = "2.0", LANDED
   db.commit()
-  monkeypatch.setattr(install, "pending_conflict_update_receipt_present", lambda path: False)
+  git_state.clear()
   await owner.refresh_results(key, db)
   entry = owner.snapshot(key)["entries"][0]
   assert (entry["status"], entry["version"], entry["resolver_chat_id"]) == ("updated", "2.0", None)
-  assert seen == [(COMMIT, "d" * 40)]
+
+
+@pytest.mark.asyncio
+async def test_conflict_cleared_without_its_answer_is_no_longer_actionable(tmp_path, db, git_state):
+  """resolve-update can drop a stale receipt; the update then did not land."""
+  app_id = add_app(db, tmp_path, "dropped", version="1.0", source_commit="d" * 40,
+    upstream_commit=COMMIT, conflict_resolver_chat_id="old-resolver",
+    conflict_resolver_upstream_commit=COMMIT)
+  git_state.add(str(tmp_path / "dropped"))
+
+  async def execute(update):
+    return {"status": "conflict", "version": "1.0", "warnings": []}
+
+  owner = batches.AppUpdateBatches(str(tmp_path), execute=execute)
+  await owner.start()
+  key = owner.submit(request(app_id), db)["id"]
+  await drain(owner)
+  await owner.refresh_results(key, db)
+  assert owner.snapshot(key)["entries"][0]["resolver_chat_id"] == "old-resolver"
+
+  git_state.clear()  # cleared, but the served source never took the commit
+  await owner.refresh_results(key, db)
+  entry = owner.snapshot(key)["entries"][0]
+  assert (entry["status"], entry["error_code"], entry["resolver_chat_id"]) == (
+    "failed", "update_not_applied", None,
+  )
+
+
+@pytest.mark.asyncio
+async def test_unreadable_progress_is_retried_on_the_next_request(tmp_path):
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  owner.root.mkdir()
+  path = owner.root / f"{uuid4()}.json"
+  path.write_text("interrupted bytes")
+  await owner.start()
+  assert not owner.accepting
+  await owner.retry_start()
+  assert not owner.accepting and "retried on the next request" in owner.failure
+  path.unlink()  # the owner repaired or removed the evidence
+  await owner.retry_start()
+  assert owner.accepting and owner.failure is None
 
 
 @pytest.mark.asyncio
@@ -638,7 +724,7 @@ def test_progress_stream_route_sends_snapshots_and_ends_when_complete(
   assert [b["id"] for b in listed.json()["batches"]] == [key]
 
 
-def test_resolution_is_accepted_against_a_real_repository(tmp_path):
+def test_landed_rule_against_a_real_repository(tmp_path):
   repo = tmp_path / "repo"
   subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
 
@@ -654,12 +740,12 @@ def test_resolution_is_accepted_against_a_real_repository(tmp_path):
   subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "other", base], check=True)
   unrelated = commit("served without the update")
 
-  assert batches._resolution_is_accepted(str(repo), reviewed, resolved) is True
-  assert batches._resolution_is_accepted(str(repo), reviewed, reviewed) is True
-  assert batches._resolution_is_accepted(str(repo), reviewed, unrelated) is False
-  assert batches._resolution_is_accepted(str(repo), reviewed, base) is False
+  assert batches._reviewed_commit_landed(str(repo), reviewed, resolved) is True
+  assert batches._reviewed_commit_landed(str(repo), reviewed, reviewed) is True
+  assert batches._reviewed_commit_landed(str(repo), reviewed, unrelated) is False
+  assert batches._reviewed_commit_landed(str(repo), reviewed, base) is False
   # A pending-update receipt means the answer is not installed yet.
   receipt = install.pending_update_receipt_file(repo)
   receipt.parent.mkdir(parents=True)
   receipt.write_text("{}")
-  assert batches._resolution_is_accepted(str(repo), reviewed, resolved) is False
+  assert batches._reviewed_commit_landed(str(repo), reviewed, resolved) is False
