@@ -339,8 +339,10 @@ async def test_receipt_failure_never_starts_unrecorded_work(tmp_path, app_rows, 
   def no_space(*args, **kwargs):
     raise OSError("disk full")
   monkeypatch.setattr(batches, "atomic_write", no_space)
-  with pytest.raises(OSError):
+  with pytest.raises(HTTPException) as unavailable:
     owner.submit(request(1), None)
+  assert unavailable.value.status_code == 503
+  assert "could not be saved" in unavailable.value.detail
   assert calls == []
   assert owner.tasks == {}
   assert not owner.accepting
@@ -562,3 +564,102 @@ async def test_single_update_transfers_before_the_lock_and_cancels_safely(tmp_pa
     await task
   assert events == [("fetch", False), ("pass settled", True)]
   assert not fs_locks.install_uninstall_lock().locked()
+
+
+@pytest.mark.asyncio
+async def test_database_error_at_boot_disables_only_batches(tmp_path, monkeypatch):
+  """Settling old batches can fail; readiness for everything else must hold."""
+  from sqlalchemy.exc import OperationalError
+
+  from app import runtime_supervisors
+  from app.runtime_supervisors import RuntimeSupervisors
+
+  runtime = RuntimeSupervisors(settings=SimpleNamespace(data_dir=str(tmp_path)),
+    logger=logging.getLogger(__name__), restart_authorization=None,
+    restart_fallback_chats=[])
+  body = request(1)
+  key = str(body.id)
+  runtime.app_updates.root.mkdir(parents=True)
+  (runtime.app_updates.root / f"{key}.json").write_text(json.dumps({
+    "id": key, "created_at": _now(), "updated_at": _now(), "phase": "applying",
+    "updates": [u.model_dump() for u in body.updates],
+    "entries": [{"app_id": 1, "status": "applying"}],
+  }))
+
+  def database_down(reviewed):
+    raise OperationalError("SELECT", {}, Exception("database is locked"))
+
+  async def required_owners():
+    for name in runtime_supervisors.REQUIRED_DATABASE_SUPERVISORS:
+      runtime._spawn(name, asyncio.Event().wait())
+
+  monkeypatch.setattr(batches, "_settled_outcomes", database_down)
+  monkeypatch.setattr(runtime, "_start_chat_supervisors", required_owners)
+  try:
+    await runtime.start_database_services()
+    assert runtime.database_service_readiness()[0] is True
+    assert not runtime.app_updates.accepting
+    with pytest.raises(HTTPException) as unavailable:
+      runtime.app_updates.submit(request(2), None)
+    assert unavailable.value.status_code == 503
+    assert "could not be read" in unavailable.value.detail
+    # The receipt is evidence, never rewritten by a failed settlement.
+    assert json.loads((runtime.app_updates.root / f"{key}.json").read_text())["phase"] == "applying"
+  finally:
+    await runtime.stop()
+
+
+def test_progress_stream_route_sends_snapshots_and_ends_when_complete(
+  client, owner_token, monkeypatch, tmp_path,
+):
+  from app.main import app as application
+
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  owner.accepting = True
+  owner.root.mkdir(parents=True)
+  key = str(uuid4())
+  owner._save({"id": key, "created_at": _now(), "updates": [],
+    "entries": [{"app_id": 1, "status": "updated", "name": "One"}]})
+  monkeypatch.setattr(application.state, "runtime_supervisors",
+    SimpleNamespace(app_updates=owner), raising=False)
+  headers = {"Authorization": f"Bearer {owner_token}"}
+  with client.stream("GET", f"/api/apps/update-batches/{key}/events", headers=headers) as response:
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    frames = [line for line in response.iter_lines() if line]
+  assert len(frames) == 1 and frames[0].startswith("data: ")
+  snapshot = json.loads(frames[0][len("data: "):])
+  assert (snapshot["id"], snapshot["phase"], snapshot["entries"][0]["status"]) == (
+    key, "complete", "updated",
+  )
+  assert not owner.listeners
+  assert client.get(f"/api/apps/update-batches/{uuid4()}/events", headers=headers).status_code == 404
+  listed = client.get("/api/apps/update-batches", headers=headers)
+  assert [b["id"] for b in listed.json()["batches"]] == [key]
+
+
+def test_resolution_is_accepted_against_a_real_repository(tmp_path):
+  repo = tmp_path / "repo"
+  subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+
+  def commit(message):
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+      "commit", "-q", "--allow-empty", "-m", message], check=True)
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+      capture_output=True, text=True, check=True).stdout.strip()
+
+  base = commit("base")
+  reviewed = commit("reviewed upstream")
+  resolved = commit("resolver answer")
+  subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "other", base], check=True)
+  unrelated = commit("served without the update")
+
+  assert batches._resolution_is_accepted(str(repo), reviewed, resolved) is True
+  assert batches._resolution_is_accepted(str(repo), reviewed, reviewed) is True
+  assert batches._resolution_is_accepted(str(repo), reviewed, unrelated) is False
+  assert batches._resolution_is_accepted(str(repo), reviewed, base) is False
+  # A pending-update receipt means the answer is not installed yet.
+  receipt = install.pending_update_receipt_file(repo)
+  receipt.parent.mkdir(parents=True)
+  receipt.write_text("{}")
+  assert batches._resolution_is_accepted(str(repo), reviewed, resolved) is False

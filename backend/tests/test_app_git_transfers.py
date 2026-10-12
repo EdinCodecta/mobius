@@ -870,3 +870,54 @@ def test_history_falls_back_to_the_origin_branch(
   assert requested == [v2, "main"]
   assert not (repo / ".git" / "shallow").exists()
   app_git.require_merge_history(repo)
+
+
+def test_update_batch_entries_run_the_real_reviewed_install(
+  client, auth, git_server, transfers, bypass_url_validation, tmp_path,
+):
+  """Two reviewed entries through install_from_manifest, transfers unlocked."""
+  from uuid import uuid4
+
+  from app import app_update_batches
+
+  updates, responses = [], {}
+  for name in ("batch-one", "batch-two"):
+    app_id, manifest = _install_served(client, auth, git_server, name)
+    v2 = {**manifest, "version": "2.0.0"}
+    head = git_server.commit(name, v2, JSX.replace("ok", "v2"), push=True)
+    responses.update(_responses(name, v2, JSX.replace("ok", "v2")))
+    with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+      access = client.post("/api/apps/preview", headers=auth, json={
+        "manifest_url": _base(name) + "mobius.json",
+      })
+    assert access.status_code == 200, access.text
+    preview = client.get(f"/api/apps/{app_id}/update-candidate-preview", headers=auth)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["upstream_commit"] == head
+    updates.append({
+      "app_id": app_id, "manifest_url": _base(name) + "mobius.json",
+      "upstream_commit": head, "source_digest": preview.json()["source_digest"],
+      "capability_digest": access.json()["capability_digest"],
+    })
+
+  async def scenario(_http):
+    owner = app_update_batches.AppUpdateBatches(str(tmp_path))
+    await owner.start()
+    from app.database import SessionLocal
+    with SessionLocal() as db:
+      accepted = owner.submit(app_update_batches.ReviewedUpdateBatch(
+        id=uuid4(), updates=updates,
+      ), db)
+    while owner.tasks:
+      await asyncio.gather(*list(owner.tasks.values()), return_exceptions=True)
+    return owner.snapshot(accepted["id"])
+
+  final = _run_async(scenario, responses)
+  assert final["phase"] == "complete"
+  assert [(e["status"], e["version"]) for e in final["entries"]] == [
+    ("updated", "2.0.0"), ("updated", "2.0.0"),
+  ], final
+  for update, name in zip(updates, ("batch-one", "batch-two")):
+    assert app_git.head_sha(_repo(name), app_git.UPSTREAM_BRANCH) == update["upstream_commit"]
+  assert all(call == (False, []) for call in transfers), transfers
+  assert _no_leftovers()

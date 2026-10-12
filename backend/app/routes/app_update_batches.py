@@ -4,11 +4,11 @@ import json
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.app_update_batches import AppUpdateBatches, ReviewedUpdateBatch
 from app.database import get_db
+from app.routes.notify import _SystemEventStreamingResponse
 from app.deps import (
   get_owner_or_app_with_manage_apps, get_principal, Principal,
   reject_cross_site, require_nondelegated_owner_or_app_control,
@@ -68,7 +68,9 @@ async def batch_events(
     async for snapshot in owner.snapshots(str(batch_id)):
       yield ": keepalive\n\n" if snapshot is None else f"data: {json.dumps(snapshot)}\n\n"
 
-  return StreamingResponse(
+  # Closes the snapshot generator as soon as ASGI abandons a send, so a
+  # dropped reader's listener is removed promptly.
+  return _SystemEventStreamingResponse(
     revocable_browser_stream(generate(), principal),
     media_type="text/event-stream",
     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

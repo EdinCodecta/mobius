@@ -11,6 +11,8 @@ read both):
   {"ev":"app_open",       "ts", "app_id", "slug"}
   {"ev":"app_install",    "ts", "app_id", "slug", "source":"bootstrap|store|url", "kept_local_paths"?:[str]}
   {"ev":"app_uninstall",  "ts", "app_id", "slug"}   # logical (tombstone) delete
+  {"ev":"app_update_outcome", "ts", "batch_id", "app_id",
+                           "outcome":"updated|conflict|failed", "duration_ms"}  # one per batch entry
   {"ev":"storage_write",  "ts", "app_id", "path", "size_delta"}  # delete = negative delta
   {"ev":"cron_outcome",   "ts", "app_id", "job", "exit_code", "duration_ms"}
   {"ev":"skill_loaded",   "ts", "chat_id", "skill"}
