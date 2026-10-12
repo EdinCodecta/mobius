@@ -52,7 +52,8 @@ import {
   parentPath,
 } from '../../lib/projectFinderNav.js'
 import {
-  startProjectChangesPoll,
+  PROJECT_CHANGES_ACTIVE_MS,
+  nextProjectChangesDelay,
 } from '../../lib/projectChangeCadence.js'
 import ProjectPdfPreview from './ProjectPdfPreview.jsx'
 import ImageLightbox from '../ChatView/markdown/ImageLightbox.jsx'
@@ -486,14 +487,16 @@ export default function ProjectFinder({
   // The durable cursor repairs missed owner events and gives invited editors
   // the same near-live file refresh without granting them the shell event
   // stream. Clean files update automatically; dirty drafts are never replaced.
-  // It polls quickly only while changes keep arriving (projectChangeCadence).
   useEffect(() => {
     if (!source.liveSync || !source.changes) return undefined
     let active = true
+    let cursor = null
+    let controller = null
+    let timer = null
+    let delay = PROJECT_CHANGES_ACTIVE_MS
     const handleChanges = async (changes, truncated = false) => {
       if (!active || (!truncated && (!changes || changes.length === 0))) return false
       await source.invalidate(queryClient)
-      if (!active) return false
       const selectedNow = liveFileRef.current?.selected
       if (
         selectedNow
@@ -514,24 +517,59 @@ export default function ProjectFinder({
       }
       return true
     }
-    const stop = startProjectChangesPoll({
-      projectId,
-      readChanges: async (after, options) => jsonOrThrow(
-        await source.changes(after, options),
-        'Project refresh failed:',
-      ),
-      handleChanges,
-      events: window,
-      visibility: document,
-      clock: {
-        now: () => performance.now(),
-        setTimeout: (callback, wait) => window.setTimeout(callback, wait),
-        clearTimeout: id => window.clearTimeout(id),
-      },
-    })
+    const schedule = (wait = delay) => {
+      if (!active) return
+      window.clearTimeout(timer)
+      timer = window.setTimeout(() => { void poll() }, wait)
+    }
+    const poll = async () => {
+      if (!active) return
+      if (document.hidden) return
+      controller = new AbortController()
+      try {
+        const establishingBaseline = cursor === null
+        const payload = await jsonOrThrow(
+          await source.changes(cursor, { signal: controller.signal }),
+          'Project refresh failed:',
+        )
+        if (!active) return
+        cursor = Number(payload.cursor || cursor || 0)
+        // Reconcile once after the baseline arrives. This closes the gap where
+        // a save lands between the first file read and the first cursor read.
+        const changed = await handleChanges(
+          payload.changes || [],
+          !!payload.truncated || establishingBaseline,
+        )
+        delay = nextProjectChangesDelay(delay, changed ? 'changed' : 'unchanged')
+      } catch (cause) {
+        if (cause?.name !== 'AbortError') delay = nextProjectChangesDelay(delay, 'failed')
+      } finally {
+        controller = null
+        if (!document.hidden) schedule()
+      }
+    }
+    const onLiveChange = event => {
+      const detail = event?.detail
+      if (String(detail?.projectId ?? '') !== String(projectId)) return
+      void handleChanges(detail?.change ? [detail.change] : [], false)
+    }
+    const onVisibility = () => {
+      if (document.hidden) {
+        window.clearTimeout(timer)
+        controller?.abort()
+      } else {
+        schedule(0)
+      }
+    }
+    window.addEventListener('mobius:project-change', onLiveChange)
+    document.addEventListener('visibilitychange', onVisibility)
+    void poll()
     return () => {
       active = false
-      stop()
+      controller?.abort()
+      window.clearTimeout(timer)
+      window.removeEventListener('mobius:project-change', onLiveChange)
+      document.removeEventListener('visibilitychange', onVisibility)
     }
   }, [projectId, queryClient, refreshSelectedFromRemote, source])
 

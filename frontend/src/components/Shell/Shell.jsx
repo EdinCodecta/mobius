@@ -3256,6 +3256,11 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           void queryClient.invalidateQueries({
             queryKey: ['projects', 'git', String(projectId)],
           })
+          // The same fact as the cursor's agent_run_completed row: an open
+          // project refreshes its selected file now instead of on its next poll.
+          window.dispatchEvent(new CustomEvent('mobius:project-change', {
+            detail: { projectId, change: { kind: 'agent_run_completed', path: null } },
+          }))
         }
         // Attention iff the finished chat is NOT visible in ANY pane — membership
         // in the visible set, not equality with one global id, so a chat visible
