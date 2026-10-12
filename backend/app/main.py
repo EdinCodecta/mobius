@@ -55,6 +55,7 @@ from app.frontend_assets import (
   live_frontend_dir,
   resolve_frontend_dir,
 )
+from app.managed_paths import SERVED_STATIC_DIR
 from app.memory_observability import record_memory_checkpoint
 from app.runtime_provenance import (
   protected_runtime_status,
@@ -72,7 +73,7 @@ from app.response_policy import (
 )
 from app.storage_io import ParentIsFile, atomic_write
 from app.account_browser_access import SharedAccessError
-from app import activity, models
+from app import activity, models, tracing
 # providers and push are on the agent's write surface; deferred into
 # lifespan with try/except so a SyntaxError in either doesn't prevent
 # uvicorn boot. See the
@@ -298,6 +299,10 @@ async def lifespan(app):
   )
   database_boot = await run_startup_plan(startup_context)
   _set_database_boot_state(database_boot)
+  if database_boot.serviceable:
+    # A database that failed its boot check is left untouched for Recovery.
+    from app.database import open_wal_anchor
+    open_wal_anchor()
   from app.runtime_supervisors import RuntimeSupervisors
   supervisors = RuntimeSupervisors(
     settings=settings,
@@ -310,6 +315,13 @@ async def lifespan(app):
   record_memory_checkpoint("startup_frontend_watcher_started")
   if database_boot.serviceable:
     await supervisors.start_database_services()
+    # Like cron mutation and restoration, the retry never runs in the test
+    # runtime, where it would reach other tests' HTTP doubles.
+    if (
+      startup_context.bootstrap_retry is not None
+      and os.environ.get("MOBIUS_TEST_RUNTIME") != "1"
+    ):
+      supervisors.retry_bootstrap_apps(startup_context.bootstrap_retry)
     from app.saved_secure_inputs import recover_interrupted
     await recover_interrupted()
     from app.startup import _capture_platform_activation_snapshot
@@ -366,6 +378,10 @@ async def lifespan(app):
       stop_writer()
     except Exception as exc:
       _log.error("chat writer stop failed: %s", exc, exc_info=True)
+    # Last database user out: closing the anchor lets SQLite checkpoint the
+    # log on the way down.
+    from app.database import close_wal_anchor
+    close_wal_anchor()
 
 settings = get_settings()
 
@@ -390,6 +406,9 @@ app = FastAPI(
   version="0.1.0",
   lifespan=lifespan,
 )
+
+# Opt-in, off unless <data_dir>/tracing.json enables it; see app.tracing.
+tracing.configure(app, engine)
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -1724,7 +1743,7 @@ def _serve_app_static_asset(
   if not source_dir:
     raise HTTPException(status_code=404, detail="Not found.")
 
-  root = (Path(source_dir) / "static").resolve()
+  root = (Path(source_dir) / SERVED_STATIC_DIR).resolve()
   try:
     target = (root / (asset_path or "index.html")).resolve()
   except OSError:
