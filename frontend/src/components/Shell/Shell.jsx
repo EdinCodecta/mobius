@@ -90,7 +90,7 @@ import {
   workspaceRequestsForBuiltApps,
   ACTIVATE_FOREGROUND,
 } from './workspacePlacement.js'
-import { appCrashReportDraft } from '../../lib/appRecovery.js'
+import { appCrashReportDraft, appReportChatId } from '../../lib/appRecovery.js'
 import {
   acknowledgeAppActivity,
   appAttentionIds,
@@ -2713,7 +2713,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     const appEntry = appsRef.current.find(a => String(a.id) === String(appId))
     const appName = appEntry?.name || `app ${appId}`
     const report = appCrashReportDraft(appName, error)
-    const buildingChatId = appEntry?.chat_id || chatId || null
+    const buildingChatId = appReportChatId(appEntry, chatId)
     const buildingChat = buildingChatId
       && chatsRef.current.find(c => c.id === buildingChatId)
     if (buildingChat) {
