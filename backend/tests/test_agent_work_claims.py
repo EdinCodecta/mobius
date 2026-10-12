@@ -593,3 +593,19 @@ def test_direct_cycle_is_not_registered(db):
   assert followed['follow_status'] == 'followed'
   assert blocked['follow_status'] == 'direct_cycle'
   assert db.query(models.GoalDependency).count() == 1
+
+
+def test_goal_less_completed_source_does_not_promise_future_progress(db):
+  from app.goal_dependency_sources import stage_reconcile_claim_sources
+  owner, first, second = _fixture(db)
+  source_run = db.get(models.ChatRun, 'claim-run-first')
+  source_run.goal_id = None
+  db.commit()
+  claim_work(db, owner_id=owner.id, chat_id=first.id,
+             run_id='claim-run-first', work_key=KEY, summary='Do work')
+  claim_work(db, owner_id=owner.id, chat_id=second.id,
+             run_id='claim-run-second', work_key=KEY, summary='Follow')
+  source_run.status = 'completed'
+  db.commit()
+  assert stage_reconcile_claim_sources(db) == 1
+  assert db.query(models.GoalDependency).one().outcome_json['kind'] == 'owner_not_progressing'

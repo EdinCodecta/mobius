@@ -181,8 +181,11 @@ def dependency_source_blocker(db: Session, row: models.GoalDependency) -> str | 
       return 'owner_not_progressing'
   else:
     run = db.get(models.ChatRun, claim.owner_run_id)
-    if run is None or run.status in ('failed', 'stopped', 'interrupted'):
+    if run is None:
       return 'owner_not_progressing'
+    if run.status in ('failed', 'stopped', 'interrupted', 'completed'):
+      if chat.pending_question_id is None:
+        return 'owner_not_progressing'
   return None
 
 
