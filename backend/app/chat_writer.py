@@ -4160,12 +4160,12 @@ class ChatWriterActor:
       return StartContinuationBlocked(blocker)
     goal_id = delegation_goal_id(db, trigger)
     goal = db.get(models.ChatGoal, goal_id) if goal_id else None
-    if goal_id is not None and goal is None:
-      db.rollback()
-      return StartContinuationBlocked("goal_missing")
     # App- and source-owned work is not Goal work (goal_assignment's own
     # rule): it proceeds without binding a Goal instead of being stranded.
     goal_work = trigger.app_id is None and trigger.source_work_id is None
+    if goal_id is not None and goal is None and goal_work:
+      db.rollback()
+      return StartContinuationBlocked("goal_missing")
     if goal is not None and goal.chat_id != cmd.chat_id and goal_work:
       from app.goal_plans import goal_assignment
       assignment = goal_assignment(db, cmd.chat_id)
