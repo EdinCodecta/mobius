@@ -158,8 +158,8 @@ def dependency_source_blocker(db: Session, row: models.GoalDependency) -> str | 
       models.ChatRun.goal_id == goal.id,
     ).order_by(models.ChatRun.started_at.desc()).first()
     if latest is not None and latest.status in ('failed', 'stopped', 'interrupted'):
-      # A card, Wait or live helper can still own progress. Never recursively
-      # inspect GoalDependency here: longer follow cycles are diagnostic only.
+      # A card, Wait, helper or dependency can still own progress. Inspect
+      # only direct durable rows; never recurse across dependency graphs.
       if chat.pending_question_id is not None:
         return None
       if db.query(models.ChatWait.id).filter(
@@ -170,6 +170,12 @@ def dependency_source_blocker(db: Session, row: models.GoalDependency) -> str | 
       if db.query(models.Delegation.id).filter(
         models.Delegation.goal_id == goal.id,
         models.Delegation.cancelled_at.is_(None),
+      ).first():
+        return None
+      if db.query(models.GoalDependency.id).filter(
+        models.GoalDependency.waiting_goal_id == goal.id,
+        models.GoalDependency.result_disposition.is_(None),
+        models.GoalDependency.withdrawn_at.is_(None),
       ).first():
         return None
       return 'owner_not_progressing'
@@ -183,8 +189,8 @@ def dependency_source_blocker(db: Session, row: models.GoalDependency) -> str | 
 def stage_reconcile_claim_sources(db: Session) -> int:
   """Resolve only conclusively nonviable claim sources in the caller's txn.
 
-  A source Goal that is still open remains viable even if its last physical
-  run failed: it can be resumed, and its card/Wait/helper may own progress.
+  A failed source Goal remains viable when a card, Wait, helper, or direct
+  dependency still owns progress; otherwise its failure is surfaced once.
   This deliberately never polls or assumes an elapsed-time deadline.
   """
   rows = db.query(models.GoalDependency).filter(
