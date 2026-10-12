@@ -249,7 +249,7 @@ def test_dispatcher_reply_without_the_call_fails_once_without_retry(tmp_path, mo
     async def query(self, line):
       queries.append(line)
       from claude_agent_sdk.types import UserMessage
-      host._on_dispatcher_user_message(UserMessage(content=line, origin={'kind': 'human'}))
+      host._on_dispatcher_user_message(UserMessage(content=line, origin=None))
       host._dispatcher_replied()
   host._client = ForgetfulDispatcher()
   turn = _turn(tmp_path)
@@ -331,7 +331,7 @@ class _DispatcherClient:
     # A resumed helper reports under the tool call that first launched it.
     self.host._on_task_started(_Started(turn.agent_id or "agent-1", "toolu_spawn"))
     from claude_agent_sdk.types import UserMessage
-    self.host._on_dispatcher_user_message(UserMessage(content=line, origin={'kind': 'human'}))
+    self.host._on_dispatcher_user_message(UserMessage(content=line, origin=None))
     self.host._dispatcher_replied()
     asyncio.get_running_loop().call_soon(self.settle, turn, verb)
 
@@ -523,7 +523,7 @@ def test_a_dispatch_that_never_starts_says_what_the_dispatcher_did(
     async def query(self, _line):
       host.dispatcher_last = "server_error: API Error: 529 Overloaded"
       from claude_agent_sdk.types import UserMessage
-      host._on_dispatcher_user_message(UserMessage(content=_line, origin={'kind': 'human'}))
+      host._on_dispatcher_user_message(UserMessage(content=_line, origin=None))
       host._dispatcher_replied()
 
   host._client = _SilentDispatcher()

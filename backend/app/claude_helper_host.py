@@ -691,7 +691,8 @@ class ClaudeHelperHost(Host):
     if turn is None or turn.done.is_set() or self._identity_closed:
       self._reject_identity(message.task_id)
       if (turn is not None and turn.dispatch_consumed and not self._identity_closed
-          and (turn.dispatch_cancelled or turn.dispatch_error)):
+          and (turn.dispatch_cancelled or
+               (turn.dispatch_error and turn.kind == "spawn"))):
         self._own_task(self._stop_agent(message.task_id))
       return
     self._rejected_agents.discard(message.task_id)
@@ -776,10 +777,11 @@ class ClaudeHelperHost(Host):
     from claude_agent_sdk.types import ToolResultBlock
 
     blocks = message.content if isinstance(message.content, list) else []
-    # Only a human-origin root echo can belong to the serialized query. Task
-    # notifications are also UserMessages and may arrive before its Result.
-    origin = getattr(message, "origin", None) or {}
-    if (origin.get("kind") == "human" and self._result_dispatch_id is None
+    # SDK query echoes have no origin in the production CLI. Only explicitly
+    # tagged injected turns (notably task notifications) are foreign.
+    origin = getattr(message, "origin", None)
+    if ((origin is None or origin.get("kind") == "human")
+        and self._result_dispatch_id is None
         and self._dispatcher_turn is not None):
       self._result_dispatch_id = self._dispatcher_turn.dispatch_id
     for block in blocks:
@@ -1053,6 +1055,9 @@ def _host_options(
         "PreCompact": [HookMatcher(matcher=None, hooks=[host.pre_compact])],
         "SubagentStop": [HookMatcher(hooks=[host.subagent_stop])],
       },
+      # Required for the root UserMessage echo that correlates each query's
+      # ResultMessage. Verified against the production CLI; without it a
+      # no-call reply cannot release the serialized dispatcher lock.
       extra_args={"settings": json.dumps({"disableWorkflows": True}),
                   "replay-user-messages": None},
     )

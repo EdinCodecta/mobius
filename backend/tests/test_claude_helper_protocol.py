@@ -15,8 +15,22 @@ def _reply(host, response=None):
     turn = host._dispatcher_turn
     host._on_dispatcher_user_message(UserMessage(
       content=f"{'SPAWN' if turn.kind == 'spawn' else 'MESSAGE'} {turn.dispatch_id}",
-      origin={'kind': 'human'}))
+      origin=None))
   host._dispatcher_replied(response)
+
+
+@pytest.mark.parametrize('origin,matched', [
+  (None, True), ({'kind': 'human'}, True),
+  ({'kind': 'task-notification'}, False),
+])
+def test_dispatcher_echo_origin_matches_real_cli_shape(tmp_path, origin, matched):
+  from claude_agent_sdk.types import UserMessage
+  host = _claude_host(tmp_path)
+  turn = _turn(tmp_path)
+  host._dispatcher_turn = turn
+  host._on_dispatcher_user_message(UserMessage(
+    content=f'SPAWN {turn.dispatch_id}', origin=origin))
+  assert (host._result_dispatch_id == turn.dispatch_id) is matched
 
 
 @pytest.mark.asyncio
@@ -346,7 +360,7 @@ async def test_task_notice_between_command_echo_and_reply_keeps_dispatch_correla
   assert await sent.get() == f'SPAWN {turn.dispatch_id}'
   from claude_agent_sdk.types import UserMessage
   host._on_dispatcher_user_message(UserMessage(
-    content=f'SPAWN {turn.dispatch_id}', origin={'kind': 'human'}))
+    content=f'SPAWN {turn.dispatch_id}', origin=None))
   host._on_dispatcher_user_message(UserMessage(
     content='Task completed', origin={'kind': 'task-notification'}))
   host._dispatcher_replied()
@@ -588,6 +602,30 @@ async def test_consumed_admission_is_stopped_when_a_late_start_supplies_identity
   assert stop_ids == ['late-agent']
   assert not sibling.done.is_set() and not host._closed
   _reply(host)
+  await host.close()
+
+
+@pytest.mark.asyncio
+async def test_late_followup_start_after_reply_timeout_is_not_stopped(tmp_path):
+  host = _claude_host(tmp_path)
+  turn = _turn(tmp_path, dispatch_id='followup')
+  turn.kind = 'message'
+  turn.agent_id = 'agent'
+  turn.dispatch_consumed = True
+  turn.dispatch_error = 'reply_timeout'
+  turn.finish('failed')
+  host._turn_by_tool_use['send'] = turn
+  stopped = []
+
+  class Dispatcher:
+    async def stop_task(self, agent_id):
+      stopped.append(agent_id)
+
+  host._client = Dispatcher()
+  host._on_task_started(_Started('agent', 'send'))
+  await asyncio.sleep(0)
+  assert stopped == []
+  assert turn.agent_id == 'agent'  # The later follow-up may still resume it.
   await host.close()
 
 
