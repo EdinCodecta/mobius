@@ -221,5 +221,5 @@ def test_cancelled_session_lock_acquire_logs_its_failure(monkeypatch, caplog):
     raise OSError("no codex home")
 
   _cancel_acquire(monkeypatch, fail)
-  assert "Codex session lock failed after its caller was cancelled" in caplog.text
+  assert "Codex session lock acquire failed after its caller was cancelled" in caplog.text
   assert "no codex home" in caplog.text

@@ -11,14 +11,11 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import fcntl
-import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from app import settled
-
-log = logging.getLogger("mobius.codex_session_lock")
 
 
 # Codex SDK waits can occupy every default asyncio worker. Lock acquisition is
@@ -81,10 +78,7 @@ def _release_abandoned(acquired: asyncio.Future[CodexSessionLock]) -> None:
   if acquired.exception() is None:
     acquired.result().release()
   else:
-    log.error(
-      "Codex session lock failed after its caller was cancelled",
-      exc_info=acquired.exception(),
-    )
+    settled.log_abandoned_failure(acquired, "Codex session lock acquire")
 
 
 def codex_home_in_use(data_dir: str | Path, *, proc_root: Path = Path("/proc")) -> bool:

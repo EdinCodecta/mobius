@@ -1353,7 +1353,7 @@ def test_cancelled_install_rolls_back_only_after_its_git_worker_exits(
   def refused():
     raise HTTPException(409, "The adopted clone cannot be committed.")
 
-  caplog.set_level(logging.INFO, logger="mobius.install")
+  caplog.set_level(logging.INFO, logger="mobius.settled")
   assert_cancellation_drains_worker_under_lock(
     _source_lock(source_dir), cancelled_install, monkeypatch,
     install.app_git, "commit_local",

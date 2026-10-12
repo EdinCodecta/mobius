@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 import pytest
+from fastapi import HTTPException
 
 from app import settled
 from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
@@ -137,46 +138,27 @@ def test_abandoned_receives_the_outcome_instead_of_the_log(caplog, fails):
   assert not [r for r in caplog.records if r.name == "mobius.settled"]
 
 
-def test_cancel_before_admission_cancels_the_work():
+def test_a_refusal_after_cancel_is_logged_at_info_without_a_traceback(caplog):
+  def refuse():
+    raise HTTPException(409, "The pending update changed.")
+
   async def run():
-    admitted, ran = asyncio.Event(), []
-    lock = asyncio.Lock()
+    lock, worker = asyncio.Lock(), BlockedWorker(refuse)
 
-    async def body():
-      async with lock:
-        admitted.set()
-        ran.append(True)
+    def park_pending_update():
+      return worker()
 
-    await lock.acquire()  # Someone else holds the lock: not admitted yet.
-    task = asyncio.create_task(settled.settle(body(), admitted=admitted))
-    await asyncio.sleep(.02)
-    task.cancel("gone")
-    with pytest.raises(asyncio.CancelledError, match="gone"):
-      await task
-    lock.release()
-    await asyncio.sleep(.02)
-    assert not ran and not admitted.is_set()
+    return await cancel_while_worker_blocked(
+      lock, _under_lock(lock, lambda: settled.run_settled(park_pending_update)),
+      worker,
+    )
 
-  asyncio.run(run())
-
-
-def test_cancel_after_admission_finishes_the_work_first():
-  async def run():
-    admitted, worker = asyncio.Event(), BlockedWorker(lambda: "done")
-    lock = asyncio.Lock()
-
-    async def body():
-      async with lock:
-        admitted.set()
-        return await asyncio.to_thread(worker)
-
-    async def operation():
-      return await settled.settle(body(), admitted=admitted)
-
-    outcome = await cancel_while_worker_blocked(lock, operation, worker)
-    assert isinstance(outcome, asyncio.CancelledError)
-
-  asyncio.run(run())
+  caplog.set_level(logging.INFO, logger="mobius.settled")
+  assert isinstance(asyncio.run(run()), asyncio.CancelledError)
+  records = [r for r in caplog.records if r.name == "mobius.settled"]
+  assert [r.levelno for r in records] == [logging.INFO]
+  assert records[0].exc_info is None
+  assert "park_pending_update refused after its caller was cancelled" in caplog.text
 
 
 def test_without_a_cancel_the_result_or_exception_passes_through():

@@ -4535,11 +4535,8 @@ def _abandon_install_step(step: asyncio.Future) -> None:
   outcome = step.exception()
   if isinstance(outcome, _UncheckedPythonTree):
     outcome.discard()
-  elif isinstance(outcome, HTTPException):
-    # An expected refusal, already rolled back: not an error.
-    log.info("Work refused after its caller was cancelled: %s", outcome.detail)
   elif outcome is not None:
-    log.error("Work failed after its caller was cancelled", exc_info=outcome)
+    settled.log_abandoned_failure(step, "Install step")
   elif isinstance(step.result(), CheckedPythonTree):
     app_python_env.discard_env(step.result().env)
 
