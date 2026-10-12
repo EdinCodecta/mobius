@@ -105,6 +105,7 @@ async def test_dispatch_failure_is_structural_not_a_text_search(tmp_path, tool, 
 @pytest.mark.parametrize('failure_channel', ['post-tool', 'post-tool-failure', 'stream-result'])
 async def test_errored_dispatch_reasks_then_starts_helper(tmp_path, failure_channel):
   from claude_agent_sdk.types import UserMessage, ToolResultBlock
+  from types import SimpleNamespace
   host = _claude_host(tmp_path)
   turn = _turn(tmp_path)
   queries = []
@@ -123,7 +124,7 @@ async def test_errored_dispatch_reasks_then_starts_helper(tmp_path, failure_chan
         await host.post_tool_use({'tool_name': 'Agent', 'tool_response': {'success': False},
           'hook_event_name': 'PostToolUseFailure' if failure_channel == 'post-tool-failure' else 'PostToolUse'},
           tool_id, None)
-      _reply(host)
+      _reply(host, SimpleNamespace(is_error=True) if len(queries) == 1 else None)
   host._client = Dispatcher()
   await host.run_turn(turn)
   assert turn.status == 'completed' and turn.dispatch_error is None

@@ -813,7 +813,8 @@ class ClaudeHelperHost(Host):
             response = await replied
           if turn.done.is_set():
             return
-          if getattr(response, "is_error", False):
+          if (getattr(response, "is_error", False)
+              and not (turn.dispatch_tool_error and turn.dispatch_id in self._specs)):
             if not turn.started.is_set():
               turn.dispatch_error = "launch_failed"
               turn.finish("failed", "Claude failed to dispatch this helper request. "
