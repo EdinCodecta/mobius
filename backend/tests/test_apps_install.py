@@ -199,6 +199,25 @@ def test_install_rejects_a_scheduled_job_without_runtime_declaration(
   assert response.json()["detail"] == "Schedule job is missing a shebang."
 
 
+def test_package_fetch_resolves_its_host_off_the_event_loop(monkeypatch):
+  """getaddrinfo blocks, so a fetch must not resolve on the server's loop."""
+  url = "https://x.test/repo/mobius.json"
+  on_loop = []
+
+  def validate(target):
+    try:
+      asyncio.get_running_loop()
+      on_loop.append(True)
+    except RuntimeError:
+      on_loop.append(False)
+    return target, "x.test", "x.test"
+
+  monkeypatch.setattr(install, "_validate_url_safe", validate)
+  client = _fake_async_client({url: (200, b"{}")})()
+  assert asyncio.run(install._http_get(client, url, 1024)) == b"{}"
+  assert on_loop == [False]
+
+
 def test_validate_url_safe_blocks_ipv6_embedded_ipv4():
   # SSRF: an IPv6 that embeds a blocked IPv4 must be rejected — IPv4-compatible
   # (::127.0.0.1), IPv4-mapped (::ffff:169.254.169.254), and well-known NAT64

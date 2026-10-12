@@ -783,7 +783,8 @@ async def _http_get(
     raise HTTPException(
       502, f"Too many redirects (>{_MAX_REDIRECTS}) starting from {url}",
     )
-  pinned_url, host_header, sni_host = _validate_url_safe(url)
+  # getaddrinfo blocks; resolve off the event loop.
+  pinned_url, host_header, sni_host = await asyncio.to_thread(_validate_url_safe, url)
   try:
     async with client.stream(
       "GET", pinned_url,
