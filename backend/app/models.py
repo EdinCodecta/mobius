@@ -15,6 +15,7 @@ separate encrypted app-secrets API.
 
 import secrets
 import json
+import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import (
@@ -1610,7 +1611,7 @@ class AgentWorkClaim(Base):
   # Stable through transfer, new on reacquisition. Revision is ownership state,
   # not acquisition identity.
   acquisition_id = Column(String(64), nullable=True, index=True,
-                          default=lambda: secrets.token_hex(16))
+                          default=lambda: uuid.uuid4().hex)
   owner_id = Column(Integer, ForeignKey("owner.id", ondelete="CASCADE"),
                     nullable=False, index=True)
   work_key = Column(String(256), nullable=False)
