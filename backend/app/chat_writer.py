@@ -4158,9 +4158,10 @@ class ChatWriterActor:
     if blocker is not None:
       db.rollback()
       return StartContinuationBlocked(blocker)
-    goal_id = delegation_goal_id(db, trigger)
-    goal = db.get(models.ChatGoal, goal_id) if goal_id else None
-    goal_objective = goal.objective if goal is not None else None
+    from app.run_state import open_goal_identity_for_chat
+    goal_objective, goal_id = open_goal_identity_for_chat(
+      db, cmd.chat_id, delegation_goal_id(db, trigger),
+    )
 
     existing = transcript_rows.read_all(db, chat)
     try:

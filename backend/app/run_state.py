@@ -20,6 +20,16 @@ from app.goal_commands import (
 )
 
 
+def open_goal_identity_for_chat(
+  db: Session, chat_id: str, goal_id: str | None,
+) -> tuple[str | None, str | None]:
+  """Bind a run only to an open Goal owned by that run's chat."""
+  goal = db.get(models.ChatGoal, goal_id) if goal_id else None
+  if goal is None or goal.chat_id != chat_id or goal.status != "open":
+    return None, None
+  return goal.objective, goal.id
+
+
 def _recoverable_result_goal(
   db: Session,
   chat_id: str,
@@ -28,10 +38,7 @@ def _recoverable_result_goal(
   """A delivery names its Goal; only the Goal's explicit outcome can retire it."""
   if source is None or not source.goal_id:
     return None, None
-  goal = db.get(models.ChatGoal, source.goal_id)
-  if goal is None or goal.chat_id != chat_id or goal.status != "open":
-    return None, None
-  return goal.objective, goal.id
+  return open_goal_identity_for_chat(db, chat_id, source.goal_id)
 
 
 def _wait_result_row(db, chat_id, message):
@@ -82,10 +89,7 @@ def goal_identity_for_run_start(db, chat_id, message):
     # New peer carriers retain the exact Goal, including an explicit NULL.
     # Uncorrelated old carriers cannot prove ownership after source rebinding.
     goal_id = message.get("goal_id")
-    goal = db.get(models.ChatGoal, goal_id) if goal_id else None
-    if goal is not None and goal.chat_id == chat_id and goal.status == "open":
-      return goal.objective, goal.id
-    return None, None
+    return open_goal_identity_for_chat(db, chat_id, goal_id)
   if exact_goal_id:
     goal = db.get(models.ChatGoal, exact_goal_id)
     if goal is not None and goal.chat_id == chat_id and goal.status == "open":

@@ -1510,6 +1510,51 @@ def test_activity_continuation_writer_changes_run_state_not_messages(db):
   assert physical.root_run_id == root_run_id
 
 
+def test_nested_helper_result_wake_keeps_inherited_goal_out_of_helper_run(db):
+  """A helper's result wakes its parent helper without adopting the owner's Goal."""
+  from app.chat_writer import StartActivityContinuation
+  from app import delegations as delegations_mod
+
+  owner_id, helper_id, outer_id = _seed_delegation(
+    db, suffix="nested-goal-outer", parent_root_id="owner-goal",
+  )
+  _owner, nested_id, inner_id = _seed_delegation(
+    db, suffix="nested-goal-inner", parent_id=helper_id,
+    parent_root_id="child-run-nested-goal-outer",
+    result_blocks=[{"type": "text", "content": "Nested work done."}],
+  )
+  db.add(models.ChatGoal(
+    id="owner-goal", chat_id=owner_id, objective="Owner's Goal", status="open",
+  ))
+  db.get(models.Delegation, outer_id).goal_id = "owner-goal"
+  inner = db.get(models.Delegation, inner_id)
+  inner.goal_id = "owner-goal"
+  db.commit()
+
+  root = delegations_mod._parent_wake_continuation_root(db, helper_id, "owner-goal")
+  assert root == "child-run-nested-goal-outer"
+  token = delegations_mod._activity_continuation_run_id(db, inner)
+  result = get_writer().submit(StartActivityContinuation(
+    chat_id=helper_id, run_token=token, root_run_id=root,
+    source_work_id="owner-goal", activity_id=inner_id,
+  )).result(timeout=5)
+
+  assert isinstance(result, dict)
+  db.expire_all()
+  run = db.get(models.ChatRun, token)
+  assert (run.status, run.goal_id, run.goal_objective) == ("running", None, None)
+  assert run.activity_delivery_json == {
+    "delegation_ids": [inner_id], "source_work_id": "owner-goal",
+  }
+  assert delegations_mod.activity_continuation_delivery_source_work_id(
+    db, helper_id, token,
+  ) == "owner-goal"
+  assert delegations_mod.build_delegation_result_context(
+    db, helper_id, source_work_id="owner-goal",
+  ).delegation_ids == (inner_id,)
+  assert db.get(models.Delegation, inner_id).delivered_run_id is None
+
+
 def _seed_later_parent_turn(db, parent_id, run_id, *, provider="claude",
                             goal_objective=None, activity_source=None):
   """A newer completed parent turn with its own root, like an answered card."""
