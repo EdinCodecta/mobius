@@ -549,3 +549,31 @@ def test_transfer_keeps_acquisition_and_withdraws_new_owner_self_follow(db):
   assert len(deps) == 2
   assert next(d for d in deps if d.waiting_chat_id == second.id).withdrawn_at
   assert next(d for d in deps if d.waiting_chat_id == first.id).withdrawn_at is None
+
+
+def test_failed_source_without_handoff_resolves_owner_not_progressing(db):
+  from app.goal_dependency_sources import stage_reconcile_claim_sources
+  owner, first, second = _fixture(db)
+  claim_work(db, owner_id=owner.id, chat_id=first.id,
+             run_id='claim-run-first', work_key=KEY, summary='Do work')
+  claim_work(db, owner_id=owner.id, chat_id=second.id,
+             run_id='claim-run-second', work_key=KEY, summary='Follow')
+  db.get(models.ChatRun, 'claim-run-first').status = 'failed'
+  db.commit()
+  assert stage_reconcile_claim_sources(db) == 1
+  db.commit()
+  assert db.query(models.GoalDependency).one().outcome_json['kind'] == 'owner_not_progressing'
+
+
+def test_failed_source_with_saved_card_remains_pending(db):
+  from app.goal_dependency_sources import stage_reconcile_claim_sources
+  owner, first, second = _fixture(db)
+  claim_work(db, owner_id=owner.id, chat_id=first.id,
+             run_id='claim-run-first', work_key=KEY, summary='Do work')
+  claim_work(db, owner_id=owner.id, chat_id=second.id,
+             run_id='claim-run-second', work_key=KEY, summary='Follow')
+  db.get(models.ChatRun, 'claim-run-first').status = 'failed'
+  first.pending_question_id = 'source-card'
+  db.commit()
+  assert stage_reconcile_claim_sources(db) == 0
+  assert db.query(models.GoalDependency).one().resolved_at is None
