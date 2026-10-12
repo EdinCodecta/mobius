@@ -6,7 +6,7 @@ import { peerTime } from './peerTimeline.js'
 import { formatDateTime, formatTime } from '../../lib/dateTimeFormat.js'
 import { preserveTogglePosition } from './preserveTogglePosition.js'
 import { useDisclosureState } from './disclosureState.js'
-import { isWorkingHelper } from './workingHelper.js'
+import { HELPER_AWAITING_PARENT_LABEL, isWorkingHelper } from './workingHelper.js'
 import { elapsedLabel } from './toolTasks.js'
 import { toolCallLabel } from './toolActivityLabel.js'
 import HelperConversation from './HelperConversation.jsx'
@@ -55,7 +55,8 @@ const SETTLED = {
   failed: ['failed', 'Failed'],
   needs_review: ['failed', 'Needs review'],
   interrupted: ['failed', 'Interrupted'],
-  needs_input: ['running', 'Needs an answer'],
+  // Paused on its question to this chat's agent: not finished, not failed.
+  needs_input: ['running', HELPER_AWAITING_PARENT_LABEL],
 }
 
 /* A helper's one row, from launch to result: its name, provider and model,

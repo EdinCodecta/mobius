@@ -3865,9 +3865,9 @@
   animation: progress-rail-in 0.22s ease both;
 }
 
-/* Expanded Goal and Waiting share the same translucent reading surface. */
+/* Expanded details need an opaque reading surface above the transcript. */
 .chat__progress-rail:has(.chat__goal-plan) {
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  background: var(--surface);
 }
 
 @keyframes progress-rail-in {
@@ -4115,7 +4115,7 @@
 
 .chat__wait-card--expanded {
   border-color: color-mix(in srgb, var(--accent) 34%, var(--border-light));
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  background: var(--surface);
 }
 
 .chat__wait-summary {
@@ -4334,6 +4334,8 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
   gap: 2px;
   max-height: min(42vh, 360px);
   overflow-y: auto;
+  /* Long saved helper questions scroll here without moving the transcript. */
+  overscroll-behavior: contain;
   margin-top: 2px;
   padding: 7px 0 1px;
   border-top: 1px solid var(--border-light);
@@ -4878,17 +4880,12 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
   line-height: 1.4;
 }
 
-.chat__progress-notice { flex: 1 0 100%; min-width: 0; }
-.chat__progress-rail:has(.chat__goal-questions) { background: var(--surface); }
-/* Long saved questions remain readable without displacing the composer. */
-.chat__goal-questions {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  max-height: 42vh;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-}
-.chat__goal-question { border-top: 1px solid var(--border-light); padding-top: 8px; overflow-wrap: anywhere; }
-.chat__goal-question p { margin: 6px 0; white-space: pre-wrap; }
-.chat__goal-question ul { margin: 6px 0; padding-left: 20px; }
+/* Execution records are secondary evidence, outside the counted work tree. */
+.chat__goal-execution { margin: 8px 10px 4px; border-top: 1px solid var(--border-light); }
+.chat__goal-execution summary { padding: 10px 0; cursor: pointer; color: var(--muted); font-size: 12px; }
+.chat__goal-execution summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chat__goal-execution p { margin: 0 0 8px; }
+.chat__goal-execution ul { list-style: none; margin: 0; padding: 0; }
+.chat__goal-execution li { display: flex; flex-direction: column; gap: 2px; padding: 6px 0; font-size: 12px; overflow-wrap: anywhere; }
+.chat__goal-helper-question { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; padding-left: 8px; border-left: 1px solid var(--border-light); }
+.chat__goal-execution .chat__goal-helper-question p { margin: 0; white-space: pre-wrap; color: var(--text); }

@@ -26,13 +26,6 @@ shell tools. The provider app's endpoint receives the conversation and tool
 requests, so installing and connecting one is a substantive trust and billing
 decision. No background provider is enabled automatically by adding an app.
 
-An Anthropic Console API key does not need an app: the built-in Claude
-provider accepts one directly under Settings → Accounts → Claude Code ("Use an
-API key"). A usable Claude subscription sign-in keeps precedence over a saved
-key; the key is used when there is no usable sign-in. The key reaches only
-Möbius's own Claude runs (chats, helpers and compaction); a nested `claude -p`
-started from an agent's shell, a Codex turn or an app job does not receive it.
-
 Example declaration, based on DeepSeek's Responses API (model names are
 illustrative and should be updated by the app publisher as the API changes):
 

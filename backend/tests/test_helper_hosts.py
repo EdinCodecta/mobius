@@ -646,28 +646,6 @@ def test_connector_capabilities_do_not_change_the_host_key(monkeypatch):
   assert first == second
 
 
-def test_a_changed_claude_credential_method_starts_a_new_host(monkeypatch):
-  """A host fixes sign-in vs API key at start; switching must not reuse it."""
-  import types
-  from app import chat as chat_mod
-
-  class _Query:
-    def filter(self, *_a):
-      return self
-    def first(self):
-      return ("parent-1",)
-
-  db = types.SimpleNamespace(query=lambda *_a: _Query())
-  policy = types.SimpleNamespace(delegation_id="d", cwd="/data", model="m")
-  method = {"value": "api_key"}
-  monkeypatch.setattr(chat_mod, "claude_auth_method", lambda _data_dir: method["value"])
-
-  keyed = chat_mod._helper_host_key(db, policy, provider_id="claude", connector_plan=None)
-  method["value"] = "subscription"
-  signed_in = chat_mod._helper_host_key(db, policy, provider_id="claude", connector_plan=None)
-  assert keyed != signed_in
-
-
 @pytest.mark.parametrize("supports_effort", [True, False])
 def test_every_hosted_helper_gets_the_claude_register_and_text_stream(tmp_path, supports_effort):
   """Hosted helpers get the same Claude register as a top-level turn."""

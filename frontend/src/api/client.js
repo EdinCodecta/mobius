@@ -920,13 +920,6 @@ export const api = {
           method: 'POST',
           body: JSON.stringify({ code }),
         }),
-        // Owner-typed only: the key goes from the Settings form to the backend,
-        // never through a chat or an agent.
-        saveApiKey: (apiKey) => apiFetch('/auth/provider/claude/api-key', {
-          method: 'PUT',
-          body: JSON.stringify({ api_key: apiKey }),
-        }),
-        removeApiKey: () => apiFetch('/auth/provider/claude/api-key', { method: 'DELETE' }),
       },
       codex: {
         startLogin: () => apiFetch('/auth/provider/codex/login', { method: 'POST' }),
