@@ -160,6 +160,29 @@ test('failed acknowledgement releases its key before server truth can retry', as
   assert.equal(inFlight.size, 0)
 })
 
+test('a rejected acknowledgement neither restores server truth nor resends', async () => {
+  const inFlight = new Set()
+  let attempts = 0
+  let restores = 0
+  const options = {
+    appId: 7,
+    activityVersion: 3,
+    appCreatedAt: 'current',
+    inFlight,
+    request: async () => {
+      attempts += 1
+      return { ok: false, status: 422 }
+    },
+    clearCached: () => {},
+    restoreServerTruth: async () => { restores += 1 },
+  }
+  assert.equal(await acknowledgeAppActivity(options), false)
+  // The visible-app effect re-runs on every list change; it must not loop.
+  assert.equal(await acknowledgeAppActivity(options), false)
+  assert.equal(attempts, 1)
+  assert.equal(restores, 0)
+})
+
 test('freshAppIds returns only ids absent from the baseline', () => {
   const baseline = new Set([1, 2, 3])
   assert.deepEqual(freshAppIds(baseline, [1, 2, 3]), [])

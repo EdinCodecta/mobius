@@ -97,11 +97,11 @@ import {
   appAttentionIds,
   freshChatBuiltApps,
   freshAppIds,
-  rememberSeenAppActivity,
-  seenAppActivityVersion,
-  withAppActivity,
-  withAppActivitySeen,
+  applyAppActivityEvent,
+  applyAppActivitySeenEvent,
   reconcileSeenAppActivity,
+  rememberSeenAppActivity,
+  withAppActivitySeen,
   withAppsFlagged,
   withoutAppFlagged,
 } from './newAppAttention.js'
@@ -3011,30 +3011,13 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     } else if (ev.type === 'app_activity') {
       // Versioned notification activity updates one cached app. Badge changes
       // and unknown markers still require the authoritative list.
-      const next = queryClient.isFetching({ queryKey: appQueries.keys.all }) === 0
-        ? withAppActivity(
-          queryClient.getQueryData(appQueries.keys.all),
-          ev.appId,
-          ev.unseenActivityVersion,
-          {
-            appCreatedAt: ev.appCreatedAt,
-            seenThrough: seenAppActivityVersion(
-              appActivitySeenThroughRef.current, ev.appId, ev.appCreatedAt,
-            ),
-          },
-        )
-        : null
-      if (next) queryClient.setQueryData(appQueries.keys.all, next)
-      else void invalidateShellListCache('apps').then(refreshApps)
+      if (!applyAppActivityEvent(
+        queryClient, appQueries.keys.all, ev, appActivitySeenThroughRef.current,
+      )) void invalidateShellListCache('apps').then(refreshApps)
     } else if (ev.type === 'app_activity_seen') {
-      // An app opened in another tab may have cleared a notification before
-      // this tab processes its earlier activity event. The exact cleared
-      // version prevents that delayed event from re-lighting the dot.
-      rememberSeenAppActivity(
-        appActivitySeenThroughRef.current, ev.appId, ev.appCreatedAt, ev.seenThroughVersion,
+      applyAppActivitySeenEvent(
+        queryClient, appQueries.keys.all, ev, appActivitySeenThroughRef.current,
       )
-      queryClient.setQueryData(appQueries.keys.all, rows =>
-        withAppActivitySeen(rows, ev.appId, ev.seenThroughVersion, ev.appCreatedAt))
     } else if (ev.type === 'chat_deleted') {
       // Exact mutation evidence from this or another live tab. Update the
       // in-memory drawer synchronously; the normal missing-active-chat effect

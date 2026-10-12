@@ -143,8 +143,9 @@ export function withAppActivity(apps, appId, activityVersion, { seenThrough, app
 }
 
 // Seen receipts from this tab or another tab share one lifetime-bound floor.
-// The server reports the version it actually cleared, not a caller's larger
-// requested bound, so this can never hide future activity.
+// This tab records the version it observed and acknowledged; another tab's
+// app_activity_seen event carries the version the server actually cleared.
+// Neither exceeds activity that existed, so the floor never hides newer work.
 const appActivityLifetimeKey = (id, createdAt) => `${id}:${createdAt}`
 
 export function rememberSeenAppActivity(seen, appId, appCreatedAt, version) {
@@ -159,11 +160,44 @@ export function seenAppActivityVersion(seen, appId, appCreatedAt) {
   return seen.get(appActivityLifetimeKey(Number(appId), appCreatedAt))
 }
 
+// Apply one live app_activity event to the cached app list. Returns false when
+// the caller must refetch the authoritative list instead: a badge-only or
+// versionless event, an uncached app, or a list read already in flight that
+// could land over this update.
+export function applyAppActivityEvent(queryClient, queryKey, ev, seen) {
+  if (queryClient.isFetching({ queryKey }) !== 0) return false
+  const next = withAppActivity(
+    queryClient.getQueryData(queryKey),
+    ev.appId,
+    ev.unseenActivityVersion,
+    {
+      appCreatedAt: ev.appCreatedAt,
+      seenThrough: seenAppActivityVersion(seen, ev.appId, ev.appCreatedAt),
+    },
+  )
+  if (!next) return false
+  queryClient.setQueryData(queryKey, next)
+  return true
+}
+
+// An app opened in another tab may have cleared a notification before this
+// tab processes its earlier activity event. Recording the exact cleared
+// version stops that delayed event, or a list read already in flight, from
+// re-lighting the dot.
+export function applyAppActivitySeenEvent(queryClient, queryKey, ev, seen) {
+  rememberSeenAppActivity(seen, ev.appId, ev.appCreatedAt, ev.seenThroughVersion)
+  queryClient.setQueryData(queryKey, rows =>
+    withAppActivitySeen(rows, ev.appId, ev.seenThroughVersion, ev.appCreatedAt))
+}
+
 // Own one exact app/version acknowledgement. The key is released before a
 // failed request restores server truth, so the resulting refetch can retry
-// immediately while the app is still visible. A successful request clears the
-// cache again because an unrelated in-flight refetch may have restored the
-// just-acknowledged version after the initial optimistic update.
+// immediately while the app is still visible. A 4xx is a rejection, not a
+// transient failure: restoring and retrying would resend the same request on
+// every refetch, so the key stays owned for this session instead. A successful
+// request clears the cache again because an unrelated in-flight refetch may
+// have restored the just-acknowledged version after the initial optimistic
+// update.
 export async function acknowledgeAppActivity({
   appId,
   activityVersion,
@@ -178,23 +212,24 @@ export async function acknowledgeAppActivity({
   if (inFlight.has(key)) return false
   inFlight.add(key)
   clearCached(appId, activityVersion)
+  let response
   try {
-    const response = await request(appId, activityVersion, appCreatedAt)
-    if (!response?.ok) {
-      throw new Error(`activity acknowledgement failed (${response?.status ?? 'unknown'})`)
-    }
+    response = await request(appId, activityVersion, appCreatedAt)
+  } catch {
+    response = null
+  }
+  if (response?.ok) {
+    inFlight.delete(key)
     confirmSeen(appId, activityVersion)
     clearCached(appId, activityVersion)
     return true
-  } catch {
-    inFlight.delete(key)
-    try {
-      await restoreServerTruth()
-    } catch {
-      // Reconnect/foreground refresh remains the durable recovery path.
-    }
-    return false
-  } finally {
-    inFlight.delete(key)
   }
+  if (response?.status >= 400 && response.status < 500) return false
+  inFlight.delete(key)
+  try {
+    await restoreServerTruth()
+  } catch {
+    // Reconnect/foreground refresh remains the durable recovery path.
+  }
+  return false
 }
