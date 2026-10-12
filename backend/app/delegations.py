@@ -902,10 +902,8 @@ def limit_resume_successor_delegation(
   return delegation
 
 
-def _record_lifecycle(
-  db: Session, row: models.Delegation, status: str,
-) -> None:
-  from app.agent_lifecycle import normalize_chat_event, record_event
+def _lifecycle_values(row: models.Delegation, status: str) -> dict | None:
+  from app.agent_lifecycle import normalize_chat_event
 
   terminal = status in TERMINAL_DELEGATION_STATUSES
   event = {
@@ -926,7 +924,7 @@ def _record_lifecycle(
     "source": "delegation",
     "source_event_id": f"delegation:{row.id}:{'terminal:' + status if terminal else 'started'}",
   }
-  values = normalize_chat_event(
+  return normalize_chat_event(
     chat_id=row.parent_chat_id,
     # Source-attached work belongs to the chat but deliberately creates no
     # source ChatRun. Its stable source_work_id is the lifecycle activation;
@@ -934,10 +932,32 @@ def _record_lifecycle(
     chat_run_id=(None if row.source_work_id is not None else row.parent_root_run_id),
     event=event,
   )
-  if values is not None and not db.query(models.AgentLifecycleEvent.id).filter(
-    models.AgentLifecycleEvent.event_key == values["event_key"],
-  ).first():
-    record_event(db, values)
+
+
+def _record_missing_lifecycles(db: Session, values: list[dict]) -> None:
+  """Append the lifecycle facts not yet recorded, checking them in one read."""
+  if not values:
+    return
+  from app.agent_lifecycle import record_event
+
+  recorded = {
+    key for (key,) in db.query(models.AgentLifecycleEvent.event_key).filter(
+      models.AgentLifecycleEvent.event_key.in_(
+        {item["event_key"] for item in values}
+      ),
+    )
+  }
+  for item in values:
+    if item["event_key"] not in recorded:
+      record_event(db, item)
+      recorded.add(item["event_key"])
+
+
+def _record_lifecycle(
+  db: Session, row: models.Delegation, status: str,
+) -> None:
+  values = _lifecycle_values(row, status)
+  _record_missing_lifecycles(db, [values] if values is not None else [])
 
 
 def serialize_delegation(
@@ -952,6 +972,55 @@ def serialize_delegation(
     .filter(models.Chat.id == row.parent_chat_id)
     .scalar()
   )
+  return _delegation_payload(row, status, run, result, parent_chat_title)
+
+
+def serialize_delegation_list(
+  db: Session, rows: list[models.Delegation],
+) -> list[dict]:
+  """Serialize a page of helpers without results in a fixed number of reads.
+
+  Same projection as `serialize_delegation(include_result=False)`, but child
+  runs, parent titles, and lifecycle repair are each one batched read rather
+  than three queries per row (the Subagents app polls this list).
+  """
+  if not rows:
+    return []
+  runs = db.query(models.ChatRun).join(
+    models.Delegation, models.ChatRun.id == _latest_child_run_id(),
+  ).filter(
+    models.Delegation.id.in_([row.id for row in rows]),
+  ).all()
+  run_by_chat = {run.chat_id: run for run in runs}
+  titles = dict(
+    db.query(models.Chat.id, models.Chat.title).filter(
+      models.Chat.id.in_({row.parent_chat_id for row in rows}),
+    ).all()
+  )
+  payloads = []
+  lifecycle = []
+  for row in rows:
+    status, run, result = _project_delegation_status(
+      row, run_by_chat.get(row.child_chat_id), "",
+    )
+    payloads.append(_delegation_payload(
+      row, status, run, result, titles.get(row.parent_chat_id),
+    ))
+    values = _lifecycle_values(row, status)
+    if values is not None:
+      lifecycle.append(values)
+  # Payloads are built first: recording commits, which would expire every row.
+  _record_missing_lifecycles(db, lifecycle)
+  return payloads
+
+
+def _delegation_payload(
+  row: models.Delegation,
+  status: str,
+  run: models.ChatRun | None,
+  result: str,
+  parent_chat_title: str | None,
+) -> dict:
   return {
     "id": row.id,
     "app_id": row.app_id,
@@ -2799,21 +2868,79 @@ async def _deliver_parent_wake_once(
     start_programmatic_activity_continuation,
     start_programmatic_chat_continuation,
   )
-  from app.database import SessionLocal
 
   async with chat_queue.get_transition_lock(parent_chat_id):
-    with SessionLocal() as db:
-      parent_chat = (
-        db.query(models.Chat)
-        .filter(models.Chat.id == parent_chat_id)
-        .first()
-      )
-      if parent_chat is None or parent_chat.deleted_at is not None:
-        return False
-      repair_completed_activity_deliveries(db, parent_chat_id)
+    # Every read and repair here is synchronous SQLite work whose cost grows
+    # with the parent's history; the periodic recovery sweep runs it for many
+    # parents, so it must never hold the server event loop.
+    plan = await asyncio.to_thread(
+      _plan_parent_wake, parent_chat_id, source_work_id,
+    )
+    if plan is None or is_chat_running(parent_chat_id):
+      return False
 
-      # Compatibility only: an old hidden carrier already committed with its
-      # deterministic ChatRun still owns its pre-upgrade recovery attempt.
+    if plan.content is not None:
+      return await start_programmatic_chat_continuation(
+        chat_id=parent_chat_id,
+        root_run_id=plan.root_run_id,
+        run_token=plan.run_token,
+        content=plan.content,
+        continuation_id=plan.continuation_id,
+        reason="delegation_result",
+        initiated_by_app_id=None,
+        message_kind="delegation_result",
+        source_work_id=plan.source_work_id,
+        hidden=True,
+        _transition_lock_held=True,
+      )
+
+    return await start_programmatic_activity_continuation(
+      chat_id=parent_chat_id,
+      root_run_id=plan.root_run_id,
+      run_token=plan.run_token,
+      source_work_id=plan.source_work_id,
+      activity_id=plan.activity_id,
+      _transition_lock_held=True,
+    )
+
+
+@dataclass(frozen=True)
+class _ParentWakePlan:
+  """One parent wake decided from durable state, started on the loop.
+
+  ``content`` is set only for a pre-upgrade hidden carrier being re-run;
+  otherwise the wake is an activity checkpoint for ``activity_id``.
+  """
+  root_run_id: str
+  run_token: str
+  source_work_id: str
+  content: str | None = None
+  continuation_id: str | None = None
+  activity_id: str | None = None
+
+
+def _plan_parent_wake(
+  parent_chat_id: str, source_work_id: str,
+) -> _ParentWakePlan | None:
+  """Decide one parent wake from durable state; runs in a worker thread."""
+  from app.database import SessionLocal
+
+  with SessionLocal() as db:
+    parent_chat = (
+      db.query(models.Chat)
+      .filter(models.Chat.id == parent_chat_id)
+      .first()
+    )
+    if parent_chat is None or parent_chat.deleted_at is not None:
+      return None
+    repair_completed_activity_deliveries(db, parent_chat_id)
+
+    # Compatibility only: an old hidden carrier already committed with its
+    # deterministic ChatRun still owns its pre-upgrade recovery attempt. That
+    # ChatRun belongs to this chat and is still "running", so without one
+    # there is nothing to find and the whole history need not be read.
+    committed = None
+    if _chat_has_running_run(db, parent_chat_id):
       committed = next((
         candidate
         for message in reversed(transcript_rows.history(parent_chat))
@@ -2824,56 +2951,51 @@ async def _deliver_parent_wake_once(
           and _committed_parent_wake_is_unowned(db, parent_chat, message)
         )
       ), None)
-      if committed is not None:
-        physical, rows, carried = committed
-        content = _compose_wake_notice(db, rows, carried)
-        effective_source = rows[0].parent_root_run_id
-        root_run_id = _parent_wake_continuation_root(
-          db, parent_chat_id, effective_source,
-        )
-        _run_id, wake_cid = _parent_wake_delivery_identity(rows, carried)
-      else:
-        rows = _wake_eligible_rows_for_parent(
-          db, parent_chat_id, source_work_id,
-          pending_ids=_recorded_parent_wake_ids(db, parent_chat_id),
-        )
-        if not rows:
-          return False
-        trigger = rows[0]
-        effective_source = trigger.parent_root_run_id
-        root_run_id = _parent_wake_continuation_root(
-          db, parent_chat_id, effective_source,
-        )
-        physical = None
-        wake_cid = None
-        activity_run_token = _activity_continuation_run_id(db, trigger)
-
-      if root_run_id is None or is_chat_running(parent_chat_id):
-        return False
-
     if committed is not None:
-      return await start_programmatic_chat_continuation(
-        chat_id=parent_chat_id,
+      physical, rows, carried = committed
+      effective_source = rows[0].parent_root_run_id
+      root_run_id = _parent_wake_continuation_root(
+        db, parent_chat_id, effective_source,
+      )
+      if root_run_id is None:
+        return None
+      _run_id, wake_cid = _parent_wake_delivery_identity(rows, carried)
+      return _ParentWakePlan(
         root_run_id=root_run_id,
         run_token=physical.id,
-        content=content,
-        continuation_id=wake_cid,
-        reason="delegation_result",
-        initiated_by_app_id=None,
-        message_kind="delegation_result",
         source_work_id=effective_source,
-        hidden=True,
-        _transition_lock_held=True,
+        content=_compose_wake_notice(db, rows, carried),
+        continuation_id=wake_cid,
       )
 
-    return await start_programmatic_activity_continuation(
-      chat_id=parent_chat_id,
+    rows = _wake_eligible_rows_for_parent(
+      db, parent_chat_id, source_work_id,
+      pending_ids=_recorded_parent_wake_ids(db, parent_chat_id),
+    )
+    if not rows:
+      return None
+    trigger = rows[0]
+    effective_source = trigger.parent_root_run_id
+    root_run_id = _parent_wake_continuation_root(
+      db, parent_chat_id, effective_source,
+    )
+    if root_run_id is None:
+      return None
+    return _ParentWakePlan(
       root_run_id=root_run_id,
-      run_token=activity_run_token,
+      run_token=_activity_continuation_run_id(db, trigger),
       source_work_id=effective_source,
       activity_id=trigger.id,
-      _transition_lock_held=True,
     )
+
+
+def _chat_has_running_run(db: Session, chat_id: str) -> bool:
+  return db.query(
+    db.query(models.ChatRun.id).filter(
+      models.ChatRun.chat_id == chat_id,
+      models.ChatRun.status == "running",
+    ).exists()
+  ).scalar()
 
 
 async def wake_parent_after_child_settled(child_chat_id: str) -> None:

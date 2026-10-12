@@ -219,6 +219,8 @@ function bootFrameVisibilityHost() {
     _FRAME_APP_ID: 7,
     currentToken: 'token',
     currentCapabilityContract: null,
+    currentNavLocation: null,
+    waitForNavigationReady: false,
     tokenAppInstanceId: () => null,
     runtimeToken: async () => 'token',
   }

@@ -62,7 +62,6 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app import chat_archive, models, schemas, transcript_rows
 from app.goals import admit_goal
-from app.chat_message_identity import assistant_message_index
 from app.chat_titles import apply_generated_title, first_message_title
 from app.json_safety import json_safe
 from app.upload_lifecycle import claim_uploads, release_uploads
@@ -1088,6 +1087,45 @@ class PersistCompaction(_Command):
   # Required when a verified note replaces a transcript prefix. The route
   # holds the checkpoint transition lock through this actor's commit.
   source_note_hash: str | None = None
+  # Explicit manual batches finish through this same atomic owner.
+  recovery_id: str | None = None
+  batch_id: str | None = None
+  generation: int | None = None
+
+
+@dataclass
+class BeginManualCompaction(_Command):
+  """Admit one explicit batch against an unchanged source snapshot."""
+
+  chat_id: str = ""
+  recovery_id: str = ""
+  batch_id: str = ""
+  source: dict = field(default_factory=dict)
+  generation: int = 0
+  continuing: bool = False
+
+
+@dataclass
+class AdvanceManualCompaction(_Command):
+  """Commit completed synthesis progress before allowing the next call."""
+
+  chat_id: str = ""
+  recovery_id: str = ""
+  batch_id: str = ""
+  generation: int = 0
+  expected_chunk: int = 0
+  next_chunk: int = 0
+  briefing: str = ""
+
+
+@dataclass
+class EndManualCompaction(_Command):
+  """Release this batch only; never schedule another one."""
+
+  chat_id: str = ""
+  recovery_id: str = ""
+  batch_id: str = ""
+  error: str | None = None
 
 
 @dataclass
@@ -1175,7 +1213,7 @@ class FinishRun(_Command):
 
 @dataclass
 class RecoverWedgedRun(_Command):
-  """Atomically materialize an interrupted turn and close its durable run.
+  """Atomically materialize a terminal error and close its durable run.
 
   Runtime recovery must never clear the only durable recovery handle while
   leaving a trailing user message unanswered.  This command folds the saved
@@ -1187,6 +1225,9 @@ class RecoverWedgedRun(_Command):
   chat_id: str = ""
   run_token: str = ""
   interruption_block: dict = field(default_factory=dict)
+  # Setup/provider failures are failed; ordinary recovery stays interrupted.
+  # Only these error outcomes are valid here (successful turns use FinishRun).
+  terminal_status: str = "interrupted"
   # When set, the exact run is parked for the continuation sweep (a resource
   # wait that resolves itself) instead of closed as an interrupted failure.
   parked_until: datetime | None = None
@@ -2158,6 +2199,12 @@ class ChatWriterActor:
       return self._begin_note_recovery(db, cmd)
     if isinstance(cmd, PersistCompaction):
       return self._persist_compaction(db, cmd)
+    if isinstance(cmd, (BeginManualCompaction, AdvanceManualCompaction, EndManualCompaction)):
+      from app.manual_compaction import persist_manual_progress
+      result = persist_manual_progress(db, cmd)
+      if not _commit_or_rollback(db):
+        raise _PersistFailed("Manual compaction progress did not persist")
+      return result
     if isinstance(cmd, AuthorizeCheckpoint):
       return self._authorize_checkpoint(db, cmd)
     if isinstance(cmd, SwitchProviderWithCompaction):
@@ -3663,7 +3710,6 @@ class ChatWriterActor:
     def settle_activation_card() -> None:
       if activation_wait is None:
         return
-      from sqlalchemy.orm.attributes import flag_modified
       messages = transcript_rows.reverse_iter(db, chat)
       found = False
       for seq, original in messages:
@@ -4788,6 +4834,12 @@ class ChatWriterActor:
     chat = _active_chat(db, cmd.chat_id)
     if chat is None:
       raise _PersistFailed("PersistCompaction: chat not found or deleted")
+    draft = None
+    if cmd.recovery_id is not None:
+      from app.manual_compaction import checked_draft
+      draft = checked_draft(db, chat, cmd.recovery_id, cmd.batch_id, cmd.generation)
+      if draft is None or draft.state["next_chunk"] != draft.state["total_chunks"]:
+        return {"status": "conflict", "reason": "recovery_changed"}
     messages = transcript_rows.read_all(db, chat)
     from app.run_state import has_nonterminal_run
     if chat.pending_messages or has_nonterminal_run(db, cmd.chat_id):
@@ -4813,10 +4865,15 @@ class ChatWriterActor:
       "from_provider": cmd.expected_provider,
       "ts": next_message_ts(messages + list(chat.pending_messages or [])),
     }
+    if draft is not None:
+      new_msg["source_evidence"] = {"chat_id": chat.id, **draft.state["evidence"]}
+      new_msg["recovery_id"] = cmd.recovery_id
     messages.append(new_msg)
     transcript_rows.append(db, chat, new_msg)
     chat.session_id = None
     chat.updated_at = datetime.now(UTC)
+    if draft is not None:
+      draft.state = {**draft.state, "status": "complete", "briefing": None, "error": None}
     if not _commit_or_rollback(db):
       raise _PersistFailed("PersistCompaction did not persist")
     return {"status": "committed", "stored": new_msg}
@@ -5619,6 +5676,13 @@ class ChatWriterActor:
 
     from app.models import Chat, ChatRun
 
+    if cmd.terminal_status not in ("failed", "interrupted"):
+      raise _PersistFailed(
+        f"invalid RecoverWedgedRun status: {cmd.terminal_status!r}"
+      )
+    if cmd.parked_until is not None and cmd.terminal_status != "interrupted":
+      raise _PersistFailed("parked RecoverWedgedRun cannot be failed")
+
     owner = self._run_token_owner.get(cmd.chat_id)
     owner_is_ours = not (
       cmd.run_token and owner is not None and owner != cmd.run_token
@@ -5641,7 +5705,7 @@ class ChatWriterActor:
         run.parked_until = cmd.parked_until
         run.park_reason = cmd.park_reason
       else:
-        run.status = "interrupted"
+        run.status = cmd.terminal_status
       run.ended_at = datetime.now(UTC)
       run.restart_nonce = None
       changed = True
