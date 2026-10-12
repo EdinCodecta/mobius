@@ -97,6 +97,10 @@ import {
   appAttentionIds,
   freshChatBuiltApps,
   freshAppIds,
+  applyAppActivityEvent,
+  applyAppActivitySeenEvent,
+  reconcileSeenAppActivity,
+  rememberSeenAppActivity,
   withAppActivitySeen,
   withAppsFlagged,
   withoutAppFlagged,
@@ -690,8 +694,14 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // pre-delete NetworkFirst fallback) until a recovery succeeds.
   const deletedChatIdsRef = useRef(new Set())
   const deletedAppIdsRef = useRef(new Set())
+  // Highest acknowledged version per app lifetime. Retain old lifetimes for
+  // this mounted session so delayed receipts/events cannot cross ID reuse.
+  const appActivitySeenThroughRef = useRef(new Map())
   const reconcileApps = useCallback(
-    rows => withoutConfirmedDeletions(rows, deletedAppIdsRef.current),
+    rows => reconcileSeenAppActivity(
+      withoutConfirmedDeletions(rows, deletedAppIdsRef.current),
+      appActivitySeenThroughRef.current,
+    ),
     [],
   )
   const appsQuery = appQueries.list.useQuery({ reconcile: reconcileApps })
@@ -2303,15 +2313,22 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       const app = apps.find(row => Number(row.id) === appId)
       if (!app?.has_unseen_activity || !app?.unseen_activity_version) continue
       const observedActivityVersion = app.unseen_activity_version
+      const appCreatedAt = app.created_at
       acknowledgeAppActivity({
         appId,
         activityVersion: observedActivityVersion,
+        appCreatedAt,
         inFlight: appActivityAckRef.current,
         request: api.apps.markActivitySeen,
+        confirmSeen: (seenAppId, seenThroughVersion) => {
+          rememberSeenAppActivity(
+            appActivitySeenThroughRef.current, seenAppId, appCreatedAt, seenThroughVersion,
+          )
+        },
         clearCached: (seenAppId, seenThroughVersion) => {
           queryClient.setQueryData(
             appQueries.keys.all,
-            rows => withAppActivitySeen(rows, seenAppId, seenThroughVersion),
+            rows => withAppActivitySeen(rows, seenAppId, seenThroughVersion, appCreatedAt),
           )
         },
         restoreServerTruth: () => appQueries.list.invalidate(queryClient),
@@ -2992,11 +3009,15 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       // Allowance changes leave sign-in and available models unchanged.
       void settingsQueries.providerUsage.reset(queryClient, ev.provider)
     } else if (ev.type === 'app_activity') {
-      // A durable activity marker (an app-attributed notification) or the
-      // app's reported unread badge changed. A refetch surfaces the dot or
-      // pill; if the app is already visible, the effect
-      // above immediately acknowledges it instead of leaving a stale nudge.
-      void invalidateShellListCache('apps').then(refreshApps)
+      // Versioned notification activity updates one cached app. Badge changes
+      // and unknown markers still require the authoritative list.
+      if (!applyAppActivityEvent(
+        queryClient, appQueries.keys.all, ev, appActivitySeenThroughRef.current,
+      )) void invalidateShellListCache('apps').then(refreshApps)
+    } else if (ev.type === 'app_activity_seen') {
+      applyAppActivitySeenEvent(
+        queryClient, appQueries.keys.all, ev, appActivitySeenThroughRef.current,
+      )
     } else if (ev.type === 'chat_deleted') {
       // Exact mutation evidence from this or another live tab. Update the
       // in-memory drawer synchronously; the normal missing-active-chat effect
