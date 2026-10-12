@@ -338,42 +338,21 @@ export function shouldRepairRuntimeStream({
 }
 
 /**
- * Cadence of the active-turn runtime fallback read. A chat stream that is
- * demonstrably delivering already carries run, question, steer, and
- * queue-promotion events, so it keeps only a slow safety read. "Demonstrably"
- * means a body read within one server keepalive (30 s) plus grace: a
- * half-open socket can stay `isStreaming` with no error indefinitely, and in
- * that state this read is the only recovery, so it must stay fast. Without a
- * proven stream, the read is also how a dropped stream is reattached and how a
- * queued turn the server starts between streams is discovered.
+ * Whether the chat stream is demonstrably delivering: it already carries run,
+ * question, steer, and queue-promotion events, so the active-turn runtime read
+ * can drop to a slow safety cadence. "Demonstrably" means a body read
+ * (keepalives included) within one server keepalive (30 s) plus grace. A
+ * half-open socket can stay `isStreaming` with no error indefinitely, and then
+ * the fast runtime read is its only recovery.
  */
 export const RUNTIME_SAFETY_POLL_MS = 15_000
 export const RUNTIME_STREAM_FRESH_MS = 35_000
 
-export function runtimeFastPollMs({ hasQueue = false } = {}) {
-  return hasQueue ? 1000 : 3000
-}
-
-export function runtimeStreamProvenHealthy({
-  isStreaming = false,
-  connectionError = null,
-  lastReadAt = 0,
-  now = Date.now(),
-} = {}) {
+export function runtimeStreamDelivering({
+  isStreaming, connectionError, lastReadAt, now = Date.now(),
+}) {
   return Boolean(isStreaming && !connectionError && lastReadAt > 0
     && now - lastReadAt < RUNTIME_STREAM_FRESH_MS)
-}
-
-export function runtimeFallbackPollMs({
-  hasQueue = false,
-  isStreaming = false,
-  connectionError = null,
-  lastReadAt = 0,
-  now = Date.now(),
-} = {}) {
-  return runtimeStreamProvenHealthy({ isStreaming, connectionError, lastReadAt, now })
-    ? RUNTIME_SAFETY_POLL_MS
-    : runtimeFastPollMs({ hasQueue })
 }
 
 export function runtimeSnapshot(value = {}) {

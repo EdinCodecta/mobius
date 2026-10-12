@@ -14,11 +14,8 @@ import {
   ownerMessageBatch,
   startsFollowingTurn,
   jumpToLatestShown,
-  RUNTIME_SAFETY_POLL_MS,
   RUNTIME_STREAM_FRESH_MS,
-  runtimeFallbackPollMs,
-  runtimeFastPollMs,
-  runtimeStreamProvenHealthy,
+  runtimeStreamDelivering,
   runtimeSnapshotTransition,
   shouldRepairRuntimeStream,
   serverSnapshotBehindLocal,
@@ -893,34 +890,15 @@ test('shouldRetryStopAfterConfirm retries only the start-window running race', (
   }), false)
 })
 
-test('runtime fallback polling is slow only while the chat stream is proven to be delivering', () => {
+test('only a stream with a read inside one keepalive counts as delivering', () => {
   const now = 1_000_000
-  const fresh = now - 5_000
-  assert.equal(runtimeFallbackPollMs({ isStreaming: true, lastReadAt: fresh, now }), RUNTIME_SAFETY_POLL_MS,
-    'a stream that read recently owns live state; the read is only a slow safety net')
-  assert.equal(runtimeFallbackPollMs({ isStreaming: true, hasQueue: true, lastReadAt: fresh, now }), RUNTIME_SAFETY_POLL_MS,
-    'queue promotion arrives on a delivering stream as queued_turn_starting')
-  assert.equal(runtimeFallbackPollMs({ isStreaming: true, connectionError: 'retrying', lastReadAt: fresh, now }), 3000)
-  assert.equal(runtimeFallbackPollMs({ isStreaming: false }), 3000,
-    'a dropped stream is reattached by the runtime read')
-  assert.equal(runtimeFallbackPollMs({ isStreaming: false, connectionError: 'disconnected', hasQueue: true }), 1000)
-  assert.equal(runtimeFallbackPollMs({ hasQueue: true }), 1000,
-    'a queued turn the server starts between streams is discovered quickly')
-  assert.ok(RUNTIME_SAFETY_POLL_MS > 3000)
-})
-
-test('a half-open chat stream that still reports isStreaming keeps the fast fallback read', () => {
-  const now = 1_000_000
-  assert.equal(runtimeFallbackPollMs({ isStreaming: true, lastReadAt: 0, now }), 3000,
+  const stream = { isStreaming: true, connectionError: null, now }
+  assert.equal(runtimeStreamDelivering({ ...stream, lastReadAt: now - 5_000 }), true)
+  assert.equal(runtimeStreamDelivering({ ...stream, lastReadAt: 0 }), false,
     'no read yet on this controller proves nothing')
-  assert.equal(runtimeFallbackPollMs({
-    isStreaming: true, lastReadAt: now - RUNTIME_STREAM_FRESH_MS, now,
-  }), 3000, 'silent past one keepalive plus grace: the socket may be half-open')
-  assert.equal(runtimeFallbackPollMs({
-    isStreaming: true, hasQueue: true, lastReadAt: now - RUNTIME_STREAM_FRESH_MS - 1, now,
-  }), 1000)
+  assert.equal(runtimeStreamDelivering({ ...stream, lastReadAt: now - RUNTIME_STREAM_FRESH_MS }), false,
+    'silent past one keepalive plus grace: the socket may be half-open')
+  assert.equal(runtimeStreamDelivering({ ...stream, connectionError: 'retrying', lastReadAt: now - 5_000 }), false)
+  assert.equal(runtimeStreamDelivering({ ...stream, isStreaming: false, lastReadAt: now - 5_000 }), false)
   assert.ok(RUNTIME_STREAM_FRESH_MS > 30_000, 'longer than the server keepalive interval')
-  assert.equal(runtimeFastPollMs({ hasQueue: true }), 1000)
-  assert.equal(runtimeFastPollMs(), 3000)
-  assert.equal(runtimeStreamProvenHealthy({ isStreaming: true, lastReadAt: now - 1, now }), true)
 })

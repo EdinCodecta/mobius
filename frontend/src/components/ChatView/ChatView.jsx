@@ -222,8 +222,7 @@ import {
   ownerMessageBatch,
   jumpToLatestShown,
   RUNTIME_SAFETY_POLL_MS,
-  runtimeFallbackPollMs,
-  runtimeFastPollMs,
+  runtimeStreamDelivering,
   runtimeSnapshot,
   runtimeSnapshotTransition,
   shouldRepairRuntimeStream,
@@ -5222,15 +5221,15 @@ export default function ChatView({
   // Fast-forward is stricter: it appears only when the click can actually
   // steer a live turn with server-confirmed pending rows. Optimistic rows stay
   // visible in the tray but do not expose an inert fast-forward button.
-  const hasPendingQueue = pendingQueue.pendingMessages.length > 0
-  const composerBusy = turnActive || hasPendingQueue
+  const composerBusy = turnActive || pendingQueue.pendingMessages.length > 0
   // A connection failure owns the action slot until Retry succeeds. Keep both
   // the visible fast-forward affordance and its keyboard shortcut inert while
   // the stream is unavailable; otherwise the tray disappears but the composer
   // can still offer an action whose request cannot reach the running turn.
   useEffect(() => {
     if (hidden || !deliveryReady) return
-    if (!turnActive && !hasPendingQueue) return
+    const hasQueue = pendingQueue.pendingMessages.length > 0
+    if (!turnActive && !hasQueue) return
     let cancelled = false
     const run = () => {
       if (cancelled) return
@@ -5239,26 +5238,20 @@ export default function ChatView({
           if (!cancelled && runtime) ensureRuntimeStreamConnected(runtime)
         })
     }
-    // Tick at the fast cadence, but read only when the current cadence is due:
-    // slow while the chat stream is proven to be delivering, fast as soon as
-    // it goes quiet past a keepalive. A proven stream just (re)attached with
-    // its own catch-up, so reading again at once would only duplicate it.
-    const pollMs = () => runtimeFallbackPollMs({
-      hasQueue: hasPendingQueue,
-      isStreaming,
-      connectionError,
-      lastReadAt: streamLastReadAtRef.current,
+    // Tick fast, but while the chat stream is demonstrably delivering read only
+    // at the safety cadence. A delivering stream just (re)attached with its own
+    // catch-up, so it needs no immediate read either.
+    const delivering = () => runtimeStreamDelivering({
+      isStreaming, connectionError, lastReadAt: streamLastReadAtRef.current,
     })
-    let lastPollAt = 0
+    let lastRuntimeReadAt = delivering() ? Date.now() : 0
     const tick = () => {
-      const now = Date.now()
-      if (now - lastPollAt < pollMs()) return
-      lastPollAt = now
+      if (delivering() && Date.now() - lastRuntimeReadAt < RUNTIME_SAFETY_POLL_MS) return
+      lastRuntimeReadAt = Date.now()
       run()
     }
-    if (pollMs() !== RUNTIME_SAFETY_POLL_MS) tick()
-    else lastPollAt = Date.now()
-    const timer = setInterval(tick, runtimeFastPollMs({ hasQueue: hasPendingQueue }))
+    tick()
+    const timer = setInterval(tick, hasQueue ? 1000 : 3000)
     // Foreground and recovery signals belong to the effect below, also for
     // idle chats. This effect owns only active-turn/queue fallback polling.
     return () => {
@@ -5270,7 +5263,7 @@ export default function ChatView({
     hidden,
     turnActive,
     deliveryReady,
-    hasPendingQueue,
+    pendingQueue.pendingMessages.length,
     isStreaming,
     connectionError,
     streamLastReadAtRef,
