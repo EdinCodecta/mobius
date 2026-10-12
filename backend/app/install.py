@@ -2903,12 +2903,15 @@ async def _to_completion(function: Callable, *args):
   return await _settle_before_cancel(asyncio.to_thread(function, *args))
 
 
-async def _settle_before_cancel(work: Awaitable):
+async def _settle_before_cancel(
+  work: Awaitable, *, abandoned: asyncio.Event | None = None,
+):
   """Await ``work`` to its end even if the caller is cancelled meanwhile.
 
   Cancelling an ``asyncio.to_thread`` await does not stop its thread. A
   cancelled caller re-raises only once ``work`` settles, so it never releases a
-  lock or rolls back under writes that are still running.
+  lock or rolls back under writes that are still running. ``abandoned`` is set
+  on the first cancellation, so multi-step work can stop at its next safe point.
   """
   work = asyncio.ensure_future(work)
   cancelled = False
@@ -2917,12 +2920,12 @@ async def _settle_before_cancel(work: Awaitable):
       await asyncio.wait({work})
     except asyncio.CancelledError:
       cancelled = True
+      if abandoned is not None:
+        abandoned.set()
   if cancelled:
     # The caller's outcome is its cancellation, so nobody takes ``work``'s.
     outcome = None if work.cancelled() else work.exception()
-    if isinstance(outcome, _UncheckedPythonTree):
-      outcome.discard()  # An install's hand-off that will never be checked.
-    elif isinstance(outcome, HTTPException):
+    if isinstance(outcome, HTTPException):
       log.info("Work refused after its caller was cancelled: %s", outcome.detail)
     elif outcome is not None:
       log.error(
@@ -4519,13 +4522,33 @@ async def install_from_manifest(
     staged_clone=staged_clone,
   )
   # Each pass holds the source lock across many Git threads and rolls back on
-  # failure, so a cancelled caller waits for the pass to settle on its own.
+  # failure, and the env check runs threads from the handed-out runtime, all
+  # under the caller's lifecycle lock. So the passes and the check settle as
+  # one unit: a cancelled caller waits for the step in flight, which then
+  # stops at its next safe point.
+  abandoned = asyncio.Event()
+  return await _settle_before_cancel(
+    _install_in_passes(install_candidate, abandoned), abandoned=abandoned,
+  )
+
+
+async def _install_in_passes(
+  install_candidate: Callable[..., Awaitable[InstallResult]],
+  abandoned: asyncio.Event,
+) -> InstallResult:
+  """Run the install's passes; once ``abandoned``, discard and stop between steps."""
   try:
-    return await _settle_before_cancel(install_candidate(python_check=None))
+    return await install_candidate(python_check=None)
   except _UncheckedPythonTree as unchecked:
     pending = unchecked
+  if abandoned.is_set():
+    pending.discard()
+    raise asyncio.CancelledError
   python_check = await _check_reconciled_python(pending)
-  return await _settle_before_cancel(install_candidate(python_check=python_check))
+  if abandoned.is_set():
+    app_python_env.discard_env(python_check.env)
+    raise asyncio.CancelledError
+  return await install_candidate(python_check=python_check)
 
 
 async def _install_candidate(

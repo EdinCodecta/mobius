@@ -1055,6 +1055,68 @@ def test_cancelled_install_discards_its_unchecked_python_runtime(
   assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
 
 
+def test_cancelled_install_settles_its_python_check_before_discarding(
+  db, monkeypatch, store,
+):
+  """A cancel during the env check waits for the build, then leaves nothing.
+
+  The check builds from the handed-out runtime under the caller's lifecycle
+  lock, so the runtime must outlive the build thread, and the build it makes
+  for a caller that is gone must not wait for the next boot to be removed.
+  """
+  import asyncio
+  import threading
+  from app import install
+  from tests.test_apps_install import _fake_async_client
+
+  base = "https://deps.test/repo/"
+  manifest = _manifest(
+    python={"lock": "requirements.lock"}, service={"entry": "service.py"},
+    source_files=["service.py", "requirements.lock"],
+  )
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, b"export default function App() { return <div>x</div> }"),
+    base + "service.py": (200, b"import json, sys\n"),
+    base + "requirements.lock": (200, b"a==1\n"),
+  }
+  entered, release = threading.Event(), threading.Event()
+  runtime_seen_after_release = []
+
+  def blocked_build(build, runtime_root, manifest, lock, relative):
+    entered.set()
+    assert release.wait(10)
+    runtime_seen_after_release.append(runtime_root.is_dir())
+    _fake_env(build)
+
+  monkeypatch.setattr(app_python_env, "_build", blocked_build)
+
+  async def run():
+    task = asyncio.create_task(install.install_from_manifest(
+      db, manifest_url=base + "mobius.json", manifest=None, raw_base=None,
+    ))
+    try:
+      assert await asyncio.to_thread(entered.wait, 5)
+      task.cancel()
+      await asyncio.sleep(.02)
+      task.cancel()
+      await asyncio.sleep(.02)
+      assert not task.done(), "the caller must wait for the build thread"
+    finally:
+      release.set()
+      outcome = await asyncio.gather(task, return_exceptions=True)
+    assert isinstance(outcome[0], asyncio.CancelledError), repr(outcome)
+
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    asyncio.run(run())
+
+  assert runtime_seen_after_release == [True]
+  assert not list((_data_dir() / "app-runtime").glob(".staged-*"))
+  assert not list((_data_dir() / "app-envs" / "builds").iterdir())
+  db.expire_all()
+  assert db.query(models.App).count() == 0
+
+
 def _assert_no_unlinked_env_or_runtime(app_id: int) -> None:
   linked = {
     link.resolve() for link in app_python_env.envs_parent(_data_dir(), app_id).iterdir()
