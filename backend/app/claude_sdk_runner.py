@@ -1329,9 +1329,7 @@ async def run_claude_sdk_turn(
   # Both are session-wide on the SDK but Möbius spawns one `query()`
   # per turn, so passing them here applies to *this* turn — which is
   # exactly the "apply on next turn" semantics the slash picker promises.
-  from app.providers import (
-    _model_belongs_to_other_provider, claude_cli_settings, model_supports_effort,
-  )
+  from app.providers import _model_belongs_to_other_provider, model_supports_effort
   _model = (agent_settings or {}).get("model") or None
   _effort = (agent_settings or {}).get("effort") or None
   # A saved or global default effort must not reach a model that rejects the
@@ -1464,8 +1462,7 @@ async def run_claude_sdk_turn(
     # Passed via --settings as inline JSON.
     _cli_settings = {"ultracode": True} if _ultracode else {"disableWorkflows": True}
     options_kwargs["extra_args"] = {
-      "settings": claude_cli_settings(get_settings().data_dir, _cli_settings),
-      "replay-user-messages": None,
+      "settings": json.dumps(_cli_settings), "replay-user-messages": None,
     }
 
     # A dict-valued SDK mcp_servers option is serialized directly into the CLI

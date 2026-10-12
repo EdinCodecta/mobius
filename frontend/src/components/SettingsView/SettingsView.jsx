@@ -336,10 +336,6 @@ export default function SettingsView({
   const claudeVersion = settingsQuery.data?.claude_version
   const codexVersion = settingsQuery.data?.codex_version
   const claudeAuthenticated = configuredProviders.has('claude')
-  // 'subscription' | 'api_key' | null: which Claude credential runs use now.
-  const claudeAuthMethod = providerStatusQuery.data?.claude?.auth_method ?? null
-  const claudeApiKeySaved = providerStatusQuery.data?.claude?.api_key_saved === true
-  const claudeOnApiKey = claudeAuthenticated && claudeAuthMethod === 'api_key'
   const hasConfiguredProvider = configuredProviders.size > 0
   // Three-state gate for the AI-providers section, in priority order:
   //
@@ -380,7 +376,7 @@ export default function SettingsView({
   }, [queryClient])
   const claudeUsageQuery = settingsQueries.providerUsage.useQuery('claude', {
     enabled: (
-      active && providerReady && claudeAuthenticated && !claudeOnApiKey
+      active && providerReady && claudeAuthenticated
       && expandedUsage.claude
     ),
   })
@@ -1050,9 +1046,7 @@ export default function SettingsView({
                   connected={claudeAuthenticated}
                   actionLabel={claudeAuthenticated ? 'Manage' : 'Connect'}
                   version={claudeVersion}
-                  statusNode={claudeOnApiKey ? (
-                    <StatusDot color="--green">API key · billed per use</StatusDot>
-                  ) : claudeAuthenticated ? (
+                  statusNode={claudeAuthenticated ? (
                     <PlanUsageToggle
                       provider="claude"
                       label={formatPlanStatus(claudePlanLabel)}
@@ -1060,7 +1054,7 @@ export default function SettingsView({
                       onToggle={toggleClaudeUsage}
                     />
                   ) : undefined}
-                  detailNode={claudeAuthenticated && !claudeOnApiKey && expandedUsage.claude ? (
+                  detailNode={claudeAuthenticated && expandedUsage.claude ? (
                     <ProviderUsage
                       id="provider-usage-claude"
                       snapshot={claudeUsageQuery.data}
@@ -1077,17 +1071,9 @@ export default function SettingsView({
                   expanded={expandedAuth === 'claude'}
                   onToggleExpand={toggleClaudeAuth}
                 >
-                  <ProviderConnection
-                    provider="claude"
-                    name="Claude Code"
-                    connected={claudeAuthenticated}
-                    onDisconnected={onProviderDisconnected}
-                    disconnectDetail={claudeApiKeySaved ? 'Your saved Anthropic API key is removed too.' : ''}
-                  >
+                  <ProviderConnection provider="claude" name="Claude Code" connected={claudeAuthenticated} onDisconnected={onProviderDisconnected}>
                     <ProviderAuth
                       authenticated={claudeAuthenticated}
-                      authMethod={claudeAuthMethod}
-                      apiKeySaved={claudeApiKeySaved}
                       compact
                       onDone={onClaudeAuthDone}
                     />
