@@ -71,15 +71,43 @@ def test_failure_after_cancel_is_logged_once_and_the_cancel_is_raised(caplog):
 
   async def run():
     lock, worker = asyncio.Lock(), BlockedWorker(fail)
+
+    def write_listing():
+      return worker()
+
     return await cancel_while_worker_blocked(
-      lock, _under_lock(lock, lambda: settled.run_settled(worker)), worker,
+      lock, _under_lock(lock, lambda: settled.run_settled(write_listing)), worker,
     )
 
   outcome = asyncio.run(run())
   assert isinstance(outcome, asyncio.CancelledError)
   errors = [r for r in caplog.records if r.name == "mobius.settled"]
   assert len(errors) == 1 and errors[0].levelno == logging.ERROR
+  # The log names what failed.
+  assert "write_listing failed after its caller was cancelled" in caplog.text
   assert "disk full" in caplog.text
+
+
+def test_a_failing_abandoned_hook_is_logged_and_the_cancel_still_wins(caplog):
+  def abandoned(task):
+    raise RuntimeError("release failed")
+
+  async def run():
+    lock, worker = asyncio.Lock(), BlockedWorker()
+    return await cancel_while_worker_blocked(
+      lock,
+      _under_lock(lock, lambda: settled.settle(
+        asyncio.to_thread(worker), abandoned=abandoned,
+      )),
+      worker,
+      cancel=lambda task: task.cancel("client gone"),
+    )
+
+  outcome = asyncio.run(run())
+  assert isinstance(outcome, asyncio.CancelledError)
+  assert outcome.args == ("client gone",)
+  errors = [r for r in caplog.records if r.name == "mobius.settled"]
+  assert len(errors) == 1 and "release failed" in caplog.text
 
 
 @pytest.mark.parametrize("fails", [False, True])
