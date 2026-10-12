@@ -1,13 +1,13 @@
 import { accountLinkCompletion, accountLinkRegistration } from '../../../lib/accountLinkBroker.js'
 
-export const ACCOUNT_MODES = Object.freeze(['signed_out', 'linked', 'managed'])
-export const RAILWAY_ACCESS = Object.freeze([
+const ACCOUNT_MODES = Object.freeze(['signed_out', 'linked', 'managed'])
+const RAILWAY_ACCESS = Object.freeze([
   'signed_out',
   'reconnect',
   'unavailable',
   'available',
 ])
-export const DELETION_STATES = Object.freeze([
+const DELETION_STATES = Object.freeze([
   'present',
   'missing',
   'missing_unconfirmed',
@@ -27,8 +27,8 @@ const TRACKED_DEPLOYMENT_STATUSES = new Set([
   'deleting',
 ])
 const TRACKED_UPDATE_STATES = new Set(['pending', 'checking', 'retry'])
-export const IMAGE_UPDATE_POLICIES = Object.freeze(['automatic', 'manual'])
-export const RAILWAY_REGION_IDS = Object.freeze([
+const IMAGE_UPDATE_POLICIES = Object.freeze(['automatic', 'manual'])
+const RAILWAY_REGION_IDS = Object.freeze([
   'us-west2', 'us-east4-eqdc4a', 'europe-west4-drams3a', 'asia-southeast1-eqsg3a',
 ])
 
@@ -272,18 +272,6 @@ export function parseAgentAccess(value) {
     || value.retention.notice.length > 500
   ) throw new Error('Möbius returned invalid model retention state.')
   return value
-}
-
-export function agentAccessPresentation(access) {
-  const trialReady = access.trial.state === 'ready'
-  const availableUnits = Number(access.balance.available_units || 0)
-  return {
-    needsActivation: trialReady,
-    title: trialReady ? 'Start with $2 on us' : 'Model access is active',
-    action: 'Activate $2 trial',
-    showBalance: !trialReady,
-    empty: !trialReady && availableUnits <= 0,
-  }
 }
 
 function nullableString(value, max) {
@@ -554,25 +542,6 @@ export function parseLinkAttempt(value) {
     ...value,
     authorization_origin: authorization.origin,
   }
-}
-
-export function accountStatus(identity) {
-  if (!identity) return { label: 'Account unavailable', tone: 'error' }
-  if (identity.account_unavailable) {
-    return {
-      label: identity.account_mode === 'managed'
-        ? 'Managed account unavailable'
-        : 'Linked account unavailable',
-      tone: 'warning',
-    }
-  }
-  if (identity.account_mode === 'managed') {
-    return { label: 'Managed by mobius.you', tone: 'online' }
-  }
-  if (identity.account_mode === 'linked') {
-    return { label: 'Linked to mobius.you', tone: 'online' }
-  }
-  return { label: 'Not signed in', tone: 'muted' }
 }
 
 export function waitForAccountLink({

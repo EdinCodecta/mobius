@@ -378,15 +378,6 @@
   line-height: 1.4;
 }
 
-/* When the status slot carries free text (e.g. the chat model's
-   "Last model: …") rather than the StatusDot, keep it on the muted
-   status scale so every row's third line reads consistently. */
-.provider-row__status-text {
-  font-size: 12.5px;
-  color: var(--muted);
-  line-height: 1.4;
-}
-
 /* The provider detail shows usage directly; its plan stays a quiet status. */
 .provider-plan-label {
   color: var(--green);

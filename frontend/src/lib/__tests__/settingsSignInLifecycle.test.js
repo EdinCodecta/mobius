@@ -46,7 +46,7 @@ function setup(t) {
     }))
     return url.endsWith('/link/complete') ? post.promise : reconciliation.promise
   })
-  const view = renderHook(props => SignInModal(props), { token: 'mock-token', onClose() {}, onSignedIn: value => signedIn.push(value) })
+  const view = renderHook(props => SignInModal(props), { onClose() {}, onSignedIn: value => signedIn.push(value) })
   t.after(() => {
     view.unmount()
     if (oldWindow === undefined) delete globalThis.window; else globalThis.window = oldWindow
@@ -62,30 +62,15 @@ function setup(t) {
   return { view, start, post, reconciliation, calls, signedIn }
 }
 
-test('unmount fences a delayed successful sign-in completion', async t => {
+test('closing Settings during completion still publishes the linked account', async t => {
   const s = setup(t)
   const { running } = await s.start()
   s.view.unmount()
   s.post.resolve(response(identity))
   await running
-  assert.equal(s.calls[1].options.signal.aborted, true)
-  assert.deepEqual(s.signedIn, [])
+  assert.equal(s.calls[1].options.signal, undefined)
+  assert.deepEqual(s.signedIn, [identity])
 })
-
-for (const succeeds of [true, false]) {
-  test(`unmount aborts and fences delayed sign-in reconciliation (${succeeds})`, async t => {
-    const s = setup(t)
-    const { running } = await s.start()
-    s.post.resolve(response({ detail: 'Ambiguous completion' }, 503))
-    await flush()
-    assert.equal(s.calls.length, 3)
-    s.view.unmount()
-    s.reconciliation.resolve(succeeds ? response(identity) : response({ detail: 'Unavailable' }, 503))
-    await running
-    assert.equal(s.calls[2].options.signal?.aborted, true)
-    assert.deepEqual(s.signedIn, [])
-  })
-}
 
 for (const reconcile of [false, true]) {
   test(`active sign-in still accepts ${reconcile ? 'authoritative reconciliation' : 'successful completion'}`, async t => {

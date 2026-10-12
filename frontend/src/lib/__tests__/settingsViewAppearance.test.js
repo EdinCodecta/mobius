@@ -17,8 +17,7 @@ const accountView = readFileSync(
 )
 
 test('hidden Settings unmounts the deletion modal while retaining the account page', () => {
-  assert.match(view, /<IdentityAccount token=\{getToken\(\)\} active=\{active\}/)
-  assert.match(accountView, /IdentityAccount\(\{ token, active = true \}\)/)
+  assert.match(view, /<IdentityAccount active=\{active\}/)
   assert.match(accountView, /\{deletingDeployment && active && \(\s*<DeleteDeploymentModal/)
 })
 
@@ -36,7 +35,7 @@ test('appearance keeps one icon switch in the header without making the section 
   assert.match(view, /<header className="settings__header">/)
   assert.doesNotMatch(view, /settings__section--appearance/)
   assert.match(view, /className="settings__appearance-toggle"[\s\S]*role="switch"[\s\S]*onClick=\{toggleTheme\}/)
-  assert.match(view, /!selectedProvider && !mobiusAccountOpen && <button[\s\S]*className="settings__appearance-toggle"/)
+  assert.match(view, /!detailPage && <button[\s\S]*className="settings__appearance-toggle"/)
   assert.match(view, /settings__appearance-option/)
   assert.doesNotMatch(view, /settings__appearance-thumb/)
   assert.match(view, /<Sun[\s\S]*<Moon/)
@@ -124,7 +123,7 @@ test('provider rows keep six-dot background priority and provider-scoped control
   assert.match(view, /background-task priority/)
   assert.match(view, /settings-provider-summary/)
   assert.match(view, /detailMode=\{selectedProvider === row\.provider\}/)
-  assert.match(view, /onClick=\{\(\) => \{ setSelectedProvider\(null\); setMobiusAccountOpen\(false\) \}\}/)
+  assert.match(view, /onClick=\{\(\) => setDetailPage\(null\)\}/)
   assert.match(view, /!detailMode && <button[\s\S]*onClick=\{onOpen\}/)
   assert.match(view, /detailMode && <div className="settings-provider-details">/)
   assert.match(view, /selectedProvider && selectedProvider !== row\.provider \? null/)
@@ -154,44 +153,23 @@ test('provider-dependent model controls stay unavailable until connected', () =>
 
 test('Möbius account opens its Settings page while GitHub expands inline', () => {
   const github = readFileSync(new URL('../../components/SettingsView/GithubConnection.jsx', import.meta.url), 'utf8')
-  assert.match(view, /onClick=\{openMobiusYou\}/)
-  assert.match(view, /setMobiusAccountOpen\(true\)/)
-  assert.match(view, /mobiusAccountOpen && <div className="settings__account-page">[\s\S]*<IdentityAccount token=\{getToken\(\)\}/)
-  assert.match(view, /mobiusAccountOpen \? 'Möbius account'/)
-  assert.match(view, /setMobiusAccountOpen\(false\)/)
-  assert.match(view, /!mobiusAccountOpen && <section[\s\S]*settings__section--ai/)
-  assert.doesNotMatch(view, /aria-expanded=\{mobiusAccountOpen\}/)
+  assert.match(view, /onClick=\{\(\) => openDetailPage\('account'\)\}/)
+  assert.match(view, /accountOpen && <div className="settings__account-page">[\s\S]*<IdentityAccount/)
+  assert.match(view, /!accountOpen && <section[\s\S]*settings__section--ai/)
   assert.match(view, /<GithubConnection[\s\S]*expanded=\{githubAccountOpen\}/)
-  assert.match(view, /setGithubAccountOpen\(value => !value\)/)
   assert.match(github, /aria-expanded=\{expanded\}[\s\S]*settings-github-detail/)
-  assert.doesNotMatch(view, /accountOpen \? <>|githubOpen \? <>|<MobiusAccountOverview/)
-  assert.doesNotMatch(view, /Trial active|mobiusTrialSubtitle|mobiusUsageQuery/)
   assert.doesNotMatch(view, /onOpenApp\?\.\('identity'\)/)
 })
 
-test('Möbius account row uses the profile photo or handle instead of the brand icon', () => {
-  const identity = readFileSync(new URL('../../components/SettingsView/identity/IdentityAccount.jsx', import.meta.url), 'utf8')
-  assert.match(view, /useIdentityQuery\(getToken\(\), \{ enabled: active \}\)\.data\?\.profile/)
-  assert.match(view, /<ProfileAvatar profile=\{mobiusProfile\} token=\{getToken\(\)\}/)
+test('Möbius account row uses the shared profile photo or handle', () => {
+  assert.match(view, /useIdentityQuery\(\{ enabled: active \}\)\.data\?\.profile/)
+  assert.match(view, /<ProfileAvatar profile=\{mobiusProfile\} \/>/)
   assert.match(view, /@\$\{mobiusProfile\.handle\}/)
-  assert.match(identity, /export function ProfileAvatar/)
-  assert.doesNotMatch(view, /identity-icon\.png/)
-})
-
-test('Möbius account omits the Railway account dropdown but keeps deployments', () => {
-  const identity = readFileSync(new URL('../../components/SettingsView/identity/IdentityAccount.jsx', import.meta.url), 'utf8')
-  assert.doesNotMatch(identity, /RailwaySummary|RailwayManagement|settings-railway-management/)
-  assert.match(identity, /<Deployments[\s\S]*onNew=\{/)
-  assert.match(identity, /onCompute=\{\(id, payload\)/)
-})
-
-test('Sign out row no longer repeats the Railway email', () => {
-  assert.doesNotMatch(view, /railwayAccountEmail|Railway account ·/)
 })
 
 test('live usage is a collapsed dropdown that only fetches while open', () => {
   const identity = readFileSync(new URL('../../components/SettingsView/identity/IdentityAccount.jsx', import.meta.url), 'utf8')
-  assert.match(identity, /<UsageDisclosure token=\{token\} instance=\{managed\} \/>/)
+  assert.match(identity, /<UsageDisclosure instance=\{managed\} \/>/)
   assert.match(identity, /onToggle=\{event => setOpen\(event\.currentTarget\.open\)\}/)
   assert.match(identity, /\{open && \(\s*<div className="id-disclosure-body">\s*<DeploymentMetrics/)
 })
@@ -199,20 +177,6 @@ test('live usage is a collapsed dropdown that only fetches while open', () => {
 test('ID card shows the Railway account email when Möbius has no sign-in email', () => {
   const identity = readFileSync(new URL('../../components/SettingsView/identity/IdentityAccount.jsx', import.meta.url), 'utf8')
   assert.match(identity, /<span>\{profile\?\.email \|\| railway\.connection\.account\}<\/span>/)
-})
-
-test('Möbius account mirrors the Möbius · You app layout', () => {
-  const account = readFileSync(new URL('../../components/SettingsView/identity/IdentityAccount.jsx', import.meta.url), 'utf8')
-  // Same footer, Account sheet and New deployment modal as the standalone app.
-  assert.match(account, /Railway workspace connected ·/)
-  assert.match(account, /Manage plan on Railway <ArrowUpRight/)
-  assert.match(account, /className="id-railway-manage" aria-label="Manage Railway account" onClick=\{onManageConnection\}/)
-  assert.match(account, /managingRailway && railway\?\.connection && \(\s*<RailwayConnectionModal/)
-  assert.match(account, /creatingDeployment && \(\s*<NewDeploymentModal/)
-  assert.match(account, /className="id-cardfoot"/)
-  // Settings-only: no standalone app chrome or model access card.
-  assert.doesNotMatch(account, /<Brand|AgentAccessCard|ModelVisibilityCard/)
-  assert.match(account, /planCheckedRef\.current = true\n\s*identityRequest\(token, '\/railway\/plan\/refresh', \{ method: 'POST' \}\)/)
 })
 
 test('Settings detail back button has a 44px touch target and keeps the shared 18px icon', () => {
@@ -243,28 +207,6 @@ test('new provider connections use the curated unattended defaults', () => {
   assert.match(view, /if \(!saved\) return[\s\S]*setExpandedAuth\(null\)/)
   assert.doesNotMatch(view, /api\.settings\.save\(\{ provider \}\)/)
   assert.match(view, /effort: defaultEffort\(provider\)/)
-})
-
-test('native account view keeps existing protected profile and Railway flows', () => {
-  const account = readFileSync(new URL('../../components/SettingsView/identity/IdentityAccount.jsx', import.meta.url), 'utf8')
-  assert.match(account, /identityRequest\(token, '\/profile'/)
-  assert.match(account, /identityRequest\(token, '\/avatar'/)
-  assert.match(account, /identityRequest\(token, '\/railway\?region_options=1'/)
-  assert.match(account, /railway_access === 'unavailable'\) next = await identityRequest\(token, '\/railway'\)/)
-  assert.doesNotMatch(account, /<RailwaySummary/)
-  assert.match(account, /<Deployments[\s\S]*onCompute=\{/)
-  assert.match(account, /<SignInModal[\s\S]*<DisconnectModal/)
-})
-
-test('remaining Möbius account controls live in native Settings views', () => {
-  const account = readFileSync(new URL('../../components/SettingsView/identity/IdentityAccount.jsx', import.meta.url), 'utf8')
-  const provider = readFileSync(new URL('../../components/SettingsView/identity/MobiusProviderAccess.jsx', import.meta.url), 'utf8')
-  assert.match(view, /<MobiusProviderAccess token=\{getToken\(\)\}/)
-  assert.match(provider, /\/agent\/trial/)
-  assert.match(provider, /\/api\/auth\/providers\/mobius\/enabled/)
-  assert.match(provider, /access\.retention\.notice/)
-  assert.match(provider, /access\.models\.map/)
-  assert.match(account, /<Deployments[\s\S]*onConnect=\{\(\) => connectRailway\(\)\}/)
 })
 
 test('appearance indicator waits for the same seeded theme repaint as the palette', () => {

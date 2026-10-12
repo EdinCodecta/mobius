@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { Alert } from '@openai/apps-sdk-ui/components/Alert'
 import { ArrowLeft, Moon, Sun } from '@openai/apps-sdk-ui/components/Icon'
 import GripVertical from 'lucide-react/dist/esm/icons/grip-vertical.mjs'
-import { api, clearQueryCache, clearToken, getToken } from '../../api/client.js'
+import { api, clearQueryCache, clearToken } from '../../api/client.js'
 import { authQueries, modelQueries, settingsQueries, themeQueries } from '../../hooks/queries.js'
 import { settleBackgroundAgentSave } from '../../lib/backgroundAgentSave.js'
 import { connectedProvidersFirst, hasActiveConnectedProvider, moveConnectedProvider } from '../../lib/backgroundProviderOrder.js'
@@ -296,20 +296,22 @@ export default function SettingsView({
   const [themeSwitching, setThemeSwitching] = useState(false)
   // Which provider has its inline auth panel expanded. null = none.
   const [expandedAuth, setExpandedAuth] = useState(null)
-  // Usage is on demand: opening a provider detail fetches only that provider.
   // Surface failures from the dark-mode toggle: a failed theme
   // persist would otherwise bounce the knob without telling the user
   // why.
   const [themeError, setThemeError] = useState('')
   const [signOutConfirm, setSignOutConfirm] = useState(false)
   const [signingOut, setSigningOut] = useState(false)
-  const [mobiusAccountOpen, setMobiusAccountOpen] = useState(false)
   const [githubAccountOpen, setGithubAccountOpen] = useState(false)
-  const [selectedProvider, setSelectedProvider] = useState(null)
+  // null shows the overview; 'account' or a provider id shows that detail page.
+  // Usage is on demand: only an open provider page fetches its usage.
+  const [detailPage, setDetailPage] = useState(null)
+  const accountOpen = detailPage === 'account'
+  const selectedProvider = accountOpen ? null : detailPage
 
   // Shared with the account page, so the row keeps the last confirmed profile
   // when the identity service is unavailable and reflects edits immediately.
-  const mobiusProfile = useIdentityQuery(getToken(), { enabled: active }).data?.profile ?? null
+  const mobiusProfile = useIdentityQuery({ enabled: active }).data?.profile ?? null
 
   useEffect(() => {
     // Mirror the full query value so a cache invalidation that
@@ -459,9 +461,8 @@ export default function SettingsView({
   }, [settingsQuery.data])
 
   useSettingsFocus({
-    focusTarget, providerReady, selectedProvider, mobiusAccountOpen,
-    setSelectedProvider, setMobiusAccountOpen, setManageModelsProvider,
-    setupFocusRefs, setAttentionSection,
+    focusTarget, providerReady, detailPage, setDetailPage,
+    setManageModelsProvider, setupFocusRefs, setAttentionSection,
   })
 
   const modelsForProvider = useCallback((provider) => {
@@ -746,8 +747,8 @@ export default function SettingsView({
     },
     [],
   )
-  const openMobiusYou = useCallback(() => {
-    setMobiusAccountOpen(true)
+  const openDetailPage = useCallback((page) => {
+    setDetailPage(page)
     settingsBoundaryRef.current?.scrollTo({ top: 0 })
   }, [])
   const toggleGithub = useCallback(() => {
@@ -940,9 +941,9 @@ export default function SettingsView({
     <div ref={settingsBoundaryRef} className="settings">
       <div className="settings__content">
         <header className="settings__header">
-          {(selectedProvider || mobiusAccountOpen) && <button type="button" className="settings__back" aria-label="Back to Settings" onClick={() => { setSelectedProvider(null); setMobiusAccountOpen(false) }}><ArrowLeft width={18} height={18} aria-hidden="true" /></button>}
-          <h1 className="settings__title">{mobiusAccountOpen ? 'Möbius account' : selectedProvider ? (modelProviderInfo[selectedProvider]?.label || selectedProvider) : 'Settings'}</h1>
-          {!selectedProvider && !mobiusAccountOpen && <button
+          {detailPage && <button type="button" className="settings__back" aria-label="Back to Settings" onClick={() => setDetailPage(null)}><ArrowLeft width={18} height={18} aria-hidden="true" /></button>}
+          <h1 className="settings__title">{accountOpen ? 'Möbius account' : selectedProvider ? (modelProviderInfo[selectedProvider]?.label || selectedProvider) : 'Settings'}</h1>
+          {!detailPage && <button
             type="button"
             className="settings__appearance-toggle"
             role="switch"
@@ -962,12 +963,12 @@ export default function SettingsView({
         </header>
         {themeError && <Alert color="danger" variant="soft" description={themeError} />}
 
-        {!selectedProvider && !mobiusAccountOpen && <section className="settings__section settings__section--accounts" aria-labelledby="settings-accounts-title">
+        {!detailPage && <section className="settings__section settings__section--accounts" aria-labelledby="settings-accounts-title">
           <h2 className="settings__section-title" id="settings-accounts-title">Accounts</h2>
           <div className="settings__providers">
-            <button type="button" className="settings__account-link" onClick={openMobiusYou}>
+            <button type="button" className="settings__account-link" onClick={() => openDetailPage('account')}>
               <span className="settings__account-icon settings__account-icon--profile" aria-hidden="true">
-                <ProfileAvatar profile={mobiusProfile} token={getToken()} />
+                <ProfileAvatar profile={mobiusProfile} />
               </span>
               <span className="settings__account-link-copy"><strong>Möbius account</strong><small>{mobiusProfile?.handle ? `@${mobiusProfile.handle} · ` : ''}Profile, hosting and deployments</small></span>
               <span className="settings__account-link-arrow" aria-hidden="true">›</span>
@@ -983,11 +984,11 @@ export default function SettingsView({
           </div>
         </section>}
 
-        {mobiusAccountOpen && <div className="settings__account-page">
-          <IdentityAccount token={getToken()} active={active} />
+        {accountOpen && <div className="settings__account-page">
+          <IdentityAccount active={active} />
         </div>}
 
-        {!mobiusAccountOpen && <section
+        {!accountOpen && <section
           className={`settings__section settings__section--ai${attentionSection === 'ai-providers' ? ' settings-setup-target' : ''}`}
           id="settings-ai-providers"
           ref={(node) => setSetupFocusRef('ai-providers', node)}
@@ -1037,7 +1038,7 @@ export default function SettingsView({
                     configuredProviders={configuredProviders}
                     onReorderStart={startBackgroundReorder}
                     detailMode={selectedProvider === row.provider}
-                    onOpen={() => { setSelectedProvider(row.provider); settingsBoundaryRef.current?.scrollTo({ top: 0 }) }}
+                    onOpen={() => openDetailPage(row.provider)}
                     details={<>
                       <button type="button" className="settings-provider-details__models" onClick={() => setManageModelsProvider(row.provider)} disabled={!configuredProviders.has(row.provider)}>
                         Manage chat models
@@ -1110,7 +1111,7 @@ export default function SettingsView({
                 </ProviderRow>
                       )}
                       {row.provider === 'mobius' &&
-                        <MobiusProviderAccess token={getToken()} onVisibilityChange={() => {
+                        <MobiusProviderAccess onVisibilityChange={() => {
                           authQueries.provider.statuses.invalidate(queryClient)
                           modelQueries.registry.invalidate(queryClient)
                         }} />}
@@ -1141,7 +1142,7 @@ export default function SettingsView({
           )}
         </section>}
 
-        {!selectedProvider && !mobiusAccountOpen && <>
+        {!detailPage && <>
         <PlatformUpdates active={active} refreshToken={refreshToken} onOpenChat={onOpenChat} inertBoundaryRef={settingsBoundaryRef} />
 
         <section className="settings__section settings__section--compact">

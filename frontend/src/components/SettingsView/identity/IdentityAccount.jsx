@@ -2,7 +2,6 @@ import { useQueryClient } from '@tanstack/react-query'
 import {
   useCallback,
   useEffect,
-  useLayoutEffect,
   useRef,
   useState,
 } from 'react'
@@ -32,16 +31,15 @@ import {
   suggestRailwayRegion,
   waitForAccountLink,
 } from './identity-contract.js'
-import { IDENTITY_STYLES } from './identity-styles.js'
 import {
   identityRequest,
   disconnectIdentity,
   loadIdentity,
   publishIdentity,
-  retryDeploymentDeletion,
   useAvatarSource,
   useIdentityQuery,
 } from './identity-client.js'
+import './IdentityAccount.css'
 
 function initials(profile) {
   const value = profile?.handle || profile?.email || 'M'
@@ -136,8 +134,8 @@ function AppleMark() {
   )
 }
 
-export function ProfileAvatar({ profile, token }) {
-  const source = useAvatarSource(profile?.avatar_url, token)
+export function ProfileAvatar({ profile }) {
+  const source = useAvatarSource(profile?.avatar_url)
   return source ? <img src={source} alt="" /> : initials(profile)
 }
 
@@ -323,13 +321,12 @@ function HandleModal({ current, onClose, onSave, required = false }) {
   )
 }
 
-export function SignInModal({ token, onClose, onSignedIn }) {
+export function SignInModal({ onClose, onSignedIn }) {
   const [pending, setPending] = useState('')
   const [error, setError] = useState('')
   const [completion, setCompletion] = useState(null)
   const popupRef = useRef(null)
   const waitAbortRef = useRef(null)
-  const completionAbortRef = useRef(null)
   const completionBusyRef = useRef(false)
   const startBusyRef = useRef(false)
   const firstProviderRef = useRef(null)
@@ -348,39 +345,32 @@ export function SignInModal({ token, onClose, onSignedIn }) {
   }, [cleanupWait, onClose])
   const dialogRef = useDialog(cancel, pending === 'complete', firstProviderRef)
 
-  useEffect(() => () => {
-    cleanupWait()
-    completionAbortRef.current?.abort()
-  }, [cleanupWait])
+  // Closing the dialog abandons the popup wait. A completion already in flight
+  // still finishes: the account may be linked, and the shared identity cache
+  // should reflect it even if Settings has moved on.
+  useEffect(() => cleanupWait, [cleanupWait])
 
   const complete = async payload => {
     if (completionBusyRef.current) return
     completionBusyRef.current = true
     setPending('complete')
     setError('')
-    const controller = new AbortController()
-    completionAbortRef.current = controller
     try {
-      const linked = await identityRequest(token, '/link/complete', {
+      const linked = await identityRequest('/link/complete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-        signal: controller.signal,
       })
-      if (controller.signal.aborted) return
       setCompletion(null)
       onSignedIn(linked)
     } catch (requestError) {
-      if (controller.signal.aborted) return
-
       // A lost response is ambiguous: the remote exchange and local commit may
       // already have succeeded. Read the authoritative state before offering a
       // retry so success never looks like failure and replay stays idempotent.
       let current = null
       try {
-        current = await identityRequest(token, '', { signal: controller.signal })
+        current = await identityRequest()
       } catch { /* keep the original completion error */ }
-      if (controller.signal.aborted) return
       if (current?.account_mode === 'linked' && !current.account_unavailable) {
         setCompletion(null)
         onSignedIn(current)
@@ -394,9 +384,8 @@ export function SignInModal({ token, onClose, onSignedIn }) {
         ? 'Your account approved the link, but this Möbius could not confirm completion. The approval is kept only in this dialog—retry completion.'
         : requestError.message)
     } finally {
-      if (completionAbortRef.current === controller) completionAbortRef.current = null
       completionBusyRef.current = false
-      if (!controller.signal.aborted) setPending('')
+      setPending('')
     }
   }
 
@@ -425,7 +414,7 @@ export function SignInModal({ token, onClose, onSignedIn }) {
     waitAbortRef.current = controller
     let completing = false
     try {
-      const attempt = await identityRequest(token, '/link/start', {
+      const attempt = await identityRequest('/link/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider }),
@@ -540,7 +529,7 @@ export function SignInModal({ token, onClose, onSignedIn }) {
   )
 }
 
-function DisconnectModal({ queryClient, token, onClose, onDisconnected, reconnecting = false }) {
+function DisconnectModal({ queryClient, onClose, onDisconnected, reconnecting = false }) {
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
   const keepRef = useRef(null)
@@ -551,7 +540,7 @@ function DisconnectModal({ queryClient, token, onClose, onDisconnected, reconnec
     setPending(true)
     setError('')
     try {
-      await disconnectIdentity(queryClient, token)
+      await disconnectIdentity(queryClient)
       onDisconnected()
     } catch (requestError) {
       setError(requestError.status === 502
@@ -615,7 +604,6 @@ function DisconnectModal({ queryClient, token, onClose, onDisconnected, reconnec
 }
 
 export function Deployments({
-  token,
   items,
   railway,
   selfHosted,
@@ -841,7 +829,7 @@ export function Deployments({
               </div>
             )}
             {managed?.status === 'ready' && (
-              <UsageDisclosure token={token} instance={managed} />
+              <UsageDisclosure instance={managed} />
             )}
             {managed && (managed.actions.edit_resources
               || (managed.actions.retry && !building)
@@ -850,7 +838,6 @@ export function Deployments({
                 key={`${managed.id}:${managingDeployment?.id === managed.id ? managingSection : 'resources'}:${managed.resources.cpu}:${managed.resources.memory_mb}:${managed.resources.volume_size_mb}`}
                 instance={managed}
                 section={managingDeployment?.id === managed.id ? managingSection : null}
-                token={token}
                 planLimits={railway?.connection?.plan_limits}
                 onClose={onCloseManage}
                 onCompute={onCompute}
@@ -1296,7 +1283,7 @@ function MetricMeter({ label, value, limit, percent }) {
 
 // Live usage polls Railway every 15 seconds, so it stays collapsed and only
 // mounts (and fetches) while the owner has it open.
-function UsageDisclosure({ token, instance }) {
+function UsageDisclosure({ instance }) {
   const [open, setOpen] = useState(false)
   // Same panel frame as Resources so both rows share spacing, divider and inset.
   return (
@@ -1312,7 +1299,7 @@ function UsageDisclosure({ token, instance }) {
           </summary>
           {open && (
             <div className="id-disclosure-body">
-              <DeploymentMetrics token={token} instance={instance} compact />
+              <DeploymentMetrics instance={instance} compact />
             </div>
           )}
         </details>
@@ -1321,7 +1308,7 @@ function UsageDisclosure({ token, instance }) {
   )
 }
 
-function DeploymentMetrics({ token, instance, compact = false }) {
+function DeploymentMetrics({ instance, compact = false }) {
   const [metrics, setMetrics] = useState(null)
   const [error, setError] = useState('')
 
@@ -1339,7 +1326,7 @@ function DeploymentMetrics({ token, instance, compact = false }) {
       controller = requestController
       try {
         const data = await identityRequest(
-          token, `/railway/deployments/${instance.id}/metrics`, { signal: requestController.signal },
+          `/railway/deployments/${instance.id}/metrics`, { signal: requestController.signal },
         )
         if (!requestController.signal.aborted && !cancelled) {
           setMetrics(data)
@@ -1371,7 +1358,7 @@ function DeploymentMetrics({ token, instance, compact = false }) {
       window.removeEventListener('focus', resume)
       document.removeEventListener('visibilitychange', resume)
     }
-  }, [instance.id, instance.status, token])
+  }, [instance.id, instance.status])
 
   if (instance.status !== 'ready') return null
   if (error && !metrics) return <div className="id-metrics-note">Live metrics are unavailable right now.</div>
@@ -1409,7 +1396,7 @@ function DeploymentMetrics({ token, instance, compact = false }) {
   )
 }
 
-export function RecoverySection({ token, instance }) {
+export function RecoverySection({ instance }) {
   // "Open Recovery" starts an ephemeral Railway worker on the account host and,
   // when it reports ready, hands off to the worker's own web UI in a popup — the
   // same web flow the mobius.you website uses. No credentials touch Settings.
@@ -1426,7 +1413,7 @@ export function RecoverySection({ token, instance }) {
       session.controller?.abort()
       try { session.popup?.close() } catch { /* popup already gone */ }
     }
-  }, [token, instance.id])
+  }, [instance.id])
 
   const start = async () => {
     const session = sessionRef.current
@@ -1455,7 +1442,7 @@ export function RecoverySection({ token, instance }) {
       if (!active()) return
       try {
         if (popup.closed) throw new Error('The recovery window was closed. Try again when you are ready.')
-        const status = await identityRequest(token, `/railway/deployments/${instance.id}/recovery/status`, { signal: controller.signal })
+        const status = await identityRequest(`/railway/deployments/${instance.id}/recovery/status`, { signal: controller.signal })
         if (!active()) return
         if (popup.closed) throw new Error('The recovery window was closed. Try again when you are ready.')
         if (status.state === 'ready') {
@@ -1475,7 +1462,7 @@ export function RecoverySection({ token, instance }) {
     }
     setRecovery({ state: 'starting', message: 'Starting a temporary recovery worker…', error: '' })
     try {
-      await identityRequest(token, `/railway/deployments/${instance.id}/recovery`, { method: 'POST', signal: controller.signal })
+      await identityRequest(`/railway/deployments/${instance.id}/recovery`, { method: 'POST', signal: controller.signal })
       if (active()) await poll()
     } catch (requestError) {
       if (active()) finish(requestError)
@@ -1510,7 +1497,7 @@ export function RecoverySection({ token, instance }) {
 }
 
 export function DeletionRecoverySection({
-  token, instance, pending, onConfirmAbsent, onDiagnosis,
+  instance, pending, onConfirmAbsent, onDiagnosis,
 }) {
   const [diagnosis, setDiagnosis] = useState(null)
   const [checkError, setCheckError] = useState('')
@@ -1528,7 +1515,6 @@ export function DeletionRecoverySection({
     ;(async () => {
       try {
         const result = await identityRequest(
-          token,
           `/railway/deployments/${instance.id}/deletion`,
           { signal: controller.signal },
         )
@@ -1545,7 +1531,7 @@ export function DeletionRecoverySection({
       }
     })()
     return () => controller.abort()
-  }, [instance.id, instance.railway_url, instance.status, instance.actions.retry, revision, token, onDiagnosis])
+  }, [instance.id, instance.railway_url, instance.status, instance.actions.retry, revision, onDiagnosis])
 
   const checking = !diagnosis && !checkError && !unsupported
   const title = checking
@@ -1647,7 +1633,7 @@ export function DeletionRecoverySection({
 }
 
 function ManageDeploymentPanel({
-  instance, section, onClose, onCompute, onStorage, onRetry, planLimits, token,
+  instance, section, onClose, onCompute, onStorage, onRetry, planLimits,
 }) {
   // Selects use '' to mean "plan maximum"; if the deployment already sits at the
   // plan ceiling, start there rather than on a value the picker would not list.
@@ -1840,7 +1826,7 @@ function ManageDeploymentPanel({
                 </span>
               </summary>
               <div className="id-disclosure-body id-manage-recovery">
-                <RecoverySection token={token} instance={instance} />
+                <RecoverySection instance={instance} />
               </div>
             </details>
           )}
@@ -1853,7 +1839,7 @@ function ManageDeploymentPanel({
 }
 
 export function DeleteDeploymentModal({
-  instance, token, onClose, onRetry, onDelete, onConfirmAbsent,
+  instance, onClose, onRetry, onDelete, onConfirmAbsent,
 }) {
   const [pending, setPending] = useState('')
   const [error, setError] = useState('')
@@ -1867,33 +1853,22 @@ export function DeleteDeploymentModal({
   const dialogRef = useDialog(onClose, Boolean(pending), closeRef)
   const retryingDelete = String(instance.status).toLowerCase() === 'delete_failed'
   const cancellingBuild = deploymentIsBuilding(instance)
+  // An ambiguous deletion is not permission to repeat a destructive request:
+  // retry only once a fresh check confirms the same project still exists. The
+  // account service re-checks eligibility when the retry arrives.
   const canRetryDelete = deletionDiagnosis?.state === 'present' && instance.actions.retry === true
-  const operationRef = useRef(null)
-
-  // Dialog close controls are blocked while pending, but Settings itself can
-  // unmount or switch accounts. Invalidate that intent before async reads resume.
-  useLayoutEffect(() => {
-    const controller = new AbortController()
-    operationRef.current = controller
-    setPending('')
-    setError('')
-    setConfirmDelete(false)
-    setDeletionDiagnosis(null)
-    return () => controller.abort()
-  }, [token, instance.id, instance.railway_url, instance.status, instance.actions.retry])
 
   const run = async (action, work) => {
-    const controller = operationRef.current
-    if (pending || !controller || controller.signal.aborted) return
+    if (pending) return
     setPending(action)
     setError('')
     try {
-      await work(controller.signal)
-      if (!controller.signal.aborted) onClose()
+      await work()
+      onClose()
     } catch (requestError) {
-      if (!controller.signal.aborted) setError(requestError.message)
+      setError(requestError.message)
     } finally {
-      if (!controller.signal.aborted) setPending('')
+      setPending('')
     }
   }
 
@@ -1919,7 +1894,6 @@ export function DeleteDeploymentModal({
 
         {retryingDelete && (
           <DeletionRecoverySection
-            token={token}
             instance={instance}
             pending={pending}
             onDiagnosis={onDiagnosis}
@@ -1954,9 +1928,7 @@ export function DeleteDeploymentModal({
                 disabled={Boolean(pending) || (retryingDelete && !canRetryDelete)}
                 onClick={() => run(
                   retryingDelete ? 'retry-delete' : 'delete',
-                  signal => retryingDelete
-                    ? retryDeploymentDeletion(token, instance, onRetry, { signal })
-                    : onDelete(instance.id),
+                  () => retryingDelete ? onRetry(instance.id) : onDelete(instance.id),
                 )}
               >
                 {pending
@@ -1980,7 +1952,7 @@ export function DeleteDeploymentModal({
 }
 
 function RailwayConnectionModal({
-  token, connection, onClose, onReload, onChangeAccount, onDisconnected,
+  connection, onClose, onReload, onChangeAccount, onDisconnected,
   connecting, connectionError,
 }) {
   const [inventory, setInventory] = useState(null)
@@ -1996,14 +1968,14 @@ function RailwayConnectionModal({
     const sequence = ++workspaceSequenceRef.current
     setInventory(null)
     try {
-      const data = await identityRequest(token, '/railway/workspaces')
+      const data = await identityRequest('/railway/workspaces')
       if (workspaceSequenceRef.current === sequence) setInventory(data)
     } catch {
       if (workspaceSequenceRef.current === sequence) {
         setInventory({ workspaces: [], current: null })
       }
     }
-  }, [token])
+  }, [])
 
   useEffect(() => {
     void reloadWorkspaces()
@@ -2065,7 +2037,7 @@ function RailwayConnectionModal({
                 onChange={event => {
                   const nextId = event.target.value
                   run('workspace', async () => {
-                    await identityRequest(token, '/railway/workspace', {
+                    await identityRequest('/railway/workspace', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({ workspace_id: nextId }),
@@ -2098,7 +2070,7 @@ function RailwayConnectionModal({
                 disabled={busy}
                 aria-label="Refresh Railway plan"
                 onClick={() => run('plan', async () => {
-                  await identityRequest(token, '/railway/plan/refresh', { method: 'POST' })
+                  await identityRequest('/railway/plan/refresh', { method: 'POST' })
                   await onReload()
                 })}
               >
@@ -2126,7 +2098,7 @@ function RailwayConnectionModal({
                 className="id-btn id-btn--danger"
                 disabled={busy}
                 onClick={() => run('disconnect', async () => {
-                  await identityRequest(token, '/railway/disconnect', { method: 'POST' })
+                  await identityRequest('/railway/disconnect', { method: 'POST' })
                   onDisconnected()
                 })}
               >
@@ -2154,45 +2126,42 @@ function RailwayConnectionModal({
 
 function IdentityLoading() {
   return (
-    <>
-      <style>{IDENTITY_STYLES}</style>
-      <main className="id-root id-root--settings" aria-busy="true">
-        <span className="id-sr-only" role="status">Loading your account…</span>
-        <div className="id-scroll">
-          <div className="id-shell id-loading-layout" aria-hidden="true">
-            <section className="id-hero id-loading-hero">
-              <div className="id-skeleton id-loading-avatar" />
-              <div className="id-loading-profile">
-                <div className="id-skeleton id-loading-title" />
-                <div className="id-skeleton id-loading-line" />
-                <div className="id-skeleton id-loading-email" />
+    <main className="id-root id-root--settings" aria-busy="true">
+      <span className="id-sr-only" role="status">Loading your account…</span>
+      <div className="id-scroll">
+        <div className="id-shell id-loading-layout" aria-hidden="true">
+          <section className="id-hero id-loading-hero">
+            <div className="id-skeleton id-loading-avatar" />
+            <div className="id-loading-profile">
+              <div className="id-skeleton id-loading-title" />
+              <div className="id-skeleton id-loading-line" />
+              <div className="id-skeleton id-loading-email" />
+            </div>
+          </section>
+          <article className="id-card id-loading-card">
+            <div className="id-card-head">
+              <div>
+                <div className="id-skeleton id-loading-section-title" />
+                <div className="id-skeleton id-loading-line id-loading-line--short" />
               </div>
-            </section>
-            <article className="id-card id-loading-card">
-              <div className="id-card-head">
-                <div>
-                  <div className="id-skeleton id-loading-section-title" />
-                  <div className="id-skeleton id-loading-line id-loading-line--short" />
-                </div>
+            </div>
+            <div className="id-deployment">
+              <div className="id-skeleton id-loading-deploy-mark" />
+              <div>
+                <div className="id-skeleton id-loading-deploy-name" />
+                <div className="id-skeleton id-loading-line id-loading-line--deployment" />
               </div>
-              <div className="id-deployment">
-                <div className="id-skeleton id-loading-deploy-mark" />
-                <div>
-                  <div className="id-skeleton id-loading-deploy-name" />
-                  <div className="id-skeleton id-loading-line id-loading-line--deployment" />
-                </div>
-              </div>
-            </article>
-          </div>
+            </div>
+          </article>
         </div>
-      </main>
-    </>
+      </div>
+    </main>
   )
 }
 
-export default function IdentityAccount({ token, active = true }) {
+export default function IdentityAccount({ active = true }) {
   const queryClient = useQueryClient()
-  const identityQuery = useIdentityQuery(token)
+  const identityQuery = useIdentityQuery()
   const data = identityQuery.data ?? null
   const loading = identityQuery.isFetching
   const loadError = identityQuery.error?.message || ''
@@ -2218,18 +2187,18 @@ export default function IdentityAccount({ token, active = true }) {
   // Settings shares this read with its overview row; an explicit load always
   // asks the identity service again, and failures surface through the query.
   const load = useCallback(
-    () => loadIdentity(queryClient, token, { force: true }).catch(() => {}),
-    [queryClient, token],
+    () => loadIdentity(queryClient, { force: true }).catch(() => {}),
+    [queryClient],
   )
 
   const loadRailway = useCallback(async ({ quiet = false } = {}) => {
     const sequence = ++railwaySequenceRef.current
     if (!quiet) setRailwayError('')
     try {
-      let next = await identityRequest(token, '/railway?region_options=1')
+      let next = await identityRequest('/railway?region_options=1')
       // Region options are optional; without them Railway still answers on the
       // ordinary route instead of reporting its controls unavailable.
-      if (next?.railway_access === 'unavailable') next = await identityRequest(token, '/railway')
+      if (next?.railway_access === 'unavailable') next = await identityRequest('/railway')
       if (railwaySequenceRef.current === sequence) setRailway(next)
       return next
     } catch (requestError) {
@@ -2238,7 +2207,7 @@ export default function IdentityAccount({ token, active = true }) {
       }
       return null
     }
-  }, [token])
+  }, [])
 
   // Railway does not tell Möbius about plan changes, and the plan bounds the
   // resource choices, so re-check it once each time this page opens.
@@ -2247,10 +2216,10 @@ export default function IdentityAccount({ token, active = true }) {
   useEffect(() => {
     if (!railwayConnected || planCheckedRef.current) return
     planCheckedRef.current = true
-    identityRequest(token, '/railway/plan/refresh', { method: 'POST' })
+    identityRequest('/railway/plan/refresh', { method: 'POST' })
       .then(() => loadRailway({ quiet: true }))
       .catch(() => {})
-  }, [railwayConnected, token, loadRailway])
+  }, [railwayConnected, loadRailway])
 
   useEffect(() => {
     if (data?.account_mode === 'linked' || data?.account_mode === 'managed') {
@@ -2302,7 +2271,6 @@ export default function IdentityAccount({ token, active = true }) {
 
   const signInDialog = signingIn && (
     <SignInModal
-      token={token}
       onClose={() => setSigningIn(false)}
       onSignedIn={next => {
         setData(next)
@@ -2321,8 +2289,7 @@ export default function IdentityAccount({ token, active = true }) {
     return (
       <>
         {signInDialog}
-        <style>{IDENTITY_STYLES}</style>
-        <main className="id-root id-root--settings">
+          <main className="id-root id-root--settings">
           <div className="id-scroll">
             <div className="id-shell">
               <section className="id-card id-fatal" role="alert">
@@ -2353,7 +2320,7 @@ export default function IdentityAccount({ token, active = true }) {
 
   const saveHandle = async handle => {
     setActionError('')
-    setData(await identityRequest(token, '/profile', {
+    setData(await identityRequest('/profile', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ handle }),
@@ -2371,7 +2338,7 @@ export default function IdentityAccount({ token, active = true }) {
       body.append('avatar', file)
       publishIdentity(
         queryClient,
-        await identityRequest(token, '/avatar', { method: 'POST', body }),
+        await identityRequest('/avatar', { method: 'POST', body }),
         { avatarChanged: true },
       )
     } catch (requestError) {
@@ -2382,7 +2349,7 @@ export default function IdentityAccount({ token, active = true }) {
   }
 
   const railwayAction = async (path, options = {}) => {
-    const result = await identityRequest(token, `/railway${path}`, options)
+    const result = await identityRequest(`/railway${path}`, options)
     await loadRailway()
     return result
   }
@@ -2401,7 +2368,7 @@ export default function IdentityAccount({ token, active = true }) {
     const controller = new AbortController()
     railwayConnectAbortRef.current = controller
     try {
-      const started = await identityRequest(token, '/railway/connect/start', {
+      const started = await identityRequest('/railway/connect/start', {
         method: 'POST',
         signal: controller.signal,
         ...(replace
@@ -2442,7 +2409,6 @@ export default function IdentityAccount({ token, active = true }) {
   return (
     <>
       {signInDialog}
-      <style>{IDENTITY_STYLES}</style>
       <main className="id-root id-root--settings">
         <div className="id-scroll">
           <div className="id-shell">
@@ -2496,7 +2462,6 @@ export default function IdentityAccount({ token, active = true }) {
                 </button>
               </section>
               <Deployments
-                token={token}
                 items={data.deployments}
                 railway={railway}
                 selfHosted={mode === 'linked'}
@@ -2529,7 +2494,7 @@ export default function IdentityAccount({ token, active = true }) {
                 >
                   <div className="id-cardid">
                     <div className={`id-avatar${!canEdit ? ' is-disabled' : ''}`}>
-                      <ProfileAvatar profile={profile} token={token} />
+                      <ProfileAvatar profile={profile} />
                       {canEdit && (
                         <>
                           <button
@@ -2593,7 +2558,6 @@ export default function IdentityAccount({ token, active = true }) {
               )}
 
               <Deployments
-                token={token}
                 items={data.deployments}
                 railway={railway}
                 selfHosted={mode === 'linked'}
@@ -2653,7 +2617,6 @@ export default function IdentityAccount({ token, active = true }) {
         {disconnecting && mode === 'linked' && (
           <DisconnectModal
             queryClient={queryClient}
-            token={token}
             reconnecting={reconnecting}
             onClose={() => setDisconnecting(false)}
             onDisconnected={() => {
@@ -2687,7 +2650,6 @@ export default function IdentityAccount({ token, active = true }) {
         {deletingDeployment && active && (
           <DeleteDeploymentModal
             instance={deletingDeployment}
-            token={token}
             onClose={() => setDeletingDeployment(null)}
             onRetry={id => railwayAction(`/deployments/${id}/retry`, { method: 'POST' })}
             onDelete={id => railwayAction(`/deployments/${id}`, { method: 'DELETE' })}
@@ -2700,7 +2662,6 @@ export default function IdentityAccount({ token, active = true }) {
         )}
         {managingRailway && railway?.connection && (
           <RailwayConnectionModal
-            token={token}
             connection={railway.connection}
             onClose={() => setManagingRailway(false)}
             onReload={loadRailway}

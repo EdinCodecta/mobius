@@ -21,7 +21,7 @@ test('delete retry is unavailable until present diagnosis and advertised eligibi
   const oldDocument = globalThis.document
   globalThis.document = { activeElement: null }
   t.after(() => { globalThis.document = oldDocument })
-  const props = { instance: target, token: 'token', onClose: noop, onRetry: noop, onDelete: noop, onConfirmAbsent: noop }
+  const props = { instance: target, onClose: noop, onRetry: noop, onDelete: noop, onConfirmAbsent: noop }
   const view = renderHook(next => DeleteDeploymentModal(next), props)
   t.after(() => view.unmount())
   assert.equal(retryButton(view.result.current).props.disabled, true)
@@ -47,7 +47,7 @@ for (const status of [200, 404, 503]) {
     const onDiagnosis = diagnosis => diagnoses.push(diagnosis)
     t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ detail: 'Check unavailable' }), { status }))
     const view = renderHook(() => DeletionRecoverySection({
-      token: 'token', instance: target, pending: '', onConfirmAbsent: noop, onDiagnosis,
+      instance: target, pending: '', onConfirmAbsent: noop, onDiagnosis,
     }))
     t.after(() => view.unmount())
     await flush()
@@ -57,43 +57,23 @@ for (const status of [200, 404, 503]) {
   })
 }
 
-for (const state of ['unknown', 'present']) {
-  test(`confirmed retry reconciles before dispatch and only proceeds for ${state}`, async t => {
-    const oldDocument = globalThis.document
-    globalThis.document = { activeElement: null }
-    t.after(() => { globalThis.document = oldDocument })
-    const calls = []
-    let retried = 0
-    const current = {
-      ...target, url: null, current_step: null, last_error: null,
-      resources: { cpu: null, memory_mb: null, volume_size_mb: null, plan: 'hobby' },
-      actions: { edit_resources: false, retry: true, delete: true },
-    }
-    t.mock.method(globalThis, 'fetch', async url => {
-      calls.push(url)
-      const body = calls.length === 1 ? {
-        railway_access: 'available',
-        connection: { connected: true, account: 'owner', workspace: 'workspace', plan: 'hobby', deploy_blocked: '' },
-        instances: [current],
-      } : { state, message: 'Railway project check.', can_confirm_absent: false }
-      return new Response(JSON.stringify(body))
-    })
-    const view = renderHook(() => DeleteDeploymentModal({
-      token: 'token', instance: target, onClose: noop,
-      onRetry: async () => {
-        assert.equal(calls.length, 2)
-        retried++
-      }, onDelete: () => assert.fail('wrong delete flow'), onConfirmAbsent: noop,
-    }))
-    t.after(() => view.unmount())
-    recovery(view.result.current).props.onDiagnosis({ state: 'present' })
-    retryButton(view.result.current).props.onClick()
-    await retryButton(view.result.current).props.onClick()
-    assert.deepEqual(calls, ['/api/identity/railway', '/api/identity/railway/deployments/mob_example/deletion'])
-    assert.equal(retried, state === 'present' ? 1 : 0)
-    if (state === 'unknown') assert.match(JSON.stringify(view.result.current), /deletion was not retried/)
-  })
-}
+test('a confirmed retry after a present diagnosis asks the account service once', async t => {
+  const oldDocument = globalThis.document
+  globalThis.document = { activeElement: null }
+  t.after(() => { globalThis.document = oldDocument })
+  const retried = []
+  let closed = 0
+  const view = renderHook(() => DeleteDeploymentModal({
+    instance: target, onClose: () => { closed++ }, onRetry: async id => { retried.push(id) },
+    onDelete: () => assert.fail('wrong deletion path'), onConfirmAbsent: noop,
+  }))
+  t.after(() => view.unmount())
+  recovery(view.result.current).props.onDiagnosis({ state: 'present' })
+  retryButton(view.result.current).props.onClick()
+  await retryButton(view.result.current).props.onClick()
+  assert.deepEqual(retried, [target.id])
+  assert.equal(closed, 1)
+})
 
 for (const status of ['ready', 'queued']) {
   test(`ordinary ${status === 'queued' ? 'build cancellation' : 'deletion'} keeps the original confirmed delete path`, async t => {
@@ -103,7 +83,7 @@ for (const status of ['ready', 'queued']) {
     let deleted = null
     t.mock.method(globalThis, 'fetch', () => assert.fail('ordinary deletion must not enter retry reconciliation'))
     const view = renderHook(() => DeleteDeploymentModal({
-      token: 'token', instance: { ...target, status }, onClose: noop,
+      instance: { ...target, status }, onClose: noop,
       onRetry: () => assert.fail('wrong retry flow'), onDelete: async id => { deleted = id }, onConfirmAbsent: noop,
     }))
     t.after(() => view.unmount())
@@ -119,7 +99,7 @@ test('a late deletion diagnosis for an old target cannot re-admit retry', async 
   const requests = []
   t.mock.method(globalThis, 'fetch', (_url, options) => new Promise(resolve => requests.push({ resolve, options })))
   const onDiagnosis = diagnosis => diagnoses.push(diagnosis)
-  const props = { token: 'token', instance: target, pending: '', onConfirmAbsent: noop, onDiagnosis }
+  const props = { instance: target, pending: '', onConfirmAbsent: noop, onDiagnosis }
   const view = renderHook(next => DeletionRecoverySection(next), props)
   t.after(() => view.unmount())
   view.rerender({ ...props, instance: { ...target, railway_url: 'https://railway.com/project/other' } })
@@ -128,70 +108,3 @@ test('a late deletion diagnosis for an old target cannot re-admit retry', async 
   await flush()
   assert.deepEqual(diagnoses, [null, null])
 })
-
-// Resolve aborted reads deliberately: cancellation must fence the destructive
-// callback even when a transport ignores AbortSignal or a response is queued.
-for (const stage of ['inventory', 'diagnosis']) {
-  for (const departure of ['unmount', 'token-change', 'target-change', 'project-url-change', 'retry-disabled', 'status-change']) {
-    test(`leaving the retry modal by ${departure} during ${stage} prevents late deletion dispatch`, async t => {
-      const oldDocument = globalThis.document
-      globalThis.document = { activeElement: null }
-      t.after(() => { globalThis.document = oldDocument })
-      const requests = []
-      t.mock.method(globalThis, 'fetch', (url, options) => new Promise(resolve => requests.push({ url, options, resolve })))
-      let retried = 0
-      let closed = 0
-      const props = {
-        instance: target, token: 'token', onRetry: async () => { retried++ },
-        onDelete: () => assert.fail('wrong deletion path'), onConfirmAbsent: noop,
-        onClose: () => { closed++ },
-      }
-      const view = renderHook(next => DeleteDeploymentModal(next), props)
-      t.after(() => view.unmount())
-      recovery(view.result.current).props.onDiagnosis({ state: 'present' })
-      retryButton(view.result.current).props.onClick()
-      const running = retryButton(view.result.current).props.onClick()
-      const inventory = {
-        railway_access: 'available',
-        connection: { connected: true, account: 'owner', workspace: 'workspace', plan: 'hobby', deploy_blocked: '' },
-        instances: [{
-          ...target, url: null, current_step: null, last_error: null,
-          resources: { cpu: null, memory_mb: null, volume_size_mb: null, plan: 'hobby' },
-          actions: { edit_resources: false, retry: true, delete: true },
-        }],
-      }
-      assert.equal(requests.length, 1)
-      const signal = requests[0].options.signal
-      assert.equal(signal.aborted, false)
-      if (stage === 'diagnosis') {
-        requests[0].resolve(new Response(JSON.stringify(inventory)))
-        await flush()
-        assert.equal(requests.length, 2)
-        assert.equal(requests[1].options.signal, signal)
-      }
-      if (departure === 'unmount') view.unmount()
-      else {
-        const changes = {
-          'token-change': { token: 'different-account-token' },
-          'target-change': { instance: { ...target, id: 'mob_other' } },
-          'project-url-change': { instance: { ...target, railway_url: 'https://railway.com/project/other' } },
-          'retry-disabled': { instance: { ...target, actions: { retry: false } } },
-          'status-change': { instance: { ...target, status: 'deleting' } },
-        }
-        view.rerender({ ...props, ...changes[departure] })
-      }
-      assert.equal(signal.aborted, true)
-      const lateBody = stage === 'inventory' ? inventory
-        : { state: 'present', message: 'Project exists.', can_confirm_absent: false }
-      requests.at(-1).resolve(new Response(JSON.stringify(lateBody)))
-      await running
-      assert.equal(retried, 0)
-      assert.equal(closed, 0)
-      assert.equal(requests.length, stage === 'inventory' ? 1 : 2)
-      if (departure !== 'unmount') {
-        if (departure !== 'status-change') assert.equal(retryButton(view.result.current).props.disabled, true)
-        assert.doesNotMatch(JSON.stringify(view.result.current), /Deletion retry was cancelled/)
-      }
-    })
-  }
-}

@@ -5,7 +5,7 @@
    shows on the overview row immediately. */
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { BASE } from '../../../api/client.js'
+import { BASE, getAuthHeaders } from '../../../api/client.js'
 
 import {
   IdentityRequestError,
@@ -22,15 +22,12 @@ const AVATAR_KEY = [...IDENTITY_KEY, 'avatar']
 // loaded it; focus and Try again still force a fresh read.
 export const IDENTITY_STALE_MS = 30_000
 
-export async function identityRequest(token, path = '', options = {}) {
+export async function identityRequest(path = '', options = {}) {
   let response
   try {
     response = await fetch(`${BASE}${path.startsWith('/api/') ? path : `/api/identity${path}`}`, {
       ...options,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        ...(options.headers || {}),
-      },
+      headers: getAuthHeaders(options.headers),
     })
   } catch (error) {
     if (error?.name === 'AbortError') throw error
@@ -65,52 +62,22 @@ export async function identityRequest(token, path = '', options = {}) {
   return body
 }
 
-/** An ambiguous deletion is not permission to repeat a destructive request. */
-export async function retryDeploymentDeletion(token, instance, retry, { signal } = {}) {
-  const assertActive = () => {
-    if (signal?.aborted) throw new DOMException('Deletion retry was cancelled.', 'AbortError')
-  }
-  assertActive()
-  const { id } = instance
-  const inventory = await identityRequest(token, '/railway', { signal })
-  assertActive()
-  const current = inventory.instances.find(instance => instance.id === id)
-  if (
-    inventory.connection?.connected !== true
-    || current?.status.toLowerCase() !== 'delete_failed'
-    || current.actions.retry !== true
-    || !instance.railway_url
-    || current.railway_url !== instance.railway_url
-  ) {
-    throw new IdentityRequestError('Check Railway first. This deployment is no longer eligible for deletion retry.')
-  }
-  const diagnosis = await identityRequest(token, `/railway/deployments/${id}/deletion`, { signal })
-  assertActive()
-  if (diagnosis.state !== 'present') {
-    throw new IdentityRequestError('Check Railway first. Möbius could not confirm that the same project still exists; deletion was not retried.')
-  }
-  // The account service still owns atomic project identity/eligibility checks
-  // at mutation time. These fresh reads contain the UI's stale retry intent.
-  assertActive()
-  return retry(id)
-}
-
 /** Read the shared identity, reusing a fresh cached copy or an in-flight read. */
-export function loadIdentity(queryClient, token, { force = false } = {}) {
+export function loadIdentity(queryClient, { force = false } = {}) {
   return queryClient.fetchQuery({
     queryKey: IDENTITY_KEY,
-    queryFn: ({ signal }) => identityRequest(token, '', { signal }),
+    queryFn: ({ signal }) => identityRequest('', { signal }),
     staleTime: force ? 0 : IDENTITY_STALE_MS,
   })
 }
 
 /** A confirmed unlink invalidates linked details even if its next read fails. */
-export async function disconnectIdentity(queryClient, token) {
-  await identityRequest(token, '/link', { method: 'DELETE' })
-  await queryClient.cancelQueries({ queryKey: IDENTITY_KEY })
+export async function disconnectIdentity(queryClient) {
+  await identityRequest('/link', { method: 'DELETE' })
   queryClient.removeQueries({ queryKey: AVATAR_KEY })
-  // Leave the cache absent until the backend supplies its full local identity,
-  // including the current deployment. Do not invent a signed-out payload.
+  // Resetting cancels a read that began before the unlink and leaves the cache
+  // absent until the backend supplies its full local identity, including the
+  // current deployment. Do not invent a signed-out payload.
   void queryClient.resetQueries({ queryKey: IDENTITY_KEY, exact: true }).catch(() => {})
 }
 
@@ -121,18 +88,18 @@ export function publishIdentity(queryClient, next, { avatarChanged = false } = {
   if (avatarChanged) queryClient.removeQueries({ queryKey: AVATAR_KEY })
 }
 
-export function useIdentityQuery(token, { enabled = true } = {}) {
+export function useIdentityQuery({ enabled = true } = {}) {
   return useQuery({
     queryKey: IDENTITY_KEY,
-    queryFn: ({ signal }) => identityRequest(token, '', { signal }),
+    queryFn: ({ signal }) => identityRequest('', { signal }),
     staleTime: IDENTITY_STALE_MS,
     enabled,
   })
 }
 
-export async function fetchAvatarBlob(token, signal) {
+async function fetchAvatarBlob(signal) {
   const response = await fetch(`${BASE}/api/identity/avatar`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: getAuthHeaders(),
     signal,
   })
   if (!response.ok) throw new Error('Profile photo is unavailable.')
@@ -142,10 +109,10 @@ export async function fetchAvatarBlob(token, signal) {
 }
 
 /** Object URL for the owner's protected profile photo, or '' to show initials. */
-export function useAvatarSource(avatarUrl, token) {
+export function useAvatarSource(avatarUrl) {
   const { data: blob } = useQuery({
     queryKey: [...AVATAR_KEY, avatarUrl],
-    queryFn: ({ signal }) => fetchAvatarBlob(token, signal),
+    queryFn: ({ signal }) => fetchAvatarBlob(signal),
     enabled: Boolean(avatarUrl),
     staleTime: Infinity,
     retry: false,

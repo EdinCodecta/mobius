@@ -33,7 +33,6 @@
 .settings__account-link-copy { display: grid; gap: 3px; min-width: 0; flex: 1; }
 .settings__account-link-copy strong { font-weight: 500; font-size: 14px; }
 .settings__account-link-copy small { color: var(--muted); font-size: 13px; }
-.settings__account-link-status { color: var(--muted); font-size: 12px; }
 .settings__account-link-arrow { color: var(--muted); font-size: 23px; line-height: 1; }
 .settings__account-link[aria-expanded="true"] .settings__account-link-arrow { transform: rotate(90deg); }
 .settings__account-detail {
@@ -237,14 +236,6 @@
   min-width: 0;
 }
 
-.settings__appearance {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 18px;
-}
-
 .settings__appearance-toggle {
   flex-shrink: 0;
   box-sizing: border-box;
@@ -290,39 +281,12 @@
   cursor: wait;
 }
 
-/* The chat model is informational, not a live status. Keep it in the normal
-   secondary-text color and weight so the model name does not read like a
-   link, warning, or selected action. */
-.settings__last-model {
-  color: var(--muted);
-  font-weight: 400;
-}
-
-.settings__standard-highlight {
-  color: var(--green);
-  font-weight: inherit;
-}
-
 /* Provider rows + .settings__providers wrapper styles live in
    ../ProviderAuth/ProviderAuth.css since the component is shared
    between SettingsView and SetupWizard. */
 
-.settings-agent-group {
-  margin-top: 14px;
-  padding-top: 14px;
-  border-top: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  scroll-margin-top: 24px;
-}
-
-.settings-agent-group--disabled {
-  opacity: 0.56;
-}
-
 .settings__section:focus,
-.settings-agent-group:focus,
+.settings-bg-list:focus,
 .settings-github:focus {
   outline: none;
 }
@@ -331,25 +295,6 @@
   outline: 2px solid color-mix(in srgb, var(--accent) 72%, transparent);
   outline-offset: 4px;
   transition: outline-color 0.18s ease, outline-offset 0.18s ease;
-}
-
-.settings-agent-group__head {
-  display: block;
-}
-
-.settings-agent-group__title-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.settings__agent-title {
-  margin: 0 0 4px;
-  font-size: 15px;
-  font-weight: 650;
-  letter-spacing: 0;
-  color: var(--text);
 }
 
 .settings__btn--nowrap { white-space: nowrap; }

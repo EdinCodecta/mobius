@@ -23,37 +23,33 @@ for (const page of ['account', 'provider']) {
         scrollIntoView() { assert.equal(mounted, true); scrolled.push(section) },
         focus() { assert.equal(mounted, true); focused.push(section) },
       }
-      let selectedProvider = null
-      let mobiusAccountOpen = false
+      let detailPage = null
       let models = null
-      const setSelectedProvider = next => { selectedProvider = next }
-      const setMobiusAccountOpen = next => { mobiusAccountOpen = next }
+      const setDetailPage = next => { detailPage = next }
       const setManageModelsProvider = next => { models = next }
       const setAttentionSection = () => {}
       const view = renderHook(({ focusTarget }) => {
         const setupFocusRefs = useRef({})
         // React commits the updated page after the navigation effect's setters.
-        mounted = !selectedProvider && !mobiusAccountOpen
+        mounted = !detailPage
         setupFocusRefs.current = mounted ? { github: node, 'ai-providers': node } : {}
-        useSettingsFocus({ focusTarget, providerReady: true,
-          selectedProvider, mobiusAccountOpen, setSelectedProvider, setMobiusAccountOpen,
+        useSettingsFocus({ focusTarget, providerReady: true, detailPage, setDetailPage,
           setManageModelsProvider, setupFocusRefs, setAttentionSection })
       }, { focusTarget: null })
       t.after(() => view.unmount())
-      if (page === 'account') mobiusAccountOpen = true; else selectedProvider = 'codex'
+      detailPage = page === 'account' ? 'account' : 'codex'
       view.rerender({ focusTarget: null })
       assert.equal(mounted, false)
       const focusTarget = { section, nonce: 1 }
       view.rerender({ focusTarget })
-      assert.equal(selectedProvider, null)
-      assert.equal(mobiusAccountOpen, false)
+      assert.equal(detailPage, null)
       view.rerender({ focusTarget })
       for (const [id, fn] of frames) { frames.delete(id); fn() }
       assert.deepEqual(focused, [section])
       assert.deepEqual(scrolled, [section])
       if (section === 'models') assert.equal(models, 'all')
       // A consumed request cannot reopen the overview when the owner opens detail.
-      if (page === 'account') mobiusAccountOpen = true; else selectedProvider = 'codex'
+      detailPage = page === 'account' ? 'account' : 'codex'
       view.rerender({ focusTarget })
       assert.equal(mounted, false)
     })

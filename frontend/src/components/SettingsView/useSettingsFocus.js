@@ -1,24 +1,20 @@
 import { useEffect, useRef } from 'react'
 
-/** Navigate an explicit Settings request out of any retained detail page. */
+/** Navigate an explicit Settings request out of any open detail page. */
 export function useSettingsFocus({
-  focusTarget, providerReady, selectedProvider, mobiusAccountOpen,
-  setSelectedProvider, setMobiusAccountOpen, setManageModelsProvider,
-  setupFocusRefs, setAttentionSection,
+  focusTarget, providerReady, detailPage, setDetailPage,
+  setManageModelsProvider, setupFocusRefs, setAttentionSection,
 }) {
   const handled = useRef(null)
   useEffect(() => {
     if (!focusTarget?.section) return
-    setSelectedProvider(null)
-    setMobiusAccountOpen(false)
+    setDetailPage(null)
     if (focusTarget.section === 'models') setManageModelsProvider('all')
-  }, [focusTarget, setSelectedProvider, setMobiusAccountOpen, setManageModelsProvider])
+  }, [focusTarget, setDetailPage, setManageModelsProvider])
 
   useEffect(() => {
     const requested = focusTarget?.section
-    if (!requested || selectedProvider || mobiusAccountOpen || handled.current === focusTarget) {
-      return undefined
-    }
+    if (!requested || detailPage || handled.current === focusTarget) return undefined
     const section = requested === 'models' ? 'ai-providers' : requested
     let clearTimer = null
     const raf = requestAnimationFrame(() => {
@@ -36,6 +32,5 @@ export function useSettingsFocus({
       cancelAnimationFrame(raf)
       if (clearTimer) clearTimeout(clearTimer)
     }
-  }, [focusTarget, providerReady, selectedProvider, mobiusAccountOpen,
-    setupFocusRefs, setAttentionSection])
+  }, [focusTarget, providerReady, detailPage, setupFocusRefs, setAttentionSection])
 }

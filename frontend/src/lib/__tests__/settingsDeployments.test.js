@@ -19,7 +19,7 @@ function renderDeployments(t, items, instances) {
   const deletions = []
   const recoveries = []
   const view = renderHook(() => Deployments({
-    token: 'fixture-token', items,
+    items,
     railway: { railway_access: 'available', connection: { connected: true }, instances },
     selfHosted: true, onDelete: target => deletions.push(target),
     onManage: (target, section) => recoveries.push([target, section]),

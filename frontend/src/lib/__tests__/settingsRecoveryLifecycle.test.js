@@ -29,7 +29,7 @@ function setup(t, blocked = false) {
     calls.push({ url, options })
     return calls.length === 1 ? post.promise : status.promise
   })
-  const view = renderHook(props => RecoverySection(props), { token: 'mock-token', instance: { id: 'dep-example' } })
+  const view = renderHook(props => RecoverySection(props), { instance: { id: 'dep-example' } })
   t.after(() => view.unmount())
   const start = () => view.result.current.props.children[0].props.onClick()
   return { view, start, post, status, calls, opens, timers, navigations, popup, get closes() { return closes } }
@@ -93,23 +93,18 @@ test('recovery reserves on the click and navigates only that popup when ready', 
   assert.equal(s.timers.size, 0)
 })
 
-for (const props of [
-  { token: 'replacement-token', instance: { id: 'dep-example' } },
-  { token: 'mock-token', instance: { id: 'other-deployment' } },
-]) {
-  test(`changing ${props.token === 'mock-token' ? 'deployment' : 'token'} retires the old recovery session`, async t => {
-    const s = setup(t)
-    const running = s.start()
-    s.view.rerender(props)
-    s.post.resolve(response({}))
-    await running
-    await flush()
-    assert.equal(s.calls.length, 1)
-    assert.equal(s.calls[0].options.signal?.aborted, true)
-    assert.equal(s.closes, 1)
-    assert.equal(s.timers.size, 0)
-  })
-}
+test('changing deployment retires the old recovery session', async t => {
+  const s = setup(t)
+  const running = s.start()
+  s.view.rerender({ instance: { id: 'other-deployment' } })
+  s.post.resolve(response({}))
+  await running
+  await flush()
+  assert.equal(s.calls.length, 1)
+  assert.equal(s.calls[0].options.signal?.aborted, true)
+  assert.equal(s.closes, 1)
+  assert.equal(s.timers.size, 0)
+})
 
 test('starting recovery arms one timer and unmount clears it and its reservation', async t => {
   const s = setup(t)

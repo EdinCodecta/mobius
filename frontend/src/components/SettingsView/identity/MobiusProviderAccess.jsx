@@ -18,7 +18,7 @@ function accessStatus(access, error) {
   return access.balance.available_units > 0 || access.trial.state === 'ready' ? 'Available' : 'No credit'
 }
 
-export default function MobiusProviderAccess({ token, onVisibilityChange }) {
+export default function MobiusProviderAccess({ onVisibilityChange }) {
   const [access, setAccess] = useState(null)
   const [accessError, setAccessError] = useState('')
   const [accessBusy, setAccessBusy] = useState(false)
@@ -29,21 +29,21 @@ export default function MobiusProviderAccess({ token, onVisibilityChange }) {
   const loadAccess = useCallback(async () => {
     setAccessError('')
     try {
-      setAccess(await identityRequest(token, '/agent'))
+      setAccess(await identityRequest('/agent'))
     } catch (error) {
       setAccessError(error.message)
     }
-  }, [token])
+  }, [])
 
   const loadVisibility = useCallback(async () => {
     setVisibilityError('')
     try {
-      const result = await identityRequest(token, '/api/auth/providers/mobius/enabled')
+      const result = await identityRequest('/api/auth/providers/mobius/enabled')
       setVisible(result.enabled)
     } catch (error) {
       setVisibilityError(error.message)
     }
-  }, [token])
+  }, [])
 
   useEffect(() => { void loadAccess(); void loadVisibility() }, [loadAccess, loadVisibility])
 
@@ -52,7 +52,7 @@ export default function MobiusProviderAccess({ token, onVisibilityChange }) {
     setVisibilityBusy(true)
     setVisibilityError('')
     try {
-      const result = await identityRequest(token, '/api/auth/providers/mobius/enabled', {
+      const result = await identityRequest('/api/auth/providers/mobius/enabled', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled: next }),
@@ -71,7 +71,7 @@ export default function MobiusProviderAccess({ token, onVisibilityChange }) {
     setAccessBusy(true)
     setAccessError('')
     try {
-      setAccess(await identityRequest(token, '/agent/trial', { method: 'POST' }))
+      setAccess(await identityRequest('/agent/trial', { method: 'POST' }))
     } catch (error) {
       setAccessError(error.code === 'trial_fund_exhausted'
         ? 'Trial capacity is unavailable right now. Your account is still ready.'
