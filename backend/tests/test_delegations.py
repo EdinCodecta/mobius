@@ -1862,7 +1862,7 @@ def test_nested_goal_parent_wake_keeps_foreign_goal_scoped_not_admitted(
 @pytest.mark.parametrize("boundary", [
   "stopped", "closed", "missing-goal", "foreign-assignment",
 ])
-def test_nested_goal_parent_wake_rejects_unowned_or_closed_work(db, boundary):
+def test_nested_goal_parent_wake_refuses_closed_work_and_never_binds_unowned_goals(db, boundary):
   from app.chat_writer import StartActivityContinuation, StartContinuationBlocked
 
   suffix = f"nested-boundary-{boundary}"
@@ -1885,13 +1885,20 @@ def test_nested_goal_parent_wake_rejects_unowned_or_closed_work(db, boundary):
     chat_id=parent_id, run_token=token, root_run_id=root,
     source_work_id=goal_id, activity_id=delegation_id,
   )).result(timeout=5)
-  assert result == StartContinuationBlocked({
-    "stopped": "parent_not_waiting", "closed": "goal_closed",
-    "missing-goal": "goal_missing",
-    "foreign-assignment": "foreign_goal_not_assigned",
-  }[boundary])
+  if boundary in ("stopped", "closed"):
+    # The shared wake gate refuses these, so the owner's waiting view agrees.
+    assert result == StartContinuationBlocked({
+      "stopped": "parent_not_waiting", "closed": "goal_closed",
+    }[boundary])
+    db.expire_all()
+    assert db.get(models.ChatRun, token) is None
+    return
+  # A Goal that is gone or not this chain's never binds, but the result still
+  # reaches its parent: refusing here would strand a chat shown as waiting.
+  assert isinstance(result, dict)
   db.expire_all()
-  assert db.get(models.ChatRun, token) is None
+  run = db.get(models.ChatRun, token)
+  assert (run.status, run.goal_id, run.goal_objective) == ("running", None, None)
 
 
 def test_successful_finalize_consumes_exact_activity_once(db):

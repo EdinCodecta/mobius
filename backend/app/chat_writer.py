@@ -4159,19 +4159,6 @@ class ChatWriterActor:
       db.rollback()
       return StartContinuationBlocked(blocker)
     goal_id = delegation_goal_id(db, trigger)
-    goal = db.get(models.ChatGoal, goal_id) if goal_id else None
-    # App- and source-owned work is not Goal work (goal_assignment's own
-    # rule): it proceeds without binding a Goal instead of being stranded.
-    goal_work = trigger.app_id is None and trigger.source_work_id is None
-    if goal_id is not None and goal is None and goal_work:
-      db.rollback()
-      return StartContinuationBlocked("goal_missing")
-    if goal is not None and goal.chat_id != cmd.chat_id and goal_work:
-      from app.goal_plans import goal_assignment
-      assignment = goal_assignment(db, cmd.chat_id)
-      if assignment is None or assignment.goal.id != goal.id:
-        db.rollback()
-        return StartContinuationBlocked("foreign_goal_not_assigned")
     # A nested helper works in its coordinator's Goal, but this physical run
     # belongs to the helper chat: bind only an open Goal this chat owns. The
     # shared Goal stays in the activity source and the assignment chain.
