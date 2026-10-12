@@ -925,6 +925,11 @@ test('chat drawer indicators distinguish owner input, active work, waiting, and 
     /ev\.type === 'chat_run_finished'[\s\S]*?invalidateChatChangesQueries\(queryClient, chatId\)/,
     'completion must refresh Changes even when its local card missed the active-to-idle transition',
   )
+  assert.match(
+    shell.slice(shell.indexOf("ev.type === 'chat_run_finished'"), shell.indexOf("ev.type === 'delegation_changed'")),
+    /projectChatLookup[\s\S]*?dispatchEvent\(new CustomEvent\('mobius:project-change'/,
+    'a project agent run completion must refresh an open project file without waiting for its backed-off cursor poll',
+  )
   assert.doesNotMatch(
     shell.slice(shell.indexOf("ev.type === 'chat_run_finished'"), shell.indexOf("ev.type === 'delegation_changed'")),
     /markChatOwnerInput\(chatId, \{ kind: null, questionId: null \}\)/,

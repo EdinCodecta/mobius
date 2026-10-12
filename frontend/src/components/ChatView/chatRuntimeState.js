@@ -337,6 +337,24 @@ export function shouldRepairRuntimeStream({
   return connectionError !== 'retrying'
 }
 
+/**
+ * Whether the chat stream is demonstrably delivering: it already carries run,
+ * question, steer, and queue-promotion events, so the active-turn runtime read
+ * can drop to a slow safety cadence. "Demonstrably" means a body read
+ * (keepalives included) within one server keepalive (30 s) plus grace. A
+ * half-open socket can stay `isStreaming` with no error indefinitely, and then
+ * the fast runtime read is its only recovery.
+ */
+export const RUNTIME_SAFETY_POLL_MS = 15_000
+export const RUNTIME_STREAM_FRESH_MS = 35_000
+
+export function runtimeStreamDelivering({
+  isStreaming, connectionError, lastReadAt, now = Date.now(),
+}) {
+  return Boolean(isStreaming && !connectionError && lastReadAt > 0
+    && now - lastReadAt < RUNTIME_STREAM_FRESH_MS)
+}
+
 export function runtimeSnapshot(value = {}) {
   const revision = value.runtime_revision ?? value.runtimeRevision
   if (!Number.isSafeInteger(revision) || revision < 0) return null

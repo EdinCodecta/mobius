@@ -9,7 +9,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
@@ -997,9 +997,10 @@ def mark_chat_failure_seen(
   return Response(status_code=204)
 
 
-# Chats whose titles are searchable but whose message text is not yet: the
-# previous release wrote them and they are not converted. Additive to the
-# result list, which stays the response body.
+# Drawer chats whose titles are searchable but whose message text is not yet:
+# the previous release wrote them and they await conversion
+# (chat_search.unindexed_chat_count). Additive to the result list, which stays
+# the response body.
 SEARCH_UNINDEXED_HEADER = "X-Search-Unindexed-Chats"
 
 
@@ -1020,7 +1021,7 @@ def search_chats(
   mark matches with private-use sentinels U+E000/U+E001; the drawer converts
   them to highlight marks.
   """
-  response.headers[SEARCH_UNINDEXED_HEADER] = str(transcript_rows.unconverted_count(db))
+  response.headers[SEARCH_UNINDEXED_HEADER] = str(chat_search.unindexed_chat_count(db))
   query = q.strip()
   if not query:
     return []
@@ -2941,6 +2942,15 @@ async def compact_chat(
   tagged so ``patch_chat`` accepts it exactly once as the handoff proof. New
   provider switches use the atomic ``/provider-switch`` route.
   """
+  if body is not None and body.recovery_id is not None and body.batch_id is None:
+    raise HTTPException(422, "Continue compaction requires a new batch request identity.")
+  if body is not None and body.batch_id is not None:
+    from app.manual_compaction import compact_batch
+    from app.compaction import CompactionError
+    try:
+      return await compact_batch(chat_id, body, db)
+    except CompactionError as exc:
+      raise HTTPException(422, str(exc)) from exc
   from app.chat_queue import get_transition_lock
   from app.chat_continuity import note_path, recovery_source
   from app.chat_notes import extract_full_digest
@@ -3032,6 +3042,35 @@ async def compact_chat(
         "command": f"POST /api/chats/{chat_id}/compact",
         "stored": result.get("stored"),
       }
+
+
+@router.get("/{chat_id}/compact-progress")
+def get_compaction_progress(
+  chat_id: str,
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+  db: Session = Depends(get_db),
+):
+  """Read saved manual preparation; observing it never starts provider work."""
+  from app.manual_compaction import latest_progress
+  return {"progress": latest_progress(db, get_active_chat_or_404(db, chat_id))}
+
+
+@router.post("/{chat_id}/compact-stop", dependencies=[Depends(reject_cross_site)])
+async def stop_manual_compaction(
+  chat_id: str,
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+  db: Session = Depends(get_db),
+):
+  """Cancel context preparation only, leaving queued input and session intact."""
+  from app.runner_registry import RunnerKind, registry
+  get_active_chat_or_404(db, chat_id)
+  db.close()
+  handle = registry.get_handle(chat_id, RunnerKind.COMPACTION)
+  if handle is not None:
+    registry.bump_generation(chat_id)
+    if not await handle.stop():
+      raise HTTPException(503, "Preparation is still stopping; no new batch was started.")
+  return {"ok": True}
 
 
 # An app that opens a chat ABOUT one of its dated reports passes the report's

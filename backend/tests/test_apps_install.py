@@ -13,13 +13,16 @@ from datetime import UTC, datetime
 import hashlib
 import io
 import json
+import logging
 import os
 import shlex
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch, AsyncMock, MagicMock
 from urllib.parse import urlparse
 
+import httpx
 import pytest
 
 from app import app_apply, app_git, install, models, transcript_rows
@@ -1121,8 +1124,8 @@ def test_git_clone_timeout_reads_as_a_timeout_not_a_missing_source(
   with patch(
     "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
   ), patch(
-    "app.install.app_git.clone_upstream",
-    side_effect=app_git.GitTransferTimeout("it ran longer than 30 seconds"),
+    "app.install.app_git.stage_clone",
+    side_effect=app_git.GitTransferTimeout("it ran longer than 600 seconds"),
   ):
     failed = client.post("/api/apps/install", headers=auth, json={
       "manifest_url": base + "mobius.json",
@@ -1130,7 +1133,7 @@ def test_git_clone_timeout_reads_as_a_timeout_not_a_missing_source(
   assert failed.status_code == 409, failed.text
   detail = failed.json()["detail"]
   assert detail["code"] == "git_transfer_timeout"
-  assert "timed out: it ran longer than 30 seconds" in detail["message"]
+  assert "timed out: it ran longer than 600 seconds" in detail["message"]
   assert "Nothing was installed." in detail["message"]
   assert db.query(models.App).filter_by(slug="slow-git").first() is None
 
@@ -1151,13 +1154,14 @@ def test_known_git_origin_clone_failure_rolls_back_instead_of_importing_http(
   with patch(
     "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
   ), patch(
-    "app.install.app_git.clone_upstream", side_effect=RuntimeError("offline"),
+    "app.install.app_git.stage_clone", side_effect=RuntimeError("offline"),
   ):
     failed = client.post("/api/apps/install", headers=auth, json={
       "manifest_url": base + "mobius.json",
     })
   assert failed.status_code == 409, failed.text
   assert failed.json()["detail"]["code"] == "git_install_unavailable"
+  assert failed.json()["detail"]["retryable"] is True
   assert db.query(models.App).filter_by(slug="required-git").first() is None
   source_dir = Path(get_settings().data_dir) / "apps" / "required-git"
   assert not source_dir.exists()
@@ -1202,8 +1206,81 @@ def test_fresh_clone_cannot_replace_owner_reviewed_source(
     })
   assert response.status_code == 409, response.text
   assert response.json()["detail"]["code"] == "git_source_mismatch"
+  assert response.json()["detail"]["retryable"] is True
   assert db.query(models.App).filter_by(slug="reviewed").first() is None
   assert not (Path(get_settings().data_dir) / "apps" / "reviewed").exists()
+
+
+def test_cancelled_install_rolls_back_only_after_its_git_worker_exits(
+  db, tmp_path, monkeypatch, bypass_url_validation, caplog,
+):
+  from app import install
+
+  _, bare, commit = _make_clone_fixture(tmp_path, JSX, "export const cards = []")
+  base = "https://raw.githubusercontent.com/acme/cancelled/main/"
+  manifest = {
+    "id": "cancelled", "name": "Cancelled", "version": "1.0.0",
+    "description": "Cancelled mid-install", "entry": "index.jsx",
+  }
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  source_dir = Path(get_settings().data_dir) / "apps" / "cancelled"
+  monkeypatch.setattr(
+    install.httpx, "AsyncClient", MagicMock(side_effect=_fake_async_client(responses)),
+  )
+  monkeypatch.setattr(install, "_derive_repo_ref", lambda url: (bare.as_uri(), commit))
+
+  async def cancelled_install():
+    staged = await install.stage_package_clone(base + "mobius.json")
+    try:
+      await install.install_from_manifest(
+        db, manifest_url=base + "mobius.json", manifest=None, raw_base=None,
+        staged_clone=staged,
+      )
+    finally:
+      install.discard_staged(staged)
+
+  def unverifiable():
+    raise RuntimeError("Git package is missing declared source cards.js")
+
+  caplog.set_level(logging.INFO, logger="mobius.install")
+  _assert_cancellation_drains_worker_under_lock(
+    source_dir, cancelled_install, monkeypatch,
+    install, "_verify_git_install_candidate",
+    while_blocked=lambda: source_dir.is_dir(), then=unverifiable,
+  )
+  db.expire_all()
+  assert db.query(models.App).filter_by(slug="cancelled").first() is None
+  assert not source_dir.exists()
+  # The pass's own refusal is not lost behind the caller's cancellation, but
+  # an expected, rolled-back refusal is not reported as an error either.
+  assert "refused after its caller was cancelled" in caplog.text
+  assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def test_cancelled_caller_logs_an_unexpected_failure_of_settling_work(caplog):
+  async def run():
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    async def failing_work():
+      started.set()
+      await finish.wait()
+      raise RuntimeError("unexpected")
+
+    task = asyncio.create_task(install._settle_before_cancel(failing_work()))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+
+  asyncio.run(run())
+  assert [record.levelno for record in caplog.records] == [logging.ERROR]
+  assert "failed after its caller was cancelled" in caplog.text
+
 
 def test_update_dropping_schedule_unregisters_orphan_cron(
     client, auth, bypass_url_validation):
@@ -2462,7 +2539,9 @@ def test_trusted_origin_first_adoption_conflict_resolves_and_finalizes(
 
   # Identity remains the canonical catalog URL while the local bare remote
   # supplies the exact Git commit without external network access.
-  with patch(
+  with _serve_github_from(
+    origin_bare, "https://github.com/mobius-os/app-trusted-adoption.git",
+  ), patch(
     "app.install.httpx.AsyncClient",
     side_effect=_fake_async_client(responses),
   ), patch(
@@ -2723,7 +2802,7 @@ def test_trusted_origin_adoption_accepts_equal_tree_with_unrelated_history(
     manifest_url: (200, json.dumps(manifest).encode()),
     raw_base + "index.jsx": (200, JSX.encode()),
   }
-  with patch(
+  with _serve_github_from(bare, expected_origin), patch(
     "app.install.httpx.AsyncClient",
     side_effect=_fake_async_client(responses),
   ), patch(
@@ -3247,6 +3326,20 @@ def test_git_conflicting_update_leaves_source_unchanged_until_resolve(
   assert update.status_code == 200, update.text
   assert update.json()["update_available"] is True
   assert update.json()["pending_update_state"] == "needs_resolution"
+
+  # The pre-install review reports the same pending state, so the Store can
+  # block the install instead of re-entering the resolver.
+  def preview_state():
+    with _git_update_source(
+      _git_candidate({**m, "version": "2.0.0"}, jsx_v2),
+    ):
+      preview = client.get(
+        f"/api/apps/{payload['id']}/update-candidate-preview", headers=auth,
+      )
+    assert preview.status_code == 200, preview.text
+    return preview.json()["pending_update_state"]
+
+  assert preview_state() == "needs_resolution"
   assert update.json()["needs_resolution"] is True
   assert update.json()["upstream_version"] == "2.0.0"
   bypass = client.patch(
@@ -3289,6 +3382,7 @@ def test_git_conflicting_update_leaves_source_unchanged_until_resolve(
     f"/api/apps/{payload['id']}/update-check", headers=auth,
   )
   assert resolved_update.json()["pending_update_state"] == "replay_pending"
+  assert preview_state() == "replay_pending"
   redundant_resolver = client.post(
     f"/api/apps/{payload['id']}/conflict-resolver-chat", headers=auth,
   )
@@ -4341,6 +4435,169 @@ def test_conflict_resolver_batch_cannot_deadlock_contribute_publication(
   asyncio.run(run_competing_operations())
 
 
+def _assert_cancellation_drains_worker_under_lock(
+  source_dir, operation, monkeypatch, target, attr, *,
+  while_blocked=lambda: True, then=lambda: None,
+):
+  """A lock-held disk mutation must finish before cancellation frees the lock.
+
+  Cancelling an ``asyncio.to_thread`` await does not stop its thread, so a
+  caller that unwinds at once releases the source lock while Git still writes.
+  ``while_blocked`` checks state the cancelled caller must not yet undo;
+  ``then`` is the worker's own outcome once released.
+  """
+  import threading
+  from app import fs_locks
+
+  entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+
+  def blocked(*args):
+    entered.set()
+    try:
+      assert release.wait(10)
+      return then()
+    finally:
+      exited.set()
+
+  monkeypatch.setattr(target, attr, blocked)
+
+  async def run():
+    lock = fs_locks.source_dir_lock(str(Path(source_dir).resolve()))
+    task = asyncio.create_task(operation())
+    try:
+      assert await asyncio.to_thread(entered.wait, 5)
+      for _ in range(2):
+        task.cancel()
+        await asyncio.sleep(.02)
+        assert not task.done() and not exited.is_set()
+        assert lock.locked(), "source lock released while its worker still ran"
+        assert while_blocked(), "cancelled caller undid state under its worker"
+    finally:
+      release.set()
+      outcome = await asyncio.gather(task, return_exceptions=True)
+    assert exited.is_set() and not lock.locked()
+    assert isinstance(outcome[0], asyncio.CancelledError), repr(outcome)
+
+  asyncio.run(run())
+
+
+@pytest.mark.parametrize("step", ["_validate_pending_update", "_park_pending_update"])
+def test_cancelled_resolver_batch_drains_worker_before_releasing_source(
+  db, tmp_path, monkeypatch, step,
+):
+  from app.routes import apps as routes
+
+  repo = tmp_path / "app"
+  repo.mkdir()
+  app = models.App(
+    name="Cancellation probe", slug="cancellation-probe",
+    source_dir=str(repo), upstream_commit="upstream",
+  )
+  db.add(app)
+  db.commit()
+
+  async def history_complete(source_dir):
+    return None
+
+  monkeypatch.setattr(routes, "_complete_history", history_complete)
+  monkeypatch.setattr(routes.app_git, "is_repo", lambda repo: True)
+  monkeypatch.setattr(routes, "_pending_store_update_receipt", lambda *args: {})
+  monkeypatch.setattr(
+    routes, "_validate_pending_update",
+    lambda *args: routes._PendingUpdatePlan(conflict_paths=["index.jsx"]),
+  )
+  monkeypatch.setattr(routes, "_upstream_version", lambda *args: "2")
+  monkeypatch.setattr(routes, "_park_pending_update", lambda *args: [])
+  _assert_cancellation_drains_worker_under_lock(
+    repo, lambda: routes._create_conflict_resolver_chat(db, [app.id]),
+    monkeypatch, routes, step,
+  )
+
+
+def test_cancelled_resolver_finish_drains_merge_commit_before_releasing_source(
+  db, tmp_path, monkeypatch,
+):
+  from app import schemas
+  from app.routes import apps as routes
+
+  repo = tmp_path / "finish"
+  receipt_file = install.pending_update_receipt_file(repo)
+  receipt_file.parent.mkdir(parents=True)
+  receipt_file.write_text("pending")
+  app = models.App(
+    name="Finish probe", slug="finish-probe",
+    source_dir=str(repo), upstream_commit="upstream",
+  )
+  db.add(app)
+  db.commit()
+  monkeypatch.setattr(routes, "_validate_source_dir", lambda *args: str(repo))
+  monkeypatch.setattr(routes, "_pending_store_update_app", lambda *args, **kwargs: app)
+  monkeypatch.setattr(
+    routes, "_pending_store_update_receipt",
+    lambda *args: {"upstream_commit": "upstream"},
+  )
+  _assert_cancellation_drains_worker_under_lock(
+    repo,
+    lambda: routes.resolve_app_update(
+      schemas.AppResolveUpdate(source_dir=str(repo)), db, None,
+    ),
+    monkeypatch, routes, "_require_pending_resolution",
+  )
+
+
+def test_cancelled_pending_cleanup_drains_worktree_removal_before_releasing_source(
+  db, tmp_path, monkeypatch,
+):
+  from app import fs_locks
+
+  repo = tmp_path / "cleanup"
+  receipt_file = install.pending_update_receipt_file(repo)
+  receipt_file.parent.mkdir(parents=True)
+  receipt_file.write_text("pending")
+  app = models.App(
+    name="Cleanup probe", slug="cleanup-probe",
+    source_dir=str(repo), upstream_commit="upstream",
+    conflict_resolver_upstream_commit="upstream",
+  )
+  db.add(app)
+  db.commit()
+
+  async def cleanup():
+    async with fs_locks.source_dir_lock(str(repo.resolve())):
+      await install.clear_pending_conflict_update(db, app)
+
+  _assert_cancellation_drains_worker_under_lock(
+    repo, cleanup, monkeypatch, install, "_drop_pending_update_worktree",
+  )
+  assert not receipt_file.exists()
+  assert app.conflict_resolver_upstream_commit is None
+
+
+def test_incomplete_history_tells_the_owner_why(tmp_path, monkeypatch):
+  from fastapi import HTTPException
+  from app.routes import apps as routes
+
+  monkeypatch.setattr(routes.app_git, "merge_in_progress", lambda repo: False)
+  monkeypatch.setattr(install, "pending_update_resolved", lambda *args: False)
+  monkeypatch.setattr(install, "pending_update_worktree", lambda repo: tmp_path / "none")
+
+  def hidden_base(repo):
+    raise app_git.HistoryIncomplete(
+      "the app's Git history is incomplete (no merge base between main and upstream)",
+    )
+
+  monkeypatch.setattr(routes.app_git, "merge_upstream", hidden_base)
+  with pytest.raises(HTTPException) as caught:
+    routes._validate_pending_update(tmp_path, {"upstream_commit": "upstream"})
+  assert caught.value.detail == {
+    "code": "git_update_unavailable",
+    "message": "The app's Git history is incomplete, so the update can't be "
+    "merged safely; retry when its source is reachable. The installed version "
+    "was left unchanged.",
+    "retryable": True,
+  }
+
+
 def test_conflict_resolver_batch_deduplicates_and_sorts_canonical_sources(
   db, tmp_path, monkeypatch,
 ):
@@ -4979,10 +5236,7 @@ def test_update_candidate_preview_fetches_incoming_diff_without_mutation(
     base + "prompt.md": (200, b"v2 prompt"),
     base + "fetch.sh": (200, b""),
   }
-  with patch(
-    "app.routes.apps._fetch_update_candidate",
-    return_value=_git_candidate(next_manifest, jsx_v2),
-  ):
+  with _git_update_source(_git_candidate(next_manifest, jsx_v2)):
     preview = client.get(
       f"/api/apps/{app_id}/update-candidate-preview", headers=auth,
     )
@@ -4995,6 +5249,7 @@ def test_update_candidate_preview_fetches_incoming_diff_without_mutation(
   assert "a/index.jsx" in payload["upstream_diff"]
   assert "b/index.jsx" in payload["upstream_diff"]
   assert len(payload["source_digest"]) == 64
+  assert payload["pending_update_state"] == "none"
   assert jsx_file.read_text() == before
 
   changed_after_review = jsx_v2.replace("INCOMING FOOTER", "MOVED AGAIN")
@@ -5039,19 +5294,18 @@ def test_update_candidate_preview_classifies_git_transfer_timeout_without_mutati
   with patch(
     "app.install._derive_repo_ref", return_value=(bare.as_uri(), "main"),
   ), patch(
-    "app.app_git._run_network",
-    side_effect=app_git.GitTransferTimeout("it ran longer than 30 seconds"),
+    "app.app_git._transfer",
+    side_effect=app_git.GitTransferTimeout("it ran longer than 600 seconds"),
   ) as network:
     response = client.get(
       f"/api/apps/{app_id}/update-candidate-preview", headers=auth,
     )
 
   network.assert_called_once()
-  assert network.call_args.args[1] == "fetch"
   assert response.status_code == 409, response.text
   detail = response.json()["detail"]
   assert detail["code"] == "git_transfer_timeout"
-  assert "timed out: it ran longer than 30 seconds" in detail["message"]
+  assert "timed out: it ran longer than 600 seconds" in detail["message"]
   assert "installed version was left unchanged" in detail["message"]
   assert (repo / "index.jsx").read_bytes() == before
   assert app_git.head_sha(repo, app_git.UPSTREAM_BRANCH) == upstream
@@ -5328,9 +5582,47 @@ def test_update_package_paths_uses_declarations_not_metadata():
   assert protected == {
     "mobius.json", "index.jsx", "logo.png", "job.sh", "service.py", "setup.sh",
     "requirements.lock", "prompt.md", "guide/SKILL.md", "guide/notes.md", "local.js",
-    "art/module.js", "static/served.js", "seed-source.json",
+    "art/module.js", "static/", "seed-source.json",
   }
   assert protected.isdisjoint({"README.md", "served.js", "guide/undeclared.md", "seed.json"})
+
+
+def test_served_static_conflict_parks_for_the_resolver(
+  client, auth, tmp_path, bypass_url_validation,
+):
+  """Undeclared files below static/ are served, so they are never kept local."""
+  manifest = _simple_manifest("served-static")
+  base = "https://raw.githubusercontent.com/example/served-static/main/"
+  index = (
+    "fetch('/app-assets/served-static/store/rules.txt').then(r => r.text());"
+    " export default () => <div>rules</div>"
+  )
+  work, bare, _ = _make_clone_fixture(tmp_path, index, CLONE_CARDS_V1)
+  (work / "static/store").mkdir(parents=True)
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps(manifest), "static/store/rules.txt": "BASE_POLICY",
+  })
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, index, CLONE_CARDS_V1, bare,
+  )
+  assert installed.status_code == 201, installed.text
+  source_dir = Path(installed.json()["source_dir"])
+  served = client.get("/app-assets/served-static/store/rules.txt")
+  assert served.status_code == 200 and served.text == "BASE_POLICY"
+  (source_dir / "static/store/rules.txt").write_text("LOCAL_POLICY")
+  _publish_clone_files(work, bare, {
+    "mobius.json": json.dumps({**manifest, "version": "2.0.0"}),
+    "static/store/rules.txt": "UPSTREAM_POLICY",
+  })
+
+  updated = _press_reviewed_update(
+    client, auth, installed.json()["id"], bare, base + "mobius.json",
+  )
+
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["mode"] == "conflict", updated.text
+  assert "static/store/rules.txt" in updated.json()["conflict_paths"]
+  assert client.get("/app-assets/served-static/store/rules.txt").text == "BASE_POLICY"
 
 
 @pytest.mark.parametrize("local", [
@@ -5849,10 +6141,7 @@ def test_update_candidate_preview_rejects_a_different_catalog_app(
     other_url.rsplit("/", 1)[0] + "/prompt.md": (200, PROMPT.encode()),
     other_url.rsplit("/", 1)[0] + "/fetch.sh": (200, b""),
   }
-  with patch(
-    "app.routes.apps._fetch_update_candidate",
-    return_value=_git_candidate(manifest, JSX),
-  ):
+  with _git_update_source(_git_candidate(manifest, JSX)):
     preview = client.get(
       f"/api/apps/{app_id}/update-candidate-preview",
       headers=auth,
@@ -6279,6 +6568,151 @@ def test_package_identity_adopts_a_github_owner_transfer_by_repository_id(
   assert adopted.json()["package_id"] == moved["package_id"]
 
 
+def _recording_async_client(responses: dict, requested: list[str]):
+  factory = _fake_async_client(responses)
+
+  def make(*args, **kwargs):
+    client = factory()
+    stream = client.stream
+
+    def recording_stream(method, url, **stream_kwargs):
+      requested.append(url)
+      return stream(method, url, **stream_kwargs)
+
+    client.stream = recording_stream
+    return client
+
+  return make
+
+
+@pytest.mark.parametrize("repo, repository_id", [
+  ("mobius-os/app-store", 1253755424),
+  ("mobius-os/app-social", 1354986466),
+  ("Mobius-OS/App-Store", 1253755424),
+])
+def test_trusted_catalog_package_identity_needs_no_github_api(
+  client, auth, db, bypass_url_validation, repo, repository_id,
+):
+  """First boot must not spend the anonymous API budget on its own catalog."""
+  base = f"https://raw.githubusercontent.com/{repo}/main/"
+  manifest = _simple_manifest("store")
+  manifest["package_id"] = "urn:uuid:cbcc33c4-6ff4-4bab-abe7-b9d9363ab72b"
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  requested: list[str] = []
+  with patch(
+    "app.install.httpx.AsyncClient",
+    side_effect=_recording_async_client(responses, requested),
+  ), patch("app.install._derive_repo_ref", return_value=None):
+    installed = client.post(
+      "/api/apps/install", headers=auth,
+      json={"manifest_url": base + "mobius.json"},
+    )
+
+  assert installed.status_code == 201, installed.text
+  assert not [url for url in requested if "api.github.com" in url]
+  row = db.get(models.App, installed.json()["id"])
+  assert row.source_identity == f"github:{repository_id}"
+
+
+def test_trusted_catalog_identity_is_read_before_any_request():
+  from app.install import _resolve_source_identity
+
+  def refuse(request: httpx.Request) -> httpx.Response:
+    raise AssertionError(f"unexpected request to {request.url}")
+
+  async def resolve():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(refuse)) as cli:
+      return await _resolve_source_identity(
+        cli,
+        "https://raw.githubusercontent.com/mobius-os/app-store/main/mobius.json",
+      )
+
+  assert asyncio.run(resolve()) == (
+    "github:1253755424",
+    "https://raw.githubusercontent.com/mobius-os/app-store/main/mobius.json",
+  )
+
+
+def test_other_repository_identity_still_asks_github_and_reports_its_limit(
+  client, auth, bypass_url_validation,
+):
+  base = "https://raw.githubusercontent.com/alice/app-notes/main/"
+  manifest = _simple_manifest("notes")
+  manifest["package_id"] = "urn:uuid:4c1f4a52-9d0b-5a57-9b5e-2a3a0e7f5b11"
+  reset = int(time.time()) + 600
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+    "https://api.github.com/repos/alice/app-notes": (
+      403, b"rate limited",
+      {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(reset)},
+    ),
+  }
+  requested: list[str] = []
+  with patch(
+    "app.install.httpx.AsyncClient",
+    side_effect=_recording_async_client(responses, requested),
+  ), patch("app.install._derive_repo_ref", return_value=None):
+    refused = client.post(
+      "/api/apps/install", headers=auth,
+      json={"manifest_url": base + "mobius.json"},
+    )
+
+  assert "https://api.github.com/repos/alice/app-notes" in requested
+  assert refused.status_code == 429, refused.text
+  assert "GitHub rate-limited" in refused.json()["detail"]
+  assert 590 <= int(refused.headers["retry-after"]) <= 600
+
+
+def test_store_installed_through_the_api_updates_without_handoff(
+  client, auth, db, bypass_url_validation,
+):
+  """Rows that stored the API-resolved id keep matching the table's id."""
+  base = "https://raw.githubusercontent.com/mobius-os/app-store/main/"
+  manifest = _simple_manifest("store")
+  manifest["package_id"] = "urn:uuid:cbcc33c4-6ff4-4bab-abe7-b9d9363ab72b"
+  first = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+    "https://api.github.com/repos/mobius-os/app-store": (
+      200, b'{"id":1253755424,"full_name":"mobius-os/app-store"}',
+    ),
+  }
+  with patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(first),
+  ), patch("app.install._derive_repo_ref", return_value=None), patch.dict(
+    "app.install._TRUSTED_CATALOG_REPOSITORY_IDS", clear=True,
+  ):
+    installed = client.post(
+      "/api/apps/install", headers=auth,
+      json={"manifest_url": base + "mobius.json"},
+    )
+  assert installed.status_code == 201, installed.text
+  assert db.get(
+    models.App, installed.json()["id"],
+  ).source_identity == "github:1253755424"
+
+  update = {**manifest, "version": "2.0.0"}
+  second = {
+    base + "mobius.json": (200, json.dumps(update).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  with patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(second),
+  ), patch("app.install._derive_repo_ref", return_value=None):
+    updated = client.post(
+      "/api/apps/install", headers=auth,
+      json={"manifest_url": base + "mobius.json"},
+    )
+
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["mode"] == "update"
+  assert updated.json()["id"] == installed.json()["id"]
+
+
 def test_package_identity_rejects_a_different_repository_without_old_source_handoff(
   client, auth, bypass_url_validation,
 ):
@@ -6562,6 +6996,36 @@ def test_rename_adopts_predecessor_row_and_moves_source_dir(
   assert r3.status_code == 201, r3.text
   assert r3.json()["mode"] == "update"
   assert r3.json()["id"] == gym_id
+
+
+@pytest.mark.parametrize("renamed_package_id, message", [
+  (None, "This installed app requires its permanent package identity."),
+  (
+    "urn:uuid:9b1e7a52-0c3d-5f4e-8a6b-7c2d1e0f3a94",
+    "Permanent package identity changed.",
+  ),
+])
+def test_rename_never_replaces_the_predecessor_package_identity(
+  client, auth, bypass_url_validation, renamed_package_id, message,
+):
+  """A previous_id rename is held to the same package rule as any update."""
+  base = "https://rename.test/packaged/"
+  original = _simple_manifest("gym")
+  original["package_id"] = "urn:uuid:5d2c8f61-4b7a-5e93-9c1d-2f6a8b3e7d05"
+  first = _install_simple(client, auth, base, original)
+  assert first.status_code == 201, first.text
+
+  renamed = _simple_manifest("workout", version="2.0.0", previous_id="gym")
+  if renamed_package_id is not None:
+    renamed["package_id"] = renamed_package_id
+  refused = _install_simple(client, auth, base, renamed)
+
+  assert refused.status_code == 409, refused.text
+  assert refused.json()["detail"] == message
+  listed = client.get("/api/apps/", headers=auth).json()
+  assert [(a["slug"], a["package_id"]) for a in listed] == [
+    ("gym", original["package_id"]),
+  ]
 
 
 def test_catalog_rename_adopts_trusted_checkout_with_unrelated_git_history(
@@ -6915,6 +7379,17 @@ def _fixture_commit(repo: Path, msg: str) -> str:
   ).stdout.strip()
 
 
+@contextmanager
+def _serve_github_from(bare: Path, github_url: str):
+  """Let Git transfer a catalog's GitHub URL from a local bare repository."""
+  with patch.dict(os.environ, {
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": f"url.{bare.as_uri()}.insteadOf",
+    "GIT_CONFIG_VALUE_0": github_url,
+  }):
+    yield
+
+
 def _make_clone_fixture(tmp_path, index: str, cards: str):
   work = tmp_path / "catalog-work"
   bare = tmp_path / "catalog.git"
@@ -7007,6 +7482,7 @@ def test_clone_update_fast_forward_uses_full_origin_tree(
   assert (src / "index.jsx").read_text() == index_v2
   assert (src / "cards.js").read_text() == cards_v2
   assert app_git.head_sha(src, app_git.UPSTREAM_BRANCH) == new_head
+  assert app_git.head_sha(src, app_git.FETCHED_REF) == new_head
   origin_head = app_git._run(src, "rev-parse", "origin/main").stdout.strip()
   assert origin_head == new_head
   assert app_git.local_diverged_from(src, new_head) is False
@@ -7129,7 +7605,7 @@ def test_clone_update_fetch_failure_preserves_installed_git_revision(
   index_v2 = CLONE_INDEX_V1.replace("TITLE_V1", "TITLE_HTTP_V2")
   cards_v2 = CLONE_CARDS_V1.replace("CARD_V1", "CARD_HTTP_V2")
   _push_clone_fixture(work, bare, index_v2, cards_v2)
-  with patch("app.app_git.fetch_upstream", side_effect=RuntimeError("offline")):
+  with patch("app.app_git.import_staged", side_effect=RuntimeError("offline")):
     r2 = _install_clone_fixture(
       client, auth, base, {**manifest, "version": "2.0.0"},
       index_v2, cards_v2, bare, include_source_file=True,
@@ -7398,11 +7874,11 @@ def test_catalog_app_rebinds_equal_local_tree_from_synthetic_history(
   canonical_origin = (
     "https://github.com/mobius-os/app-catalog-rebind.git"
   )
-  with patch(
+  with _serve_github_from(bare, canonical_origin), patch(
     "app.install.httpx.AsyncClient",
     side_effect=_fake_async_client(responses_v2),
   ), patch(
-    "app.install._derive_repo_ref", return_value=(bare.as_uri(), "main"),
+    "app.install._derive_repo_ref", return_value=(canonical_origin, "main"),
   ), patch(
     "app.install.app_git.origin_url", return_value=canonical_origin,
   ):
@@ -7795,7 +8271,7 @@ def test_preview_with_old_or_odd_recorded_baseline_manifest(
   })
   materialized = _spy_git_materialized_paths(monkeypatch)
   candidate = _git_candidate({**MANIFEST_MULTI, "id": slug, "source_files": []}, JSX)
-  with patch("app.routes.apps._fetch_update_candidate", AsyncMock(return_value=candidate)):
+  with _git_update_source(candidate):
     preview = client.get(f"/api/apps/{app_id}/update-candidate-preview", headers=auth)
   assert preview.status_code == 200, preview.text
   diff = preview.json()["upstream_diff"]
@@ -7818,7 +8294,10 @@ def test_update_check_legacy_baseline_over_bound_degrades(
   manifest = {**MANIFEST_MULTI, "id": slug, "source_files": []}
   candidate = _git_candidate(manifest, JSX)
   materialized = _spy_git_materialized_paths(monkeypatch)
-  monkeypatch.setattr(install, "fetch_git_package_summary", lambda *a, **k: candidate)
+  monkeypatch.setattr(
+    "app.routes.apps._fetch_update_commit", AsyncMock(return_value=candidate.commit),
+  )
+  monkeypatch.setattr(install, "read_git_package_summary", lambda *a, **k: candidate)
   monkeypatch.setattr(install, "read_git_install_candidate", lambda *a, **k: candidate)
   monkeypatch.setattr(install, "trusted_catalog_checkout", lambda *a, **k: None)
   monkeypatch.setattr(install, "_PACKAGE_MAX_BYTES", 1000)
@@ -7943,7 +8422,8 @@ def test_update_preview_materializes_only_needed_baseline_paths(
     {**manifest, "source_files": ["added.js"], "static_assets": {}}, JSX,
     sources={"added.js": b"new declared source"},
   )
-  monkeypatch.setattr(apps, "_fetch_update_candidate", AsyncMock(return_value=candidate))
+  monkeypatch.setattr(apps, "_fetch_update_commit", AsyncMock(return_value=candidate.commit))
+  monkeypatch.setattr(install, "read_git_install_candidate", lambda *a, **k: candidate)
   preview = client.get(
     f"/api/apps/{response.json()['id']}/update-candidate-preview", headers=auth,
   )
@@ -7993,7 +8473,8 @@ def test_update_preview_does_not_apply_candidate_limits_to_installed_source(
     {**manifest, "source_files": ["big.js"] if oversized == "new_path" else []}, JSX,
     sources={"big.js": b"small new source"} if oversized == "new_path" else {},
   )
-  monkeypatch.setattr(apps, "_fetch_update_candidate", AsyncMock(return_value=candidate))
+  monkeypatch.setattr(apps, "_fetch_update_commit", AsyncMock(return_value=candidate.commit))
+  monkeypatch.setattr(install, "read_git_install_candidate", lambda *a, **k: candidate)
   preview = client.get(
     f"/api/apps/{response.json()['id']}/update-candidate-preview", headers=auth,
   )
@@ -8016,10 +8497,7 @@ def test_update_preview_says_an_oversized_release_is_too_large(
   r1 = _install_v1(client, auth, base, {**MANIFEST_NEWS, "id": "oversized-preview"}, JSX)
   assert r1.status_code == 201, r1.text
   reason = install.package_limit_message(65 * 1024 * 1024)
-  with patch(
-    "app.routes.apps._fetch_update_candidate",
-    side_effect=install.PackageTooLarge(reason),
-  ):
+  with _git_update_source(read_error=install.PackageTooLarge(reason)):
     preview = client.get(
       f"/api/apps/{r1.json()['id']}/update-candidate-preview", headers=auth,
     )
@@ -8036,6 +8514,8 @@ def test_applying_an_oversized_reviewed_update_says_it_is_too_large(
   app = create_local_app(client, auth, name="Oversized reviewed update")
   reason = install.package_limit_message(65 * 1024 * 1024)
   with patch("app.install._reviewed_commit_has_manifest", return_value=True), patch(
+    "app.install.fetch_app_commit", AsyncMock(return_value="f" * 40),
+  ), patch(
     "app.install.read_git_install_candidate",
     side_effect=install.PackageTooLarge(reason),
   ):
@@ -8427,15 +8907,24 @@ def _git_candidate(manifest, jsx, sources=None, job=b"#!/bin/sh\n"):
   )
 
 
+@contextmanager
+def _git_update_source(candidate=None, *, fetch=None, read_error=None):
+  """Serve one update: the unlocked commit fetch, then the locked read."""
+  commit = AsyncMock(return_value="f" * 40, side_effect=fetch)
+  read = MagicMock(return_value=candidate, side_effect=read_error)
+  with patch("app.routes.apps._fetch_update_commit", commit), patch(
+    "app.install.read_git_install_candidate", read,
+  ), patch("app.install.read_git_package_summary", read):
+    yield commit
+
+
 def _update_check(
   client, headers, base, app_id, manifest, jsx, sources=None,
   job=b"#!/bin/sh\n",
   candidate_manifest_url=None,
 ):
   candidate = _git_candidate(manifest, jsx, sources=sources, job=job)
-  with patch(
-    "app.install.fetch_git_package_summary", return_value=candidate,
-  ), patch("app.install.read_git_install_candidate", return_value=candidate):
+  with _git_update_source(candidate):
     return client.get(
       f"/api/apps/{app_id}/update-check",
       headers=headers,
@@ -8451,15 +8940,15 @@ def _update_check(
 
 def test_known_origin_check_never_falls_back_to_http(tmp_path):
   """An origin outage cannot silently change the source being reviewed."""
-  from app.routes.apps import _fetch_update_candidate
+  from app.routes.apps import _fetch_update_commit
   app_git.ensure_repo(tmp_path)
   app_git._run(tmp_path, "remote", "add", "origin", "https://github.com/acme/source.git")
-  with patch("app.install.fetch_git_install_candidate", side_effect=RuntimeError("offline")), patch(
+  with patch("app.app_git._transfer", side_effect=RuntimeError("offline")), patch(
     "app.install._http_get", new_callable=AsyncMock,
   ) as http_get:
     with pytest.raises(RuntimeError, match="offline"):
-      asyncio.run(_fetch_update_candidate(
-        tmp_path, "https://raw.githubusercontent.com/acme/source/main/mobius.json", strict=True,
+      asyncio.run(_fetch_update_commit(
+        tmp_path, "https://raw.githubusercontent.com/acme/source/main/mobius.json",
       ))
   http_get.assert_not_called()
 
@@ -8467,7 +8956,7 @@ def test_known_origin_check_never_falls_back_to_http(tmp_path):
 def test_git_update_candidate_reads_one_commit_without_advancing_managed_refs(
   tmp_path,
 ):
-  from app.install import fetch_git_install_candidate
+  from app.install import fetch_app_commit, read_git_install_candidate
 
   work = tmp_path / "candidate-work"
   bare = tmp_path / "candidate.git"
@@ -8491,7 +8980,9 @@ def test_git_update_candidate_reads_one_commit_without_advancing_managed_refs(
   subprocess.run(
     ["git", "clone", "-q", "--bare", str(work), str(bare)], check=True,
   )
-  assert app_git.clone_upstream(installed, bare.as_uri(), "main") == first
+  staged = app_git.stage_clone(bare.as_uri(), "main", tmp_path / "transfers")
+  app_git.adopt_clone(staged, installed)
+  assert staged.sha == first
 
   manifest["version"] = "2.0.0"
   (work / "mobius.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -8505,12 +8996,10 @@ def test_git_update_candidate_reads_one_commit_without_advancing_managed_refs(
     ["git", "-C", str(work), "push", "-q", str(bare), "main"], check=True,
   )
 
-  with patch(
-    "app.install._derive_repo_ref", return_value=(bare.as_uri(), "main"),
-  ):
-    candidate = fetch_git_install_candidate(
-      installed, "https://example.invalid/mobius.json", strict=True,
-    )
+  commit = asyncio.run(fetch_app_commit(installed, "main"))
+  candidate = read_git_install_candidate(
+    installed, commit, "https://example.invalid/mobius.json", strict=True,
+  )
 
   assert candidate.commit == second
   assert candidate.manifest["version"] == "2.0.0"
@@ -8691,12 +9180,12 @@ def test_update_check_final_fence_preserves_concurrent_pending_conflict(
       capability_digest="test-capability-digest",
       candidate_digest="0" * 64,
     )
-    return _git_candidate(manifest_v2, upstream_v2)
+    return "f" * 40
 
-  monkeypatch.setattr(
-    "app.install.fetch_git_package_summary", advance_during_fetch,
-  )
-  res = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
+  with _git_update_source(
+    _git_candidate(manifest_v2, upstream_v2), fetch=advance_during_fetch,
+  ):
+    res = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
   assert res.status_code == 200, res.text
   payload = res.json()
   assert payload["update_available"] is True
@@ -8744,9 +9233,8 @@ def test_update_check_ignores_invalid_preview_metadata_but_install_rejects_it(
   with patch(
     "app.install.httpx.AsyncClient",
     side_effect=_fake_async_client(responses),
-  ), patch(
-    "app.routes.apps._fetch_update_candidate",
-    side_effect=HTTPException(400, "previews[0].source is required"),
+  ), _git_update_source(
+    read_error=HTTPException(400, "previews[0].source is required"),
   ):
     preview = client.get(
       f"/api/apps/{app_id}/update-candidate-preview", headers=auth,
@@ -8802,9 +9290,8 @@ def test_update_check_malformed_candidate_degrades_to_unknown(
   installed = _install_v1(client, auth, base, manifest, JSX)
   assert installed.status_code == 201, installed.text
   candidate = {**manifest, **invalid} if isinstance(invalid, dict) else invalid
-  with patch(
-    "app.install.fetch_git_package_summary",
-    side_effect=ValueError(f"invalid candidate: {candidate!r}"),
+  with _git_update_source(
+    read_error=ValueError(f"invalid candidate: {candidate!r}"),
   ):
     response = client.get(
       f"/api/apps/{installed.json()['id']}/update-check",
@@ -8970,10 +9457,7 @@ def test_update_check_network_failure_degrades_to_null(
   app_id = r1.json()["id"]
 
   # A failed Git fetch degrades to unknown rather than breaking Store refresh.
-  with patch(
-    "app.install.fetch_git_package_summary",
-    side_effect=RuntimeError("synthetic origin outage"),
-  ):
+  with _git_update_source(fetch=RuntimeError("synthetic origin outage")):
     res = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
   assert res.status_code == 200, res.text
   assert res.json()["update_available"] is None
@@ -9002,11 +9486,9 @@ def test_update_check_releases_db_connection_before_remote_fetch(
       "update-check kept its request DB connection checked out while "
       "starting remote work"
     )
-    raise HTTPException(status_code=502, detail="synthetic upstream outage")
+    raise RuntimeError("synthetic upstream outage")
 
-  with patch(
-    "app.install.fetch_git_package_summary", new=_slow_remote_fetch,
-  ):
+  with _git_update_source(fetch=_slow_remote_fetch):
     res = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
 
   assert res.status_code == 200, res.text
@@ -9405,6 +9887,77 @@ def test_update_discovery_fallback_follows_package_id_across_id_change(
     assert response.json()["upstream_commit"]
 
 
+@pytest.mark.parametrize("route", ["update-check", "update-candidate-preview"])
+def test_update_discovery_explicit_stored_address_follows_package_id(
+  client, auth, tmp_path, bypass_url_validation, route,
+):
+  """The row's own address finds its package after a manifest id rename."""
+  manifest = {
+    "id": "pkg-explicit", "name": "Package explicit", "version": "1.0.0",
+    "description": "Binding", "entry": "index.jsx", "source_files": ["cards.js"],
+    "package_id": "urn:uuid:9d4e2b1a-6c3f-5d8e-a2b7-1f0e9c8d7b6a",
+  }
+  base = "https://pkg-explicit.test/repo/"
+  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(manifest)})
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
+    include_source_file=True,
+  )
+  assert installed.status_code == 201, installed.text
+  renamed = {**manifest, "id": "pkg-explicit-renamed", "version": "2.0.0"}
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(renamed)})
+  with patch("app.install._derive_repo_ref", return_value=(bare.as_uri(), "main")):
+    response = client.get(
+      f"/api/apps/{installed.json()['id']}/{route}", headers=auth,
+      params={"manifest_url": installed.json()["manifest_url"]},
+    )
+  assert response.status_code == 200, response.text
+  if route == "update-check":
+    assert response.json()["update_available"] is True
+  else:
+    assert response.json()["upstream_commit"]
+
+
+@pytest.mark.parametrize("route", ["update-check", "update-candidate-preview"])
+@pytest.mark.parametrize("candidate_package_id", [None, "urn:uuid:another-package"])
+@pytest.mark.parametrize("catalog_address", [False, True])
+def test_update_discovery_never_offers_what_install_refuses(
+  client, auth, tmp_path, bypass_url_validation, route, candidate_package_id,
+  catalog_address,
+):
+  """With or without a catalog address, discovery applies install's package rule."""
+  manifest = {
+    "id": "pkg-strict", "name": "Package strict", "version": "1.0.0",
+    "description": "Binding", "entry": "index.jsx", "source_files": ["cards.js"],
+    "package_id": "urn:uuid:7a1c3e5f-2b4d-5f6a-8c9e-0d1f2a3b4c5d",
+  }
+  base = "https://pkg-strict.test/repo/"
+  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(manifest)})
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
+    include_source_file=True,
+  )
+  assert installed.status_code == 201, installed.text
+  republished = {**manifest, "version": "2.0.0"}
+  republished.pop("package_id")
+  if candidate_package_id:
+    republished["package_id"] = candidate_package_id
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(republished)})
+  params = {"manifest_url": base + "mobius.json"} if catalog_address else {}
+  with patch("app.install._derive_repo_ref", return_value=(bare.as_uri(), "main")):
+    response = client.get(
+      f"/api/apps/{installed.json()['id']}/{route}", headers=auth, params=params,
+    )
+  if route == "update-check":
+    assert response.status_code == 200, response.text
+    assert response.json()["update_available"] is None
+  else:
+    assert response.status_code == 409, response.text
+    assert "permanent package identity" in response.json()["detail"].lower()
+
+
 def test_reviewed_update_applies_package_id_rename_through_stored_address(
   client, auth, db, tmp_path, bypass_url_validation,
 ):
@@ -9467,8 +10020,10 @@ def test_stored_address_binding_accepts_the_rows_package_id():
 
   manifest = {"id": "renamed", "package_id": "urn:uuid:p"}
   require_bound_manifest(manifest, "current", "urn:uuid:p")
-  with pytest.raises(ValueError, match="no longer"):
+  with pytest.raises(ValueError, match="identity changed"):
     require_bound_manifest(manifest, "current", "urn:uuid:other")
+  with pytest.raises(ValueError, match="requires its permanent package"):
+    require_bound_manifest({"id": "current"}, "current", "urn:uuid:p")
   with pytest.raises(ValueError, match="no longer"):
     require_bound_manifest(manifest, "current")
 
@@ -9761,6 +10316,44 @@ def test_stored_address_binding_does_not_borrow_another_installed_package(
   assert result.status_code == 409, result.text
 
 
+@pytest.mark.parametrize("operation", ["preview", "install"])
+def test_live_row_wins_a_stored_address_shared_with_a_tombstone(
+  client, auth, db, bypass_url_validation, operation,
+):
+  """The live app binds an address it shares with an earlier tombstone."""
+  manifest = {**_simple_manifest("duplicate-proof"), "package_id": "app.example.duplicate"}
+  base = "https://duplicate-proof.test/repo/"
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+  }
+  shared = base.rstrip("/") + "#manifest-id=duplicate-proof"
+  # The tombstone gets the lower id, so an unordered lookup could return it.
+  old = models.App(
+    name="Old duplicate", slug="old-duplicate",
+    source_dir="/tmp/unused-duplicate-proof",
+    manifest_url="https://elsewhere.test/repo#manifest-id=old-duplicate",
+    deleted_at=datetime(2026, 1, 1, tzinfo=UTC),
+  )
+  db.add(old)
+  db.commit()
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    live = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert live.status_code == 201, live.text
+  assert live.json()["manifest_url"] == shared and live.json()["id"] > old.id
+  old.manifest_url = shared
+  db.commit()
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    result = client.post(f"/api/apps/{operation}", headers=auth, json={
+      "manifest_url": shared,
+    })
+  assert result.status_code in (200, 201), result.text
+  if operation == "install":
+    assert result.json()["id"] == live.json()["id"]
+
+
 @pytest.mark.asyncio
 async def test_ancillary_bundle_comparison_uses_same_root_and_upstream_deletions(tmp_path):
   manifest = _simple_manifest("compare-bundle")
@@ -9922,10 +10515,10 @@ def test_conflict_resolver_rejects_oversized_prompt_before_parking_any_checkout(
                for app_id in ids)
 
 
-def test_install_git_network_has_short_lifecycle_ceiling(
+def test_install_git_transfer_has_the_transfer_ceiling(
   client, auth, db, bypass_url_validation, monkeypatch,
 ):
-  """An unopened connection must not monopolize app lifecycle work."""
+  """An overlong clone is reported as a timeout and installs nothing."""
   base = "https://raw.githubusercontent.com/acme/unopened/main/"
   manifest = {
     "id": "unopened", "name": "Unopened", "version": "1.0.0",
@@ -9942,10 +10535,9 @@ def test_install_git_network_has_short_lifecycle_ceiling(
     timed_out = False
 
     def communicate(self, *args, **kwargs):
-      if not self.timed_out and ("clone" in self.args or "fetch" in self.args):
+      if not self.timed_out and "fetch" in self.args:
         self.timed_out = True
         seen.append(kwargs["timeout"])
-        assert 0 < kwargs["timeout"] <= 30
         raise subprocess.TimeoutExpired(self.args, kwargs["timeout"])
       return super().communicate(*args, **kwargs)
 
@@ -9956,13 +10548,13 @@ def test_install_git_network_has_short_lifecycle_ceiling(
     failed = client.post("/api/apps/install", headers=auth, json={
       "manifest_url": base + "mobius.json",
     })
-  assert seen
+  assert seen == [app_git._GIT_TRANSFER_TIMEOUT]
   assert failed.status_code == 409, failed.text
   assert failed.json()["detail"]["code"] == "git_transfer_timeout"
   assert db.query(models.App).filter_by(slug="unopened").first() is None
 
 
-def test_update_git_fetch_has_short_ceiling_and_preserves_installed_revision(
+def test_update_git_transfer_timeout_preserves_installed_revision(
   client, auth, tmp_path, bypass_url_validation, monkeypatch,
 ):
   base = "https://raw.githubusercontent.com/acme/fetch-ceiling/main/"
@@ -9985,7 +10577,6 @@ def test_update_git_fetch_has_short_ceiling_and_preserves_installed_revision(
       if not self.timed_out and ("fetch" in self.args):
         self.timed_out = True
         seen.append(kwargs["timeout"])
-        assert 0 < kwargs["timeout"] <= 30
         raise subprocess.TimeoutExpired(self.args, kwargs["timeout"])
       return super().communicate(*args, **kwargs)
 
@@ -9994,7 +10585,7 @@ def test_update_git_fetch_has_short_ceiling_and_preserves_installed_revision(
     client, auth, base, {**manifest, "version": "2.0.0"},
     CLONE_INDEX_V1, CLONE_CARDS_V1, bare,
   )
-  assert seen
+  assert seen == [app_git._GIT_TRANSFER_TIMEOUT]
   assert failed.status_code == 409, failed.text
   assert failed.json()["detail"]["code"] == "git_transfer_timeout"
   src = Path(get_settings().data_dir) / "apps" / "fetch-ceiling"
@@ -10003,7 +10594,7 @@ def test_update_git_fetch_has_short_ceiling_and_preserves_installed_revision(
 
 
 @pytest.mark.parametrize("operation", ["update", "resolver"])
-def test_update_merge_unshallow_timeout_is_short_and_preserves_installed_app(
+def test_shallow_history_never_transfers_under_locks_and_preserves_installed_app(
   client, auth, db, bypass_url_validation, monkeypatch, operation,
 ):
   from app import install
@@ -10020,8 +10611,8 @@ def test_update_merge_unshallow_timeout_is_short_and_preserves_installed_app(
   upstream_before = app_git.head_sha(repo, app_git.UPSTREAM_BRANCH)
 
   def hide_merge_base(source_dir):
-    # Model a depth-one upstream graft left by an earlier fetch. Local Git
-    # commands and the entire merge -> unshallow chain remain real.
+    # Model a depth-one upstream graft left by an earlier fetch. The update's
+    # merge refuses it locally; the resolver completes history before locking.
     app_git._run(source_dir, "remote", "add", "origin", base)
     upstream = app_git.head_sha(source_dir, app_git.UPSTREAM_BRANCH)
     (Path(source_dir) / ".git" / "shallow").write_text(upstream + "\n")
@@ -10052,7 +10643,6 @@ def test_update_merge_unshallow_timeout_is_short_and_preserves_installed_app(
       if not self.timed_out and ("--unshallow" in self.args):
         self.timed_out = True
         seen.append(kwargs["timeout"])
-        assert 0 < kwargs["timeout"] <= 30
         raise subprocess.TimeoutExpired(self.args, kwargs["timeout"])
       return super().communicate(*args, **kwargs)
 
@@ -10066,9 +10656,13 @@ def test_update_merge_unshallow_timeout_is_short_and_preserves_installed_app(
       f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth,
     )
 
-  assert seen == [30]
   assert failed.status_code == 409, failed.text
-  assert failed.json()["detail"]["code"] == "git_transfer_timeout"
+  if operation == "update":
+    assert seen == []
+    assert failed.json()["detail"]["code"] == "git_update_unavailable"
+  else:
+    assert seen == [app_git._GIT_TRANSFER_TIMEOUT]
+    assert failed.json()["detail"]["code"] == "git_transfer_timeout"
   assert (repo / "index.jsx").read_text() == local
   assert app_git.head_sha(repo, app_git.UPSTREAM_BRANCH) == upstream_before
   assert not install.pending_update_worktree(repo).exists()
@@ -10109,12 +10703,21 @@ async def test_ancillary_source_check_and_tree_writes_leave_event_loop(monkeypat
     assert (source_path.parent / "README.md").read_bytes() == expected
     Path(out_path).write_bytes(b"identical bundle")
 
+  removed = []
+  rmtree = install.shutil.rmtree
+
+  def record_rmtree(path, *args, **kwargs):
+    removed.append(threading.get_ident())
+    return rmtree(path, *args, **kwargs)
+
   monkeypatch.setattr(install, "_source_completeness", check_source)
   monkeypatch.setattr(Path, "write_bytes", record_write)
   monkeypatch.setattr(install, "compile_jsx", compile_tree)
+  monkeypatch.setattr(install.shutil, "rmtree", record_rmtree)
   assert await install._kept_local_bundle_unchanged(
     tree, manifest, {}, {"README.md": b"upstream"}, ["README.md"],
   )
+  assert len(removed) == 1 and removed[0] != event_loop_thread
   assert len(checked) == 1 and checked[0] != event_loop_thread
   assert len(writes) == 3 and all(thread != event_loop_thread for thread in writes)
   assert len(entries) == 2 and entries[0] == entries[1]

@@ -80,7 +80,9 @@ import useChatRuntimePolicy from './hooks/useChatRuntimePolicy.js'
 import useOffscreenNudge, { useNudgeTargetRef } from './hooks/useOffscreenNudge.js'
 import { composerAdjacentActionProps } from './composerAdjacentAction.js'
 import ChatInputBar from './ChatInputBar.jsx'
-import { compactFailureInput, mobiusChatCommand } from './slashCommands.js'
+import CompactionProgress from './CompactionProgress.jsx'
+import useCompactCommands from './hooks/useCompactCommands.js'
+import { mobiusChatCommand } from './slashCommands.js'
 import { hasSendablePayload } from './composerSubmission.js'
 import AgentContextInspector from './AgentContextInspector.jsx'
 import ChatSummaryViewer from './ChatSummaryViewer.jsx'
@@ -219,6 +221,8 @@ import {
   combineOwnerMessagesForDisplay,
   ownerMessageBatch,
   jumpToLatestShown,
+  RUNTIME_SAFETY_POLL_MS,
+  runtimeStreamDelivering,
   runtimeSnapshot,
   runtimeSnapshotTransition,
   shouldRepairRuntimeStream,
@@ -709,10 +713,6 @@ export default function ChatView({
   )
   const [fileDropActive, setFileDropActive] = useState(false)
   const fileDragDepthRef = useRef(0)
-  // A "/compact" submission is a chat action, not a turn: it rewrites the live
-  // context instead of asking the model anything.
-  const [compactingChat, setCompactingChat] = useState(false)
-  const compactingChatRef = useRef(false)
   // The server's view of the same window, shared by every pane and device.
   const serverCompactingKind = useSyncExternalStore(
     subscribeChatCompaction,
@@ -1891,6 +1891,7 @@ export default function ChatView({
     disconnect,
     clearStreamItems,
     patchQuestionAnswers,
+    lastReadAtRef: streamLastReadAtRef,
   } = useStreamConnection(chatId, {
     onCatchUpSettled: acceptInitialStreamCatchUp,
     onConnectionLost: () => {
@@ -4217,33 +4218,14 @@ export default function ChatView({
     patchQuestionAnswers,
   ])
 
-  // "/compact" never becomes a message. It asks the backend to replace this
-  // chat's live context with a fresh briefing and reset the provider session;
-  // the visible transcript is untouched and the platform renders the stored
-  // compaction as its own "Context compacted" card.
-  async function runCompactCommand(instructions = '', submittedInput = '/compact') {
-    if (!activationSettledRef.current) return
-    if (!chatId || provisionalNewChat) {
-      setSendFailure('There’s no chat context to compact yet.')
-      return
-    }
-    if (compactingChatRef.current) return
-    if (isProviderSwitchBlocking(chatId)) return
-    compactingChatRef.current = true
-    setCompactingChat(true)
-    setComposerInput('')
-    setSendFailure(null)
-    try {
-      await api.chats.compact(chatId, { instructions })
-      await fetchMessages({ force: true })
-    } catch (err) {
-      setComposerInput(compactFailureInput(inputValueRef.current, submittedInput))
-      setSendFailure(sendFailureMessage(err, { online: getOnlineSnapshot() }))
-    } finally {
-      compactingChatRef.current = false
-      setCompactingChat(false)
-    }
-  }
+  const {
+    preparing: preparingCompaction, compactionProgress,
+    runCompactCommand, continueCompaction, stopCompactCommand, stopComposerWork,
+  } = useCompactCommands({
+    chatId, provisionalNewChat, hidden, serverCompactingKind,
+    activationSettledRef, inputValueRef, setComposerInput, setSendFailure, fetchMessages,
+    stopTurn: handleStop,
+  })
 
   function dispatchMobiusChatCommand(composed) {
     const command = mobiusChatCommand(composed)
@@ -5256,9 +5238,20 @@ export default function ChatView({
           if (!cancelled && runtime) ensureRuntimeStreamConnected(runtime)
         })
     }
-    run()
-    const intervalMs = hasQueue ? 1000 : 3000
-    const timer = setInterval(run, intervalMs)
+    // Tick fast, but while the chat stream is demonstrably delivering, read
+    // only at the safety cadence (and not at once): the stream already carries
+    // the run, question, steer, and queue-promotion state this read fetches.
+    const delivering = () => runtimeStreamDelivering({
+      isStreaming, connectionError, lastReadAt: streamLastReadAtRef.current,
+    })
+    let lastRuntimeReadAt = delivering() ? Date.now() : 0
+    const tick = () => {
+      if (delivering() && Date.now() - lastRuntimeReadAt < RUNTIME_SAFETY_POLL_MS) return
+      lastRuntimeReadAt = Date.now()
+      run()
+    }
+    tick()
+    const timer = setInterval(tick, hasQueue ? 1000 : 3000)
     // Foreground and recovery signals belong to the effect below, also for
     // idle chats. This effect owns only active-turn/queue fallback polling.
     return () => {
@@ -5271,6 +5264,9 @@ export default function ChatView({
     turnActive,
     deliveryReady,
     pendingQueue.pendingMessages.length,
+    isStreaming,
+    connectionError,
+    streamLastReadAtRef,
     reconcileRuntimeState,
   ])
 
@@ -6490,6 +6486,13 @@ export default function ChatView({
             restarting={restartPending}
             focusComposer={() => focusComposerElement(inputRef.current)}
           />
+        <CompactionProgress
+          progress={compactionProgress}
+          busy={preparingCompaction}
+          onContinue={continueCompaction}
+          onStartOver={() => runCompactCommand('', null)}
+          onStop={stopCompactCommand}
+        />
         <ChatInputBar
           chatId={chatId}
           input={input}
@@ -6505,7 +6508,7 @@ export default function ChatView({
           listeningRef={listeningRef}
           onManualVoiceEdit={acceptManualEdit}
           onToggleVoice={toggleVoice}
-          onStop={handleStop}
+          onStop={stopComposerWork}
           onSteer={handleSteer}
           canSteer={canSteer}
           showSteer={showSteer}
@@ -6514,7 +6517,7 @@ export default function ChatView({
           canSubmitSteer={canSubmitSteer}
           sendFailure={sendFailure}
           notice={compactionNotice(
-            serverCompactingKind || (compactingChat ? 'compact' : null),
+            serverCompactingKind || (preparingCompaction ? 'compact' : null),
             { sendBlockedBySwitch: providerSwitching },
           )}
           submissionBlocked={

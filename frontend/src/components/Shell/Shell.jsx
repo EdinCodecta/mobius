@@ -90,7 +90,7 @@ import {
   workspaceRequestsForBuiltApps,
   ACTIVATE_FOREGROUND,
 } from './workspacePlacement.js'
-import { appCrashReportDraft } from '../../lib/appRecovery.js'
+import { appCrashReportDraft, appReportChatId } from '../../lib/appRecovery.js'
 import {
   acknowledgeAppActivity,
   appAttentionIds,
@@ -2713,7 +2713,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     const appEntry = appsRef.current.find(a => String(a.id) === String(appId))
     const appName = appEntry?.name || `app ${appId}`
     const report = appCrashReportDraft(appName, error)
-    const buildingChatId = appEntry?.chat_id || chatId || null
+    const buildingChatId = appReportChatId(appEntry, chatId)
     const buildingChat = buildingChatId
       && chatsRef.current.find(c => c.id === buildingChatId)
     if (buildingChat) {
@@ -3256,6 +3256,11 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           void queryClient.invalidateQueries({
             queryKey: ['projects', 'git', String(projectId)],
           })
+          // The same fact as the cursor's agent_run_completed row: an open
+          // project refreshes its selected file now instead of on its next poll.
+          window.dispatchEvent(new CustomEvent('mobius:project-change', {
+            detail: { projectId, change: { kind: 'agent_run_completed', path: null } },
+          }))
         }
         // Attention iff the finished chat is NOT visible in ANY pane — membership
         // in the visible set, not equality with one global id, so a chat visible

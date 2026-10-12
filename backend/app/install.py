@@ -24,6 +24,7 @@ See feature ticket 062 for the design rationale.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import dataclasses
 import functools
@@ -35,10 +36,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Awaitable, Callable, Mapping, Sequence
 from urllib.parse import quote, unquote, urljoin, urlparse
 
 import httpx
@@ -77,6 +79,7 @@ from app.manifest_identity import (
   canonical_manifest_identity_key as _canonical_identity_key,
   requested_manifest_source,
   require_bound_manifest as _require_bound_manifest,
+  require_permanent_package,
   stored_manifest_fetch_url,
 )
 from app.manifest_contract import (
@@ -103,6 +106,7 @@ from app.manifest_contract import (
 # net_utils.py for why the two SSRF validators were unified.
 from app.net_utils import (
   MAX_REDIRECTS as _MAX_REDIRECTS,
+  pinned_client,
   validate_url_safe as _validate_url_safe,
 )
 from app.storage_io import atomic_write
@@ -585,6 +589,11 @@ def _find_install_identity_row(
   existing = (
     db.query(models.App)
     .filter(models.App.manifest_url == canonical)
+    # Rows can share an address; choose deterministically, as below.
+    .order_by(
+      case((models.App.deleted_at.is_(None), 0), else_=1),
+      models.App.id.asc(),
+    )
     .first()
   )
   if existing is None:
@@ -796,7 +805,7 @@ async def _http_get(
         if r.status_code == 404:
           raise HTTPException(404, f"Not found: {url}")
         if _is_rate_limited(url, r.status_code, r.headers):
-          raise HTTPException(429, _rate_limit_detail(url, r.headers))
+          raise _rate_limit_error(url, r.headers)
         if r.status_code >= 400:
           raise HTTPException(
             502, f"Upstream {r.status_code} fetching {url}",
@@ -880,6 +889,30 @@ async def _resolve_source_identity(
     return f"url:{digest}", source_url
 
   owner, repo = repository
+  repository_id = _TRUSTED_CATALOG_REPOSITORY_IDS.get(repository)
+  if repository_id is not None:
+    canonical_owner, canonical_repo = repository
+  else:
+    repository_id, canonical_owner, canonical_repo = (
+      await _fetch_github_repository(client, owner, repo)
+    )
+
+  parsed = urlparse(source_url)
+  parts = [part for part in parsed.path.split("/") if part]
+  if len(parts) < 3:
+    raise HTTPException(400, "GitHub package source is not a root manifest.")
+  parts[0] = canonical_owner
+  parts[1] = canonical_repo
+  trailing_slash = parsed.path.endswith("/")
+  canonical_path = "/" + "/".join(parts) + ("/" if trailing_slash else "")
+  canonical_url = parsed._replace(path=canonical_path).geturl()
+  return f"github:{repository_id}", canonical_url
+
+
+async def _fetch_github_repository(
+  client: httpx.AsyncClient, owner: str, repo: str,
+) -> tuple[int, str, str]:
+  """Return GitHub's numeric id and canonical owner/name for one repository."""
   api_url = f"https://api.github.com/repos/{owner}/{repo}"
   try:
     raw = await _http_get(client, api_url, 256 * 1024)
@@ -898,17 +931,7 @@ async def _resolve_source_identity(
   canonical_owner, canonical_repo = full_name.split("/", 1)
   if not canonical_owner or not canonical_repo:
     raise HTTPException(502, "GitHub returned incomplete repository metadata.")
-
-  parsed = urlparse(source_url)
-  parts = [part for part in parsed.path.split("/") if part]
-  if len(parts) < 3:
-    raise HTTPException(400, "GitHub package source is not a root manifest.")
-  parts[0] = canonical_owner
-  parts[1] = canonical_repo
-  trailing_slash = parsed.path.endswith("/")
-  canonical_path = "/" + "/".join(parts) + ("/" if trailing_slash else "")
-  canonical_url = parsed._replace(path=canonical_path).geturl()
-  return f"github:{repository_id}", canonical_url
+  return repository_id, canonical_owner, canonical_repo
 
 
 def _header(headers, name: str) -> str | None:
@@ -930,6 +953,17 @@ _GITHUB_RATE_LIMIT_HOSTS = frozenset((
   "github.com", "api.github.com", "raw.githubusercontent.com",
 ))
 
+# GitHub's permanent ids for the platform's own catalog repositories whose
+# packages declare `package_id`. The `mobius-os` organization is already the
+# trust root for these sources, so their identity needs no anonymous API call,
+# which shared egress addresses often have exhausted on first boot. Any other
+# repository is still resolved through the API. `tests/test_bootstrap_live.py`
+# checks every live default app against this table.
+_TRUSTED_CATALOG_REPOSITORY_IDS = {
+  ("mobius-os", "app-store"): 1253755424,
+  ("mobius-os", "app-social"): 1354986466,
+}
+
 
 def _is_rate_limited(url: str, status_code: int, headers) -> bool:
   """True for 429, and for the 403 GitHub uses for its rate limits.
@@ -948,26 +982,38 @@ def _is_rate_limited(url: str, status_code: int, headers) -> bool:
   )
 
 
-def _rate_limit_detail(url: str, headers) -> str:
-  host = urlparse(url).hostname or "upstream"
-  service = "GitHub" if host in _GITHUB_RATE_LIMIT_HOSTS else host
-  detail = f"{service} rate-limited this app request."
+def _rate_limit_wait_seconds(headers) -> int | None:
+  """Seconds the upstream asked us to wait, from retry-after or its reset."""
   retry_after = _header(headers, "retry-after")
   if retry_after:
     try:
       seconds = int(float(retry_after))
       if seconds > 0:
-        return f"{detail} Try again in {_wait_label(seconds)}."
+        return seconds
     except ValueError:
       pass
   reset = _header(headers, "x-ratelimit-reset")
   if reset:
     try:
-      reset_at = datetime.fromtimestamp(int(reset), UTC)
-      return f"{detail} Try again after {reset_at.isoformat(timespec='minutes')}."
-    except (ValueError, OSError):
+      return max(1, int(reset) - int(time.time()))
+    except ValueError:
       pass
-  return f"{detail} Please wait a minute and try again."
+  return None
+
+
+def _rate_limit_error(url: str, headers) -> HTTPException:
+  """The 429 for a rate-limited fetch, carrying the wait as Retry-After."""
+  host = urlparse(url).hostname or "upstream"
+  service = "GitHub" if host in _GITHUB_RATE_LIMIT_HOSTS else host
+  detail = f"{service} rate-limited this app request."
+  wait = _rate_limit_wait_seconds(headers)
+  if wait is None:
+    return HTTPException(429, f"{detail} Please wait a minute and try again.")
+  return HTTPException(
+    429,
+    f"{detail} Try again in {_wait_label(wait)}.",
+    headers={"Retry-After": str(wait)},
+  )
 
 
 def _seed_value_is_inline(value) -> bool:
@@ -1290,9 +1336,11 @@ def committed_conflict_marker_paths(
 def _update_package_paths(
   source_dir: str | Path, incoming_manifest: dict,
 ) -> set[str] | None:
-  """Protect declarations on either side and installed static destinations.
+  """Protect declarations on either side and everything the app serves.
 
-  None protects every path when the local package contract cannot be read.
+  A trailing slash protects a whole directory: the asset route serves every
+  file below SERVED_STATIC_DIR, declared or not. None protects every path
+  when the local package contract cannot be read.
   """
   try:
     raw = app_git.read_blob(source_dir, app_git.LOCAL_BRANCH, "mobius.json") or b""
@@ -1305,12 +1353,9 @@ def _update_package_paths(
     json.JSONDecodeError, ManifestContractError, RecursionError,
   ):
     return None
-  paths = {"mobius.json"}
+  paths = {"mobius.json", f"{managed_paths.SERVED_STATIC_DIR}/"}
   for side in (incoming_manifest, local_manifest):
     paths.update(package_input_paths(side))
-    paths.update(
-      f"static/{dest}" for dest in static_asset_entries(side.get("static_assets"))
-    )
   return paths
 
 
@@ -1331,7 +1376,9 @@ async def _kept_local_bundle_unchanged(
   )
   if source_check.errors:
     return False
-  with tempfile.TemporaryDirectory(prefix="mobius-ancillary-check-") as temp:
+  # Creation and removal touch disk; keep both off the event loop.
+  temp = await asyncio.to_thread(tempfile.mkdtemp, prefix="mobius-ancillary-check-")
+  try:
     root = Path(temp).resolve() / "source"
     output = Path(temp) / "bundle.js"
 
@@ -1372,6 +1419,8 @@ async def _kept_local_bundle_unchanged(
       raise HTTPException(503, "JavaScript builder is busy; retry the update.") from exc
     except (RuntimeError, OSError, UnicodeError, KeyError, HTTPException):
       return False
+  finally:
+    await asyncio.to_thread(shutil.rmtree, temp, ignore_errors=True)
 
 
 def committed_pending_resolution(
@@ -1712,6 +1761,7 @@ def _verify_git_install_candidate(
           "reviewed. Refresh the update and try again."
         ),
         "reason": reason,
+        "retryable": True,
       },
     )
 
@@ -1783,7 +1833,7 @@ async def clear_pending_conflict_update(db: Session, app: models.App) -> None:
   app.conflict_resolver_chat_id = None
   app.conflict_resolver_upstream_commit = None
   db.commit()
-  await asyncio.to_thread(_drop_pending_update_worktree, source_dir)
+  await _to_completion(_drop_pending_update_worktree, source_dir)
   shutil.rmtree(
     Path(source_dir) / ".git" / _PENDING_UPDATE_DIR,
     ignore_errors=True,
@@ -2382,9 +2432,7 @@ def validate_manifest_address(
   if manifest_url is None:
     return
   _, bound_id = requested_manifest_source(manifest_url)
-  if bound_id is None:
-    return
-  if db is not None:
+  if db is not None and bound_id is not None:
     existing = _find_install_identity_row(
       db, source_url=manifest_url, manifest_id=bound_id,
     )
@@ -2445,10 +2493,7 @@ async def preview_manifest_capabilities(
   db: Session | None = None,
 ) -> tuple[dict, str, dict, str]:
   """Return the validated manifest/base and its canonical review contract."""
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT,
-    follow_redirects=False,
-  ) as cli:
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
     loaded, normalized_base = await _fetch_and_validate_manifest(
       cli,
       manifest_url=manifest_url,
@@ -2786,55 +2831,186 @@ def read_git_package_summary(
 def git_source_error(
   outcome: str, exc: BaseException, *,
   code: str = "git_update_unavailable", failure: str = "",
+  retryable: bool = False,
 ) -> HTTPException:
   """The owner-facing 409 for a Git source that could not be used.
 
   A transfer exceeding its wall-clock ceiling is reported as a timeout,
-  distinct from a missing or unverifiable source.
+  distinct from a missing or unverifiable source. ``retryable`` marks a
+  failure the same request may later get past unchanged; bootstrap retries it.
   """
   if isinstance(exc, app_git.GitTransferTimeout):
     code = "git_transfer_timeout"
     failure = f"The app's Git transfer timed out: {exc}."
     outcome = f"{outcome} Retrying on a steadier connection may help."
-  return HTTPException(409, detail={"code": code, "message": f"{failure} {outcome}".strip()})
+    retryable = True
+  elif isinstance(exc, app_git.HistoryIncomplete):
+    log.warning("install: %s", exc)  # Names the refs; the owner text does not.
+    failure = (
+      "The app's Git history is incomplete, so the update can't be merged "
+      "safely; retry when its source is reachable."
+    )
+    retryable = True
+  return HTTPException(409, detail={
+    "code": code, "message": f"{failure} {outcome}".strip(), "retryable": retryable,
+  })
 
 
-def _fetch_git_package_commit(source_dir: str | Path, source_url: str) -> str:
-  repo_ref = _derive_repo_ref(source_url)
-  if repo_ref is None:
-    raise ValueError("update source is not a root Git repository package")
-  expected_origin, ref = repo_ref
-  actual_origin = app_git.origin_url(source_dir)
-  normalize = lambda value: value.rstrip("/").removesuffix(".git").lower()
-  if actual_origin is None or normalize(actual_origin) != normalize(expected_origin):
-    raise ValueError("installed Git origin does not match update source")
-  return app_git.fetch_origin_ref(source_dir, ref)
+def git_transfer_root() -> Path:
+  """Private staging for Git transfers; swept at boot, never a live app."""
+  return Path(get_settings().data_dir) / "apps" / ".git-transfers"
 
 
-def fetch_git_install_candidate(
-  source_dir: str | Path,
-  source_url: str,
-  *,
-  source_identity: str | None = None,
-  strict: bool = True,
-) -> GitInstallCandidate:
-  """Fetch one Git ref, then read the complete package from its exact commit."""
-  commit = _fetch_git_package_commit(source_dir, source_url)
-  return read_git_install_candidate(
-    source_dir,
-    commit,
-    source_url,
-    source_identity=source_identity,
-    strict=strict,
+def discard_staged(staged: app_git.Staged | None) -> None:
+  if staged is not None:
+    shutil.rmtree(staged.path, ignore_errors=True)
+
+
+# Transfers may each hold a thread for the full transfer ceiling, so they get
+# their own small pool instead of the default one the rest of the server uses.
+_GIT_TRANSFER_WORKERS = 4
+_TRANSFER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+  max_workers=_GIT_TRANSFER_WORKERS, thread_name_prefix="git-transfer",
+)
+
+
+async def _stage(stage: Callable[..., app_git.Staged], *args) -> app_git.Staged:
+  """Run a staging transfer; a cancelled caller still discards its result.
+
+  The transfer thread cannot be interrupted, so cancellation hands its
+  eventual staging directory to a callback instead of leaking it on disk.
+  """
+  loop = asyncio.get_running_loop()
+  transfer = loop.run_in_executor(
+    _TRANSFER_EXECUTOR, functools.partial(stage, *args),
   )
+  try:
+    return await asyncio.shield(transfer)
+  except asyncio.CancelledError:
+    transfer.add_done_callback(
+      lambda done: not done.cancelled() and done.exception() is None
+      and loop.run_in_executor(None, discard_staged, done.result())
+    )
+    raise
 
 
-def fetch_git_package_summary(
-  source_dir: str | Path, source_url: str, *, strict: bool = False,
-) -> GitPackageSummary:
-  """Fetch a discovery candidate under the same origin guard as installation."""
-  commit = _fetch_git_package_commit(source_dir, source_url)
-  return read_git_package_summary(source_dir, commit, strict=strict)
+async def _to_completion(function: Callable, *args):
+  """Run a thread that must finish before its caller releases a lock."""
+  return await _settle_before_cancel(asyncio.to_thread(function, *args))
+
+
+async def _settle_before_cancel(work: Awaitable):
+  """Await ``work`` to its end even if the caller is cancelled meanwhile.
+
+  Cancelling an ``asyncio.to_thread`` await does not stop its thread. A
+  cancelled caller re-raises only once ``work`` settles, so it never releases a
+  lock or rolls back under writes that are still running.
+  """
+  work = asyncio.ensure_future(work)
+  cancelled = False
+  while not work.done():
+    try:
+      await asyncio.wait({work})
+    except asyncio.CancelledError:
+      cancelled = True
+  if cancelled:
+    # The caller's outcome is its cancellation, so nobody takes ``work``'s.
+    outcome = None if work.cancelled() else work.exception()
+    if isinstance(outcome, _UncheckedPythonTree):
+      outcome.discard()  # An install's hand-off that will never be checked.
+    elif isinstance(outcome, HTTPException):
+      log.info("Work refused after its caller was cancelled: %s", outcome.detail)
+    elif outcome is not None:
+      log.error(
+        "Work failed after its caller was cancelled", exc_info=outcome,
+      )
+    raise asyncio.CancelledError
+  return work.result()
+
+
+async def stage_package_clone(
+  manifest_url: str, *, db: Session | None = None,
+) -> app_git.Staged | None:
+  """The pre-lock Git step of a URL install: clone the package's repository.
+
+  Returns None for a package that is not a root Git repository. An owner
+  request passes ``db``: the manifest is validated first, with the stored
+  address checks the preview uses, so a missing or invalid package is reported
+  before any history is transferred, and the connection is released before
+  the transfer.
+  """
+  repo_ref = _derive_repo_ref(manifest_url)
+  if repo_ref is None:
+    return None
+  if db is not None:
+    await preview_manifest_capabilities(
+      manifest_url=manifest_url, manifest=None, raw_base=None, db=db,
+    )
+    db.rollback()
+  return await _stage(app_git.stage_clone, *repo_ref, git_transfer_root())
+
+
+# One transfer per (repository, origin, ref) at a time; concurrent requests,
+# such as parallel Store update checks, share it instead of repeating it.
+_FETCHES: dict[tuple[str, str, str], asyncio.Future] = {}
+
+
+def _forget_fetch(key: tuple[str, str, str], done: asyncio.Future) -> None:
+  if _FETCHES.get(key) is done:
+    del _FETCHES[key]
+  if not done.cancelled():
+    done.exception()  # Retrieved even when every waiting request has gone.
+
+
+async def fetch_app_commit(
+  source_dir: str | Path, ref: str, *, expected_origin: str | None = None,
+) -> str:
+  """Make ``ref``'s commit present, with full history, in an app repository.
+
+  Callers hold no app lock: the transfer runs in a private staging repository
+  and only the local import takes this app's source lock, after checking the
+  repository and its origin are still the ones the transfer started from.
+  """
+  repo = Path(source_dir)
+  url = await asyncio.to_thread(app_git.origin_url, repo)
+  if expected_origin is not None and not app_git.same_origin(url, expected_origin):
+    raise ValueError("installed Git origin does not match update source")
+  present = await asyncio.to_thread(app_git.present_commit, repo, ref)
+  if present is not None:
+    return present
+  if url is None:
+    raise RuntimeError("source repository has no origin")
+  key = (str(repo.resolve()), url, ref)
+  shared = _FETCHES.get(key)
+  if shared is None or shared.get_loop() is not asyncio.get_running_loop():
+    shared = asyncio.ensure_future(_fetch_and_import(repo, url, ref))
+    _FETCHES[key] = shared
+    shared.add_done_callback(lambda done: _forget_fetch(key, done))
+  # A request that goes away leaves the shared transfer running for the rest.
+  return await asyncio.shield(shared)
+
+
+async def _fetch_and_import(repo: Path, url: str, ref: str) -> str:
+  staged = await _stage(app_git.stage_fetch, repo, url, ref, git_transfer_root())
+  try:
+    async with fs_locks.source_dir_lock(str(repo)):
+      return await _to_completion(app_git.import_staged, repo, staged)
+  finally:
+    await _to_completion(discard_staged, staged)
+
+
+def _url_update_commit(
+  repo: Path, ref: str, staged_clone: app_git.Staged | None,
+) -> str:
+  """The URL update's commit, imported from its staged clone or already here."""
+  if staged_clone is not None:
+    return app_git.import_staged(repo, staged_clone)
+  present = app_git.present_commit(repo, ref)
+  if present is None:
+    raise HTTPException(
+      409, "The app's Git update must be fetched before it is installed.",
+    )
+  return present
 
 
 def install_candidate_content_digest(candidate: InstallCandidate) -> str:
@@ -2929,10 +3105,7 @@ async def _fetch_install_candidate(
   db: Session | None = None,
 ) -> InstallCandidate:
   """Fetch every install input once and enforce all review/replay guards."""
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT,
-    follow_redirects=False,
-  ) as cli:
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
     manifest, raw_base = await _fetch_and_validate_manifest(
       cli,
       manifest_url=manifest_url,
@@ -3137,10 +3310,7 @@ async def _authorize_source_handoff(
   package_id = target.package_id
   if existing is None or not package_id or not existing.manifest_url:
     raise HTTPException(409, "App source changed without a trusted handoff.")
-  async with httpx.AsyncClient(
-    timeout=_HTTP_TIMEOUT,
-    follow_redirects=False,
-  ) as cli:
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
     # The old row's own address is fetched without the stored id binding:
     # trust here comes from `package_id` + `moved_to`, and a `package_id` app
     # may have changed its manifest id without `previous_id`.
@@ -3203,14 +3373,6 @@ def _select_install_target(
       db, source_url=previous_source, manifest_id=manifest_id,
     )
 
-  if existing is not None and existing.package_id is not None:
-    if package_id is None:
-      raise HTTPException(
-        409, "This installed app requires its permanent package identity.",
-      )
-    if existing.package_id != package_id:
-      raise HTTPException(409, "Permanent package identity changed.")
-
   adopting_previous_id = False
   origin_migration = None
   if existing is None:
@@ -3249,6 +3411,14 @@ def _select_install_target(
         adopting_previous_id = True
       else:
         origin_migration = None
+
+  # Every resolved row, including a previous_id predecessor, keeps its
+  # permanent package identity.
+  if existing is not None:
+    try:
+      require_permanent_package(manifest, existing.package_id)
+    except ValueError as exc:
+      raise HTTPException(409, str(exc)) from exc
 
   if (
     existing is not None
@@ -3827,6 +3997,10 @@ class _UncheckedPythonTree(Exception):
     self.runtime = runtime
     self.app_id = app_id
 
+  def discard(self) -> None:
+    """Remove the handed-out runtime copy once checked, or once abandoned."""
+    shutil.rmtree(self.runtime.root, ignore_errors=True)
+
 
 async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPythonTree:
   """Build or reuse the env and smoke-run the exact reconciled tree, unlocked."""
@@ -3846,7 +4020,7 @@ async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPyth
       500, "Install failed due to an unexpected server error.",
     ) from exc
   finally:
-    shutil.rmtree(pending.runtime.root, ignore_errors=True)
+    pending.discard()
   return CheckedPythonTree(tree_oid=pending.tree_oid, env=env)
 
 
@@ -4120,6 +4294,7 @@ async def install_from_manifest(
   expected_upstream_commit: str | None = None,
   expected_candidate_digest: str | None = None,
   publication_handoff_app_id: int | None = None,
+  staged_clone: app_git.Staged | None = None,
 ) -> InstallResult:
   """Return a structured durable install/update/conflict outcome.
 
@@ -4144,6 +4319,9 @@ async def install_from_manifest(
 
   The per-app git model is unconditional. Every installed app has a canonical
   source directory and repository; updates never overwrite source blindly.
+  Callers hold the lifecycle lock, so this never touches the network: a root
+  Git package arrives as ``staged_clone`` (from ``stage_package_clone``) or as a
+  commit already made present by ``fetch_app_commit``.
 
   Failure modes:
     - Pre-commit failures (manifest fetch, validation, JSX compile,
@@ -4334,13 +4512,16 @@ async def install_from_manifest(
     reviewed_upstream_commit=reviewed_upstream_commit,
     expected_upstream_commit=expected_upstream_commit,
     publication_handoff_app_id=publication_handoff_app_id,
+    staged_clone=staged_clone,
   )
+  # Each pass holds the source lock across many Git threads and rolls back on
+  # failure, so a cancelled caller waits for the pass to settle on its own.
   try:
-    return await install_candidate(python_check=None)
+    return await _settle_before_cancel(install_candidate(python_check=None))
   except _UncheckedPythonTree as unchecked:
     pending = unchecked
   python_check = await _check_reconciled_python(pending)
-  return await install_candidate(python_check=python_check)
+  return await _settle_before_cancel(install_candidate(python_check=python_check))
 
 
 async def _install_candidate(
@@ -4353,6 +4534,7 @@ async def _install_candidate(
   reviewed_upstream_commit: str | None,
   expected_upstream_commit: str | None,
   publication_handoff_app_id: int | None,
+  staged_clone: app_git.Staged | None,
   python_check: CheckedPythonTree | None,
 ) -> InstallResult:
   """Reconcile and activate one selected candidate in one transaction.
@@ -4611,8 +4793,21 @@ async def _install_candidate(
           cloned_update = await asyncio.to_thread(
             app_git.has_origin, git_source_dir,
           )
-        elif reviewed_upstream_commit is not None:
+        elif reviewed_upstream_commit is not None or (
+          repo_ref is not None
+          and await asyncio.to_thread(app_git.has_origin, git_source_dir)
+        ):
           try:
+            if reviewed_upstream_commit is not None:
+              upstream_sha = reviewed_upstream_commit
+            else:
+              upstream_sha = await _to_completion(
+                _url_update_commit, git_source_dir, repo_ref[1], staged_clone,
+              )
+              await asyncio.to_thread(
+                _verify_git_install_candidate,
+                git_source_dir, upstream_sha, candidate,
+              )
             previous_tree = await asyncio.to_thread(
               app_git.read_ref_tree,
               git_source_dir,
@@ -4627,11 +4822,11 @@ async def _install_candidate(
               await asyncio.to_thread(
                 app_git.replace_upstream_ref,
                 git_source_dir,
-                reviewed_upstream_commit,
+                upstream_sha,
                 expected_sha=prev_upstream_commit,
               )
               promoted = app_git.FetchUpstreamResult(
-                sha=reviewed_upstream_commit,
+                sha=upstream_sha,
                 allow_unrelated_histories=True,
               )
               git_merge_base_override = prev_upstream_commit
@@ -4639,14 +4834,14 @@ async def _install_candidate(
               promoted = await asyncio.to_thread(
                 app_git.promote_upstream,
                 git_source_dir,
-                reviewed_upstream_commit,
+                upstream_sha,
                 trusted_origin_adoption=target.trusted_origin,
               )
           except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
             raise git_source_error(
               "The installed version was left unchanged.",
               exc,
-              failure="The reviewed Git update could not be applied.",
+              failure="The app's Git update could not be applied.",
             ) from exc
           app.upstream_commit = promoted.sha
           allow_unrelated_histories = (
@@ -4654,67 +4849,6 @@ async def _install_candidate(
             or promoted.allow_unrelated_histories
           )
           cloned_update = True
-        elif repo_ref is not None and await asyncio.to_thread(
-          app_git.has_origin, git_source_dir,
-        ):
-          _, ref = repo_ref
-          previous_tree = await asyncio.to_thread(
-            app_git.read_ref_tree,
-            git_source_dir,
-            app_git.UPSTREAM_BRANCH,
-          )
-          synthetic_baseline = bool(
-            prev_upstream_commit
-          ) and replaces_migration_bridge(
-            previous_tree, trusted_origin=target.trusted_origin,
-          )
-          if synthetic_baseline:
-            try:
-              fetched_sha = await asyncio.to_thread(
-                app_git.fetch_origin_ref, git_source_dir, ref,
-              )
-              await asyncio.to_thread(
-                _verify_git_install_candidate,
-                git_source_dir, fetched_sha, candidate,
-              )
-            except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-              raise git_source_error(
-                "The installed version was left unchanged.",
-                exc,
-                failure="The app's Git update could not be fetched or verified.",
-              ) from exc
-            await asyncio.to_thread(
-              app_git.replace_upstream_ref,
-              git_source_dir,
-              fetched_sha,
-              expected_sha=prev_upstream_commit,
-            )
-            app.upstream_commit = fetched_sha
-            git_merge_base_override = prev_upstream_commit
-            cloned_update = True
-          else:
-            try:
-              fetched_upstream = await asyncio.to_thread(
-                app_git.fetch_upstream,
-                git_source_dir,
-                ref,
-                trusted_origin_adoption=target.trusted_origin,
-                verify=lambda commit: _verify_git_install_candidate(
-                  git_source_dir, commit, candidate,
-                ),
-              )
-            except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-              raise git_source_error(
-                "The installed version was left unchanged.",
-                exc,
-                failure="The app's Git update could not be fetched or verified.",
-              ) from exc
-            app.upstream_commit = fetched_upstream.sha
-            allow_unrelated_histories = (
-              allow_unrelated_histories
-              or fetched_upstream.allow_unrelated_histories
-            )
-            cloned_update = True
         if expected_upstream_commit is not None:
           new_upstream_paths = await asyncio.to_thread(
             _read_upstream_source_paths, git_source_dir,
@@ -4954,11 +5088,15 @@ async def _install_candidate(
         # URLs without a derivable origin remain supported: their fetched
         # source is imported into a local Git repository below.
         if repo_ref is not None:
-          repo_url, ref = repo_ref
-          try:
-            app.upstream_commit = await asyncio.to_thread(
-              app_git.clone_upstream, git_source_dir, repo_url, ref,
+          if staged_clone is None:
+            raise HTTPException(
+              409, "The app's Git repository must be fetched before install.",
             )
+          try:
+            journal.rollback_actions.append(await _to_completion(
+              app_git.adopt_clone, staged_clone, git_source_dir,
+            ))
+            app.upstream_commit = staged_clone.sha
             await asyncio.to_thread(
               _verify_git_install_candidate,
               git_source_dir, app.upstream_commit, candidate,
@@ -4976,6 +5114,7 @@ async def _install_candidate(
               code="git_install_unavailable",
               failure="The app's Git repository could not be cloned or verified; "
               "retry when its source is available.",
+              retryable=True,
             ) from exc
         if not cloned_install:
           # record the pristine source tree on `upstream`, then align the
@@ -5192,12 +5331,11 @@ async def _install_candidate(
     db.rollback()
     journal.rollback_materialization()
     raise HTTPException(422, _compile_error_detail(app_name, exc))
-  except app_git.GitTransferTimeout as exc:
+  except app_git.HistoryIncomplete as exc:
     db.rollback()
     journal.rollback_materialization()
     raise git_source_error(
-      "The installed version was left unchanged.",
-      exc,
+      "The installed version was left unchanged.", exc,
     ) from exc
   except (HTTPException, _UncheckedPythonTree):
     db.rollback()

@@ -505,6 +505,12 @@ class UpdateCandidatePreviewOut(BaseModel):
   source_digest: str = Field(
     min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$",
   )
+  # Mirrors update-check's pending_update_state so the Store can surface a
+  # conflict warning during review rather than letting the install attempt
+  # fail or silently re-create the resolver.
+  pending_update_state: Literal[
+    "none", "needs_resolution", "replay_pending", "unknown",
+  ] = "none"
 
 
 class UpdateCheckOut(BaseModel):
@@ -675,6 +681,10 @@ class ChatCompactRequest(BaseModel):
   """Optional owner guidance for one manual chat compaction."""
 
   instructions: str | None = Field(default=None, max_length=4000)
+  # An explicit request identity opts into manual, resumable batches. Old
+  # bodyless clients retain their bounded one-request compaction contract.
+  batch_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+  recovery_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
   @field_validator("instructions")
   @classmethod
