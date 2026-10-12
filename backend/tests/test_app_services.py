@@ -972,7 +972,6 @@ def _compact(value, encoding="utf-8", ensure_ascii=False):
 _LEGACY_DENSE_AND_DEEP = {
   "dense-ints": list(range(300_000)),
   "deep": _nested(70),
-  "dense-floats": [i + 0.5 for i in range(300_000)],
   "dense-literals": [True, False, None] * 100_000,
   "dense-empties": [[], {}] * 110_000,
   "wide-object": {f"k{i}": i for i in range(100_000)},
@@ -1071,14 +1070,90 @@ async def test_retained_depth_matches_the_lexical_scan_at_its_exact_bound():
   assert app_services._admitted_exchange_cost == 0
 
 
+async def _number_work_verdicts(value):
+  """The HTTP (lexical) and materialized (retain) verdicts for one compact body."""
+  raw = _compact(value)
+  verdicts = []
+  for source in ("http", "materialized"):
+    try:
+      with app_services.ServiceExchangeAdmission(60 * MIB) as admission:
+        if source == "http":
+          admission.admit_received(len(raw))
+          await admission.decode(raw)
+        else:
+          await admission.retain(value)
+    except HTTPException as exc:
+      verdicts.append(exc.detail)
+    else:
+      verdicts.append("accepted")
+  assert app_services._admitted_exchange_cost == 0
+  return verdicts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value,expected", [
+  (list(range(300_000)), "accepted"),
+  (list(range(500_000)), "structural"),
+  # Each 24-character float measured up to 18.6 small-int elements to parse.
+  ([-1.2345678901234567e-300 * (i + 1) for i in range(10_000)], "accepted"),
+  ([-1.2345678901234567e-300 * (i + 1) for i in range(40_000)], "structural"),
+  # 4300 digits is the stdlib's limit; each measured about 1,300 elements.
+  ([int("9" * 4300)] * 50, "accepted"),
+  ([int("9" * 4300)] * 400, "structural"),
+], ids=["300k-ints", "500k-ints", "10k-long-floats", "40k-long-floats", "50-4300-digit-ints", "400-4300-digit-ints"])
+async def test_compact_number_work_has_one_verdict_over_http_and_materialized(value, expected):
+  verdicts = await _number_work_verdicts(value)
+  if expected == "accepted":
+    assert verdicts == ["accepted", "accepted"]
+  else:
+    assert verdicts == [
+      "App service request structural resource limit exceeded.",
+      "App service request structural resource limit exceeded.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_redundant_number_text_costs_more_only_over_http():
+  # Whitespace and longer spellings are parse work the raw text really holds;
+  # the materialized value is charged on its compact form only.
+  raw = b"[" + b"1.00000000000000000000e0 ,  " * 30_000 + b"1]"
+  value = json.loads(raw)
+  with pytest.raises(HTTPException):
+    with app_services.ServiceExchangeAdmission(60 * MIB) as admission:
+      await admission.decode(raw)
+  with app_services.ServiceExchangeAdmission(60 * MIB) as admission:
+    await admission.retain(value)
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split", [1, 2, 3, 2150, 4299])
+async def test_number_split_across_scan_chunks_is_charged_as_one_token(monkeypatch, split):
+  # A 4300-digit int is quadratic work; a chunk boundary inside it must not
+  # turn it into two cheaper tokens. Halves would cost at least one unit less.
+  token = b"9" * 4300
+  raw = b"[" + b" " * (64 * 1024 - 1 - split) + token + b"]"
+  assert raw[64 * 1024 - split:64 * 1024] == token[:split]
+  units = 1 + len(raw) // app_services._JSON_BARE_CHARS_PER_UNIT + app_services._json_number_work(4300, False)
+  monkeypatch.setattr(app_services, "MAX_JSON_STRUCTURE", units)
+  with app_services.ServiceExchangeAdmission(MIB) as admission:
+    assert await admission.decode(raw) == [int(token)]
+  monkeypatch.setattr(app_services, "MAX_JSON_STRUCTURE", units - 1)
+  with pytest.raises(HTTPException) as caught:
+    with app_services.ServiceExchangeAdmission(MIB) as admission:
+      await admission.decode(raw)
+  assert caught.value.detail == "App service request structural resource limit exceeded."
+  assert app_services._admitted_exchange_cost == 0
+
+
 def _resource_corpus():
   n = 40_000
   return {
     "small-ints": b"[" + b"0," * n + b"0]",
     "large-ints": _compact([2 ** 62 + i for i in range(n)]),
     "long-int": _compact(int("9" * 4000)),
-    "floats": _compact([i + 0.5 for i in range(n)]),
-    "float-render-expansion": b"[" + b"1e15," * n + b"1e15]",
+    "floats": _compact([i + 0.5 for i in range(n // 4)]),
+    "float-render-expansion": b"[" + b"1e15," * (n // 4) + b"1e15]",
     "literals": _compact([True, False, None] * (n // 3)),
     "empty-lists": b"[" + b"[]," * n + b"[]]",
     "empty-objects": b"[" + b"{}," * n + b"{}]",
@@ -1095,82 +1170,242 @@ def _resource_corpus():
     "ascii-then-astral-escape": _compact("x" * 400_000 + "\n😀"),
     "bmp-then-astral": _compact("x" * 400_000 + "雪😀"),
     "astral-only": _compact("x" * 400_000 + "😀"),
+    "emoji-every-chunk": _compact(["x" * 4000 + "雪😀"] * 100),
     "latin1": _compact("é" * 200_000),
+    "utf-8-bom": b"\xef\xbb\xbf" + _compact({"items": ["QUJD" * 1000], "caption": "雪😀"}),
     "utf-16": _compact(["雪😀", "x"] * n, "utf-16"),
-    "utf-32": _compact(["é", 1.5] * n, "utf-32"),
-    "base64-media": _compact({"items": ["QUJD" * 250_000] * 2, "caption": "😀"}),
+    "utf-16-le-no-bom": _compact(["雪😀", "x"] * n, "utf-16-le"),
+    "utf-32": _compact(["é", 1.5] * (n // 4), "utf-32"),
+    "base64-media-mixed-caption": _compact({"items": ["QUJD" * 250_000] * 2, "caption": "雪😀"}),
+    "binary-with-unicode-metadata": _compact({
+      "body_base64": "QUJD" * 250_000, "media_type": "image/gif", "headers": {"x-note": "雪😀"},
+    }),
     "pretty-printed": json.dumps({"rows": [{"id": i, "v": [i]} for i in range(n // 4)]}, indent=4).encode(),
   }
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("shape", sorted(_resource_corpus()))
-async def test_decode_estimates_cover_measured_stdlib_allocation_peaks(shape):
-  """Estimates are upper bounds of what stdlib JSON actually allocates.
+async def test_decode_estimates_cover_measured_allocation_peaks(shape):
+  """Each phase's reservation bounds what it actually allocates.
 
-  The raw bytes are excluded (transfer owns them). A request's decode must
-  cover json.loads' peak and retain() its surviving tree. A response's must
-  also cover that tree while it renders; three stdout copies (transfer) cover
-  the rendered text and bytes.
+  Raw bytes are excluded (transfer owns them). The measured decode is the
+  real scan, Unicode copy and stdlib parse; retain() must cover the surviving
+  tree; a response's estimate plus three stdout copies must cover the tree
+  while it renders; rendering is byte-identical to Starlette's JSONResponse.
   """
   import gc
   import tracemalloc
   from starlette.responses import JSONResponse
 
   raw = _resource_corpus()[shape]
+  # Exclude one-time codec module imports from the first measurement.
   with app_services.ServiceExchangeAdmission(60 * MIB) as admission:
-    await admission.decode_response(raw)
-    response_estimate = admission.response_cost
-  with app_services.ServiceExchangeAdmission(60 * MIB) as admission:
-    value = await admission.decode(raw)
-    request_estimate = admission.request_cost
-    await admission.retain(value)
-    retained_estimate = admission.request_cost
-  del value
+    await admission.decode(raw)
+  for direction in ("request", "response"):
+    gc.collect()
+    with app_services.ServiceExchangeAdmission(60 * MIB) as admission:
+      tracemalloc.start()
+      try:
+        value = await (admission.decode(raw) if direction == "request" else admission.decode_response(raw))
+        decode_peak = tracemalloc.get_traced_memory()[1]
+        # Scan chunks, the Unicode copy and parsing, never released early.
+        estimate = admission.request_cost if direction == "request" else admission.response_cost
+        assert decode_peak <= estimate, direction
+        if direction == "request":
+          await admission.retain(value)
+          retained = admission.request_cost
+        else:
+          tracemalloc.reset_peak()
+          rendered = await app_services.render_json(value)
+          _current, render_peak = tracemalloc.get_traced_memory()
+          assert render_peak <= estimate + 3 * len(raw)
+      finally:
+        tracemalloc.stop()
+    print(f"{shape} {direction}: {len(raw)} bytes, decode peak {decode_peak} <= {estimate}")
+    del value
+  # The parsed tree alone, measured away from the event loop's own allocations.
   gc.collect()
   tracemalloc.start()
   try:
     value = json.loads(raw)
-    tree, decode_peak = tracemalloc.get_traced_memory()
-    tracemalloc.reset_peak()
-    rendered = JSONResponse(value).body
-    _current, render_peak = tracemalloc.get_traced_memory()
+    tree = tracemalloc.get_traced_memory()[0]
   finally:
     tracemalloc.stop()
-  assert decode_peak <= request_estimate <= response_estimate
-  assert tree <= retained_estimate
-  assert render_peak <= response_estimate + 3 * len(raw)
-  assert json.loads(rendered) == value
-  print(
-    f"{shape}: {len(raw)} bytes, decode peak {decode_peak} <= {request_estimate}, "
-    f"tree {tree} <= retained {retained_estimate}, "
-    f"render peak {render_peak} <= {response_estimate + 3 * len(raw)}"
-  )
+  assert tree <= retained
+  assert rendered == JSONResponse(value).body
   assert app_services._admitted_exchange_cost == 0
 
 
-def test_http_unicode_decode_widening_beyond_budget_rejects_before_materialization(
-  client, auth, db, monkeypatch,
-):
-  # A BMP character then an astral one makes stdlib decoding hold a UCS2 and a
-  # UCS4 buffer sized by the byte count at once: six times this ~59 MB body,
-  # beyond the unchanged 320 MiB decode budget, before any tree is built.
-  app = _service_app(db, max_bytes=60 * MIB)
-  encoded = "QUJD" * (7 * MIB)
-  raw = _compact({"items": [encoded, encoded], "caption": "雪😀"})
-  assert 5 * len(raw) <= app_services.MAX_JSON_DECODE_COST < 6 * len(raw)
+@pytest.mark.parametrize("value", [
+  {"a": [1, -0.0, 1e15, 5e-324, 1.7976931348623157e308, True, None], "é": "雪😀 \x00\"\\/"},
+  "x" * 70_000 + "😀", [[]] * 20_000, int("9" * 4300), _nested(app_services.MAX_JSON_DEPTH),
+], ids=["scalars", "wide-string", "dense", "long-int", "deep"])
+def test_part_rendering_is_byte_identical_to_json_response(value):
+  from starlette.responses import JSONResponse
+
+  assert asyncio.run(app_services.render_json(value)) == JSONResponse(value).body
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("nan"), {"k": ["\ud800"]}])
+def test_part_rendering_raises_what_json_response_raises(value):
+  from starlette.responses import JSONResponse
+
+  with pytest.raises(Exception) as default:
+    JSONResponse(value)
+  with pytest.raises(default.type):
+    asyncio.run(app_services.render_json(value))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ["request", "response"])
+async def test_huge_wide_scalar_rejects_before_any_unicode_copy_or_parse(monkeypatch, direction):
+  import tracemalloc
+
+  # One astral character makes this string four bytes per character in the
+  # text and in the parsed value: more than the decode budget holds.
+  raw = _compact("x" * (58 * MIB) + "😀")
   real_loads = json.loads
-
-  def guarded_loads(value, *args, **kwargs):
-    if isinstance(value, bytes) and len(value) == len(raw):
-      pytest.fail("over-budget body reached the stdlib decoder")
-    return real_loads(value, *args, **kwargs)
-
-  monkeypatch.setattr(app_services.json, "loads", guarded_loads)
-  response = client.post(f"/api/apps/{app.id}/service/echo", headers=auth, content=raw)
-  assert response.status_code == 413
-  assert response.json()["detail"] == "App service request decoded resource limit exceeded."
+  monkeypatch.setattr(app_services.json, "loads", lambda *_a, **_k: pytest.fail("parsed"))
+  tracemalloc.start()
+  try:
+    with pytest.raises(HTTPException) as caught:
+      with app_services.ServiceExchangeAdmission(60 * MIB) as admission:
+        await (admission.decode(raw) if direction == "request" else admission.decode_response(raw))
+    peak = tracemalloc.get_traced_memory()[1]
+  finally:
+    tracemalloc.stop()
+    monkeypatch.setattr(app_services.json, "loads", real_loads)
+  assert caught.value.detail.endswith("decoded resource limit exceeded.")
+  # Only the reserved scan chunks existed; no wide text was joined.
+  assert peak < len(raw) + 4 * MIB
   assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_parent_mixed_caption_gallery_fits_every_phase_of_both_directions():
+  body = {"items": ["QUJD" * (7 * MIB)] * 2, "caption": "雪😀"}
+  raw = _compact(body)
+  with app_services.ServiceExchangeAdmission(60 * MIB) as admission:
+    admission.admit_received(len(raw))
+    value = await admission.decode(raw)
+    assert value == body
+    await admission.retain({"body": value})
+    admission.admit_execution(60 * MIB)
+    request = await app_services._serialize_request({"body": value}, 60 * MIB)
+    assert json.loads(request)["body"] == body
+    del request
+    admission.admit_output(raw)
+    response = await admission.decode_response(raw)
+    assert await app_services.render_json(response) == raw
+    assert admission.cost <= app_services.MAX_ADMITTED_EXCHANGE_COST
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_wide_request_serialization_is_reserved_before_its_part_is_built(db, auth, monkeypatch):
+  import tracemalloc
+  from app import service_preload
+
+  app = _service_app(db, max_bytes=60 * MIB)
+  owner = db.query(models.Owner).first()
+  monkeypatch.setattr(service_preload, "ready_host", lambda *_: None)
+  envelope = {"actor": {}, "body": ["x" * (10 * MIB) + "😀"]}
+  reserved = []
+  real_serialize = app_services._serialize_request
+
+  async def serialize(value, max_bytes):
+    reserved.append(app_services._admitted_exchange_cost)
+    tracemalloc.start()
+    try:
+      return await real_serialize(value, max_bytes)
+    finally:
+      reserved.append(tracemalloc.get_traced_memory()[1])
+      tracemalloc.stop()
+
+  async def reply(*_args):
+    return b'{"body":{"ok":true}}', b"", 0
+
+  monkeypatch.setattr(app_services, "_serialize_request", serialize)
+  monkeypatch.setattr(app_services, "_run_spawned", reply)
+  await app_services.invoke_service(app, owner, envelope, lane="tools")
+  total, peak = reserved
+  # The retained envelope is already held; encoding needs its own allowance.
+  assert total > 3 * 60 * MIB
+  assert peak <= total
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_cooperative_retain_runs_pinned_and_attributed(db, auth, monkeypatch):
+  app = _service_app(db)
+  owner = db.query(models.Owner).first()
+  seen = []
+  monkeypatch.setattr(app_services, "_validate_browser_call", lambda *_: None)
+  monkeypatch.setattr(app_services, "hold_runtime", lambda _id: seen.append("pinned") or SimpleNamespace(
+    close=lambda: seen.append("released"),
+  ))
+  async def retain(self, envelope):
+    seen.append(("retain", asyncio.current_task() in app_services._browser_calls.get("grant", ())))
+    raise HTTPException(413, "stop")
+
+  monkeypatch.setattr(app_services.ServiceExchangeAdmission, "retain", retain)
+  monkeypatch.setattr(app_services, "_actor_browser", lambda _actor: SimpleNamespace(grant_id="grant"))
+  with pytest.raises(HTTPException):
+    await app_services.invoke_service(app, owner, {"actor": {}}, lane="tools")
+  assert seen == ["pinned", ("retain", True), "released"]
+  assert "grant" not in app_services._browser_calls
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["scan", "retain"])
+async def test_cancellation_while_chunks_or_retain_walk_are_held_releases_everything(stage):
+  raw = _compact(["é雪😀" * 100] * 4000)
+  value = json.loads(raw)
+  started = asyncio.Event()
+
+  async def run():
+    with app_services.ServiceExchangeAdmission(60 * MIB) as admission:
+      admission.admit_received(len(raw))
+      if stage == "scan":
+        coro = admission.decode(raw)
+      else:
+        coro = admission.retain({"body": [value] * 60})
+      started.set()
+      await coro
+
+  task = asyncio.create_task(run())
+  await started.wait()
+  for _ in range(3):
+    await asyncio.sleep(0)
+  assert app_services._admitted_exchange_cost > 0
+  task.cancel()
+  with pytest.raises(asyncio.CancelledError):
+    await task
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_http_render_cancellation_releases_the_held_response(db, auth, monkeypatch):
+  import httpx
+  from app.main import app as application
+
+  app = _service_app(db, access="public")
+  entered = asyncio.Event()
+
+  async def blocked(_value):
+    entered.set()
+    await asyncio.Event().wait()
+
+  monkeypatch.setattr(app_services, "render_json", blocked)
+  async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as http:
+    task = asyncio.create_task(http.post(f"/api/app-services/{app.slug}/echo", json={"value": "ok"}))
+    await asyncio.wait_for(entered.wait(), 10)
+    assert app_services._admitted_exchange_cost > 0, "rendering ran outside the exchange reservation"
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
 
 
 @pytest.mark.asyncio
@@ -1229,11 +1464,8 @@ print(json.dumps({"body": [{"size": len(base64.b64decode(item)), "sha256": hashl
   gif = b"GIF89a" + b"x" * (20 * 1024 * 1024 - 6)
   encoded = base64.b64encode(gif).decode("ascii")
   items = [encoded] * (2 if shape == "gallery" else 1)
-  body = encoded if shape == "scalar" else {"items": items, "caption": "😀 snow"}
-  # ensure_ascii=False exercises the full Unicode text copy alongside base64:
-  # stdlib decoding widens a byte-sized buffer from ASCII to UCS4 (5x bytes).
-  # A BMP character before the astral one costs a sixth copy, which a gallery
-  # this size cannot fit (test_http_unicode_decode_widening_beyond_budget...).
+  body = encoded if shape == "scalar" else {"items": items, "caption": "雪😀"}
+  # ensure_ascii=False exercises the full Unicode text copy alongside base64.
   raw = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
   path = f"/api/app-services/{app.slug}/media" if public else f"/api/apps/{app.id}/service/media"
   response = client.post(path, headers=auth, content=raw)
@@ -1969,7 +2201,9 @@ async def test_cooperative_resource_scan_cancel_releases_owned_bytes(monkeypatch
   try:
     await asyncio.wait_for(scanned.wait(), 1)
     assert not task.done()
-    assert app_services._admitted_exchange_cost == 3 * len(raw)
+    # Three transfer copies plus the scan's own reservation for the chunks
+    # it holds and the next one it decodes.
+    assert app_services._admitted_exchange_cost > 3 * len(raw)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
       await task
@@ -2226,7 +2460,10 @@ async def test_http_route_ceiling_is_reserved_and_enforced_before_body_decode(
   assert all(read[1] == read[2] == 0 for read in reads)
   assert max(size for size, _public in grown) == cap
   assert all(public == (3 * size if route == "public" else 0) for size, public in grown)
-  assert executions == [(cap, 3 * cap)] * 2, "admission did not reserve the route ceiling"
+  # Three copies of the ceiling; encoding a ceiling-sized string part also
+  # holds the part, its bytes and encoder state (measured 13.2 KB at 4 KiB).
+  assert [size for size, _transfer in executions] == [cap, cap]
+  assert executions[0][1] > 13_210 and executions[1] == (cap, 3 * cap), "admission did not reserve the route ceiling"
   if framing == "understated-length":
     assert [read[3] for read in reads[:2]] == ["2", "2"]
   assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
@@ -2788,10 +3025,13 @@ print(json.dumps({"body": {"path": request["path"]}}))
 def test_http_busy_execution_answers_retry_after_and_starts_no_service(
   client, auth, db, monkeypatch, route,
 ):
-  app = _service_app(db, access="public", max_bytes=4096)
+  # A ceiling whose three copies exceed the fixed decode reservation, so the
+  # body decodes and its envelope is retained before execution is refused.
+  cap = 64 * 1024
+  app = _service_app(db, access="public", max_bytes=cap)
   started = []
   monkeypatch.setattr(app_services, "service_entry", lambda *a: started.append(True))
-  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", 3 * 4096 - 1)
+  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", 3 * cap - 1)
   path = {
     "self": f"/api/apps/{app.id}/service/echo",
     "shared": f"/api/services/{app.slug}/echo",

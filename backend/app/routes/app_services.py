@@ -24,10 +24,18 @@ SERVICE_BODY_TIMEOUT_SECONDS = 120
 _limiter = Limiter(key_func=get_remote_address, key_style="endpoint")
 
 
-def _response(status: int, body, headers: dict[str, str], media_type: str | None):
+async def _response(status: int, body, headers: dict[str, str], media_type: str | None):
+  """Construct the response while the caller's exchange admission is held.
+
+  A JSON body renders to the same bytes as JSONResponse, one part at a time
+  (app_services.render_json), within the estimate its decode reserved.
+  """
   if media_type is not None:
     return Response(body, status_code=status, headers=headers, media_type=media_type)
-  return JSONResponse(body, status_code=status, headers=headers)
+  return Response(
+    await app_services.render_json(body), status_code=status, headers=headers,
+    media_type=JSONResponse.media_type,
+  )
 
 
 def _service_app(db: Session, service_id: str) -> models.App | None:
@@ -154,7 +162,7 @@ async def authenticated_app_service(
     status, body, headers, media_type = await app_services.invoke_service(
       app, principal.owner, envelope, admission=admission,
     )
-    return _response(status, body, headers, media_type)
+    return await _response(status, body, headers, media_type)
 
 
 @router.api_route(
@@ -191,7 +199,7 @@ async def shared_app_service(
     status, body, headers, media_type = await app_services.invoke_service(
       target, principal.owner, envelope, admission=admission,
     )
-    return _response(status, body, headers, media_type)
+    return await _response(status, body, headers, media_type)
 
 
 @router.api_route(
@@ -224,4 +232,4 @@ async def public_app_service(
     status, body, headers, media_type = await app_services.invoke_service(
       app, owner, envelope, admission=admission,
     )
-    return _response(status, body, headers, media_type)
+    return await _response(status, body, headers, media_type)

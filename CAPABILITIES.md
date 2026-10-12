@@ -219,38 +219,54 @@ Adding or lowering a route ceiling narrows the service in update review;
 removing, renaming or raising one widens it.
 
 Service exchange admission also bounds decoded resources independently of
-serialized bytes, in both directions: at most 524,288 structural marks (string
-openings, container openings, commas and colons outside strings, plus one per
-24 other characters outside strings, such as number text), nesting depth 128,
-and a conservative 320 MiB decoded-resource estimate per direction. Marks
-bound the standard-library parser's and renderer's uninterruptible work, so a
-larger transfer grant buys media bytes, not denser JSON; the depth stays well
-inside the platform's own encoders and response validation. The estimate
-is the largest of the phases the standard library actually goes through:
-decoding the whole body into Unicode (a buffer sized by its bytes, copied once
-per widening from ASCII to wider characters), parsing (that text plus
-per-kind allocation bounds for each string, list, object, element, member and
-number, including container growth and the parser's key memo), and, for a
-response, holding the decoded value while it is rendered (characters at the
-widest string's width, float expansion, and UTF-8 bytes beyond three stdout
-copies). A bounded lexical scan checks these limits before the
-standard-library JSON parser materializes either the HTTP request or service
-stdout; punctuation inside strings does not consume structural marks. String
-content (including escape-heavy input) is scanned in native bounded 64 KiB
-chunks with a cooperative cancellation/yield point per chunk, rather than a
-Python iteration per escape or an uninterrupted whole-body scan. JSON syntax
-and values remain exclusively authoritative in the standard-library parser. The
-complete request envelope, including tool and policy requests, has the same
-mark, depth and decoded-cost ceilings, counted on its compact JSON form with
-the envelope itself at depth 0; its retained estimate is each value's
-`sys.getsizeof` plus allocator slack. That walk and request serialization
-yield cooperatively. Large base64 scalars, 20 MiB originals/downloads, and
-galleries fitting the reviewed 60 MiB serialized grant remain supported. Wide
-text costs more: a request mixing a non-Latin character with an astral one
-(such as an emoji) decodes through six byte-sized copies, so it is limited to
-about 53 MiB, and a response containing an astral character renders at four
-bytes per character, so it is limited to about 45 MiB (binary responses
-included, because the estimate precedes parsing).
+serialized bytes, in both directions: at most 524,288 work units, nesting
+depth 128, and a conservative 320 MiB decoded-resource estimate per direction.
+A unit is a structural mark (a string opening, container opening, comma or
+colon outside strings), 24 other characters outside strings, or a number
+token's measured extra parse cost (a float its length plus 4; an int of more
+than 83 digits its length squared over 7,000). Units bound the one
+uninterruptible standard-library call per document, the parse, so a larger
+transfer grant buys media bytes, not denser JSON; the depth stays well inside
+the platform's own encoders and response validation. A body is scanned in
+16 KiB chunks with a cooperative cancellation/yield point per chunk; punctuation
+inside strings does not consume units, and string content (including
+escape-heavy input) is scanned natively rather than one Python iteration per
+escape. The scan reserves the chunks it keeps plus the next chunk's decode
+before decoding it, then makes the Unicode text once by whichever exactly
+charged copy is cheaper: joining those chunks, or letting the standard library
+decode the bytes into a byte-sized buffer copied per widening. The remaining
+estimate covers parsing (that text plus per-kind allocation bounds for each
+string, list, object, element, member and number, including container growth
+and the parser's key memo) and, for a response, rendering. All of it is
+reserved before the standard-library parser materializes either the HTTP
+request or service stdout. JSON syntax and values remain exclusively
+authoritative in the standard-library parser.
+
+A JSON response body is rendered part by part to exactly the bytes Starlette's
+`JSONResponse` would produce, inside the exchange reservation and yielding
+between parts, so its text is never held at its widest character's width.
+Request serialization works the same way. Both reserve the growing buffer, the
+largest string part (its escaped text, held twice when it follows a list
+separator, and its UTF-8 bytes) and the encoder's per-level state before
+encoding; request serialization adds what exceeds three serialized copies to
+its execution allowance. The complete request envelope, including tool and
+policy requests, has the same unit, depth and decoded-cost ceilings, counted on
+its compact JSON form with the envelope itself at depth 0, so a compact body
+gets the same verdict over HTTP as when materialized; redundant raw text
+(whitespace, longer number spellings) is real parse work and costs more only
+over HTTP. Its retained estimate is each value's `sys.getsizeof` plus
+allocator slack, and that walk runs pinned to the accepted runtime and
+attributed to any browser grant. Large base64 scalars, 20 MiB
+originals/downloads, and galleries with Unicode captions fitting the reviewed
+60 MiB serialized grant remain supported in both directions. A single huge
+string containing a wide character is held at that width when decoded and
+again while encoded, so one beyond roughly 21 to 35 MiB (depending on
+direction and whether it is a list item) is refused before it is copied.
+Parsing a large
+Unicode document is still one uninterruptible call proportional to its bytes
+(about 0.3 s for a 58 MB gallery measured on the development host), so the
+platform does not promise event-loop responsiveness for the largest media
+bodies.
 
 One process-wide 512 MiB estimated exchange budget covers body/stdio reading,
 decoding, serialization, retained execution backlog and response handoff
@@ -266,7 +282,8 @@ a declared length over the ceiling is still refused before reading. A request
 waiting for its execution slot holds only its retained envelope estimate.
 Inside the slot, before the request is serialized or any process starts, the
 exchange reserves three times its accepted serialized ceiling for
-simultaneous raw, pipe/buffer and encoder copies. When the budget cannot hold
+simultaneous raw, pipe/buffer and encoder copies, or more when encoding its
+largest string part needs it. When the budget cannot hold
 that allowance, the call answers a retryable HTTP **503** with `Retry-After`
 and no service runs. Once the service answers, the allowance is replaced by
 three copies of its actual stdout, so finished responses awaiting handoff do
