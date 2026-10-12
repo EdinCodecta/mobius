@@ -247,12 +247,6 @@ def _settle_capture(
       os.close(stored_fd)
     return True
 
-  return _consume_inbox_capture(data_dir, chat_id, captured)
-
-
-def _consume_inbox_capture(data_dir: str, chat_id: str, captured: dict) -> bool:
-  """Remove only the original inbox inode, never a subsequent replacement."""
-  root = _chat_root(data_dir, chat_id)
   try:
     inbox_fd = _open_directory(root / "inbox", create=False)
   except OSError:
@@ -367,24 +361,37 @@ def _open_deliverable_file(
     os.close(directory_fd)
 
 
-async def publish_inbox_files(
-  sink, *, data_dir: str, chat_id: str, discard_if_full: dict | None = None,
-) -> dict[str, str]:
-  """Freeze, persist, and consume a batch; return original->recorded names.
+def add_inbox_file(data_dir: str, chat_id: str, name: str, content: bytes) -> None:
+  """Offer runtime-produced bytes as a finished deliverable.
 
-  Native provider artifacts use the receipt to distinguish actual delivery.
-  Only an explicitly owned new capture may be discarded on acknowledged full
-  capacity; owner inbox files and uncertain publications remain recoverable.
+  The inbox is published without format checks, so a partial file must never
+  appear there. Write in the private store, then rename it in whole.
   """
-  published: dict[str, str] = {}
+  root = _chat_root(data_dir, chat_id)
+  inbox_fd = _open_directory(root / "inbox", create=True)
+  stored_fd = None
+  temporary = f".{uuid.uuid4().hex}.tmp"
+  try:
+    stored_fd = _open_directory(root / "files", create=True)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=stored_fd)
+    with os.fdopen(fd, "wb") as stream:
+      stream.write(content)
+    os.rename(temporary, name, src_dir_fd=stored_fd, dst_dir_fd=inbox_fd)
+  finally:
+    if stored_fd is not None:
+      try:
+        os.unlink(temporary, dir_fd=stored_fd)
+      except FileNotFoundError:
+        pass
+      os.close(stored_fd)
+    os.close(inbox_fd)
+
+
+async def publish_inbox_files(sink, *, data_dir: str, chat_id: str) -> set[str]:
+  """Freeze, persist, and consume a batch; return the published inbox names."""
+  published: set[str] = set()
   capacity = await sink.generated_file_capacity()
-  if capacity is None:
-    return published
   if capacity <= 0:
-    if discard_if_full is not None:
-      await asyncio.to_thread(
-        _consume_inbox_capture, data_dir, chat_id, discard_if_full,
-      )
     return published
   names = (await asyncio.to_thread(_inbox_names, data_dir, chat_id))[:capacity]
   for name in names:
@@ -408,13 +415,6 @@ async def publish_inbox_files(
     await asyncio.to_thread(
       _settle_capture, data_dir, chat_id, captured, accepted=bool(outcome),
     )
-    if isinstance(outcome, str) and outcome:
-      published[name] = outcome
-  if discard_if_full is not None and discard_if_full["name"] not in published:
-    # Capacity can disappear after the initial check (or be used by older inbox
-    # entries). Recheck only after every attempted publication is settled.
-    if await sink.generated_file_capacity() == 0:
-      await asyncio.to_thread(
-        _consume_inbox_capture, data_dir, chat_id, discard_if_full,
-      )
+    if outcome:
+      published.add(name)
   return published

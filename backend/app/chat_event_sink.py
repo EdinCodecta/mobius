@@ -995,12 +995,12 @@ class ChatEventSink:
         raise RuntimeError("late generated-file commit could not settle capture")
       self._uncertain_generated_files.pop(path, None)
 
-  async def generated_file_capacity(self) -> int | None:
-    """Return available rows, or None when the capacity is unacknowledged."""
-    if not self.chat_id:
+  async def generated_file_capacity(self) -> int:
+    """Return how many files can fit before performing any disk copies."""
+    # An unresolved commit may still consume a row, and a publication behind
+    # it would only leave another frozen copy. Report no room until it settles.
+    if not self.chat_id or self._uncertain_generated_files:
       return 0
-    if self._uncertain_generated_files:
-      return None
     try:
       return int(await _await_ack(get_writer().submit(
         CheckGeneratedFileCapacity(chat_id=self.chat_id),
@@ -1010,7 +1010,7 @@ class ChatEventSink:
         "generated-file capacity check failed chat_id=%s",
         self.chat_id, exc_info=True,
       )
-      return None
+      return 0
 
   def record_lifecycle(self, event: dict) -> None:
     """Queue private lifecycle metadata without broadcasting it.

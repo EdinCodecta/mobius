@@ -264,7 +264,6 @@ export function ExpandableImage({
   const [open, setOpen] = useState(false)
   const buttonRef = useRef(null)
   const [resolvedSrc, setResolvedSrc] = useState(null)
-  const [loadState, setLoadState] = useState('loading')
   const historyDismiss = useHistoryDismiss(() => setOpen(false))
 
   const rawSrc = safeImageHref(href)
@@ -277,7 +276,7 @@ export function ExpandableImage({
   // projected into the message response. The URL remains a resource identity,
   // not a layout transport. This value is available on the first render, before
   // token resolution or image bytes, so decode can never resize the frame.
-  const dims = imageDimensionsForHref(rawSrc, mediaChatId ? mediaDimensions : null)
+  const dims = imageDimensionsForHref(rawSrc, mediaDimensions)
   const viewportClientHeight = dims
     ? ((typeof window !== 'undefined'
       && (window.visualViewport?.height || window.innerHeight)) || 800)
@@ -297,21 +296,17 @@ export function ExpandableImage({
     && imageUnreadableForHref(rawSrc, mediaDimensions)
 
   useEffect(() => {
-    setResolvedSrc(null)
-    setLoadState('loading')
-    if (!rawSrc || dimensionError) return
+    if (!rawSrc || dimensionError) { setResolvedSrc(null); return }
     let cancelled = false
     if (mediaChatId) {
       // Media path: fetch a short-lived media token, never the owner JWT in URL.
       mediaTokenParam(mediaChatId).then(param => {
         if (cancelled) return
-        if (!param) { setLoadState('error'); return }
-        const path = new URL(rawSrc, location.origin).pathname
-        // Generated files serve the original bytes; inline disposition is
-        // required in both the transcript and its expanded viewer.
-        setResolvedSrc(`${BASE}${path}${param}${path.includes('/generated-files/') ? '&preview=true' : ''}`)
-      }, () => {
-        if (!cancelled) setLoadState('error')
+        const src = `${BASE}${new URL(rawSrc, location.origin).pathname}${param}`
+        // Generated files have no display derivative (preview only selects
+        // inline delivery), so the viewer reuses the transcript's URL rather
+        // than downloading the original a second time.
+        setResolvedSrc(src.includes('/generated-files/') ? previewSrcForChatMedia(src) : src)
       })
     } else {
       // Non-media API path or external URL: use owner token (or no token for external).
@@ -345,11 +340,10 @@ export function ExpandableImage({
         type="button"
         className="md-image-frame"
         style={imageVars || undefined}
-        aria-label={loadState === 'error' ? `Image unavailable: ${alt || 'image'}` : `Open ${alt || 'image'} preview`}
-        disabled={!resolvedSrc || loadState !== 'loaded'}
-        aria-busy={loadState === 'loading'}
+        aria-label={`Open ${alt || 'image'} preview`}
+        disabled={!resolvedSrc}
         onClick={() => {
-          if (!resolvedSrc || loadState !== 'loaded') return
+          if (!resolvedSrc) return
           if (onOpen) onOpen(imageIndex, { href, src: resolvedSrc, alt })
           else {
             historyDismiss.open()
@@ -357,21 +351,17 @@ export function ExpandableImage({
           }
         }}
       >
-        {loadState === 'loading' && <span className="md-image-loading" role="status">Loading image…</span>}
-        {loadState === 'error' && <span className="md-image-loading" role="status">Image unavailable</span>}
-        {loadState !== 'error' && previewSrc && (
+        {previewSrc && (
           <img
             src={previewSrc}
             alt={alt}
             className="md-image"
             loading={loading || 'lazy'}
             decoding="async"
-            onLoad={() => setLoadState('loaded')}
-            onError={() => setLoadState('error')}
           />
         )}
       </button>
-      {!onOpen && open && resolvedSrc && loadState === 'loaded' && <ChatPanePortal anchorRef={buttonRef}>
+      {!onOpen && open && resolvedSrc && <ChatPanePortal anchorRef={buttonRef}>
         <ImageLightbox src={resolvedSrc} alt={alt} onClose={historyDismiss.close} />
       </ChatPanePortal>}
     </>

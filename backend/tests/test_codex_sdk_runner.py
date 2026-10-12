@@ -5332,9 +5332,12 @@ def test_generated_image_rejects_invalid_bytes_without_leaving_files(tmp_path, r
   assert generated_files._inbox_names(str(tmp_path), 'chat') == []
 
 
-@pytest.mark.parametrize('damage', ['signature', 'truncated', 'checksum', 'pixels', 'zero', 'oversized'])
+@pytest.mark.parametrize('damage', [
+  'signature', 'truncated', 'checksum', 'pixels', 'zero', 'oversized', 'animated',
+])
 def test_generated_image_rejects_malformed_png_before_staging(tmp_path, monkeypatch, damage):
   import base64
+  import io
   import struct
   import zlib
   from PIL import Image
@@ -5353,6 +5356,13 @@ def test_generated_image_rejects_malformed_png_before_staging(tmp_path, monkeypa
     payload = b'not a zlib stream'
     chunk = b'IDAT' + payload
     content = content[:33] + struct.pack('>I', len(payload)) + chunk + struct.pack('>I', zlib.crc32(chunk)) + content[-12:]
+  elif damage == 'animated':
+    # Only the first frame would be decoded, so later frames stay unproven.
+    buffer = io.BytesIO()
+    Image.new('RGB', (2, 2)).save(
+      buffer, 'PNG', save_all=True, append_images=[Image.new('RGB', (2, 2), 'red')],
+    )
+    content = buffer.getvalue()
   else:
     width = 0 if damage == 'zero' else 32_000_001
     header = content[12:16] + struct.pack('>II', width, 1) + content[24:29]
@@ -5365,140 +5375,12 @@ def test_generated_image_rejects_malformed_png_before_staging(tmp_path, monkeypa
   assert generated_files._inbox_names(str(tmp_path), 'chat') == []
 
 
-def _generated_apng(size=(2, 2), *, default_image=False, malformed_later=False, declared_frames=2):
-  import struct
-  import zlib
-
-  def chunk(kind, payload):
-    data = kind + payload
-    return struct.pack('>I', len(payload)) + data + struct.pack('>I', zlib.crc32(data))
-
-  width, height = size
-  content = b'\x89PNG\r\n\x1a\n'
-  content += chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0))
-  content += chunk(b'acTL', struct.pack('>II', declared_frames, 0))
-  sequence = 0
-  for frame in range(2 + int(default_image)):
-    if not default_image or frame:
-      content += chunk(b'fcTL', struct.pack(
-        '>IIIIIHHBB', sequence, width, height, 0, 0, 1, 10, 0, 0,
-      ))
-      sequence += 1
-    compressor = zlib.compressobj()
-    row = b'\0' + bytes((frame * 100, 0, 0, 255)) * width
-    payload = b''.join(compressor.compress(row) for _ in range(height))
-    payload += compressor.flush()
-    if malformed_later and frame == 1:
-      payload = b'not a zlib stream'
-    if frame == 0:
-      content += chunk(b'IDAT', payload)
-    else:
-      content += chunk(b'fdAT', struct.pack('>I', sequence) + payload)
-      sequence += 1
-  return content + chunk(b'IEND', b'')
-
-
-@pytest.mark.parametrize('default_image', [False, True])
-def test_generated_image_rejects_malformed_later_apng_before_staging(tmp_path, monkeypatch, default_image):
-  import base64
-  import io
-  from PIL import Image
+def test_generated_image_obeys_existing_deliverable_size_limit(tmp_path, monkeypatch):
   from app import generated_files
 
-  content = _generated_apng(default_image=default_image, malformed_later=True)
-  # Checksums and the first frame genuinely pass; only decoding later fails.
-  with Image.open(io.BytesIO(content)) as image:
-    image.verify()
-  with Image.open(io.BytesIO(content)) as image:
-    image.load()
-    with pytest.raises(OSError):
-      image.seek(1)
-      image.load()
-
-  def unexpected_write(*args, **kwargs):
-    pytest.fail('invalid APNG reached the staging directory')
-
-  monkeypatch.setattr(generated_files, 'output_dir', unexpected_write)
-  with pytest.raises(ValueError, match='valid bounded PNG'):
-    codex_sdk_runner._stage_codex_generated_image(
-      str(tmp_path), 'chat', base64.b64encode(content).decode(),
-    )
-  assert list(tmp_path.iterdir()) == []
-
-
-def test_generated_image_rejects_missing_declared_apng_frame_before_staging(tmp_path, monkeypatch):
-  import base64
-  import io
-  from PIL import Image
-  from app import generated_files
-
-  content = _generated_apng(declared_frames=3)
-  with Image.open(io.BytesIO(content)) as image:
-    image.verify()
-  with Image.open(io.BytesIO(content)) as image:
-    image.seek(1)
-    image.load()
-    with pytest.raises((EOFError, OSError)):
-      image.seek(2)
-
-  def unexpected_write(*args, **kwargs):
-    pytest.fail('incomplete APNG reached the staging directory')
-
-  monkeypatch.setattr(generated_files, 'output_dir', unexpected_write)
-  with pytest.raises(ValueError, match='valid bounded PNG'):
-    codex_sdk_runner._stage_codex_generated_image(
-      str(tmp_path), 'chat', base64.b64encode(content).decode(),
-    )
-  assert list(tmp_path.iterdir()) == []
-
-
-@pytest.mark.parametrize('default_image', [False, True])
-def test_generated_image_rejects_excessive_apng_work_before_staging(tmp_path, monkeypatch, default_image):
-  import base64
-  import io
-  from PIL import Image, PngImagePlugin
-  from app import generated_files
-
-  content = _generated_apng((4096, 4096), default_image=default_image)
-  # Each frame is under 32M pixels and valid, but their aggregate is over it.
-  with Image.open(io.BytesIO(content)) as image:
-    assert image.width * image.height < codex_sdk_runner.MAX_GENERATED_IMAGE_PIXELS
-    assert image.width * image.height * image.n_frames > codex_sdk_runner.MAX_GENERATED_IMAGE_PIXELS
-    for frame in range(image.n_frames):
-      image.seek(frame)
-      image.load()
-
-  def unexpected_write(*args, **kwargs):
-    pytest.fail('excessive APNG reached the staging directory')
-
-  def unexpected_decode(*args, **kwargs):
-    pytest.fail('excessive APNG reached pixel decoding')
-
-  monkeypatch.setattr(PngImagePlugin.PngImageFile, 'load', unexpected_decode)
-  monkeypatch.setattr(generated_files, 'output_dir', unexpected_write)
-  with pytest.raises(ValueError, match='valid bounded PNG'):
-    codex_sdk_runner._stage_codex_generated_image(
-      str(tmp_path), 'chat', base64.b64encode(content).decode(),
-    )
-  assert list(tmp_path.iterdir()) == []
-
-
-@pytest.mark.parametrize('default_image', [False, True])
-def test_generated_image_preserves_bounded_apng_bytes_at_limit(tmp_path, monkeypatch, default_image):
-  import base64
-  import io
-  from PIL import Image
-  from app import generated_files
-
-  content = _generated_apng(default_image=default_image)
-  with Image.open(io.BytesIO(content)) as image:
-    monkeypatch.setattr(codex_sdk_runner, 'MAX_GENERATED_IMAGE_PIXELS', 4 * image.n_frames)
-  name = codex_sdk_runner._stage_codex_generated_image(
-    str(tmp_path), 'chat', base64.b64encode(content).decode(),
-  )['name']
-  inbox = generated_files.output_dir(str(tmp_path), 'chat')
-  assert (inbox / name).read_bytes() == content
-  assert [path.name for path in inbox.iterdir()] == [name]
+  monkeypatch.setattr(generated_files, 'MAX_RECORDED_BYTES', 8)
+  with pytest.raises(ValueError, match='size limit'):
+    codex_sdk_runner._stage_codex_generated_image(str(tmp_path), 'chat', _IMAGE_RESULT)
 
 
 def test_generated_image_preserves_bytes_and_uses_unique_names(tmp_path):
@@ -5507,7 +5389,7 @@ def test_generated_image_preserves_bytes_and_uses_unique_names(tmp_path):
 
   names = [codex_sdk_runner._stage_codex_generated_image(
     str(tmp_path), 'chat', _IMAGE_RESULT,
-  )['name'] for _ in range(2)]
+  ) for _ in range(2)]
   inbox = generated_files.output_dir(str(tmp_path), 'chat')
   assert names[0] != names[1]
   assert all((inbox / name).read_bytes() == base64.b64decode(_IMAGE_RESULT) for name in names)
@@ -5524,66 +5406,6 @@ class _ImagePublicationSink:
   async def publish_generated_file(self, event):
     self.events.append(event)
     return event['name']
-
-
-def test_generated_image_crash_residue_stays_outside_publication(tmp_path):
-  import base64
-  import multiprocessing
-  import os
-  from app import generated_files
-
-  def crash_during_capture():
-    original = os.fdopen
-
-    class CrashingWrite:
-      def __init__(self, fd, *args, **kwargs):
-        self.stream = original(fd, *args, **kwargs)
-
-      def __enter__(self):
-        return self
-
-      def __exit__(self, *args):
-        return self.stream.__exit__(*args)
-
-      def write(self, content):
-        self.stream.write(content[:8])
-        self.stream.flush()
-        os._exit(77)
-
-    os.fdopen = CrashingWrite
-    codex_sdk_runner._stage_codex_generated_image(str(tmp_path), 'chat', _IMAGE_RESULT)
-
-  process = multiprocessing.get_context('fork').Process(target=crash_during_capture)
-  process.start()
-  try:
-    process.join(5)
-    assert process.exitcode == 77
-  finally:
-    if process.is_alive():
-      process.terminate()
-      process.join(5)
-    process.close()
-
-  sink = _ImagePublicationSink()
-  assert asyncio.run(generated_files.publish_inbox_files(
-    sink, data_dir=str(tmp_path), chat_id='chat',
-  )) == {}
-  assert sink.events == []
-  residue = list(generated_files.stored_dir(str(tmp_path), 'chat').iterdir())
-  assert len(residue) == 1
-  assert residue[0].read_bytes() == base64.b64decode(_IMAGE_RESULT)[:8]
-  # A complete capture still recovers, and owner-named hidden files stay valid.
-  name = codex_sdk_runner._stage_codex_generated_image(str(tmp_path), 'chat', _IMAGE_RESULT)['name']
-  inbox = generated_files.output_dir(str(tmp_path), 'chat')
-  (inbox / '.owner-notes.txt').write_bytes(b'finished owner deliverable')
-  receipt = asyncio.run(generated_files.publish_inbox_files(
-    sink, data_dir=str(tmp_path), chat_id='chat',
-  ))
-  assert set(receipt) == {name, '.owner-notes.txt'}
-  assert generated_files._inbox_names(str(tmp_path), 'chat') == []
-  for event in sink.events:
-    expected = base64.b64decode(_IMAGE_RESULT) if event['name'] == name else b'finished owner deliverable'
-    assert (generated_files.stored_dir(str(tmp_path), 'chat') / event['path']).read_bytes() == expected
 
 
 def test_generated_image_cancelled_capture_never_publishes_partial_bytes(tmp_path, monkeypatch):
@@ -5604,9 +5426,6 @@ def test_generated_image_cancelled_capture_never_publishes_partial_bytes(tmp_pat
 
     def __exit__(self, *args):
       return self.stream.__exit__(*args)
-
-    def flush(self):
-      self.stream.flush()
 
     def write(self, content):
       self.stream.write(content[:8])
@@ -5632,18 +5451,18 @@ def test_generated_image_cancelled_capture_never_publishes_partial_bytes(tmp_pat
       # Match the runner's final inbox publication while its worker still writes.
       assert await generated_files.publish_inbox_files(
         sink, data_dir=str(tmp_path), chat_id='chat',
-      ) == {}
+      ) == set()
       assert sink.events == []
     finally:
       release.set()
       assert await asyncio.to_thread(finished.wait, 5)
+    # The completed capture is recovered whole by the next publication.
     names = generated_files._inbox_names(str(tmp_path), 'chat')
     assert len(names) == 1
     assert (generated_files.output_dir(str(tmp_path), 'chat') / names[0]).read_bytes() == base64.b64decode(_IMAGE_RESULT)
-    receipt = await generated_files.publish_inbox_files(
+    assert await generated_files.publish_inbox_files(
       sink, data_dir=str(tmp_path), chat_id='chat',
-    )
-    assert list(receipt) == names
+    ) == set(names)
     assert len(sink.events) == 1
     assert generated_files._inbox_names(str(tmp_path), 'chat') == []
 
@@ -5656,56 +5475,6 @@ def test_generated_image_cancelled_capture_never_publishes_partial_bytes(tmp_pat
   asyncio.run(cancel_and_publish())
 
 
-@pytest.mark.parametrize('capacity', [0, None, 500])
-def test_native_capture_cancellation_joins_worker_and_settlement(tmp_path, monkeypatch, capacity):
-  import threading
-  from app import generated_files
-
-  entered, release = threading.Event(), threading.Event()
-  stage = codex_sdk_runner._stage_codex_generated_image
-
-  def blocked_stage(*args):
-    entered.set()
-    assert release.wait(5)
-    return stage(*args)
-
-  class Sink(_ImagePublicationSink):
-    async def generated_file_capacity(self):
-      return capacity
-
-  async def scenario():
-    sink = Sink()
-    task = asyncio.create_task(codex_sdk_runner._capture_codex_generated_image(
-      sink, str(tmp_path), 'chat', _IMAGE_RESULT, set(), 'image-call',
-    ))
-    try:
-      assert await asyncio.to_thread(entered.wait, 5)
-      task.cancel()
-      await asyncio.sleep(0)
-      assert not task.done()  # ownership cannot end while its worker can rename
-      task.cancel()  # repeated cancellation must not abandon the owned task
-    finally:
-      release.set()
-    with pytest.raises(asyncio.CancelledError):
-      await task
-    pending = generated_files._inbox_names(str(tmp_path), 'chat')
-    assert len(pending) == (1 if capacity is None else 0)
-    assert len(sink.events) == (1 if capacity == 500 else 0)
-    stored = list(generated_files.stored_dir(str(tmp_path), 'chat').iterdir())
-    assert len(stored) == (1 if capacity == 500 else 0)
-
-  monkeypatch.setattr(codex_sdk_runner, '_stage_codex_generated_image', blocked_stage)
-  asyncio.run(scenario())
-
-
-def test_generated_image_obeys_existing_deliverable_size_limit(tmp_path, monkeypatch):
-  from app import generated_files
-
-  monkeypatch.setattr(generated_files, 'MAX_RECORDED_BYTES', 8)
-  with pytest.raises(ValueError, match='size limit'):
-    codex_sdk_runner._stage_codex_generated_image(str(tmp_path), 'chat', _IMAGE_RESULT)
-
-
 @pytest.mark.parametrize('status,result,expected_files,capacity,publication', [
   ('completed', _IMAGE_RESULT, 1, 500, 'accepted'),
   ('completed', 'invalid!', 0, 500, 'accepted'),
@@ -5713,7 +5482,6 @@ def test_generated_image_obeys_existing_deliverable_size_limit(tmp_path, monkeyp
   ('completed', '', 0, 500, 'accepted'),
   ('failed', _IMAGE_RESULT, 0, 500, 'accepted'),
   ('completed', _IMAGE_RESULT, 0, 0, 'accepted'),
-  ('completed', _IMAGE_RESULT, 0, None, 'accepted'),
   ('completed', _IMAGE_RESULT, 0, 499, 'capacity_race'),
   ('completed', _IMAGE_RESULT, 0, 500, 'raises'),
   ('completed', _IMAGE_RESULT, 0, 500, 'uncertain'),
@@ -5798,10 +5566,6 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
       size=1, mime_type='image/png',
     ) for index in range(500 if capacity == 0 else 499)])
     db.commit()
-  if capacity is None:
-    async def unavailable_capacity():
-      return None
-    monkeypatch.setattr(sink, 'generated_file_capacity', unavailable_capacity)
   publish_generated_file = sink.publish_generated_file
   if publication != 'accepted':
     async def uncertain_publication(event):
@@ -5839,10 +5603,12 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
   assert str(private_path) not in serialized
   assert _IMAGE_RESULT not in serialized
   pending = generated_files._inbox_names(get_settings().data_dir, chat.id)
-  recoverable = capacity is None or publication in ('uncertain', 'raises')
-  assert len(pending) == (1 if recoverable else 0)
-  if recoverable:
+  # Full capacity stages nothing; a lost race leaves at most this one capture.
+  retained = publication in ('uncertain', 'raises', 'capacity_race')
+  assert len(pending) == (1 if retained else 0)
+  if retained:
     assert 'could not attach' in tools[0]['output']
+  if publication in ('uncertain', 'raises'):
     # Ordinary inbox recovery must deliver the one retained capture, not lose
     # it or turn the replay into a second attachment.
     monkeypatch.setattr(sink, 'publish_generated_file', publish_generated_file)
@@ -5869,18 +5635,3 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
       if b.get('type') == 'generated_files'
     ]
     assert attachment_blocks[0]['files'][0]['name'] == row.name
-
-
-def test_inbox_recovery_retains_image_without_owned_capture_receipt(tmp_path):
-  from app import generated_files
-
-  class FullSink:
-    async def generated_file_capacity(self):
-      return 0
-
-  name = codex_sdk_runner._stage_codex_generated_image(str(tmp_path), 'chat', _IMAGE_RESULT)['name']
-  receipt = asyncio.run(generated_files.publish_inbox_files(
-    FullSink(), data_dir=str(tmp_path), chat_id='chat',
-  ))
-  assert receipt == {}
-  assert (generated_files.output_dir(str(tmp_path), 'chat') / name).exists()

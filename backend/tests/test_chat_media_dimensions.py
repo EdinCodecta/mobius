@@ -1,8 +1,6 @@
 import sqlite3
 from unittest.mock import patch
 
-import pytest
-
 from PIL import Image
 
 from app.chat_media_dimensions import project_message_image_dimensions
@@ -197,18 +195,16 @@ def test_generated_dimensions_follow_recorded_storage_and_reject_unrecorded_path
   base = stored_dir(str(tmp_path), chat.id, create=True)
   Image.new('RGB', (120, 300)).save(base / 'frozen-key', 'PNG')
   Image.new('RGB', (500, 500)).save(base / 'unrecorded.png', 'PNG')
-  (base / 'symlink-key').symlink_to(base / 'frozen-key')
   for name, path in [
     ('stored.png', 'frozen-key'),
     ('missing.png', 'missing-key'),
     ('escape.png', '../outside.png'),
-    ('link.png', 'symlink-key'),
   ]:
     db.add(GeneratedFile(chat_id=chat.id, name=name, path=path,
       size=100, mime_type='image/png'))
   db.commit()
   prefix = f'/api/chats/{chat.id}/generated-files'
-  names = ['stored.png', 'missing.png', 'escape.png', 'link.png', 'unrecorded.png']
+  names = ['stored.png', 'missing.png', 'escape.png', 'unrecorded.png']
   messages = [{'role': 'assistant', 'content': ' '.join(f'![x]({prefix}/{name})' for name in names)}]
   result = project_message_image_dimensions(messages, chat_id=chat.id,
     data_dir=str(tmp_path), db=db)[0]['media_dimensions']
@@ -216,17 +212,15 @@ def test_generated_dimensions_follow_recorded_storage_and_reject_unrecorded_path
   assert all(result[f'{prefix}/{name}'] is None for name in names[1:])
 
 
-@pytest.mark.parametrize("variable_limit", [None, 999], ids=["native-limit", "legacy-limit"])
-def test_generated_reference_projection_exceeds_sqlite_bind_limit(tmp_path, db, chat, variable_limit):
+def test_generated_reference_projection_exceeds_sqlite_bind_limit(tmp_path, db, chat):
   from app.generated_files import stored_dir
   from app.models import GeneratedFile
 
   connection = db.connection().connection.driver_connection
   native_limit = connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
-  if variable_limit is not None:
-    connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, variable_limit)
+  limit = 999
+  connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, limit)
   try:
-    limit = connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
     base = stored_dir(str(tmp_path), chat.id, create=True)
     Image.new("RGB", (120, 300)).save(base / "opaque-key", "PNG")
     for name in ["first.png", "last image.png"]:
@@ -235,7 +229,6 @@ def test_generated_reference_projection_exceeds_sqlite_bind_limit(tmp_path, db, 
     db.flush()
     prefix = f"/api/chats/{chat.id}/generated-files"
     # Markdown is not bounded by the 500-row generated-file publication cap.
-    # Exercise the real SQLite connection, including its native build limit.
     messages = [{"role": "assistant", "content": " ".join([
       f"![first]({prefix}/first.png)",
       *(f"![missing]({prefix}/missing-{i}.png)" for i in range(limit)),

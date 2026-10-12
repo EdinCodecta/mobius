@@ -305,7 +305,7 @@ for (const isStreaming of [true, false]) {
       chatId: 'chat-generated-file', isStreaming,
     }))
     assert.match(html, /--md-image-ratio:1536 \/ 1024/)
-    assert.match(html, /Loading image/)
+    assert.match(html, /chat__generated-image/)
     assert.equal(html.includes('notes.pdf'), !isStreaming)
   })
 }
@@ -348,22 +348,6 @@ for (const protocol of ['javascript:', 'data:', 'ftp:']) {
     })
   }
 }
-
-for (const origin of ['http://localhost', 'https://example.com']) {
-  test(`approved ${origin} Markdown preserves distinct image resource identities`, () => {
-    const href = `${origin}/api/chats/chat-generated-file/generated-files/chart.png`
-    const html = renderToStaticMarkup(createElement(MsgContent, {
-      msg: { role: 'assistant', blocks: [
-        { type: 'text', content: `![chart](${href}?preview=true)` },
-        { type: 'generated_files', files: [{ name: 'chart.png', mime_type: 'image/png', previewable: true }] },
-      ] }, chatId: 'chat-generated-file', isStreaming: false,
-    }))
-    const external = origin !== globalThis.location.origin
-    assert.equal((html.match(/class="md-image-frame"/g) || []).length, external ? 2 : 1)
-    assert.equal(html.includes('chat__generated-image'), external)
-  })
-}
-
 
 test('reopened generated gallery images reserve every frame before authorization', () => {
   const chatId = 'chat-generated-file'

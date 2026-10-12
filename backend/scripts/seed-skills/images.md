@@ -11,12 +11,13 @@ For simple icons or logos, consider an SVG instead — it's crisp, themeable, an
 Codex includes a built-in image generator covered by the plan, with no separate API key needed.
 
 Call the injected `imagegen` tool according to its current contract. Return the
-tool's generated-image result directly. Möbius captures the native completion
-bytes automatically as a durable image attachment, shown directly in the conversation as soon as capture completes.
-Do not duplicate it with a Markdown image. Do not inspect, locate, or republish a backing file:
-provider storage is an implementation detail inside the protected credentials
-tree. No credential access or recovery approval is needed for normal delivery.
-If delivery fails, report the failure rather than claiming the image is visible
+tool's generated-image result directly: Möbius captures it automatically as a
+durable image attachment, shown in the conversation as soon as it is saved, so
+do not repeat it as a Markdown image. Do
+not inspect, locate, or republish a backing file: provider storage is an
+implementation detail inside the protected credentials tree, and normal
+delivery needs no credential access or recovery approval. If the tool reports
+that the image could not be attached, say so rather than claiming it is visible
 or asking the owner to recover it from protected storage.
 
 ---

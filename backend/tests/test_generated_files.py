@@ -656,14 +656,14 @@ def test_generated_file_timeout_preserves_late_writer_commit(
     )
     assert (inbox / "report.pdf").read_bytes() == b"report"
     # Let the late command commit, but keep its sink acknowledgement unresolved.
-    # A later capacity read can succeed while publication still needs settlement.
+    # Later publications (one per native image) must not freeze more copies.
     writer.resume_for_test()
     monkeypatch.setattr(chat_writer, "ACK_TIMEOUT_SECS", 2)
     sink.generated_file_capacity = ChatEventSink.generated_file_capacity.__get__(sink)
     for _ in range(3):
       assert await gf.publish_inbox_files(
         sink, data_dir=settings.data_dir, chat_id=chat.id,
-      ) == {}
+      ) == set()
     assert len(list(gf.stored_dir(settings.data_dir, chat.id).iterdir())) == 1
     sink.publish({
       "type": "error", "message": "Stopped", "resumable": True,
@@ -807,88 +807,3 @@ def test_non_ascii_filename_downloads_instead_of_500(client, db, auth, chat):
   assert res.status_code == 200
   assert res.content == b"%PDF-1.4 cjk"
   assert "filename*=utf-8''" in res.headers["content-disposition"]
-
-
-@pytest.mark.parametrize('first_capacity,last_capacity,publication,retained', [
-  (0, 0, None, False),
-  (1, 0, None, False),  # capacity lost between check and writer admission
-  (1, None, None, True),
-  (None, 0, None, True),
-  (1, 0, gf.PUBLICATION_UNCERTAIN, True),
-])
-def test_owned_native_capture_full_capacity_settlement(
-  tmp_path, first_capacity, last_capacity, publication, retained,
-):
-  from app.codex_sdk_runner import _stage_codex_generated_image
-  import base64
-  import io
-  from PIL import Image
-
-  buffer = io.BytesIO()
-  Image.new('RGB', (1, 1)).save(buffer, format='PNG')
-  result = base64.b64encode(buffer.getvalue()).decode()
-  inbox = gf.output_dir(str(tmp_path), 'chat', create=True)
-  owner = inbox / '.owner-report.txt'
-  owner.write_bytes(b'owner deliverable')
-
-  class Sink:
-    checks = 0
-
-    async def generated_file_capacity(self):
-      self.checks += 1
-      return first_capacity if self.checks == 1 else last_capacity
-
-    async def publish_generated_file(self, event):
-      return publication
-
-  for _ in range(3):
-    capture = _stage_codex_generated_image(str(tmp_path), 'chat', result)
-    asyncio.run(gf.publish_inbox_files(
-      Sink(), data_dir=str(tmp_path), chat_id='chat', discard_if_full=capture,
-    ))
-    assert (inbox / capture['name']).exists() is retained
-    assert owner.read_bytes() == b'owner deliverable'
-  if not retained:
-    assert list(inbox.iterdir()) == [owner]
-    assert list(gf.stored_dir(str(tmp_path), 'chat').iterdir()) == []
-
-
-def test_full_capacity_does_not_delete_replacement_of_owned_capture(tmp_path):
-  from app.codex_sdk_runner import _stage_codex_generated_image
-  import base64
-  import io
-  from PIL import Image
-
-  buffer = io.BytesIO()
-  Image.new('RGB', (1, 1)).save(buffer, format='PNG')
-  capture = _stage_codex_generated_image(
-    str(tmp_path), 'chat', base64.b64encode(buffer.getvalue()).decode(),
-  )
-  inbox = gf.output_dir(str(tmp_path), 'chat')
-  replacement = inbox / 'replacement'
-  replacement.write_bytes(b'owner replacement')
-  os.replace(replacement, inbox / capture['name'])
-
-  class FullSink:
-    async def generated_file_capacity(self):
-      return 0
-
-  asyncio.run(gf.publish_inbox_files(
-    FullSink(), data_dir=str(tmp_path), chat_id='chat', discard_if_full=capture,
-  ))
-  assert (inbox / capture['name']).read_bytes() == b'owner replacement'
-
-
-@pytest.mark.parametrize('failure', [TimeoutError, RuntimeError])
-def test_sink_capacity_failure_is_not_confirmed_full(chat, monkeypatch, failure):
-  async def failed_ack(_ack):
-    raise failure('unavailable writer acknowledgement')
-
-  monkeypatch.setattr(chat_event_sink, '_await_ack', failed_ack)
-  assert asyncio.run(_sink(chat).generated_file_capacity()) is None
-
-
-def test_sink_missing_chat_has_no_capacity(chat):
-  sink = _sink(chat)
-  sink.chat_id = None
-  assert asyncio.run(sink.generated_file_capacity()) == 0

@@ -36,13 +36,12 @@ import os
 import shutil
 import time
 import uuid
-import warnings
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image
 
 from app import generated_files
 from app.codex_sdk_contract import (
@@ -132,113 +131,55 @@ def _ensure_codex_home(env: dict[str, str], data_dir: str) -> None:
   env.setdefault("CODEX_HOME", str(Path(data_dir) / "cli-auth" / "codex"))
 
 
-def _stage_codex_generated_image(data_dir: str, chat_id: str, result: str) -> dict:
-  """Stage the native PNG result, never read a provider-supplied saved path.
-
-  Use the existing deliverable inbox/publication lifecycle for confinement,
-  immutable storage, authorization, and crash recovery. Image bytes stay out
-  of tool outputs and chat JSON.
-  """
-  if not isinstance(result, str) or not result:
-    raise ValueError("generated image result is missing")
+def _generated_png_bytes(result: str) -> bytes:
+  """Decode a native image result, proving it is one bounded, decodable PNG."""
   limit = generated_files.MAX_RECORDED_BYTES
-  if len(result) > ((limit + 2) // 3) * 4:
-    raise ValueError("generated image exceeds the deliverable size limit")
-  content = base64.b64decode(result.strip(), validate=True)
-  if len(content) > limit or not content.startswith(b"\x89PNG\r\n\x1a\n"):
-    raise ValueError("generated image result is not a supported PNG")
   try:
-    with warnings.catch_warnings():
-      warnings.simplefilter("error", Image.DecompressionBombWarning)
-      with Image.open(io.BytesIO(content)) as image:
-        width, height = image.size
-        if (
-          image.format != "PNG" or width <= 0 or height <= 0
-          or width * height > MAX_GENERATED_IMAGE_PIXELS
-        ):
-          raise ValueError("generated image dimensions exceed the pixel limit")
-        image.verify()
-      # Chunk checksums alone do not prove that every pixel stream decodes.
-      with Image.open(io.BytesIO(content)) as image:
-        # APNG decoding composites each frame on the full canvas, including
-        # any separate default image. Bound the aggregate before decoding.
-        if image.width * image.height * image.n_frames > MAX_GENERATED_IMAGE_PIXELS:
-          raise ValueError("generated image frames exceed the pixel limit")
-        for frame in range(image.n_frames):
-          image.seek(frame)
-          image.load()
-  except (
-    Image.DecompressionBombError, Image.DecompressionBombWarning,
-    UnidentifiedImageError, EOFError, OSError, SyntaxError, ValueError,
-  ) as exc:
-    raise ValueError("generated image result is not a valid bounded PNG") from exc
-  directory = generated_files.output_dir(data_dir, chat_id, create=True)
-  directory_fd = generated_files._open_directory(directory, create=False)
-  stored_fd = None
+    if len(result) > ((limit + 2) // 3) * 4:
+      raise ValueError("generated image exceeds the deliverable size limit")
+    content = base64.b64decode(result, validate=True)
+    if len(content) > limit:
+      raise ValueError("generated image exceeds the deliverable size limit")
+    with Image.open(io.BytesIO(content), formats=["PNG"]) as image:
+      # Size comes from the header; check it before decoding any pixels. An
+      # animated PNG is rejected because load() decodes only its first frame.
+      if (
+        not 0 < image.width * image.height <= MAX_GENERATED_IMAGE_PIXELS
+        or getattr(image, "n_frames", 1) != 1
+      ):
+        raise ValueError("generated image is not one bounded frame")
+      image.verify()  # Chunk checksums and a complete file, without pixels.
+    with Image.open(io.BytesIO(content), formats=["PNG"]) as image:
+      image.load()
+  except (TypeError, ValueError, OSError, SyntaxError, EOFError, Image.DecompressionBombError) as exc:
+    raise ValueError(f"generated image result is not a valid bounded PNG: {exc}") from exc
+  return content
+
+
+def _stage_codex_generated_image(data_dir: str, chat_id: str, result: str) -> str:
   name = f"generated-image-{uuid.uuid4().hex}.png"
-  temporary = f".{name}.tmp"
+  generated_files.add_inbox_file(data_dir, chat_id, name, _generated_png_bytes(result))
+  return name
+
+
+async def _deliver_codex_generated_image(sink, data_dir: str, chat_id: str, result: str) -> bool:
+  """Attach a native image through the deliverable inbox; return whether it shows.
+
+  Use the typed result bytes, never the provider's saved path inside the
+  protected credentials tree. A capture interrupted after staging stays in the
+  inbox, where the turn's final publication or the next turn recovers it.
+  """
   try:
-    # Reuse the private store's existing temporary-file boundary. A crash or
-    # cancelled await must never expose an unfinished capture to inbox recovery.
-    stored_fd = generated_files._open_directory(
-      generated_files.stored_dir(data_dir, chat_id, create=True), create=False,
+    # Never stage bytes that cannot become an attachment.
+    if await sink.generated_file_capacity() <= 0:
+      return False
+    name = await asyncio.to_thread(_stage_codex_generated_image, data_dir, chat_id, result)
+    return name in await generated_files.publish_inbox_files(
+      sink, data_dir=data_dir, chat_id=chat_id,
     )
-    fd = os.open(
-      temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
-      dir_fd=stored_fd,
-    )
-    with os.fdopen(fd, "wb") as stream:
-      stream.write(content)
-      stream.flush()
-      info = os.fstat(fd)
-    os.rename(temporary, name, src_dir_fd=stored_fd, dst_dir_fd=directory_fd)
-    return {
-      "name": name,
-      "_source_identity": (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size),
-    }
-  finally:
-    if stored_fd is not None:
-      try:
-        os.unlink(temporary, dir_fd=stored_fd)
-      except FileNotFoundError:
-        pass
-      os.close(stored_fd)
-    os.close(directory_fd)
-
-
-async def _capture_codex_generated_image(
-  sink, data_dir: str, chat_id: str, result: str, captured_ids: set[str], item_id: str,
-) -> bool:
-  """Join capture and settlement before propagating caller cancellation."""
-  async def capture_and_publish():
-    capture = await asyncio.to_thread(_stage_codex_generated_image, data_dir, chat_id, result)
-    # Successful staging owns replay identity even if settlement later fails.
-    captured_ids.add(item_id)
-    published = await generated_files.publish_inbox_files(
-      sink, data_dir=data_dir, chat_id=chat_id, discard_if_full=capture,
-    )
-    return capture["name"] in published
-
-  task = asyncio.create_task(capture_and_publish())
-  deferred_cancel: asyncio.CancelledError | None = None
-  while not task.done():
-    try:
-      await asyncio.shield(task)
-    except asyncio.CancelledError as exc:
-      if task.cancelled():
-        break
-      deferred_cancel = deferred_cancel or exc
-    except Exception:
-      break
-  try:
-    attached = task.result()
-  except BaseException:
-    if deferred_cancel is not None:
-      raise deferred_cancel
-    raise
-  if deferred_cancel is not None:
-    raise deferred_cancel
-  return attached
+  except (OSError, ValueError):
+    log.warning("Codex generated-image capture failed chat_id=%s", chat_id, exc_info=True)
+    return False
 
 
 def _process_group_capture_delay(elapsed: float) -> float:
@@ -1728,7 +1669,7 @@ async def _run_codex_sdk_turn(
   # completed item. Retain them only for the lifetime of this turn so a Codex
   # path that omits that aggregate can still publish one authoritative result.
   command_output_deltas: dict[str, list[str]] = {}
-  captured_image_ids: set[str] = set()
+  completed_image_ids: set[str] = set()
   helper_host = None
   codex_context = (
     sdk["AsyncCodex"](config=config) if helper_host_key is None else None
@@ -2232,28 +2173,18 @@ async def _run_codex_sdk_turn(
 
         if isinstance(payload, sdk["ItemCompletedNotification"]):
           item = payload.item.root if hasattr(payload.item, "root") else payload.item
-          image_generation_cls = sdk.get("ImageGenerationThreadItem")
           image_delivery_error = None
-          if (
-            image_generation_cls is not None
-            and isinstance(item, image_generation_cls)
-            and item.id in captured_image_ids
-          ):
-            continue  # A repeated completion must not create a second image.
-          if (
-            image_generation_cls is not None
-            and isinstance(item, image_generation_cls)
-            and item.status == "completed"
-            and getattr(item, "failure", None) is None
-          ):
-            try:
-              attached = await _capture_codex_generated_image(
-                bc, runtime_data_dir, chat_id, item.result, captured_image_ids, item.id,
+          image_generation_cls = sdk.get("ImageGenerationThreadItem")
+          if image_generation_cls is not None and isinstance(item, image_generation_cls):
+            if item.id in completed_image_ids:
+              continue  # A repeated completion must not attach a second image.
+            completed_image_ids.add(item.id)
+            if (
+              item.status == "completed" and item.failure is None
+              and not await _deliver_codex_generated_image(
+                bc, runtime_data_dir, chat_id, item.result,
               )
-              if not attached:
-                image_delivery_error = "The image was generated, but Möbius could not attach it."
-            except (OSError, ValueError):
-              log.warning("Codex generated-image capture failed chat_id=%s", chat_id, exc_info=True)
+            ):
               image_delivery_error = "The image was generated, but Möbius could not attach it."
           if isinstance(item, sdk["ContextCompactionThreadItem"]):
             _publish_codex_context_compaction(bc, chat_id)

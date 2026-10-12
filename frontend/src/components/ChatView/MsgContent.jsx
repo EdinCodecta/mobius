@@ -18,7 +18,7 @@ import { foldAppActivityOperations } from './activityGrouping.js'
 import QuestionCard from './QuestionCard.jsx'
 import { isDurableRestartOffer } from './restartCard.js'
 import SecureInputCard from './SecureInputCard.jsx'
-import Attachments, { attachmentIsGalleryImage } from './Attachments.jsx'
+import Attachments, { attachmentIsGalleryImage, generatedImageHref } from './Attachments.jsx'
 import CompactionCard from './CompactionCard.jsx'
 import ContinuationCard from './ContinuationCard.jsx'
 import { isContinuationMessage } from './chatRuntimeState.js'
@@ -609,22 +609,18 @@ function MsgContentInner({
             : [],
         )
       : []
-    // Images can arrive mid-turn; documents wait for the final answer. Keep
-    // both after the last prose and before any terminal question card.
-    const embeddedImagePaths = new Set(generatedFiles.some(attachmentIsGalleryImage) ? displayBlocks.filter(block => block.type === 'text')
-      .flatMap(block => markdownImageHrefs(block.content || block.text || ''))
-      .map(href => {
-        const src = safeImageHref(href)
-        if (!src) return null
-        try {
-          const url = new URL(src, location.origin)
-          return url.origin === location.origin ? url.pathname : null
-        } catch { return null }
-      }) : [])
-    const visibleFiles = generatedFiles.filter(file => (!isStreaming || attachmentIsGalleryImage(file))
-      && !(attachmentIsGalleryImage(file) && embeddedImagePaths.has(
-        `/api/chats/${encodeURIComponent(chatId)}/generated-files/${encodeURIComponent(file.name)}`,
-      )))
+    // Images show as soon as they are published; documents wait for the final
+    // answer. Both sit after the last prose and before any terminal question
+    // card. A picture the prose already embeds is not repeated as an attachment.
+    const embeddedImagePaths = new Set(generatedFiles.some(attachmentIsGalleryImage)
+      ? displayBlocks.filter(block => block.type === 'text')
+        .flatMap(block => markdownImageHrefs(block.content || block.text || ''))
+        .map(safeImageHref).filter(Boolean)
+        .map(src => new URL(src, 'https://mobius.local').pathname)
+      : [])
+    const visibleFiles = generatedFiles.filter(file => attachmentIsGalleryImage(file)
+      ? !embeddedImagePaths.has(generatedImageHref(chatId, file.name))
+      : !isStreaming)
 
     const lastTextNode = nodes.findLastIndex(node => node.single?.item?.type === 'text')
     const beforeQuestionNode = visibleFiles.length
