@@ -223,15 +223,21 @@ serialized bytes, in both directions: at most 524,288 work units, nesting
 depth 128, and a conservative 320 MiB decoded-resource estimate per direction.
 A unit is a structural mark (a string opening, container opening, comma or
 colon outside strings), 24 other characters outside strings, or a number
-token's measured extra parse cost (a float its length plus 4; an int of more
-than 83 digits its length squared over 7,000). Units bound the one
+token's measured extra parse cost: a decimal without an exponent 2 plus an
+eighth of its length up to 16 characters and 2 plus half its length up to 24;
+an exponent or a longer decimal its length plus 12, plus its length beyond 24
+again; an int of more than 18 digits its length squared over 7,000, plus 2.
+Invalid marks no valid document repeats (a closer with no open container, a
+backslash outside strings) cost a unit each. Units bound the one
 uninterruptible standard-library call per document, the parse, so a larger
 transfer grant buys media bytes, not denser JSON; the depth stays well inside
 the platform's own encoders and response validation. A body is scanned in
 16 KiB chunks with a cooperative cancellation/yield point per chunk; punctuation
 inside strings does not consume units, and string content (including
 escape-heavy input) is scanned natively rather than one Python iteration per
-escape. The scan reserves the chunks it keeps plus the next chunk's decode
+escape. A number is examined only where a value can start (the document's
+start, or after a bracket, comma or colon), so other digits and short ints
+cost no Python step each. The scan reserves the chunks it keeps plus the next chunk's decode
 before decoding it, then makes the Unicode text once by whichever exactly
 charged copy is cheaper: joining those chunks, or letting the standard library
 decode the bytes into a byte-sized buffer copied per widening. The remaining
@@ -246,8 +252,8 @@ A JSON response body is rendered part by part to exactly the bytes Starlette's
 `JSONResponse` would produce, inside the exchange reservation and yielding
 between parts, so its text is never held at its widest character's width.
 Request serialization works the same way. Both reserve the growing buffer, the
-largest string part (its escaped text, held twice when it follows a list
-separator, and its UTF-8 bytes) and the encoder's per-level state before
+largest string part (its escaped text with either its UTF-8 bytes or, when it
+follows a list separator, its separator-prefixed copy, whichever is larger) and the encoder's per-level state before
 encoding; request serialization adds what exceeds three serialized copies to
 its execution allowance. The complete request envelope, including tool and
 policy requests, has the same unit, depth and decoded-cost ceilings, counted on
@@ -259,7 +265,8 @@ text (whitespace, longer number spellings) is real parse work and costs more
 only over HTTP. Its retained estimate is each value's `sys.getsizeof` plus
 allocator slack, and that walk runs pinned to the accepted runtime. The walk
 reserves its own iterator stack, and every bounded copy it makes to size a long
-string, before making it. A browser grant's attribution belongs to the whole
+string, before making it, and yields by the work it has done, counting each
+16 KiB slice sized as many visited values. A browser grant's attribution belongs to the whole
 exchange, so revoking the grant also cancels an HTTP response that is still
 rendering. Large base64 scalars, 20 MiB
 originals/downloads, and galleries with Unicode captions fitting the reviewed

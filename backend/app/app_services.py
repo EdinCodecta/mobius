@@ -90,10 +90,20 @@ MAX_ADMITTED_EXCHANGE_COST = 512 * 1024 * 1024
 MAX_PUBLIC_INGRESS_COST = 192 * 1024 * 1024
 _admitted_exchange_cost = 0
 _public_ingress_cost = 0
-# Marks and number tokens outside strings. A '\\' outside a string is invalid
-# JSON; it is matched only so the scan never misreads it. A lone '-' is a
-# number's sign, which a chunk boundary can separate from its digits.
-_JSON_RESOURCE_MARKS = re.compile(r'["\\{}\[\],:]|-?[0-9]+([.eE][0-9.eE+-]*)?|-')
+# Marks outside strings. A value can only start after '[', ',' or ':' (or
+# open the document), and json.loads stops at the first syntax error, so a
+# number is examined only there: a float, an int past _JSON_LINEAR_DIGITS,
+# or any token (a lone sign included) cut by the chunk end, which carry work
+# beyond their characters. Short ints and any other text are skipped by the
+# native search, never one Python step each. A '\\' outside a string is
+# invalid JSON; it is matched only so the scan never misreads it, and costs a
+# unit (``stray``).
+_JSON_VALUE_START = (
+  r'[ \t\n\r]*+(?:(?P<number>-?[0-9]++(?:[.eE][0-9.eE+-]*+|(?<=[0-9]{19})|\Z)|-\Z)'
+  r'|(?P<pending>\Z))?'
+)
+_JSON_RESOURCE_MARKS = re.compile(r'["\\{}\]]|[\[,:]' + _JSON_VALUE_START)
+_JSON_FIRST_VALUE = re.compile(_JSON_VALUE_START)
 _JSON_NUMBER_TAIL = re.compile(r'[0-9.eE+-]*')
 # Disjoint alternatives consume string content in native, bounded chunks,
 # including escaped quotes/backslashes. This only finds the end of a string;
@@ -151,6 +161,9 @@ _JSON_ENCODER_LEVEL_COST = 768
 # A cooperative yield after this many encoded parts or visited values keeps a
 # Python walk of a dense document from monopolizing the event loop.
 _COOPERATIVE_STEP = 4 * 1024
+# Escaping and UTF-8 sizing one _JSON_SCAN_BYTES slice of a long string costs
+# about as much CPU as this many visited values (measured near 100 us).
+_SIZING_SLICE_STEPS = 256
 _EXHAUSTED = object()
 
 
@@ -340,7 +353,14 @@ class ServiceExchangeAdmission:
     strings = lists = dicts = commas = members = 0
     number_work = 0
     number_length = 0
-    number_float = False
+    number_shape = _JSON_INT
+    # Whether the next chunk may start a value (the document's first, or one
+    # after a separator and whitespace that ended the last chunk).
+    value_pending = True
+    # Invalid input's marks no valid document has more of (a closer with no
+    # open container, '\\' outside a string): one unit each, so a run of
+    # them is bounded like any other Python scan step.
+    stray = 0
     depth = deepest = 0
     # Open containers, for whether a string is a list item (malformed input
     # may unbalance it; the stdlib parser stops there anyway).
@@ -368,16 +388,36 @@ class ServiceExchangeAdmission:
       text_width = max(text_width, _json_text_width(chunk))
       text_bmp = text_bmp or text_width > 1 and _JSON_BMP_TEXT.search(chunk) is not None
       last = 0
+      value = None
       if number_length:
         # A number token can continue across the chunk boundary.
         end = _JSON_NUMBER_TAIL.match(chunk).end()
         number_length += end
-        number_float = number_float or _json_is_float(chunk, 0, end)
+        number_shape = max(number_shape, _json_number_shape(chunk, 0, end))
         if end < len(chunk) or final:
-          number_work += _json_number_work(number_length, number_float)
+          number_work += _json_number_work(number_length, number_shape)
           number_length = 0
         last = end
-      while last < len(chunk):
+      elif value_pending:
+        value = _JSON_FIRST_VALUE.match(chunk)
+        last = value.end()
+      value_pending = False
+      while True:
+        if value is not None:
+          # A value may start right after a separator (and whitespace).
+          if value.start("number") != -1:
+            index, end = value.span("number")
+            shape = _json_number_shape(chunk, index, end)
+            if end == len(chunk) and not final:
+              number_length = end - index
+              number_shape = shape
+            else:
+              number_work += _json_number_work(end - index, shape)
+          elif value.start("pending") != -1:
+            value_pending = True
+          value = None
+        if last >= len(chunk):
+          break
         if in_string:
           # A final backslash can escape the first character of the next
           # incremental text chunk (also for UTF-16/32 inputs).
@@ -420,6 +460,8 @@ class ServiceExchangeAdmission:
           break
         index, last = mark.span()
         char = chunk[index]
+        if mark.lastindex is not None:
+          value = mark
         if char == ",":
           commas += 1
         elif char == '"':
@@ -446,20 +488,17 @@ class ServiceExchangeAdmission:
           depth -= 1
           if containers:
             containers.pop()
-        elif char != "\\":
-          # A number; group 1 is its fraction or exponent.
-          if last == len(chunk) and not final:
-            number_length = last - index
-            number_float = mark.lastindex == 1
-          elif mark.lastindex == 1 or last - index > _JSON_LINEAR_DIGITS:
-            number_work += _json_number_work(last - index, mark.lastindex == 1)
+          else:
+            stray += 1
+        else:
+          stray += 1
       bare = text_length - string_chars - (string_length + 1 if in_string else 0)
       # Units only bound work done after the scan, so checking them per
       # bounded chunk still rejects before the stdlib parser runs.
       units = (
-        strings + lists + dicts + commas + members + number_work
+        strings + lists + dicts + commas + members + number_work + stray
         + bare // _JSON_BARE_CHARS_PER_UNIT
-        + _json_number_work(number_length, number_float)
+        + _json_number_work(number_length, number_shape)
       )
       if units > MAX_JSON_STRUCTURE:
         self._reject(direction, "structural resource limit exceeded")
@@ -537,6 +576,15 @@ class ServiceExchangeAdmission:
       if needed > self.request_cost:
         self._hold("request", request=needed + _RETAINED_WALK_HEADROOM)
 
+    async def pace(steps: int):
+      # Yield by work done, not values visited: one sized string slice is
+      # worth _SIZING_SLICE_STEPS visited values.
+      nonlocal visited
+      visited += steps
+      if visited >= _COOPERATIVE_STEP:
+        visited = 0
+        await asyncio.sleep(0)
+
     pending = []
     hold_walk(_RETAINED_WALK_HEADROOM)
     pending.append(iter((envelope,)))
@@ -547,9 +595,7 @@ class ServiceExchangeAdmission:
         pending.pop()
         in_list.pop()
         continue
-      visited += 1
-      if visited % _COOPERATIVE_STEP == 0:
-        await asyncio.sleep(0)
+      await pace(1)
       hold_walk(_RETAINED_WALK_HEADROOM)
       children = None
       if isinstance(item, dict):
@@ -562,7 +608,7 @@ class ServiceExchangeAdmission:
         children = iter(item)
       elif isinstance(item, str):
         marks += 1
-        part, size = _json_string_part(item, self.max_bytes, in_list[-1], hold_walk)
+        part, size = await _json_string_part(item, self.max_bytes, in_list[-1], hold_walk, pace)
         largest_part = max(largest_part, part)
         string_bytes += size
       elif item is True or item is None:
@@ -572,11 +618,12 @@ class ServiceExchangeAdmission:
       elif isinstance(item, int):
         length = _json_int_length(item)
         bare += length
-        number_work += _json_number_work(length, False)
+        number_work += _json_number_work(length, _JSON_INT)
       elif isinstance(item, float):
-        length = len(repr(item))
-        bare += length
-        number_work += _json_number_work(length, True)
+        text = repr(item)
+        bare += len(text)
+        number_work += _json_number_work(len(text), _json_number_shape(text, 0, len(text)))
+        del text
       cost += sys.getsizeof(item) + _RETAINED_BLOCK_SLACK * (1 if children is None else 2)
       depth = len(pending) - 1
       deepest = max(deepest, depth)
@@ -602,26 +649,42 @@ class ServiceExchangeAdmission:
     self._hold("request", transfer=0, request=cost)
 
 
-def _json_is_float(text: str, start: int, end: int) -> bool:
-  return text.find(".", start, end) != -1 or text.find("e", start, end) != -1 or text.find("E", start, end) != -1
+_JSON_INT, _JSON_DECIMAL, _JSON_EXPONENT = 0, 1, 2
 
 
-def _json_number_work(length: int, is_float: bool) -> int:
+def _json_number_shape(text: str, start: int, end: int) -> int:
+  if text.find("e", start, end) != -1 or text.find("E", start, end) != -1:
+    return _JSON_EXPONENT
+  return _JSON_DECIMAL if text.find(".", start, end) != -1 else _JSON_INT
+
+
+def _json_number_work(length: int, shape: int) -> int:
   """Parse work of one number token beyond its mark and characters, in units.
 
-  Calibrated (scratch calibrate_numbers.py) against the per-element cost of a
-  small int: a float up to 24 characters measured at most 18.6 units and a
-  subnormal "5e-324" 5.6, so every float costs its length plus 4; big ints
-  grow quadratically (4300 digits, the stdlib's limit: under 1,300 units),
-  bounded with margin by length^2/7000.
+  Calibrated in thread CPU time against the per-element cost of a small int,
+  worst measured case per class with at least 1.2x margin. A decimal without
+  an exponent of at most 16 characters has at most 15 digits and a decimal
+  exponent within 15, so it takes the exact double fast path (measured under
+  1.5 units). Up to 24 characters a correction loop runs on small big ints
+  (under 8). An exponent, or a longer decimal, can force big-int comparison
+  near a halfway point ("2.2e-308" 13.3, "2.2250738585072014e-300" 15.5, and
+  roughly 1.2 units per character past 40). Ints past 18 digits leave the
+  machine-word path and grow quadratically (4300 digits, the stdlib's limit:
+  under 1,300 units).
   """
   if not length:
     return 0
-  return length + 4 if is_float else length * length // 7000
+  if shape == _JSON_INT:
+    return length * length // 7000 + 2 if length > _JSON_LINEAR_DIGITS else 0
+  if shape == _JSON_DECIMAL and length <= 16:
+    return 2 + length // 8
+  if shape == _JSON_DECIMAL and length <= 24:
+    return 2 + length // 2
+  return length + 12 + max(0, length - 24)
 
 
-# Ints at most this long have no work beyond their characters (83^2 < 7000).
-_JSON_LINEAR_DIGITS = 83
+# Ints at most this long are machine words with no work beyond their characters.
+_JSON_LINEAR_DIGITS = 18
 
 
 def _json_int_length(value: int) -> int:
@@ -635,11 +698,13 @@ def _json_int_length(value: int) -> int:
 
 def _json_part_peak(chars: int, width: int, ascii_only: bool, list_item: bool) -> int:
   """What encoding one string scalar briefly holds: its quoted escaped part
-  of ``chars`` characters (twice for a list item, which the pure-Python
-  encoder prefixes with its separator) and the UTF-8 encoder's buffer, which
-  for non-ASCII text is sized for the widest character of its kind."""
+  of ``chars`` characters and the UTF-8 encoder's buffer, which for non-ASCII
+  text is sized for the widest character of its kind. A list item's part is
+  the separator concatenated to the escaped form, which is freed before the
+  part is encoded: two parts coexist, or one part and its UTF-8 buffer."""
+  part = chars * width + _JSON_STRING_COST
   utf8 = chars if ascii_only else chars * min(width + 1, 4)
-  return (2 if list_item else 1) * (chars * width + _JSON_STRING_COST) + utf8
+  return max(2 * part, part + utf8) if list_item else part + utf8
 
 
 def _json_encoding_peak(output_bytes: int, largest_part: int, depth: int) -> int:
@@ -736,8 +801,8 @@ def exchange_max_bytes(service: dict, method, path) -> int:
   return routes.get((method, service_route_key(path)), ceiling)
 
 
-def _json_string_part(
-  value: str, max_bytes: int, list_item: bool, reserve_sizing,
+async def _json_string_part(
+  value: str, max_bytes: int, list_item: bool, reserve_sizing, pace,
 ) -> tuple[int, int]:
   """Reject a scalar before JSONEncoder can materialize its entire escaped form.
 
@@ -745,7 +810,7 @@ def _json_string_part(
   quoted UTF-8 size. Six UTF-8 bytes per character is a safe upper bound for
   one JSON string character with ensure_ascii=False; a longer string is
   measured exactly in bounded slices, whose copies ``reserve_sizing`` admits
-  before the first is made.
+  before the first is made, yielding through ``pace`` as slices add up.
   """
   if len(value) > max_bytes:
     raise HTTPException(413, "App service request is too large.")
@@ -773,6 +838,7 @@ def _json_string_part(
     del part
     if size > max_bytes:
       raise HTTPException(413, "App service request is too large.")
+    await pace(_SIZING_SLICE_STEPS)
   return _json_part_peak(chars, width, ascii_only, list_item), size
 
 

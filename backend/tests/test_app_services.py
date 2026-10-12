@@ -1,11 +1,15 @@
 """Accepted app services own policy; the platform owns their hard boundary."""
 
 import asyncio
+import gc
 import json
 import logging
 import os
+import random
 from pathlib import Path
 import signal
+import time
+import tracemalloc
 from types import SimpleNamespace
 
 import pytest
@@ -1134,7 +1138,7 @@ async def test_number_split_across_scan_chunks_is_charged_as_one_token(monkeypat
   token = b"9" * 4300
   raw = b"[" + b" " * (64 * 1024 - 1 - split) + token + b"]"
   assert raw[64 * 1024 - split:64 * 1024] == token[:split]
-  units = 1 + len(raw) // app_services._JSON_BARE_CHARS_PER_UNIT + app_services._json_number_work(4300, False)
+  units = 1 + len(raw) // app_services._JSON_BARE_CHARS_PER_UNIT + app_services._json_number_work(4300, app_services._JSON_INT)
   monkeypatch.setattr(app_services, "MAX_JSON_STRUCTURE", units)
   with app_services.ServiceExchangeAdmission(MIB) as admission:
     assert await admission.decode(raw) == [int(token)]
@@ -1153,7 +1157,7 @@ async def test_minus_sign_split_from_its_float_at_a_chunk_end_still_charges_the_
   raw = b"[" + b" " * (size - 2) + token + b"]"
   assert raw[size - 1:size] == b"-"
   units = 1 + len(raw) // app_services._JSON_BARE_CHARS_PER_UNIT
-  units += app_services._json_number_work(len(token), True)
+  units += app_services._json_number_work(len(token), app_services._JSON_EXPONENT)
   monkeypatch.setattr(app_services, "MAX_JSON_STRUCTURE", units)
   with app_services.ServiceExchangeAdmission(MIB) as admission:
     assert await admission.decode(raw) == [-1.2345678901234567e-300]
@@ -3261,3 +3265,119 @@ async def test_disconnect_after_body_growth_releases_the_received_charge(public)
       await _envelope(request, "echo", public=public, actor={}, max_bytes=4096, admission=admission)
   assert observed == [(0, 0), (3000, 3000 if public else 0)]
   assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
+# Ordinary numeric payloads an 8 MiB service accepted before number work was
+# charged: each measured well inside the unit budget's parse time.
+_rng = random.Random(7)
+_ORDINARY_NUMERIC = {
+  "geojson-20k": {"type": "LineString", "coordinates": [
+    [round(_rng.uniform(-180, 180), 6), round(_rng.uniform(-90, 90), 6)] for _ in range(20_000)
+  ]},
+  "embeddings-16x1536": [[_rng.random() for _ in range(1536)] for _ in range(16)],
+  "sensor-100k": [round(_rng.uniform(0, 100), 2) for _ in range(100_000)],
+  "timestamps-50k": [1697040000.123 + i for i in range(50_000)],
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(_ORDINARY_NUMERIC))
+async def test_ordinary_numeric_payloads_have_one_accepting_verdict(shape):
+  value = _ORDINARY_NUMERIC[shape]
+  assert len(_compact(value)) < 8 * MIB
+  assert await _number_work_verdicts(value) == ["accepted", "accepted"]
+  raw = _compact(value)
+  with app_services.ServiceExchangeAdmission(8 * MIB) as admission:
+    admission.admit_output(raw)
+    assert await admission.decode_response(raw) == value
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+# Counts at which each spelling's measured parse time alone (thread CPU, in
+# small-int elements: 14.6, 12.5, 17 and 10 per element) exceeds the budget by
+# at least 1.3x, so a relaxed charge can never admit them.
+@pytest.mark.parametrize("token,count", [
+  (b"2.2e-308", 50_000), (b"5e-324", 60_000), (b"2.2250738585072014e-300", 40_000),
+  (b"0.9539150178908785693288", 70_000),
+], ids=["short-near-min-normal", "subnormal", "halfway-exponent", "long-decimal"])
+async def test_costly_float_spellings_still_exhaust_the_unit_budget(token, count):
+  raw = b"[" + b",".join([token] * count) + b"]"
+  with pytest.raises(HTTPException) as refused:
+    with app_services.ServiceExchangeAdmission(8 * MIB) as admission:
+      await admission.decode(raw)
+  assert refused.value.detail == "App service request structural resource limit exceeded."
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [
+  b"[" + b"1 " * (2 * MIB) + b"]",
+  b"[" + b"- " * (2 * MIB) + b"]",
+  b"[" + b"]" * (4 * MIB) + b"]",
+  b"[" + b"\\" * (4 * MIB) + b"]",
+], ids=["spaced-digits", "lone-signs", "closers", "backslashes"])
+async def test_invalid_token_runs_take_no_python_step_each_beyond_the_unit_budget(monkeypatch, raw):
+  searches = []
+  real = app_services._JSON_RESOURCE_MARKS
+
+  class Counting:
+    def search(self, *args):
+      searches.append(1)
+      return real.search(*args)
+
+  monkeypatch.setattr(app_services, "_JSON_RESOURCE_MARKS", Counting())
+  with pytest.raises((HTTPException, ValueError)):
+    with app_services.ServiceExchangeAdmission(8 * MIB) as admission:
+      await admission.decode(raw)
+  chunks = len(raw) // app_services._JSON_SCAN_BYTES + 1
+  assert len(searches) <= 2 * chunks + app_services.MAX_JSON_STRUCTURE + 1
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+  {"images": ["A" * (14 * MIB)] * 4, "caption": "雪😀"},
+  ["x" * (20 * 1024) for _ in range(3000)],
+  "x" * (55 * MIB),
+], ids=["gallery", "many-medium-strings", "one-long-string"])
+async def test_retained_string_sizing_yields_by_bytes_sized(body):
+  beats = []
+  running = True
+
+  async def heartbeat():
+    while running:
+      beats.append(time.perf_counter())
+      await asyncio.sleep(0)
+
+  task = asyncio.create_task(heartbeat())
+  await asyncio.sleep(0)
+  try:
+    with app_services.ServiceExchangeAdmission(60 * MIB) as admission:
+      await admission.retain({"body": body})
+  finally:
+    beats.append(time.perf_counter())
+    running = False
+    await task
+  assert max(b - a for a, b in zip(beats, beats[1:])) < 0.05
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_wide_list_item_rendering_fits_a_reservation_without_unheld_copies():
+  raw = _compact({"body": ["x" * (20 * MIB) + "😀"]})
+  with app_services.ServiceExchangeAdmission(60 * MIB) as admission:
+    admission.admit_output(raw)
+    gc.collect()
+    tracemalloc.start()
+    try:
+      decoded = await admission.decode_response(raw)
+      await app_services.render_json(decoded["body"])
+      peak = tracemalloc.get_traced_memory()[1]
+    finally:
+      tracemalloc.stop()
+    held = admission.response_cost + admission.transfer_cost
+    assert peak <= held
+    # Separator concatenation and UTF-8 encoding never coexist.
+    assert held < peak + 80 * MIB
+  assert app_services._admitted_exchange_cost == 0
