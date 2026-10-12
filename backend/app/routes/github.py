@@ -5425,10 +5425,8 @@ async def connect_published_app(
     )
 
   try:
+    await install.fetch_app_commit(spec.source_repo, merge_sha)
     async with fs_locks.source_dir_lock(str(spec.source_repo)):
-      await asyncio.to_thread(
-        app_git.fetch_origin_commit, spec.source_repo, merge_sha,
-      )
       witnessed = await asyncio.to_thread(
         app_git.verify_landed_equivalent_change,
         spec.source_repo,

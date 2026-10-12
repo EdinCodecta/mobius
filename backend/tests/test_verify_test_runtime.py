@@ -744,7 +744,8 @@ def test_manual_and_pull_request_runs_cover_suites_and_main_image():
   ).exists()
   test_triggers = test_workflow.split("\npermissions:\n", 1)[0]
   image_triggers = image_workflow.split("\npermissions:\n", 1)[0]
-  # The backend check spans its checks, test shards, and combining gate.
+  # The backend check spans its checks, test shards, the all-unconverted
+  # boundary suites, and the combining gate.
   backend = test_workflow.split("\n  backend-checks:\n", 1)[1].split(
     "\n  frontend-unit:\n", 1,
   )[0]
@@ -756,7 +757,9 @@ def test_manual_and_pull_request_runs_cover_suites_and_main_image():
   backend_env = (
     ROOT / ".github" / "actions" / "backend-env" / "action.yml"
   ).read_text(encoding="utf-8")
-  assert backend.count("uses: ./.github/actions/backend-env") == 2
+  assert backend.count("uses: ./.github/actions/backend-env") == 3
+  assert "MOBIUS_TEST_ALL_UNCONVERTED: '1'" in backend
+  assert "needs: [backend-checks, backend-tests, backend-all-unconverted]" in backend
   assert "openai-codex==$(sed -n 's/^ARG CODEX_SDK_VERSION=//p' Dockerfile)" in backend_env
   for job in (backend, e2e):
     assert "github.event_name == 'pull_request'" not in job

@@ -514,6 +514,19 @@ def chat(db, owner_token):
   return c
 
 
+@pytest.fixture
+def healthy_data_disk(monkeypatch):
+  """A data disk with room to spare, whatever the host's real free space.
+
+  Background transcript conversion pauses at the "constrained" disk tier, so
+  a test that runs it must not depend on how full the test host is. A test of
+  the floor itself replaces this stub with its own pressure.
+  """
+  from app import resource_pressure
+  monkeypatch.setattr(resource_pressure, "resource_status",
+                      lambda _dir=None, **_kw: {"pressure": {"disk": {"state": "normal"}}})
+
+
 # ── Parallel shards ──────────────────────────────────────────────────────
 # MOBIUS_TEST_SHARD=k/n runs one of n slices of the suite; CI runs the slices
 # as parallel jobs and combines their coverage. Whole files are assigned,
