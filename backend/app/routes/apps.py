@@ -47,6 +47,7 @@ from app.routes.app_publication import (
   router as publication_router,
 )
 from app.routes.app_runtime import router as runtime_router
+from app.routes.app_update_batches import router as update_batches_router
 from app.storage_io import (
   delete_content_type_tree,
   make_parent_folders,
@@ -90,6 +91,7 @@ from app.timeutil import now_naive_utc, SOFT_DELETE_TTL
 
 router = APIRouter(prefix="/api/apps", tags=["apps"])
 router.include_router(schedules_router)
+router.include_router(update_batches_router)
 
 # Tombstoned apps are hard-purged this long after uninstall. Aliases the single
 # shared SOFT_DELETE_TTL (app.timeutil) — the same window chat soft-delete uses,
@@ -834,58 +836,17 @@ async def install_app(
   # routes/apps.py at module top.
   from app import install
 
-  # Git transfers finish before the lifecycle lock, so one slow repository
-  # never holds up other apps' installs, updates or uninstalls.
-  staged_clone = None
-  try:
-    if body.update_app_id is not None and body.reviewed_upstream_commit is not None:
-      reviewed = db.get(models.App, body.update_app_id)
-      reviewed_source = reviewed.source_dir if reviewed is not None else None
-      # Release the request's connection for the transfer, as update-check does.
-      db.rollback()
-      if reviewed_source is not None and app_git.is_repo(reviewed_source):
-        try:
-          await install.fetch_app_commit(
-            reviewed_source, body.reviewed_upstream_commit,
-          )
-        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-          raise install.git_source_error(
-            "Refresh the update and try again.",
-            exc,
-            code="update_changed",
-            failure="The reviewed Git update is no longer available.",
-          ) from exc
-    elif body.update_app_id is None and body.manifest_url is not None:
-      try:
-        staged_clone = await install.stage_package_clone(body.manifest_url, db=db)
-      except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-        raise install.git_source_error(
-          "Nothing was installed.",
-          exc,
-          code="git_install_unavailable",
-          failure="The app's Git repository could not be cloned or verified; "
-          "retry when its source is available.",
-          retryable=True,
-        ) from exc
-    # Serialize the whole install against any concurrent uninstall — both are
-    # app-lifecycle operations over the same /data/apps trees, and letting them
-    # overlap lets one delete what the other just wrote
-    # (fs_locks.install_uninstall_lock has the full rationale).
-    async with fs_locks.install_uninstall_lock():
-      result = await install.install_from_manifest(
-        db,
-        manifest_url=body.manifest_url,
-        manifest=body.manifest,
-        raw_base=body.raw_base,
-        source="store",
-        reviewed_capability_digest=body.reviewed_capability_digest,
-        reviewed_source_digest=body.reviewed_source_digest,
-        reviewed_app_id=body.update_app_id,
-        reviewed_upstream_commit=body.reviewed_upstream_commit,
-        staged_clone=staged_clone,
-      )
-  finally:
-    await asyncio.to_thread(install.discard_staged, staged_clone)
+  # The same path runs each entry of a server-owned update batch.
+  result = await install.install_requested_app(
+    db,
+    manifest_url=body.manifest_url,
+    manifest=body.manifest,
+    raw_base=body.raw_base,
+    reviewed_capability_digest=body.reviewed_capability_digest,
+    reviewed_source_digest=body.reviewed_source_digest,
+    update_app_id=body.update_app_id,
+    reviewed_upstream_commit=body.reviewed_upstream_commit,
+  )
   app = result.app
   mode = result.mode
   warnings = result.warnings

@@ -4010,7 +4010,9 @@ async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPyth
   """Build or reuse the env and smoke-run the exact reconciled tree, unlocked."""
   data_dir = Path(get_settings().data_dir)
   try:
-    env = await asyncio.to_thread(
+    # The caller holds the lifecycle lock; a cancelled update (a batch at
+    # shutdown) must not release it while the env build is still writing.
+    env = await _to_completion(
       app_python_env.prepare_env, data_dir, pending.app_id, pending.runtime.root,
     )
   except app_python_env.PythonEnvBuildError as exc:
@@ -4282,6 +4284,71 @@ async def _activate_install_source(
     )
   applied_app_runtime.publish_runtime(app, runtime_staged)
   return equivalence_target
+
+
+async def install_requested_app(
+  db: Session,
+  *,
+  manifest_url: str | None,
+  manifest: dict | None = None,
+  raw_base: str | None = None,
+  reviewed_capability_digest: str | None = None,
+  reviewed_source_digest: str | None = None,
+  update_app_id: int | None = None,
+  reviewed_upstream_commit: str | None = None,
+) -> InstallResult:
+  """One owner-reviewed Store install or update, the same for every caller.
+
+  The install route and each entry of a server-owned update batch take this
+  one path. Git transfers finish before the lifecycle lock, so one slow
+  repository never holds up other apps' installs, updates or uninstalls; the
+  local install then runs under that lock (``fs_locks.install_uninstall_lock``
+  has the full rationale), and its passes settle before a cancellation.
+  """
+  staged_clone = None
+  try:
+    if update_app_id is not None and reviewed_upstream_commit is not None:
+      reviewed = db.get(models.App, update_app_id)
+      reviewed_source = reviewed.source_dir if reviewed is not None else None
+      # Release the connection for the transfer, as update-check does.
+      db.rollback()
+      if reviewed_source is not None and app_git.is_repo(reviewed_source):
+        try:
+          await fetch_app_commit(reviewed_source, reviewed_upstream_commit)
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+          raise git_source_error(
+            "Refresh the update and try again.",
+            exc,
+            code="update_changed",
+            failure="The reviewed Git update is no longer available.",
+          ) from exc
+    elif update_app_id is None and manifest_url is not None:
+      try:
+        staged_clone = await stage_package_clone(manifest_url, db=db)
+      except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+        raise git_source_error(
+          "Nothing was installed.",
+          exc,
+          code="git_install_unavailable",
+          failure="The app's Git repository could not be cloned or verified; "
+          "retry when its source is available.",
+          retryable=True,
+        ) from exc
+    async with fs_locks.install_uninstall_lock():
+      return await install_from_manifest(
+        db,
+        manifest_url=manifest_url,
+        manifest=manifest,
+        raw_base=raw_base,
+        source="store",
+        reviewed_capability_digest=reviewed_capability_digest,
+        reviewed_source_digest=reviewed_source_digest,
+        reviewed_app_id=update_app_id,
+        reviewed_upstream_commit=reviewed_upstream_commit,
+        staged_clone=staged_clone,
+      )
+  finally:
+    await _to_completion(discard_staged, staged_clone)
 
 
 async def install_from_manifest(
