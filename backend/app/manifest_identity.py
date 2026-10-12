@@ -34,11 +34,6 @@ def requested_manifest_source(manifest_url: str) -> tuple[str, str | None]:
   return stored_manifest_fetch_url(manifest_url), manifest_id
 
 
-def same_permanent_package(manifest: dict, package_id: str | None) -> bool:
-  """Whether a manifest keeps the installed row's permanent `package_id`."""
-  return bool(package_id) and manifest.get("package_id") == package_id
-
-
 def require_permanent_package(manifest: dict, package_id: str | None) -> None:
   """An installed row's permanent `package_id` is its whole identity.
 

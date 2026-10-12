@@ -31,7 +31,7 @@ from app import (
   source_dirs, workspace_files,
 )
 from app.manifest_identity import (
-  requested_manifest_source, same_permanent_package, stored_manifest_fetch_url,
+  requested_manifest_source, stored_manifest_fetch_url,
 )
 from app.app_identity import (
   reject_if_source_dir_taken as _reject_if_source_dir_taken,
@@ -1402,11 +1402,12 @@ def _update_candidate_matches_installed(
   """Accept the installed package identity or its reviewed predecessor.
 
   A permanent `package_id` binds the package across manifest id renames, as
-  it does for install.
+  it does for install. Callers have already required the candidate to carry
+  it (``validate_manifest_address``), so a row that has one matches here.
   """
   from app import install
 
-  if same_permanent_package(candidate_manifest, installed_package_id):
+  if installed_package_id:
     return True
 
   predecessor_source, _ = install._reviewed_predecessor_source(
