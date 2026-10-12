@@ -1,7 +1,6 @@
 """Accepted app services own policy; the platform owns their hard boundary."""
 
 import asyncio
-import json
 import logging
 import os
 from pathlib import Path
@@ -50,7 +49,7 @@ async def test_queued_service_pins_runtime_until_cancelled(monkeypatch, blocked_
     return SimpleNamespace(close=lambda: events.append("released"))
 
   monkeypatch.setattr(app_services, "hold_runtime", pin)
-  task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1), None, {}))
+  task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1, slug="test"), None, {}))
   try:
     await asyncio.wait_for(gate.waiting.wait(), timeout=1)
     assert events == ["pinned"], "queued old-runtime requests must prevent a false drain verdict"
@@ -85,12 +84,12 @@ async def test_one_apps_backlog_does_not_take_other_apps_execution_slots(monkeyp
     raise HTTPException(418, "second app admitted")
 
   monkeypatch.setattr(app_services, "service_entry", entered)
-  first = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1), None, {}))
+  first = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1, slug="test"), None, {}))
   try:
     await asyncio.wait_for(busy.waiting.wait(), timeout=1)
     with pytest.raises(HTTPException, match="second app admitted"):
       await asyncio.wait_for(
-        app_services.invoke_service(SimpleNamespace(id=2), None, {}), timeout=1,
+        app_services.invoke_service(SimpleNamespace(id=2, slug="test"), None, {}), timeout=1,
       )
   finally:
     first.cancel()
@@ -126,13 +125,13 @@ async def test_public_callback_does_not_queue_behind_private_request(monkeypatch
 
   monkeypatch.setattr(app_services, "service_entry", entered)
   private = asyncio.create_task(
-    app_services.invoke_service(SimpleNamespace(id=1), None, {"public": False}),
+    app_services.invoke_service(SimpleNamespace(id=1, slug="test"), None, {"public": False}),
   )
   try:
     await asyncio.wait_for(busy.waiting.wait(), timeout=1)
     with pytest.raises(HTTPException, match="public callback admitted"):
       await asyncio.wait_for(
-        app_services.invoke_service(SimpleNamespace(id=1), None, {"public": True}),
+        app_services.invoke_service(SimpleNamespace(id=1, slug="test"), None, {"public": True}),
         timeout=1,
       )
   finally:
@@ -164,7 +163,7 @@ async def test_cancel_during_spawn_reaps_process_before_releasing_runtime(monkey
     close=lambda: released.append(processes[0].returncode),
   ))
   monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
-  task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1), None, {}))
+  task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1, slug="test"), None, {}))
   try:
     await asyncio.wait_for(created.wait(), timeout=3)
     task.cancel()
@@ -207,7 +206,7 @@ print(json.dumps({
 
 def _service_app(
   db, *, access="self", slug="service-test", service_id=None, aliases=(),
-  service_bytes=SERVICE, diagnostics_routes=(), diagnostics_error_types=(),
+  service_bytes=SERVICE,
 ):
   source = Path(get_settings().data_dir) / "apps" / slug
   source.mkdir(parents=True)
@@ -223,8 +222,6 @@ def _service_app(
         "entry": "service.py",
         "access": access,
         "protocol": "json-v1",
-        "diagnostics_routes": list(diagnostics_routes),
-        "diagnostics_error_types": list(diagnostics_error_types),
         "max_request_bytes": 8 * 1024 * 1024,
         "max_response_bytes": 8 * 1024 * 1024,
       },
@@ -635,340 +632,31 @@ def test_http_callers_cannot_reach_the_platforms_tool_lane(client, auth, db, pat
   assert response.status_code == 404
 
 
-def test_service_diagnostics_are_local_shape_only(client, auth, db, monkeypatch):
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-  app = _service_app(db, slug="diagnostic-shape",
-                     diagnostics_routes=["/replies/{post_id}"],
-                     diagnostics_error_types=["HTTPStatusError"])
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  (accepted / "service.py").write_text(
-    'import json\nprint(json.dumps({"status":502,"body":{"detail":"private body"},'
-    '"diagnostics":{"route":"/replies/{post_id}","error_type":"HTTPStatusError",'
-    '"upstream_status":404,"message":"private message","path":"/replies/private-id"}}))\n'
-  )
-  response = client.get(f"/api/apps/{app.id}/service/replies/private-id?token=private-query", headers=auth)
-  assert response.status_code == 502
-  assert response.json() == {"detail": "private body"}
-  flattened = {key: value for attrs in recorded for key, value in attrs.items()}
-  assert flattened == {
-    "mobius.app.slug": "diagnostic-shape",
-    "mobius.service.route": "/replies/{post_id}",
-    "mobius.service.error_type": "app_http_error",
-    "mobius.service.app_error_type": "HTTPStatusError",
-    "mobius.service.upstream_status": 404,
-  }
-  assert "private" not in str(flattened)
-
-
-def test_service_boundary_failure_has_safe_category(client, auth, db, monkeypatch):
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-  app = _service_app(db, slug="boundary-diagnostic")
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  (accepted / "service.py").write_text('print("not JSON containing private data")\n')
-  response = client.get(f"/api/apps/{app.id}/service/status", headers=auth)
-  assert response.status_code == 502
-  assert {k: v for attrs in recorded for k, v in attrs.items()} == {
-    "mobius.app.slug": "boundary-diagnostic",
-    "mobius.service.error_type": "invalid_json",
-  }
-
-
-@pytest.mark.parametrize("output, detail, category", [
-  ("not JSON", "App service returned invalid JSON.", "invalid_json"),
-  ('[]', "App service returned an invalid response envelope.", "invalid_envelope"),
-  ('{"status":true}', "App service returned an invalid status.", "invalid_status"),
-  ('{"headers":[]}', "response headers must be a bounded object", "invalid_headers"),
-  ('{"body_base64":123}', "App service returned an invalid binary response.", "invalid_binary_response"),
-  ('{"media_type":"text/plain"}', "App service returned an invalid media type.", "invalid_media_type"),
-  ('{"body_base64":"!","media_type":"text/plain"}', "App service returned invalid binary data.", "invalid_binary_data"),
+@pytest.mark.parametrize("source, status, category", [
+  ('print("not JSON private")', 502, "invalid_json"),
+  ('print("[]")', 502, "invalid_envelope"),
+  ('print(\'{"status":true}\')', 502, "invalid_status"),
+  # A boundary failure outranks the app's own 5xx status.
+  ('print(\'{"status":503,"headers":[]}\')', 502, "invalid_headers"),
+  ('print(\'{"body_base64":123}\')', 502, "invalid_binary_response"),
+  ('print(\'{"media_type":"text/plain"}\')', 502, "invalid_media_type"),
+  ('print(\'{"body_base64":"!","media_type":"text/plain"}\')', 502, "invalid_binary_data"),
+  ('import sys\nprint("private", file=sys.stderr)\nsys.exit(3)', 502, "process_failed"),
+  ('print(\'{"status":503,"body":{"detail":"private"}}\')', 503, "app_http_error"),
+  ('print(\'{"body":{"ok":"private"}}\')', 200, None),
 ])
-def test_response_boundary_failures_keep_http_detail_and_stable_category(
-  client, auth, db, monkeypatch, output, detail, category,
+def test_service_traces_record_app_and_platform_category_never_request_data(
+  client, auth, db, monkeypatch, source, status, category,
 ):
   recorded = []
   monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
   app = _service_app(db)
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  (accepted / "service.py").write_text(f"print({output!r})\n")
-  response = client.get(f"/api/apps/{app.id}/service/status", headers=auth)
-  assert response.status_code == 502
-  assert response.json() == {"detail": detail}
-  assert recorded[-1] == {"mobius.service.error_type": category}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("detail", [
-  "App service returned invalid JSON.", "Reworded failure with private text.",
-])
-async def test_boundary_category_survives_display_text_changes(monkeypatch, detail):
-  error = app_services.ServiceBoundaryError(502, detail, category="invalid_json")
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-
-  async def fail(*args, **kwargs):
-    raise error
-
-  monkeypatch.setattr(app_services, "_invoke_service", fail)
-  with pytest.raises(HTTPException) as raised:
-    await app_services.invoke_service(SimpleNamespace(slug="test"), None, {})
-  assert raised.value is error
-  assert raised.value.status_code == 502
-  assert raised.value.detail == detail
-  assert recorded[-1] == {"mobius.service.error_type": "invalid_json"}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("error, category", [
-  (HTTPException(502, "App service returned invalid JSON."), "service_boundary_error"),
-  (HTTPException(503, {"private": "text"}), "service_boundary_error"),
-  (ValueError("private message"), "service_internal_error"),
-  (type("PrivateImplementationError", (Exception,), {})("private message"), "service_internal_error"),
-  (HTTPException(403, "private message"), None),
-  (asyncio.CancelledError(), None),
-])
-async def test_untyped_failures_never_derive_labels_from_text_or_class(
-  monkeypatch, error, category,
-):
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-
-  async def fail(*args, **kwargs):
-    raise error
-
-  monkeypatch.setattr(app_services, "_invoke_service", fail)
-  with pytest.raises(type(error)) as raised:
-    await app_services.invoke_service(SimpleNamespace(slug="test"), None, {})
-  assert raised.value is error
-  labels = [attrs["mobius.service.error_type"] for attrs in recorded
-            if "mobius.service.error_type" in attrs]
-  assert labels == ([] if category is None else [category])
-
-
-def test_malformed_optional_diagnostics_do_not_break_service(client, auth, db):
-  app = _service_app(db, slug="optional-diagnostic")
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  (accepted / "service.py").write_text(
-    'print(\'{"status":200,"body":{"ok":true},"diagnostics":{"route":"/x?secret",'
-    '"error_type":{"private":"text"},"upstream_status":true}}\')\n'
+  (runtime_parent(app.id) / app.runtime_revision / "service.py").write_text(source)
+  response = client.get(
+    f"/api/apps/{app.id}/service/private-id?token=private-query", headers=auth,
   )
-  response = client.get(f"/api/apps/{app.id}/service/status", headers=auth)
-  assert response.status_code == 200
-  assert response.json() == {"ok": True}
-
-
-@pytest.mark.parametrize("route", [
-  "/replies/private-id", "/users/12345", "/undeclared/{id}", ["/status"],
-])
-def test_undeclared_route_diagnostics_never_enter_tracing(
-  client, auth, db, monkeypatch, route,
-):
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-  app = _service_app(db, diagnostics_routes=["/replies/{post_id}", "/status"])
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  envelope = {"body": {"ok": True}, "diagnostics": {"route": route}}
-  (accepted / "service.py").write_text(f"print({json.dumps(envelope)!r})\n")
-  response = client.get(f"/api/apps/{app.id}/service/replies/private-id", headers=auth)
-  assert response.status_code == 200
-  assert response.json() == {"ok": True}
-  assert {k: v for attrs in recorded for k, v in attrs.items()} == {
-    "mobius.app.slug": "service-test",
-  }
-
-
-@pytest.mark.parametrize("declared", [False, True])
-def test_static_route_diagnostics_require_an_accepted_declaration(
-  client, auth, db, monkeypatch, declared,
-):
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-  app = _service_app(db, diagnostics_routes=["/status"] if declared else [])
-  if not declared:
-    contract = dict(app.capability_contract)
-    contract["service"] = dict(contract["service"])
-    contract["service"].pop("diagnostics_routes")
-    app.capability_contract = contract
-    db.commit()
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  (accepted / "service.py").write_text(
-    'print(\'{"body":{"ok":true},"diagnostics":{"route":"/status"}}\')\n'
-  )
-  # A draft manifest cannot add authority to the accepted runtime contract.
-  (Path(app.source_dir) / "mobius.json").write_text(
-    '{"service":{"diagnostics_routes":["/status"]}}'
-  )
-  response = client.get(f"/api/apps/{app.id}/service/status", headers=auth)
-  assert response.status_code == 200
-  flattened = {k: v for attrs in recorded for k, v in attrs.items()}
-  assert flattened == {
-    "mobius.app.slug": "service-test",
-    **({"mobius.service.route": "/status"} if declared else {}),
-  }
-
-
-def test_request_derived_class_shaped_error_label_never_enters_tracing(
-  client, auth, db, monkeypatch,
-):
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-  app = _service_app(db, diagnostics_error_types=["HTTPStatusError"])
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  (accepted / "service.py").write_text(
-    'import json,sys\nr=json.load(sys.stdin)\n'
-    'print(json.dumps({"status":502,"body":{"detail":"safe"},'
-    '"diagnostics":{"error_type":r["path"],"upstream_status":404}}))\n'
-  )
-  response = client.get(f"/api/apps/{app.id}/service/User_12345", headers=auth)
-  assert response.status_code == 502
-  assert response.json() == {"detail": "safe"}
-  assert {k: v for attrs in recorded for k, v in attrs.items()} == {
-    "mobius.app.slug": "service-test",
-    "mobius.service.error_type": "app_http_error",
-    "mobius.service.upstream_status": 404,
-  }
-
-
-@pytest.mark.parametrize("label", [
-  "User_12345", "ValueError", "httpstatuserror", "private message", "E" * 129,
-  None, [], {}, True, 123,
-])
-def test_undeclared_or_malformed_error_labels_keep_generic_category(
-  client, auth, db, monkeypatch, label,
-):
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-  app = _service_app(db, diagnostics_error_types=["HTTPStatusError"])
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  envelope = {"status": 500, "body": {"ok": False}, "diagnostics": {"error_type": label}}
-  (accepted / "service.py").write_text(f"print({json.dumps(envelope)!r})\n")
-  response = client.get(f"/api/apps/{app.id}/service/status", headers=auth)
-  assert response.status_code == 500
-  assert response.json() == {"ok": False}
-  assert {k: v for attrs in recorded for k, v in attrs.items()} == {
-    "mobius.app.slug": "service-test",
-    "mobius.service.error_type": "app_http_error",
-  }
-
-
-@pytest.mark.parametrize("declaration", [None, [], ["HTTPStatusError"]])
-def test_error_labels_require_accepted_not_draft_declaration(
-  client, auth, db, monkeypatch, declaration,
-):
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-  app = _service_app(db, diagnostics_error_types=declaration or [])
-  if declaration is None:
-    contract = json.loads(json.dumps(app.capability_contract))
-    contract["service"].pop("diagnostics_error_types")
-    app.capability_contract = contract
-    db.commit()
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  (accepted / "service.py").write_text(
-    'print(\'{"status":502,"body_base64":"c2FmZQ==","media_type":"text/plain",'
-    '"headers":{"Content-Language":"en"},'
-    '"diagnostics":{"error_type":"HTTPStatusError"}}\')\n'
-  )
-  (Path(app.source_dir) / "mobius.json").write_text(
-    '{"service":{"diagnostics_error_types":["HTTPStatusError"]}}'
-  )
-  response = client.get(f"/api/apps/{app.id}/service/status", headers=auth)
-  assert response.status_code == 502
-  assert response.content == b"safe"
-  assert response.headers["content-language"] == "en"
-  assert response.headers["content-type"].startswith("text/plain")
-  assert {k: v for attrs in recorded for k, v in attrs.items()} == {
-    "mobius.app.slug": "service-test",
-    "mobius.service.error_type": "app_http_error",
-    **({"mobius.service.app_error_type": "HTTPStatusError"} if declaration else {}),
-  }
-
-
-@pytest.mark.parametrize("diagnostics", [None, [], "HTTPStatusError", {}, {"upstream_status": True}])
-def test_missing_or_malformed_diagnostics_keep_generic_category(
-  client, auth, db, monkeypatch, diagnostics,
-):
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-  app = _service_app(db, diagnostics_error_types=["HTTPStatusError"])
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  envelope = {"status": 599, "body": {"ok": False}}
-  if diagnostics is not None:
-    envelope["diagnostics"] = diagnostics
-  (accepted / "service.py").write_text(f"print({json.dumps(envelope)!r})\n")
-  response = client.get(f"/api/apps/{app.id}/service/status", headers=auth)
-  assert response.status_code == 599
-  assert response.json() == {"ok": False}
-  assert {k: v for attrs in recorded for k, v in attrs.items()} == {
-    "mobius.app.slug": "service-test",
-    "mobius.service.error_type": "app_http_error",
-  }
-
-
-@pytest.mark.parametrize("status", [200, 400, 499])
-def test_non_5xx_diagnostics_never_record_error_labels_or_upstream_status(
-  client, auth, db, monkeypatch, status,
-):
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-  app = _service_app(db, diagnostics_routes=["/status"], diagnostics_error_types=["HTTPStatusError"])
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  envelope = {"status": status, "body": {"ok": True}, "diagnostics": {
-    "route": "/status", "error_type": "HTTPStatusError", "upstream_status": 404,
-  }}
-  (accepted / "service.py").write_text(f"print({json.dumps(envelope)!r})\n")
-  response = client.get(f"/api/apps/{app.id}/service/status", headers=auth)
   assert response.status_code == status
-  assert response.json() == {"ok": True}
-  assert {k: v for attrs in recorded for k, v in attrs.items()} == {
-    "mobius.app.slug": "service-test", "mobius.service.route": "/status",
-  }
-
-
-def test_declared_app_label_cannot_override_platform_boundary_category(
-  client, auth, db, monkeypatch,
-):
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-  app = _service_app(db, diagnostics_error_types=["HTTPStatusError"])
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  (accepted / "service.py").write_text(
-    'print(\'{"status":502,"headers":[],"body":{"detail":"private"},'
-    '"diagnostics":{"error_type":"HTTPStatusError"}}\')\n'
-  )
-  response = client.get(f"/api/apps/{app.id}/service/status", headers=auth)
-  assert response.status_code == 502
-  assert response.json() == {"detail": "response headers must be a bounded object"}
-  assert recorded[-1] == {"mobius.service.error_type": "invalid_headers"}
-
-
-@pytest.mark.parametrize("invalid_headers", [False, True])
-def test_app_error_label_cannot_collide_with_platform_category(
-  client, auth, db, monkeypatch, invalid_headers,
-):
-  recorded = []
-  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
-  app = _service_app(db, diagnostics_error_types=["invalid_headers"])
-  accepted = runtime_parent(app.id) / app.runtime_revision
-  envelope = {
-    "status": 503, "body": {"detail": "app failure"},
-    "headers": [] if invalid_headers else {"Content-Language": "en"},
-    "diagnostics": {"error_type": "invalid_headers", "upstream_status": 404},
-  }
-  (accepted / "service.py").write_text(f"print({json.dumps(envelope)!r})\n")
-  response = client.get(f"/api/apps/{app.id}/service/status", headers=auth)
-  if invalid_headers:
-    assert response.status_code == 502
-    assert response.json() == {"detail": "response headers must be a bounded object"}
-  else:
-    assert response.status_code == 503
-    assert response.json() == {"detail": "app failure"}
-    assert response.headers["content-language"] == "en"
-  flattened = {k: v for attrs in recorded for k, v in attrs.items()}
-  assert flattened == {
-    "mobius.app.slug": "service-test",
-    "mobius.service.error_type": "invalid_headers" if invalid_headers else "app_http_error",
-    "mobius.service.app_error_type": "invalid_headers",
-    "mobius.service.upstream_status": 404,
-  }
+  assert recorded == [
+    {"mobius.app.slug": "service-test"},
+    *([{"mobius.service.error_type": category}] if category else []),
+  ]

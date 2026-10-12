@@ -2,13 +2,7 @@
 
 The platform owns authentication, accepted-runtime identity, process limits,
 and revocation. The app owns the request paths and domain behavior behind one
-small JSON protocol. An optional response `diagnostics` object may contain
-`route` (a matched template declared in `service.diagnostics_routes`),
-`error_type` (a class label declared in `service.diagnostics_error_types`),
-and `upstream_status` (HTTP integer).
-These fields are local tracing metadata only, not forwarded to HTTP callers.
-Never include request values, ids, exception messages, stderr, or response bodies.
-This is deliberately not a framework or an import hook:
+small JSON protocol. This is deliberately not a framework or an import hook:
 every request runs in its own process from one reviewed Python entrypoint and
 receives one JSON reply. An entry that declares ``MOBIUS_PRELOAD = True`` has
 its module setup run once and each request forked from it (``service_preload``);
@@ -29,7 +23,6 @@ import signal
 import weakref
 from datetime import timedelta
 from pathlib import Path
-from typing import Literal
 
 from fastapi import HTTPException
 
@@ -70,20 +63,14 @@ _app_slots: weakref.WeakValueDictionary[tuple[int, str], asyncio.Semaphore] = (
 )
 
 
-# Boundary failures carry platform-owned categories independently of HTTP text.
-ServiceFailureCategory = Literal[
-  "invalid_declaration", "runtime_unavailable", "entry_unavailable",
-  "python_env_unavailable", "start_failed", "request_not_accepted",
-  "execution_limit", "process_failed", "invalid_json", "invalid_envelope",
-  "invalid_status", "invalid_headers", "invalid_binary_response",
-  "invalid_media_type", "invalid_binary_data", "response_limit",
-]
-
-
 class ServiceBoundaryError(HTTPException):
-  def __init__(
-    self, status_code: int, detail: str, *, category: ServiceFailureCategory,
-  ):
+  """A platform-boundary failure with a stable trace category.
+
+  The category, never the detail text, reaches tracing: details can quote
+  runtime paths or header names and may be reworded without changing meaning.
+  """
+
+  def __init__(self, category: str, status_code: int, detail: str):
     super().__init__(status_code, detail)
     self.category = category
 
@@ -104,10 +91,7 @@ def service_contract(app, *, access: str) -> dict:
     raise HTTPException(403, "This app service is private.")
   entry = service.get("entry")
   if not isinstance(entry, str) or not entry.endswith(".py"):
-    raise ServiceBoundaryError(
-      503, "Accepted app service declaration is invalid.",
-      category="invalid_declaration",
-    )
+    raise ServiceBoundaryError("invalid_declaration", 503, "Accepted app service declaration is invalid.")
   return service
 
 
@@ -143,20 +127,14 @@ def service_entry(app, service: dict) -> Path:
   try:
     root = runtime_root(app)
   except AppliedRuntimeUnavailable as exc:
-    raise ServiceBoundaryError(
-      503, str(exc), category="runtime_unavailable",
-    ) from exc
+    raise ServiceBoundaryError("runtime_unavailable", 503, str(exc)) from exc
   entry = root / service["entry"]
   try:
     if entry.is_symlink() or not entry.is_file() or entry.parent != root:
-      raise ServiceBoundaryError(
-        503, "Accepted app service entry is unavailable.",
-        category="entry_unavailable",
-      )
+      raise ServiceBoundaryError("entry_unavailable", 503, "Accepted app service entry is unavailable.")
   except OSError as exc:
     raise ServiceBoundaryError(
-      503, "Accepted app service entry is unavailable.",
-      category="entry_unavailable",
+      "entry_unavailable", 503, "Accepted app service entry is unavailable.",
     ) from exc
   return entry
 
@@ -167,9 +145,7 @@ def service_python_env(app, entry: Path) -> Path | None:
     return app_python_env.resolve_env(get_settings().data_dir, app.id, entry.parent)
   except app_python_env.PythonEnvUnavailable as exc:
     log.warning("App service %s cannot start: %s", app.slug, exc)
-    raise ServiceBoundaryError(
-      503, str(exc), category="python_env_unavailable",
-    ) from exc
+    raise ServiceBoundaryError("python_env_unavailable", 503, str(exc)) from exc
 
 
 def service_environment(app, owner, service: dict, *, public: bool, browser: BrowserLineage | None = None) -> dict[str, str]:
@@ -295,9 +271,7 @@ async def _run_spawned(
           continue
       raise
   except OSError as exc:
-    raise ServiceBoundaryError(
-      502, "App service could not start.", category="start_failed",
-    ) from exc
+    raise ServiceBoundaryError("start_failed", 502, "App service could not start.") from exc
   assert process.stdin is not None
   assert process.stdout is not None
   assert process.stderr is not None
@@ -311,15 +285,11 @@ async def _run_spawned(
     )
   except (TimeoutError, ValueError) as exc:
     await _stop_process(process, write_task, stdout_task, stderr_task)
-    raise ServiceBoundaryError(
-      503, "App service exceeded its execution limits.",
-      category="execution_limit",
-    )
+    raise ServiceBoundaryError("execution_limit", 503, "App service exceeded its execution limits.")
   except OSError as exc:
     await _stop_process(process, write_task, stdout_task, stderr_task)
     raise ServiceBoundaryError(
-      502, "App service failed before accepting its request.",
-      category="request_not_accepted",
+      "request_not_accepted", 502, "App service failed before accepting its request.",
     ) from exc
   except asyncio.CancelledError:
     await _stop_process(process, write_task, stdout_task, stderr_task)
@@ -365,20 +335,18 @@ async def invoke_service(
   timeout_seconds: float = SERVICE_TIMEOUT_SECONDS,
   lane: str | None = None,
 ) -> tuple[int, object, dict[str, str], str | None]:
-  tracing.annotate(None, {"mobius.app.slug": getattr(app, "slug", None)})
+  # Traces record only the app slug and platform-authored categories, never
+  # request values or app-supplied text.
+  tracing.annotate(None, {"mobius.app.slug": app.slug})
   try:
     result = await _invoke_service(
       app, owner, request_envelope, timeout_seconds=timeout_seconds, lane=lane,
     )
-  except HTTPException as exc:
-    if exc.status_code >= 500:
-      tracing.annotate(None, {"mobius.service.error_type":
-        exc.category if isinstance(exc, ServiceBoundaryError)
-        else "service_boundary_error"})
+  except ServiceBoundaryError as exc:
+    tracing.annotate(None, {"mobius.service.error_type": exc.category})
     raise
-  except Exception:
-    tracing.annotate(None, {"mobius.service.error_type": "service_internal_error"})
-    raise
+  if result[0] >= 500:
+    tracing.annotate(None, {"mobius.service.error_type": "app_http_error"})
   return result
 
 
@@ -454,13 +422,11 @@ async def _invoke_service(
           pass
         except (TimeoutError, ValueError) as exc:
           raise ServiceBoundaryError(
-            503, "App service exceeded its execution limits.",
-            category="execution_limit",
+            "execution_limit", 503, "App service exceeded its execution limits.",
           ) from exc
         except OSError as exc:
           raise ServiceBoundaryError(
-            502, "App service failed before accepting its request.",
-            category="request_not_accepted",
+            "request_not_accepted", 502, "App service failed before accepting its request.",
           ) from exc
       if outcome is None:
         outcome = await _run_spawned(
@@ -470,9 +436,7 @@ async def _invoke_service(
       if returncode != 0:
         detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
         log.warning("App service %s failed: %s", app.slug, detail or "no diagnostics")
-        raise ServiceBoundaryError(
-          502, "App service failed.", category="process_failed",
-        )
+        raise ServiceBoundaryError("process_failed", 502, "App service failed.")
   finally:
     pin.close()
     if grant_id is not None:
@@ -484,44 +448,14 @@ async def _invoke_service(
   try:
     response = json.loads(stdout, parse_constant=_reject_json_constant)
   except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
-    raise ServiceBoundaryError(
-      502, "App service returned invalid JSON.", category="invalid_json",
-    ) from exc
+    raise ServiceBoundaryError("invalid_json", 502, "App service returned invalid JSON.") from exc
   if not isinstance(response, dict) or set(response) - {
-    "status", "body", "body_base64", "headers", "media_type", "diagnostics",
+    "status", "body", "body_base64", "headers", "media_type",
   }:
-    raise ServiceBoundaryError(
-      502, "App service returned an invalid response envelope.",
-      category="invalid_envelope",
-    )
+    raise ServiceBoundaryError("invalid_envelope", 502, "App service returned an invalid response envelope.")
   status = response.get("status", 200)
   if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status <= 599:
-    raise ServiceBoundaryError(
-      502, "App service returned an invalid status.",
-      category="invalid_status",
-    )
-  # App-authored shape only. These optional diagnostics are not returned to
-  # callers and cannot change the response or make an otherwise valid call fail.
-  diagnostics = response.get("diagnostics")
-  if isinstance(diagnostics, dict):
-    route = diagnostics.get("route")
-    error_type = diagnostics.get("error_type")
-    upstream_status = diagnostics.get("upstream_status")
-    safe = {}
-    # Only the accepted manifest supplies labels, never response syntax.
-    routes = service.get("diagnostics_routes", [])
-    if isinstance(route, str) and isinstance(routes, list) and route in routes:
-      safe["mobius.service.route"] = route
-    if status >= 500:
-      safe["mobius.service.error_type"] = "app_http_error"
-      error_types = service.get("diagnostics_error_types", [])
-      if isinstance(error_type, str) and isinstance(error_types, list) and error_type in error_types:
-        safe["mobius.service.app_error_type"] = error_type
-      if type(upstream_status) is int and 100 <= upstream_status <= 599:
-        safe["mobius.service.upstream_status"] = upstream_status
-    tracing.annotate(None, safe)
-  elif status >= 500:
-    tracing.annotate(None, {"mobius.service.error_type": "app_http_error"})
+    raise ServiceBoundaryError("invalid_status", 502, "App service returned an invalid status.")
   if status >= 500 and stderr:
     detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
     if detail:
@@ -533,40 +467,27 @@ async def _invoke_service(
       response.get("headers"), public=bool(request_envelope.get("public")),
     )
   except ValueError as exc:
-    raise ServiceBoundaryError(
-      502, str(exc), category="invalid_headers",
-    ) from exc
+    raise ServiceBoundaryError("invalid_headers", 502, str(exc)) from exc
   encoded = response.get("body_base64")
   media_type = response.get("media_type")
   if encoded is not None:
     if response.get("body") is not None or not isinstance(encoded, str):
       raise ServiceBoundaryError(
-        502, "App service returned an invalid binary response.",
-        category="invalid_binary_response",
+        "invalid_binary_response", 502, "App service returned an invalid binary response.",
       )
     if not isinstance(media_type, str) or _MEDIA_TYPE.fullmatch(media_type) is None:
-      raise ServiceBoundaryError(
-        502, "App service returned an invalid media type.",
-        category="invalid_media_type",
-      )
+      raise ServiceBoundaryError("invalid_media_type", 502, "App service returned an invalid media type.")
     try:
       body = base64.b64decode(encoded, validate=True)
     except (ValueError, binascii.Error) as exc:
       raise ServiceBoundaryError(
-        502, "App service returned invalid binary data.",
-        category="invalid_binary_data",
+        "invalid_binary_data", 502, "App service returned invalid binary data.",
       ) from exc
     if len(body) > MAX_RESPONSE_BYTES:
-      raise ServiceBoundaryError(
-        502, "App service returned too much binary data.",
-        category="response_limit",
-      )
+      raise ServiceBoundaryError("response_limit", 502, "App service returned too much binary data.")
     return status, body, headers, media_type
   if media_type is not None:
-    raise ServiceBoundaryError(
-      502, "App service returned an invalid media type.",
-      category="invalid_media_type",
-    )
+    raise ServiceBoundaryError("invalid_media_type", 502, "App service returned an invalid media type.")
   return status, response.get("body"), headers, None
 
 
