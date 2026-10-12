@@ -2569,35 +2569,49 @@ async def _run_codex_sdk_turn(
         )
       registry.unregister(chat_id, RunnerKind.CODEX_SDK)
       current.mark_finished()
-    # AsyncCodex.close() terminates only its direct Popen PID.  Reap the
-    # isolated group and every command this run started in its own session
-    # after that context exit, so a tool child cannot be re-parented to
-    # container init and consume CPU/RAM after the turn.  A
-    # worker keeps the short grace period off the FastAPI event loop; shield
-    # ensures task cancellation cannot prevent the SIGKILL backstop from
-    # running in that worker once cleanup has started.
+    async def finish_teardown_step(work: Any, step: str) -> None:
+      """Run one step to its end; defer a cancellation, log a failure."""
+      nonlocal deferred_cancel
+
+      async def logged() -> None:
+        try:
+          await work
+        except Exception:
+          log.exception("Codex turn teardown: %s failed chat_id=%s", step, chat_id)
+
+      try:
+        await settled.settle(logged())
+      except asyncio.CancelledError as exc:
+        deferred_cancel = deferred_cancel or exc
+
     if helper_host is not None:
       # Unload this helper's thread (its tool servers exit with it) before
       # ending its leftover commands; the host itself stays up.
-      await asyncio.shield(helper_host.unload_thread(current_session_id))
+      await finish_teardown_step(
+        helper_host.unload_thread(current_session_id), "helper thread unload",
+      )
       if not helper_host.alive:
         from app import helper_hosts
-        await asyncio.shield(helper_hosts.MANAGER.discard(helper_host))
+        await finish_teardown_step(
+          helper_hosts.MANAGER.discard(helper_host), "helper host discard",
+        )
     if turn_env_file is not None:
       turn_env_file.remove()
+    # AsyncCodex.close() terminates only its direct Popen PID. Reap the
+    # isolated group and every command this run started in its own session
+    # after that context exit, so a tool child cannot be re-parented to
+    # container init and consume CPU/RAM after the turn. The worker finishes
+    # its bounded TERM/KILL sequence before any cancellation is raised, and
+    # neither a cancellation nor a failure skips the executor close.
     run_marker = base_env.get(RUN_MARKER_ENV)
     if (
       (process_group_id is not None or run_marker)
       and not group_already_terminated
     ):
-      try:
-        # The worker finishes its bounded TERM/KILL sequence before any
-        # caller cancellation is raised; that cancellation then wins.
-        await settled.run_settled(
-          _terminate_codex_processes, process_group_id, run_marker,
-        )
-      except asyncio.CancelledError as exc:
-        deferred_cancel = deferred_cancel or exc
+      await finish_teardown_step(
+        asyncio.to_thread(_terminate_codex_processes, process_group_id, run_marker),
+        "process reap",
+      )
     if codex_call_executor is not None:
       codex_call_executor.close()
     if deferred_cancel is not None:
