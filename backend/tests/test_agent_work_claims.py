@@ -186,7 +186,7 @@ def test_deleting_owner_releases_only_unfinished_exact_action(db):
 
   assert len(released) == 1
   assert released[0].interested_chat_ids == []
-  assert db.query(models.GoalDependency).one().outcome_json["kind"] == "released"
+  assert db.query(models.GoalDependency).one().outcome_json["kind"] == "owner_deleted"
   row = db.query(models.AgentWorkClaim).one()
   assert row.released_at is not None
   assert "deleted" in row.outcome
