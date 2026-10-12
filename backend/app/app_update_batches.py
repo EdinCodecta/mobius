@@ -40,6 +40,9 @@ _ACTIVE = frozenset({"queued", "applying"})
 # Entries running at once across all batches. Each may hold a Git transfer on
 # the shared transfer workers; the rest stay free for interactive installs.
 _RUNNING_ENTRIES = 2
+# Shutdown waits this long for running installs to settle. A process killed
+# sooner is covered too: boot settles every unfinished entry the same way.
+_STOP_GRACE_SECONDS = 60
 # SSE transport heartbeat, not an update deadline. A long Python check can run
 # without a status change; keep proxies from mistaking that for a dead link.
 _STREAM_KEEPALIVE_SECONDS = 15
@@ -105,15 +108,17 @@ async def install_reviewed_update(update: dict) -> dict:
 
 
 def _reviewed_commit_landed(source_dir: str, reviewed_commit: str, source_commit: str | None) -> bool:
-  """The served revision contains the reviewed commit and nothing is pending.
+  """The served revision contains the reviewed commit and no receipt is pending.
 
   ``main`` can hold unapplied edits, and a conflicted update records the
   reviewed commit as its upstream without serving it; only the accepted
-  ``source_commit`` is evidence.
+  ``source_commit`` is evidence. As resolve-update's "already installed"
+  rule, only the receipt FILE means pending: finishing deletes it first, and
+  a leftover pending directory or checkout is harmless.
   """
-  from app.install import pending_conflict_update_receipt_present
+  from app.install import pending_update_receipt_file
 
-  return bool(source_commit) and not pending_conflict_update_receipt_present(source_dir) and (
+  return bool(source_commit) and not pending_update_receipt_file(source_dir).is_file() and (
     app_git.ref_is_ancestor(source_dir, reviewed_commit, source_commit) is True
   )
 
@@ -221,6 +226,7 @@ class AppUpdateBatches:
     self.failure: str | None = None
     self._read_failed = False
     self._slots: asyncio.Semaphore | None = None
+    self._starting = asyncio.Lock()
 
   def _save(self, record: dict) -> None:
     record["updated_at"] = _now()
@@ -247,27 +253,35 @@ class AppUpdateBatches:
       wake.set()
 
   async def start(self) -> None:
+    async with self._starting:
+      await self._start()
+
+  async def _start(self) -> None:
     self._slots = asyncio.Semaphore(_RUNNING_ENTRIES)
     self.records = {}
+    self.failure = None
     try:
       await asyncio.to_thread(self._load_receipts)
     except Exception:
       # A damaged receipt or a failed settlement read (including a database
       # error) must not fail readiness for unrelated chats and apps. Disable
-      # only this owner, visibly, and keep the evidence for repair.
-      self.failure = _UNREADABLE
-      self._read_failed = True
+      # only this owner, visibly, and keep the evidence for repair. A failed
+      # settlement write is a write failure (_save set it): never retried.
+      self._read_failed = self.failure != _UNSAVED
+      if self._read_failed:
+        self.failure = _UNREADABLE
       self.accepting = False
       log.exception("app update progress could not be recovered")
       return
-    self.failure = None
     self._read_failed = False
     self.accepting = True
 
   async def retry_start(self) -> None:
     """Retry a failed boot read; never after a failed write or at shutdown."""
-    if self._read_failed and not self.tasks:
-      await self.start()
+    async with self._starting:
+      # Concurrent requests share one retry: re-check under the lock.
+      if self._read_failed and not self.tasks:
+        await self._start()
 
   def _load_receipts(self) -> None:
     self.root.mkdir(parents=True, exist_ok=True)
@@ -300,7 +314,12 @@ class AppUpdateBatches:
     for task in tasks:
       task.cancel()
     if tasks:
-      await asyncio.gather(*tasks, return_exceptions=True)
+      _done, pending = await asyncio.wait(tasks, timeout=_STOP_GRACE_SECONDS)
+      if pending:
+        log.warning(
+          "%d app update batch(es) still settling at shutdown; boot settles them",
+          len(pending),
+        )
 
   def submit(self, request: ReviewedUpdateBatch, db) -> dict:
     if not self.accepting:
@@ -373,25 +392,46 @@ class AppUpdateBatches:
     return visible
 
   async def refresh_results(self, key: str, db=None) -> None:
-    """Re-read conflicted entries through the one "did it land" rule."""
+    """Re-read actionable entries through the one "did it land" rule.
+
+    A conflict takes whatever the rule says. A failure keeps its own reason
+    unless the reviewed commit has since landed (the owner updated the app
+    another way), when it is no longer actionable.
+    """
     record = self.records.get(key)
     if record is None:
       raise HTTPException(404, "App update batch not found.")
     if db is not None:
       db.rollback()  # release the request's read before blocking work
-    conflicts = _unfinished(record, record["entries"], {"conflict"})
-    if conflicts and _apply(record, await asyncio.to_thread(_settled_outcomes, conflicts)):
+    actionable = _unfinished(record, record["entries"], {"conflict", "failed"})
+    if not actionable:
+      return
+    outcomes = await asyncio.to_thread(_settled_outcomes, actionable)
+    failed = {e["app_id"] for e in record["entries"] if e["status"] == "failed"}
+    outcomes = {
+      app_id: patch for app_id, patch in outcomes.items()
+      if app_id not in failed or patch["status"] == "updated"
+    }
+    if _apply(record, outcomes):
       self._save(record)
 
   async def snapshots(self, key: str):
     """Coalesce slow readers to the newest durable snapshot, never a backlog."""
-    self.snapshot(key)
+    try:
+      self.snapshot(key)
+    except HTTPException:
+      return
     wake = asyncio.Event()
     self.listeners.setdefault(key, set()).add(wake)
     try:
       while True:
         wake.clear()
-        snapshot = self.snapshot(key)
+        try:
+          snapshot = self.snapshot(key)
+        except HTTPException:
+          # Progress can no longer be saved: end the stream cleanly; the
+          # client's next GET reports the 503.
+          return
         yield snapshot
         if snapshot["phase"] == "complete":
           return

@@ -36,19 +36,36 @@ def lifecycle_lock(monkeypatch):
 LANDED = "e" * 40  # an accepted source commit that contains COMMIT
 
 
+class _Receipts:
+  """Real pending-update receipt files, as a conflicted update writes them."""
+
+  def __init__(self):
+    self.paths = []
+
+  def add(self, source_dir, app_id, commit=COMMIT):
+    path = install.pending_update_receipt_file(source_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+      "schema": 4, "app_id": app_id, "upstream_commit": commit,
+      "manifest": {}, "raw_base": "", "capability_digest": "c" * 64,
+      "candidate_digest": "d" * 64,
+    }))
+    self.paths.append(path)
+
+  def clear(self):
+    # As clear_pending_conflict_update: the file goes first, and a leftover
+    # pending directory is harmless.
+    for path in self.paths:
+      path.unlink()
+    self.paths = []
+
+
 @pytest.fixture
 def git_state(monkeypatch):
-  """Durable Git facts per source dir: which pending receipts exist."""
-  pending = set()
+  """Fake commits (ancestry only); receipts are real files."""
   monkeypatch.setattr(batches.app_git, "ref_is_ancestor",
     lambda path, reviewed, accepted: reviewed == COMMIT and accepted == LANDED)
-  monkeypatch.setattr(install, "pending_conflict_update_receipt_present",
-    lambda path: str(path) in pending)
-  monkeypatch.setattr(install, "read_pending_conflict_update_receipt",
-    lambda path, *, app_id, upstream_commit:
-      {"upstream_commit": upstream_commit}
-      if str(path) in pending and upstream_commit == COMMIT else None)
-  return pending
+  return _Receipts()
 
 
 @pytest.fixture
@@ -313,7 +330,7 @@ async def test_restart_settles_unfinished_entries_from_durable_rows(tmp_path, db
     source_commit=LANDED)
   conflicted = add_app(db, tmp_path, "conflicted", version="1.0", upstream_commit=COMMIT,
     source_commit="1" * 40)
-  git_state.add(str(tmp_path / "conflicted"))
+  git_state.add(tmp_path / "conflicted", conflicted)
   # A conflicted retry records the reviewed upstream; clearing its receipt
   # never serves it. Upstream alone must not read as updated.
   cleared = add_app(db, tmp_path, "cleared", version="1.0", upstream_commit=COMMIT,
@@ -543,7 +560,7 @@ async def test_progress_stream_coalesces_to_latest_result(tmp_path, app_rows):
 async def test_conflicted_entry_follows_its_resolver_until_the_answer_is_applied(tmp_path, db, git_state):
   app_id = add_app(db, tmp_path, "resolved", version="1.0", source_commit="d" * 40,
     upstream_commit=COMMIT)
-  git_state.add(str(tmp_path / "resolved"))
+  git_state.add(tmp_path / "resolved", app_id)
 
   async def execute(update):
     return {"status": "conflict", "version": "1.0", "warnings": []}
@@ -581,7 +598,7 @@ async def test_conflict_cleared_without_its_answer_is_no_longer_actionable(tmp_p
   app_id = add_app(db, tmp_path, "dropped", version="1.0", source_commit="d" * 40,
     upstream_commit=COMMIT, conflict_resolver_chat_id="old-resolver",
     conflict_resolver_upstream_commit=COMMIT)
-  git_state.add(str(tmp_path / "dropped"))
+  git_state.add(tmp_path / "dropped", app_id)
 
   async def execute(update):
     return {"status": "conflict", "version": "1.0", "warnings": []}
@@ -749,3 +766,141 @@ def test_landed_rule_against_a_real_repository(tmp_path):
   receipt.parent.mkdir(parents=True)
   receipt.write_text("{}")
   assert batches._reviewed_commit_landed(str(repo), reviewed, resolved) is False
+
+
+def test_landed_update_with_a_leftover_pending_directory_reads_updated(tmp_path, db):
+  """Finishing deletes the receipt file first; a leftover directory is harmless."""
+  repo = tmp_path / "leftover"
+  subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+
+  def commit(message):
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+      "commit", "-q", "--allow-empty", "-m", message], check=True)
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+      capture_output=True, text=True, check=True).stdout.strip()
+
+  reviewed = commit("reviewed upstream")
+  served = commit("resolved answer")
+  app = models.App(name="Leftover", slug="leftover", jsx_source="export default 1",
+    source_dir=str(repo), source_commit=served, upstream_commit=reviewed, version="2.0")
+  db.add(app)
+  db.commit()
+  receipt = install.pending_update_receipt_file(repo)
+  receipt.parent.mkdir(parents=True)
+  (receipt.parent / "checkout").mkdir()  # the checkout not yet removed
+  assert install.pending_conflict_update_receipt_present(repo)
+  outcome = batches._settled_outcomes({app.id: reviewed})[app.id]
+  assert (outcome["status"], outcome["version"]) == ("updated", "2.0")
+  receipt.write_text("{}")  # a real receipt still means pending
+  assert batches._settled_outcomes({app.id: reviewed})[app.id]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_failure_clears_only_once_the_reviewed_commit_lands(tmp_path, db, git_state):
+  app_id = add_app(db, tmp_path, "later", version="1.0", source_commit="1" * 40)
+
+  async def execute(update):
+    raise HTTPException(409, detail={"code": "update_changed", "message": "Changed."})
+
+  owner = batches.AppUpdateBatches(str(tmp_path), execute=execute)
+  await owner.start()
+  key = owner.submit(request(app_id), db)["id"]
+  await drain(owner)
+  await owner.refresh_results(key, db)
+  entry = owner.snapshot(key)["entries"][0]
+  # Not landed: the failure keeps its own reason.
+  assert (entry["status"], entry["error_code"]) == ("failed", "update_changed")
+
+  row = db.get(models.App, app_id)
+  row.source_commit, row.version = LANDED, "2.0"  # updated one at a time
+  db.commit()
+  await owner.refresh_results(key, db)
+  entry = owner.snapshot(key)["entries"][0]
+  assert (entry["status"], entry["version"], entry["error_code"]) == ("updated", "2.0", None)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_retries_after_a_failed_boot_read_load_once(tmp_path, monkeypatch):
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  owner.root.mkdir()
+  bad = owner.root / f"{uuid4()}.json"
+  bad.write_text("interrupted bytes")
+  await owner.start()
+  bad.unlink()
+  loads = []
+  real = owner._load_receipts
+  def counted():
+    loads.append(1)
+    real()
+  monkeypatch.setattr(owner, "_load_receipts", counted)
+  await asyncio.gather(*(owner.retry_start() for _ in range(5)))
+  assert loads == [1]
+  assert owner.accepting
+
+
+@pytest.mark.asyncio
+async def test_settlement_write_failure_at_boot_is_not_retried(tmp_path, monkeypatch, app_rows):
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  await owner.start()
+  body = request(1)
+  key = str(body.id)
+  owner._save({"id": key, "created_at": _now(),
+    "updates": [u.model_dump() for u in body.updates],
+    "entries": [{"app_id": 1, "status": "applying"}]})
+  monkeypatch.setattr(batches, "_settled_outcomes",
+    lambda reviewed: {1: {"status": "failed", "error": batches._NOT_APPLIED}})
+  def no_space(*args, **kwargs):
+    raise OSError("disk full")
+  monkeypatch.setattr(batches, "atomic_write", no_space)
+  reboot = batches.AppUpdateBatches(str(tmp_path))
+  await reboot.start()
+  assert reboot.failure == batches._UNSAVED
+  loads = []
+  monkeypatch.setattr(reboot, "_load_receipts", lambda: loads.append(1))
+  await reboot.retry_start()
+  assert loads == [] and not reboot.accepting
+
+
+@pytest.mark.asyncio
+async def test_progress_stream_ends_cleanly_when_saving_fails(tmp_path, app_rows, monkeypatch):
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  await owner.start()
+  key = str(uuid4())
+  record = {"id": key, "created_at": _now(), "updates": [],
+            "entries": [{"app_id": 1, "status": "applying"}]}
+  owner._save(record)
+  stream = owner.snapshots(key)
+  assert (await anext(stream))["phase"] == "applying"
+  def no_space(*args, **kwargs):
+    raise OSError("disk full")
+  monkeypatch.setattr(batches, "atomic_write", no_space)
+  with pytest.raises(OSError):
+    owner._save(record)
+  with pytest.raises(StopAsyncIteration):
+    await anext(stream)
+  assert not owner.listeners
+
+
+@pytest.mark.asyncio
+async def test_shutdown_wait_is_bounded(tmp_path, app_rows, monkeypatch):
+  monkeypatch.setattr(batches, "_STOP_GRACE_SECONDS", 0.05)
+  entered, release = asyncio.Event(), asyncio.Event()
+
+  async def stuck_pass():
+    await release.wait()
+    return {"status": "updated"}
+
+  async def execute(update):
+    entered.set()
+    return await install._settle_before_cancel(stuck_pass())
+
+  owner = batches.AppUpdateBatches(str(tmp_path), execute=execute)
+  await owner.start()
+  owner.submit(request(1), None)
+  await entered.wait()
+  await asyncio.wait_for(owner.stop(), timeout=2)
+  assert owner.tasks  # still settling; boot would settle it after a kill
+  release.set()
+  monkeypatch.setattr(batches, "_settled_outcomes",
+    lambda reviewed: {1: {"status": "updated"}})
+  await drain(owner)
