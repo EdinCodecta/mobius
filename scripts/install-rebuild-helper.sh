@@ -118,11 +118,11 @@ verify_admission_identity() {
   local inspected
   inspected=$(docker inspect "$CID" --format \
     '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Entrypoint":{{json .Config.Entrypoint}},"Cmd":{{json .Config.Cmd}},"Labels":{{json .Config.Labels}},"Mounts":{{json .Mounts}}}') || return 1
-  python3 - "$PROJECT" "$CID" "$inspected" "$DATA_MOUNT_SOURCE" <<'PY_ADMISSION'
+  python3 - "$PROJECT" "$CID" "$inspected" "$DATA_SOURCE" "$DATA_MOUNT_SOURCE" <<'PY_ADMISSION'
 import json, re, stat, sys
 from pathlib import Path
 
-project, cid, raw, data_mount_source = sys.argv[1:]
+project, cid, raw, data_source, data_mount_source = sys.argv[1:]
 configuration = json.loads(Path("/etc/mobius-rebuild/config.v4.json").read_text())
 expected = json.loads(Path("/etc/mobius-rebuild/image.override.yml").read_text())
 actual = json.loads(raw)
@@ -154,6 +154,9 @@ def require(condition):
         raise SystemExit("Running admission container does not match the root-frozen owning identity")
 
 require(configuration.get("version") == 4 and configuration.get("project") == project)
+# The frozen data_dir names this app's persistent /data: its stable source, or
+# Docker's Mountpoint spelling recorded by helper protocol 5 and earlier.
+require(configuration.get("data_dir") in {data_source, data_mount_source})
 require(configuration.get("name_source") in {"explicit", "generated"})
 require(isinstance(deployment, str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{1,127}", deployment))
 require(re.fullmatch(r"[0-9a-f]{64}", cid) and actual.get("Id") == cid)
@@ -183,8 +186,6 @@ require(json.loads(attempt_path.read_text()) == expected)
 for target, source, writable, kind in (
     ("/run/mobius-boot-admission.py", "/usr/local/libexec/mobius-boot-admission.py", False, "bind"),
     ("/run/mobius-admission", "/var/lib/mobius-rebuild/admission/" + operation, True, "bind"),
-    # Docker reports a volume's Mountpoint here; the worker separately proves
-    # the frozen data_dir is that volume's stable host source.
     ("/data", data_mount_source, True, None),
 ):
     require(isinstance(source, str) and source.startswith("/"))
@@ -195,9 +196,6 @@ for target, source, writable, kind in (
     require(kind is None or mount.get("Type") == kind)
 PY_ADMISSION
 }
-if [[ $ADMISSION_MANAGED == 1 ]]; then
-  verify_admission_identity
-fi
 
 git -C "$ROOT" diff --quiet HEAD -- \
   scripts/install-rebuild-helper.sh scripts/mobius-rebuild-host.py \
@@ -216,10 +214,7 @@ git -C "$ROOT" diff --quiet HEAD -- \
   "${FILES[@]#"$ROOT/"}") ]] \
   || { echo "The selected helper and Compose inputs must be clean." >&2; exit 1; }
 
-ARGS=()
-for file in "${ENV_FILES[@]}"; do ARGS+=(--env-file "$file"); done
-ARGS+=(-p "$PROJECT")
-for file in "${FILES[@]}"; do ARGS+=(-f "$file"); done
+# Only after the checkout is proven clean may root run its resolver.
 # The host must reach /data even while no app container runs. Docker reports a
 # bind-option local volume at its Mountpoint, which it mounts only while a
 # container uses the volume; the worker's resolver returns the stable source
@@ -232,6 +227,14 @@ for path in "$DATA_SOURCE" "$DATA_MOUNT_SOURCE"; do
   [[ $path =~ ^/[A-Za-z0-9_./-]+$ && -d $path ]] \
     || { echo "Could not resolve the persistent /data mount on the host." >&2; exit 1; }
 done
+if [[ $ADMISSION_MANAGED == 1 ]]; then
+  verify_admission_identity
+fi
+
+ARGS=()
+for file in "${ENV_FILES[@]}"; do ARGS+=(--env-file "$file"); done
+ARGS+=(-p "$PROJECT")
+for file in "${FILES[@]}"; do ARGS+=(-f "$file"); done
 # Every existing helper configuration, legacy or frozen-source alike, must
 # describe this exact project and persistent data directory. The released
 # config.json is never rewritten, so a changed topology would otherwise pair it

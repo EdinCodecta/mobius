@@ -542,9 +542,12 @@ and dispatch are in place). The app refuses to queue a replacement while that
 value is below the served source's `deployment/self-hosted-helper.required`, so
 a helper fix that was released but never installed on this host cannot be
 bypassed by running the old cutover path; status of an older helper, including
-an unresolved recovery, stays readable. Fixed helpers keep working: the app does not require the launcher, and
-`deployment/self-hosted-helper.required` advances only for a change the
-launcher itself or an older fixed helper cannot provide.
+an unresolved recovery, stays readable. The requirement is the larger of the
+served source's and the target release's
+`deployment/self-hosted-helper.required`, which advances only for a change the
+launcher itself or an older fixed helper cannot provide. Every installation
+from before protocol 6, including fixed helpers without the launcher, must
+therefore rerun the installer once before its next replacement.
 
 **Trust.** The worker runs as root on the host, so the authority to publish
 `ghcr.io/mobius-os/mobius:sha-*` becomes authority to publish host-root code on

@@ -383,7 +383,8 @@ def _wrapped_identity(tmp_path, *, deployment="original-app-1", source="generate
                                      "duplicate_mount", "config_files", "immutable_changed", "immutable_symlink",
                                      "immutable_writable", "immutable_directory_symlink", "config_v3",
                                      "name_source", "live_renamed", "token_derived_name",
-                                     "attempt_shares_original_project", "frozen_name_changed"])
+                                     "attempt_shares_original_project", "frozen_name_changed",
+                                     "stable_spelling", "frozen_data_dir"])
 def test_wrapped_reinstall_requires_frozen_identity_and_immutable_attempt(tmp_path, mutation):
     frozen, attempt, actual, code, cid = _wrapped_identity(tmp_path)
     configuration = json.loads((frozen / "config.v4.json").read_text())
@@ -444,9 +445,15 @@ def test_wrapped_reinstall_requires_frozen_identity_and_immutable_attempt(tmp_pa
         relocated = frozen / "other"
         attempt.parent.rename(relocated)
         attempt.parent.symlink_to(relocated, target_is_directory=True)
-    result = subprocess.run([sys.executable, "-c", code, "original", cid, json.dumps(actual), "/host/data"],
+    # The resolved stable source and Docker's view of /data; the frozen
+    # data_dir must be one of them (the Mountpoint spelling predates protocol 6).
+    paths = {"stable_spelling": ["/srv/data", "/host/data"],
+             "frozen_data_dir": ["/srv/data", "/host/mountpoint"]}.get(mutation, ["/host/data", "/host/data"])
+    if mutation == "frozen_data_dir":
+        actual["Mounts"][2]["Source"] = "/host/mountpoint"
+    result = subprocess.run([sys.executable, "-c", code, "original", cid, json.dumps(actual), *paths],
                             capture_output=True, text=True)
-    assert (result.returncode == 0) is (mutation is None), result.stderr
+    assert (result.returncode == 0) is (mutation in {None, "stable_spelling"}), result.stderr
 
 
 def test_wrapped_reinstall_preserves_current_pointer_not_wrapped_base():
@@ -677,7 +684,8 @@ def test_wrapped_reinstall_preserves_literal_argv_and_empty_command(tmp_path, ob
     actual["Cmd"] = observed_command
     attempt.write_text(json.dumps(document))
     (frozen / "image.override.yml").write_text(json.dumps(document))
-    result = subprocess.run([sys.executable, "-c", code, "original", cid, json.dumps(actual), "/host/data"],
+    result = subprocess.run([sys.executable, "-c", code, "original", cid, json.dumps(actual),
+                             "/host/data", "/host/data"],
                             capture_output=True, text=True)
     assert (result.returncode == 0) is (observed_command is None or observed_command == []), result.stderr
 

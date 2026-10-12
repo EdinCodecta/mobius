@@ -238,7 +238,8 @@ def persistent_data_dir(kind: str, source: str) -> str:
         if not options:
             path = volume.get("Mountpoint", "")
         elif (set(options) <= {"type", "o", "device"} and options.get("type") == "none"
-              and {"bind", "rbind"} & set(str(options.get("o", "")).split(","))):
+              and {"bind", "rbind"} & set(str(options.get("o", "")).split(","))
+              and "ro" not in str(options.get("o", "")).split(",")):
             path = options.get("device", "")
         else:
             raise RuntimeError("the /data volume's driver options hide its data from the "

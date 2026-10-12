@@ -106,13 +106,13 @@ _HELPER_PROTOCOL_MESSAGE = (
   "the Möbius checkout on the host, then re-run sudo "
   "scripts/install-rebuild-helper.sh there before replacing the container."
 )
-# The host helper protocol this served source requires; a release that needs
-# new host pieces advances it. Compared with the protocol the host installer
-# certified, so a helper fix that was merged but never installed on this host
-# blocks replacement instead of running the old cutover path.
-_REQUIRED_HELPER_PROTOCOL = (
-  Path(__file__).resolve().parents[2] / "deployment" / "self-hosted-helper.required"
-)
+# A release that needs new host pieces advances its helper protocol. A host
+# replacement is queued only when the protocol the host installer certified
+# meets both the served source's and the target release's requirement, so a
+# helper fix that was merged but never installed on this host blocks
+# replacement instead of running the old cutover path.
+_HELPER_REQUIREMENT_PATH = "deployment/self-hosted-helper.required"
+_REQUIRED_HELPER_PROTOCOL = Path(__file__).resolve().parents[2] / _HELPER_REQUIREMENT_PATH
 
 
 def _empty_status(
@@ -495,11 +495,26 @@ def _read_host_status() -> dict[str, Any]:
   return value
 
 
-def _required_helper_protocol() -> int | None:
+def _required_helper_protocol(target_sha: str | None = None) -> int | None:
+  """The larger of the served and target requirements; None if unreadable."""
   try:
-    return int(_REQUIRED_HELPER_PROTOCOL.read_text(encoding="ascii").strip())
+    required = int(_REQUIRED_HELPER_PROTOCOL.read_text(encoding="ascii").strip())
   except (OSError, UnicodeError, ValueError):
-    return None  # an unreadable requirement never admits a replacement
+    return None
+  if target_sha is None:
+    return required
+  repo = platform_update.PLATFORM_REPO
+  if platform_update._rev(repo, target_sha) != target_sha:
+    return None
+  shown = platform_update._git(
+    "show", f"{target_sha}:{_HELPER_REQUIREMENT_PATH}", repo=repo, check=False,
+  )
+  if shown.returncode != 0:
+    return required  # a release from before the requirement existed
+  try:
+    return max(required, int(shown.stdout.strip()))
+  except ValueError:
+    return None
 
 
 def _current_host_controller(raw: dict[str, Any]) -> bool:
@@ -513,15 +528,22 @@ def _current_host_controller(raw: dict[str, Any]) -> bool:
   )
 
 
-def _host_helper_meets_release(raw: dict[str, Any]) -> bool:
+def _ensure_host_helper_meets_release(target_sha: str) -> None:
   """Dispatch-only: status of an older helper stays readable for recovery."""
-  installed = raw.get("helper_protocol")
-  required = _required_helper_protocol()
-  return (
-    required is not None
-    and isinstance(installed, int) and not isinstance(installed, bool)
-    and installed >= required
-  )
+  required = _required_helper_protocol(target_sha)
+  if required is None:
+    raise DeploymentControlError(
+      "helper_requirement_unavailable",
+      "Möbius could not read this release's host helper requirement. Refresh "
+      "the update review and try again.",
+      status_code=409,
+    )
+  installed = _read_host_status().get("helper_protocol")
+  if not (isinstance(installed, int) and not isinstance(installed, bool)
+          and installed >= required):
+    raise DeploymentControlError(
+      "controller_upgrade_required", _HELPER_PROTOCOL_MESSAGE, status_code=409,
+    )
 
 
 def _write_request(expected_sha: str, nonce: str) -> None:
@@ -905,10 +927,7 @@ async def _request_self_hosted_rebuild(
       status_code=409,
     )
   _ensure_can_rebuild(await read_rebuild_status())
-  if not _host_helper_meets_release(await asyncio.to_thread(_read_host_status)):
-    raise DeploymentControlError(
-      "controller_upgrade_required", _HELPER_PROTOCOL_MESSAGE, status_code=409,
-    )
+  await asyncio.to_thread(_ensure_host_helper_meets_release, expected_sha)
   # A binding left by an attempt that provably ended may be replaced.
   stale = await asyncio.to_thread(_bound_operation)
   replacing = stale if stale and await _binding_ended(stale) else None
@@ -1073,6 +1092,10 @@ async def _request_reviewed_rebuild_transaction(
   else:
     await asyncio.to_thread(validate_reviewed_release)
     _ensure_can_rebuild(await read_rebuild_status())
+    if deployment != "railway":
+      # Refuse before preparing: an outdated helper must not leave a
+      # prepared update parked with nothing able to finish it.
+      await asyncio.to_thread(_ensure_host_helper_meets_release, target_sha)
     started.set()
     # Prepare from a snapshot of the live source; the live checkout keeps
     # serving it until the cutover swaps the checked update in.

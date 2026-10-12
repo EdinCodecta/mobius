@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -16,6 +17,22 @@ from app import deployment_control as dc
 
 
 _TEST_DIGEST = "sha256:" + "d" * 64
+_REQUIRED_HELPER_PROTOCOL = dc._required_helper_protocol
+_ENSURE_HOST_HELPER = dc._ensure_host_helper_meets_release
+
+
+@pytest.fixture(autouse=True)
+def served_helper_requirement(monkeypatch):
+  """Synthetic targets are not commits here, and most tests stub the status
+  read for other contracts. The helper-protocol gate tests below opt in."""
+  monkeypatch.setattr(dc, "_required_helper_protocol",
+                      lambda target_sha=None: _REQUIRED_HELPER_PROTOCOL())
+  monkeypatch.setattr(dc, "_ensure_host_helper_meets_release", lambda _target: None)
+
+
+@pytest.fixture
+def helper_gate(monkeypatch):
+  monkeypatch.setattr(dc, "_ensure_host_helper_meets_release", _ENSURE_HOST_HELPER)
 
 
 @pytest.fixture(autouse=True)
@@ -1294,7 +1311,7 @@ async def test_legacy_host_helper_is_visible_but_cannot_queue_replacement(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("installed", [None, "6", True, -1, "older"])
 async def test_host_helper_below_the_release_protocol_cannot_queue_replacement(
-  tmp_path, monkeypatch, installed,
+  tmp_path, monkeypatch, installed, helper_gate,
 ):
   # Production 2026-10-12: the recovery fix was merged but the host still ran
   # the old helper, so the next replacement took the same fatal path. A helper
@@ -1317,6 +1334,82 @@ async def test_host_helper_below_the_release_protocol_cannot_queue_replacement(
     )
   assert exc.value.code == "controller_upgrade_required"
   assert "install-rebuild-helper.sh" in exc.value.message
+  assert not (inbox / "request.json").exists()
+
+
+def _release_repo(tmp_path, *requirements):
+  repo = tmp_path / "platform"
+  (repo / "deployment").mkdir(parents=True)
+  env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+  subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env)
+  shas = []
+  for value in requirements:
+    marker = repo / "deployment" / "self-hosted-helper.required"
+    if value is None:
+      marker.unlink(missing_ok=True)
+      (repo / "README").write_text(str(len(shas)))
+    else:
+      marker.write_text(f"{value}\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, env=env)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "r"], check=True, env=env)
+    shas.append(subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                               env=env, capture_output=True, text=True).stdout.strip())
+  return repo, shas
+
+
+@pytest.mark.asyncio
+async def test_target_release_requiring_a_newer_helper_is_refused_before_dispatch(
+  tmp_path, monkeypatch, helper_gate,
+):
+  # The served source can lag the target it is about to install. A target that
+  # advances the requirement past the host's certified protocol must not reach
+  # the old helper, whichever source is serving.
+  monkeypatch.setattr(dc, "_required_helper_protocol", _REQUIRED_HELPER_PROTOCOL)
+  served = _REQUIRED_HELPER_PROTOCOL()
+  repo, (newer, older, unmarked) = _release_repo(tmp_path, served + 1, served - 1, None)
+  monkeypatch.setattr(dc.platform_update, "PLATFORM_REPO", repo)
+  assert dc._required_helper_protocol(newer) == served + 1
+  assert dc._required_helper_protocol(older) == served
+  assert dc._required_helper_protocol("f" * 40) is None  # not a fetched commit
+  control, inbox = _install_control(tmp_path, monkeypatch)
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+  with pytest.raises(dc.DeploymentControlError) as exc:
+    await dc._request_self_hosted_rebuild(
+      expected_sha=newer, final_check=lambda: pytest.fail("newer requirement reached final check"),
+    )
+  assert exc.value.code == "controller_upgrade_required"
+  with pytest.raises(dc.DeploymentControlError) as exc:
+    await dc._request_self_hosted_rebuild(expected_sha="f" * 40, final_check=lambda: None)
+  assert exc.value.code == "helper_requirement_unavailable"
+  assert not (inbox / "request.json").exists()
+  for target in (older, unmarked):
+    status = await dc._request_self_hosted_rebuild(expected_sha=target, final_check=lambda: None)
+    assert status["state"] == "queued"
+    (inbox / "request.json").unlink()
+
+
+@pytest.mark.asyncio
+async def test_outdated_helper_is_refused_before_an_update_is_prepared(
+  tmp_path, monkeypatch, helper_gate,
+):
+  control, inbox = _install_control(tmp_path, monkeypatch)
+  (control / "status.json").write_text(json.dumps({
+    "state": "idle", "handoff": "external-cutover-v1", "request_versions": [1, 2],
+  }), encoding="utf-8")
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+  monkeypatch.setattr(dc.platform_update, "read_prepared_update", lambda: None)
+  _install_reviewed_image_plan(monkeypatch)
+
+  async def must_not_prepare(**_plan):
+    pytest.fail("an outdated helper left a prepared update behind")
+
+  monkeypatch.setattr(dc.platform_update, "prepare_platform_update", must_not_prepare)
+  with pytest.raises(dc.DeploymentControlError) as exc:
+    await dc.request_reviewed_rebuild(
+      db=None, plan_id="p" * 64, current_sha="a" * 40, target_sha="c" * 40, image_digest=None,
+    )
+  assert exc.value.code == "controller_upgrade_required"
   assert not (inbox / "request.json").exists()
 
 
