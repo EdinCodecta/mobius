@@ -1154,6 +1154,10 @@ def _call_apply_app(arguments: dict[str, Any]) -> dict[str, Any]:
 
 SCREENSHOT_SCRIPT = Path(__file__).with_name("agent-screenshot.sh")
 SCREENSHOT_TIMEOUT_SECONDS = 150
+# The helper bounds its whole capture by the time this tool can wait, less a
+# margin for its final kill, cleanup, and report, so a too-busy machine yields
+# the helper's own explanation instead of this tool's bare timeout.
+SCREENSHOT_CAPTURE_BUDGET_SECONDS = SCREENSHOT_TIMEOUT_SECONDS - 10
 
 
 def _call_screenshot(arguments: dict[str, Any]) -> ToolContent:
@@ -1181,6 +1185,10 @@ def _call_screenshot(arguments: dict[str, Any]) -> ToolContent:
   try:
     done = subprocess.run(
       command, capture_output=True, text=True, timeout=SCREENSHOT_TIMEOUT_SECONDS,
+      env={
+        **os.environ,
+        "MOBIUS_SCREENSHOT_BUDGET_SECONDS": str(SCREENSHOT_CAPTURE_BUDGET_SECONDS),
+      },
     )
   except subprocess.TimeoutExpired as exc:
     raise RuntimeError("screenshot timed out; nothing was captured") from exc

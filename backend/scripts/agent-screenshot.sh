@@ -72,15 +72,36 @@ esac
 # killing the first navigation mid-flight is what wedges the daemon.
 #
 # The capture deadline bounds the whole capture, including that one recovery,
-# so the helper reports and cleans up before its callers' own limits kill it
-# mid-command (the screenshot tool allows 150 s; an agent's shell command
-# commonly 120 s). Reaching it means the machine is too busy, not that the
-# browser is stuck, so it never triggers a session reset.
-CAPTURE_DEADLINE_SECONDS=90
-STEP_GRACE_SECONDS=5
+# so the helper reports and cleans up before its caller's own limit kills it
+# mid-command. Only the caller knows that limit, so it passes the time it can
+# wait as MOBIUS_SCREENSHOT_BUDGET_SECONDS; the screenshot tool sets it a
+# cleanup margin below its own timeout. A direct shell invocation cannot know
+# its caller's limit, so it defaults to the longest shell command an agent can
+# run (600 s): that never ends a capture a slower machine would have finished,
+# and only bounds a capture that is truly running away. Reaching the deadline
+# means the machine is too busy, not that the browser is stuck, so it never
+# triggers a session reset.
+#
+# A command started with only a few seconds left would be killed mid-flight,
+# which can wedge the daemon just as a too-short step kill does. When less than
+# one busy-machine command (~5 s on a loaded 1 GB server) remains, the helper
+# stops before starting the next command instead.
+#
+# The step grace covers agent-browser's own per-command overhead on top of its
+# action timeout: CLI startup plus the daemon round trip, observed at ~5 s on a
+# loaded 1 GB server. A grace equal to that overhead would turn an ordinary
+# `wait` failure on such a machine into a false "stuck" verdict and a needless
+# reset, so the grace is three times it. With the default 25 s action timeout
+# a truly stuck daemon is still caught 40 s in, leaving room for the one reset.
+case "${MOBIUS_SCREENSHOT_BUDGET_SECONDS:-}" in
+  ''|*[!0-9]*) CAPTURE_BUDGET_SECONDS=600 ;;
+  *) CAPTURE_BUDGET_SECONDS=$((10#$MOBIUS_SCREENSHOT_BUDGET_SECONDS)) ;;
+esac
+MIN_COMMAND_SECONDS=5
+STEP_GRACE_SECONDS=15
 case "${AGENT_BROWSER_DEFAULT_TIMEOUT:-}" in
   ''|*[!0-9]*) BROWSER_ACTION_TIMEOUT_MS=25000 ;;
-  *) BROWSER_ACTION_TIMEOUT_MS="$AGENT_BROWSER_DEFAULT_TIMEOUT" ;;
+  *) BROWSER_ACTION_TIMEOUT_MS=$((10#$AGENT_BROWSER_DEFAULT_TIMEOUT)) ;;
 esac
 BROWSER_STEP_CEILING_SECONDS=$((
   (BROWSER_ACTION_TIMEOUT_MS + 999) / 1000 + STEP_GRACE_SECONDS
@@ -91,11 +112,11 @@ CAPTURE_DEADLINE=""
 if [ "$SCREENSHOT_RECOVERY_COUNT" -eq 1 ]; then
   case "${MOBIUS_SCREENSHOT_DEADLINE:-}" in
     ''|*[!0-9]*) : ;;
-    *) CAPTURE_DEADLINE="$MOBIUS_SCREENSHOT_DEADLINE" ;;
+    *) CAPTURE_DEADLINE=$((10#$MOBIUS_SCREENSHOT_DEADLINE)) ;;
   esac
 fi
 [ -n "$CAPTURE_DEADLINE" ] \
-  || CAPTURE_DEADLINE=$((EPOCHSECONDS + CAPTURE_DEADLINE_SECONDS))
+  || CAPTURE_DEADLINE=$((EPOCHSECONDS + CAPTURE_BUDGET_SECONDS))
 
 cleanup() {
   local path
@@ -104,6 +125,26 @@ cleanup() {
   do
     [ -z "$path" ] || rm -f "$path"
   done
+}
+
+restart_capture_once() {
+  # Reset this chat's exact browser profile, then re-run the whole capture once
+  # under the original deadline, so one capture can never outlive its caller's
+  # budget. Do not queue `agent-browser close` behind a stuck daemon: it can
+  # create a competing supervisor while the old command is still in flight. Go
+  # straight to the exact profile-owned process boundary instead. Returns only
+  # when that reset could not be verified.
+  python3 "$(dirname "${BASH_SOURCE[0]}")/agent_browser_session_reset.py" \
+    "$AGENT_BROWSER_PROFILE" || return 1
+  clear_stale_browser_profile_lock
+  if [ "$CURRENT_PAGE" -eq 1 ]; then
+    echo "agent-screenshot.sh: current-page state was lost during browser reset; open and prepare the page again before capturing" >&2
+    exit 1
+  fi
+  cleanup
+  export MOBIUS_SCREENSHOT_RECOVERY_COUNT=1
+  export MOBIUS_SCREENSHOT_DEADLINE="$CAPTURE_DEADLINE"
+  exec bash "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
 }
 
 die() {
@@ -116,8 +157,8 @@ die() {
       # A busy machine, not a stuck browser: resetting would destroy a working
       # session and retrying has no time left. The session is left running; a
       # later capture resets it once if it turns out to be stuck.
-      printf 'agent-screenshot.sh: %s did not finish within the %ss capture deadline; the machine is too busy, so the browser session was left running instead of being reset\n' \
-        "$timed_out_phase" "$CAPTURE_DEADLINE_SECONDS" >&2
+      printf 'agent-screenshot.sh: %s did not finish within the %ss capture budget; the machine is too busy, so the browser session was left running instead of being reset\n' \
+        "$timed_out_phase" "$CAPTURE_BUDGET_SECONDS" >&2
     elif [ "$SCREENSHOT_RECOVERY_COUNT" -eq 0 ]; then
       if [ "$CURRENT_PAGE" -eq 1 ]; then
         printf 'agent-screenshot.sh: %s timed out; cleaning up the isolated browser session\n' \
@@ -126,22 +167,8 @@ die() {
         printf 'agent-screenshot.sh: %s timed out; restarting this chat\047s isolated browser session once\n' \
           "$timed_out_phase" >&2
       fi
-      # Do not queue `agent-browser close` behind the timed-out daemon. It can
-      # create a competing supervisor while the old command is still in flight.
-      # Go straight to the exact profile-owned process boundary instead.
-      if python3 "$(dirname "${BASH_SOURCE[0]}")/agent_browser_session_reset.py" \
-          "$AGENT_BROWSER_PROFILE"; then
-        clear_stale_browser_profile_lock
-        if [ "$CURRENT_PAGE" -eq 1 ]; then
-          echo "agent-screenshot.sh: current-page state was lost during browser reset; open and prepare the page again before capturing" >&2
-          exit 1
-        fi
-        cleanup
-        export MOBIUS_SCREENSHOT_RECOVERY_COUNT=1
-        export MOBIUS_SCREENSHOT_DEADLINE="$CAPTURE_DEADLINE"
-        exec bash "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
-      fi
-      echo "agent-screenshot.sh: the isolated browser session could not be reset safely" >&2
+      restart_capture_once \
+        || echo "agent-screenshot.sh: the isolated browser session could not be reset safely" >&2
     else
       printf 'agent-screenshot.sh: %s timed out again after one isolated browser-session restart\n' \
         "$timed_out_phase" >&2
@@ -152,8 +179,13 @@ die() {
         echo "agent-screenshot.sh: final isolated browser cleanup could not be verified" >&2
       fi
     fi
+  else
+    # Once a command timed out, every later check short-circuits without
+    # running, so its own failure message ("stale shell loaded", "token
+    # rejected") would misreport the cause. The timeout line above is the
+    # reason; report the caller's message only when no timeout was recorded.
+    printf 'agent-screenshot.sh: %s\n' "$*" >&2
   fi
-  printf 'agent-screenshot.sh: %s\n' "$*" >&2
   if [ -n "$BROWSER_ERROR_FILE" ] && [ -s "$BROWSER_ERROR_FILE" ]; then
     tail -n 2 "$BROWSER_ERROR_FILE" | sed 's/^/agent-browser: /' >&2
   fi
@@ -162,7 +194,7 @@ die() {
 
 browser_command() {
   # Runs one agent-browser command under the step ceiling or the remaining
-  # capture deadline, whichever is sooner (see CAPTURE_DEADLINE_SECONDS). A
+  # capture deadline, whichever is sooner (see CAPTURE_BUDGET_SECONDS). A
   # kill records the phase and which limit fired in BROWSER_TIMEOUT_FILE, since
   # callers run this in subshells; die() reads it to choose the recovery.
   local status=0
@@ -177,10 +209,12 @@ browser_command() {
     limit=deadline
     ceiling="$remaining"
   fi
-  if [ "$ceiling" -le 0 ]; then
-    printf 'capture deadline reached before the next command\n' \
+  if [ "$remaining" -lt "$MIN_COMMAND_SECONDS" ]; then
+    # Too little time for even one busy-machine command (see
+    # MIN_COMMAND_SECONDS): stop cleanly rather than kill it mid-flight.
+    printf 'capture budget ran out before the next command\n' \
       > "$BROWSER_ERROR_FILE"
-    printf '%s\n%s\n' "$BROWSER_PHASE" "$limit" > "$BROWSER_TIMEOUT_FILE"
+    printf '%s\n%s\n' "$BROWSER_PHASE" deadline > "$BROWSER_TIMEOUT_FILE"
     return 124
   fi
   : > "$BROWSER_ERROR_FILE"
@@ -232,24 +266,31 @@ browser_ensure_fonts_ready() {
 }
 
 browser_screenshot_retry() {
+  # With `prepared`, the caller has just captured this same page with the
+  # viewport and fonts settled, so the first attempt skips re-preparing it; the
+  # kept PNG's IHDR still proves the viewport, and any retry prepares again.
   local output_path="$1"
+  local prepared="${2:-}"
   local attempt
   local byte_count
   for attempt in 1 2 3; do
-    # Navigation/service-worker handoffs can replace the page after an earlier
-    # viewport command. Configure the page that will produce THIS screenshot,
-    # not merely the page that existed at helper startup.
-    if ! browser_set_viewport_retry; then
-      continue
+    if [ "$attempt" -gt 1 ] || [ "$prepared" != prepared ]; then
+      # Navigation/service-worker handoffs can replace the page after an
+      # earlier viewport command. Configure the page that will produce THIS
+      # screenshot, not merely the page that existed at helper startup.
+      if ! browser_set_viewport_retry; then
+        continue
+      fi
+      # DOM/style changes between comparison shots can request a face that
+      # was not used before the final viewport selected its responsive layout.
+      # Settle the exact computed font specs at the capture boundary rather
+      # than treating an earlier global status as a permanent guarantee.
+      BROWSER_PHASE="font readiness"
+      if ! browser_ensure_fonts_ready; then
+        continue
+      fi
     fi
-    # DOM/style changes between comparison shots can request a face that was
-    # not used before the final viewport selected its responsive layout. Settle
-    # the exact computed font specs at the capture boundary rather than treating
-    # an earlier global status as a permanent guarantee.
-    BROWSER_PHASE="font readiness"
-    if ! browser_ensure_fonts_ready; then
-      continue
-    fi
+    BROWSER_PHASE="screenshot capture"
     if browser_command screenshot "$output_path" >/dev/null; then
       byte_count="$(wc -c < "$output_path" 2>/dev/null || printf '0')"
       if { [ "${CAPTURE_MIN_BYTES:-0}" -le 0 ] \
@@ -345,9 +386,11 @@ browser_open_origin_retry() {
 }
 
 browser_open_exact_retry() {
+  # Only used for about:blank, which has no redirect or service worker that
+  # could move the page after it commits, so one read proves arrival. Origin
+  # navigations need browser_open_origin_retry's stability check instead.
   local url="$1"
   local current=""
-  local confirmed=""
   local attempt
   for attempt in 1 2 3 4 5; do
     browser_command open "$url" >/dev/null || true
@@ -357,12 +400,7 @@ browser_open_exact_retry() {
       browser_command get url || true
     )"
     [ ! -s "$BROWSER_TIMEOUT_FILE" ] || return 1
-    sleep 0.2
-    confirmed="$(
-      browser_command get url || true
-    )"
-    [ ! -s "$BROWSER_TIMEOUT_FILE" ] || return 1
-    [ "$current" = "$url" ] && [ "$confirmed" = "$url" ] && return 0
+    [ "$current" = "$url" ] && return 0
   done
   return 1
 }
@@ -463,16 +501,7 @@ recover_singleton_contention() {
   # Chromium explicitly refused this exact profile rather than merely
   # failing a command. Reset its verified owners once, then start a fresh
   # authenticated capture; never bypass the mounted-frame/freshness gates.
-  if python3 "$(dirname "${BASH_SOURCE[0]}")/agent_browser_session_reset.py" \
-      "$AGENT_BROWSER_PROFILE"; then
-    clear_stale_browser_profile_lock
-    cleanup
-    export MOBIUS_SCREENSHOT_RECOVERY_COUNT=1
-    # Like die()'s recovery, the fresh attempt keeps the original deadline so
-    # one capture can never outlive the screenshot tool's own limit.
-    export MOBIUS_SCREENSHOT_DEADLINE="$CAPTURE_DEADLINE"
-    exec bash "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
-  fi
+  restart_capture_once
   die "browser profile contention could not be reset safely"
 }
 
@@ -906,7 +935,9 @@ if ! browser_eval_retry \
   die "page did not commit after capture priming"
 fi
 
-if ! browser_screenshot_retry "$CAPTURE_OUT"; then
+# The warm-up just settled this page's viewport and fonts; only the two frames
+# above have passed since.
+if ! browser_screenshot_retry "$CAPTURE_OUT" prepared; then
   die "page remained too busy to capture after bounded retries"
 fi
 mv -f "$CAPTURE_OUT" "$OUT"

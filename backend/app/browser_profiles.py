@@ -20,12 +20,14 @@ from app.run_state import running_chat_ids
 
 _CHAT_PROFILE = re.compile(r"^chat-([0-9a-fA-F-]{36})$")
 # An agent that needs a second browser often names its extra profile after its
-# chat with a short prefix (for example `sd-<chat id>`). Such a profile is that
-# chat's scratch, not a deliberately long-lived named session, so it retires
-# with the chat. Only that exact `<prefix>-<chat id>` shape qualifies; any other
-# name keeps the named-session grace.
+# chat with a short prefix (for example `sd-<chat id>` or
+# `qa-refresh-<chat id>`). Such a profile is that chat's scratch, not a
+# deliberately long-lived named session, so it retires with the chat. Only a
+# lowercase, hyphen-separated prefix followed by the chat id at the very end
+# qualifies; any other name keeps the named-session grace.
 _EMBEDDED_CHAT_ID = re.compile(
-  r"^[a-z0-9]+-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"
+  r"^[a-z0-9]+(?:-[a-z0-9]+)*"
+  r"-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"
 )
 _CACHE_PATHS = (
   "Default/Cache",

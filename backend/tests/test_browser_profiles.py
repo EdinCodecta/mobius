@@ -662,7 +662,8 @@ def test_named_profile_outlives_the_chat_idle_horizon(tmp_path):
 
 
 def test_ad_hoc_profile_named_after_a_chat_retires_with_that_chat(tmp_path):
-  """An agent's extra `sd-<chat id>` profile is that chat's scratch.
+  """An agent's extra `sd-<chat id>` or `qa-refresh-<chat id>` profile is
+  that chat's scratch.
 
   Left on the named-session grace, a 41 MB leftover outlived its chat on a
   434 MB volume; it now follows the chat's own idle and deletion horizon.
@@ -673,7 +674,9 @@ def test_ad_hoc_profile_named_after_a_chat_retires_with_that_chat(tmp_path):
   running_chat = "42345678-1234-1234-1234-123456789abc"
   now = datetime.now(UTC).replace(tzinfo=None)
   idle = _named_profile(tmp_path, f"sd-{idle_chat}", cache_bytes=0, durable_bytes=20)
-  deleted = _named_profile(tmp_path, f"touch-{deleted_chat}", cache_bytes=0, durable_bytes=20)
+  deleted = _named_profile(
+    tmp_path, f"qa-refresh-{deleted_chat}", cache_bytes=0, durable_bytes=20,
+  )
   recent = _named_profile(tmp_path, f"sd-{recent_chat}", cache_bytes=0, durable_bytes=20)
   running = _named_profile(tmp_path, f"sdv3-{running_chat}", cache_bytes=0, durable_bytes=20)
   chats = {
@@ -713,12 +716,20 @@ def test_profile_naming_an_unknown_id_keeps_the_named_session_grace(tmp_path):
 
 
 def test_only_a_prefix_dash_chat_id_name_retires_with_the_chat(tmp_path):
-  """A name that merely contains a chat id is a deliberate named session."""
+  """A name that merely contains a chat id is a deliberate named session.
+
+  The prefix may have several lowercase words, but it must be a clean
+  hyphen-separated prefix and the chat id must end the name.
+  """
   chat = "52345678-1234-1234-1234-123456789abc"
   now = datetime.now(UTC).replace(tzinfo=None)
   kept = [
     _named_profile(tmp_path, name, cache_bytes=0, durable_bytes=20)
-    for name in (f"{chat}-touch", f"keep-{chat}-long", f"QA-{chat}")
+    for name in (
+      f"{chat}-touch", f"keep-{chat}-long", f"qa-refresh-{chat}-2",
+      f"QA-{chat}", f"QA-refresh-{chat}", f"qa_refresh-{chat}",
+      f"qa--{chat}", f"-{chat}",
+    )
   ]
   chats = {chat: {"activity_at": now - timedelta(days=3), "deleted_at": now, "running": False}}
 
