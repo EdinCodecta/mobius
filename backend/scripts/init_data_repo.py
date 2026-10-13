@@ -87,6 +87,8 @@ platform.crashloop-prev.*
 .platform-restart-requested
 .platform-rolled-back
 .platform-update-progress.json
+# Server-owned App Store update batch receipts are runtime progress.
+/app-update-batches/
 .platform-reconcile-pre
 .platform-reconcile.lock
 """
