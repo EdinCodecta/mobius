@@ -1,4 +1,4 @@
-"""Exact-Goal claim results, delivered by the existing chat continuation owner.
+"""Exact-Goal dependency results, delivered by the existing chat continuation owner.
 
 Source transitions stamp immutable outcomes in their own transaction. This
 module owns selection, admission and receipt, not claim execution. Reconciliation
@@ -172,12 +172,15 @@ def goal_dependency_handoffs(db, goal):
   for row in rows:
     claim = db.get(models.AgentWorkClaim, row.target_claim_id) if row.target_claim_id else None
     outcome = row.outcome_json or {}
+    from app.decision_cards import saved_decision
+    card = saved_decision(db, row.target_chat_id, row.target_question_id) if row.target_kind == "owner_card" else None
     source_id = (claim.owner_chat_id if claim is not None and
       claim.acquisition_id == row.target_acquisition_id and row.resolved_at is None
       else outcome.get("source_chat_id") or row.target_chat_id)
     source = db.get(models.Chat, source_id) if source_id else None
     title = (source.title if source is not None else None) or outcome.get("source_chat_title") or "Deleted chat"
     condition = (outcome.get("summary") or (claim.summary if claim is not None else None)
+      or (card.summary if card is not None else None)
       or outcome.get("work_key") or "Shared work")
     blocker = (dependency_resume_blocker(db, row) if row.resolved_at is not None
       else dependency_source_blocker(db, row))
@@ -192,9 +195,34 @@ def goal_dependency_handoffs(db, goal):
     result.append({"id": row.id, "target_kind": row.target_kind,
       "condition": condition, "source_chat_id": source_id,
       "source_chat_title": title, "automatic": automatic,
+      "source_question_id": row.target_question_id,
+      "source_deleted": source is None or source.deleted_at is not None,
       "delivery_pending": row.resolved_at is not None, "resume_blocker": blocker,
       "outcome": row.outcome_json})
   return result
+
+
+def goal_decision_history(db, goal):
+  rows = db.query(models.GoalDependency).filter(
+    models.GoalDependency.waiting_goal_id == goal.id,
+    models.GoalDependency.waiting_chat_id == goal.chat_id,
+    models.GoalDependency.target_kind == "owner_card",
+    models.GoalDependency.result_disposition.is_not(None),
+  ).order_by(models.GoalDependency.created_at).all()
+  history = []
+  for row in rows:
+    outcome = row.outcome_json or {}
+    source = db.get(models.Chat, row.target_chat_id)
+    from app.decision_cards import saved_decision
+    card = saved_decision(db, row.target_chat_id, row.target_question_id)
+    history.append({"id": row.id, "target_kind": row.target_kind,
+      "condition": outcome.get("summary") or (card.summary if card else "Saved decision"),
+      "source_chat_id": row.target_chat_id, "source_question_id": row.target_question_id,
+      "source_chat_title": (source.title if source else None) or outcome.get("source_chat_title") or "Deleted chat",
+      "source_deleted": source is None or source.deleted_at is not None,
+      "automatic": False, "delivery_pending": False, "outcome": row.outcome_json,
+      "disposition": row.result_disposition, "received_run_id": row.received_run_id})
+  return history
 
 
 def safe_dependency_startup_orphan(db, chat, physical):

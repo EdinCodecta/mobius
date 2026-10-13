@@ -1,0 +1,265 @@
+"""A foreign plain decision owns the handoff without a duplicate card/claim."""
+import asyncio
+
+import pytest
+
+from app import chat as chat_mod, models, questions
+from app.chat_writer import (create_chat, AnswerQuestion, FinishRun, QuestionCommit,
+  StartTurn, AdmitProviderExecution, AcknowledgeProviderSuccess, get_writer)
+from app.decision_cards import (saved_decision, stage_wait_for_decision,
+  stage_delete_decisions)
+from app import goal_dependencies as deps
+from app.chat_handoffs import goal_handoffs
+from app.timeutil import now_naive_utc
+
+
+def _setup(db, chat, *, family=None, quiet=False):
+  source = create_chat(id="source", title="Repair decision", messages=[])
+  db.add(source)
+  db.add(models.ChatGoal(id="dependent-goal", chat_id=chat.id, objective="Finish update"))
+  db.add(models.ChatRun(id="dependent-run", root_run_id="dependent-run", chat_id=chat.id,
+    goal_id="dependent-goal", status="completed", provider="claude"))
+  db.add(models.ChatGoal(id="source-goal", chat_id=source.id, objective="Choose repair"))
+  db.commit()
+  get_writer().submit(StartTurn(chat_id=source.id, run_token="source-run",
+    user_msg={"role": "user", "content": "Choose repair", "ts": 1})).result(5)
+  db.expire_all()
+  db.get(models.ChatRun, "source-run").goal_id = "source-goal"
+  db.commit()
+  card = {"type": "question", "question_id": "choice", "response_mode": "continuation",
+    "questions": [{"id": "q", "question": "Which release?", "options": [
+      {"id": "later", "label": "Not now", **({"on_answer": "close"} if quiet else {})},
+      {"id": "yes", "label": "Build and test"}]}]}
+  if family == "approval":
+    card["action_key"] = "update:repair"
+  elif family == "restart":
+    card["platform_action"] = {"kind": "restart"}
+  elif family == "sealed":
+    card["secure_input"] = {"request_id": "secret", "value": "never-copy"}
+  get_writer().submit(QuestionCommit(chat_id=source.id, run_token="source-run",
+    snapshot={"id": "source-run", "role": "assistant", "blocks": [card], "ts": 2})).result(5)
+  db.expire_all()
+  return source, card
+
+
+def _follow(db, chat, qid="choice"):
+  row = stage_wait_for_decision(db, chat_id=chat.id, run_id="dependent-run",
+    source_chat_id="source", question_id=qid)
+  db.commit()
+  return row
+
+
+def _answer(*, quiet=False):
+  get_writer().submit(AnswerQuestion(chat_id="source", question_id="choice",
+    answers={"q": "Not now"}, selected_options={"q": ["later"]},
+    close_without_reply=quiet)).result(5)
+
+
+@pytest.mark.parametrize("incident", ["13:33", "16:48"])
+def test_plain_foreign_question_is_one_handoff_and_one_exact_goal_continuation(db, chat, monkeypatch, incident):
+  source, card = _setup(db, chat)
+  row = _follow(db, chat)
+  assert _follow(db, chat).id == row.id
+  handoff = goal_handoffs(db, db.get(models.ChatGoal, "dependent-goal"))
+  assert handoff.prevents_settlement and not handoff.owner_input
+  assert db.query(models.AgentWorkClaim).count() == 0
+  assert len([c for c in (questions.saved_question(source, "choice"),) if c]) == 1
+  _answer()
+  db.expire_all()
+  assert row.outcome_json["kind"] == "answered"
+  assert row.outcome_json["answers"] == {"q": "Not now"}
+  assert row.outcome_json["selected_options"] == {"q": ["later"]}
+  db.add(models.ChatGoal(id="unrelated", chat_id=chat.id, objective="Other work"))
+  db.add(models.ChatRun(id="unrelated-run", chat_id=chat.id, goal_id="unrelated", status="completed"))
+  db.commit()
+  scheduled = []
+  monkeypatch.setattr(chat_mod, "_schedule_continuation", lambda **kw: scheduled.append(kw))
+  assert asyncio.run(deps.deliver_dependency(row.id))
+  assert not asyncio.run(deps.deliver_dependency(row.id))
+  assert len(scheduled) == 1
+  db.expire_all()
+  receiver = db.get(models.ChatRun, "dependency-resume-" + row.id)
+  assert receiver.goal_id == "dependent-goal" and row.received_run_id is None
+  get_writer().submit(AdmitProviderExecution(chat_id=chat.id, run_token=receiver.id,
+    dependency_results=(row.id,))).result(5)
+  get_writer().submit(AcknowledgeProviderSuccess(chat_id=chat.id, run_token=receiver.id,
+    dependency_results=(row.id,))).result(5)
+  db.expire_all()
+  assert row.received_run_id == receiver.id
+
+
+def test_already_answered_card_is_immediately_owed(db, chat):
+  _setup(db, chat)
+  _answer()
+  row = _follow(db, chat)
+  assert row.outcome_json["kind"] == "answered" and row.resolved_at
+
+
+def test_quiet_close_holds_source_but_owes_actual_answer_to_dependent(db, chat):
+  _setup(db, chat, quiet=True)
+  row = _follow(db, chat)
+  _answer(quiet=True)
+  db.expire_all()
+  assert row.outcome_json["kind"] == "closed_without_reply"
+  assert row.outcome_json["answers"] == {"q": "Not now"}
+  assert db.get(models.ChatGoal, "source-goal").status == "stopped"
+  assert not db.get(models.Chat, "source").pending_messages
+  assert db.get(models.ChatGoal, "dependent-goal").status == "open"
+
+
+def test_stop_cancellation_survives_process_registry_loss(db, chat):
+  _setup(db, chat)
+  row = _follow(db, chat)
+  get_writer().submit(FinishRun(chat_id="source", terminal_status="stopped")).result(5)
+  questions._cancelled.clear()
+  db.expire_all()
+  assert row.outcome_json["kind"] == "cancelled"
+  assert saved_decision(db, "source", "choice").outcome_json["kind"] == "cancelled"
+
+
+def test_replacement_stamps_original_without_following_new_card(db, chat):
+  _source, card = _setup(db, chat)
+  row = _follow(db, chat)
+  card = dict(card, question_id="replacement")
+  get_writer().submit(QuestionCommit(chat_id="source", run_token="source-run",
+    snapshot={"id": "source-run", "role": "assistant", "blocks": [card], "ts": 2})).result(5)
+  db.expire_all()
+  assert row.outcome_json["kind"] == "superseded"
+  assert db.get(models.Chat, "source").pending_question_id == "replacement"
+
+
+@pytest.mark.parametrize("answered", [False, True])
+def test_source_deletion_preserves_answer_or_records_deleted_atomically(db, chat, answered):
+  source, _ = _setup(db, chat)
+  row = _follow(db, chat)
+  if answered:
+    _answer()
+  db.expire_all()
+  stage_delete_decisions(db, source)
+  source.deleted_at = now_naive_utc()
+  db.commit()
+  db.expire_all()
+  assert row.outcome_json["kind"] == ("answered" if answered else "source_deleted")
+
+
+@pytest.mark.parametrize("family", ["restart", "sealed"])
+def test_restart_and_sealed_input_are_not_followable(db, chat, family):
+  _setup(db, chat, family=family)
+  with pytest.raises(ValueError, match="Restart and sealed"):
+    _follow(db, chat)
+  assert db.query(models.SavedDecisionCard).count() == 0
+  assert db.query(models.GoalDependency).count() == 0
+
+
+def test_approval_result_is_evidence_not_executor_authority(db, chat):
+  _setup(db, chat, family="approval")
+  row = _follow(db, chat)
+  _answer()
+  db.expire_all()
+  assert row.outcome_json["family"] == "approval"
+  assert "not permission" in deps.dependency_notice(row)
+  assert "action_key" not in row.outcome_json
+  assert db.query(models.AgentWorkClaim).count() == 0
+
+
+def test_held_dependent_keeps_answer_and_deletion_retires_without_receipt(db, chat):
+  _setup(db, chat)
+  row = _follow(db, chat)
+  db.get(models.ChatGoal, "dependent-goal").status = "stopped"
+  db.commit()
+  _answer()
+  db.expire_all()
+  assert not asyncio.run(deps.deliver_dependency(row.id))
+  assert row.outcome_json["kind"] == "answered" and row.received_run_id is None
+  deps.stage_retire_chat_dependencies(db, chat.id)
+  db.commit()
+  db.expire_all()
+  assert row.result_disposition == "withdrawn"
+  assert row.received_run_id is None
+
+
+@pytest.mark.parametrize("order", ["answer_first", "subscribe_first"])
+def test_answer_and_subscription_serialize_without_losing_outcome(db, chat, monkeypatch, order):
+  from concurrent.futures import ThreadPoolExecutor
+  from threading import Event
+  from app import decision_cards
+  from app.database import SessionLocal
+  _setup(db, chat)
+  chat_id = chat.id
+  db.rollback()
+  entered, release = Event(), Event()
+  original = decision_cards.fence_decisions
+  first = [True]
+
+  def fenced(session):
+    original(session)
+    if first[0]:
+      first[0] = False
+      entered.set()
+      assert release.wait(5)
+  monkeypatch.setattr(decision_cards, "fence_decisions", fenced)
+
+  def follow():
+    with SessionLocal() as session:
+      row = stage_wait_for_decision(session, chat_id=chat_id, run_id="dependent-run",
+        source_chat_id="source", question_id="choice")
+      session.commit()
+      return row.id
+
+  with ThreadPoolExecutor(max_workers=2) as pool:
+    leading = pool.submit(_answer if order == "answer_first" else follow)
+    assert entered.wait(5)
+    trailing = pool.submit(follow if order == "answer_first" else _answer)
+    release.set()
+    results = [leading.result(10), trailing.result(10)]
+  db.expire_all()
+  row = db.get(models.GoalDependency, next(value for value in results if value))
+  assert row.outcome_json["kind"] == "answered"
+  assert row.outcome_json["selected_options"] == {"q": ["later"]}
+  assert db.query(models.GoalDependency).count() == 1
+
+
+def test_direct_card_cycle_and_self_card_are_refused(db, chat):
+  source, _ = _setup(db, chat)
+  # Source's saved card has exact Goal ownership from its assistant run.
+  own = {"type": "question", "question_id": "own", "questions": [{"question": "Continue?"}]}
+  from app.decision_cards import stage_saved_decision
+  stage_saved_decision(db, chat, own, source_goal_id="dependent-goal")
+  db.add(models.GoalDependency(id="reverse", waiting_goal_id="source-goal",
+    waiting_chat_id="source", target_kind="owner_card", target_key="card:own",
+    target_chat_id=chat.id, target_question_id="own"))
+  db.commit()
+  with pytest.raises(ValueError, match="cycle"):
+    _follow(db, chat)
+  with pytest.raises(ValueError, match="own chat"):
+    stage_wait_for_decision(db, chat_id=chat.id, run_id="dependent-run",
+      source_chat_id=chat.id, question_id="own")
+
+
+def test_deleted_source_history_keeps_outcome_without_implying_receipt(db, chat):
+  source, _ = _setup(db, chat)
+  row = _follow(db, chat)
+  _answer()
+  db.expire_all()
+  stage_delete_decisions(db, source)
+  source.deleted_at = now_naive_utc()
+  deps.stage_retire_goal_dependencies(db, chat.id, "dependent-goal")
+  db.commit()
+  history = deps.goal_decision_history(db, db.get(models.ChatGoal, "dependent-goal"))
+  assert history[0]["source_deleted"] and history[0]["received_run_id"] is None
+  assert history[0]["outcome"]["kind"] == "answered"
+  assert history[0]["disposition"] == "retired_by_goal_outcome"
+
+
+def test_saved_decision_schema_upgrade_is_repeatable_without_history_adoption(tmp_path):
+  from sqlalchemy import create_engine, inspect, text
+  from app.schema_migrations import _add_saved_decision_cards
+  engine = create_engine(f"sqlite:///{tmp_path / 'cards.db'}")
+  models.Base.metadata.create_all(engine)
+  with engine.begin() as conn:
+    conn.execute(text("DROP TABLE saved_decision_cards"))
+  _add_saved_decision_cards(engine)
+  _add_saved_decision_cards(engine)
+  assert "saved_decision_cards" in inspect(engine).get_table_names()
+  with engine.connect() as conn:
+    assert conn.execute(text("SELECT count(*) FROM saved_decision_cards")).scalar_one() == 0

@@ -6653,6 +6653,21 @@ def _add_goal_dependencies(eng) -> None:
       conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON goal_dependencies ({columns})"))
 
 
+def _add_saved_decision_cards(eng) -> None:
+  """Schema only: no ambiguous old cancellation or historical wakes invented."""
+  from sqlalchemy import text
+  with eng.begin() as conn:
+    conn.execute(text("""
+      CREATE TABLE IF NOT EXISTS saved_decision_cards (
+        chat_id VARCHAR(64) NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        question_id VARCHAR(64) NOT NULL,
+        source_goal_id VARCHAR(64), family VARCHAR(16) NOT NULL,
+        summary TEXT NOT NULL, outcome_json JSON, resolved_at TIMESTAMP,
+        PRIMARY KEY (chat_id, question_id)
+      )
+    """))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -6765,6 +6780,7 @@ _SCHEMA_MIGRATIONS = (
   ("0086_goal_execution_identity", _goal_execution_identity),
   ("0089_wait_result_receipts", _add_wait_result_receipts),
   ("0090_goal_dependencies", _add_goal_dependencies),
+  ("0091_saved_decision_cards", _add_saved_decision_cards),
 )
 
 

@@ -2051,6 +2051,12 @@ class ChatWriterActor:
     real helpers.  The contention tests in `test_chat_writer_contention`
     drive a real `SessionLocal`, exercising the real dispatch below.
     """
+    if (not hasattr(db, "record_commit") and isinstance(cmd, (
+        QuestionCommit, AnswerQuestion, AppendPending, Finalize, FinishRun))):
+      # Read source state only after the graph fence: subscriptions, answers,
+      # Stop and replacement must agree on one side of the transition.
+      from app.decision_cards import fence_decisions
+      fence_decisions(db)
     if isinstance(cmd, ReconcileClaimSources):
       from app.goal_dependency_sources import stage_reconcile_claim_sources
       resolved = stage_reconcile_claim_sources(db)
@@ -2329,6 +2335,15 @@ class ChatWriterActor:
     chat = _active_chat(db, chat_id)
     if chat is None:
       return _WriteOutcome.NOOP
+    from app.decision_cards import stage_decision_outcome, stage_saved_decision
+    if chat.pending_question_id and chat.pending_question_id != question_id:
+      stage_decision_outcome(db, chat, chat.pending_question_id, "superseded")
+    card = next((block for block in snapshot.get("blocks", [])
+                 if block.get("type") == "question" and block.get("question_id") == question_id), None)
+    if card is not None:
+      from app.chat_message_identity import assistant_message_run_id
+      owner = db.get(models.ChatRun, assistant_message_run_id(snapshot.get("id"))) if snapshot.get("id") else None
+      stage_saved_decision(db, chat, card, source_goal_id=owner.goal_id if owner else None)
     chat.pending_question_id = question_id
     if activation_wait is not None:
       from app.platform_restart import ACTIVATION_WAIT_KIND
@@ -2409,6 +2424,8 @@ class ChatWriterActor:
       for block in (snapshot.get("blocks") or [])
     )
     if not keeps_owner_handoff:
+      from app.decision_cards import stage_decision_outcome
+      stage_decision_outcome(db, chat, chat.pending_question_id, "superseded")
       chat.pending_question_id = None
     if thinking_stashes:
       self._stage_thinking_stashes(db, thinking_stashes)
@@ -5772,6 +5789,9 @@ class ChatWriterActor:
       )
       if chat is not None and not preserve_parked_question:
         if chat.pending_question_id is not None and not preserve_owner_question:
+          from app.decision_cards import stage_decision_outcome
+          stage_decision_outcome(db, chat, chat.pending_question_id,
+            "cancelled" if cmd.terminal_status == "stopped" else "superseded")
           chat.pending_question_id = None
           changed = True
         if chat.active_assistant_message_id is not None:
@@ -7442,6 +7462,11 @@ def apply_answers_to_last_question(
   if db is None:
     raise _PersistFailed("AnswerQuestion: detached chat")
 
+  def stamp_answer(block):
+    from app.decision_cards import stage_decision_outcome
+    stage_decision_outcome(db, chat, block.get("question_id"),
+      "closed_without_reply" if block.get("answer_turn") == "none" else "answered", card=block)
+
   def sync_live_answer(match_id: str | None) -> bool:
     live = copy.deepcopy(chat.live_assistant)
     if not isinstance(live, dict):
@@ -7456,6 +7481,7 @@ def apply_answers_to_last_question(
       if isinstance(block.get("platform_action"), dict):
         return False
       block.update({"answers": answers, **(metadata or {})})
+      stamp_answer(block)
       chat.live_assistant = live
       return True
     return False
@@ -7475,6 +7501,7 @@ def apply_answers_to_last_question(
           if isinstance(block.get("platform_action"), dict):
             return False
           block.update({"answers": answers, **(metadata or {})})
+          stamp_answer(block)
           transcript_rows.update_at(db, chat, seq, msg)
           sync_live_answer(question_id)
           return True
@@ -7496,6 +7523,7 @@ def apply_answers_to_last_question(
         if isinstance(block.get("platform_action"), dict):
           return False
         block.update({"answers": answers, **(metadata or {})})
+        stamp_answer(block)
         transcript_rows.update_at(db, chat, seq, msg)
         sync_live_answer(None)
         return True

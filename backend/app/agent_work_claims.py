@@ -289,20 +289,10 @@ def claim_work(
   # Transfer makes the former owner a follower. Reject an existing reverse
   # dependency from the new owner's Goal to the former owner's Goal, except
   # the exact executor's follow on this acquisition, suppressed below.
-  if goal_id and previous_goal_id and db.query(models.GoalDependency.id).join(
-    models.AgentWorkClaim,
-    models.AgentWorkClaim.id == models.GoalDependency.target_claim_id,
-  ).filter(
-    models.GoalDependency.waiting_goal_id == goal_id,
-    models.GoalDependency.target_kind == "claim_acquisition",
-    models.AgentWorkClaim.owner_goal_id == previous_goal_id,
-    models.AgentWorkClaim.acquisition_id == models.GoalDependency.target_acquisition_id,
-    models.GoalDependency.target_acquisition_id != row.acquisition_id,
-    models.GoalDependency.resolved_at.is_(None),
-    models.GoalDependency.result_disposition.is_(None),
-    models.GoalDependency.withdrawn_at.is_(None),
-    models.GoalDependency.owner_suppressed_at.is_(None),
-  ).first():
+  from app.goal_dependency_sources import _direct_cycle
+  if goal_id and previous_goal_id and _direct_cycle(db,
+      waiting_goal_id=previous_goal_id, source_goal_id=goal_id,
+      ignore_acquisition_id=row.acquisition_id):
     raise ValueError("Transfer would create a direct Goal dependency cycle.")
   changed = db.query(models.AgentWorkClaim).filter(
     models.AgentWorkClaim.id == row.id,

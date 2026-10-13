@@ -129,3 +129,34 @@ def cancel(
       detail="Use the Restart card or Stop the chat instead.",
     )
   return serialize_wait(cancel_wait(db, row), db=db)
+
+
+class DecisionFollow(BaseModel):
+  chat_id: str = Field(min_length=1, max_length=64)
+  question_id: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/decision")
+def wait_for_decision(
+  payload: DecisionFollow,
+  principal: Principal = Depends(get_agent_run_principal),
+  db: Session = Depends(get_db),
+):
+  """Only the caller's exact open top-level Goal gains a subscription."""
+  _require_owner(principal)
+  from app.resource_access import get_active_chat_for_principal
+  get_active_chat_for_principal(db, payload.chat_id, principal)
+  from app.decision_cards import stage_wait_for_decision
+  try:
+    row = stage_wait_for_decision(db, chat_id=principal.chat_id,
+      run_id=principal.run_id, source_chat_id=payload.chat_id,
+      question_id=payload.question_id)
+    db.commit()
+  except ValueError as exc:
+    db.rollback()
+    raise HTTPException(status_code=422, detail=str(exc))
+  return {"dependency_id": row.id, "goal_id": row.waiting_goal_id,
+    "status": row.result_disposition or ("result_owed" if row.resolved_at else "waiting"),
+    "outcome": row.outcome_json,
+    "next_action": "Do independent work first. This exact Goal receives the saved outcome when eligible; "
+      "no polling or peer interrupt is needed. An answer grants authority only to the card's own executor."}

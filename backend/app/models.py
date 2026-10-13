@@ -1659,11 +1659,25 @@ class AgentWorkInterest(Base):
   resolved_at = Column(DateTime, nullable=True)
 
 
+class SavedDecisionCard(Base):
+  """Safe identity and disposition of one saved Q&A/approval, never secrets.
+
+  Source retention removes this row; subscribed outcomes survive independently.
+  """
+  __tablename__ = "saved_decision_cards"
+  chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), primary_key=True)
+  question_id = Column(String(64), primary_key=True)
+  source_goal_id = Column(String(64), nullable=True)
+  family = Column(String(16), nullable=False)
+  summary = Column(Text, nullable=False)
+  outcome_json = Column(JSON, nullable=True)
+  resolved_at = Column(DateTime, nullable=True)
+
+
 class GoalDependency(Base):
   """One Goal's durable subscription to an exact external acquisition/card.
 
-  Historical interests without provable acquisition identity use a legacy
-  target key only when already resolved; those rows are never owed results.
+  Legacy interests remain only in AgentWorkInterest as non-waking history.
   """
 
   __tablename__ = "goal_dependencies"

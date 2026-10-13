@@ -182,9 +182,16 @@ def purge_expired_chat_tombstones(db: Session) -> list[str]:
   # owner identity is removed.
   from app.agent_work_claims import stage_release_claims_for_chat
   from app.goal_dependencies import stage_retire_chat_dependencies
+  from app.decision_cards import stage_delete_decisions
   for chat_id in chat_ids:
+    source = db.get(models.Chat, chat_id)
+    if source is not None:
+      stage_delete_decisions(db, source)
     stage_release_claims_for_chat(db, chat_id)
     stage_retire_chat_dependencies(db, chat_id)
+  db.query(models.SavedDecisionCard).filter(
+    models.SavedDecisionCard.chat_id.in_(chat_ids),
+  ).delete(synchronize_session=False)
   db.query(models.GoalDependency).filter(
     models.GoalDependency.waiting_chat_id.in_(chat_ids),
   ).delete(synchronize_session=False)

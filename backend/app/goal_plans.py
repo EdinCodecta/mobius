@@ -774,6 +774,10 @@ def _goal_presentation(
   from dataclasses import asdict
   if native.dependencies:
     presentation["dependencies"] = [asdict(item) for item in native.dependencies]
+  from app.goal_dependencies import goal_decision_history
+  history = goal_decision_history(db, root)
+  if history:
+    presentation["dependency_history"] = history
   presentation["plan"] = plan
   return presentation
 

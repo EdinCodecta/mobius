@@ -2543,6 +2543,8 @@ async def delete_chat(
           # a reorder held this boundary and waited to commit.
           from app.chat_waits import stage_cancel_waits_for_chat
           from app.agent_work_claims import stage_release_claims_for_chat
+          from app.decision_cards import stage_delete_decisions
+          stage_delete_decisions(db, chat)
           stage_cancel_waits_for_chat(db, chat_id)
           released_claims = stage_release_claims_for_chat(db, chat_id)
           from app.goal_dependencies import stage_retire_chat_dependencies

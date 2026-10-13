@@ -37,24 +37,32 @@ def _eligible_goal(db: Session, chat_id: str, run_id: str, waiting_goal_id=None)
   ).first()
 
 
-def _direct_cycle(db: Session, *, waiting_goal_id: str, source_goal_id: str | None) -> bool:
+def _direct_cycle(db: Session, *, waiting_goal_id: str, source_goal_id: str | None,
+                  ignore_acquisition_id: str | None = None) -> bool:
   if source_goal_id is None:
     return False
   if source_goal_id == waiting_goal_id:
     return True
-  return db.query(models.GoalDependency.id).join(
-    models.AgentWorkClaim,
-    models.AgentWorkClaim.id == models.GoalDependency.target_claim_id,
-  ).filter(
+  pending = db.query(models.GoalDependency.id).filter(
     models.GoalDependency.waiting_goal_id == source_goal_id,
-    models.GoalDependency.target_kind == 'claim_acquisition',
-    models.AgentWorkClaim.owner_goal_id == waiting_goal_id,
-    models.AgentWorkClaim.acquisition_id == models.GoalDependency.target_acquisition_id,
     models.GoalDependency.withdrawn_at.is_(None),
     models.GoalDependency.owner_suppressed_at.is_(None),
     models.GoalDependency.result_disposition.is_(None),
     models.GoalDependency.resolved_at.is_(None),
-  ).first() is not None
+  )
+  claims = pending.join(models.AgentWorkClaim,
+    models.AgentWorkClaim.id == models.GoalDependency.target_claim_id).filter(
+    models.GoalDependency.target_kind == 'claim_acquisition',
+    models.AgentWorkClaim.owner_goal_id == waiting_goal_id,
+    models.AgentWorkClaim.acquisition_id == models.GoalDependency.target_acquisition_id)
+  if ignore_acquisition_id is not None:
+    claims = claims.filter(models.GoalDependency.target_acquisition_id != ignore_acquisition_id)
+  cards = pending.join(models.SavedDecisionCard,
+    (models.SavedDecisionCard.chat_id == models.GoalDependency.target_chat_id) &
+    (models.SavedDecisionCard.question_id == models.GoalDependency.target_question_id)).filter(
+    models.GoalDependency.target_kind == 'owner_card',
+    models.SavedDecisionCard.source_goal_id == waiting_goal_id)
+  return claims.first() is not None or cards.first() is not None
 
 
 MAX_CLAIM_DEPENDENCIES_PER_GOAL = 64

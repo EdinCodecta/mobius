@@ -50,6 +50,8 @@ class GoalDependencyHandoff:
   delivery_pending: bool
   resume_blocker: str | None
   outcome: dict | None
+  source_question_id: str | None = None
+  source_deleted: bool = False
 
 
 @dataclass(frozen=True)
