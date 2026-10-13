@@ -274,6 +274,8 @@ class AppUpdateBatches:
     state when its turn comes, so the last write always holds the latest
     progress. The write finishes even if its caller is cancelled.
     """
+    if self.records.get(record["id"]) is not record:
+      return  # Pruned already: never write it back, nor leave a lock behind.
     lock = self._save_locks.setdefault(record["id"], asyncio.Lock())
     async with lock:
       if self.records.get(record["id"]) is not record:

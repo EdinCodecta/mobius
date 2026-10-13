@@ -1125,6 +1125,7 @@ async def test_a_prune_during_a_refresh_is_never_written_back(tmp_path, monkeypa
   worker.release.set()
   await refresh
   assert key not in owner.records
+  assert key not in owner._save_locks
   assert not (owner.root / f"{key}.json").exists()
 
 

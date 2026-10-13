@@ -48,7 +48,12 @@ async def start_batch(
 async def list_batches(request: Request, db: Session = Depends(get_db)):
   owner = await batches(request)
   for snapshot in owner.recent():
-    await owner.refresh_results(snapshot["id"], db)
+    try:
+      await owner.refresh_results(snapshot["id"], db)
+    except HTTPException as exc:
+      if exc.status_code != 404:
+        raise
+      # Pruned by a concurrent submit while listing: just leave it out.
   return {"batches": owner.recent()}
 
 
