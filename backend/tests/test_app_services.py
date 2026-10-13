@@ -187,6 +187,34 @@ async def test_cancel_during_spawn_reaps_process_before_releasing_runtime(monkey
       await process.wait()
 
 
+@pytest.mark.asyncio
+async def test_cancel_wins_over_a_spawn_that_then_fails_unexpectedly(monkeypatch, tmp_path, caplog):
+  started, finish_spawn, released = asyncio.Event(), asyncio.Event(), []
+
+  async def failing_spawn(*args, **kwargs):
+    started.set()
+    await finish_spawn.wait()
+    raise ValueError("bad spawn argument")
+
+  monkeypatch.setattr(app_services, "service_contract", lambda *a, **k: {})
+  monkeypatch.setattr(app_services, "service_entry", lambda *a: tmp_path / "service.py")
+  monkeypatch.setattr(app_services, "service_environment", lambda *a, **k: {})
+  monkeypatch.setattr(app_services, "hold_runtime", lambda *_: SimpleNamespace(
+    close=lambda: released.append(True),
+  ))
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", failing_spawn)
+  task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1, slug="test"), None, {}))
+  await asyncio.wait_for(started.wait(), timeout=3)
+  task.cancel("request gone")
+  await asyncio.sleep(0)
+  assert not task.done() and not released
+  finish_spawn.set()
+  with pytest.raises(asyncio.CancelledError, match="^request gone$"):
+    await asyncio.wait_for(task, timeout=3)
+  assert released
+  assert "failed to start" in caplog.text and "bad spawn argument" in caplog.text
+
+
 SERVICE = b'''import json, sys
 request = json.load(sys.stdin)
 print(json.dumps({

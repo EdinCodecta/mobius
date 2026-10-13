@@ -1,6 +1,5 @@
 """Shared cron declaration and parsing primitives for installed apps."""
 
-import asyncio
 import json
 import logging
 import os
@@ -88,31 +87,6 @@ def record_schedule_choice(app_id: int, choice: ScheduleChoice) -> None:
 
 def clear_schedule_choice(app_id: int) -> None:
   (schedule_state_dir(app_id) / _SCHEDULE_CHOICE_FILE).unlink(missing_ok=True)
-
-
-async def run_schedule_mutation(operation, *args, **kwargs):
-  """Finish blocking cron work before the caller releases its lifecycle lock.
-
-  Cancelling an asyncio.to_thread await does not stop its thread. Draining it
-  under the caller's install_uninstall_lock prevents a disconnected save or
-  teardown from racing the next mutation. Lock waits themselves stay async.
-  """
-  task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
-  try:
-    return await asyncio.shield(task)
-  except asyncio.CancelledError:
-    while not task.done():
-      try:
-        await asyncio.shield(task)
-      except asyncio.CancelledError:
-        continue
-      except Exception:
-        break
-    try:
-      task.result()
-    except Exception:
-      log.exception("Schedule mutation failed after its caller was cancelled")
-    raise
 
 
 def _restore_schedule_file(path: Path, data: bytes | None, mode: int | None) -> None:
