@@ -163,10 +163,10 @@ def native_goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
     failed_attempt=bool(owns_chat_attempt and latest.status in {"failed", "interrupted"}),
   )
 
-def goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
+def goal_handoffs(db: Session, goal: models.ChatGoal, *, include_foreign_context=True) -> GoalHandoffs:
   from app.goal_dependencies import goal_dependency_handoffs
   return replace(native_goal_handoffs(db, goal), dependencies=tuple(
-    GoalDependencyHandoff(**item) for item in goal_dependency_handoffs(db, goal)
+    GoalDependencyHandoff(**item) for item in goal_dependency_handoffs(db, goal, include_foreign_context=include_foreign_context)
   ))
 
 

@@ -194,7 +194,7 @@ def dependency_resume_blocker(db, row):
   return None
 
 
-def goal_dependency_handoffs(db, goal):
+def goal_dependency_handoffs(db, goal, *, include_foreign_context=True):
   from app.goal_dependency_sources import dependency_source_blocker
   rows = outstanding_dependencies(db).filter(
     models.GoalDependency.waiting_chat_id == goal.chat_id,
@@ -202,18 +202,7 @@ def goal_dependency_handoffs(db, goal):
   ).order_by(models.GoalDependency.created_at).all()
   result = []
   for row in rows:
-    claim = db.get(models.AgentWorkClaim, row.target_claim_id) if row.target_claim_id else None
-    outcome = row.outcome_json or {}
-    from app.decision_cards import saved_decision
-    card = saved_decision(db, row.target_chat_id, row.target_question_id) if row.target_kind == "owner_card" else None
-    source_id = (claim.owner_chat_id if claim is not None and
-      claim.acquisition_id == row.target_acquisition_id and row.resolved_at is None
-      else outcome.get("source_chat_id") or row.target_chat_id)
-    source = db.get(models.Chat, source_id) if source_id else None
-    title = (source.title if source is not None else None) or outcome.get("source_chat_title") or "Deleted chat"
-    condition = (outcome.get("summary") or (claim.summary if claim is not None else None)
-      or (card.summary if card is not None else None)
-      or outcome.get("work_key") or "Shared work")
+    context = dependency_summary(db, row, include_foreign_context=include_foreign_context)
     blocker = (dependency_resume_blocker(db, row) if row.resolved_at is not None
       else dependency_source_blocker(db, row))
     if goal.status != "open":
@@ -224,47 +213,57 @@ def goal_dependency_handoffs(db, goal):
       "goal_held", "goal_closed", "chat_deleted", "disposed", "source_deleted",
       "source_held", "source_failed", "source_goal_missing", "acquisition_changed",
       "source_settled_without_outcome", "owner_deleted", "owner_goal_not_open"}
-    result.append({"id": row.id, "target_kind": row.target_kind,
-      "condition": condition, "source_chat_id": source_id,
-      "source_chat_title": title, "automatic": automatic,
-      "source_question_id": row.target_question_id,
-      "source_deleted": source is None or source.deleted_at is not None,
-      "delivery_pending": row.resolved_at is not None, "resume_blocker": blocker,
-      "outcome": row.outcome_json})
+    result.append({key: context[key] for key in (
+      "id", "target_kind", "condition", "source_chat_id", "source_chat_title",
+      "source_question_id", "source_deleted", "outcome")})
+    result[-1].update(automatic=automatic, delivery_pending=row.resolved_at is not None,
+      resume_blocker=blocker)
   return result
 
 
-def dependency_summary(db, row):
+def dependency_summary(db, row, *, include_foreign_context=True):
   """Safe source identity shared by settled history and transcript receipts."""
   outcome = row.outcome_json or {}
-  claim = db.get(models.AgentWorkClaim, row.target_claim_id) if row.target_claim_id else None
-  if claim is not None and claim.acquisition_id != row.target_acquisition_id:
-    claim = None
-  source_id = outcome.get("source_chat_id") or (claim.owner_chat_id if claim else row.target_chat_id)
-  source = db.get(models.Chat, source_id) if source_id else None
-  from app.decision_cards import saved_decision
-  card = saved_decision(db, source_id, row.target_question_id) if row.target_kind == "owner_card" else None
+  # Exact-chat embeds may display facts already saved on their subscription,
+  # never enrich them from another chat or export its navigation identifiers.
+  source_id = None
+  title = outcome.get("source_chat_title") or "Another chat"
+  condition = outcome.get("summary") or "Shared work"
+  deleted = False
+  if include_foreign_context:
+    claim = db.get(models.AgentWorkClaim, row.target_claim_id) if row.target_claim_id else None
+    if claim is not None and claim.acquisition_id != row.target_acquisition_id:
+      claim = None
+    source_id = outcome.get("source_chat_id") or (claim.owner_chat_id if claim else row.target_chat_id)
+    source = db.get(models.Chat, source_id) if source_id else None
+    from app.decision_cards import saved_decision
+    card = saved_decision(db, source_id, row.target_question_id) if row.target_kind == "owner_card" else None
+    condition = outcome.get("summary") or (card.summary if card else None) or (claim.summary if claim else "Shared work")
+    title = (source.title if source else None) or outcome.get("source_chat_title") or "Deleted chat"
+    deleted = source is None or source.deleted_at is not None
+  safe_outcome = row.outcome_json
+  if not include_foreign_context and safe_outcome is not None:
+    safe_outcome = {key: value for key, value in outcome.items()
+      if key in {"kind", "summary", "answers", "outcome"}}
   return {"id": row.id, "target_kind": row.target_kind,
-    "condition": outcome.get("summary") or (card.summary if card else None)
-      or (claim.summary if claim else "Shared work"),
-    "source_chat_id": source_id, "source_question_id": row.target_question_id,
-    "source_chat_title": (source.title if source else None) or outcome.get("source_chat_title") or "Deleted chat",
-    "source_deleted": source is None or source.deleted_at is not None,
+    "condition": condition, "source_chat_id": source_id,
+    "source_question_id": row.target_question_id if include_foreign_context else None,
+    "source_chat_title": title, "source_deleted": deleted,
     "automatic": False, "delivery_pending": row.result_disposition is None,
-    "outcome": row.outcome_json, "disposition": row.result_disposition,
+    "outcome": safe_outcome, "disposition": row.result_disposition,
     "result_disposition": row.result_disposition, "received_run_id": row.received_run_id}
 
 
-def goal_dependency_history(db, goal):
+def goal_dependency_history(db, goal, *, include_foreign_context=True):
   rows = db.query(models.GoalDependency).filter(
     models.GoalDependency.waiting_goal_id == goal.id,
     models.GoalDependency.waiting_chat_id == goal.chat_id,
     models.GoalDependency.result_disposition.is_not(None),
   ).order_by(models.GoalDependency.created_at, models.GoalDependency.id).all()
-  return [dependency_summary(db, row) for row in rows]
+  return [dependency_summary(db, row, include_foreign_context=include_foreign_context) for row in rows]
 
 
-def terminal_dependency_summaries_by_message_index(db, chat_id, messages):
+def terminal_dependency_summaries_by_message_index(db, chat_id, messages, *, include_foreign_context=True):
   """A settled subscription stays beside its exact receiving or declaring turn.
 
   Never guess a recipient from a timestamp or attach another Goal's result to
@@ -288,7 +287,7 @@ def terminal_dependency_summaries_by_message_index(db, chat_id, messages):
     if index is None:
       index = by_run.get(row.created_by_run_id)
     if index is not None:
-      result.setdefault(index, []).append(dependency_summary(db, row))
+      result.setdefault(index, []).append(dependency_summary(db, row, include_foreign_context=include_foreign_context))
   return result
 
 

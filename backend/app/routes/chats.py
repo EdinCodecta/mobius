@@ -647,6 +647,7 @@ def _chat_detail_response(
   from app.goal_plans import terminal_goal_summaries_by_message_index
   summaries_by_index = terminal_goal_summaries_by_message_index(
     db, chat.id, coordinates, message_start=start, message_end=start + len(page),
+    include_foreign_context=expose_session,
   )
   # Insert read-side lifecycle blocks before activity compaction. The completion
   # call then ends its stretch, and later prose/tools cannot drag the card down.
@@ -731,7 +732,8 @@ def _chat_detail_response(
   question_ids = {block.get("question_id") for message in page
     for block in (message.get("blocks") or []) if isinstance(block, dict) and block.get("type") == "question"}
   backlinks = source_dependency_backlinks(db, chat.id, question_ids=question_ids) if expose_session else {}
-  dependency_summaries = terminal_dependency_summaries_by_message_index(db, chat.id, coordinates) if expose_session else {}
+  dependency_summaries = terminal_dependency_summaries_by_message_index(
+    db, chat.id, coordinates, include_foreign_context=expose_session)
   if backlinks or dependency_summaries:
     page = [{**message,
       **({"blocks": [{**block, "needed_by": backlinks[block["question_id"]]}
@@ -777,7 +779,7 @@ def _chat_detail_response(
   active_goal_objective = (
     running_goal_objective(db, chat.id) if running else None
   )
-  goal = presented_goal(db, chat.id)
+  goal = presented_goal(db, chat.id, include_foreign_context=expose_session)
   run_id, run_status, runtime_revision = _latest_run_snapshot(db, chat.id)
   response = {
     "id": chat.id,
@@ -833,8 +835,6 @@ def _chat_detail_response(
       if expose_session else {"count": 0, "items": []}
     ),
   }
-  if not expose_session and response["goal"]:
-    response["goal"].pop("needed_by", None)
   response["handoff"] = project_handoff(
     owner_input=bool(response["pending_question_id"]) or chat.id in secure_inputs.pending_chat_ids(),
     running=running,
@@ -1881,7 +1881,7 @@ def get_chat_runtime(
     "recovery_run_id": _recovery_run_id(db, chat.id),
     "continuation_wait": continuation_wait_for_chat(db, chat.id),
     "active_goal_objective": running_goal_objective(db, chat.id),
-    "goal": presented_goal(db, chat.id),
+    "goal": presented_goal(db, chat.id, include_foreign_context=principal.scope != "chat_embed"),
     "pending_messages": list(chat.pending_messages or []),
     "pending_question_id": _open_question_id_for(chat),
     "updated_at": chat.updated_at.isoformat() if chat.updated_at else None,
@@ -1893,8 +1893,6 @@ def get_chat_runtime(
       if principal.scope != "chat_embed" else {"count": 0, "items": []}
     ),
   }
-  if principal.scope == "chat_embed" and response["goal"]:
-    response["goal"].pop("needed_by", None)
   response["handoff"] = project_handoff(
     owner_input=bool(response["pending_question_id"]) or chat.id in secure_inputs.pending_chat_ids(),
     running=running, waits=response["waits"],

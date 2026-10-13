@@ -755,10 +755,11 @@ def serialize_goal(
   db: Session,
   physical: models.ChatRun,
   root: models.ChatGoal,
+  *, include_foreign_context=True,
 ) -> dict[str, Any]:
   """Project durable Goal presentation independently of turn liveness."""
   plan = serialize_plan(db, physical, root)
-  return _goal_presentation(db, physical, root, plan)
+  return _goal_presentation(db, physical, root, plan, include_foreign_context=include_foreign_context)
 
 
 def _goal_presentation(
@@ -766,6 +767,7 @@ def _goal_presentation(
   physical: models.ChatRun,
   root: models.ChatGoal,
   plan: dict[str, Any] | None,
+  *, include_foreign_context=True,
 ) -> dict[str, Any]:
   """Project only the Goal's own lifecycle: active, paused, or terminal.
 
@@ -797,17 +799,17 @@ def _goal_presentation(
     else:
       presentation["pause_reason"] = hold["actor"] if hold else "unknown"
   from app.chat_handoffs import goal_handoffs
-  native = goal_handoffs(db, root)
+  native = goal_handoffs(db, root, include_foreign_context=include_foreign_context)
   presentation["handoff"] = _goal_handoff(db, physical, root, native=native)
   from dataclasses import asdict
   if native.dependencies:
     presentation["dependencies"] = [asdict(item) for item in native.dependencies]
   from app.goal_dependencies import goal_dependency_history
-  history = goal_dependency_history(db, root)
+  history = goal_dependency_history(db, root, include_foreign_context=include_foreign_context)
   if history:
     presentation["dependency_history"] = history
   from app.goal_dependencies import source_dependency_backlinks
-  backlinks = source_dependency_backlinks(db, root.chat_id, goal_id=root.id).get(root.id)
+  backlinks = source_dependency_backlinks(db, root.chat_id, goal_id=root.id).get(root.id) if include_foreign_context else None
   if backlinks:
     presentation["needed_by"] = backlinks
   presentation["plan"] = plan
@@ -857,10 +859,10 @@ def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal, 
   return handoff
 
 
-def presented_goal(db: Session, chat_id: str) -> dict[str, Any] | None:
+def presented_goal(db: Session, chat_id: str, *, include_foreign_context=True) -> dict[str, Any] | None:
   """Serialize the Goal presentation retained by this chat, if any."""
   rows = presented_goal_rows(db, chat_id)
-  return serialize_goal(db, *rows) if rows is not None else None
+  return serialize_goal(db, *rows, include_foreign_context=include_foreign_context) if rows is not None else None
 
 
 def paused_goal_run(db: Session, chat_id: str) -> models.ChatRun | None:
@@ -935,6 +937,7 @@ def terminal_goal_summaries_by_message_index(
   *,
   message_start: int = 0,
   message_end: int | None = None,
+  include_foreign_context=True,
 ) -> dict[int, list[dict[str, Any]]]:
   """Project terminal Goals at their outcome receipt, or legacy final answer.
 
@@ -1076,7 +1079,7 @@ def terminal_goal_summaries_by_message_index(
         or (message_end is not None and candidate_index >= message_end)):
       continue
     plan = serialize_plan(db, latest, root)
-    presentation = _goal_presentation(db, latest, root, plan)
+    presentation = _goal_presentation(db, latest, root, plan, include_foreign_context=include_foreign_context)
     projected.setdefault(candidate_index, []).append({
       **presentation,
       "started_at": started_at.isoformat(),

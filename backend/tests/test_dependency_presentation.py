@@ -141,3 +141,71 @@ def test_retired_pending_claim_keeps_source_context_after_reacquisition(db, chat
   assert history['outcome'].get('kind') is None
   assert row.resolved_at is None and row.received_run_id is None
   assert history['disposition'] == 'retired_by_goal_outcome'
+
+
+@pytest.mark.parametrize('suffix', ['', '/runtime'])
+@pytest.mark.parametrize('state', ['pending', 'owed', 'delivered', 'terminal'])
+@pytest.mark.parametrize('kind', ['claim_acquisition', 'owner_card'])
+@pytest.mark.parametrize('saved_title', [None, 'Title saved with the result'])
+def test_embed_dependency_facts_do_not_enrich_or_link_foreign_chats(client, owner_token, db, suffix, state, kind, saved_title):
+  from app import transcript_rows
+  from tests.test_chat_embed_capability import _session, _embed_headers
+  _, _, chat_id, _, session = _session(client, owner_token, name='dependency-embed')
+  chat = db.get(models.Chat, chat_id)
+  source = create_chat(id='private-chat', title='Private renamed title', messages=[])
+  db.add(source); db.commit()
+  run = _run(db, chat, 'embed-declare', 'embed-goal')
+  run.goal_objective = 'Own work'
+  row = _dependency(db, chat, run, settled=state != 'pending')
+  row.target_kind, row.target_chat_id = kind, source.id
+  row.target_question_id = 'private-card'
+  db.add(models.AgentWorkClaim(id='claim', acquisition_id='acquisition',
+    owner_id=db.query(models.Owner).one().id, work_key='private-key',
+    summary='Private live condition', owner_chat_id=source.id, owner_run_id='private-run'))
+  db.add(models.SavedDecisionCard(chat_id=source.id, question_id='private-card',
+    family='question', summary='Private live condition'))
+  if state != 'pending':
+    row.outcome_json = {'kind': 'released' if kind == 'claim_acquisition' else 'answered',
+      'summary': 'Saved condition', 'outcome': 'Saved result', 'source_chat_id': source.id,
+      'source_question_id': 'private-card', 'source_run_id': 'private-run',
+      **({'source_chat_title': saved_title} if saved_title else {})}
+  if state in {'delivered', 'terminal'}:
+    row.result_disposition, row.received_run_id = 'delivered', run.id
+  if state == 'terminal':
+    goal = db.get(models.ChatGoal, 'embed-goal')
+    goal.status, goal.result, goal.completion_run_id = 'completed', 'Own answer', run.id
+    goal.completed_at = run.ended_at = now_naive_utc()
+  transcript_rows.append(db, chat, {'role': 'assistant', 'id': run.id,
+    'ts': now_naive_utc().timestamp() * 1000, 'blocks': [{'type': 'text', 'text': 'Own answer'}]})
+  db.commit()
+  headers = _embed_headers(session)
+  assert client.get('/api/chats/private-chat', headers=headers).status_code in (403, 404)
+  response = client.get(f'/api/chats/{chat_id}{suffix}', headers=headers)
+  assert response.status_code == 200, response.text
+  for private in ['Private renamed title', 'Private live condition', 'private-chat', 'private-card', 'private-run', 'private-key']:
+    assert private not in response.text
+  goal = response.json()['goal']
+  projection = goal['dependency_history' if state in {'delivered', 'terminal'} else 'dependencies'][0]
+  assert projection['condition'] == ('Shared work' if state == 'pending' else 'Saved condition')
+  assert projection['source_chat_title'] == (saved_title if state != 'pending' and saved_title else 'Another chat')
+  assert projection['source_chat_id'] is None and projection['source_question_id'] is None
+  assert 'needed_by' not in goal
+  if state != 'pending':
+    assert projection['outcome'] == {'kind': 'released' if kind == 'claim_acquisition' else 'answered',
+      'summary': 'Saved condition', 'outcome': 'Saved result'}
+  if not suffix and state != 'pending':
+    receipts = [s for m in response.json()['messages'] for s in m.get('wait_summaries', [])]
+    assert receipts and receipts[0]['source_chat_id'] is None
+    if state == 'terminal':
+      goals = [s for m in response.json()['messages'] for s in m.get('goal_summaries', [])]
+      assert goals and goals[0]['dependency_history'][0]['source_chat_id'] is None
+
+
+def test_restricted_history_never_queries_foreign_metadata(db, chat, monkeypatch):
+  from app.goal_dependencies import dependency_summary
+  run = _run(db, chat, 'declare-restricted', 'own-goal')
+  row = _dependency(db, chat, run)
+  def forbidden(*args, **kwargs):
+    raise AssertionError('Restricted history must use only its already-saved facts')
+  monkeypatch.setattr(db, 'get', forbidden)
+  assert dependency_summary(db, row, include_foreign_context=False)['condition'] == 'Host repair'
