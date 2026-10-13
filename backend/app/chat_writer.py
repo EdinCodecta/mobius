@@ -7481,10 +7481,12 @@ def apply_answers_to_last_question(
   if db is None:
     raise _PersistFailed("AnswerQuestion: detached chat")
 
-  def stamp_answer(block):
+  def stamp_answer(block, message):
     from app.decision_cards import stage_decision_outcome
+    from app.chat_message_identity import assistant_message_run_id
     stage_decision_outcome(db, chat, block.get("question_id"),
-      "closed_without_reply" if block.get("answer_turn") == "none" else "answered", card=block)
+      "closed_without_reply" if block.get("answer_turn") == "none" else "answered",
+      card=block, source_run_id=assistant_message_run_id(message.get("id")) or "")
 
   def sync_live_answer(match_id: str | None) -> bool:
     live = copy.deepcopy(chat.live_assistant)
@@ -7500,7 +7502,7 @@ def apply_answers_to_last_question(
       if isinstance(block.get("platform_action"), dict):
         return False
       block.update({"answers": answers, **(metadata or {})})
-      stamp_answer(block)
+      stamp_answer(block, live)
       chat.live_assistant = live
       return True
     return False
@@ -7520,7 +7522,7 @@ def apply_answers_to_last_question(
           if isinstance(block.get("platform_action"), dict):
             return False
           block.update({"answers": answers, **(metadata or {})})
-          stamp_answer(block)
+          stamp_answer(block, msg)
           transcript_rows.update_at(db, chat, seq, msg)
           sync_live_answer(question_id)
           return True
@@ -7542,7 +7544,7 @@ def apply_answers_to_last_question(
         if isinstance(block.get("platform_action"), dict):
           return False
         block.update({"answers": answers, **(metadata or {})})
-        stamp_answer(block)
+        stamp_answer(block, msg)
         transcript_rows.update_at(db, chat, seq, msg)
         sync_live_answer(None)
         return True

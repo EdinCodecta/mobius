@@ -576,3 +576,13 @@ def test_transcript_replacement_and_subscription_share_atomic_disposition(db, ch
   row = db.get(models.GoalDependency, next(value for value in results if value))
   assert row.outcome_json["kind"] == "superseded"
   assert db.query(models.GoalDependency).count() == 1
+
+
+def test_replacing_a_legacy_open_card_preserves_its_exact_goal_owner(db, chat, client, auth):
+  _source, card = _setup(db, chat)
+  db.delete(saved_decision(db, "source", "choice"))
+  db.commit()
+  result = client.put("/api/chats/source", headers=auth, json={"messages": [
+    {"id": "source-run", "role": "assistant", "blocks": [card], "ts": 2}]})
+  assert result.status_code == 200
+  assert saved_decision(db, "source", "choice").source_goal_id == "source-goal"
