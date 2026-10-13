@@ -7,17 +7,20 @@ from datetime import UTC, datetime
 import hashlib
 import io
 import json
+import logging
 import re
 import subprocess
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, JpegImagePlugin, UnidentifiedImageError
 
 from app import app_git, icon_assets, models
 from app.config import get_settings
 from app.manifest_contract import (
+  MANIFEST_MAX_BYTES,
+  MAX_STORE_SCREENSHOTS,
   PACKAGE_MAX_BYTES,
   STORE_LISTING_IMAGE_MAX_BYTES,
   ManifestContractError,
@@ -28,10 +31,11 @@ from app.manifest_contract import (
 from app.storage_io import atomic_write
 
 
+log = logging.getLogger(__name__)
+
 MAX_SOURCE_FILES = 250
 MAX_PATH_BYTES = 512
 MAX_JOURNAL_BYTES = 16 * 1024
-MAX_STORE_SCREENSHOTS = 5
 _OID = re.compile(r"^[0-9a-f]{40,64}$")
 # Unicode UCD categories plus Default_Ignorable_Code_Point extras from
 # DerivedCoreProperties.txt (Hangul/Khmer/Mongolian fillers and selectors),
@@ -407,7 +411,10 @@ DESCRIPTION_MAX_BYTES = 4000
 SCREENSHOT_ALT_MAX_BYTES = 300
 SCREENSHOT_LABEL_MAX_BYTES = 120
 LISTING_IMAGE_MAX_DIMENSION = 8192
-_LISTING_IMAGE_SUFFIXES = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
+# A multi-picture JPEG (MPO, such as an HDR phone photo) is a JPEG whose
+# primary image is all a listing shows.
+_LISTING_IMAGE_SUFFIXES = {"PNG": ".png", "JPEG": ".jpg", "MPO": ".jpg", "WEBP": ".webp"}
+LISTING_MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp"}
 
 
 def check_listing_image(content: bytes, what: str) -> str:
@@ -430,10 +437,13 @@ def check_listing_image(content: bytes, what: str) -> str:
     "listing_image_too_large", 422,
   )
   try:
-    image = Image.open(io.BytesIO(content), formats=list(_LISTING_IMAGE_SUFFIXES))
+    image = Image.open(io.BytesIO(content), formats=["PNG", "JPEG", "WEBP"])
     width, height = image.size
     if width * height > icon_assets.MAX_IMAGE_PIXELS:
       raise too_many_pixels
+    suffix = _LISTING_IMAGE_SUFFIXES.get(str(image.format))
+    if suffix is None:
+      raise UnidentifiedImageError(image.format)
     image.verify()
   except CommunityPublicationError:
     raise
@@ -452,8 +462,121 @@ def check_listing_image(content: bytes, what: str) -> str:
       f"The {what} is larger than {LISTING_IMAGE_MAX_DIMENSION} pixels.",
       "listing_image_too_large", 422,
     )
-  suffix = _LISTING_IMAGE_SUFFIXES[str(image.format)]
   return suffix
+
+
+# Only chunks that shape how the image looks are kept; anything else (EXIF,
+# XMP, text, provenance manifests, unknown or future chunks) is dropped.
+_PNG_KEPT_CHUNKS = {
+  b"IHDR", b"PLTE", b"IDAT", b"IEND", b"tRNS", b"cHRM", b"gAMA", b"iCCP",
+  b"sBIT", b"sRGB", b"cICP", b"mDCV", b"cLLI", b"bKGD", b"pHYs",
+  b"acTL", b"fcTL", b"fdAT",
+}
+_WEBP_KEPT_CHUNKS = {b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ANIM", b"ANMF", b"ICCP"}
+_JPEG_PRIVATE_SEGMENTS = {0xE1, 0xED, 0xFE}  # EXIF/XMP, IPTC, comment
+_EXIF_ORIENTATION = 0x0112
+
+
+def _png_chunks_kept(content: bytes) -> bytes:
+  out, at = [content[:8]], 8
+  while at + 12 <= len(content):
+    length = int.from_bytes(content[at:at + 4], "big")
+    kind = content[at + 4:at + 8]
+    end = at + 12 + length
+    if kind in _PNG_KEPT_CHUNKS:
+      out.append(content[at:end])
+    if kind == b"IEND":
+      break  # Anything after the end of the image is not part of it.
+    at = end
+  return b"".join(out)
+
+
+def _webp_chunks_kept(content: bytes) -> bytes:
+  riff_end = min(len(content), 8 + int.from_bytes(content[4:8], "little"))
+  chunks, at = [], 12
+  while at + 8 <= riff_end:
+    kind = content[at:at + 4]
+    size = int.from_bytes(content[at + 4:at + 8], "little")
+    end = at + 8 + size + (size & 1)
+    chunk = content[at:end]
+    if kind == b"VP8X":
+      # Clear the EXIF and XMP presence flags along with their chunks.
+      chunk = chunk[:8] + bytes([chunk[8] & ~0x0C]) + chunk[9:]
+    if kind in _WEBP_KEPT_CHUNKS:
+      chunks.append(chunk)
+    at = end
+  body = b"WEBP" + b"".join(chunks)
+  return b"RIFF" + len(body).to_bytes(4, "little") + body
+
+
+def _jpeg_has_private_segments(content: bytes) -> bool:
+  at = 2
+  while at + 4 <= len(content) and content[at] == 0xFF:
+    marker = content[at + 1]
+    if marker == 0xDA:  # Image data follows; metadata segments come before it.
+      return False
+    if marker in _JPEG_PRIVATE_SEGMENTS:
+      return True
+    at += 2 + int.from_bytes(content[at + 2:at + 4], "big")
+  return False
+
+
+def listing_image_has_metadata(content: bytes) -> bool:
+  """Whether a valid listing image carries anything beyond how it looks."""
+  with Image.open(io.BytesIO(content)) as image:
+    image_format = image.format
+  if image_format == "PNG":
+    return _png_chunks_kept(content) != content
+  if image_format == "WEBP":
+    return _webp_chunks_kept(content) != content
+  return image_format == "MPO" or _jpeg_has_private_segments(content)
+
+
+def strip_listing_image_metadata(content: bytes) -> bytes:
+  """The image as it looks, without camera, location, text or other metadata.
+
+  PNG and WebP keep only the chunks that draw the image, losslessly. A JPEG
+  has no such clean split (EXIF carries thumbnails, an MPO appends whole
+  images), so it is re-encoded from its primary image with its own
+  quantization tables, which keeps its quality. An image that relies on EXIF
+  orientation is turned upright first, since that tag goes.
+  """
+  with Image.open(io.BytesIO(content)) as image:
+    orientation = image.getexif().get(_EXIF_ORIENTATION, 1)
+    image_format = image.format
+    if orientation == 1 and image_format == "PNG":
+      return _png_chunks_kept(content)
+    if orientation == 1 and image_format == "WEBP":
+      return _webp_chunks_kept(content)
+    icc = image.info.get("icc_profile")
+    lossless = bool(image.info.get("lossless"))
+    progressive = bool(image.info.get("progressive"))
+    jpeg = image_format in {"JPEG", "MPO"}
+    options: dict = {"icc_profile": icc} if icc else {}
+    if jpeg and orientation == 1:
+      sampling = JpegImagePlugin.get_sampling(image)
+      options.update(
+        qtables=image.quantization, progressive=progressive,
+        **({"subsampling": sampling} if sampling != -1 else {}),
+      )
+      clean = image.copy()
+    else:
+      clean = ImageOps.exif_transpose(image)
+      options.update(
+        {"quality": 95} if jpeg
+        else {"quality": 95, "lossless": lossless} if image_format == "WEBP"
+        else {},
+      )
+  # A bare copy carries no comment, XMP or EXIF for the encoder to re-save.
+  clean.info = {}
+  output = io.BytesIO()
+  clean.save(output, format="JPEG" if jpeg else image_format, **options)
+  stripped = output.getvalue()
+  if image_format == "PNG":
+    return _png_chunks_kept(stripped)
+  if image_format == "WEBP":
+    return _webp_chunks_kept(stripped)
+  return stripped
 
 
 def _file_bytes(item: dict) -> bytes:
@@ -554,7 +677,14 @@ def _listing_asset(value: object, label: str, by_path: dict[str, dict]) -> str:
       f"The {label} must be saved under static/store/. Saving the listing "
       "again copies it there.",
     )
-  check_listing_image(_file_bytes(by_path[source]), label)
+  content = _file_bytes(by_path[source])
+  check_listing_image(content, label)
+  if listing_image_has_metadata(content):
+    raise CommunityPublicationError(
+      f"The {label} carries camera, location or other hidden metadata that "
+      "publishing would make public. Saving the listing again removes it.",
+      "listing_image_metadata",
+    )
   return source
 
 
@@ -647,6 +777,12 @@ def store_listing_review(
       results[item] = validate()
     except CommunityPublicationError as exc:
       problems[item] = exc
+    except Exception:
+      # One unreadable item must not take down the whole checklist.
+      log.exception("Checking the Store listing's %s failed", item)
+      problems[item] = CommunityPublicationError(
+        "This could not be checked. Add it again.", "listing_check_failed",
+      )
 
   # A manifest missing publication fields still holds an editable listing;
   # only unreadable JSON leaves nothing to show.
@@ -851,7 +987,7 @@ def read_public_store_asset(
   by_path = {entry.path: entry for entry in entries}
   manifest: object = {}
   manifest_entry = by_path.get("mobius.json")
-  if manifest_entry is not None and manifest_entry.size <= PACKAGE_MAX_BYTES:
+  if manifest_entry is not None and manifest_entry.size <= MANIFEST_MAX_BYTES:
     try:
       manifest = json.loads(_blob(repo, manifest_entry))
     except ValueError:
@@ -927,7 +1063,7 @@ def read_public_snapshot(
     by_path = {entry.path: entry for entry in entries}
     manifest: object = {}
     manifest_entry = by_path.get("mobius.json")
-    if manifest_entry is not None and manifest_entry.size <= STORE_LISTING_IMAGE_MAX_BYTES:
+    if manifest_entry is not None and manifest_entry.size <= MANIFEST_MAX_BYTES:
       try:
         manifest = json.loads(_blob(repo, manifest_entry))
       except ValueError:

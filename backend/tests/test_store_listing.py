@@ -293,7 +293,7 @@ def test_a_store_app_listing_save_explains_what_it_changes(client, auth, monkeyp
     result = await real_apply(*args, **kwargs)
     return app_apply.ApplyResult(
       app=result.app, mode=result.mode,
-      warnings=(app_apply._STORE_LOCAL_PACKAGE_DIVERGED,),
+      warnings=(app_apply.STORE_LOCAL_PACKAGE_DIVERGED,),
     )
 
   monkeypatch.setattr(app_routes, "_apply_source_or_http", store_apply)
@@ -378,6 +378,13 @@ def test_images_over_the_pixel_cap_are_refused_plainly():
   assert f"{icon_assets.MAX_IMAGE_PIXELS // 1_000_000} million pixels" in refused.value.detail
 
 
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+  import struct
+  import zlib
+
+  return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+
 def test_uploaded_photos_lose_their_location_and_camera_data(client, auth):
   import hashlib
 
@@ -387,19 +394,118 @@ def test_uploaded_photos_lose_their_location_and_camera_data(client, auth):
   exif[0x010F] = "Camera maker"
   exif[0x8825] = {1: "N", 2: (51.0, 30.0, 0.0), 3: "W", 4: (0.0, 7.0, 0.0)}
   photo = io.BytesIO()
-  Image.new("RGB", (64, 40), (200, 120, 40)).save(photo, format="JPEG", exif=exif)
+  Image.new("RGB", (64, 40), (200, 120, 40)).save(
+    photo, format="JPEG", exif=exif, comment=b"JPEG comment",
+  )
   assert Image.open(io.BytesIO(photo.getvalue())).getexif().get_ifd(0x8825)
+  plain = _png((9, 90, 9))
+  end = plain.rindex(b"IEND") - 4
+  # An unknown provenance chunk, and bytes hidden after the image ends.
+  png = plain[:end] + _png_chunk(b"caBX", b"C2PA manifest") + plain[end:] + b"TRAILING"
+  assert Image.open(io.BytesIO(png)).size == (64, 40)
 
   saved = _save(client, auth, app_id, **_complete_listing(
-    screenshots=[{"data_base64": _b64(photo.getvalue()), "alt": "A photo."}],
+    screenshots=[
+      {"data_base64": _b64(photo.getvalue()), "alt": "A photo."},
+      {"data_base64": _b64(png), "alt": "A chart."},
+    ],
+  ))
+
+  assert saved.status_code == 200, saved.text
+  shots = json.loads((source / "mobius.json").read_text())["store"]["screenshots"]
+  stored = [(source / shot["src"]).read_bytes() for shot in shots]
+  assert not Image.open(io.BytesIO(stored[0])).getexif()
+  assert b"Camera maker" not in stored[0] and b"JPEG comment" not in stored[0]
+  assert stored[1] == plain
+  for shot, content in zip(shots, stored):
+    assert Path(shot["src"]).stem == hashlib.sha256(content).hexdigest()[:16]
+  assert _preview(client, auth, app_id)["ready"] is True
+
+
+def test_a_multi_picture_jpeg_is_saved_as_one_plain_jpeg(client, auth):
+  source = _source()
+  app_id = _create(client, auth, source)
+  frames = [Image.new("RGB", (48, 32), (40 * index, 80, 120)) for index in range(2)]
+  mpo = io.BytesIO()
+  frames[0].save(mpo, format="MPO", save_all=True, append_images=frames[1:])
+  assert Image.open(io.BytesIO(mpo.getvalue())).format == "MPO"
+
+  saved = _save(client, auth, app_id, **_complete_listing(
+    screenshots=[{"data_base64": _b64(mpo.getvalue()), "alt": "An HDR photo."}],
   ))
 
   assert saved.status_code == 200, saved.text
   src = json.loads((source / "mobius.json").read_text())["store"]["screenshots"][0]["src"]
-  stored = (source / src).read_bytes()
-  assert not Image.open(io.BytesIO(stored)).getexif()
-  assert b"Camera maker" not in stored
-  assert Path(src).stem == hashlib.sha256(stored).hexdigest()[:16]
+  stored = Image.open(source / src)
+  assert src.endswith(".jpg") and stored.format == "JPEG"
+  assert getattr(stored, "n_frames", 1) == 1
+  assert _preview(client, auth, app_id)["ready"] is True
+
+
+def test_committed_art_with_metadata_is_flagged_and_cleaned_by_a_save(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  exif = Image.Exif()
+  exif[0x8825] = {1: "N", 2: (51.0, 30.0, 0.0)}
+  photo = io.BytesIO()
+  Image.new("RGB", (64, 40), (1, 120, 40)).save(photo, format="JPEG", exif=exif)
+  (source / "static" / "store").mkdir(parents=True)
+  (source / "static" / "store" / "shot.jpg").write_bytes(photo.getvalue())
+  manifest = json.loads(_MANIFEST)
+  manifest["store"] = {
+    "tagline": "t", "description": "d",
+    "screenshots": [{"src": "static/store/shot.jpg", "alt": "A"}],
+  }
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  _commit_accepted(db, source, app_id, "agent-committed photo")
+
+  preview = _preview(client, auth, app_id)
+
+  assert preview["ready"] is False
+  assert _item(preview, "screenshots")["code"] == "listing_image_metadata"
+  saved = _save(client, auth, app_id, **_complete_listing(
+    screenshots=[{"path": "static/store/shot.jpg", "alt": "A"}],
+  ))
+  assert saved.status_code == 200, saved.text
+  assert not Image.open(source / "static" / "store" / "shot.jpg").getexif()
+  assert _preview(client, auth, app_id)["ready"] is True
+
+
+def test_an_unexpected_image_error_is_a_checklist_item_not_a_crash(monkeypatch):
+  from app import community_publish
+
+  def broken(content, what):
+    raise KeyError("surprise")
+
+  monkeypatch.setattr(community_publish, "check_listing_image", broken)
+  manifest = json.loads(_MANIFEST)
+  manifest["store"] = {
+    "tagline": "t", "description": "d",
+    "screenshots": [{"src": "static/store/a.png", "alt": "A"}],
+  }
+  review = store_listing_review([
+    _file("mobius.json", json.dumps(manifest).encode()),
+    _file("icon.png", _png()), _file("static/store/a.png", _png()),
+  ])
+
+  assert review["ready"] is False
+  assert _item(review, "screenshots")["code"] == "listing_check_failed"
+
+
+def test_saving_keeps_crlf_and_escaped_manifests_as_they_are(client, auth):
+  source = _source()
+  manifest = json.loads(_MANIFEST)
+  text = json.dumps(manifest, indent=2).replace("\n", "\r\n") + "\r\n"
+  assert "\\u00e9" in text
+  (source / "mobius.json").write_bytes(text.encode())
+  app_id = _create(client, auth, source)
+
+  assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
+
+  saved = (source / "mobius.json").read_bytes()
+  assert saved.startswith(text.encode().rstrip().rstrip(b"}").rstrip())
+  assert b"\n" not in saved.replace(b"\r\n", b"")
+  assert "\\u00e9".encode() in saved
 
 
 @pytest.mark.parametrize("problem", ["no_entry", "bad_json", "secret"])

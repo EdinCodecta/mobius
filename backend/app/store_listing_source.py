@@ -11,13 +11,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
-import io
 import json
 from pathlib import Path, PurePosixPath
 import re
 from typing import Callable
-
-from PIL import Image, ImageOps
 
 from app import app_git, icon_assets, models, workspace_files
 from app.community_publish import (
@@ -28,6 +25,8 @@ from app.community_publish import (
   TAGLINE_MAX_BYTES,
   CommunityPublicationError,
   check_listing_image,
+  listing_image_has_metadata,
+  strip_listing_image_metadata,
   read_accepted_file,
 )
 from app.manifest_contract import STORE_LISTING_IMAGE_MAX_BYTES
@@ -260,92 +259,31 @@ def _image_suffix(content: bytes, what: str) -> str:
     raise ListingEditError(exc.code, exc.detail, exc.status_code) from exc
 
 
-_PNG_PRIVATE_CHUNKS = {b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"tIME"}
-_WEBP_PRIVATE_CHUNKS = {b"EXIF", b"XMP "}
-_EXIF_ORIENTATION = 0x0112
-
-
-def _without_png_metadata(content: bytes) -> bytes:
-  out, at = [content[:8]], 8
-  while at + 12 <= len(content):
-    length = int.from_bytes(content[at:at + 4], "big")
-    end = at + 12 + length
-    if content[at + 4:at + 8] not in _PNG_PRIVATE_CHUNKS:
-      out.append(content[at:end])
-    at = end
-  return b"".join(out)
-
-
-def _without_webp_metadata(content: bytes) -> bytes:
-  chunks, at = [], 12
-  while at + 8 <= len(content):
-    kind = content[at:at + 4]
-    size = int.from_bytes(content[at + 4:at + 8], "little")
-    end = at + 8 + size + (size & 1)
-    chunk = content[at:end]
-    if kind == b"VP8X":
-      # Clear the EXIF and XMP presence flags along with their chunks.
-      chunk = chunk[:8] + bytes([chunk[8] & ~0x0C]) + chunk[9:]
-    if kind not in _WEBP_PRIVATE_CHUNKS:
-      chunks.append(chunk)
-    at = end
-  body = b"WEBP" + b"".join(chunks)
-  return b"RIFF" + len(body).to_bytes(4, "little") + body
-
-
-def _without_metadata(content: bytes) -> bytes:
-  """The image without camera, location, or text metadata, as it looks.
-
-  PNG and WebP drop their metadata chunks losslessly. JPEG has no such clean
-  split (EXIF can carry thumbnails and trailing images), so it is re-encoded
-  with its own quantization tables, which keeps its quality. An image that
-  relies on EXIF orientation is turned upright first, since that tag goes.
-  """
-  with Image.open(io.BytesIO(content)) as image:
-    orientation = image.getexif().get(_EXIF_ORIENTATION, 1)
-    image_format = image.format
-    if orientation == 1 and image_format == "PNG":
-      return _without_png_metadata(content)
-    if orientation == 1 and image_format == "WEBP":
-      return _without_webp_metadata(content)
-    icc = image.info.get("icc_profile")
-    output = io.BytesIO()
-    options = {"icc_profile": icc} if icc else {}
-    if orientation == 1:
-      image.save(
-        output, format="JPEG", quality="keep", subsampling="keep",
-        progressive=bool(image.info.get("progressive")), **options,
-      )
-    else:
-      upright = ImageOps.exif_transpose(image)
-      if image_format == "JPEG":
-        options.update(quality=95)
-      elif image_format == "WEBP":
-        options.update(quality=95, lossless=bool(image.info.get("lossless")))
-      upright.save(output, format=image_format, **options)
-  return output.getvalue()
-
-
 def _place_art(
   root: Path, app: models.App, changes: _SourceChanges, image: ListingImage, what: str,
 ) -> str:
   """Return the ``static/store/`` path holding this image, writing it if new.
 
-  New art is stripped of metadata and content-addressed, so re-saving the
-  same upload is a no-op and
-  reordering screenshots never overwrites another one. A kept file outside
-  ``static/store/`` (an older listing layout) is copied into it.
+  Listing art is public, so it never carries camera, location or other
+  hidden metadata. New art is content-addressed by the bytes stored, so
+  re-saving the same upload is a no-op and reordering screenshots never
+  overwrites another one. A kept file outside ``static/store/`` (an older
+  listing layout) is copied into it; kept art that still carries metadata
+  (an agent committed it directly) is cleaned in place, or under a new
+  content name if the editor named it.
   """
   content = image.data if image.data is not None else _accepted_file(root, app, image.path)
   suffix = _image_suffix(content, what)
-  if image.data is None and image.path.startswith(f"{STORE_ART_DIR}/"):
+  kept = image.data is None and image.path.startswith(f"{STORE_ART_DIR}/")
+  if kept and not listing_image_has_metadata(content):
     rel = image.path
   else:
-    # New art becomes public, so it never carries camera or location data;
-    # its name hashes the bytes actually stored.
-    content = _without_metadata(content)
+    content = strip_listing_image_metadata(content)
     suffix = _image_suffix(content, what)
-    rel = f"{STORE_ART_DIR}/{hashlib.sha256(content).hexdigest()[:16]}{suffix}"
+    if kept and not _EDITOR_ART.fullmatch(image.path):
+      rel = image.path
+    else:
+      rel = f"{STORE_ART_DIR}/{hashlib.sha256(content).hexdigest()[:16]}{suffix}"
   target = _source_path(root, rel)
   if not (target.is_file() and target.read_bytes() == content):
     changes.write(rel, content)
@@ -355,14 +293,19 @@ def _place_art(
 def _manifest_text(manifest: dict, original: str) -> str:
   """Serialize ``manifest`` in the layout of the file it replaces.
 
-  Keeping the author's indentation and final newline confines the diff to
-  the listing, so a later Store update does not conflict on whitespace. Key
-  order is already kept, since the edit updates the parsed dict in place.
+  Keeping the author's indentation, line endings, escaping and final newline
+  confines the diff to the listing, so a later Store update does not conflict
+  on whitespace. Key order is already kept, since the edit updates the parsed
+  dict in place.
   """
   match = re.match(r"\{[ \t]*\r?\n([ \t]+)\S", original)
   indent = match.group(1) if match else ("  " if "\n" in original.strip() else None)
-  text = json.dumps(manifest, ensure_ascii=False, indent=indent)
-  return text + "\n" if original.endswith("\n") else text
+  # Escape non-ASCII only for a file that already does and has no raw form.
+  ascii_only = "\\u" in original and original.isascii()
+  text = json.dumps(manifest, ensure_ascii=ascii_only, indent=indent)
+  if original.endswith("\n"):
+    text += "\n"
+  return text.replace("\n", "\r\n") if "\r\n" in original else text
 
 
 def _referenced_art(store: object) -> set[str]:
@@ -393,9 +336,10 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     manifest_path = _source_path(root, "mobius.json")
     if manifest_path.is_file():
       try:
-        original = manifest_path.read_text(encoding="utf-8")
+        # Bytes, not text mode, which would fold CRLF line endings away.
+        original = manifest_path.read_bytes().decode("utf-8")
         current = json.loads(original)
-      except json.JSONDecodeError as exc:
+      except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ListingEditError(
           "manifest_invalid", "mobius.json is not valid JSON. Ask an agent to repair it.",
         ) from exc

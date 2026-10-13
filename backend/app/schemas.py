@@ -11,7 +11,7 @@ from pydantic import (
   model_validator,
 )
 
-from app.manifest_contract import STORE_LISTING_IMAGE_MAX_BYTES
+from app.manifest_contract import MAX_STORE_SCREENSHOTS, STORE_LISTING_IMAGE_MAX_BYTES
 from app.manifest_identity import requested_manifest_source
 from app.providers import PROVIDERS, _model_belongs_to_other_provider
 
@@ -148,7 +148,9 @@ class StoreListingIn(BaseModel):
   description: str = Field(default="", max_length=20_000)
   icon: StoreListingImageIn | None = None
   hero: StoreListingImageIn | None = None
-  screenshots: list[StoreListingScreenshotIn] = Field(default_factory=list, max_length=5)
+  screenshots: list[StoreListingScreenshotIn] = Field(
+    default_factory=list, max_length=MAX_STORE_SCREENSHOTS,
+  )
 
 
 class AppResolveUpdate(BaseModel):

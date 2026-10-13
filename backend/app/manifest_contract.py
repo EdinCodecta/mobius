@@ -12,6 +12,7 @@ import shlex
 # full listing upload (icon, banner and every screenshot, base64-encoded)
 # stays below the API's request body cap.
 STORE_LISTING_IMAGE_MAX_BYTES = 6 * 1024 * 1024
+MAX_STORE_SCREENSHOTS = 5
 
 REQUIRED_STRING_FIELDS = ("id", "name", "version", "description", "entry")
 RECOGNIZED_CAPABILITIES = (

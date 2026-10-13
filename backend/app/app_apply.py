@@ -72,7 +72,7 @@ _LOCAL_PACKAGE_WARNING = (
   "and skills; a future reviewed Store update may replace them."
 )
 
-_STORE_LOCAL_PACKAGE_DIVERGED = (
+STORE_LOCAL_PACKAGE_DIVERGED = (
   "This app is Store-managed, so its live package comes from the accepted "
   "manifest. Your local mobius.json changes were NOT applied by this "
   "ordinary apply. Re-apply with --accept-local-package to make the local "
@@ -396,7 +396,7 @@ def _store_local_package_divergence(app: models.App, snapshot_dir: Path) -> str 
     )
   except (OSError, ValueError, applied_app_runtime.AppliedRuntimeUnavailable):
     return None
-  return _STORE_LOCAL_PACKAGE_DIVERGED if local != accepted else None
+  return STORE_LOCAL_PACKAGE_DIVERGED if local != accepted else None
 
 
 def _entry_source(snapshot_dir: Path, relative: str) -> str:

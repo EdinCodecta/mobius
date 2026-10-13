@@ -2365,7 +2365,7 @@ async def save_store_listing(
           accepted_now = db.query(models.App.source_commit).filter_by(id=app_id).scalar()
           if (
             accepted_now == accepted_before_apply
-            and await asyncio.to_thread(app_git.head_sha, source, "HEAD") == head_before_apply
+            and await settled.run_settled(app_git.head_sha, source, "HEAD") == head_before_apply
           ):
             await settled.run_settled(undo)
           raise
@@ -2387,9 +2387,9 @@ async def save_store_listing(
       )
   _publish_apply_events(result, None)
   warnings = list(result.warnings)
-  if app_apply._STORE_LOCAL_PACKAGE_DIVERGED in warnings:
+  if app_apply.STORE_LOCAL_PACKAGE_DIVERGED in warnings:
     # Addressed to agents applying by hand; say what it means for a listing.
-    warnings.remove(app_apply._STORE_LOCAL_PACKAGE_DIVERGED)
+    warnings.remove(app_apply.STORE_LOCAL_PACKAGE_DIVERGED)
     warnings.append(_STORE_APP_LISTING_SAVED)
   return schemas.AppApplyOut(mode=result.mode, app=result.app, warnings=warnings)
 

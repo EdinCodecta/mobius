@@ -6,7 +6,6 @@ import asyncio
 import base64
 from datetime import UTC, datetime
 import hashlib
-import mimetypes
 from pathlib import Path
 import re
 from typing import Any, Literal
@@ -26,6 +25,8 @@ from app.community_broker import (
   community_broker,
 )
 from app.community_publish import (
+  LISTING_MEDIA_TYPES,
+  check_listing_image,
   CommunityPublicationJournal,
   CommunityPublicationError,
   accepted_history_contains,
@@ -968,7 +969,9 @@ async def preview_local_app_publication_asset(
     raise HTTPException(
       exc.status_code, {"code": exc.code, "message": exc.detail},
     ) from exc
-  media_type = mimetypes.guess_type(asset_path)[0] or "application/octet-stream"
+  # The type comes from the bytes the image rule accepted, never the name, so
+  # a file that is also valid HTML cannot be served as a page.
+  media_type = LISTING_MEDIA_TYPES[check_listing_image(content, "listing image")]
   return Response(
     content,
     media_type=media_type,

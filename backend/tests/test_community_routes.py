@@ -205,9 +205,13 @@ async def test_publication_preview_asset_serves_commit_bound_bytes(monkeypatch):
 
   seen = {}
 
+  # JPEG bytes behind a .png name: the type follows the bytes, not the name.
+  jpeg = io.BytesIO()
+  Image.new("RGB", (8, 8), (1, 2, 3)).save(jpeg, format="JPEG")
+
   def exact_asset(value, commit, path):
     seen.update(app=value, commit=commit, path=path)
-    return b"accepted-screen"
+    return jpeg.getvalue()
 
   monkeypatch.setattr(community.fs_locks, "source_dir_lock", source_lock)
   monkeypatch.setattr(community, "read_public_store_asset", exact_asset)
@@ -215,8 +219,8 @@ async def test_publication_preview_asset_serves_commit_bound_bytes(monkeypatch):
     42, "a" * 40, "static/store/screen.png", DB(),
   )
 
-  assert response.body == b"accepted-screen"
-  assert response.media_type == "image/png"
+  assert response.body == jpeg.getvalue()
+  assert response.media_type == "image/jpeg"
   assert response.headers["cache-control"] == "private, max-age=31536000, immutable"
   assert seen == {
     "app": app,
