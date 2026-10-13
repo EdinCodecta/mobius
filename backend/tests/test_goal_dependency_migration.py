@@ -5,7 +5,7 @@ import asyncio
 import pytest
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import Session
 
 from app import models, schema_migrations
@@ -167,13 +167,84 @@ def test_retired_audit_rows_have_no_guarantee_beyond_chat_purge(tmp_path, foreig
   eng.dispose()
 
 
+def _seed_transfer_notice_upgrade(eng):
+  with eng.begin() as conn:
+    conn.execute(text("CREATE TABLE apps (id TEXT)"))
+    conn.execute(text(
+      "CREATE TABLE agent_work_claims (id TEXT, revision INTEGER, "
+      "notification_revision INTEGER, previous_owner_chat_id TEXT, "
+      "completed_at TEXT, released_at TEXT)"
+    ))
+    conn.execute(text(
+      "INSERT INTO agent_work_claims VALUES "
+      "('pending', 2, 1, 'old', NULL, NULL), "
+      "('acknowledged', 2, 2, 'old', NULL, NULL), "
+      "('completed', 3, 1, 'old', 'now', NULL), "
+      "('released', 3, 1, 'old', NULL, 'now'), "
+      "('never-transferred', 1, 0, NULL, NULL, NULL)"
+    ))
+
+
+def _transfer_notice_revisions(eng):
+  with eng.connect() as conn:
+    return dict(conn.execute(text(
+      "SELECT id, transfer_notice_revision FROM agent_work_claims"
+    )).all())
+
+
 def test_transfer_notice_migration_backfills_only_known_open_transfer_events(tmp_path):
   eng = create_engine(f"sqlite:///{tmp_path / 'transfer.db'}")
+  _seed_transfer_notice_upgrade(eng)
+  schema_migrations._add_transfer_notice_revision(eng)
+  schema_migrations._add_transfer_notice_revision(eng)
+  assert _transfer_notice_revisions(eng) == {
+    'pending': 2, 'acknowledged': None, 'completed': None,
+    'released': None, 'never-transferred': None,
+  }
+  # Later claim updates must not change the transfer event's captured identity.
   with eng.begin() as conn:
-    conn.execute(text('CREATE TABLE agent_work_claims (id TEXT, revision INTEGER, notification_revision INTEGER, previous_owner_chat_id TEXT, completed_at TEXT, released_at TEXT)'))
-    conn.execute(text("INSERT INTO agent_work_claims VALUES ('pending', 2, 1, 'old', NULL, NULL), ('acknowledged', 2, 2, 'old', NULL, NULL), ('settled', 3, 1, 'old', 'now', NULL)"))
+    conn.execute(text("UPDATE agent_work_claims SET revision=3 WHERE id='pending'"))
   schema_migrations._add_transfer_notice_revision(eng)
-  schema_migrations._add_transfer_notice_revision(eng)
-  with eng.connect() as conn:
-    assert dict(conn.execute(text('SELECT id, transfer_notice_revision FROM agent_work_claims')).all()) == {'pending': 2, 'acknowledged': None, 'settled': None}
+  assert _transfer_notice_revisions(eng)['pending'] == 2
+  eng.dispose()
+
+
+@pytest.mark.parametrize("interrupted", [False, True], ids=["column-present", "interrupted-ddl"])
+def test_transfer_notice_upgrade_resumes_before_recording_completion(tmp_path, monkeypatch, interrupted):
+  eng = create_engine(f"sqlite:///{tmp_path / 'partial-transfer.db'}")
+  _seed_transfer_notice_upgrade(eng)
+  version = "0092_transfer_notice_revision"
+  monkeypatch.setattr(schema_migrations, "_SCHEMA_MIGRATIONS", (
+    (version, schema_migrations._add_transfer_notice_revision),
+  ))
+  schema_migrations._ensure_migration_ledger(eng)
+  if interrupted:
+    def fail_backfill(conn, cursor, statement, parameters, context, executemany):
+      if statement.startswith("UPDATE agent_work_claims SET transfer_notice_revision"):
+        raise RuntimeError("interrupted after add-column")
+
+    event.listen(eng, "before_cursor_execute", fail_backfill)
+    try:
+      with pytest.raises(RuntimeError, match="interrupted after add-column"):
+        schema_migrations.run_migrations(eng)
+    finally:
+      event.remove(eng, "before_cursor_execute", fail_backfill)
+  else:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE agent_work_claims ADD COLUMN transfer_notice_revision INTEGER"))
+
+  assert "transfer_notice_revision" in {
+    column["name"] for column in inspect(eng).get_columns("agent_work_claims")
+  }
+  assert version not in schema_migrations._applied_migrations(eng)
+  assert _transfer_notice_revisions(eng)['pending'] is None
+  schema_migrations.run_migrations(eng)
+  assert _transfer_notice_revisions(eng) == {
+    'pending': 2, 'acknowledged': None, 'completed': None,
+    'released': None, 'never-transferred': None,
+  }
+  assert schema_migrations._applied_migrations(eng) == {version}
+  schema_migrations.run_migrations(eng)
+  assert _transfer_notice_revisions(eng)['pending'] == 2
+  assert schema_migrations._applied_migrations(eng) == {version}
   eng.dispose()

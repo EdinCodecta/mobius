@@ -6672,17 +6672,22 @@ def _add_transfer_notice_revision(eng) -> None:
   """Transfer identity must survive later completion/release revisions."""
   from sqlalchemy import inspect, text
   inspector = inspect(eng)
-  if "agent_work_claims" not in inspector.get_table_names() or "transfer_notice_revision" in {
-    column["name"] for column in inspector.get_columns("agent_work_claims")
-  }:
+  if "agent_work_claims" not in inspector.get_table_names():
     return
+  has_revision = "transfer_notice_revision" in {
+    column["name"] for column in inspector.get_columns("agent_work_claims")
+  }
   with eng.begin() as conn:
-    conn.execute(text("ALTER TABLE agent_work_claims ADD COLUMN transfer_notice_revision INTEGER"))
+    if not has_revision:
+      conn.execute(text("ALTER TABLE agent_work_claims ADD COLUMN transfer_notice_revision INTEGER"))
+    # SQLite may retain the column after an interrupted backfill. Retry from
+    # data state, preserving event identities already captured by this migration
+    # or runtime transfers even when the claim revision has since advanced.
     # An open pending transfer has a known event revision. Do not guess one
     # from older settled rows whose later revisions erased that distinction.
     conn.execute(text(
       "UPDATE agent_work_claims SET transfer_notice_revision=revision "
-      "WHERE previous_owner_chat_id IS NOT NULL "
+      "WHERE transfer_notice_revision IS NULL AND previous_owner_chat_id IS NOT NULL "
       "AND completed_at IS NULL AND released_at IS NULL "
       "AND notification_revision < revision"
     ))
