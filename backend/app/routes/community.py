@@ -35,6 +35,7 @@ from app.community_publish import (
   new_publication_journal,
   public_store_listing,
   store_listing_review,
+  read_public_snapshot,
   read_public_store_asset,
   read_publication_journal,
   write_publication_journal,
@@ -902,10 +903,12 @@ async def preview_local_app_publication(
     raise HTTPException(404, "App not found.")
   try:
     async with fs_locks.source_dir_lock(str(app.source_dir)):
-      accepted_commit, files = await asyncio.to_thread(
-        build_public_snapshot, app, allow_missing_manifest=True,
+      # Lenient: whatever publication would refuse becomes a checklist item,
+      # so the editor always gets a draft to fix it from.
+      accepted_commit, files, problems = await asyncio.to_thread(
+        read_public_snapshot, app,
       )
-      review = await asyncio.to_thread(store_listing_review, files)
+      review = await asyncio.to_thread(store_listing_review, files, problems)
       await asyncio.to_thread(
         store_listing_source.note_what_saving_fixes,
         review["checklist"], Path(str(app.source_dir)), app,

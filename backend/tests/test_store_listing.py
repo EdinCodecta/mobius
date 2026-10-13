@@ -311,6 +311,127 @@ def test_an_oversized_image_gets_a_clear_message_and_a_full_listing_fits():
     schemas.StoreListingImageIn(data_base64=largest + "AAAA")
 
 
+def _commit_accepted(db, source: Path, app_id: int, message: str) -> None:
+  """Commit the worktree and record it as accepted, bypassing apply's checks."""
+  app_git._run(source, "add", "-A")
+  app_git._run(source, "commit", "-q", "-m", message)
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  row.source_commit = app_git.head_sha(source, "HEAD")
+  db.commit()
+
+
+def _item(preview: dict, item_id: str) -> dict:
+  return next(item for item in preview["checklist"] if item["id"] == item_id)
+
+
+def test_one_image_rule_for_readiness_preview_and_save(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  gif = io.BytesIO()
+  Image.new("RGB", (16, 16), (9, 9, 9)).save(gif, format="GIF")
+  (source / "static" / "store").mkdir(parents=True)
+  (source / "static" / "store" / "a.png").write_bytes(gif.getvalue())
+  manifest = json.loads(_MANIFEST)
+  manifest["store"] = {
+    "tagline": "t", "description": "d",
+    "screenshots": [{"src": "static/store/a.png", "alt": "A"}],
+  }
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  _commit_accepted(db, source, app_id, "gif listing")
+
+  preview = _preview(client, auth, app_id)
+
+  assert preview["ready"] is False
+  assert _item(preview, "screenshots")["code"] == "listing_image_invalid"
+  assert client.get(
+    preview["asset_root"] + "static/store/a.png", headers=auth,
+  ).status_code == 404
+  refused = _save(client, auth, app_id, **_complete_listing(
+    screenshots=[{"path": "static/store/a.png", "alt": "A"}],
+  ))
+  assert refused.status_code == 422
+  assert refused.json()["detail"]["code"] == "listing_image_invalid"
+
+
+@pytest.mark.parametrize("problem", ["no_entry", "bad_json", "secret"])
+def test_preview_reports_publication_problems_as_checklist_items(
+  client, auth, db, problem,
+):
+  source = _source()
+  app_id = _create(client, auth, source)
+  manifest = json.loads(_MANIFEST)
+  manifest["store"] = {"tagline": "Kept.", "description": "Still here."}
+  if problem == "no_entry":
+    manifest.pop("entry")
+  (source / "mobius.json").write_text(
+    "{not json" if problem == "bad_json" else json.dumps(manifest, indent=2),
+  )
+  if problem == "secret":
+    (source / "config.js").write_text("export const key = 'ghp_" + "A" * 36 + "'\n")
+  _commit_accepted(db, source, app_id, problem)
+
+  preview = _preview(client, auth, app_id)
+
+  details = _item(preview, "details")
+  assert preview["ready"] is False and details["done"] is False
+  assert details["code"] == {
+    "no_entry": "invalid_manifest", "bad_json": "invalid_manifest",
+    "secret": "secret_detected",
+  }[problem]
+  if problem != "bad_json":
+    assert preview["draft"]["tagline"] == "Kept."
+
+
+def test_a_save_interrupted_before_its_commit_recovers(client, auth):
+  source = _source()
+  app_id = _create(client, auth, source)
+  manifest = json.loads(_MANIFEST)
+  manifest["store"] = {"tagline": "Left behind."}
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  (source / "static" / "store").mkdir(parents=True)
+  (source / "static" / "store" / "0123456789abcdef.png").write_bytes(_png((3, 3, 3)))
+
+  saved = _save(client, auth, app_id, **_complete_listing())
+
+  assert saved.status_code == 200, saved.text
+  assert app_git._run(source, "status", "--porcelain").stdout == ""
+
+
+def test_removing_listing_art_keeps_files_the_editor_did_not_create(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  (source / "static" / "store").mkdir(parents=True)
+  (source / "static" / "store" / "hero.png").write_bytes(_png((8, 8, 8)))
+  manifest = json.loads(_MANIFEST)
+  manifest["store"] = {"hero": "static/store/hero.png"}
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  _commit_accepted(db, source, app_id, "hand-made hero")
+
+  saved = _save(client, auth, app_id, **_complete_listing())
+
+  assert saved.status_code == 200, saved.text
+  assert "hero" not in json.loads((source / "mobius.json").read_text())["store"]
+  assert (source / "static" / "store" / "hero.png").is_file()
+
+
+def test_icon_is_not_automatic_while_unapplied_edits_block_the_save(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  manifest = json.loads(_MANIFEST)
+  manifest.pop("icon")
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  (source / "icon.png").unlink()
+  _commit_accepted(db, source, app_id, "icon on the record only")
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  row.icon_png = _png((10, 200, 10), (32, 32))
+  db.commit()
+  assert _item(_preview(client, auth, app_id), "icon")["automatic"] is True
+
+  (source / "index.jsx").write_text("export default function App() { return null }\n")
+
+  assert "automatic" not in _item(_preview(client, auth, app_id), "icon")
+
+
 def test_saving_rejects_replaced_source_root(client, auth):
   source = _source()
   app_id = _create(client, auth, source)

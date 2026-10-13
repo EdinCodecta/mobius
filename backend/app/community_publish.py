@@ -5,12 +5,16 @@ from __future__ import annotations
 import base64
 from datetime import UTC, datetime
 import hashlib
+import io
 import json
 import re
 import subprocess
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+import warnings
+
+from PIL import Image
 
 from app import app_git, icon_assets, models
 from app.config import get_settings
@@ -105,6 +109,7 @@ class _PublicTreeEntry:
   path: str
   mode: str
   oid: str
+  size: int
 
 
 @dataclass
@@ -402,6 +407,50 @@ TAGLINE_MAX_BYTES = 120
 DESCRIPTION_MAX_BYTES = 4000
 SCREENSHOT_ALT_MAX_BYTES = 300
 SCREENSHOT_LABEL_MAX_BYTES = 120
+LISTING_IMAGE_MAX_DIMENSION = 8192
+_LISTING_IMAGE_SUFFIXES = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
+
+
+def check_listing_image(content: bytes, what: str) -> str:
+  """Return the file suffix of a usable Store listing image, or raise why not.
+
+  Readiness, the listing save and the public preview all apply this one rule,
+  so an image the checklist accepts is one the Store can show.
+  """
+  if len(content) > STORE_LISTING_IMAGE_MAX_BYTES:
+    raise CommunityPublicationError(
+      f"The {what} must be an image of at most "
+      f"{STORE_LISTING_IMAGE_MAX_BYTES // (1024 * 1024)} MB.",
+      "listing_image_too_large", 422,
+    )
+  try:
+    with warnings.catch_warnings():
+      warnings.simplefilter("error", Image.DecompressionBombWarning)
+      image = Image.open(io.BytesIO(content))
+      width, height = image.size
+      image.verify()
+  except Exception as exc:
+    raise CommunityPublicationError(
+      f"The {what} is not a readable image.", "listing_image_invalid", 422,
+    ) from exc
+  suffix = _LISTING_IMAGE_SUFFIXES.get(str(image.format or ""))
+  if suffix is None:
+    raise CommunityPublicationError(
+      f"Use a PNG, JPEG, or WebP file for the {what}.", "listing_image_invalid", 422,
+    )
+  if max(width, height) > LISTING_IMAGE_MAX_DIMENSION:
+    raise CommunityPublicationError(
+      f"The {what} is larger than {LISTING_IMAGE_MAX_DIMENSION} pixels.",
+      "listing_image_too_large", 422,
+    )
+  return suffix
+
+
+def _file_bytes(item: dict) -> bytes:
+  try:
+    return base64.b64decode(item.get("content_base64") or "")
+  except ValueError:
+    return b""
 
 
 def _incomplete(message: str) -> CommunityPublicationError:
@@ -426,11 +475,48 @@ def _parsed_manifest(by_path: dict[str, dict]) -> dict:
   return manifest
 
 
-def _listing_details(manifest: dict) -> None:
+def _manifest_problems(
+  manifest: dict, by_path: dict[str, dict],
+) -> list[CommunityPublicationError]:
+  """Everything publication refuses in a parsed manifest, in check order.
+
+  Icon problems carry ``invalid_icon`` so the checklist can file them under
+  the icon; every other one belongs to the app details.
+  """
   if not manifest.get("id") or not manifest.get("entry"):
-    raise CommunityPublicationError(
+    return [CommunityPublicationError(
       "mobius.json is missing required publication fields.", "invalid_manifest",
-    )
+    )]
+  try:
+    validate_manifest_contract(manifest)
+  except ManifestContractError as exc:
+    return [CommunityPublicationError(str(exc), "invalid_manifest")]
+  problems = []
+  icon = manifest.get("icon")
+  if icon:
+    icon_item = by_path.get(icon)
+    if icon_item is None:
+      problems.append(CommunityPublicationError(
+        f"The app icon {icon} is missing from the published snapshot.", "invalid_icon",
+      ))
+    else:
+      try:
+        icon_assets.normalize_icon(_file_bytes(icon_item))
+      except icon_assets.InvalidIcon as exc:
+        problems.append(CommunityPublicationError(
+          f"The app icon {icon} cannot be used: {exc}", "invalid_icon",
+        ))
+  # Install charges each declaration in full, so bound the same declared sum:
+  # every snapshot the Store accepts is then installable.
+  declared = package_bytes(
+    manifest,
+    lambda rel: len(_file_bytes(by_path[rel])) if rel in by_path else 0,
+  )
+  if declared > PACKAGE_MAX_BYTES:
+    problems.append(CommunityPublicationError(
+      package_limit_message(declared), "payload_too_large", 413,
+    ))
+  return problems
 
 
 def _listing_text(store: dict, field: str, label: str, maximum: int) -> str:
@@ -456,8 +542,9 @@ def _listing_asset(value: object, label: str, by_path: dict[str, dict]) -> str:
   if not source.startswith("static/store/"):
     raise _incomplete(
       f"The {label} must be saved under static/store/. Saving the listing "
-      "again moves it there.",
+      "again copies it there.",
     )
+  check_listing_image(_file_bytes(by_path[source]), label)
   return source
 
 
@@ -521,11 +608,17 @@ def _listing_draft(manifest: dict, store: dict, by_path: dict[str, dict]) -> dic
   }
 
 
-def store_listing_review(files: list[dict[str, str]]) -> dict:
+def store_listing_review(
+  files: list[dict[str, str]],
+  source_problems: list[CommunityPublicationError] | tuple = (),
+) -> dict:
   """Check every Store listing requirement of one accepted snapshot at once.
 
   The Store's checklist and the publish gate both read this review, so the
-  checklist can never call a listing ready that publishing would refuse. Store
+  checklist can never call a listing ready that publishing would refuse.
+  ``source_problems`` are those ``read_public_snapshot`` found in the source
+  itself; they and the manifest's problems fall under the details and icon
+  items, so a broken manifest still leaves an editable draft. Store
   artwork lives below ``static/store/`` so a commit-bound preview can read it
   directly without a copy step. It remains ordinary accepted source rather
   than ``static_assets`` package input; the manifest contract reserves this
@@ -549,16 +642,22 @@ def store_listing_review(files: list[dict[str, str]]) -> dict:
   # only unreadable JSON leaves nothing to show.
   check("manifest", lambda: _parsed_manifest(by_path))
   manifest = results.get("manifest") or {}
-  if "manifest" in problems:
-    problems["details"] = problems.pop("manifest")
-  else:
-    check("details", lambda: _listing_details(manifest))
+  details = [problems.pop("manifest")] if "manifest" in problems else []
+  manifest_problems = _manifest_problems(manifest, by_path) if not details else []
+  details += source_problems
+  details += [p for p in manifest_problems if p.code != "invalid_icon"]
+  if details:
+    problems["details"] = details[0]
   store = manifest.get("store") if isinstance(manifest.get("store"), dict) else {}
 
   def icon() -> str:
+    for problem in manifest_problems:
+      if problem.code == "invalid_icon":
+        raise problem
     source = str(manifest.get("icon") or "").strip()
     if not source or source not in by_path:
       raise _incomplete("Add an app icon.")
+    check_listing_image(_file_bytes(by_path[source]), "app icon")
     return source
 
   check("icon", icon)
@@ -613,9 +712,10 @@ def public_store_listing(files: list[dict[str, str]]) -> dict:
   return review["listing"]
 
 
-def listing_draft_assets(review: dict) -> set[str]:
+def listing_draft_assets(manifest: dict, by_path: dict) -> set[str]:
   """Only artwork paths safe for the unauthenticated preview endpoint."""
-  draft = review["draft"]
+  store = manifest.get("store") if isinstance(manifest.get("store"), dict) else {}
+  draft = _listing_draft(manifest, store, by_path)
   # The accepted manifest's icon has always been public. An incomplete draft
   # must not make arbitrary other tracked source files public as artwork.
   paths = {draft["icon"]}
@@ -627,49 +727,68 @@ def listing_draft_assets(review: dict) -> set[str]:
   return paths
 
 
-def _public_tree_entries(repo: Path, commit: str) -> list[_PublicTreeEntry]:
-  listing = _git(repo, "ls-tree", "-r", "-z", commit, binary=True)
+def _public_tree_entries(
+  repo: Path, commit: str,
+) -> tuple[list[_PublicTreeEntry], list[CommunityPublicationError]]:
+  """Every regular file of ``commit``, and each problem publishing it would hit.
+
+  Problems are collected rather than raised so a listing preview can still
+  read the manifest and artwork of a tree that is not yet publishable.
+  """
+  listing = _git(repo, "ls-tree", "-r", "-l", "-z", commit, binary=True)
   assert isinstance(listing, bytes)
   raw_entries = [entry for entry in listing.split(b"\0") if entry]
+  problems: list[CommunityPublicationError] = []
   if not raw_entries or len(raw_entries) > MAX_SOURCE_FILES:
-    raise CommunityPublicationError(
+    problems.append(CommunityPublicationError(
       f"A public app must contain 1–{MAX_SOURCE_FILES} files.",
       "payload_too_large",
       413,
-    )
+    ))
 
   entries: list[_PublicTreeEntry] = []
   seen: set[str] = set()
   for raw_entry in raw_entries:
     metadata, separator, raw_path = raw_entry.partition(b"\t")
-    if not separator:
-      raise CommunityPublicationError("The app source tree is invalid.")
     try:
-      mode, object_type, oid = metadata.decode("ascii").split(" ", 2)
+      if not separator:
+        raise ValueError(raw_entry)
+      mode, object_type, oid, size = metadata.decode("ascii").split()
       path = raw_path.decode("utf-8", "strict")
-    except (UnicodeDecodeError, ValueError) as exc:
-      raise CommunityPublicationError(
+    except (UnicodeDecodeError, ValueError):
+      problems.append(CommunityPublicationError(
         f"The path {raw_path.decode('utf-8', 'replace')!r} is not valid UTF-8 "
         "and cannot be published.",
         "invalid_path",
-      ) from exc
-    _validate_path(path)
+      ))
+      continue
+    try:
+      _validate_path(path)
+    except CommunityPublicationError as exc:
+      problems.append(exc)
     # Case-insensitive and macOS (decomposed Unicode) checkouts would merge
     # these names into one file.
     folded = unicodedata.normalize("NFC", path).casefold()
     if folded in seen:
-      raise CommunityPublicationError(
+      problems.append(CommunityPublicationError(
         f"The path {path!r} collides with another file that differs only in "
         "letter case or Unicode form.",
         "invalid_path",
-      )
+      ))
     seen.add(folded)
     if object_type != "blob" or mode not in {"100644", "100755"} or not _OID.fullmatch(oid):
-      raise CommunityPublicationError(
+      problems.append(CommunityPublicationError(
         f"{path} is not a regular publishable file.", "invalid_file_type",
-      )
-    entries.append(_PublicTreeEntry(path=path, mode=mode, oid=oid))
-  return entries
+      ))
+      continue
+    entries.append(_PublicTreeEntry(path=path, mode=mode, oid=oid, size=int(size)))
+  return entries, problems
+
+
+def _blob(repo: Path, entry: _PublicTreeEntry) -> bytes:
+  content = _git(repo, "cat-file", "-p", entry.oid, binary=True)
+  assert isinstance(content, bytes)
+  return content
 
 
 def read_accepted_file(app: models.App, path: str, *, max_bytes: int) -> bytes | None:
@@ -718,63 +837,47 @@ def read_public_store_asset(
       409,
     )
   _validate_path(asset_path)
-  entries = _public_tree_entries(repo, commit)
+  entries, _ = _public_tree_entries(repo, commit)
   by_path = {entry.path: entry for entry in entries}
+  manifest: object = {}
   manifest_entry = by_path.get("mobius.json")
-  if manifest_entry is None:
-    raise CommunityPublicationError(
-      "The accepted revision must include mobius.json before it can be public.",
-      "invalid_manifest",
-    )
-  manifest_content = _git(repo, "cat-file", "-p", manifest_entry.oid, binary=True)
-  assert isinstance(manifest_content, bytes)
-  listing_files = [
-    {
-      "path": entry.path,
-      "content_base64": (
-        base64.b64encode(manifest_content).decode("ascii")
-        if entry.path == "mobius.json"
-        else ""
-      ),
-    }
-    for entry in entries
-  ]
-  allowed = listing_draft_assets(store_listing_review(listing_files))
+  if manifest_entry is not None and manifest_entry.size <= PACKAGE_MAX_BYTES:
+    try:
+      manifest = json.loads(_blob(repo, manifest_entry))
+    except ValueError:
+      manifest = {}
   entry = by_path.get(asset_path)
-  if asset_path not in allowed or entry is None:
+  if (
+    entry is None or not isinstance(manifest, dict)
+    or asset_path not in listing_draft_assets(manifest, by_path)
+    or entry.size > STORE_LISTING_IMAGE_MAX_BYTES
+  ):
     raise CommunityPublicationError(
       "That file is not part of the accepted Store listing.",
       "listing_asset_unavailable",
       404,
     )
-  content = _git(repo, "cat-file", "-p", entry.oid, binary=True)
-  assert isinstance(content, bytes)
+  content = _blob(repo, entry)
   # An incomplete listing's draft is served too, so the editor can show it;
-  # its icon may name any tracked file, so only real images go out.
-  if len(content) > STORE_LISTING_IMAGE_MAX_BYTES or not _is_listing_image(content):
+  # its icon may name any tracked file, so only real listing images go out.
+  try:
+    check_listing_image(content, "listing image")
+  except CommunityPublicationError as exc:
     raise CommunityPublicationError(
       "That file is not a Store listing image.", "listing_asset_unavailable", 404,
-    )
+    ) from exc
   _scan_content(asset_path, content)
   return content
 
 
-def _is_listing_image(content: bytes) -> bool:
-  """Whether ``content`` starts like a PNG, JPEG or WebP file."""
-  return (
-    content.startswith(b"\x89PNG\r\n\x1a\n")
-    or content.startswith(b"\xff\xd8\xff")
-    or (content[:4] == b"RIFF" and content[8:12] == b"WEBP")
-  )
+def read_public_snapshot(
+  app: models.App,
+) -> tuple[str, list[dict[str, str]], list[CommunityPublicationError]]:
+  """The accepted commit, its files, and each problem publishing them would hit.
 
-
-def build_public_snapshot(
-  app: models.App, *, allow_missing_manifest: bool = False,
-) -> tuple[str, list[dict[str, str]]]:
-  """Return the exact accepted commit and every regular tracked file.
-
-  Listing previews may inspect legacy source without a manifest. Publication
-  still requires a valid, installable manifest and the declared package budget.
+  Only source that cannot be read at all raises; the listing preview reports
+  everything else as checklist items. Over the package budget, only the
+  manifest and listing artwork are read, which is all the review needs.
 
   Reading a Git tree rather than the editable worktree prevents an unsaved or
   concurrently-changing draft from crossing the public-source consent boundary.
@@ -787,33 +890,62 @@ def build_public_snapshot(
       409,
     )
   commit = _accepted_commit(app, repo)
-  entries = _public_tree_entries(repo, commit)
+  entries, problems = _public_tree_entries(repo, commit)
+  if sum(entry.size for entry in entries) > PACKAGE_MAX_BYTES:
+    problems.append(CommunityPublicationError(
+      "The public app snapshot is larger than the "
+      f"{PACKAGE_MAX_BYTES // (1024 * 1024)} MiB app package limit.",
+      "payload_too_large",
+      413,
+    ))
+    small = {
+      entry.path: entry for entry in entries
+      if entry.size <= STORE_LISTING_IMAGE_MAX_BYTES
+    }
+    icon = ""
+    if "mobius.json" in small:
+      try:
+        declared = json.loads(_blob(repo, small["mobius.json"]))
+        icon = str(declared.get("icon") or "") if isinstance(declared, dict) else ""
+      except ValueError:
+        pass
+    entries = [
+      entry for path, entry in small.items()
+      if path in {"mobius.json", icon} or path.startswith("static/store/")
+    ]
 
   files: list[dict[str, str]] = []
-  sizes: dict[str, int] = {}
-  total = 0
   for entry in entries:
-    content = _git(repo, "cat-file", "-p", entry.oid, binary=True)
-    assert isinstance(content, bytes)
-    sizes[entry.path] = len(content)
-    total += len(content)
-    if total > PACKAGE_MAX_BYTES:
-      raise CommunityPublicationError(
-        "The public app snapshot is larger than the "
-        f"{PACKAGE_MAX_BYTES // (1024 * 1024)} MiB app package limit.",
-        "payload_too_large",
-        413,
-      )
-    _scan_content(entry.path, content)
+    content = _blob(repo, entry)
+    try:
+      _scan_content(entry.path, content)
+    except CommunityPublicationError as exc:
+      problems.append(exc)
     files.append({
       "path": entry.path,
       "mode": entry.mode,
       "content_base64": base64.b64encode(content).decode("ascii"),
     })
+  return commit, files, problems
 
-  manifest_item = next((item for item in files if item["path"] == "mobius.json"), None)
-  if manifest_item is None and allow_missing_manifest:
-    return commit, files
+
+def build_public_snapshot(app: models.App) -> tuple[str, list[dict[str, str]]]:
+  """Return the exact accepted commit and every regular tracked file.
+
+  Raises the first problem publication would hit: the same ones the listing
+  review reports, so a ready listing always passes here.
+  """
+  commit, files, problems = read_public_snapshot(app)
+  by_path = {item["path"]: item for item in files}
+  try:
+    manifest = _parsed_manifest(by_path)
+  except CommunityPublicationError as exc:
+    problems.append(exc)
+  else:
+    problems.extend(_manifest_problems(manifest, by_path))
+  if problems:
+    raise problems[0]
+  return commit, files
   if manifest_item is None:
     raise CommunityPublicationError(
       "The accepted revision must include mobius.json before it can be public.",

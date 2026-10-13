@@ -2327,13 +2327,10 @@ async def save_store_listing(
         )
       head_before_apply = await asyncio.to_thread(app_git.head_sha, source, "HEAD")
       accepted_before_apply = app.source_commit
-      # Edits committed without being applied are unreviewed just like
-      # uncommitted ones; only a failed save's own listing commit may remain.
-      if await asyncio.to_thread(app_git.worktree_dirty, source) or (
-        accepted_before_apply and await asyncio.to_thread(
-          store_listing_source.changes_beyond_listing,
-          source, accepted_before_apply, head_before_apply,
-        )
+      # Unapplied edits, committed or not, are unreviewed; only listing files
+      # an interrupted or failed save left behind may ride along.
+      if await asyncio.to_thread(
+        store_listing_source.has_unapplied_changes, source, accepted_before_apply,
       ):
         raise HTTPException(
           status_code=409,

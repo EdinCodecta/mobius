@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import base64
 from contextlib import asynccontextmanager
+import io
 import json
 import shutil
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from PIL import Image
 
 from app import community_publish, models
 from app.routes import community
+
+
+def _png() -> bytes:
+  output = io.BytesIO()
+  Image.new("RGB", (8, 8), (40, 90, 180)).save(output, format="PNG")
+  return output.getvalue()
 
 
 @pytest.fixture(autouse=True)
@@ -148,7 +156,7 @@ async def test_local_publication_preview_is_bound_to_the_accepted_listing(
   files = [{"path": "mobius.json", "content_base64": "e30="}]
   monkeypatch.setattr(community.fs_locks, "source_dir_lock", source_lock)
   monkeypatch.setattr(
-    community, "build_public_snapshot", lambda _, *, allow_missing_manifest: ("a" * 40, files),
+    community, "read_public_snapshot", lambda _: ("a" * 40, files, []),
   )
   review = {
     "ready": True,
@@ -159,7 +167,7 @@ async def test_local_publication_preview_is_bound_to_the_accepted_listing(
     "listing": listing,
     "draft": {**listing, "hero": ""},
   }
-  monkeypatch.setattr(community, "store_listing_review", lambda value: review)
+  monkeypatch.setattr(community, "store_listing_review", lambda value, problems: review)
 
   preview = await community.preview_local_app_publication(42, DB(), None)
 
@@ -493,7 +501,7 @@ async def test_local_publish_rejects_an_incomplete_listing_before_github_writes(
       "path": "mobius.json",
       "content_base64": base64.b64encode(json.dumps(manifest).encode()).decode(),
     },
-    {"path": "icon.png", "content_base64": ""},
+    {"path": "icon.png", "content_base64": base64.b64encode(_png()).decode()},
   ]
   monkeypatch.setattr(community.github_auth, "get_token", lambda: "local-only-token")
   monkeypatch.setattr(community.community_broker, "request", fake_broker)

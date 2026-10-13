@@ -34,9 +34,9 @@ def _git(repo, *args):
   ).stdout.strip()
 
 
-def _png():
+def _png(color=(40, 90, 180), size=(8, 8), image_format="PNG"):
   output = io.BytesIO()
-  Image.new("RGB", (8, 8), (40, 90, 180)).save(output, format="PNG")
+  Image.new("RGB", size, color).save(output, format=image_format)
   return output.getvalue()
 
 
@@ -69,9 +69,9 @@ def test_listing_art_is_direct_versioned_source_not_a_runtime_asset():
   files = [
     _public_file("mobius.json", json.dumps(manifest).encode()),
     _public_file("index.jsx", b"export default function App() {}"),
-    _public_file("icon.png", b"icon"),
-    _public_file("static/store/hero.png", b"hero"),
-    _public_file("static/store/screen.png", b"screen"),
+    _public_file("icon.png", _png((1, 1, 1))),
+    _public_file("static/store/hero.png", _png((2, 2, 2))),
+    _public_file("static/store/screen.png", _png((3, 3, 3))),
   ]
 
   listing = public_store_listing(files)
@@ -82,6 +82,8 @@ def test_listing_art_is_direct_versioned_source_not_a_runtime_asset():
 
 
 _PNG = b"\x89PNG\r\n\x1a\n"
+_ACCEPTED_SCREEN = _png((4, 4, 4))
+_SCREEN = _png((5, 5, 5))
 
 
 def test_preview_asset_reads_the_accepted_tree_not_the_editable_worktree(tmp_path):
@@ -97,10 +99,10 @@ def test_preview_asset_reads_the_accepted_tree_not_the_editable_worktree(tmp_pat
     }],
   }
   (repo / "mobius.json").write_text(json.dumps(manifest), encoding="utf-8")
-  (repo / "icon.png").write_bytes(_PNG + b"accepted-icon")
+  (repo / "icon.png").write_bytes(_png((6, 6, 6)))
   (repo / "static" / "store").mkdir(parents=True)
   screenshot = repo / "static" / "store" / "screen.png"
-  screenshot.write_bytes(_PNG + b"accepted-screen")
+  screenshot.write_bytes(_ACCEPTED_SCREEN)
   _git(repo, "add", "mobius.json", "icon.png", "static/store/screen.png")
   _git(repo, "commit", "-m", "accepted listing")
   accepted = _git(repo, "rev-parse", "HEAD")
@@ -109,7 +111,7 @@ def test_preview_asset_reads_the_accepted_tree_not_the_editable_worktree(tmp_pat
 
   assert read_public_store_asset(
     app, accepted, "static/store/screen.png",
-  ) == _PNG + b"accepted-screen"
+  ) == _ACCEPTED_SCREEN
 
   with pytest.raises(CommunityPublicationError) as unavailable:
     read_public_store_asset(app, accepted, "index.jsx")
@@ -131,7 +133,7 @@ def test_incomplete_listing_cannot_make_other_source_public(tmp_path):
   (repo / "mobius.json").write_text(json.dumps(manifest), encoding="utf-8")
   (repo / "private-notes.txt").write_text("not public", encoding="utf-8")
   (repo / "static" / "store").mkdir(parents=True)
-  (repo / "static" / "store" / "screen.png").write_bytes(_PNG + b"screen")
+  (repo / "static" / "store" / "screen.png").write_bytes(_SCREEN)
   _git(repo, "add", "mobius.json", "private-notes.txt", "static/store/screen.png")
   _git(repo, "commit", "-m", "draft listing")
   accepted = _git(repo, "rev-parse", "HEAD")
@@ -140,7 +142,7 @@ def test_incomplete_listing_cannot_make_other_source_public(tmp_path):
   with pytest.raises(CommunityPublicationError) as private:
     read_public_store_asset(app, accepted, "private-notes.txt")
   assert private.value.code == "listing_asset_unavailable"
-  assert read_public_store_asset(app, accepted, "static/store/screen.png") == _PNG + b"screen"
+  assert read_public_store_asset(app, accepted, "static/store/screen.png") == _SCREEN
 
 
 def test_preview_serves_only_images_even_for_the_declared_icon(tmp_path):
@@ -192,7 +194,7 @@ def test_app_git_accepts_store_art_but_excludes_runtime_static_assets(tmp_path):
   )
   (repo / "icon.png").write_bytes(_png())
   (repo / "static" / "store").mkdir(parents=True)
-  (repo / "static" / "store" / "screen.png").write_bytes(b"screen")
+  (repo / "static" / "store" / "screen.png").write_bytes(_png((7, 7, 7)))
   (repo / "static" / "runtime").mkdir()
   (repo / "static" / "runtime" / "bundle.js").write_bytes(b"generated")
   (repo / ".mobius-static-assets.json").write_text(
@@ -233,8 +235,8 @@ def test_listing_art_must_use_the_existing_local_static_route():
   }
   files = [
     _public_file("mobius.json", json.dumps(manifest).encode()),
-    _public_file("icon.png", b"icon"),
-    _public_file("listing/screen.png", b"screen"),
+    _public_file("icon.png", _png((1, 1, 1))),
+    _public_file("listing/screen.png", _png((3, 3, 3))),
   ]
 
   with pytest.raises(CommunityPublicationError) as raised:
@@ -446,8 +448,8 @@ def test_listing_preview_can_inspect_legacy_source_but_publication_requires_mani
   _git(repo, "commit", "-m", "legacy source")
   app.source_commit = _git(repo, "rev-parse", "HEAD")
 
-  commit, files = build_public_snapshot(app, allow_missing_manifest=True)
-  assert commit == app.source_commit
+  commit, files, problems = community_publish.read_public_snapshot(app)
+  assert commit == app.source_commit and problems == []
   assert files and not any(item["path"] == "mobius.json" for item in files)
   with pytest.raises(CommunityPublicationError) as raised:
     build_public_snapshot(app)

@@ -948,6 +948,26 @@ def endpoint_diff_paths(
   return {path for path in proc.stdout.split("\0") if path}
 
 
+def worktree_diff_paths(source_dir: str | Path, ref: str) -> set[str] | None:
+  """Paths whose worktree differs from ``ref``, untracked included.
+
+  Ignored files are left out, as apply never commits them. ``None`` when Git
+  cannot answer.
+  """
+  repo = Path(source_dir)
+  diff = _run(
+    repo, "diff", "--name-only", "--no-renames", "-z", ref, "--",
+    check=False, read_only=True,
+  )
+  untracked = _run(
+    repo, "ls-files", "--others", "--exclude-standard", "-z",
+    check=False, read_only=True,
+  )
+  if diff.returncode or untracked.returncode:
+    return None
+  return {path for path in (diff.stdout + untracked.stdout).split("\0") if path}
+
+
 def commit_range_touches_paths(
   source_dir: str | Path,
   ancestor: str,

@@ -11,13 +11,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
-import io
 import json
 from pathlib import Path, PurePosixPath
+import re
 from typing import Callable
-import warnings
-
-from PIL import Image
 
 from app import app_git, icon_assets, models, workspace_files
 from app.community_publish import (
@@ -27,15 +24,16 @@ from app.community_publish import (
   SCREENSHOT_LABEL_MAX_BYTES,
   TAGLINE_MAX_BYTES,
   CommunityPublicationError,
+  check_listing_image,
   read_accepted_file,
 )
 from app.manifest_contract import STORE_LISTING_IMAGE_MAX_BYTES
 
 
 STORE_ART_DIR = "static/store"
-MAX_LISTING_IMAGE_BYTES = STORE_LISTING_IMAGE_MAX_BYTES
-MAX_LISTING_IMAGE_DIMENSION = 8192
-_IMAGE_SUFFIXES = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
+# Art the editor writes is named by its content; only those files are the
+# listing's own to delete. Other static/store/ files may also be app media.
+_EDITOR_ART = re.compile(r"static/store/[0-9a-f]{16}\.(?:png|jpg|webp)")
 _DETAILS_NEED_AGENT = (
   "This older app needs an agent to create its app details without "
   "changing its permissions, capabilities, or scheduled jobs."
@@ -101,10 +99,11 @@ def note_what_saving_fixes(checklist: list[dict], root: Path, app: models.App) -
     details["message"] = _DETAILS_NEED_AGENT
   icon = items["icon"]
   # Only a save that can go ahead keeps the icon; one refused for missing
-  # details fixes nothing.
+  # details or unapplied source changes fixes nothing.
   if (
     not icon["done"] and details.get("automatic") is not False
     and record_icon_for_save(root, app) is not None
+    and not has_unapplied_changes(root, app.source_commit)
   ):
     icon["automatic"] = True
     icon["message"] = "Saving the listing keeps the app's current icon."
@@ -114,8 +113,7 @@ def _listing_fields_removed(manifest: dict) -> dict:
   return {key: value for key, value in manifest.items() if key not in {"icon", "store"}}
 
 
-def _manifest_at(root: Path, ref: str) -> dict | None:
-  raw = app_git.ref_file(root, ref, "mobius.json")
+def _manifest_from(raw: bytes | None) -> dict | None:
   try:
     manifest = json.loads(raw) if raw is not None else None
   except ValueError:
@@ -123,20 +121,26 @@ def _manifest_at(root: Path, ref: str) -> dict | None:
   return manifest if isinstance(manifest, dict) else None
 
 
-def changes_beyond_listing(root: Path, accepted: str, head: str) -> bool:
-  """Whether commits since the accepted revision change more than a listing.
+def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
+  """Whether the source differs from its accepted revision beyond a listing.
 
-  A save that failed after Git advanced leaves its own commit as the retry
-  point, so listing files committed but not yet accepted may ride along with
-  the next save. Anything else (code, or manifest fields other than the icon
-  and ``store``) was never reviewed and must not be accepted by it.
+  A save interrupted after writing, or one that failed after Git advanced,
+  leaves listing files changed but not yet accepted; the next save may carry
+  them, committed or not. Anything else (code, or manifest fields other than
+  the icon and ``store``) was never reviewed and must not be accepted by it.
   """
-  if accepted == head:
-    return False
-  changed = app_git.endpoint_diff_paths(root, accepted, head, read_only=True)
+  if not accepted:
+    return app_git.worktree_dirty(root)
+  changed = app_git.worktree_diff_paths(root, accepted)
   if changed is None:
     return True
-  manifests = [_manifest_at(root, ref) for ref in (accepted, head)]
+  if not changed:
+    return False
+  manifest_path = root / "mobius.json"
+  manifests = [
+    _manifest_from(app_git.ref_file(root, accepted, "mobius.json")),
+    _manifest_from(manifest_path.read_bytes() if manifest_path.is_file() else None),
+  ]
   # Listing saves write only PNG icons, so a code file can never pass as one.
   icons = {"icon.png"} | {
     str(manifest.get("icon") or "") for manifest in manifests
@@ -214,13 +218,13 @@ def _accepted_file(root: Path, app: models.App, rel: str) -> bytes:
   """
   _source_path(root, rel)
   try:
-    content = read_accepted_file(app, rel, max_bytes=MAX_LISTING_IMAGE_BYTES)
+    content = read_accepted_file(app, rel, max_bytes=STORE_LISTING_IMAGE_MAX_BYTES)
   except CommunityPublicationError as exc:
     if exc.code == "payload_too_large":
       raise ListingEditError(
         "listing_image_too_large",
         f"The image {rel} is larger than "
-        f"{MAX_LISTING_IMAGE_BYTES // (1024 * 1024)} MB.",
+        f"{STORE_LISTING_IMAGE_MAX_BYTES // (1024 * 1024)} MB.",
       ) from exc
     raise ListingEditError(exc.code, exc.detail, exc.status_code) from exc
   if content is None:
@@ -232,32 +236,10 @@ def _accepted_file(root: Path, app: models.App, rel: str) -> bytes:
 
 
 def _image_suffix(content: bytes, what: str) -> str:
-  if not content or len(content) > MAX_LISTING_IMAGE_BYTES:
-    raise ListingEditError(
-      "listing_image_too_large",
-      f"The {what} must be an image of at most "
-      f"{MAX_LISTING_IMAGE_BYTES // (1024 * 1024)} MB.",
-    )
   try:
-    with warnings.catch_warnings():
-      warnings.simplefilter("error", Image.DecompressionBombWarning)
-      image = Image.open(io.BytesIO(content))
-      width, height = image.size
-      image.verify()
-  except Exception as exc:
-    raise ListingEditError(
-      "listing_image_invalid", f"The {what} is not a readable image.",
-    ) from exc
-  suffix = _IMAGE_SUFFIXES.get(str(image.format or ""))
-  if suffix is None:
-    raise ListingEditError(
-      "listing_image_invalid", f"Use a PNG, JPEG, or WebP file for the {what}.",
-    )
-  if max(width, height) > MAX_LISTING_IMAGE_DIMENSION:
-    raise ListingEditError(
-      "listing_image_too_large", f"The {what} is larger than 8192 pixels.",
-    )
-  return suffix
+    return check_listing_image(content, what)
+  except CommunityPublicationError as exc:
+    raise ListingEditError(exc.code, exc.detail, exc.status_code) from exc
 
 
 def _place_art(
@@ -373,8 +355,11 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     manifest["store"] = store
     changes.write("mobius.json", _manifest_text(manifest).encode("utf-8"))
 
-    # Listing art the icon still uses is not stale.
+    # Listing art the icon still uses is not stale, and only the editor's own
+    # content-addressed files are removed.
     for stale in previous_art - _referenced_art(store) - {manifest.get("icon")}:
+      if not _EDITOR_ART.fullmatch(stale):
+        continue
       changes.delete(stale)
   except BaseException:
     changes.undo()
