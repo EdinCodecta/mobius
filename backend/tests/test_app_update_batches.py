@@ -757,19 +757,17 @@ def test_landed_rule_against_a_real_repository(tmp_path):
   subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "other", base], check=True)
   unrelated = commit("served without the update")
 
-  assert batches._reviewed_commit_landed(str(repo), reviewed, resolved) is True
-  assert batches._reviewed_commit_landed(str(repo), reviewed, reviewed) is True
-  assert batches._reviewed_commit_landed(str(repo), reviewed, unrelated) is False
-  assert batches._reviewed_commit_landed(str(repo), reviewed, base) is False
-  # A pending-update receipt means the answer is not installed yet.
-  receipt = install.pending_update_receipt_file(repo)
-  receipt.parent.mkdir(parents=True)
-  receipt.write_text("{}")
-  assert batches._reviewed_commit_landed(str(repo), reviewed, resolved) is False
+  assert batches._reviewed_commit_landed(str(repo), 1, reviewed, resolved) is True
+  assert batches._reviewed_commit_landed(str(repo), 1, reviewed, reviewed) is True
+  assert batches._reviewed_commit_landed(str(repo), 1, reviewed, unrelated) is False
+  assert batches._reviewed_commit_landed(str(repo), 1, reviewed, base) is False
+  # A receipt naming the reviewed commit means its answer is not installed.
+  _Receipts().add(repo, 1, reviewed)
+  assert batches._reviewed_commit_landed(str(repo), 1, reviewed, resolved) is False
 
 
 def test_landed_update_with_a_leftover_pending_directory_reads_updated(tmp_path, db):
-  """Finishing deletes the receipt file first; a leftover directory is harmless."""
+  """A leftover pending directory, or a later update's receipt, is not this one's."""
   repo = tmp_path / "leftover"
   subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
 
@@ -791,8 +789,14 @@ def test_landed_update_with_a_leftover_pending_directory_reads_updated(tmp_path,
   assert install.pending_conflict_update_receipt_present(repo)
   outcome = batches._settled_outcomes({app.id: reviewed})[app.id]
   assert (outcome["status"], outcome["version"]) == ("updated", "2.0")
-  receipt.write_text("{}")  # a real receipt still means pending
-  assert batches._settled_outcomes({app.id: reviewed})[app.id]["status"] == "failed"
+  # A later update's receipt does not unseat the one that landed.
+  later = commit("later upstream")
+  _Receipts().add(repo, app.id, later)
+  outcome = batches._settled_outcomes({app.id: reviewed})[app.id]
+  assert (outcome["status"], outcome["version"]) == ("updated", "2.0")
+  # A receipt naming the reviewed commit still means pending: a conflict.
+  _Receipts().add(repo, app.id, reviewed)
+  assert batches._settled_outcomes({app.id: reviewed})[app.id]["status"] == "conflict"
 
 
 @pytest.mark.asyncio
@@ -981,3 +985,52 @@ async def test_boot_removes_temporary_files_a_crash_left(tmp_path):
   await owner.start()
   assert owner.accepting
   assert not leftover.exists()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_ends_open_progress_streams(tmp_path, app_rows, monkeypatch):
+  monkeypatch.setattr(batches, "_STOP_GRACE_SECONDS", 0.05)
+  release = asyncio.Event()
+
+  async def execute(update):
+    await release.wait()
+    return {"status": "updated"}
+
+  owner = batches.AppUpdateBatches(str(tmp_path), execute=execute)
+  await owner.start()
+  key = owner.submit(request(1), None)["id"]
+  stream = owner.snapshots(key)
+  assert (await anext(stream))["phase"] == "applying"
+  pending_frame = asyncio.ensure_future(anext(stream))
+  await asyncio.sleep(0)
+  monkeypatch.setattr(batches, "_settled_outcomes",
+    lambda reviewed: {1: {"status": "failed", "error": batches._NOT_APPLIED}})
+  await owner.stop()
+  # The stream yields at most the settled snapshot and then ends at once.
+  with pytest.raises(StopAsyncIteration):
+    while True:
+      await asyncio.wait_for(pending_frame, timeout=1)
+      pending_frame = asyncio.ensure_future(anext(stream))
+  assert not owner.listeners
+
+
+@pytest.mark.asyncio
+async def test_runtime_prunes_finished_batches_past_retention(tmp_path, app_rows):
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  await owner.start()
+  old = (datetime.now(UTC) - timedelta(days=31)).isoformat()
+  key = str(uuid4())
+  owner._save({"id": key, "created_at": old, "updates": [],
+    "entries": [{"app_id": 9, "status": "updated"}]})
+  owner.records[key]["updated_at"] = old
+  owner._save_locks[key] = asyncio.Lock()
+
+  async def execute(update):
+    return {"status": "updated"}
+
+  owner.execute = execute
+  fresh = owner.submit(request(1), None)["id"]
+  await drain(owner)
+  assert key not in owner.records and key not in owner._save_locks
+  assert not (owner.root / f"{key}.json").exists()
+  assert fresh in owner.records and fresh not in owner._save_locks

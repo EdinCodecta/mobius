@@ -107,20 +107,24 @@ async def install_reviewed_update(update: dict) -> dict:
     }
 
 
-def _reviewed_commit_landed(source_dir: str, reviewed_commit: str, source_commit: str | None) -> bool:
-  """The served revision contains the reviewed commit and no receipt is pending.
+def _reviewed_commit_landed(
+  source_dir: str, app_id: int, reviewed_commit: str, source_commit: str | None,
+) -> bool:
+  """The served revision contains the reviewed commit, which is not pending.
 
   ``main`` can hold unapplied edits, and a conflicted update records the
   reviewed commit as its upstream without serving it; only the accepted
-  ``source_commit`` is evidence. As resolve-update's "already installed"
-  rule, only the receipt FILE means pending: finishing deletes it first, and
-  a leftover pending directory or checkout is harmless.
+  ``source_commit`` is evidence. Only a receipt that names this commit means
+  it is still pending: a leftover pending directory or checkout is harmless,
+  and a receipt for a later update does not unseat an earlier one that landed.
   """
-  from app.install import pending_update_receipt_file
+  from app.install import read_pending_conflict_update_receipt
 
-  return bool(source_commit) and not pending_update_receipt_file(source_dir).is_file() and (
+  return bool(source_commit) and (
     app_git.ref_is_ancestor(source_dir, reviewed_commit, source_commit) is True
-  )
+  ) and read_pending_conflict_update_receipt(
+    source_dir, app_id=app_id, upstream_commit=reviewed_commit,
+  ) is None
 
 
 def _settled_outcomes(reviewed: dict[int, str]) -> dict[int, dict]:
@@ -156,7 +160,7 @@ def _settled_outcomes(reviewed: dict[int, str]) -> dict[int, dict]:
       continue
     source_dir, source_commit, version, resolver, resolver_commit = row
     try:
-      if _reviewed_commit_landed(source_dir, commit, source_commit):
+      if _reviewed_commit_landed(source_dir, app_id, commit, source_commit):
         outcomes[app_id] = {
           "status": "updated", "version": version, "error": "",
           "error_code": None, "retryable": False, "resolver_chat_id": None,
@@ -228,6 +232,7 @@ class AppUpdateBatches:
     self._slots: asyncio.Semaphore | None = None
     self._starting = asyncio.Lock()
     self._save_locks: dict[str, asyncio.Lock] = {}
+    self.stopping = False
 
   def _encode(self, record: dict) -> str:
     record["updated_at"] = _now()
@@ -335,13 +340,21 @@ class AppUpdateBatches:
         self._save(record)
 
   async def stop(self) -> None:
-    """Stop admitting, then cancel running entries and wait for them.
+    """Stop admitting, end progress streams, then cancel running entries.
 
     The installer settles its current pass, rolls back, and releases its locks
     only once its threads end; each entry then records its settled outcome.
+    A planned restart usually kills the process before a long install pass
+    settles; boot then settles those entries from durable state.
     """
     self.accepting = False
     self._read_failed = False
+    # Open streams must not hold the server's connection drain; the Store
+    # reconnects and reads the settled result after the restart.
+    self.stopping = True
+    for listeners in self.listeners.values():
+      for wake in listeners:
+        wake.set()
     tasks = list(self.tasks.values())
     for task in tasks:
       task.cancel()
@@ -356,6 +369,7 @@ class AppUpdateBatches:
   def submit(self, request: ReviewedUpdateBatch, db) -> dict:
     if not self.accepting:
       raise HTTPException(503, self.failure or "App updates are unavailable while the server restarts.")
+    self._prune_finished()
     key = str(request.id)
     updates = [item.model_dump() for item in request.updates]
     old = self.records.get(key)
@@ -393,8 +407,19 @@ class AppUpdateBatches:
     task.add_done_callback(lambda done: self._finished(key, done))
     return self.snapshot(key)
 
+  def _prune_finished(self) -> None:
+    """Forget finished batches past retention, as boot does."""
+    expired = (datetime.now(UTC) - _RETAIN_COMPLETE).isoformat()
+    for key, record in list(self.records.items()):
+      if record["phase"] == "complete" and record["updated_at"] < expired:
+        (self.root / f"{key}.json").unlink(missing_ok=True)
+        self.records.pop(key)
+        self._save_locks.pop(key, None)
+
   def _finished(self, key: str, task: asyncio.Task) -> None:
     self.tasks.pop(key, None)
+    # Its last save is done; a later refresh creates a fresh lock if needed.
+    self._save_locks.pop(key, None)
     if not task.cancelled() and task.exception() is not None:
       log.error("app update batch %s stopped: %s", key, task.exception())
 
@@ -468,7 +493,7 @@ class AppUpdateBatches:
           # client's next GET reports the 503.
           return
         yield snapshot
-        if snapshot["phase"] == "complete":
+        if snapshot["phase"] == "complete" or self.stopping:
           return
         try:
           await asyncio.wait_for(wake.wait(), timeout=_STREAM_KEEPALIVE_SECONDS)

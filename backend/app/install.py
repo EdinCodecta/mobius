@@ -4324,8 +4324,9 @@ async def install_requested_app(
   one path. Network transfers (``fetch_app_commit`` for a reviewed update,
   ``prepare_package`` for an install) finish before the lifecycle lock, so
   one slow package never holds up other apps' installs, updates or
-  uninstalls; the local install then runs under that lock (``fs_locks.install_uninstall_lock``
-  has the full rationale), and its passes settle before a cancellation.
+  uninstalls. The local install then runs under that lock
+  (``fs_locks.install_uninstall_lock`` has the full rationale), and its
+  passes settle before a cancellation.
   """
   prepared = None
   try:

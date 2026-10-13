@@ -1,6 +1,7 @@
 """Review-bound batch admission and recoverable per-app progress."""
 
 import json
+from contextlib import aclosing
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -67,8 +68,11 @@ async def batch_events(
   owner = await batches(request)
 
   async def generate():
-    async for snapshot in owner.snapshots(str(batch_id)):
-      yield ": keepalive\n\n" if snapshot is None else f"data: {json.dumps(snapshot)}\n\n"
+    # aclosing: a disconnect closes the inner generator at once, removing
+    # its listener, rather than whenever it is garbage-collected.
+    async with aclosing(owner.snapshots(str(batch_id))) as snapshots:
+      async for snapshot in snapshots:
+        yield ": keepalive\n\n" if snapshot is None else f"data: {json.dumps(snapshot)}\n\n"
 
   # Wrap first: a guest stream copies the owner's id and token epoch now,
   # while the principal is still attached; the refresh below expires it and
