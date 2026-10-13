@@ -32,23 +32,22 @@ def _service_auth():
   return {"Authorization": f"Bearer {token}"}
 
 
-def _published_candidate(row: models.App) -> install.InstallCandidate:
+def _published_candidate(
+  row: models.App, entry_bytes: bytes | None = None,
+) -> install.InstallCandidate:
+  """The candidate a fetch of the row's package returns, as fetches build it."""
   tree = app_git.read_ref_tree(row.source_dir, row.source_commit)
   manifest = json.loads(tree["mobius.json"])
-  return install.InstallCandidate(
+  return install._new_candidate(
     manifest=manifest,
     raw_base="https://raw.githubusercontent.com/example/app/main/",
-    entry_bytes=tree[manifest["entry"]],
+    entry_bytes=entry_bytes or tree[manifest["entry"]],
     icon_processed=None,
     icon_warning=None,
     bundled_job=None,
     static_assets={},
     source_files={},
     seeds={},
-    capability_contract={},
-    capability_digest="test-capabilities",
-    candidate_digest="test-candidate",
-    source_review_digest="test-source",
   )
 
 
@@ -227,8 +226,7 @@ def test_update_app_rejects_distribution_package_that_is_not_the_accepted_revisi
     client, auth, name="Stale publication", description="test",
   )
   row = db.query(models.App).filter(models.App.id == app["id"]).one()
-  candidate = _published_candidate(row)
-  candidate = replace(candidate, entry_bytes=b"export default 'stale'\n")
+  candidate = _published_candidate(row, b"export default 'stale'\n")
 
   with patch(
     "app.install.fetch_install_candidate",

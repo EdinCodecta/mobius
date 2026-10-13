@@ -1214,7 +1214,11 @@ def test_connect_published_app_reuses_reviewed_local_row_idempotently(
     capability_contract=contract,
     capability_digest=capability_digest,
     candidate_digest="a" * 64,
-    source_review_digest="b" * 64,
+    # A fetched candidate's review digest is its package content digest.
+    source_review_digest=install.package_content_digest(
+      manifest=manifest, entry_bytes=tree["index.jsx"], icon_processed=None,
+      bundled_job=None, static_assets={}, source_files={}, seeds={},
+    ),
   )
   monkeypatch.setattr(
     github_routes, "_merged_upstream_sha", lambda *_args: landed,
@@ -1670,7 +1674,7 @@ def test_connect_published_app_rejects_package_mismatch_before_activation(
     candidate_digest="a" * 64,
     source_review_digest="b" * 64,
   )
-  package_digest = install.install_candidate_content_digest(candidate)
+  package_digest = candidate.source_review_digest
   expected = {
     "manifest_id": "mismatch",
     "package_digest": package_digest,
@@ -1853,17 +1857,13 @@ def test_connect_published_app_rejects_full_handoff_drift_after_install(
       f"app-concurrent-publication/{reviewed_head}/"
     ),
     candidate_digest="4" * 64,
+    source_review_digest=original_spec.package_digest,
   )
 
   async def fetch_candidate(_url):
     return candidate
 
   monkeypatch.setattr(install, "fetch_install_candidate", fetch_candidate)
-  monkeypatch.setattr(
-    install,
-    "install_candidate_content_digest",
-    lambda _candidate: original_spec.package_digest,
-  )
   installs = []
 
   async def install_and_drift(db, **_kwargs):

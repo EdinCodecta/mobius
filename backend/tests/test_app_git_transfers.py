@@ -1012,6 +1012,8 @@ def test_permanent_fetch_failures_are_not_retryable(
   assert failed.status_code == 409, failed.text
   assert failed.json()["detail"]["code"] == "git_install_unavailable"
   assert failed.json()["detail"]["retryable"] is False
+  # A permanent failure never tells the owner to retry.
+  assert "retry" not in failed.json()["detail"]["message"].lower()
   assert _no_leftovers()
 
 

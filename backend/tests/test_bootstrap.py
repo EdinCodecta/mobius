@@ -646,11 +646,11 @@ async def test_bootstrap_recognizes_skills_row_installed_at_other_ref(
   earlier release's fixed commit is the SAME app (identity is the repo, not the
   ref) — bootstrap must recognize it and never reinstall a duplicate."""
   monkeypatch.delenv("MOEBIUS_SKIP_BOOTSTRAP", raising=False)
-  from app.install import _canonical_identity_key, _trusted_catalog_repo_base
+  from app.install import _canonical_identity_key, _trusted_catalog_origin_url
 
-  assert _trusted_catalog_repo_base(BOOTSTRAP_SKILLS_MANIFEST_URL) == (
-    "https://raw.githubusercontent.com/mobius-os/app-skills"
-  )
+  assert _trusted_catalog_origin_url(BOOTSTRAP_SKILLS_MANIFEST_URL) == (
+    _trusted_catalog_origin_url(_SKILLS_COMMIT_MANIFEST)
+  ) == "https://github.com/mobius-os/app-skills.git"
   db.add(models.App(
     source_dir="/tmp/mobius-tests/skills",
     id=50, name="Skills", slug="skills",
