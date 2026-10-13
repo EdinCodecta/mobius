@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
-from math import ceil
+from math import ceil, floor
 from time import monotonic
 from urllib.parse import urljoin, urlparse
 from urllib.request import parse_http_list
@@ -63,6 +63,10 @@ _proxy_clients = PinnedHostClientPool()
 
 # Browser freshness the owner proxy will grant at most, whatever upstream says.
 _PROXY_MAX_BROWSER_AGE = 24 * 60 * 60
+# Float slack when turning a monotonic deadline back into whole seconds:
+# (now + 60) - now can come out as 59.99999999999999, which would otherwise
+# lose a whole second of freshness. Real hop time is far larger than this.
+_FRESHNESS_FLOAT_SLACK = 1e-6
 
 ResponseCacheHeaders = Callable[[httpx.Response, float], dict[str, str]]
 
@@ -198,7 +202,10 @@ class _PrivateBrowserCacheHeaders:
     if self.no_store:
       return {"cache-control": "no-store"}
     # Round down so time spent following later hops is never granted again.
-    max_age = int(self.fresh_until - now) if self.fresh_until is not None else 0
+    max_age = (
+      floor(self.fresh_until - now + _FRESHNESS_FLOAT_SLACK)
+      if self.fresh_until is not None else 0
+    )
     cache_control = (
       "private, no-cache" if self.no_cache or max_age <= 0
       else f"private, max-age={max_age}"
