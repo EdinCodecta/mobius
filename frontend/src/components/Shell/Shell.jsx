@@ -12,6 +12,11 @@ import {
   SettingsNavIcon,
 } from '../navigationIcons.js'
 import Drawer from '../Drawer/Drawer.jsx'
+import {
+  copyChatSettings as copyNewChatSettings,
+  withCopiedSettings,
+  startChatFromCommand as startNewChatFromCommand,
+} from './newChatCommand.js'
 import AppCanvas from '../AppCanvas/AppCanvas.jsx'
 import NotificationCenter from '../NotificationBell/NotificationCenter.jsx'
 import {
@@ -985,6 +990,13 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // per-render function declaration with volatile inputs — chats, streaming,
   // online — that would churn any callback listing it as a dep).
   const newChatRef = useRef(null)
+  // Chat panes are memoized on prop identity (paneChatProps.js), so they get
+  // one stable `/new` handler that calls this render's closure.
+  const startChatFromCommandRef = useRef(null)
+  const handleNewChatCommand = useCallback(
+    options => startChatFromCommandRef.current?.(options) ?? Promise.resolve(false),
+    [],
+  )
   // Latest-materialize ref so the deferred-New-Chat watcher (stable deps) runs this
   // render's live closure without depending on the function's identity (round 4 item 3).
   const materializeNewChatHomeRef = useRef(null)
@@ -1647,13 +1659,21 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     })
   }
 
-  async function createProjectChat(project, { title = 'New chat', prompt = null } = {}) {
+  async function createProjectChat(project, {
+    title = 'New chat', prompt = null, autoSend = false, settings = null,
+  } = {}) {
     if (!project?.id) return null
     const response = await api.projects.createChat(project.id, {
       title,
       recovery_request_id: crypto.randomUUID(),
     })
-    const chat = await jsonOrThrow(response, 'Project chat creation failed:')
+    const created = await jsonOrThrow(response, 'Project chat creation failed:')
+    // The copy lands before the chat opens, so an auto-sent first message
+    // already runs on the copied model, and every cache below holds the chat
+    // as the copy saved it rather than the pre-copy creation record.
+    const copy = await copyChatSettings(created.id, settings)
+    const chat = withCopiedSettings(created, copy.saved)
+    const sendsPrompt = !!prompt && autoSend && copy.ok
     knownExistingOffListChatIdsRef.current.add(String(chat.id))
     queryClient.setQueryData(projectQueries.keys.chats(project.id), current => [
       chat,
@@ -1674,12 +1694,45 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           : row)
         : current
     ))
+    // A staged auto-send is read by the chat as it opens, so stage it first.
+    if (sendsPrompt) stageComposerHandoff(chat.id, prompt, { autoSend: true })
     openProjectChat(project, chat)
-    if (prompt) {
+    if (prompt && !sendsPrompt) {
       stageComposerHandoff(chat.id, prompt, { autoSend: false })
       requestComposer(chat.id, { draft: prompt })
     }
     return chat
+  }
+
+  // `/new` and `/clear` (newChatCommand.js): the dependencies its two steps
+  // use, read from this render.
+  function newChatCommandDeps() {
+    return {
+      updateChat: (chatId, body) => api.chats.update(chatId, body),
+      // A created chat's first paint reads the detail cache seeded from the
+      // create response; show the copied model there, not the default.
+      onSaved: (chatId, saved) => queryClient.setQueryData(
+        chatMessagesQueryKey(chatId),
+        current => (current?.chatInfo
+          ? { ...current, chatInfo: withCopiedSettings(current.chatInfo, saved) }
+          : current),
+      ),
+      notify: notifyShell,
+      recordError: (where, error) => recordClientError({ where, error }),
+      findProject: projectId => projectsRef.current.find(
+        row => String(row.id) === String(projectId),
+      ) || null,
+      createProjectChat,
+      newChat,
+    }
+  }
+
+  function copyChatSettings(chatId, settings) {
+    return copyNewChatSettings(newChatCommandDeps(), chatId, settings)
+  }
+
+  function startChatFromCommand(options) {
+    return startNewChatFromCommand(newChatCommandDeps(), options)
   }
 
   async function createProjectFromTemplate(template) {
@@ -4129,7 +4182,8 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // bootstrap) have no live typing surface to preserve. Owner-facing New Chat
   // actions must use startUserChat(), which mounts the final-UUID composer
   // synchronously before allocation begins.
-  async function newChat({ draft, forceNew, autoSend, recordHistory } = {}) {
+  // Resolves the chat id it opened, or null when no chat could be started.
+  async function newChat({ draft, forceNew, autoSend, recordHistory, settings } = {}) {
     let resolution
     try {
       resolution = await resolveNewChatId()
@@ -4144,8 +4198,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       if (reason === 'offline') notifyShell("You're offline.")
       else if (reason === 'error') notifyShell("Couldn't start a new chat — please try again.", { variant: 'error' })
       closeDrawer()
-      return
+      return null
     }
+    const { ok: settingsCopied } = await copyChatSettings(chatId, settings)
 
     const changesRoute = activeViewRef.current !== 'chat'
       || String(activeChatIdRef.current) !== String(chatId)
@@ -4154,7 +4209,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     const suppliedDraft = draft ? String(draft) : ''
     if (suppliedDraft) {
       stageComposerHandoff(chatId, suppliedDraft, {
-        autoSend: !!autoSend,
+        autoSend: !!autoSend && settingsCopied,
       })
     }
     // Keep history writes inside useNavigation so the entry gets its route,
@@ -4170,6 +4225,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       const ws = workspaceStateRef.current.ws
       applyModeDestination({ view: 'chat', chatId, appId: null, paneId: ws.focusedPaneId })
     }
+    return chatId
   }
 
   // Single screen owns one compose surface; Builder treats New chat as an
@@ -4224,6 +4280,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // Keep the latest-newChat ref current so handleAppError's crash-report
   // fallback starts a chat with this render's live closure.
   newChatRef.current = newChat
+  startChatFromCommandRef.current = startChatFromCommand
   // Keep the latest-materialize ref current so the watcher effect (stable deps) always
   // runs this render's live closure without depending on the function's identity.
   materializeNewChatHomeRef.current = materializeNewChatHome
@@ -5091,6 +5148,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 newChatSession={newChatSession}
                 onNewChatSubmit={queueDraftFirstNewChat}
                 onNewChatRetry={retryDraftFirstNewChat}
+                onNewChatCommand={handleNewChatCommand}
                 artifactsAppId={artifactsAppId}
                 // Runtime activity and painting are independent during a handoff:
                 // staging owns the work while held remains the visual cover.

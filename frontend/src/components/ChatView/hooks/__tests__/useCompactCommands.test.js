@@ -82,6 +82,20 @@ test('resolved compact POST releases busy and admission while optional status GE
   assert.equal(posts.length, 2, 'readback never auto-continues')
 })
 
+test('a completed compaction reports its chat so cached context sizes drop', async t => {
+  const compacted = []
+  const { hook, posts } = setup(t, { onCompacted: chatId => compacted.push(chatId) })
+  const action = hook.result.current.runCompactCommand()
+  posts[0].resolve(response({ ok: true, progress: { state: 'completed' } }))
+  await action
+  assert.deepEqual(compacted, ['a'], 'the /context parts cache is invalidated once')
+  // A failed compaction changed nothing, so the cached breakdown stands.
+  const failed = hook.result.current.runCompactCommand()
+  posts[1].reject(new Error('compaction unavailable'))
+  await failed
+  assert.deepEqual(compacted, ['a'])
+})
+
 test('Pause POST releases its admission latch independently of deferred and failed status GETs', async t => {
   const { hook, reads, stops, failures } = setup(t)
   const first = hook.result.current.stopCompactCommand()

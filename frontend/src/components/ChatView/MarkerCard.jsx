@@ -13,9 +13,10 @@ import { preserveTogglePosition } from './preserveTogglePosition.js'
 //
 // `children` is the optional collapsible body. With children the header is a
 // real toggle button; with none the card is a static labeled divider (no
-// chevron, non-interactive header).
-export default function MarkerCard({ icon, title, subtitle, children }) {
-  const [open, setOpen] = useState(false)
+// chevron, non-interactive header). `defaultOpen` shows the body first, for a
+// marker whose body is the point (an added side question's answer).
+export default function MarkerCard({ icon, title, subtitle, children, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen)
   const headerRef = useRef(null)
   const collapsible = !!children
   const cls = 'chat__marker' + (open ? ' chat__marker--open' : '')

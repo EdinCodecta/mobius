@@ -63,6 +63,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app import chat_archive, models, schemas, transcript_rows
 from app.goals import admit_goal
 from app.chat_titles import apply_generated_title, first_message_title
+from app.continuations import SIDE_QUESTION_MESSAGE_KIND
 from app.json_safety import json_safe
 from app.upload_lifecycle import claim_uploads, release_uploads
 from app.events import (
@@ -443,8 +444,9 @@ class AcknowledgeProviderSuccess(_Command):
   Provider admission is intentionally earlier: it prevents ambiguous replay
   of an execution attempt. It is not proof that the provider accepted the
   prompt. This later acknowledgement both heals an older provider-limit signal
-  and records what the provider received — the peer-note cursor and the Wait
-  results the turn carried — in the same writer-owned transaction.
+  and records what the provider received — the peer-note cursor, the Wait
+  results and the added side questions the turn carried — in the same
+  writer-owned transaction.
   """
 
   chat_id: str = ""
@@ -452,6 +454,8 @@ class AcknowledgeProviderSuccess(_Command):
   peer_message_through_created_at: datetime | None = None
   peer_message_through_id: str | None = None
   wait_results: tuple[str, ...] = ()
+  # cids of the added /btw side questions this turn's prompt carried.
+  side_question_cids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -993,6 +997,27 @@ class AppendSteeredUserMessage(_Command):
   user_msg: dict = field(default_factory=dict)
   user_msgs: list[dict] = field(default_factory=list)
   consume_pending_cids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AppendSideQuestion(_Command):
+  """Add an owner-kept ``/btw`` answer to the transcript without a turn.
+
+  The row is context for the agent, not a request: it never enters the
+  pending queue, so it cannot start a turn or join a queued batch, and it may
+  land while a turn runs (above that turn's reply). It is refused while an
+  owner question card is open, because that card must stay the transcript's
+  tail to remain answerable. ``cid`` makes a retried add return the stored
+  row. The agent receives the row once, on its next successful turn
+  (``transcript_rows.owed_side_questions`` and AcknowledgeProviderSuccess).
+  Returns ``{"status": "stored", "stored": row}`` or a ``conflict``.
+  """
+
+  chat_id: str = ""
+  cid: str = ""
+  question: str = ""
+  answer: str = ""
+  provider: str = ""
 
 
 @dataclass
@@ -2208,6 +2233,8 @@ class ChatWriterActor:
       return self._append_pending(db, cmd)
     if isinstance(cmd, AppendSteeredUserMessage):
       return self._append_steered_user_message(db, cmd)
+    if isinstance(cmd, AppendSideQuestion):
+      return self._append_side_question(db, cmd)
     if isinstance(cmd, BeginNoteRecovery):
       return self._begin_note_recovery(db, cmd)
     if isinstance(cmd, PersistCompaction):
@@ -2873,8 +2900,68 @@ class ChatWriterActor:
     )
     from app.chat_waits import stage_wait_results_delivered
     stage_wait_results_delivered(db, cmd.chat_id, cmd.wait_results)
+    self._stage_side_questions_delivered(db, cmd.chat_id, cmd.side_question_cids)
     if not _commit_or_rollback(db):
       raise _PersistFailed("AcknowledgeProviderSuccess did not persist")
+
+  def _stage_side_questions_delivered(
+    self, db, chat_id: str, cids: tuple[str, ...],
+  ) -> None:
+    """Record, in the ack's transaction, that the agent got these answers."""
+    if not cids:
+      return
+    chat = _active_chat(db, chat_id)
+    if chat is None:
+      return
+    for cid in cids:
+      seq = transcript_rows.client_message_seq(db, chat, cid)
+      if seq is None:
+        continue
+      body = transcript_rows.at(db, chat, seq)
+      if (
+        isinstance(body, dict)
+        and body.get("kind") == SIDE_QUESTION_MESSAGE_KIND
+        and body.get("delivered_to_agent") is not True
+      ):
+        transcript_rows.update_at(
+          db, chat, seq, {**body, "delivered_to_agent": True},
+        )
+
+  def _append_side_question(self, db, cmd: AppendSideQuestion) -> dict:
+    """Append one kept side question; see AppendSideQuestion."""
+    from datetime import UTC, datetime
+
+    if not cmd.cid or not cmd.question.strip() or not cmd.answer.strip():
+      raise _PersistFailed("AppendSideQuestion needs a cid, question and answer")
+    chat = _active_chat(db, cmd.chat_id)
+    if chat is None:
+      raise _PersistFailed("AppendSideQuestion: chat not found or deleted")
+    existing = transcript_rows.client_message_seq(db, chat, cmd.cid)
+    if existing is not None:
+      db.rollback()
+      return {"status": "stored", "stored": transcript_rows.at(db, chat, existing)}
+    if chat.pending_question_id is not None:
+      db.rollback()
+      return {"status": "conflict", "reason": "question_open"}
+    from app.side_questions import side_question_row_content
+    row = {
+      "role": "user",
+      "kind": SIDE_QUESTION_MESSAGE_KIND,
+      "content": side_question_row_content(cmd.question, cmd.answer),
+      "side_question": {
+        "question": cmd.question,
+        "answer": cmd.answer,
+        "provider": cmd.provider,
+      },
+      "delivered_to_agent": False,
+      "cid": cmd.cid,
+      "ts": _next_row_ts(db, chat, list(chat.pending_messages or [])),
+    }
+    transcript_rows.append(db, chat, row)
+    chat.updated_at = datetime.now(UTC)
+    if not _commit_or_rollback(db):
+      raise _PersistFailed("AppendSideQuestion did not persist")
+    return {"status": "stored", "stored": row}
 
   def _stage_activity_delivery_consumption(
     self, db, *, chat_id: str, run_token: str,
