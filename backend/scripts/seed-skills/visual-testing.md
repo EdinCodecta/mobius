@@ -149,9 +149,60 @@ Take fewer, purposeful captures rather than many near-identical ones.
 A timed-out `--current-page` capture cleans up its poisoned browser but cannot
 restore injected CSS or unsaved page state; prepare that state again explicitly.
 
+## Which browser runs
+
+On amd64 images agent-browser uses Chrome for Testing's **headless shell** by
+default: Chrome's rendering engine without the full browser, light enough for
+a 1 GB server. It covers the screenshot tool, app frames, snapshots, clicks,
+scripts, PDF output, offline mode, and tabs. arm64 images use Debian's
+Chromium instead.
+
+Full Chrome stays installed for what only it does: browser extensions and
+full-browser features such as its built-in PDF viewer. It needs roughly
+500 MB on top of the server and agents, so check the container limit first
+with `cat /sys/fs/cgroup/memory.max` (`max` means unlimited). **Below 2 GiB
+(2147483648), do not start it:** it thrashes memory, times out, and slows
+every other chat. Tell the owner plainly that the task needs full Chrome,
+how much memory their server has, that full Chrome needs about 500 MB of it,
+and that raising the server's memory to 2 GB would make it possible. Keep
+using the default browser for everything else. If the owner still asks you
+to try, warn once, then proceed.
+
+This recipe is for amd64 only: arm64 images have no separate full Chrome,
+and their default Chromium already is the full browser. Use full Chrome
+in its own session with a throwaway profile named after that session, so the
+default session keeps its identity and no other session shares the profile.
+Shell state does not carry between commands, so start every command that uses
+full Chrome, including the cleanup, with these definitions. They always
+resolve to the same session and profile, and stop with an error if a value is
+missing:
+
+```bash
+FULL_CHROME="$(ls -d /opt/agent-browser/browsers/chrome-*/chrome | head -n 1)"
+FULL_SESSION="${AGENT_BROWSER_SESSION:?}-full"
+FULL_PROFILE="${TMPDIR:?}/agent-browser-$FULL_SESSION"
+full() {
+  AGENT_BROWSER_SESSION="$FULL_SESSION" \
+  AGENT_BROWSER_PROFILE="$FULL_PROFILE" \
+  AGENT_BROWSER_EXECUTABLE_PATH="${FULL_CHROME:?}" agent-browser "$@"
+}
+```
+
+Then use it, for example `full open <url>`. When done, close it, confirm
+nothing still uses the profile, then delete the profile (after the same
+definitions):
+
+```bash
+full close
+python3 "$SCRIPTS_DIR/agent_browser_session_reset.py" "${FULL_PROFILE:?}" && rm -rf "$FULL_PROFILE"
+```
+
+If `full close` hangs, stop it and run only the reset line. If the reset
+fails, leave the profile in place and name its path for the next agent.
+
 ## Close the browser session when you are done
 
-`agent-browser` leaves a full Chrome tree alive after the turn. Close the
+`agent-browser` leaves its browser process tree alive after the turn. Close the
 session in the same turn you finish visual work; do not retain it in case of a
 follow-up. If it cannot close cleanly, name the profile
 (`/data/agent-browser-profiles/chat-<chat-id>`) for the next agent. When graceful close fails, use

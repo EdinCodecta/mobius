@@ -5106,13 +5106,14 @@ _MEMORY_RECLAIM_DISPOSITIONS = frozenset({
 async def _acknowledge_provider_success(
   *, chat_id: str, run_token: str, delivered_through,
   wait_results: tuple[str, ...] = (),
+  side_question_cids: tuple[str, ...] = (),
 ) -> None:
   """Best-effort provider-success and delivery acknowledgement.
 
   A failed acknowledgement conservatively leaves provider availability limited
-  and repeats an already-seen peer note or Wait result on a later turn; it
-  never records success before the provider call has actually returned
-  successfully.
+  and repeats an already-seen peer note, Wait result or added side question
+  on a later turn; it never records success before the provider call has
+  actually returned successfully.
   """
   if not chat_id or not run_token:
     return
@@ -5127,6 +5128,7 @@ async def _acknowledge_provider_success(
         delivered_through.message_id if delivered_through is not None else None
       ),
       wait_results=wait_results,
+      side_question_cids=side_question_cids,
     )))
     if wait_results:
       from app.chat_waits import (
@@ -5735,6 +5737,28 @@ async def _run_chat_impl_with_db(
     if waits_context:
       user_message = f"{waits_context}\n\n{user_message}"
 
+  # Side questions the owner added to the chat ("/btw", then Add to chat)
+  # reach the agent once: on this turn, recorded delivered only when the
+  # provider call succeeds (AcknowledgeProviderSuccess), like Wait results.
+  side_question_cids: tuple[str, ...] = ()
+  if run_policy is None and chat_row is not None:
+    from app.side_questions import owed_side_questions_context
+    try:
+      owed_side_rows = [
+        body for _seq, body in transcript_rows.owed_side_questions(db, chat_row)
+        if isinstance(body, dict) and isinstance(body.get("cid"), str)
+      ]
+    except Exception:
+      # Advisory context: an unreadable row must not cost the owner's turn.
+      # The answers stay owed and ride the next turn instead.
+      log.exception("owed side questions unreadable chat_id=%s", chat_id)
+      owed_side_rows = []
+    if owed_side_rows:
+      user_message = (
+        f"{owed_side_questions_context(owed_side_rows)}\n\n{user_message}"
+      )
+      side_question_cids = tuple(body["cid"] for body in owed_side_rows)
+
   goal_brief_refresh = None
   if chat_id:
     from app.goals import compaction_brief_refresh, turn_goal_brief
@@ -6215,6 +6239,7 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
+          side_question_cids=side_question_cids,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(
@@ -6410,6 +6435,7 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
+          side_question_cids=side_question_cids,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(

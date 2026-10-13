@@ -13,6 +13,7 @@ const COMPACTION_PROGRESS_TIMEOUT_MS = 15000
 export default function useCompactCommands({
   chatId, provisionalNewChat, hidden, serverCompactingKind,
   activationSettledRef, inputValueRef, setComposerInput, setSendFailure, fetchMessages, stopTurn,
+  onCompacted,
 }) {
   // A "/compact" submission is a chat action, not a turn: it rewrites the live
   // context instead of asking the model anything. Compact and Pause belong to
@@ -145,6 +146,9 @@ export default function useCompactCommands({
         setCompactProgressRecord({ chatId: targetChatId, progress: result.progress || null })
       }
       if (result.ok) {
+        // The compaction rewrote what the context holds: a cached /context
+        // breakdown must not survive it, whichever pane shows this chat.
+        onCompacted?.(targetChatId)
         if (ownerDraft && stillVisible() && isOwnerWorkspace()
           && composerDraftRevision(targetChatId) === ownerDraft.revision
           && inputValueRef.current === ownerDraft.text) setComposerInput('')

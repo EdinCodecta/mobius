@@ -267,7 +267,7 @@ test('multiple questions read as one compact decision panel', () => {
 
 test('a failed question submission does not append a transcript row', () => {
   const start = chatView.indexOf('const doSendSilent = useCallback')
-  const end = chatView.indexOf('function handleSubmit(e)', start)
+  const end = chatView.indexOf('function handleSubmit(e', start)
   assert.ok(start >= 0 && end > start, 'doSendSilent source should be present')
   const silentSubmit = chatView.slice(start, end)
   assert.doesNotMatch(
@@ -294,7 +294,7 @@ test('a failed question submission does not append a transcript row', () => {
 
 test('question submission paints a resumed turn only after the POST commits', () => {
   const start = chatView.indexOf('const doSendSilent = useCallback')
-  const end = chatView.indexOf('function handleSubmit(e)', start)
+  const end = chatView.indexOf('function handleSubmit(e', start)
   const silentSubmit = chatView.slice(start, end)
   const send = silentSubmit.indexOf('const response = await streamSend')
   const paintRunning = silentSubmit.indexOf('setServerRunningState(true)')
@@ -309,7 +309,7 @@ test('question submission paints a resumed turn only after the POST commits', ()
 
 test('question submission freezes the visible anchor before the async handoff', () => {
   const start = chatView.indexOf('const doSendSilent = useCallback')
-  const end = chatView.indexOf('function handleSubmit(e)', start)
+  const end = chatView.indexOf('function handleSubmit(e', start)
   const silentSubmit = chatView.slice(start, end)
   const freeze = silentSubmit.indexOf('freezeQuestionSubmission(questionSubmissionContext)')
   const send = silentSubmit.indexOf('const response = await streamSend')
