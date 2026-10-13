@@ -173,11 +173,7 @@ import {
   reconcileChatSearchActivation,
   subscribeChatSearchReveal,
 } from '../../lib/chatSearchReveal.js'
-import {
-  chatQuestionRevealFor,
-  consumeChatQuestionReveal, questionRevealElement,
-  subscribeChatQuestionReveal,
-} from '../../lib/chatQuestionReveal.js'
+import { useChatQuestionActivation, useChatQuestionReveal } from './hooks/useChatQuestionReveal.js'
 import {
   highlightSearchTerms,
 } from '../../lib/searchTermHighlight.js'
@@ -435,8 +431,6 @@ export default function ChatView({
   onDisplayReady = null,
   artifactsAppId = null,
   onOpenArtifact = null,
-  focusPendingQuestion = false,
-  focusQuestionId = null,
 }) {
   const queryClient = useQueryClient()
   const provisionalNewChat = !!newChatSession && !newChatSession.materialized
@@ -470,19 +464,10 @@ export default function ChatView({
   const searchRevealConsumed = searchActivationRef.current.consumedId === searchReveal?.id
   const searchRevealCleanupRef = useRef(() => {})
   useEffect(() => () => searchRevealCleanupRef.current(), [])
-  const [, setQuestionRevealVersion] = useState(0)
-  useEffect(() => subscribeChatQuestionReveal(chatId, () => {
-    setQuestionRevealVersion(version => version + 1)
-  }), [chatId])
-  const questionReveal = chatQuestionRevealFor(chatId)
-  const decisionActivationRef = useRef({ chatId, questionId: focusQuestionId, requestId: null })
-  if (decisionActivationRef.current.chatId !== chatId) {
-    decisionActivationRef.current = { chatId, questionId: focusQuestionId, requestId: null }
-  }
-  if (questionReveal && decisionActivationRef.current.requestId !== questionReveal.id) {
-    decisionActivationRef.current = { chatId, questionId: questionReveal.questionId || null, requestId: questionReveal.id }
-  }
-  const decisionQuestionId = decisionActivationRef.current.questionId
+  const questionActivation = useChatQuestionActivation({
+    chatId, hidden, searchRevealId: searchReveal?.id,
+  })
+  const decisionQuestionId = questionActivation.reveal?.questionId
   const decisionAnchorKey = decisionQuestionId ? `question:${decisionQuestionId}` : null
   const inputRef = useRef(null)
   const handleInternalNav = useCallback((url) => {
@@ -5660,22 +5645,11 @@ export default function ChatView({
     scrollRef, hasPendingResume, resumeCardEl,
   )
   const questionNudgeShown = hasPendingQuestion && pendingCardOffscreen
-  const questionRevealConsumedRef = useRef(null)
-  useLayoutEffect(() => {
-    const requestId = questionReveal?.id ?? (focusPendingQuestion ? 'deep-link' : null)
-    if (!requestId || questionRevealConsumedRef.current === requestId) return
-    if (decisionQuestionId && !displayReady) return
-    // Exact-card navigation may target an answered historical card. Never
-    // redirect that request to whichever newer question is pending now.
-    const exact = decisionQuestionId ? questionRevealElement(scrollRef.current, decisionQuestionId, null) : null
-    if (decisionQuestionId ? !exact : (!hasPendingQuestion || !pendingQuestionEl)) return
-    questionRevealConsumedRef.current = requestId
-    if (exact) {
-      revealPendingQuestion(exact)
-      exact.focus({ preventScroll: true })
-    } else revealPendingQuestion(pendingQuestionEl)
-    if (questionReveal?.id != null) consumeChatQuestionReveal(chatId, questionReveal.id)
-  }, [chatId, focusPendingQuestion, decisionQuestionId, hasPendingQuestion, pendingQuestionEl, questionReveal, revealPendingQuestion, messages, displayReady])
+  useChatQuestionReveal({
+    activation: questionActivation, hidden, displayReady, rootRef: scrollRef,
+    pendingElement: hasPendingQuestion ? pendingQuestionEl : null,
+    revealElement: revealPendingQuestion, contentVersion: messages,
+  })
   const resumeNudgeShown = hasPendingResume && resumeCardOffscreen
   const jumpToLatestVisible = jumpToLatestShown({
     // A send-owned PIN_USER_MSG is the expected latest-turn location, not a

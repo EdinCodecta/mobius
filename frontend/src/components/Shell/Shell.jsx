@@ -5085,10 +5085,6 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
               <PaneChatView
                 chatId={chatId}
                 paneId={paneId}
-                focusQuestionId={deepLink?.view === 'chat' && String(deepLink.chatId) === String(chatId) ? deepLink.questionId : null}
-                focusPendingQuestion={deepLink?.view === 'chat'
-                  && String(deepLink.chatId) === String(chatId)
-                  && deepLink.focusQuestion === true}
                 newChatSession={newChatSession}
                 onNewChatSubmit={queueDraftFirstNewChat}
                 onNewChatRetry={retryDraftFirstNewChat}

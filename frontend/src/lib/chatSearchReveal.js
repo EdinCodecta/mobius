@@ -1,3 +1,5 @@
+import { chatQuestionRevealFor, consumeChatQuestionReveal } from './chatQuestionReveal.js'
+
 // A drawer result is navigation plus one short-lived instruction for the
 // transcript already mounted for that chat. Keep it out of URL/state
 // persistence: a search jump must not replace the owner's saved reading
@@ -39,6 +41,10 @@ export function consumeChatSearchActivation(current, revealId) {
 export function requestChatSearchReveal(chatId, { anchorKey, terms } = {}) {
   const id = String(chatId || '')
   if (!id || typeof anchorKey !== 'string' || !anchorKey) return null
+  // New explicit navigation supersedes an unconsumed card jump, including
+  // while all retained physical views are hidden.
+  const question = chatQuestionRevealFor(id)
+  if (question) consumeChatQuestionReveal(id, question.id)
   clearTimeout(expiryTimers.get(id))
   const reveal = {
     id: ++serial,
