@@ -1,7 +1,7 @@
 """Stored app identities and their bound manifest fetch addresses."""
 
 from dataclasses import dataclass
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 MANIFEST_ID_MARKER = "#manifest-id="
 RAW_GITHUB_HOST = "raw.githubusercontent.com"
@@ -31,8 +31,15 @@ class RootManifest:
 
   @property
   def url(self) -> str:
-    """The raw address: the manifest file, or the package base with a slash."""
-    base = f"https://{RAW_GITHUB_HOST}/{self.owner}/{self.repo}/{self.ref}/"
+    """The raw address: the manifest file, or the package base with a slash.
+
+    Segments are re-encoded, since ``parse_root_manifest`` decoded them: a
+    ref ``fix#1`` must stay one path segment, not become a fragment.
+    """
+    segments = (self.owner, self.repo, self.ref)
+    base = f"https://{RAW_GITHUB_HOST}/" + "".join(
+      f"{quote(segment, safe='')}/" for segment in segments
+    )
     return base + (self.filename or "")
 
 

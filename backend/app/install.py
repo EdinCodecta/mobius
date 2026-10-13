@@ -108,34 +108,18 @@ from app.net_utils import (
   validate_url_safe as _validate_url_safe,
 )
 from app.storage_io import atomic_write
-# Moved to `app_skills`; re-exported for callers and tests that use them
-# through this module.
-from app.app_skills import (
-  _sync_app_skills as _sync_app_skills,
-  deactivate_app_skills as deactivate_app_skills,
-  purge_app_skills as purge_app_skills,
-  restore_app_skills as restore_app_skills,
-)
-# Moved to `git_transfers`; re-exported for callers and tests that use them
-# (or patch them) through this module.
+# Moved out of this module and imported by name: tests patch `_stage`,
+# `fetch_app_commit`, `_sync_app_skills` and `clear_pending_conflict_update`
+# here to reach the install path, and routes call `fetch_app_commit` and
+# apply calls `_sync_app_skills` through this module for the same reason.
+from app.app_skills import _sync_app_skills
 from app.git_transfers import (
-  _stage as _stage,
-  discard_staged as discard_staged,
-  fetch_app_commit as fetch_app_commit,
-  git_transfer_root as git_transfer_root,
+  _stage, discard_staged, fetch_app_commit, git_transfer_root,
 )
-# Moved to `pending_update`; re-exported for callers and tests that use them
-# through this module.
 from app.pending_update import (
-  clear_pending_conflict_update as clear_pending_conflict_update,
-  committed_conflict_marker_paths as committed_conflict_marker_paths,
-  committed_pending_resolution as committed_pending_resolution,
-  pending_conflict_update_receipt_present as pending_conflict_update_receipt_present,
-  pending_update_receipt_file as pending_update_receipt_file,
-  pending_update_resolved as pending_update_resolved,
-  pending_update_worktree as pending_update_worktree,
-  read_pending_conflict_update_receipt as read_pending_conflict_update_receipt,
-  stage_pending_conflict_update as stage_pending_conflict_update,
+  clear_pending_conflict_update,
+  committed_pending_resolution,
+  stage_pending_conflict_update,
 )
 from app.terminal_output import strip_terminal_noise
 from app.app_identity import (
@@ -2387,7 +2371,8 @@ async def prepare_package(
 def _read_staged_manifest(staged: app_git.Staged) -> dict | None:
   """The staged commit's bounded, valid root manifest, or None.
 
-  None defers to the full package read, which reports why it is unusable.
+  None when it is absent, oversized or invalid, or when Git could not read
+  it; the full package read then reports which.
   """
   raw = app_git.read_committed_file(
     staged.path, staged.sha, "mobius.json", max_bytes=_MANIFEST_MAX_BYTES,
@@ -2400,6 +2385,46 @@ def _read_staged_manifest(staged: app_git.Staged) -> dict | None:
     return None
 
 
+async def _staged_package_identity(
+  manifest: dict, manifest_url: str, source_url: str, db: Session | None,
+) -> dict[str, str | None]:
+  """Check a staged manifest's address, then resolve a permanent identity.
+
+  The address is checked before any identity request, so a package at the
+  wrong address never reaches the network.
+  """
+  validate_manifest_address(manifest, manifest_url, db=db)
+  if db is not None:
+    db.rollback()
+  if not manifest.get("package_id"):
+    return {}
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
+    source_identity, predecessor, canonical = await _resolve_package_identity(
+      cli, manifest, source_url,
+    )
+  return dict(
+    source_identity=source_identity,
+    predecessor_source_identity=predecessor,
+    canonical_source_url=canonical,
+  )
+
+
+async def _read_staged_candidate(
+  staged: app_git.Staged, source_url: str, identity: dict[str, str | None],
+) -> InstallCandidate:
+  try:
+    return (await asyncio.to_thread(functools.partial(
+      read_git_install_candidate, staged.path, staged.sha, source_url,
+      **identity,
+    ))).candidate
+  except PackageTooLarge as exc:
+    raise HTTPException(
+      413, detail={"code": "package_too_large", "message": str(exc)},
+    ) from exc
+  except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+    raise HTTPException(422, f"The app's Git package is unusable: {exc}") from exc
+
+
 async def _staged_clone_candidate(
   manifest_url: str, staged: app_git.Staged, *, db: Session | None,
 ) -> InstallCandidate:
@@ -2410,37 +2435,21 @@ async def _staged_clone_candidate(
   """
   source_url = requested_manifest_source(manifest_url)[0]
   manifest = await asyncio.to_thread(_read_staged_manifest, staged)
-  identity: dict[str, str | None] = {}
-  if manifest is not None:
-    validate_manifest_address(manifest, manifest_url, db=db)
-    if db is not None:
-      db.rollback()
-    if manifest.get("package_id"):
-      async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
-        source_identity, predecessor, canonical = (
-          await _resolve_package_identity(cli, manifest, source_url)
-        )
-      identity = dict(
-        source_identity=source_identity,
-        predecessor_source_identity=predecessor,
-        canonical_source_url=canonical,
-      )
-  try:
-    candidate = (await asyncio.to_thread(functools.partial(
-      read_git_install_candidate, staged.path, staged.sha, source_url,
-      **identity,
-    ))).candidate
-  except PackageTooLarge as exc:
-    raise HTTPException(
-      413, detail={"code": "package_too_large", "message": str(exc)},
-    ) from exc
-  except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-    raise HTTPException(422, f"The app's Git package is unusable: {exc}") from exc
   if manifest is None:
-    # The full read accepted a manifest the bounded read could not: never
-    # bind a package to an identity it was not resolved for.
-    raise HTTPException(422, "The app's Git package manifest is unreadable.")
-  return candidate
+    # The full read reports an absent, oversized or invalid manifest. If it
+    # accepts the package, only the bounded read failed (a transient Git read
+    # error): bind identity from the manifest the full read accepted instead.
+    candidate = await _read_staged_candidate(staged, source_url, {})
+    identity = await _staged_package_identity(
+      candidate.manifest, manifest_url, source_url, db,
+    )
+    if not identity:
+      return candidate
+  else:
+    identity = await _staged_package_identity(
+      manifest, manifest_url, source_url, db,
+    )
+  return await _read_staged_candidate(staged, source_url, identity)
 
 
 def _require_reviewed_capabilities(

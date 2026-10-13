@@ -71,6 +71,14 @@ def _forget_fetch(key: tuple[str, str, str], done: asyncio.Future) -> None:
     done.exception()  # Retrieved even when every waiting request has gone.
 
 
+class OriginMismatch(ValueError):
+  """The update source names another repository than the app's Git origin.
+
+  The transfer would read a different repository into this app's object
+  database, so it is refused before any network work.
+  """
+
+
 async def fetch_app_commit(
   source_dir: str | Path, ref: str, *, expected_origin: str | None = None,
 ) -> str:
@@ -83,6 +91,8 @@ async def fetch_app_commit(
   repo = Path(source_dir)
   url = await asyncio.to_thread(app_git.origin_url, repo)
   if expected_origin is not None and not app_git.same_origin(url, expected_origin):
+    if url is not None:
+      raise OriginMismatch("installed Git origin does not match update source")
     raise ValueError("installed Git origin does not match update source")
   present = await asyncio.to_thread(app_git.present_commit, repo, ref)
   if present is not None:

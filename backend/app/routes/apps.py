@@ -28,7 +28,7 @@ from app import chat_writer
 from app import (
   activity, app_activity, app_apply, app_badge, app_capability_acceptance,
   app_git, app_jobs, app_recency, chat_app_artifacts, chat_queue, drawer_pins, fs_locks,
-  icon_cache, models, project_git, providers, schemas,
+  git_transfers, icon_cache, models, project_git, providers, schemas,
   pending_update, settled, source_dirs, workspace_files,
 )
 from app.manifest_identity import (
@@ -607,7 +607,7 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
   get_system_broadcast().publish(
     {"type": "app_deleted", "appId": str(deleted_app_id)}
   )
-  from app.install import purge_app_skills
+  from app.app_skills import purge_app_skills
   try:
     await purge_app_skills(deleted_app_id)
   except Exception:
@@ -790,6 +790,8 @@ async def preview_app_install(
     )
   )
   source = body.manifest_url if body.manifest_url is not None else raw_base
+  # Release the request session first: the worker opens its own short one.
+  db.close()
   installed_contract = await settled.run_settled(
     _installed_contract_for_preview, manifest, source,
   )
@@ -1393,28 +1395,29 @@ def _update_candidate_rejection(
     return {"code": "identity_mismatch", "message": str(exc.detail)}
   if row_id == app_id:
     return None
-  if row_id is not None:
-    message = "This update source belongs to another installed app."
-  elif (
-    source_identity is None
-    and manifest.get("package_id")
-    and manifest.get("previous_manifest_url")
-  ):
-    # Only provider repository ids prove a permanent package's move, and this
-    # row predates them. A fresh install resolves both ids, so it would
-    # update this app rather than add another.
-    message = (
-      "This app was installed before repository identities were recorded, "
-      "so this check cannot confirm that the source's repository move keeps "
-      "it the same app. Installing it again confirms the move and updates "
-      "this app."
-    )
-  else:
-    message = (
+  return {
+    "code": "identity_mismatch",
+    "message": (
       "This update source is a different app; installing it would add a "
       "separate app."
-    )
-  return {"code": "identity_mismatch", "message": message}
+      if row_id is None else
+      "This update source belongs to another installed app."
+    ),
+  }
+
+
+# Discovery reads a candidate only from the app's own Git origin, so a Store
+# listing at another repository is reported, not fetched. Install follows a
+# move whose new repository proves it is the same app (``resolve_package_row``).
+_REPOSITORY_MOVED = {
+  "code": "repository_moved",
+  "message": (
+    "The Store lists this app at a different repository than the one it was "
+    "installed from, so its update can't be checked here. If the app moved "
+    "there, reinstalling it from the Store updates this app when the new "
+    "repository proves it is the same app; otherwise it adds a separate app."
+  ),
+}
 
 
 def _update_manifest_source(
@@ -1556,6 +1559,8 @@ async def update_check(
   )
   try:
     commit = await _fetch_update_commit(repo, fetch_manifest_url)
+  except git_transfers.OriginMismatch:
+    return _unknown(dict(_REPOSITORY_MOVED))
   except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):
     return _unknown()
   # This lock is the response's linearization point. A concurrent install
@@ -1707,6 +1712,8 @@ async def update_candidate_preview(
   )
   try:
     commit = await _fetch_update_commit(repo, fetch_manifest_url)
+  except git_transfers.OriginMismatch:
+    raise HTTPException(409, detail=dict(_REPOSITORY_MOVED)) from None
   except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
     raise install.git_source_error(
       "The installed version was left unchanged.",
@@ -3155,7 +3162,7 @@ async def delete_app(
         "App %s was deleted but its supervised jobs could not be terminated",
         app_id,
       )
-    from app.install import deactivate_app_skills
+    from app.app_skills import deactivate_app_skills
     try:
       for warning in await deactivate_app_skills(app_id):
         log.warning("uninstall: %s", warning)
@@ -3445,7 +3452,7 @@ async def recover_app(
         "App %s was recovered but cron supervision could not be reconciled",
         app_id,
       )
-    from app.install import restore_app_skills
+    from app.app_skills import restore_app_skills
     try:
       for warning in await restore_app_skills(app_id):
         log.warning("recover: %s", warning)
