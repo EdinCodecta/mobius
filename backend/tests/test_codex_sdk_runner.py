@@ -4555,70 +4555,96 @@ def test_run_codex_sdk_turn_waits_for_sdk_exit_before_reap_and_return(
   assert order == ["close", "reap"]
 
 
+class _CancelledTurnHarness:
+  """A Codex turn that blocks in its body, its teardown steps recorded."""
+
+  def __init__(self, monkeypatch):
+    self.order = []
+    self.body_ready = None
+    harness = self
+
+    class FakeAsyncCodex:
+      def __init__(self, config=None):
+        self.config = config
+        self._client = SimpleNamespace(
+          _sync=SimpleNamespace(
+            _proc=SimpleNamespace(pid=4321),
+            _approval_handler=None,
+          ),
+        )
+
+      async def __aenter__(self):
+        return self
+
+      async def __aexit__(self, _exc_type, _exc, _tb):
+        return None
+
+      async def thread_start(self, *_args, **_kwargs):
+        return await harness.thread_start()
+
+    monkeypatch.setattr(
+      codex_sdk_runner, "_sdk_imports", lambda: _fake_sdk(FakeAsyncCodex),
+    )
+    monkeypatch.setattr(codex_sdk_runner.shutil, "which", lambda name: {
+      "codex": "/usr/local/bin/codex",
+      "setsid": "/usr/bin/setsid",
+    }.get(name))
+    monkeypatch.setattr(codex_sdk_runner.os, "getpgid", lambda _pid: 4321)
+    monkeypatch.setattr(codex_sdk_runner.os, "getpgrp", lambda: 9999)
+    monkeypatch.setattr(
+      codex_sdk_runner, "_terminate_codex_processes",
+      lambda *_args: self.order.append("reap") or True,
+    )
+    monkeypatch.setattr(
+      codex_sdk_runner, "_install_codex_call_executor",
+      lambda *_args: SimpleNamespace(close=lambda: self.order.append("executor close")),
+    )
+
+  async def thread_start(self):
+    """By default the turn blocks before it has a thread."""
+    self.body_ready.set()
+    await asyncio.Future()
+
+  async def start(self, chat_id):
+    """Start the turn and return its task once its body is running."""
+    self.body_ready = asyncio.Event()
+    task = asyncio.create_task(codex_sdk_runner.run_codex_sdk_turn(
+      user_message="hello",
+      session_id=None,
+      base_env={},
+      cwd="/tmp",
+      chat_id=chat_id,
+      bc=_FakeBroadcast(),
+      pending_questions={},
+      db=None,
+    ))
+    await self.body_ready.wait()
+    return task
+
+
+@pytest.fixture
+def cancelled_turn(monkeypatch):
+  return _CancelledTurnHarness(monkeypatch)
+
+
 def test_cancelled_turn_reap_finishes_then_closes_executor_and_cancel_wins(
-  monkeypatch, caplog,
+  monkeypatch, caplog, cancelled_turn,
 ):
   """A failing reap during a cancelled turn neither skips the executor close
   nor replaces the cancellation; the cancel lands only after the reap."""
   from tests.cancel_helpers import BlockedWorker
 
-  body_ready = None
-  order = []
-
-  class FakeAsyncCodex:
-    def __init__(self, config=None):
-      self.config = config
-      self._client = SimpleNamespace(
-        _sync=SimpleNamespace(
-          _proc=SimpleNamespace(pid=4321),
-          _approval_handler=None,
-        ),
-      )
-
-    async def __aenter__(self):
-      return self
-
-    async def __aexit__(self, _exc_type, _exc, _tb):
-      return None
-
-    async def thread_start(self, *_args, **_kwargs):
-      body_ready.set()
-      await asyncio.Future()
+  order = cancelled_turn.order
 
   def reap_fails():
     order.append("reap")
     raise RuntimeError("kill failed")
 
   reap = BlockedWorker(reap_fails)
-  monkeypatch.setattr(
-    codex_sdk_runner, "_sdk_imports", lambda: _fake_sdk(FakeAsyncCodex),
-  )
-  monkeypatch.setattr(codex_sdk_runner.shutil, "which", lambda name: {
-    "codex": "/usr/local/bin/codex",
-    "setsid": "/usr/bin/setsid",
-  }.get(name))
-  monkeypatch.setattr(codex_sdk_runner.os, "getpgid", lambda _pid: 4321)
-  monkeypatch.setattr(codex_sdk_runner.os, "getpgrp", lambda: 9999)
   monkeypatch.setattr(codex_sdk_runner, "_terminate_codex_processes", reap)
-  monkeypatch.setattr(
-    codex_sdk_runner, "_install_codex_call_executor",
-    lambda *_args: SimpleNamespace(close=lambda: order.append("executor close")),
-  )
 
   async def scenario():
-    nonlocal body_ready
-    body_ready = asyncio.Event()
-    task = asyncio.create_task(codex_sdk_runner.run_codex_sdk_turn(
-      user_message="hello",
-      session_id=None,
-      base_env={},
-      cwd="/tmp",
-      chat_id="chat-cancel-failed-reap",
-      bc=_FakeBroadcast(),
-      pending_questions={},
-      db=None,
-    ))
-    await body_ready.wait()
+    task = await cancelled_turn.start("chat-cancel-failed-reap")
     task.cancel("turn stopped")
     assert await asyncio.to_thread(reap.entered.wait, 5)
     task.cancel("turn stopped again")
@@ -4633,71 +4659,24 @@ def test_cancelled_turn_reap_finishes_then_closes_executor_and_cancel_wins(
   assert "process reap failed" in caplog.text and "kill failed" in caplog.text
 
 
-def test_cancel_during_generated_file_capture_still_reaps_and_closes(monkeypatch):
+def test_cancel_during_generated_file_capture_still_reaps_and_closes(
+  monkeypatch, cancelled_turn,
+):
   """A second cancellation in the first teardown await skips nothing after it."""
-  body_ready = publish_started = finish_publish = None
-  order = []
-
-  class FakeAsyncCodex:
-    def __init__(self, config=None):
-      self.config = config
-      self._client = SimpleNamespace(
-        _sync=SimpleNamespace(
-          _proc=SimpleNamespace(pid=4321),
-          _approval_handler=None,
-        ),
-      )
-
-    async def __aenter__(self):
-      return self
-
-    async def __aexit__(self, _exc_type, _exc, _tb):
-      return None
-
-    async def thread_start(self, *_args, **_kwargs):
-      body_ready.set()
-      await asyncio.Future()
+  order = cancelled_turn.order
+  publish_started = finish_publish = None
 
   async def publish(*_args, **_kwargs):
     publish_started.set()
     await finish_publish.wait()
     order.append("publish")
 
-  monkeypatch.setattr(
-    codex_sdk_runner, "_sdk_imports", lambda: _fake_sdk(FakeAsyncCodex),
-  )
-  monkeypatch.setattr(codex_sdk_runner.shutil, "which", lambda name: {
-    "codex": "/usr/local/bin/codex",
-    "setsid": "/usr/bin/setsid",
-  }.get(name))
-  monkeypatch.setattr(codex_sdk_runner.os, "getpgid", lambda _pid: 4321)
-  monkeypatch.setattr(codex_sdk_runner.os, "getpgrp", lambda: 9999)
   monkeypatch.setattr(codex_sdk_runner.generated_files, "publish_inbox_files", publish)
-  monkeypatch.setattr(
-    codex_sdk_runner, "_terminate_codex_processes",
-    lambda *_args: order.append("reap") or True,
-  )
-  monkeypatch.setattr(
-    codex_sdk_runner, "_install_codex_call_executor",
-    lambda *_args: SimpleNamespace(close=lambda: order.append("executor close")),
-  )
 
   async def scenario():
-    nonlocal body_ready, publish_started, finish_publish
-    body_ready, publish_started, finish_publish = (
-      asyncio.Event(), asyncio.Event(), asyncio.Event(),
-    )
-    task = asyncio.create_task(codex_sdk_runner.run_codex_sdk_turn(
-      user_message="hello",
-      session_id=None,
-      base_env={},
-      cwd="/tmp",
-      chat_id="chat-cancel-during-capture",
-      bc=_FakeBroadcast(),
-      pending_questions={},
-      db=None,
-    ))
-    await body_ready.wait()
+    nonlocal publish_started, finish_publish
+    publish_started, finish_publish = asyncio.Event(), asyncio.Event()
+    task = await cancelled_turn.start("chat-cancel-during-capture")
     task.cancel("turn stopped")
     await asyncio.wait_for(publish_started.wait(), 5)
     task.cancel("turn stopped again")
@@ -4711,81 +4690,39 @@ def test_cancel_during_generated_file_capture_still_reaps_and_closes(monkeypatch
   assert order == ["publish", "reap", "executor close"]
 
 
-def test_cancel_during_steer_settlement_still_unregisters_reaps_and_closes(monkeypatch):
+def test_cancel_during_steer_settlement_still_unregisters_reaps_and_closes(
+  monkeypatch, cancelled_turn,
+):
   """A second cancellation in the steer settlement skips nothing after it."""
-  body_ready = settle_started = finish_settle = None
-  order = []
-
-  class FakeAsyncCodex:
-    def __init__(self, config=None):
-      self.config = config
-      self._client = SimpleNamespace(
-        _sync=SimpleNamespace(
-          _proc=SimpleNamespace(pid=4321),
-          _approval_handler=None,
-        ),
-      )
-
-    async def __aenter__(self):
-      return self
-
-    async def __aexit__(self, _exc_type, _exc, _tb):
-      return None
-
-    async def thread_start(self, *_args, **_kwargs):
-      return _FakeThread("thread-steer", BlockedTurn())
+  order = cancelled_turn.order
+  settle_started = finish_settle = None
 
   class BlockedTurn(_FakeTurnHandle):
     async def stream(self):
-      body_ready.set()
+      cancelled_turn.body_ready.set()
       await asyncio.Future()
       yield  # pragma: no cover
+
+  async def thread_start():
+    return _FakeThread("thread-steer", BlockedTurn())
 
   async def finish_steer(self):
     settle_started.set()
     await finish_settle.wait()
     order.append("steer settled")
 
-  monkeypatch.setattr(
-    codex_sdk_runner, "_sdk_imports", lambda: _fake_sdk(FakeAsyncCodex),
-  )
-  monkeypatch.setattr(codex_sdk_runner.shutil, "which", lambda name: {
-    "codex": "/usr/local/bin/codex",
-    "setsid": "/usr/bin/setsid",
-  }.get(name))
-  monkeypatch.setattr(codex_sdk_runner.os, "getpgid", lambda _pid: 4321)
-  monkeypatch.setattr(codex_sdk_runner.os, "getpgrp", lambda: 9999)
+  cancelled_turn.thread_start = thread_start
   monkeypatch.setattr(
     codex_sdk_runner.ActiveCodexTurn, "finish_steer_before_turn_end", finish_steer,
   )
   monkeypatch.setattr(
     codex_sdk_runner, "_persist_session_id", lambda *_args, **_kwargs: asyncio.sleep(0),
   )
-  monkeypatch.setattr(
-    codex_sdk_runner, "_terminate_codex_processes",
-    lambda *_args: order.append("reap") or True,
-  )
-  monkeypatch.setattr(
-    codex_sdk_runner, "_install_codex_call_executor",
-    lambda *_args: SimpleNamespace(close=lambda: order.append("executor close")),
-  )
 
   async def scenario():
-    nonlocal body_ready, settle_started, finish_settle
-    body_ready, settle_started, finish_settle = (
-      asyncio.Event(), asyncio.Event(), asyncio.Event(),
-    )
-    task = asyncio.create_task(codex_sdk_runner.run_codex_sdk_turn(
-      user_message="hello",
-      session_id=None,
-      base_env={},
-      cwd="/tmp",
-      chat_id="chat-cancel-during-steer-settlement",
-      bc=_FakeBroadcast(),
-      pending_questions={},
-      db=None,
-    ))
-    await body_ready.wait()
+    nonlocal settle_started, finish_settle
+    settle_started, finish_settle = asyncio.Event(), asyncio.Event()
+    task = await cancelled_turn.start("chat-cancel-during-steer-settlement")
     task.cancel("turn stopped")
     await asyncio.wait_for(settle_started.wait(), 5)
     task.cancel("turn stopped again")

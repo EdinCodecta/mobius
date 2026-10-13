@@ -92,7 +92,7 @@ class Teardown:
   def __init__(self, logger: logging.Logger, context: str) -> None:
     self._log = logger
     self._context = context
-    self._unwinding = sys.exc_info()[1]
+    self._unwinding = _unwinding(sys._getframe(1))
     self.cancel: asyncio.CancelledError | None = None
 
   def defer(self, cancel: asyncio.CancelledError) -> None:
@@ -117,7 +117,7 @@ class Teardown:
         )
 
     try:
-      await settle(logged(), what=what)
+      await settle(logged())
     except asyncio.CancelledError as exc:
       self.defer(exc)
     return succeeded
@@ -128,3 +128,19 @@ class Teardown:
       self._unwinding, asyncio.CancelledError,
     ):
       raise self.cancel
+
+
+def _unwinding(frame) -> BaseException | None:
+  """The exception unwinding through ``frame``, if any.
+
+  ``sys.exc_info`` also reports an exception a caller further up the stack is
+  only handling. One unwinding this frame has already passed through it, so
+  its traceback holds the frame.
+  """
+  error = sys.exc_info()[1]
+  trace = error.__traceback__ if error is not None else None
+  while trace is not None:
+    if trace.tb_frame is frame:
+      return error
+    trace = trace.tb_next
+  return None

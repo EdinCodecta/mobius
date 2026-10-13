@@ -293,7 +293,10 @@ async def _run_spawned(
       "request_not_accepted", 502, "App service failed before accepting its request.",
     ) from exc
   except asyncio.CancelledError:
-    await _stop_process(process, write_task, stdout_task, stderr_task)
+    # A second cancel must not interrupt the stop and leak a running child.
+    await settled.settle(
+      _stop_process(process, write_task, stdout_task, stderr_task),
+    )
     raise
   try:
     os.killpg(process.pid, signal.SIGKILL)

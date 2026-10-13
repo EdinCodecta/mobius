@@ -174,7 +174,7 @@ def test_without_a_cancel_the_result_or_exception_passes_through():
   asyncio.run(run())
 
 
-async def _teardown_under_cancel(raise_first, caplog_logger):
+async def _teardown_under_cancel(raise_first, caplog_logger, handled_above=False):
   """A finally whose first step is cancelled twice; return (task, ran)."""
   ran, started, finish = [], asyncio.Event(), asyncio.Event()
 
@@ -198,7 +198,15 @@ async def _teardown_under_cancel(raise_first, caplog_logger):
       ran.append(f"second ok={ok}")
       teardown.finish()
 
-  task = asyncio.create_task(turn())
+  async def turn_while_a_caller_handles_a_cancel():
+    try:
+      raise asyncio.CancelledError("handled above")
+    except asyncio.CancelledError:
+      await turn()
+
+  task = asyncio.create_task(
+    turn_while_a_caller_handles_a_cancel() if handled_above else turn(),
+  )
   await started.wait()
   task.cancel("held one")
   await asyncio.sleep(0)
@@ -228,3 +236,13 @@ def test_teardown_lets_the_original_unwinding_cancel_propagate():
   )
   assert outcome.args == ("original",)
   assert ran == ["first", "second", "second ok=False"]
+
+
+def test_teardown_is_not_fooled_by_a_cancel_handled_further_up_the_stack():
+  """Only an exception unwinding the teardown's own block counts as unwinding."""
+  outcome, ran = asyncio.run(_teardown_under_cancel(
+    False, logging.getLogger("mobius.test_teardown"), handled_above=True,
+  ))
+  assert outcome.args == ("held one",)
+  assert ran == ["first", "second", "second ok=False"]
+
