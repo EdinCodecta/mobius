@@ -1329,6 +1329,14 @@ class PrepareAutoResume(_Command):
 
 
 @dataclass
+class WithdrawGoalDependency(_Command):
+  """Owner withdrawal of one exact pending/owed edge, not its Goal or source."""
+  chat_id: str = ""
+  run_token: str = ""
+  dependency_id: str = ""
+
+
+@dataclass
 class ReconcileClaimSources(_Command):
   """Decide source nonviability between, never during, queue/run transitions."""
   chat_id: str = ""
@@ -2058,6 +2066,8 @@ class ChatWriterActor:
       # Stop and replacement must agree on one side of the transition.
       from app.decision_cards import fence_decisions
       fence_decisions(db)
+    if isinstance(cmd, WithdrawGoalDependency):
+      return self._withdraw_goal_dependency(db, cmd)
     if isinstance(cmd, ReconcileClaimSources):
       from app.goal_dependency_sources import stage_reconcile_claim_sources
       resolved = stage_reconcile_claim_sources(db)
@@ -2768,6 +2778,44 @@ class ChatWriterActor:
     if not _commit_or_rollback(db):
       raise _PersistFailed("PersistSessionId did not persist")
     return True
+
+  def _withdraw_goal_dependency(self, db, cmd: WithdrawGoalDependency) -> str:
+    from app.decision_cards import fence_decisions
+    from app.goal_dependencies import stage_withdraw_dependency, dependency_result_row
+    from app.continuations import DEPENDENCY_RESULT_MESSAGE_KIND
+    from app.timeutil import now_naive_utc
+    fence_decisions(db)
+    result = stage_withdraw_dependency(db, cmd.chat_id, cmd.dependency_id)
+    stopped_tokens = set()
+    if result == "withdrawn":
+      chat = db.get(models.Chat, cmd.chat_id)
+      row = db.get(models.GoalDependency, cmd.dependency_id)
+      # Queue/transcript ownership stays here, not in the dependency module.
+      # Rechecking at enqueue, turn admission and provider admission closes
+      # the read-before-withdraw windows without cancelling unrelated work.
+      chat.pending_messages = [message for message in (chat.pending_messages or [])
+        if not (message.get("kind") == DEPENDENCY_RESULT_MESSAGE_KIND
+          and (target := dependency_result_row(db, chat.id, message)) is not None
+          and target.id == row.id)]
+      for token in ("dependency-resume-" + row.id, "dependency-resume-" + row.id + ".retry"):
+        carrier = db.get(models.ChatRun, token)
+        if (carrier is not None and carrier.chat_id == chat.id
+            and carrier.goal_id == row.waiting_goal_id and carrier.status == "running"
+            and carrier.provider_execution_admitted is False):
+          carrier.status = "interrupted"
+          carrier.ended_at = now_naive_utc()
+          stopped_tokens.add(token)
+          if (chat.live_assistant or {}).get("id") == token:
+            chat.live_assistant = None
+          if chat.active_assistant_message_id == token:
+            chat.active_assistant_message_id = None
+    if not _commit_or_rollback(db):
+      raise _PersistFailed("WithdrawGoalDependency did not persist")
+    if result == "withdrawn":
+      if self._run_token_owner.get(cmd.chat_id) in stopped_tokens:
+        self._run_token_owner.pop(cmd.chat_id, None)
+      _publish_goal_runtime_changed(db, cmd.chat_id)
+    return result
 
   def _admit_provider_execution(self, db, cmd: AdmitProviderExecution) -> None:
     """Only the current, never-admitted physical run may enter its provider."""
@@ -4551,6 +4599,11 @@ class ChatWriterActor:
     if chat is None:
       raise _PersistFailed("AppendPending: chat not found or deleted")
     pending = list(chat.pending_messages or [])
+    from app.goal_dependencies import dependency_result_message_blocker
+    if dependency_result_message_blocker(db, cmd.chat_id, cmd.user_msg) in {
+      "disposed", "dependency_missing", "goal_closed", "chat_deleted",
+    }:
+      raise _PersistFailed("AppendPending: dependency result is no longer receivable")
     new_msg = dict(cmd.user_msg)
     # Only the authenticated route may supply this provenance, never message data.
     new_msg.pop("_browser_grant_id", None)

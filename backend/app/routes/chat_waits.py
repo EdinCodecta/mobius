@@ -163,3 +163,28 @@ def wait_for_decision(
       "no polling or peer interrupt is needed. An answer grants authority only to the card's own executor."
       if following else "This dependency is already disposed; no new continuation was requested. "
       "Its saved outcome is evidence, never authority.")}
+
+
+@router.post("/dependencies/{dependency_id}/withdraw")
+async def withdraw_dependency(
+  dependency_id: str,
+  principal: Principal = Depends(get_principal),
+  db: Session = Depends(get_db),
+):
+  """Owner control bound to the waiting chat, never the foreign source."""
+  _require_owner(principal)
+  row = db.get(models.GoalDependency, dependency_id)
+  if row is None:
+    raise HTTPException(status_code=404, detail="No such follow.")
+  if principal.chat_id is not None and principal.chat_id != row.waiting_chat_id:
+    raise HTTPException(status_code=403, detail="Not this chat's follow.")
+  chat_id = row.waiting_chat_id
+  get_active_chat_or_404(db, chat_id)
+  db.rollback()
+  from app.chat_writer import WithdrawGoalDependency, await_ack, get_writer
+  result = await await_ack(get_writer().submit(WithdrawGoalDependency(
+    chat_id=chat_id, dependency_id=dependency_id)))
+  if result != "withdrawn":
+    raise HTTPException(status_code=404 if result == "missing" else 409,
+      detail="This follow is no longer available to stop.")
+  return {"id": dependency_id, "disposition": "withdrawn"}

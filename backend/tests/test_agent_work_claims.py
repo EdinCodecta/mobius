@@ -954,7 +954,10 @@ def test_round_trip_does_not_revive_a_deliberately_ended_follow(db, explicit_end
   owner, first, second = _owned_goal_claim(db)
   dependency = db.query(models.GoalDependency).one()
   if explicit_end == "withdrawn":
-    dependency.withdrawn_at = now_naive_utc()
+    from app.chat_writer import WithdrawGoalDependency, get_writer
+    assert get_writer().submit(WithdrawGoalDependency(
+      chat_id=dependency.waiting_chat_id, dependency_id=dependency.id)).result(5) == "withdrawn"
+    db.expire_all()
   else:
     dependency.result_disposition = "delivered"
     dependency.resolved_at = now_naive_utc()
@@ -962,10 +965,18 @@ def test_round_trip_does_not_revive_a_deliberately_ended_follow(db, explicit_end
   db.commit()
   claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY,
     summary="Transfer", expected_owner_chat_id=first.id, takeover_reason="Accepted exact action ownership")
-  with pytest.raises(ValueError, match="cannot preserve the former Goal's follow"):
-    claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY,
+  if explicit_end == "withdrawn":
+    returned = claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY,
       summary="Return", expected_owner_chat_id=second.id, takeover_reason="Accepted exact action back")
-  assert _claim_row(db).owner_chat_id == second.id
+    assert returned["previous_follow_status"] == "withdrawn"
+    db.refresh(dependency)
+    assert dependency.result_disposition == "withdrawn"
+    assert _claim_row(db).owner_chat_id == first.id
+  else:
+    with pytest.raises(ValueError, match="cannot preserve the former Goal's follow"):
+      claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY,
+        summary="Return", expected_owner_chat_id=second.id, takeover_reason="Accepted exact action back")
+    assert _claim_row(db).owner_chat_id == second.id
 
 
 @pytest.mark.parametrize("goal_less", [False, True])

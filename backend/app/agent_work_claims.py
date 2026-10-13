@@ -127,7 +127,7 @@ def _stage_goal_owner_change(db: Session, row: models.AgentWorkClaim, *,
   if previous_goal_id and previous_goal_id != goal_id:
     previous_follow_status = stage_follow_claim(db, row, chat_id=previous,
       run_id=previous_run_id, waiting_goal_id=previous_goal_id, restore_owner_follow=True)
-    if previous_follow_status not in {"followed", "result_owed", "no_open_top_level_goal"}:
+    if previous_follow_status not in {"followed", "result_owed", "no_open_top_level_goal", "withdrawn"}:
       db.rollback()
       raise ValueError("Transfer cannot preserve the former Goal's follow: " + previous_follow_status)
   return previous_follow_status

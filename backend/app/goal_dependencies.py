@@ -135,6 +135,44 @@ def stage_retire_chat_dependencies(db, chat_id):
     models.GoalDependency.withdrawn_at: now}, synchronize_session=False)
 
 
+def stage_withdraw_dependency(db, chat_id, dependency_id):
+  """Withdraw only this edge, including an owed result, under the graph fence.
+
+  This cannot undo evidence already admitted to a running provider. It prevents
+  future admission/receipt and never interrupts work that has already entered.
+  The caller owns the writer transaction and runtime invalidation.
+  """
+  chat = db.get(models.Chat, chat_id)
+  row = db.get(models.GoalDependency, dependency_id)
+  if chat is None or chat.deleted_at is not None or row is None or row.waiting_chat_id != chat_id:
+    return "missing"
+  if row.result_disposition == "withdrawn":
+    return "withdrawn"
+  goal = db.get(models.ChatGoal, row.waiting_goal_id)
+  if goal is None or goal.chat_id != chat_id or goal.status not in {"open", "stopped"}:
+    return "goal_closed"
+  if row.result_disposition is not None or row.received_run_id is not None:
+    return "already_received"
+  _retain_source_context(db, [row])
+  now = now_naive_utc()
+  changed = undisposed_dependencies(db).filter(
+    models.GoalDependency.id == row.id,
+    models.GoalDependency.received_run_id.is_(None),
+    models.GoalDependency.waiting_goal_id.in_(db.query(models.ChatGoal.id).filter(
+      models.ChatGoal.chat_id == chat_id, models.ChatGoal.status.in_(("open", "stopped")),
+    )),
+  ).update({models.GoalDependency.withdrawn_at: now,
+    models.GoalDependency.result_disposed_at: now,
+    models.GoalDependency.result_disposition: "withdrawn"}, synchronize_session=False)
+  if not changed:
+    db.refresh(row)
+    return "withdrawn" if row.result_disposition == "withdrawn" else "already_received"
+  # The Goal remains open/held. Without another handoff its ordinary Resume
+  # presentation (or an active turn's settlement) stays responsible for it.
+  db.flush()
+  return "withdrawn"
+
+
 def _retain_source_context(db, rows):
   """Non-waking retirement retains identity, never fabricates a source result.
 
