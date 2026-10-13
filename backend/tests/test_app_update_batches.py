@@ -879,7 +879,7 @@ async def test_concurrent_retries_after_a_failed_boot_read_load_once(tmp_path, m
   real = owner._load_receipts
   def counted():
     loads.append(1)
-    real()
+    return real()
   monkeypatch.setattr(owner, "_load_receipts", counted)
   await asyncio.gather(*(owner.retry_start() for _ in range(5)))
   assert loads == [1]
@@ -1051,3 +1051,92 @@ async def test_runtime_prunes_finished_batches_past_retention(tmp_path, app_rows
   assert key not in owner.records and key not in owner._save_locks
   assert not (owner.root / f"{key}.json").exists()
   assert fresh in owner.records and fresh in owner._save_locks  # Kept until pruning.
+
+
+@pytest.mark.asyncio
+async def test_a_retry_settles_receipts_off_the_loop_and_applies_them_on_it(
+  tmp_path, monkeypatch,
+):
+  """A retry runs beside live requests: no record or save changes off the loop."""
+  import threading
+
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  owner.root.mkdir()
+  bad = owner.root / f"{uuid4()}.json"
+  bad.write_text("interrupted bytes")
+  await owner.start()
+  assert not owner.accepting
+  bad.unlink()
+  body = request(1)
+  key = str(body.id)
+  (owner.root / f"{key}.json").write_text(json.dumps({
+    "id": key, "created_at": _now(), "updated_at": _now(), "phase": "applying",
+    "updates": [u.model_dump() for u in body.updates],
+    "entries": [{"app_id": 1, "status": "applying", "version": "1.0", "error": ""}],
+  }))
+  loop_thread = threading.get_ident()
+  seen = []
+
+  def settled_outcomes(reviewed):
+    seen.append(("read", threading.get_ident() != loop_thread, key in owner.records))
+    return {1: {"status": "failed", "error": batches._NOT_APPLIED}}
+
+  real_apply = batches._apply
+
+  def apply(record, outcomes):
+    seen.append(("apply", threading.get_ident() == loop_thread))
+    return real_apply(record, outcomes)
+
+  monkeypatch.setattr(batches, "_settled_outcomes", settled_outcomes)
+  monkeypatch.setattr(batches, "_apply", apply)
+  await owner.retry_start()
+  # Read off the loop, before any record is visible; applied on the loop.
+  assert seen == [("read", True, False), ("apply", True)]
+  assert owner.accepting
+  assert owner.snapshot(key)["entries"][0]["status"] == "failed"
+  saved = json.loads((owner.root / f"{key}.json").read_text())
+  assert (saved["phase"], saved["entries"][0]["status"]) == ("complete", "failed")
+
+
+async def _expired_failed_batch(owner):
+  body = request(1)
+  key = str(body.id)
+  old = (datetime.now(UTC) - timedelta(days=31)).isoformat()
+  owner._save({"id": key, "created_at": old,
+    "updates": [u.model_dump() for u in body.updates],
+    "entries": [{"app_id": 1, "status": "failed", "version": "1.0", "error": "x"}]})
+  owner.records[key]["updated_at"] = old
+  return key
+
+
+@pytest.mark.asyncio
+async def test_a_prune_during_a_refresh_is_never_written_back(tmp_path, monkeypatch):
+  from tests.cancel_helpers import BlockedWorker
+
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  await owner.start()
+  key = await _expired_failed_batch(owner)
+  worker = BlockedWorker(lambda: {1: {"status": "updated", "version": "2.0", "error": ""}})
+  monkeypatch.setattr(batches, "_settled_outcomes", lambda reviewed: worker())
+  refresh = asyncio.create_task(owner.refresh_results(key))
+  assert await asyncio.to_thread(worker.entered.wait, 5)
+  owner._prune_finished()
+  assert key not in owner.records
+  worker.release.set()
+  await refresh
+  assert key not in owner.records
+  assert key not in owner._save_locks
+  assert not (owner.root / f"{key}.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_prune_skips_a_batch_whose_save_is_in_flight(tmp_path):
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  await owner.start()
+  key = await _expired_failed_batch(owner)
+  lock = owner._save_locks[key] = asyncio.Lock()
+  async with lock:
+    owner._prune_finished()
+    assert key in owner.records and (owner.root / f"{key}.json").exists()
+  owner._prune_finished()
+  assert key not in owner.records and not (owner.root / f"{key}.json").exists()

@@ -288,28 +288,60 @@ def _held(node: ast.AsyncWith) -> bool:
   )
 
 
+def _dotted(expr) -> str:
+  parts = []
+  while isinstance(expr, ast.Attribute):
+    parts.append(expr.attr)
+    expr = expr.value
+  if isinstance(expr, ast.Name):
+    parts.append(expr.id)
+  return ".".join(reversed(parts))
+
+
+# Every plain way this code hands work to a thread: asyncio's, Starlette's
+# (``starlette.concurrency`` or re-exported by FastAPI) and anyio's.
+_THREAD_CALLS = {
+  "asyncio.to_thread",
+  "run_in_threadpool",
+  "concurrency.run_in_threadpool",
+  "starlette.concurrency.run_in_threadpool",
+  "fastapi.concurrency.run_in_threadpool",
+  "anyio.to_thread.run_sync",
+  "to_thread.run_sync",
+}
+
+
 def _plain_to_thread_calls(body):
-  """Yield lexical ``asyncio.to_thread`` calls, not those in nested functions."""
+  """Yield lexical plain thread calls, not those in nested functions."""
   pending = list(body)
   while pending:
     node = pending.pop()
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
       continue
-    if (
-      isinstance(node, ast.Call)
-      and isinstance(node.func, ast.Attribute)
-      and node.func.attr == "to_thread"
-      and isinstance(node.func.value, ast.Name)
-      and node.func.value.id == "asyncio"
-    ):
+    if isinstance(node, ast.Call) and _dotted(node.func) in _THREAD_CALLS:
       yield node
     pending.extend(ast.iter_child_nodes(node))
+
+
+@pytest.mark.parametrize("call, plain", [
+  ("asyncio.to_thread(f)", True),
+  ("run_in_threadpool(f)", True),
+  ("starlette.concurrency.run_in_threadpool(f)", True),
+  ("anyio.to_thread.run_sync(f)", True),
+  ("settled.run_settled(f)", False),
+  ("other.to_thread(f)", False),
+])
+def test_the_lint_sees_every_plain_thread_call(call, plain):
+  body = ast.parse(f"async def g():\n  async with lock:\n    await {call}\n").body
+  lock_block = body[0].body[0]
+  assert bool(list(_plain_to_thread_calls(lock_block.body))) is plain
 
 
 def test_lock_held_thread_work_is_settled_or_marked_read_only():
   """Under a lock, a cancelled caller must not unwind while its thread writes.
 
-  Plain ``asyncio.to_thread`` releases the lock on cancel while the thread
+  Plain ``asyncio.to_thread``, ``run_in_threadpool`` or
+  ``anyio.to_thread.run_sync`` releases the lock on cancel while the thread
   runs on, so lock-held thread work goes through ``settled``. Read-only work
   may stay plain, marked ``# unsettled: read-only (<what it reads>)`` on the
   call's line.
@@ -335,7 +367,8 @@ def test_lock_held_thread_work_is_settled_or_marked_read_only():
         if not _READ_ONLY.search(lines[call.lineno - 1]):
           offenders.append(f"{path.relative_to(app_root)}:{call.lineno}")
   assert not sorted(set(offenders)), (
-    "Lock-held asyncio.to_thread must use settled.run_settled, or be marked "
+    "Lock-held asyncio.to_thread or run_in_threadpool must use "
+    "settled.run_settled, or be marked "
     "'# unsettled: read-only (<reason>)' when the thread only reads: "
     f"{sorted(set(offenders))}"
   )

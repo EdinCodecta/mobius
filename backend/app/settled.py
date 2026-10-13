@@ -25,7 +25,8 @@ Policy for thread work under a lock:
   in-process rollback must run once the section fails, as App Apply and the
   tombstone purge do. A settled section also finishes steps that had not
   started when the cancel came.
-* A plain ``asyncio.to_thread`` only for a read, marked on its line with
+* A plain ``asyncio.to_thread`` (or Starlette's ``run_in_threadpool``, or
+  ``anyio.to_thread.run_sync``) only for a read, marked on its line with
   ``# unsettled: read-only (<what it reads>)``. ``tests/test_settled.py``
   enforces this for direct calls inside lock blocks; it cannot see thread work
   reached through a called coroutine, and a marker is a reviewed claim.
