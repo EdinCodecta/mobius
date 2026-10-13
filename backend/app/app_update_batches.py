@@ -232,7 +232,6 @@ class AppUpdateBatches:
     self._slots: asyncio.Semaphore | None = None
     self._starting = asyncio.Lock()
     self._save_locks: dict[str, asyncio.Lock] = {}
-    self.stopping = False
 
   def _encode(self, record: dict) -> str:
     record["updated_at"] = _now()
@@ -292,9 +291,10 @@ class AppUpdateBatches:
   async def _start(self) -> None:
     self._slots = asyncio.Semaphore(_RUNNING_ENTRIES)
     self.records = {}
-    self.failure = None
     try:
-      await asyncio.to_thread(self._load_receipts)
+      # Settled: a retry cancelled mid-read keeps the previous failure, so the
+      # next request retries again, and the read never races that retry.
+      await settled.run_settled(self._load_receipts)
     except Exception:
       # A damaged receipt or a failed settlement read (including a database
       # error) must not fail readiness for unrelated chats and apps. Disable
@@ -306,6 +306,7 @@ class AppUpdateBatches:
       self.accepting = False
       log.exception("app update progress could not be recovered")
       return
+    self.failure = None
     self._read_failed = False
     self.accepting = True
 
@@ -340,7 +341,7 @@ class AppUpdateBatches:
         self._save(record)
 
   async def stop(self) -> None:
-    """Stop admitting, end progress streams, then cancel running entries.
+    """Stop admitting, then cancel running entries.
 
     The installer settles its current pass, rolls back, and releases its locks
     only once its threads end; each entry then records its settled outcome.
@@ -349,12 +350,6 @@ class AppUpdateBatches:
     """
     self.accepting = False
     self._read_failed = False
-    # Open streams must not hold the server's connection drain; the Store
-    # reconnects and reads the settled result after the restart.
-    self.stopping = True
-    for listeners in self.listeners.values():
-      for wake in listeners:
-        wake.set()
     tasks = list(self.tasks.values())
     for task in tasks:
       task.cancel()
@@ -418,8 +413,7 @@ class AppUpdateBatches:
 
   def _finished(self, key: str, task: asyncio.Task) -> None:
     self.tasks.pop(key, None)
-    # Its last save is done; a later refresh creates a fresh lock if needed.
-    self._save_locks.pop(key, None)
+    # Keep its save lock: a refresh may still hold it. Pruning drops it.
     if not task.cancelled() and task.exception() is not None:
       log.error("app update batch %s stopped: %s", key, task.exception())
 
@@ -493,7 +487,7 @@ class AppUpdateBatches:
           # client's next GET reports the 503.
           return
         yield snapshot
-        if snapshot["phase"] == "complete" or self.stopping:
+        if snapshot["phase"] == "complete":
           return
         try:
           await asyncio.wait_for(wake.wait(), timeout=_STREAM_KEEPALIVE_SECONDS)
