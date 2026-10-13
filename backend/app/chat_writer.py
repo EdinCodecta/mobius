@@ -2052,7 +2052,8 @@ class ChatWriterActor:
     drive a real `SessionLocal`, exercising the real dispatch below.
     """
     if (not hasattr(db, "record_commit") and isinstance(cmd, (
-        QuestionCommit, AnswerQuestion, AppendPending, Finalize, FinishRun))):
+        QuestionCommit, AnswerQuestion, AppendPending, Finalize, FinishRun,
+        ReplaceTranscript, ParkRun))):
       # Read source state only after the graph fence: subscriptions, answers,
       # Stop and replacement must agree on one side of the transition.
       from app.decision_cards import fence_decisions
@@ -2425,7 +2426,14 @@ class ChatWriterActor:
     )
     if not keeps_owner_handoff:
       from app.decision_cards import stage_decision_outcome
-      stage_decision_outcome(db, chat, chat.pending_question_id, "superseded")
+      # Native Finalize precedes both resumable ParkRun and terminal
+      # FinishRun. A retained card has not ended merely because its transient
+      # marker is cleared; the lifecycle owner decides its disposition.
+      retained = any(block.get("type") == "question"
+        and block.get("question_id") == chat.pending_question_id
+        for block in snapshot.get("blocks") or [])
+      if not retained:
+        stage_decision_outcome(db, chat, chat.pending_question_id, "superseded")
       chat.pending_question_id = None
     if thinking_stashes:
       self._stage_thinking_stashes(db, thinking_stashes)
@@ -5629,6 +5637,8 @@ class ChatWriterActor:
     if cmd.title is not None:
       chat.title = cmd.title
     if cmd.messages is not None:
+      from app.decision_cards import stage_replace_decisions
+      stage_replace_decisions(db, chat, cmd.messages, _tail_open_question_id(cmd.messages))
       transcript_rows.replace_all(db, chat, cmd.messages)
       chat.live_assistant = None
       (
@@ -5788,12 +5798,21 @@ class ChatWriterActor:
         and open_continuation_question(chat, chat.pending_question_id) is not None
       )
       if chat is not None and not preserve_parked_question:
-        if chat.pending_question_id is not None and not preserve_owner_question:
+        if not preserve_owner_question:
+          # Finalize may have cleared a native card's marker before this
+          # terminal transition. Its retained transcript identity still owns
+          # cancellation/supersession; ParkRun instead preserves it.
+          terminal_question_id = chat.pending_question_id or _tail_open_question_id([
+            next((message for _seq, message in transcript_rows.reverse_iter(db, chat)
+                  if isinstance(message, dict) and not message.get("hidden")), None)
+          ])
           from app.decision_cards import stage_decision_outcome
-          stage_decision_outcome(db, chat, chat.pending_question_id,
-            "cancelled" if cmd.terminal_status == "stopped" else "superseded")
-          chat.pending_question_id = None
-          changed = True
+          if stage_decision_outcome(db, chat, terminal_question_id,
+              "cancelled" if cmd.terminal_status == "stopped" else "superseded") is not None:
+            changed = True
+          if chat.pending_question_id is not None:
+            chat.pending_question_id = None
+            changed = True
         if chat.active_assistant_message_id is not None:
           chat.active_assistant_message_id = None
           changed = True

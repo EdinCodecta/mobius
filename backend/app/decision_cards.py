@@ -128,6 +128,42 @@ def stage_delete_decisions(db, chat):
   stage_deleted_decision_rows(db, chat.id, chat.title)
 
 
+def stage_replace_decisions(db, chat, messages, pending_question_id):
+  """A transcript replacement owns removal/adoption, not a later poll.
+
+  Preserve settled facts even if the owner removes the answer from history.
+  Only the replacement's actual pending card can remain an open source.
+  """
+  from app.questions import saved_question
+  from app.chat_message_identity import assistant_message_run_id
+  fence_decisions(db)
+  if chat.pending_question_id:
+    previous = saved_question(chat, chat.pending_question_id)
+    if previous is not None:
+      stage_saved_decision(db, chat, previous)
+  for message in messages:
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+      continue
+    run_id = assistant_message_run_id(message.get("id")) if message.get("id") else None
+    owner = db.get(models.ChatRun, run_id) if run_id else None
+    for card in message.get("blocks") or []:
+      if not isinstance(card, dict) or card.get("type") != "question":
+        continue
+      row = stage_saved_decision(db, chat, card, source_goal_id=owner.goal_id if owner else None)
+      if row is not None and card.get("answers"):
+        stage_decision_outcome(db, chat, row.question_id, "answered", card=card)
+  # Unsupported replacements with a reused id are not the old public card.
+  valid_pending = any(
+    isinstance(message, dict) and message.get("role") == "assistant" and any(
+      isinstance(card, dict) and card.get("type") == "question"
+      and card.get("question_id") == pending_question_id and supported_family(card)
+      for card in message.get("blocks") or []) for message in messages)
+  for row in db.query(models.SavedDecisionCard).filter_by(chat_id=chat.id).filter(
+      models.SavedDecisionCard.resolved_at.is_(None)).all():
+    if not valid_pending or row.question_id != pending_question_id:
+      stage_decision_outcome(db, chat, row.question_id, "superseded")
+
+
 def stage_wait_for_decision(db, *, chat_id, run_id, source_chat_id, question_id):
   """Subscribe atomically to one readable saved foreign decision, or refuse."""
   from uuid import uuid4

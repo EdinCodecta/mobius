@@ -448,3 +448,131 @@ def test_project_delete_and_restore_do_not_lose_or_revive_card_dependencies(db, 
   db.expire_all()
   assert not any("dependency-result" in str(message) for message in transcript_rows.history(chat))
   assert row.outcome_json == before if target == "source" else row.withdrawn_at is not None
+
+
+@pytest.mark.parametrize("replacement", ["removed", "new_card", "answered", "preserved"])
+def test_transcript_put_settles_removed_cards_and_adopts_replacements(db, chat, client, auth, replacement):
+  source, card = _setup(db, chat)
+  row = _follow(db, chat)
+  incoming = dict(card)
+  if replacement == "new_card":
+    incoming["question_id"] = "new-choice"
+  elif replacement == "answered":
+    incoming.update(answers={"q": "Build and test"}, selected_options={"q": ["yes"]})
+  messages = [] if replacement == "removed" else [
+    {"id": "source-run", "role": "assistant", "blocks": [incoming], "ts": 2}]
+  result = client.put("/api/chats/source", headers=auth, json={"messages": messages})
+  assert result.status_code == 200, result.text
+  db.expire_all()
+  if replacement == "preserved":
+    assert row.outcome_json is None and source.pending_question_id == "choice"
+  else:
+    assert row.outcome_json["kind"] == ("answered" if replacement == "answered" else "superseded")
+    assert row.resolved_at is not None
+  if replacement == "new_card":
+    new = _follow(db, chat, "new-choice")
+    assert new.outcome_json is None and new.id != row.id
+  elif replacement == "answered":
+    assert row.outcome_json["selected_options"] == {"q": ["yes"]}
+  elif replacement == "removed":
+    # A later subscription observes the durable removal, never an endless wait.
+    assert _follow(db, chat).outcome_json["kind"] == "superseded"
+
+
+def test_transcript_removal_preserves_a_previously_answered_card(db, chat, client, auth):
+  _setup(db, chat)
+  _answer()
+  result = client.put("/api/chats/source", headers=auth, json={"messages": []})
+  assert result.status_code == 200
+  row = _follow(db, chat)
+  assert row.outcome_json["kind"] == "answered"
+  assert row.outcome_json["answers"] == {"q": "Not now"}
+
+
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("terminal", ["restart", "stopped", "completed"])
+def test_finalization_does_not_preempt_native_or_continuation_card_lifecycle(db, chat, native, terminal):
+  from app.chat_writer import Finalize, ParkRun
+  source, card = _setup(db, chat)
+  if native:
+    card.pop("response_mode")
+    get_writer().submit(QuestionCommit(chat_id="source", run_token="source-run",
+      snapshot={"id": "source-run", "role": "assistant", "blocks": [card], "ts": 2})).result(5)
+  row = _follow(db, chat)
+  get_writer().submit(Finalize(chat_id="source", run_token="source-run",
+    snapshot={"id": "source-run", "role": "assistant", "blocks": [card], "ts": 2})).result(5)
+  db.expire_all()
+  assert row.outcome_json is None
+  if terminal == "restart":
+    assert get_writer().submit(ParkRun(chat_id="source", run_token="source-run",
+      park_reason="restart", restart_nonce="test", parked_until=now_naive_utc())).result(5)
+    db.expire_all()
+    assert source.pending_question_id == "choice" and row.outcome_json is None
+    _answer()
+    db.expire_all()
+    assert row.outcome_json["kind"] == "answered"
+  else:
+    get_writer().submit(FinishRun(chat_id="source", run_token="source-run", terminal_status=terminal)).result(5)
+    db.expire_all()
+    if terminal == "stopped":
+      assert row.outcome_json["kind"] == "cancelled"
+    elif native:
+      assert row.outcome_json["kind"] == "superseded"
+    else:
+      assert row.outcome_json is None and source.pending_question_id == "choice"
+
+
+def test_transcript_replacement_rollback_keeps_source_and_dependency_open(db, chat, monkeypatch):
+  from app import chat_writer
+  _setup(db, chat)
+  row = _follow(db, chat)
+  def fail_commit(session):
+    session.rollback()
+    return False
+  monkeypatch.setattr(chat_writer, "_commit_or_rollback", fail_commit)
+  with pytest.raises(chat_writer._PersistFailed, match="ReplaceTranscript did not persist"):
+    get_writer().submit(chat_writer.ReplaceTranscript(chat_id="source", messages=[])).result(5)
+  db.expire_all()
+  assert row.outcome_json is None
+  assert saved_decision(db, "source", "choice").outcome_json is None
+  assert questions.saved_question(db.get(models.Chat, "source"), "choice") is not None
+
+
+@pytest.mark.parametrize("order", ["replace_first", "subscribe_first"])
+def test_transcript_replacement_and_subscription_share_atomic_disposition(db, chat, monkeypatch, order):
+  from concurrent.futures import ThreadPoolExecutor
+  from threading import Event
+  from app import decision_cards
+  from app.database import SessionLocal
+  from app.chat_writer import ReplaceTranscript
+  _setup(db, chat)
+  chat_id = chat.id
+  db.rollback()
+  entered, release = Event(), Event()
+  original = decision_cards.fence_decisions
+  first = [True]
+  def fenced(session):
+    original(session)
+    if first[0]:
+      first[0] = False
+      entered.set()
+      assert release.wait(5)
+  monkeypatch.setattr(decision_cards, "fence_decisions", fenced)
+  def follow():
+    with SessionLocal() as session:
+      row = stage_wait_for_decision(session, chat_id=chat_id, run_id="dependent-run",
+        source_chat_id="source", question_id="choice")
+      session.commit()
+      return row.id
+  def replace():
+    get_writer().submit(ReplaceTranscript(chat_id="source", messages=[])).result(5)
+  with ThreadPoolExecutor(max_workers=2) as pool:
+    leading = pool.submit(replace if order == "replace_first" else follow)
+    assert entered.wait(5)
+    trailing = pool.submit(follow if order == "replace_first" else replace)
+    release.set()
+    results = [leading.result(10), trailing.result(10)]
+  db.expire_all()
+  row = db.get(models.GoalDependency, next(value for value in results if value))
+  assert row.outcome_json["kind"] == "superseded"
+  assert db.query(models.GoalDependency).count() == 1
