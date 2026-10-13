@@ -62,6 +62,13 @@ def test_plain_foreign_question_is_one_handoff_and_one_exact_goal_continuation(d
   assert _follow(db, chat).id == row.id
   handoff = goal_handoffs(db, db.get(models.ChatGoal, "dependent-goal"))
   assert handoff.prevents_settlement and not handoff.owner_input
+  from app.chat_writer import PromotePending
+  from app import transcript_rows
+  response = get_writer().submit(PromotePending(chat_id=chat.id, run_token="must-not-settle",
+    ending_run_token="dependent-run", ending_status="completed")).result(5)
+  assert response["promoted"] is None
+  assert db.get(models.ChatRun, "must-not-settle") is None
+  assert not any("goal_settlement_unfinished" in str(message) for message in transcript_rows.history(chat))
   assert db.query(models.AgentWorkClaim).count() == 0
   assert len([c for c in (questions.saved_question(source, "choice"),) if c]) == 1
   _answer()
@@ -263,3 +270,100 @@ def test_saved_decision_schema_upgrade_is_repeatable_without_history_adoption(tm
   assert "saved_decision_cards" in inspect(engine).get_table_names()
   with engine.connect() as conn:
     assert conn.execute(text("SELECT count(*) FROM saved_decision_cards")).scalar_one() == 0
+
+
+@pytest.mark.parametrize("invalid", ["goalless", "held", "helper", "wrong_card"])
+def test_only_open_top_level_goal_and_exact_saved_card_can_subscribe(db, chat, invalid):
+  _setup(db, chat)
+  if invalid == "goalless":
+    db.get(models.ChatRun, "dependent-run").goal_id = None
+  elif invalid == "held":
+    db.get(models.ChatGoal, "dependent-goal").status = "stopped"
+  elif invalid == "helper":
+    from tests.test_chat_waits import _delegated_agent_run_auth
+    _delegated_agent_run_auth(db, chat.id, "dependent-run")
+  db.commit()
+  with pytest.raises(ValueError, match="saved decision" if invalid == "wrong_card" else "top-level"):
+    _follow(db, chat, "missing" if invalid == "wrong_card" else "choice")
+  assert db.query(models.GoalDependency).count() == 0
+
+
+def test_run_bound_wait_for_decision_route_and_auth(db, chat, client, auth):
+  from tests.test_chat_waits import _agent_run_auth
+  _setup(db, chat)
+  db.get(models.ChatRun, "dependent-run").status = "running"
+  db.commit()
+  headers = _agent_run_auth(db, chat.id, "dependent-run")
+  payload = {"chat_id": "source", "question_id": "choice"}
+  assert client.post("/api/chat-waits/decision", json=payload, headers=auth).status_code == 403
+  response = client.post("/api/chat-waits/decision", json=payload, headers=headers)
+  assert response.status_code == 200, response.text
+  assert response.json()["status"] == "waiting"
+  assert response.json()["goal_id"] == "dependent-goal"
+  assert "only to the card's own executor" in response.json()["next_action"]
+
+
+def test_exact_answered_card_navigation_loads_older_card_not_new_pending_card(db, chat, client, auth):
+  from app import transcript_rows
+  source, _ = _setup(db, chat)
+  _answer()
+  db.expire_all()
+  messages = list(transcript_rows.history(source))
+  messages.extend({"role": "user", "content": str(i), "ts": 100 + i} for i in range(30))
+  messages.append({"role": "assistant", "id": "later", "ts": 999, "blocks": [
+    {"type": "question", "question_id": "later-card", "questions": [{"question": "Another choice?"}]}]})
+  transcript_rows.replace_all(db, source, messages)
+  source.pending_question_id = "later-card"
+  db.commit()
+  response = client.get("/api/chats/source?anchor=question:choice&compact=true&limit=2", headers=auth)
+  assert response.status_code == 200, response.text
+  data = response.json()
+  assert data["requested_anchor_found"] is True
+  cards = [block for message in data["messages"] for block in message.get("blocks", []) if block.get("type") == "question"]
+  assert cards[0]["question_id"] == "choice" and cards[0]["answers"] == {"q": "Not now"}
+  assert data["pending_question_id"] == "later-card"
+  assert db.query(models.ChatRun).filter_by(chat_id="source").count() == 1
+
+
+@pytest.mark.parametrize("target", ["source", "dependent"])
+def test_real_delete_route_stamps_source_or_retires_dependent(db, chat, client, auth, target):
+  source, _ = _setup(db, chat)
+  row = _follow(db, chat)
+  target_id = source.id if target == "source" else chat.id
+  response = client.delete(f"/api/chats/{target_id}", headers=auth)
+  assert response.status_code == 204, response.text
+  db.expire_all()
+  if target == "source":
+    assert row.outcome_json["kind"] == "source_deleted"
+  else:
+    assert row.result_disposition == "withdrawn" and row.received_run_id is None
+    assert source.deleted_at is None and source.pending_question_id == "choice"
+
+
+def test_later_explicit_answer_to_stopped_card_does_not_rewrite_owed_cancellation(db, chat):
+  _setup(db, chat)
+  row = _follow(db, chat)
+  get_writer().submit(FinishRun(chat_id="source", terminal_status="stopped")).result(5)
+  _answer()
+  db.expire_all()
+  assert row.outcome_json["kind"] == "cancelled"
+  assert saved_decision(db, "source", "choice").outcome_json["kind"] == "answered"
+
+
+def test_source_purge_drops_card_record_but_retains_dependent_answer(db, chat, monkeypatch):
+  from datetime import timedelta
+  from app import chat_retention
+  source, _ = _setup(db, chat)
+  row = _follow(db, chat)
+  _answer()
+  db.expire_all()
+  stage_delete_decisions(db, source)
+  source.deleted_at = now_naive_utc() - timedelta(days=8)
+  db.get(models.ChatRun, "source-run").status = "completed"
+  db.commit()
+  monkeypatch.setattr(chat_retention, "_purge_chat_storage", lambda _: None)
+  chat_retention.purge_expired_chat_tombstones(db)
+  db.expire_all()
+  assert db.get(models.Chat, "source") is None
+  assert saved_decision(db, "source", "choice") is None
+  assert row.outcome_json["kind"] == "answered" and row.outcome_json["answers"] == {"q": "Not now"}

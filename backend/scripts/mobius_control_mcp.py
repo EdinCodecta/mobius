@@ -1483,18 +1483,17 @@ _TOOL_DEFINITIONS = {
   REQUEST_APPROVAL_TOOL: {
     "name": REQUEST_APPROVAL_TOOL,
     "description": (
-      "Ask the owner to approve a proposed Möbius action other than a platform "
-      "restart (use request_restart). This is an application decision, not a "
+      "Ask the owner to approve an action; for restart use request_restart. "
+      "This is an application decision, not a "
       "tool-permission escalation. Saves an answerable card; returns a "
       "receipt, NOT an answer or permission. "
       f"{SAVED_CARD_TERMINAL_INSTRUCTION} "
-      "The owner's answer "
-      "resumes the chat, with no timeout. Explain the action and its impact, "
+      "The answer resumes the chat without timeout. Explain its impact "
       "and include a decline/defer choice. work_key also claims the exact "
       "action, so do not call claim_agent_work first. If another chat already "
       "owns or completed that key, no card is saved, your turn continues, and "
-      "the result is that claim (held_by_peer or completed): do not duplicate "
-      "the action. A held_by_peer Goal follows only if the response confirms "
+      "the result is held_by_peer or completed: do not duplicate. "
+      "A held_by_peer Goal follows only if the response confirms "
       "its dependency was created; otherwise do not promise a wake. "
       "Identical retries within a turn reuse the same card. Never "
       "request secrets here. Background agents leave approvals pending for a "

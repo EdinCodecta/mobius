@@ -18,7 +18,7 @@ def fence_decisions(db):
 
 
 def supported_family(card):
-  if card.get("secure_input") or card.get("platform_action"):
+  if card.get("secure_input") is not None or card.get("platform_action") is not None:
     return None
   return "approval" if card.get("action_key") else "question"
 
@@ -72,8 +72,9 @@ def stage_decision_outcome(db, chat, question_id, kind, *, card=None):
     return None
   fence_decisions(db)
   from app.questions import saved_question
-  card = card if card is not None else saved_question(chat, question_id)
   row = saved_decision(db, chat.id, question_id)
+  if row is None and card is None:
+    card = saved_question(chat, question_id)
   if row is None and card is not None:
     from app.chat_writer import _question_owner_run
     owner = _question_owner_run(db, chat, question_id)
@@ -92,17 +93,31 @@ def stage_decision_outcome(db, chat, question_id, kind, *, card=None):
     "question_id": question_id}
   if kind in {"answered", "closed_without_reply"} and card is not None:
     payload.update(_answer_payload(card))
+  _stamp_outcome(db, row, payload)
+  return row
+
+
+def _stamp_outcome(db, row, payload):
   row.outcome_json, row.resolved_at = payload, now_naive_utc()
   db.query(models.GoalDependency).filter(
     models.GoalDependency.target_kind == "owner_card",
-    models.GoalDependency.target_chat_id == chat.id,
-    models.GoalDependency.target_question_id == question_id,
+    models.GoalDependency.target_chat_id == row.chat_id,
+    models.GoalDependency.target_question_id == row.question_id,
     models.GoalDependency.resolved_at.is_(None),
     models.GoalDependency.result_disposition.is_(None),
     models.GoalDependency.withdrawn_at.is_(None),
   ).update({models.GoalDependency.outcome_json: payload,
             models.GoalDependency.resolved_at: row.resolved_at}, synchronize_session=False)
-  return row
+
+
+def stage_deleted_decision_rows(db, chat_id, title):
+  """Retention uses only canonical metadata, never hydrates old transcripts."""
+  fence_decisions(db)
+  for row in db.query(models.SavedDecisionCard).filter_by(chat_id=chat_id).filter(
+      models.SavedDecisionCard.resolved_at.is_(None)).all():
+    _stamp_outcome(db, row, {"kind": "source_deleted", "family": row.family,
+      "summary": row.summary, "source_chat_id": chat_id,
+      "source_chat_title": title or "Untitled chat", "question_id": row.question_id})
 
 
 def stage_delete_decisions(db, chat):
@@ -111,8 +126,7 @@ def stage_delete_decisions(db, chat):
   # Register the one legacy open source if it has not yet been followed.
   if chat.pending_question_id:
     stage_decision_outcome(db, chat, chat.pending_question_id, "source_deleted")
-  for row in db.query(models.SavedDecisionCard).filter_by(chat_id=chat.id).all():
-    stage_decision_outcome(db, chat, row.question_id, "source_deleted")
+  stage_deleted_decision_rows(db, chat.id, chat.title)
 
 
 def stage_wait_for_decision(db, *, chat_id, run_id, source_chat_id, question_id):
@@ -144,8 +158,8 @@ def stage_wait_for_decision(db, *, chat_id, run_id, source_chat_id, question_id)
     if not card.get("answers") and source.pending_question_id != question_id:
       raise ValueError("This old card has no durable disposition and is not open.")
     row = stage_saved_decision(db, source, card, source_goal_id=owner.goal_id if owner else None)
-  if card and card.get("answers"):
-    row = stage_decision_outcome(db, source, question_id, "answered", card=card)
+    if card.get("answers"):
+      row = stage_decision_outcome(db, source, question_id, "answered", card=card)
   if row.outcome_json is None and _direct_cycle(db, waiting_goal_id=goal.id,
       source_goal_id=row.source_goal_id):
     raise ValueError("This decision would create a self or direct Goal dependency cycle.")
