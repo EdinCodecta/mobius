@@ -1,6 +1,73 @@
 """Stored app identities and their bound manifest fetch addresses."""
 
+from dataclasses import dataclass
+from urllib.parse import unquote, urlparse
+
 MANIFEST_ID_MARKER = "#manifest-id="
+RAW_GITHUB_HOST = "raw.githubusercontent.com"
+
+
+@dataclass(frozen=True)
+class RootManifest:
+  """A package at the root of one GitHub repository, at one ref.
+
+  ``filename`` is ``"mobius.json"`` when the address names the manifest file
+  itself and ``None`` when it names the package base.
+  """
+
+  owner: str
+  repo: str
+  ref: str
+  filename: str | None
+
+  @property
+  def repository(self) -> tuple[str, str]:
+    """GitHub owner and repository names compare case-insensitively."""
+    return self.owner.lower(), self.repo.lower()
+
+  @property
+  def origin_url(self) -> str:
+    return f"https://github.com/{self.owner}/{self.repo}.git"
+
+
+def parse_root_manifest(url: str) -> RootManifest | None:
+  """The one parser for raw-GitHub package addresses.
+
+  Accepts ``https://raw.githubusercontent.com/<owner>/<repo>/<ref>`` with an
+  optional trailing ``/mobius.json``, ignoring any query or fragment (a stored
+  identity key carries one). The host compares case-insensitively and may name
+  the default port. Anything else is not a root package and returns None: a
+  manifest in a repository subdirectory, a ref containing a slash, another
+  file name, credentials, or an empty, dot, dash-leading, backslash or
+  encoded-slash segment.
+  """
+  if not isinstance(url, str) or not url:
+    return None
+  parsed = urlparse(url)
+  try:
+    port = parsed.port
+  except ValueError:
+    return None
+  if (
+    parsed.scheme.lower() != "https"
+    or parsed.hostname != RAW_GITHUB_HOST
+    or port not in (None, 443)
+    or parsed.username is not None
+    or parsed.password is not None
+  ):
+    return None
+  parts = [unquote(part) for part in parsed.path.split("/") if part]
+  filename = None
+  if len(parts) == 4 and parts[3] == "mobius.json":
+    filename = parts.pop()
+  if len(parts) != 3 or any(
+    part in ("", ".", "..") or part.startswith("-")
+    or "\\" in part or "/" in part  # `%2F` decodes to a slash.
+    for part in parts
+  ):
+    return None
+  owner, repo, ref = parts
+  return RootManifest(owner, repo, ref, filename)
 
 
 def canonical_manifest_base(url_or_base: str) -> str:

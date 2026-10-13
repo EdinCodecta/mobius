@@ -5415,8 +5415,7 @@ async def connect_published_app(
   candidate = await install.fetch_install_candidate(pinned_manifest_url)
   if (
     candidate.manifest.get("id") != spec.manifest_id
-    or install.install_candidate_content_digest(candidate)
-    != spec.package_digest
+    or candidate.source_review_digest != spec.package_digest
     or candidate.capability_digest != spec.capability_digest
   ):
     raise HTTPException(
