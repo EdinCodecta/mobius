@@ -25,7 +25,7 @@ def supported_family(card):
 
 def saved_decision(db, chat_id, question_id):
   """Read the persisted disposition; absence is unknown, never cancelled."""
-  return db.get(models.SavedDecisionCard, (chat_id, question_id))
+  return db.get(models.SavedDecisionCard, (chat_id, question_id), populate_existing=True)
 
 
 def stage_saved_decision(db, chat, card, *, source_goal_id=None):
@@ -81,7 +81,6 @@ def stage_decision_outcome(db, chat, question_id, kind, *, card=None):
     row = stage_saved_decision(db, chat, card, source_goal_id=owner.goal_id if owner else None)
   if row is None:
     return None
-  db.refresh(row)
   if row.outcome_json and (kind not in {"answered", "closed_without_reply"}
       or row.outcome_json.get("kind") in {"answered", "closed_without_reply"}):
     return row
@@ -144,15 +143,14 @@ def stage_wait_for_decision(db, *, chat_id, run_id, source_chat_id, question_id)
   source = db.query(models.Chat).filter_by(id=source_chat_id).populate_existing().first()
   if source is None or source.deleted_at is not None:
     raise ValueError("The decision's chat is missing or deleted.")
-  card = saved_question(source, question_id)
-  row = saved_decision(db, source.id, question_id)
-  if card is None and row is None:
-    raise ValueError("No saved decision with that question id exists in that chat.")
-  if card is not None and supported_family(card) is None:
-    raise ValueError("Restart and sealed secure-input cards cannot be followed.")
-  owner = _question_owner_run(db, source, question_id)
   row = saved_decision(db, source.id, question_id)
   if row is None:
+    card = saved_question(source, question_id)
+    if card is None:
+      raise ValueError("No saved decision with that question id exists in that chat.")
+    if supported_family(card) is None:
+      raise ValueError("Restart and sealed secure-input cards cannot be followed.")
+    owner = _question_owner_run(db, source, question_id)
     # Legacy adoption uses only explicit saved answer/open identity evidence.
     # Missing pending markers never become guessed cancellation dispositions.
     if not card.get("answers") and source.pending_question_id != question_id:
@@ -165,7 +163,7 @@ def stage_wait_for_decision(db, *, chat_id, run_id, source_chat_id, question_id)
     raise ValueError("This decision would create a self or direct Goal dependency cycle.")
   target_key = f"card:{source.id}:{question_id}"
   existing = db.query(models.GoalDependency).filter_by(
-    waiting_goal_id=goal.id, target_key=target_key).first()
+    waiting_goal_id=goal.id, target_key=target_key).populate_existing().first()
   if existing is not None:
     return existing
   count = db.query(models.GoalDependency).filter(

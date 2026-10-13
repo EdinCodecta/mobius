@@ -113,6 +113,8 @@ def test_previous_release_database_upgrades_to_current_orm(tmp_path):
     c["name"] for c in inspect(eng).get_columns("chat_runs")
   }
   assert "goal_dependencies" in inspect(eng).get_table_names()
+  assert "0091_saved_decision_cards" in {row["version"] for row in first_history}
+  assert "saved_decision_cards" in inspect(eng).get_table_names()
 
 
 @pytest.mark.parametrize("start", ["fresh", "schema_0013"])
@@ -1872,6 +1874,7 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0086_goal_execution_identity",
     "0089_wait_result_receipts",
     "0090_goal_dependencies",
+    "0091_saved_decision_cards",
   ]
   assert second == first
 

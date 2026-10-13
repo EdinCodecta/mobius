@@ -301,6 +301,11 @@ def test_run_bound_wait_for_decision_route_and_auth(db, chat, client, auth):
   assert response.json()["status"] == "waiting"
   assert response.json()["goal_id"] == "dependent-goal"
   assert "only to the card's own executor" in response.json()["next_action"]
+  deps.stage_retire_chat_dependencies(db, chat.id)
+  db.commit()
+  repeated = client.post("/api/chat-waits/decision", json=payload, headers=headers)
+  assert repeated.json()["status"] == "withdrawn"
+  assert "no new continuation" in repeated.json()["next_action"]
 
 
 def test_exact_answered_card_navigation_loads_older_card_not_new_pending_card(db, chat, client, auth):
@@ -367,3 +372,79 @@ def test_source_purge_drops_card_record_but_retains_dependent_answer(db, chat, m
   assert db.get(models.Chat, "source") is None
   assert saved_decision(db, "source", "choice") is None
   assert row.outcome_json["kind"] == "answered" and row.outcome_json["answers"] == {"q": "Not now"}
+
+
+def test_claim_follow_cannot_close_reverse_edge_through_a_saved_card(db, chat):
+  from app.agent_work_claims import claim_work
+  _setup(db, chat)
+  _follow(db, chat)
+  owner = db.query(models.Owner).first()
+  claim_work(db, owner_id=owner.id, chat_id=chat.id, run_id="dependent-run",
+    work_key="exact:action", summary="Own the action")
+  response = claim_work(db, owner_id=owner.id, chat_id="source", run_id="source-run",
+    work_key="exact:action", summary="Follow action")
+  assert response["follow_status"] == "direct_cycle"
+  assert db.query(models.GoalDependency).count() == 1
+
+
+def test_answer_commit_failure_rolls_back_source_disposition_and_dependent_outcome(db, chat, monkeypatch):
+  from app import chat_writer
+  _setup(db, chat)
+  row = _follow(db, chat)
+  def fail_commit(session):
+    session.rollback()
+    return False
+  monkeypatch.setattr(chat_writer, "_commit_or_rollback", fail_commit)
+  with pytest.raises(chat_writer._PersistFailed, match="AnswerQuestion did not persist"):
+    _answer()
+  db.expire_all()
+  assert row.resolved_at is None and row.outcome_json is None
+  assert saved_decision(db, "source", "choice").outcome_json is None
+  assert db.get(models.Chat, "source").pending_question_id == "choice"
+
+
+@pytest.mark.parametrize("already_following", [False, True])
+def test_preobserved_orm_state_cannot_hide_an_answer_committed_before_subscribe(db, chat, already_following):
+  _setup(db, chat)
+  stale_card = saved_decision(db, "source", "choice")
+  assert stale_card.outcome_json is None
+  previous = _follow(db, chat) if already_following else None
+  assert stale_card.outcome_json is None
+  if previous is not None:
+    assert previous.outcome_json is None
+  _answer()
+  # Deliberately retain the caller's pre-answer identity map, like a route
+  # that inspected the card before waiting on the registration graph fence.
+  assert stale_card.outcome_json is None
+  row = _follow(db, chat)
+  assert row.outcome_json["kind"] == "answered"
+  if previous:
+    assert row.id == previous.id
+
+
+@pytest.mark.parametrize("target", ["source", "dependent"])
+def test_project_delete_and_restore_do_not_lose_or_revive_card_dependencies(db, chat, client, auth, target):
+  source, _ = _setup(db, chat)
+  row = _follow(db, chat)
+  project = client.post("/api/projects", headers=auth,
+    json={"name": "Decision project", "template_id": "blank"}).json()
+  (source if target == "source" else chat).project_id = project["id"]
+  db.commit()
+  response = client.delete(f"/api/projects/{project['id']}", headers=auth)
+  assert response.status_code == 204, response.text
+  db.expire_all()
+  if target == "source":
+    assert row.outcome_json["kind"] == "source_deleted"
+  else:
+    assert row.result_disposition == "withdrawn" and row.received_run_id is None
+  # Recovery cannot erase the historical source disposition or revive a
+  # dependent subscription that deletion already retired.
+  from app import transcript_rows
+  before = dict(row.outcome_json or {})
+  receipt = response.headers["X-Recovery-Notification-Id"]
+  recovered = client.post(f"/api/projects/{project['id']}/recover", headers=auth,
+    json={"notification_id": receipt})
+  assert recovered.status_code == 200, recovered.text
+  db.expire_all()
+  assert not any("dependency-result" in str(message) for message in transcript_rows.history(chat))
+  assert row.outcome_json == before if target == "source" else row.withdrawn_at is not None

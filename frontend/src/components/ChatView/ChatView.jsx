@@ -536,7 +536,7 @@ export default function ChatView({
   const initialCacheEntryState = chatCacheEntryState(
     cached,
     initialActivationAnchorKey,
-    !searchReveal && savedReadingAnchorHasNestedPart(chatId),
+    !decisionAnchorKey && !searchReveal && savedReadingAnchorHasNestedPart(chatId),
   )
   const [loading, setLoading] = useState(
     provisionalNewChat ? false : initialCacheEntryState === 'missing',
@@ -5664,6 +5664,7 @@ export default function ChatView({
   useLayoutEffect(() => {
     const requestId = questionReveal?.id ?? (focusPendingQuestion ? 'deep-link' : null)
     if (!requestId || questionRevealConsumedRef.current === requestId) return
+    if (decisionQuestionId && !displayReady) return
     // Exact-card navigation may target an answered historical card. Never
     // redirect that request to whichever newer question is pending now.
     const exact = decisionQuestionId ? questionRevealElement(scrollRef.current, decisionQuestionId, null) : null
