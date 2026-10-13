@@ -252,7 +252,7 @@ def test_deleted_source_history_keeps_outcome_without_implying_receipt(db, chat)
   source.deleted_at = now_naive_utc()
   deps.stage_retire_goal_dependencies(db, chat.id, "dependent-goal")
   db.commit()
-  history = deps.goal_decision_history(db, db.get(models.ChatGoal, "dependent-goal"))
+  history = deps.goal_dependency_history(db, db.get(models.ChatGoal, "dependent-goal"))
   assert history[0]["source_deleted"] and history[0]["received_run_id"] is None
   assert history[0]["outcome"]["kind"] == "answered"
   assert history[0]["disposition"] == "retired_by_goal_outcome"

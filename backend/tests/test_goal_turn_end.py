@@ -317,9 +317,12 @@ async def test_second_unhanded_ending_preserves_goal_and_records_durable_recover
   db.expire_all()
   assert db.get(models.ChatGoal, "goal-run").status == "open"
   assert db.get(models.ChatRun, token).status == "failed"
-  assert any(block.get("code") == "goal_settlement_unfinished"
-             for message in transcript_rows.history(db.get(models.Chat, chat.id))
-             for block in message.get("blocks") or [])
+  notice = next(block for message in transcript_rows.history(db.get(models.Chat, chat.id))
+                for block in message.get("blocks") or []
+                if block.get("code") == "goal_settlement_unfinished")
+  assert notice["resumable"] is True
+  assert notice["message"] == "Work interrupted. Your progress is saved. This Goal is unfinished. Resume to continue."
+  assert "automatic settlement" not in notice["message"].lower()
 
 
 def test_resource_and_restart_recovery_cannot_reset_the_settlement_budget(db, chat):
@@ -349,7 +352,7 @@ def test_unknown_recovery_history_stays_closed_without_claiming_an_attempt(db, c
   db.commit()
   assert recovery_attempted(db, run, reason="goal_settlement") is True
   assert "after one recovery attempt" not in GOAL_SETTLEMENT_UNFINISHED_MESSAGE
-  assert "cannot safely continue" in GOAL_SETTLEMENT_UNFINISHED_MESSAGE
+  assert "This Goal is unfinished. Resume to continue." in GOAL_SETTLEMENT_UNFINISHED_MESSAGE
 
 
 @pytest.mark.asyncio

@@ -45,10 +45,8 @@ PRODUCT_RESULT_MESSAGE_KINDS = frozenset({
 PEER_MESSAGE_WAKE_KIND = "peer_message"
 
 GOAL_SETTLEMENT_UNFINISHED_MESSAGE = (
-  "The Goal is still unfinished: the agent ended without recording an "
-  "outcome or saving its next handoff. Automatic settlement cannot safely "
-  "continue. Resume to recover this execution; "
-  "the Goal has not been declared impossible."
+  "Work interrupted. Your progress is saved. "
+  "This Goal is unfinished. Resume to continue."
 )
 
 

@@ -114,21 +114,45 @@ def stage_dependency_results_delivered(db, chat_id, dependency_ids, *, run_id):
 
 
 def stage_retire_goal_dependencies(db, chat_id, goal_id):
-  return undisposed_dependencies(db).filter(
+  query = undisposed_dependencies(db).filter(
     models.GoalDependency.waiting_chat_id == chat_id,
     models.GoalDependency.waiting_goal_id == goal_id,
-  ).update({models.GoalDependency.result_disposition: "retired_by_goal_outcome",
+  )
+  _retain_source_context(db, query.all())
+  return query.update({models.GoalDependency.result_disposition: "retired_by_goal_outcome",
     models.GoalDependency.result_disposed_at: now_naive_utc()}, synchronize_session=False)
 
 
 def stage_retire_chat_dependencies(db, chat_id):
   """Deletion is permanent for pending/owed links, even if the chat is restored."""
   now = now_naive_utc()
-  return undisposed_dependencies(db).filter(
+  query = undisposed_dependencies(db).filter(
     models.GoalDependency.waiting_chat_id == chat_id,
-  ).update({models.GoalDependency.result_disposition: "withdrawn",
+  )
+  _retain_source_context(db, query.all())
+  return query.update({models.GoalDependency.result_disposition: "withdrawn",
     models.GoalDependency.result_disposed_at: now,
     models.GoalDependency.withdrawn_at: now}, synchronize_session=False)
+
+
+def _retain_source_context(db, rows):
+  """Non-waking retirement retains identity, never fabricates a source result.
+
+  Retired pending follows have no source outcome. Save only the safe identity
+  before source retention or reacquisition can erase it; an already-stamped
+  outcome wins. No kind/resolution/receipt is invented by this snapshot.
+  """
+  for row in rows:
+    if row.outcome_json is not None:
+      continue
+    summary = dependency_summary(db, row)
+    db.query(models.GoalDependency).filter(
+      models.GoalDependency.id == row.id, models.GoalDependency.resolved_at.is_(None),
+      models.GoalDependency.result_disposition.is_(None),
+    ).update({models.GoalDependency.outcome_json: {
+      "summary": summary["condition"], "source_chat_id": summary["source_chat_id"],
+      "source_chat_title": summary["source_chat_title"],
+    }}, synchronize_session=False)
 
 
 def selected_dependency_carrier(db, row):
@@ -202,27 +226,99 @@ def goal_dependency_handoffs(db, goal):
   return result
 
 
-def goal_decision_history(db, goal):
+def dependency_summary(db, row):
+  """Safe source identity shared by settled history and transcript receipts."""
+  outcome = row.outcome_json or {}
+  claim = db.get(models.AgentWorkClaim, row.target_claim_id) if row.target_claim_id else None
+  if claim is not None and claim.acquisition_id != row.target_acquisition_id:
+    claim = None
+  source_id = outcome.get("source_chat_id") or (claim.owner_chat_id if claim else row.target_chat_id)
+  source = db.get(models.Chat, source_id) if source_id else None
+  from app.decision_cards import saved_decision
+  card = saved_decision(db, source_id, row.target_question_id) if row.target_kind == "owner_card" else None
+  return {"id": row.id, "target_kind": row.target_kind,
+    "condition": outcome.get("summary") or (card.summary if card else None)
+      or (claim.summary if claim else "Shared work"),
+    "source_chat_id": source_id, "source_question_id": row.target_question_id,
+    "source_chat_title": (source.title if source else None) or outcome.get("source_chat_title") or "Deleted chat",
+    "source_deleted": source is None or source.deleted_at is not None,
+    "automatic": False, "delivery_pending": row.result_disposition is None,
+    "outcome": row.outcome_json, "disposition": row.result_disposition,
+    "result_disposition": row.result_disposition, "received_run_id": row.received_run_id}
+
+
+def goal_dependency_history(db, goal):
   rows = db.query(models.GoalDependency).filter(
     models.GoalDependency.waiting_goal_id == goal.id,
     models.GoalDependency.waiting_chat_id == goal.chat_id,
-    models.GoalDependency.target_kind == "owner_card",
     models.GoalDependency.result_disposition.is_not(None),
-  ).order_by(models.GoalDependency.created_at).all()
-  history = []
+  ).order_by(models.GoalDependency.created_at, models.GoalDependency.id).all()
+  return [dependency_summary(db, row) for row in rows]
+
+
+def terminal_dependency_summaries_by_message_index(db, chat_id, messages):
+  """A settled subscription stays beside its exact receiving or declaring turn.
+
+  Never guess a recipient from a timestamp or attach another Goal's result to
+  the newest answer. Paging uses the full coordinate index, like native Waits.
+  """
+  from app.goal_plans import assistant_message_run_id
+  by_run = {}
+  for index, message in enumerate(messages):
+    if isinstance(message, dict) and message.get("role") == "assistant" and not message.get("hidden"):
+      run_id = assistant_message_run_id(message.get("id"))
+      if run_id:
+        by_run.setdefault(run_id, index)
+  rows = db.query(models.GoalDependency).filter(
+    models.GoalDependency.waiting_chat_id == chat_id,
+    (models.GoalDependency.resolved_at.is_not(None)
+     | models.GoalDependency.result_disposition.is_not(None)),
+  ).order_by(models.GoalDependency.created_at, models.GoalDependency.id).all()
+  result = {}
   for row in rows:
-    outcome = row.outcome_json or {}
-    source = db.get(models.Chat, row.target_chat_id)
-    from app.decision_cards import saved_decision
-    card = saved_decision(db, row.target_chat_id, row.target_question_id)
-    history.append({"id": row.id, "target_kind": row.target_kind,
-      "condition": outcome.get("summary") or (card.summary if card else "Saved decision"),
-      "source_chat_id": row.target_chat_id, "source_question_id": row.target_question_id,
-      "source_chat_title": (source.title if source else None) or outcome.get("source_chat_title") or "Deleted chat",
-      "source_deleted": source is None or source.deleted_at is not None,
-      "automatic": False, "delivery_pending": False, "outcome": row.outcome_json,
-      "disposition": row.result_disposition, "received_run_id": row.received_run_id})
-  return history
+    index = by_run.get(row.received_run_id) if row.received_run_id else None
+    if index is None:
+      index = by_run.get(row.created_by_run_id)
+    if index is not None:
+      result.setdefault(index, []).append(dependency_summary(db, row))
+  return result
+
+
+def source_dependency_backlinks(db, source_chat_id, *, question_ids=(), goal_id=None):
+  """Quiet context for exact source cards or the Goal owning live acquisitions.
+
+  Live subscriptions only; closed/deleted dependents and historical acquisitions
+  must not imply a new request. Multiple Goals in one chat share one backlink.
+  """
+  from sqlalchemy import and_, or_
+  targets = []
+  if question_ids:
+    targets.append(and_(models.GoalDependency.target_kind == "owner_card",
+      models.GoalDependency.target_chat_id == source_chat_id,
+      models.GoalDependency.target_question_id.in_(question_ids)))
+  if goal_id:
+    claims = db.query(models.AgentWorkClaim.id, models.AgentWorkClaim.acquisition_id).filter(
+      models.AgentWorkClaim.owner_chat_id == source_chat_id,
+      models.AgentWorkClaim.owner_goal_id == goal_id,
+      models.AgentWorkClaim.completed_at.is_(None), models.AgentWorkClaim.released_at.is_(None),
+    ).all()
+    targets.extend(and_(models.GoalDependency.target_kind == "claim_acquisition",
+      models.GoalDependency.target_claim_id == claim.id,
+      models.GoalDependency.target_acquisition_id == claim.acquisition_id) for claim in claims)
+  if not targets:
+    return {}
+  rows = outstanding_dependencies(db).join(models.ChatGoal,
+    models.ChatGoal.id == models.GoalDependency.waiting_goal_id).join(models.Chat,
+    models.Chat.id == models.GoalDependency.waiting_chat_id).filter(
+      or_(*targets), models.ChatGoal.status.in_(("open", "stopped")),
+      models.ChatGoal.chat_id == models.Chat.id, models.Chat.deleted_at.is_(None),
+  ).with_entities(models.GoalDependency.target_kind, models.GoalDependency.target_question_id,
+    models.Chat.id, models.Chat.title).order_by(models.Chat.title, models.Chat.id).all()
+  result = {}
+  for row in rows:
+    key = row.target_question_id if row.target_kind == "owner_card" else goal_id
+    result.setdefault(key, {})[row.id] = {"chat_id": row.id, "title": row.title or "Untitled chat"}
+  return {key: list(chats.values()) for key, chats in result.items()}
 
 
 def safe_dependency_startup_orphan(db, chat, physical):

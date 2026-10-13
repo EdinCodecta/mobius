@@ -75,7 +75,7 @@ from app.chat_titles import (
 )
 from app.database import get_db
 from app.delegations import background_helper_chat_ids, serialize_background_helpers
-from app.goal_plans import presented_goal, presented_deferred_goals
+from app.goal_plans import presented_goal, presented_deferred_goals, presented_dependency_goals
 from app.helper_transcripts import read_helper_conversation
 from app.memory_observability import record_memory_checkpoint_once
 from app.owner_input import OwnerInputKind
@@ -726,6 +726,20 @@ def _chat_detail_response(
       projected_message["wait_summaries"] = summaries
       next_page[relative_index] = projected_message
     page = next_page
+  from app.goal_dependencies import (source_dependency_backlinks,
+    terminal_dependency_summaries_by_message_index)
+  question_ids = {block.get("question_id") for message in page
+    for block in (message.get("blocks") or []) if isinstance(block, dict) and block.get("type") == "question"}
+  backlinks = source_dependency_backlinks(db, chat.id, question_ids=question_ids) if expose_session else {}
+  dependency_summaries = terminal_dependency_summaries_by_message_index(db, chat.id, coordinates) if expose_session else {}
+  if backlinks or dependency_summaries:
+    page = [{**message,
+      **({"blocks": [{**block, "needed_by": backlinks[block["question_id"]]}
+        if isinstance(block, dict) and block.get("type") == "question" and block.get("question_id") in backlinks
+        else block for block in (message.get("blocks") or [])]} if backlinks else {}),
+      **({"wait_summaries": [*message.get("wait_summaries", []), *dependency_summaries[start + index]]}
+        if start + index in dependency_summaries else {}),
+    } for index, message in enumerate(page)]
   from app.continuations import recovery_reasons_by_message_index
   recovery_reasons = recovery_reasons_by_message_index(
     db, chat.id, coordinates, message_start=start, message_end=start + len(page),
@@ -819,6 +833,8 @@ def _chat_detail_response(
       if expose_session else {"count": 0, "items": []}
     ),
   }
+  if not expose_session and response["goal"]:
+    response["goal"].pop("needed_by", None)
   response["handoff"] = project_handoff(
     owner_input=bool(response["pending_question_id"]) or chat.id in secure_inputs.pending_chat_ids(),
     running=running,
@@ -941,6 +957,7 @@ def list_chats(
       "shell_chat_list_first_response",
       chat_count=len(chats),
     )
+  dependency_goals = presented_dependency_goals(db, (chat.id for chat in chats))
   deferred_goals = presented_deferred_goals(db, (chat.id for chat in chats))
   result = []
   for chat in chats:
@@ -957,7 +974,7 @@ def list_chats(
       waits=waits,
       helper_count=1 if chat.id in helper_chat_ids else 0,
       park=park,
-      goal=deferred_goals.get(chat.id),
+      goal=deferred_goals.get(chat.id) or dependency_goals.get(chat.id),
     )
     result.append(_owner_chat_summary(
       chat,
@@ -1844,6 +1861,7 @@ def get_chat_runtime(
     chat_id,
     principal,
     load_fields=(
+      models.Chat.deleted_at,
       models.Chat.pending_messages,
       models.Chat.pending_question_id,
       models.Chat.active_assistant_message_id,
@@ -1875,6 +1893,8 @@ def get_chat_runtime(
       if principal.scope != "chat_embed" else {"count": 0, "items": []}
     ),
   }
+  if principal.scope == "chat_embed" and response["goal"]:
+    response["goal"].pop("needed_by", None)
   response["handoff"] = project_handoff(
     owner_input=bool(response["pending_question_id"]) or chat.id in secure_inputs.pending_chat_ids(),
     running=running, waits=response["waits"],

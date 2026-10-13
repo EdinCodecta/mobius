@@ -482,6 +482,34 @@ def presented_deferred_goals(db: Session, chat_ids) -> dict[str, dict]:
   return result
 
 
+def presented_dependency_goals(db: Session, chat_ids) -> dict[str, dict]:
+  """Drawer handoffs for retained exact Goals with outstanding dependencies.
+
+  Avoid hydrating plans and unrelated chats. Native precedence remains owned by
+  the shared Goal handoff projection, not a second drawer-only source checker.
+  """
+  ids = list(chat_ids)
+  if not ids:
+    return {}
+  from app.goal_dependencies import outstanding_dependencies
+  owned = outstanding_dependencies(db).with_entities(models.GoalDependency.waiting_goal_id)
+  rows = _presented_goal_attempts(db, ids).join(models.ChatGoal,
+    (models.ChatGoal.id == models.ChatRun.goal_id)
+    & (models.ChatGoal.chat_id == models.ChatRun.chat_id),
+  ).filter(models.ChatGoal.id.in_(owned), models.ChatGoal.status.in_(("open", "stopped"))).with_entities(
+    models.ChatRun, models.ChatGoal,
+  ).options(defer(models.ChatGoal.plan_json)).all()
+  from dataclasses import asdict
+  from app.chat_handoffs import goal_handoffs
+  result = {}
+  for physical, goal in rows:
+    native = goal_handoffs(db, goal)
+    result[physical.chat_id] = {"id": goal.id,
+      "dependencies": [asdict(item) for item in native.dependencies],
+      "handoff": _goal_handoff(db, physical, goal, native=native)}
+  return result
+
+
 def _delegation_tree(
   db: Session, physical: models.ChatRun, root: models.ChatGoal,
   *, all_attempts: bool = False,
@@ -774,10 +802,14 @@ def _goal_presentation(
   from dataclasses import asdict
   if native.dependencies:
     presentation["dependencies"] = [asdict(item) for item in native.dependencies]
-  from app.goal_dependencies import goal_decision_history
-  history = goal_decision_history(db, root)
+  from app.goal_dependencies import goal_dependency_history
+  history = goal_dependency_history(db, root)
   if history:
     presentation["dependency_history"] = history
+  from app.goal_dependencies import source_dependency_backlinks
+  backlinks = source_dependency_backlinks(db, root.chat_id, goal_id=root.id).get(root.id)
+  if backlinks:
+    presentation["needed_by"] = backlinks
   presentation["plan"] = plan
   return presentation
 

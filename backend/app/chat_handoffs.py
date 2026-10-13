@@ -241,4 +241,9 @@ def project_handoff(*, owner_input: bool, running: bool, waits: list[dict],
   if goal and goal.get("pause_reason") == "deferred":
     return {"kind": "on_hold", "reason": "deferred", "goal_id": goal["id"],
             "hold_reason": goal["hold_reason"]}
+  if goal and goal.get("dependencies") and goal.get("handoff", {}).get("kind") in {"automatic", "recovery", "blocked", "owner_hold"}:
+    handoff = goal["handoff"]
+    if handoff["kind"] == "owner_hold":
+      return {"kind": "on_hold", "reason": "owner", "goal_id": goal["id"]}
+    return handoff
   return {"kind": "none", "reason": None}
