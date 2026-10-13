@@ -425,7 +425,7 @@ def check_listing_image(content: bytes, what: str) -> str:
   # Opening reads only the header, and the pixel limit below sits under
   # Pillow's decompression-bomb threshold, so no image is ever decoded here.
   try:
-    image = Image.open(io.BytesIO(content))
+    image = Image.open(io.BytesIO(content), formats=["PNG", "JPEG", "WEBP"])
     width, height = image.size
     image.verify()
   except Exception as exc:

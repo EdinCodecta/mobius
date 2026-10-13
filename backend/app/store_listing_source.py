@@ -144,13 +144,15 @@ def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
     _manifest_from(app_git.ref_file(root, accepted, "mobius.json")),
     _manifest_from(manifest_path.read_bytes() if manifest_path.is_file() else None),
   ]
-  # Listing saves write only PNG icons, so a code file can never pass as one.
-  icons = {"icon.png"} | {
+  # A listing save writes only its own hash-named art and a declared PNG icon,
+  # so nothing else under the art folder (a script, a hand-placed file) can
+  # ride along unreviewed.
+  icons = {
     str(manifest.get("icon") or "") for manifest in manifests
     if manifest is not None and str(manifest.get("icon") or "").endswith(".png")
   }
   for path in changed:
-    if path.startswith(f"{STORE_ART_DIR}/") or path in icons:
+    if _EDITOR_ART.fullmatch(path) or path in icons:
       continue
     if path == "mobius.json" and None not in manifests and (
       _listing_fields_removed(manifests[0]) == _listing_fields_removed(manifests[1])

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -259,10 +260,13 @@ def test_committed_listing_only_changes_may_ride_along(client, auth):
   source = _source()
   app_id = _create(client, auth, source)
   manifest = json.loads(_MANIFEST)
+  # What an interrupted save leaves: its own hash-named art and the PNG icon
+  # the manifest now declares.
   manifest["store"] = {"tagline": "Committed by hand."}
+  manifest["icon"] = "icon.png"
   (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
   (source / "static" / "store").mkdir(parents=True)
-  (source / "static" / "store" / "old.png").write_bytes(_png((3, 3, 3)))
+  (source / "static" / "store" / "0123456789abcdef.png").write_bytes(_png((3, 3, 3)))
   (source / "icon.png").write_bytes(_png((4, 4, 4)))
   app_git._run(source, "add", "-A")
   app_git._run(source, "commit", "-qm", "listing files only")
@@ -796,3 +800,31 @@ def test_listing_writes_stay_inside_editable_source(tmp_path, path):
 
   with pytest.raises(listing.ListingEditError):
     listing._SourceChanges(tmp_path).write(path, b"changed")
+
+
+def test_only_editor_art_and_the_declared_icon_ride_along_unreviewed(tmp_path):
+  """A listing save may carry its own hash-named art and declared PNG icon
+  only; any other file under the art folder, or an undeclared icon.png, is an
+  unreviewed edit."""
+  root = tmp_path / "app"
+  root.mkdir()
+  subprocess.run(["git", "init", "-q", str(root)], check=True)
+  (root / "mobius.json").write_text(json.dumps({"id": "demo", "icon": "assets/logo.svg"}))
+  subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+  subprocess.run(
+    ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t",
+     "commit", "-q", "-m", "accepted"], check=True,
+  )
+  accepted = app_git.head_sha(root, "HEAD")
+  art = root / "static" / "store"
+  art.mkdir(parents=True)
+
+  (art / "0123456789abcdef.png").write_bytes(b"png")
+  assert store_listing_source.has_unapplied_changes(root, accepted) is False
+
+  (art / "loader.js").write_text("alert(1)")
+  assert store_listing_source.has_unapplied_changes(root, accepted) is True
+  (art / "loader.js").unlink()
+
+  (root / "icon.png").write_bytes(b"png")
+  assert store_listing_source.has_unapplied_changes(root, accepted) is True
