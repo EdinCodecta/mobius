@@ -4307,6 +4307,67 @@ async def _activate_install_source(
   return equivalence_target
 
 
+async def install_requested_app(
+  db: Session,
+  *,
+  manifest_url: str | None,
+  manifest: dict | None = None,
+  raw_base: str | None = None,
+  reviewed_capability_digest: str | None = None,
+  reviewed_source_digest: str | None = None,
+  update_app_id: int | None = None,
+  reviewed_upstream_commit: str | None = None,
+) -> InstallResult:
+  """One owner-reviewed Store install or update, the same for every caller.
+
+  The install route and each entry of a server-owned update batch take this
+  one path. Network transfers (``fetch_app_commit`` for a reviewed update,
+  ``prepare_package`` for an install) finish before the lifecycle lock, so
+  one slow package never holds up other apps' installs, updates or
+  uninstalls. The local install then runs under that lock
+  (``fs_locks.install_uninstall_lock`` has the full rationale), and its
+  passes settle before a cancellation.
+  """
+  prepared = None
+  try:
+    if update_app_id is not None and reviewed_upstream_commit is not None:
+      reviewed = db.get(models.App, update_app_id)
+      reviewed_source = reviewed.source_dir if reviewed is not None else None
+      # Release the connection for the transfer, as update-check does.
+      db.rollback()
+      if reviewed_source is not None and app_git.is_repo(reviewed_source):
+        try:
+          await fetch_app_commit(reviewed_source, reviewed_upstream_commit)
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+          raise git_source_error(
+            "Refresh the update and try again.",
+            exc,
+            code="update_changed",
+            failure="The reviewed Git update is no longer available.",
+          ) from exc
+    elif update_app_id is None:
+      prepared = await prepare_package(
+        manifest_url, manifest, raw_base,
+        reviewed_capability_digest=reviewed_capability_digest, db=db,
+      )
+    async with fs_locks.install_uninstall_lock():
+      return await install_from_manifest(
+        db,
+        manifest_url=manifest_url,
+        manifest=manifest,
+        raw_base=raw_base,
+        source="store",
+        reviewed_capability_digest=reviewed_capability_digest,
+        reviewed_source_digest=reviewed_source_digest,
+        reviewed_app_id=update_app_id,
+        reviewed_upstream_commit=reviewed_upstream_commit,
+        prepared=prepared,
+      )
+  finally:
+    if prepared is not None:
+      await settled.run_settled(discard_staged, prepared.staged_clone)
+
+
 async def install_from_manifest(
   db: Session,
   manifest_url: str | None,
