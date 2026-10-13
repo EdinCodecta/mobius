@@ -467,8 +467,97 @@ def test_committed_art_with_metadata_is_flagged_and_cleaned_by_a_save(client, au
     screenshots=[{"path": "static/store/shot.jpg", "alt": "A"}],
   ))
   assert saved.status_code == 200, saved.text
-  assert not Image.open(source / "static" / "store" / "shot.jpg").getexif()
+  # Cleaned into a content-named copy, which a retry after a failed accept
+  # can carry; the author's own file is left for them to remove.
+  src = json.loads((source / "mobius.json").read_text())["store"]["screenshots"][0]["src"]
+  assert src != "static/store/shot.jpg" and src.endswith(".jpg")
+  assert not Image.open(source / src).getexif()
   assert _preview(client, auth, app_id)["ready"] is True
+
+
+@pytest.mark.parametrize("marker", [0xE3, 0xEB, 0xEF])
+def test_any_non_drawing_jpeg_segment_or_trailing_bytes_count_as_metadata(
+  client, auth, db, marker,
+):
+  source = _source()
+  app_id = _create(client, auth, source)
+  plain = io.BytesIO()
+  Image.new("RGB", (64, 40), (1, 120, 40)).save(plain, format="JPEG")
+  payload = b"c2pa provenance manifest"
+  segment = bytes([0xFF, marker]) + (len(payload) + 2).to_bytes(2, "big") + payload
+  for shot in (
+    plain.getvalue()[:2] + segment + plain.getvalue()[2:],
+    plain.getvalue() + b"appended after the image",
+  ):
+    (source / "static" / "store").mkdir(parents=True, exist_ok=True)
+    (source / "static" / "store" / "shot.jpg").write_bytes(shot)
+    manifest = json.loads((source / "mobius.json").read_text())
+    manifest["store"] = {
+      "tagline": "t", "description": "d",
+      "screenshots": [{"src": "static/store/shot.jpg", "alt": "A"}],
+    }
+    (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+    _commit_accepted(db, source, app_id, "agent-committed art")
+
+    assert _item(_preview(client, auth, app_id), "screenshots")["code"] == (
+      "listing_image_metadata"
+    )
+    saved = _save(client, auth, app_id, **_complete_listing(
+      screenshots=[{"path": "static/store/shot.jpg", "alt": "A"}],
+    ))
+    assert saved.status_code == 200, saved.text
+    src = json.loads((source / "mobius.json").read_text())["store"]["screenshots"][0]["src"]
+    stored = (source / src).read_bytes()
+    assert payload not in stored and b"appended" not in stored
+    assert _preview(client, auth, app_id)["ready"] is True
+
+
+def test_an_icon_with_location_data_is_flagged_and_cleaned_by_a_save(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  exif = Image.Exif()
+  exif[0x8825] = {1: "N", 2: (51.0, 30.0, 0.0)}
+  icon = io.BytesIO()
+  Image.new("RGB", (64, 64), (200, 40, 40)).save(icon, format="PNG", exif=exif)
+  (source / "icon.png").write_bytes(icon.getvalue())
+  _commit_accepted(db, source, app_id, "icon with GPS")
+
+  item = _item(_preview(client, auth, app_id), "icon")
+
+  assert item["code"] == "listing_image_metadata" and item["automatic"] is True
+  saved = _save(client, auth, app_id, **_complete_listing())
+  assert saved.status_code == 200, saved.text
+  assert not Image.open(source / "icon.png").getexif()
+  assert _preview(client, auth, app_id)["ready"] is True
+
+
+@pytest.mark.parametrize("style", ["inline", "compact"])
+def test_saving_changes_only_the_listing_in_the_manifest_text(client, auth, style):
+  source = _source()
+  manifest = json.loads(_MANIFEST)
+  manifest["categories"] = ["tools", "focus"]
+  manifest["permissions"] = {"notifications": True}
+  if style == "inline":
+    text = json.dumps(manifest, indent=2, ensure_ascii=False)
+    text = text.replace(
+      '"categories": [\n    "tools",\n    "focus"\n  ]', '"categories": ["tools", "focus"]',
+    ).replace(
+      '"permissions": {\n    "notifications": true\n  }', '"permissions": {"notifications": true}',
+    ) + "\n"
+    assert '"categories": ["tools", "focus"]' in text
+  else:
+    text = json.dumps(manifest, separators=(",", ":"), ensure_ascii=False)
+  (source / "mobius.json").write_text(text, encoding="utf-8")
+  app_id = _create(client, auth, source)
+
+  assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
+
+  saved = (source / "mobius.json").read_text(encoding="utf-8")
+  body = text.rstrip().removesuffix("}").rstrip()
+  assert saved.startswith(body)
+  assert json.loads(saved)["store"]["tagline"] == "Small and exact."
+  if style == "compact":
+    assert "\n" not in saved and ", " not in saved and '": ' not in saved
 
 
 def test_an_unexpected_image_error_is_a_checklist_item_not_a_crash(monkeypatch):
@@ -999,8 +1088,15 @@ def test_only_editor_art_and_the_declared_icon_ride_along_unreviewed(tmp_path):
   art = root / "static" / "store"
   art.mkdir(parents=True)
 
-  (art / f"{_content_name(b'png')}.png").write_bytes(b"png")
+  clean = _png((5, 6, 7))
+  (art / f"{_content_name(clean)}.png").write_bytes(clean)
   assert store_listing_source.has_unapplied_changes(root, accepted) is False
+  # Arbitrary bytes, or an image with hidden metadata, cannot pass as editor
+  # art even under the name their content hashes to.
+  for content in (b"not an image", _png((5, 6, 7)) + b"trailing"):
+    (art / f"{_content_name(content)}.png").write_bytes(content)
+    assert store_listing_source.has_unapplied_changes(root, accepted) is True
+    (art / f"{_content_name(content)}.png").unlink()
 
   (art / "loader.js").write_text("alert(1)")
   assert store_listing_source.has_unapplied_changes(root, accepted) is True

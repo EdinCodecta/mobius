@@ -102,13 +102,17 @@ def note_what_saving_fixes(checklist: list[dict], root: Path, app: models.App) -
   icon = items["icon"]
   # Only a save that can go ahead keeps the icon; one refused for missing
   # details or unapplied source changes fixes nothing.
-  if (
-    not icon["done"] and details.get("automatic") is not False
-    and record_icon_for_save(root, app) is not None
-    and not has_unapplied_changes(root, app.source_commit)
-  ):
+  if icon["done"] or details.get("automatic") is False:
+    return
+  if icon.get("code") == "listing_image_metadata":
+    message = "Saving the listing removes the icon's hidden metadata."
+  elif record_icon_for_save(root, app) is not None:
+    message = "Saving the listing keeps the app's current icon."
+  else:
+    return
+  if not has_unapplied_changes(root, app.source_commit):
     icon["automatic"] = True
-    icon["message"] = "Saving the listing keeps the app's current icon."
+    icon["message"] = message
 
 
 def _listing_fields_removed(manifest: dict) -> dict:
@@ -123,13 +127,19 @@ def _manifest_from(raw: bytes | None) -> dict | None:
   return manifest if isinstance(manifest, dict) else None
 
 
-def _named_by_content(root: Path, rel: str) -> bool:
-  """Whether editor art at ``rel`` is absent or holds the bytes its name hashes."""
+def _clean_editor_art(root: Path, rel: str) -> bool:
+  """Whether editor-named art is absent, or a clean image its name hashes."""
   target = root / rel
   if not target.is_file():
     return True
-  digest = hashlib.sha256(target.read_bytes()).hexdigest()[:16]
-  return PurePosixPath(rel).stem == digest
+  content = target.read_bytes()
+  if PurePosixPath(rel).stem != hashlib.sha256(content).hexdigest()[:16]:
+    return False
+  try:
+    check_listing_image(content, "listing image")
+  except CommunityPublicationError:
+    return False
+  return not listing_image_has_metadata(content)
 
 
 def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
@@ -164,7 +174,7 @@ def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
     and str(manifest.get("icon") or "").lower().endswith(".png")
   }
   for path in changed:
-    if path in icons or (_EDITOR_ART.fullmatch(path) and _named_by_content(root, path)):
+    if path in icons or (_EDITOR_ART.fullmatch(path) and _clean_editor_art(root, path)):
       continue
     if path == "mobius.json" and None not in manifests and (
       _listing_fields_removed(manifests[0]) == _listing_fields_removed(manifests[1])
@@ -269,8 +279,7 @@ def _place_art(
   re-saving the same upload is a no-op and reordering screenshots never
   overwrites another one. A kept file outside ``static/store/`` (an older
   listing layout) is copied into it; kept art that still carries metadata
-  (an agent committed it directly) is cleaned in place, or under a new
-  content name if the editor named it.
+  (an agent committed it directly) is cleaned into a new content-named file.
   """
   content = image.data if image.data is not None else _accepted_file(root, app, image.path)
   suffix = _image_suffix(content, what)
@@ -280,10 +289,7 @@ def _place_art(
   else:
     content = strip_listing_image_metadata(content)
     suffix = _image_suffix(content, what)
-    if kept and not _EDITOR_ART.fullmatch(image.path):
-      rel = image.path
-    else:
-      rel = f"{STORE_ART_DIR}/{hashlib.sha256(content).hexdigest()[:16]}{suffix}"
+    rel = f"{STORE_ART_DIR}/{hashlib.sha256(content).hexdigest()[:16]}{suffix}"
   target = _source_path(root, rel)
   if not (target.is_file() and target.read_bytes() == content):
     changes.write(rel, content)
@@ -322,6 +328,112 @@ def _referenced_art(store: object) -> set[str]:
   }
 
 
+def _skip_string(text: str, at: int) -> int:
+  at += 1
+  while text[at] != '"':
+    at += 2 if text[at] == "\\" else 1
+  return at + 1
+
+
+def _skip_value(text: str, at: int) -> int:
+  if text[at] == '"':
+    return _skip_string(text, at)
+  if text[at] in "{[":
+    depth = 0
+    while True:
+      if text[at] == '"':
+        at = _skip_string(text, at)
+        continue
+      if text[at] in "{[":
+        depth += 1
+      elif text[at] in "}]":
+        depth -= 1
+        if depth == 0:
+          return at + 1
+      at += 1
+  while text[at] not in ",}] \t\r\n":
+    at += 1
+  return at
+
+
+def _skip_space(text: str, at: int) -> int:
+  while text[at] in " \t\r\n":
+    at += 1
+  return at
+
+
+def _top_level_members(text: str) -> tuple[dict[str, tuple[int, int]], str, int]:
+  """Each top-level key's value span, the key separator, and the last value's end."""
+  at = _skip_space(text, 0) + 1
+  spans: dict[str, tuple[int, int]] = {}
+  separator, last_end = ": ", at
+  while text[at := _skip_space(text, at)] != "}":
+    key_end = _skip_string(text, at)
+    colon = _skip_space(text, key_end)
+    value = _skip_space(text, colon + 1)
+    if not spans:
+      separator = ":" + text[colon + 1:value].replace("\r", "").replace("\n", "")[:1]
+    # The last duplicate wins, as it does for json.loads.
+    spans[json.loads(text[at:key_end])] = (value, last_end := _skip_value(text, value))
+    at = _skip_space(text, last_end)
+    if text[at] == ",":
+      at += 1
+  return spans, separator, last_end
+
+
+def _spliced_manifest(original: str, manifest: dict, keys: tuple[str, ...]) -> str:
+  """``original`` with only the top-level ``keys`` replaced or added.
+
+  Everything else stays byte for byte, inline arrays and compact styles
+  included, so a save's diff is the listing alone. Falls back to a whole
+  rewrite in the file's own layout if the result would not parse back.
+  """
+  try:
+    spans, separator, last_end = _top_level_members(original)
+    newline = "\r\n" if "\r\n" in original else "\n"
+    match = re.match(r"\{[ \t]*\r?\n([ \t]+)\S", original)
+    indent = match.group(1) if match else None
+    ascii_only = "\\u" in original and original.isascii()
+
+    def value_text(value: object) -> str:
+      text = json.dumps(
+        value, ensure_ascii=ascii_only, indent=indent,
+        separators=("," if indent is not None or separator == ":" else ", ", separator),
+      )
+      return text.replace("\n", newline + indent) if indent is not None else text
+
+    edits = [
+      (*spans[key], value_text(manifest[key])) for key in keys if key in spans
+    ]
+    added = "".join(
+      ("," + newline + indent if indent is not None else ("," if separator == ":" else ", "))
+      + json.dumps(key) + separator + value_text(manifest[key])
+      for key in keys if key not in spans
+    )
+    if added:
+      edits.append((last_end, last_end, added))
+    text = original
+    for start, end, replacement in sorted(edits, reverse=True):
+      text = text[:start] + replacement + text[end:]
+    if json.loads(text) == manifest:
+      return text
+  except (IndexError, ValueError):
+    pass
+  return _manifest_text(manifest, original)
+
+
+def _icon_with_metadata(root: Path, declared: str) -> bytes | None:
+  """The declared icon's bytes if it is a listing image with hidden metadata."""
+  if not declared:
+    return None
+  try:
+    content = _source_path(root, declared).read_bytes()
+    check_listing_image(content, "app icon")
+    return content if listing_image_has_metadata(content) else None
+  except (OSError, ListingEditError, CommunityPublicationError):
+    return None
+
+
 def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[], None]:
   """Write ``edit`` into the app source at ``root`` and return its undo."""
   if len(edit.screenshots) > MAX_STORE_SCREENSHOTS:
@@ -356,12 +468,16 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
         edit.icon.data if edit.icon.data is not None
         else _accepted_file(root, app, edit.icon.path)
       )
+    elif (declared := _icon_with_metadata(root, declared_icon)) is not None:
+      # The icon is published as it is; normalizing it drops hidden metadata.
+      icon_bytes = declared
+    else:
+      icon_bytes = record_icon_for_save(root, app)
+    if icon_bytes is not None and declared_icon:
       # Normalized icons are PNG; never write PNG bytes under another suffix,
       # nor over content-addressed listing art the icon may share a file with.
       if not icon_rel.lower().endswith(".png") or icon_rel.startswith(f"{STORE_ART_DIR}/"):
         icon_rel = "icon.png"
-    else:
-      icon_bytes = record_icon_for_save(root, app)
     if icon_bytes is not None:
       try:
         changes.write(icon_rel, icon_assets.normalize_icon(icon_bytes))
@@ -396,7 +512,10 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     if has_icon:
       manifest["icon"] = icon_rel
     manifest["store"] = store
-    changes.write("mobius.json", _manifest_text(manifest, original).encode("utf-8"))
+    changes.write(
+      "mobius.json",
+      _spliced_manifest(original, manifest, ("icon", "store")).encode("utf-8"),
+    )
 
     # Listing art the icon still uses is not stale, and only the editor's own
     # content-addressed files are removed.

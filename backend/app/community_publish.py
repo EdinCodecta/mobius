@@ -473,7 +473,10 @@ _PNG_KEPT_CHUNKS = {
   b"acTL", b"fcTL", b"fdAT",
 }
 _WEBP_KEPT_CHUNKS = {b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ANIM", b"ANMF", b"ICCP"}
-_JPEG_PRIVATE_SEGMENTS = {0xE1, 0xED, 0xFE}  # EXIF/XMP, IPTC, comment
+# Tables, frame headers, restart intervals and scans: what draws a JPEG.
+_JPEG_DRAWING_MARKERS = {0xC4, 0xCC, 0xDA, 0xDB, 0xDD} | {
+  marker for marker in range(0xC0, 0xD0) if marker not in {0xC4, 0xC8, 0xCC}
+}
 _EXIF_ORIENTATION = 0x0112
 
 
@@ -509,16 +512,43 @@ def _webp_chunks_kept(content: bytes) -> bytes:
   return b"RIFF" + len(body).to_bytes(4, "little") + body
 
 
-def _jpeg_has_private_segments(content: bytes) -> bool:
-  at = 2
-  while at + 4 <= len(content) and content[at] == 0xFF:
-    marker = content[at + 1]
-    if marker == 0xDA:  # Image data follows; metadata segments come before it.
-      return False
-    if marker in _JPEG_PRIVATE_SEGMENTS:
+def _jpeg_drawing_segment(marker: int, payload: bytes) -> bool:
+  return (
+    marker in _JPEG_DRAWING_MARKERS
+    or (marker == 0xE0 and payload.startswith(b"JFIF\0"))
+    or (marker == 0xE2 and payload.startswith(b"ICC_PROFILE\0"))
+    or (marker == 0xEE and payload.startswith(b"Adobe"))
+  )
+
+
+def _jpeg_has_metadata(content: bytes) -> bool:
+  """Whether a JPEG holds any segment that does not draw it, or trailing bytes.
+
+  An allow-list: EXIF, XMP, comments, C2PA and any unknown APPn segment
+  count as metadata, as does anything after the end-of-image marker.
+  """
+  size, at = len(content), 2
+  while at + 1 < size:
+    if content[at] != 0xFF:
       return True
-    at += 2 + int.from_bytes(content[at + 2:at + 4], "big")
-  return False
+    marker = content[at + 1]
+    if marker == 0xFF:  # Fill byte before a marker.
+      at += 1
+      continue
+    if marker == 0xD9:
+      return at + 2 != size
+    length = int.from_bytes(content[at + 2:at + 4], "big")
+    if not _jpeg_drawing_segment(marker, content[at + 4:at + 2 + length]):
+      return True
+    at += 2 + length
+    if marker == 0xDA:
+      # Entropy-coded data runs to the next marker; 0xFF is only ever
+      # followed there by a stuffed zero or a restart marker.
+      while at + 1 < size and not (
+        content[at] == 0xFF and content[at + 1] != 0 and not 0xD0 <= content[at + 1] <= 0xD7
+      ):
+        at += 1
+  return True  # No end-of-image marker.
 
 
 def listing_image_has_metadata(content: bytes) -> bool:
@@ -529,7 +559,7 @@ def listing_image_has_metadata(content: bytes) -> bool:
     return _png_chunks_kept(content) != content
   if image_format == "WEBP":
     return _webp_chunks_kept(content) != content
-  return image_format == "MPO" or _jpeg_has_private_segments(content)
+  return image_format == "MPO" or _jpeg_has_metadata(content)
 
 
 def strip_listing_image_metadata(content: bytes) -> bytes:
@@ -662,6 +692,17 @@ def _listing_text(store: dict, field: str, label: str, maximum: int) -> str:
   return value
 
 
+def _clean_listing_image(content: bytes, label: str) -> None:
+  """Apply the image rule, then refuse hidden metadata publishing would expose."""
+  check_listing_image(content, label)
+  if listing_image_has_metadata(content):
+    raise CommunityPublicationError(
+      f"The {label} carries camera, location or other hidden metadata that "
+      "publishing would make public. Saving the listing again removes it.",
+      "listing_image_metadata",
+    )
+
+
 def _listing_asset(value: object, label: str, by_path: dict[str, dict]) -> str:
   source = value.strip() if isinstance(value, str) else ""
   if not source:
@@ -677,14 +718,7 @@ def _listing_asset(value: object, label: str, by_path: dict[str, dict]) -> str:
       f"The {label} must be saved under static/store/. Saving the listing "
       "again copies it there.",
     )
-  content = _file_bytes(by_path[source])
-  check_listing_image(content, label)
-  if listing_image_has_metadata(content):
-    raise CommunityPublicationError(
-      f"The {label} carries camera, location or other hidden metadata that "
-      "publishing would make public. Saving the listing again removes it.",
-      "listing_image_metadata",
-    )
+  _clean_listing_image(_file_bytes(by_path[source]), label)
   return source
 
 
@@ -803,7 +837,7 @@ def store_listing_review(
     source = str(manifest.get("icon") or "").strip()
     if not source or source not in by_path:
       raise _incomplete("Add an app icon.")
-    check_listing_image(_file_bytes(by_path[source]), "app icon")
+    _clean_listing_image(_file_bytes(by_path[source]), "app icon")
     return source
 
   check("icon", icon)
@@ -937,14 +971,8 @@ def _blob(repo: Path, entry: _PublicTreeEntry) -> bytes:
   return content
 
 
-def read_accepted_file(app: models.App, path: str, *, max_bytes: int) -> bytes | None:
-  """One regular file of the app's accepted revision, or None if it has none.
-
-  The editable worktree can also hold ignored or generated files that were
-  never accepted source, so anything that may become public reads from here.
-  """
-  repo = Path(app.source_dir)
-  commit = _accepted_commit(app, repo)
+def _tree_entry(repo: Path, commit: str, path: str) -> _PublicTreeEntry | None:
+  """One regular file of ``commit``, looked up by path alone."""
   listing = _git(repo, "ls-tree", "-l", "-z", commit, "--", path, binary=True)
   assert isinstance(listing, bytes)
   for raw_entry in listing.split(b"\0"):
@@ -954,14 +982,25 @@ def read_accepted_file(app: models.App, path: str, *, max_bytes: int) -> bytes |
     mode, object_type, oid, size = metadata.decode("ascii").split()
     if object_type != "blob" or mode not in {"100644", "100755"}:
       return None
-    if int(size) > max_bytes:
-      raise CommunityPublicationError(
-        f"{path} is larger than {max_bytes} bytes.", "payload_too_large", 413,
-      )
-    content = _git(repo, "cat-file", "blob", oid, binary=True)
-    assert isinstance(content, bytes)
-    return content
+    return _PublicTreeEntry(path=path, mode=mode, oid=oid, size=int(size))
   return None
+
+
+def read_accepted_file(app: models.App, path: str, *, max_bytes: int) -> bytes | None:
+  """One regular file of the app's accepted revision, or None if it has none.
+
+  The editable worktree can also hold ignored or generated files that were
+  never accepted source, so anything that may become public reads from here.
+  """
+  repo = Path(app.source_dir)
+  entry = _tree_entry(repo, _accepted_commit(app, repo), path)
+  if entry is None:
+    return None
+  if entry.size > max_bytes:
+    raise CommunityPublicationError(
+      f"{path} is larger than {max_bytes} bytes.", "payload_too_large", 413,
+    )
+  return _blob(repo, entry)
 
 
 def read_public_store_asset(
@@ -983,19 +1022,18 @@ def read_public_store_asset(
       409,
     )
   _validate_path(asset_path)
-  entries, _ = _public_tree_entries(repo, commit)
-  by_path = {entry.path: entry for entry in entries}
+  # Two path lookups, not a listing of the whole tree under the source lock.
   manifest: object = {}
-  manifest_entry = by_path.get("mobius.json")
+  manifest_entry = _tree_entry(repo, commit, "mobius.json")
   if manifest_entry is not None and manifest_entry.size <= MANIFEST_MAX_BYTES:
     try:
       manifest = json.loads(_blob(repo, manifest_entry))
     except ValueError:
       manifest = {}
-  entry = by_path.get(asset_path)
+  entry = _tree_entry(repo, commit, asset_path)
   if (
     entry is None or not isinstance(manifest, dict)
-    or asset_path not in listing_draft_assets(manifest, by_path)
+    or asset_path not in listing_draft_assets(manifest, {asset_path: entry})
     or entry.size > STORE_LISTING_IMAGE_MAX_BYTES
   ):
     raise CommunityPublicationError(
