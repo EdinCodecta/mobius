@@ -145,6 +145,14 @@ def _retain_source_context(db, rows):
   for row in rows:
     if row.outcome_json is not None:
       continue
+    if row.target_kind == "claim_acquisition":
+      claim = db.get(models.AgentWorkClaim, row.target_claim_id)
+      if claim is None or claim.acquisition_id != row.target_acquisition_id:
+        continue
+    else:
+      from app.decision_cards import saved_decision
+      if saved_decision(db, row.target_chat_id, row.target_question_id) is None:
+        continue
     summary = dependency_summary(db, row)
     db.query(models.GoalDependency).filter(
       models.GoalDependency.id == row.id, models.GoalDependency.resolved_at.is_(None),
