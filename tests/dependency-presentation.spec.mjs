@@ -130,6 +130,38 @@ for (const width of [390, 960]) test(`short and long receipts fill the real assi
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
   if (process.env.MOBIUS_PRESENTATION_SCREENS) {
     await mkdir(process.env.MOBIUS_PRESENTATION_SCREENS, { recursive: true })
+    // Shell overflow containment is real CSS; give this fixture's full content
+    // enough viewport height rather than clipping the last recovery action.
+    const height = await page.locator('main').evaluate(el => Math.ceil(el.scrollHeight + el.offsetTop + 24))
+    await page.setViewportSize({ width, height: Math.max(1100, height) })
     await page.screenshot({ path: join(process.env.MOBIUS_PRESENTATION_SCREENS, `final-${width}.png`), fullPage: true })
   }
+})
+
+
+test('stop following confirms, cancels and retries without touching the source card', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await open(page)
+  const details = page.getByRole('region', { name: 'Dependent Goal' })
+  const stop = details.getByRole('button', { name: /^Stop following:/ })
+  await stop.focus(); await page.keyboard.press('Enter')
+  await expect(details).toContainText('Your Goal stays unfinished')
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  expect(await page.evaluate(() => window.withdrawals)).toEqual([])
+  await details.getByRole('button', { name: 'Keep following' }).click()
+  await expect(stop).toBeVisible()
+  await stop.click()
+  await page.evaluate(() => { window.failWithdrawal = true })
+  const confirm = details.getByRole('button', { name: /^Confirm stop following:/ })
+  await confirm.focus(); await page.keyboard.press('Enter')
+  await expect(details.getByRole('alert')).toHaveText('Could not stop following. Try again.')
+  await expect(confirm).toBeEnabled()
+  await page.evaluate(() => { window.failWithdrawal = false })
+  await confirm.click()
+  await expect(details).toContainText('You stopped following this')
+  await expect(details.getByRole('button', { name: /following/ })).toHaveCount(0)
+  await expect(details).not.toContainText('Continues automatically')
+  expect(await page.evaluate(() => window.withdrawals)).toEqual(['d', 'd'])
+  await expect(page.locator('.qcard')).not.toHaveClass(/qcard--answered/)
+  await expect(details.getByRole('link', { name: /^Open decision/ })).toBeVisible()
 })

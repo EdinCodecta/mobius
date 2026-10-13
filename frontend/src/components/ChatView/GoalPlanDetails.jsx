@@ -1,6 +1,7 @@
 /* GoalPlanDetails renders the expanded dependency-aware todo list. */
 import DependencyBacklinks from './DependencyBacklinks.jsx'
 import DependencyLink from './DependencyLink.jsx'
+import StopFollowingAction from './StopFollowingAction.jsx'
 
 import { Check, Clock } from '@openai/apps-sdk-ui/components/Icon'
 import { goalTaskDisplayStatus, goalDependencyOutcomeLabel } from './goalProgress'
@@ -92,7 +93,7 @@ function GoalPlanRow({ title, status, meta, depth, emphasized, children }) {
   )
 }
 
-export default function GoalPlanDetails({ plan, holdReason = null, dependencies = [], dependencyHistory = [], neededBy = [], onInternalNav }) {
+export default function GoalPlanDetails({ plan, holdReason = null, dependencies = [], dependencyHistory = [], neededBy = [], onInternalNav, onStopFollowing }) {
   const reason = typeof holdReason === 'string' ? holdReason.trim() : ''
   const tasks = Array.isArray(plan?.tasks) ? plan.tasks : []
   if (!tasks.length && !plan?.delegations?.length && !reason && !dependencies.length && !dependencyHistory.length && !neededBy.length) return null
@@ -139,7 +140,10 @@ export default function GoalPlanDetails({ plan, holdReason = null, dependencies 
             <Clock width={14} height={14} aria-hidden="true" />
             <span className="chat__goal-task-copy">
               <span className="chat__goal-task-title">{dependency.condition}</span>
-              <DependencyLink dependency={dependency} onInternalNav={onInternalNav} />
+              <span className="chat__dependency-actions">
+                <DependencyLink dependency={dependency} onInternalNav={onInternalNav} />
+                {!settled && onStopFollowing && <StopFollowingAction dependency={dependency} onStopFollowing={onStopFollowing} />}
+              </span>
               <span className="chat__goal-task-meta">{dependency.outcome || settled
                 ? goalDependencyOutcomeLabel(dependency)
                 : dependency.source_deleted ? 'The chat was deleted'

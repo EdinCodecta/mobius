@@ -4933,3 +4933,8 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 .chat__dependency-backlinks a:focus-visible,
 .chat__dependency-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
 .chat__dependency-history-detail { margin: 6px 0 0 38px; font-size: 12px; }
+
+.chat__dependency-actions { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.chat__dependency-stop { display: flex; flex-direction: column; gap: 4px; }
+button.chat__dependency-link { cursor: pointer; background: none; border: 0; text-align: left; }
+button.chat__dependency-link:disabled { cursor: default; opacity: .55; }

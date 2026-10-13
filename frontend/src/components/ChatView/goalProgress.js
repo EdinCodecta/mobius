@@ -82,6 +82,7 @@ export function normalizeGoalPresentation(goal) {
 
 /** A dependency outcome is a saved fact, never permission or a Goal outcome. */
 export function goalDependencyOutcomeLabel(dependency) {
+  if ((dependency?.disposition || dependency?.result_disposition) === 'withdrawn') return 'You stopped following this'
   const kind = dependency?.outcome?.kind
   const answer = Object.values(dependency?.outcome?.answers || {}).filter(value => typeof value === 'string').join(' · ')
   if (kind === 'answered' || kind === 'closed_without_reply') {
@@ -91,7 +92,7 @@ export function goalDependencyOutcomeLabel(dependency) {
     cancelled: 'Stopped', superseded: 'Replaced', source_deleted: 'The chat was deleted',
     completed: 'Work completed', released: 'Work handed back', owner_deleted: 'The chat was deleted',
     owner_not_progressing: 'Work interrupted',
-  }[kind] || (dependency?.disposition === 'withdrawn' ? 'Stopped following' : 'Waiting ended with this Goal')
+  }[kind] || 'Waiting ended with this Goal'
   const detail = dependency?.outcome?.outcome
   return detail ? `${label} · ${detail}` : label
 }

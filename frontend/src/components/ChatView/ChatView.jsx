@@ -4161,6 +4161,20 @@ export default function ChatView({
       .finally(() => { submitSteerInFlightRef.current = false })
   }
 
+  const handleStopFollowing = useCallback(async (dependencyId) => {
+    const res = await apiFetch(`/chat-waits/dependencies/${encodeURIComponent(dependencyId)}/withdraw`, {
+      method: 'POST', timeoutMs: CHAT_FETCH_TIMEOUT_MS,
+    })
+    if (!res.ok) {
+      let data = null
+      try { data = await res.json() } catch { /* use the fallback below */ }
+      throw new Error(typeof data?.detail === 'string' ? data.detail : 'Could not stop following. Try again.')
+    }
+    // No optimistic deletion: the committed result/history and remaining Goal
+    // ownership arrive together, including Resume when no handoff remains.
+    await fetchMessages({ force: true, authoritative: true })
+  }, [fetchMessages])
+
   // Goal clearing is lifecycle control, never chat content. The rail confirms
   // first, then this exact-id request dismisses completed work without
   // interrupting its final response; unfinished Goals still stop through the
@@ -5843,6 +5857,7 @@ export default function ChatView({
         ? { details: <GoalPlanDetails
             plan={goalPresentation?.plan}
             dependencies={goalPresentation?.dependencies}
+            onStopFollowing={!embedded ? handleStopFollowing : undefined}
             dependencyHistory={goalPresentation?.dependency_history}
             neededBy={goalPresentation?.needed_by}
             onInternalNav={internalNav}

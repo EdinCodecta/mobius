@@ -120,3 +120,16 @@ test('deleted chat receipt states its outcome once without an empty disclosure',
   assert.equal(visible.split('The chat was deleted').length - 1, 1)
   assert.doesNotMatch(html, /<details|<a /)
 })
+
+
+test('only active owner details expose a quiet exact-edge stop control', () => {
+  const dependency = { id: 'd', condition: 'Repair host', target_kind: 'claim_acquisition', source_chat_id: 'repair', source_chat_title: 'Repair' }
+  const html = render(h(Details, { dependencies: [dependency], onStopFollowing: () => {} }))
+  assert.match(html, /aria-label="Stop following: Repair host"/)
+  assert.match(html, /chat__dependency-actions/)
+  assert.doesNotMatch(render(h(Details, { dependencies: [dependency] })), /Stop following/)
+  assert.doesNotMatch(render(h(Details, { dependencyHistory: [{ ...dependency, disposition: 'delivered' }], onStopFollowing: () => {} })), /Stop following/)
+  const withdrawn = render(h(History, { summary: { ...dependency, disposition: 'withdrawn', outcome: { kind: 'answered', answers: { q: 'Not now' } } } }))
+  assert.match(withdrawn, /You stopped following this/)
+  assert.doesNotMatch(withdrawn, /You chose|Continues automatically/)
+})

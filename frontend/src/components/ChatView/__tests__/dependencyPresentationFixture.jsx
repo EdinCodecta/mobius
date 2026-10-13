@@ -1,5 +1,5 @@
 /* Backend-free mounted production surfaces for dependency lifecycle regressions. */
-import React from 'react'
+import React, { useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import '../../../index.css'
 import '../ChatView.css'
@@ -17,8 +17,16 @@ const chats = [{ chat_id: 'dependent', title: 'Finish the blocked update' }, { c
 const dependency = { id: 'd', target_kind: 'owner_card', condition: 'Choose the exact release to install after preserving local work and checking the host', source_chat_id: 'source', source_question_id: 'choice', source_chat_title: 'Restart and update recovery', automatic: true }
 window.navigations = []
 window.resumes = 0
+window.withdrawals = []
+window.failWithdrawal = false
 const navigate = url => window.navigations.push(url.href)
 function Fixture({ held = false, receiptCondition = dependency.condition, wrapped = false, kind = 'owner_card', comparisons = false } = {}) {
+  const [withdrawn, setWithdrawn] = useState(false)
+  const stopFollowing = async id => {
+    window.withdrawals.push(id)
+    if (window.failWithdrawal) throw new Error('Could not stop following. Try again.')
+    setWithdrawn(true)
+  }
   const active = { ...dependency, target_kind: kind, automatic: !held, resume_blocker: held ? 'goal_held' : null }
   const receipt = <WaitHistoryCard onInternalNav={navigate} summary={{ ...active, condition: receiptCondition,
     disposition: 'delivered', result_disposition: 'delivered', received_run_id: 'received',
@@ -33,7 +41,7 @@ function Fixture({ held = false, receiptCondition = dependency.condition, wrappe
     <QuestionCard chatId="source" questionId="choice" questions={[{ question: 'Which release should we install?', options: [{ id: 'later', label: 'Not now' }] }]} neededBy={chats} onInternalNav={navigate} />
     <section aria-label="Dependent Goal" style={{ marginTop: 12 }}><ProgressRail ariaLabel="Goal progress" items={[{
       key: 'goal', label: 'Waiting · Finish the blocked update', icon: <Flag width={14} height={14} aria-hidden="true" />, expandable: true,
-      details: <GoalPlanDetails dependencies={[active]} onInternalNav={navigate} />,
+      details: <GoalPlanDetails dependencies={withdrawn ? [] : [active]} dependencyHistory={withdrawn ? [{ ...active, disposition: 'withdrawn' }] : []} onInternalNav={navigate} onStopFollowing={stopFollowing} />,
     }]} /></section>
     <div className="chat__msg chat__msg--assistant" data-testid="receipt">
       {wrapped ? <div className="chat__answer-cause">{receipt}</div> : receipt}
