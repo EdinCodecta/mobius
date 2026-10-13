@@ -101,6 +101,7 @@
     "0086_goal_execution_identity": "8cfac7d944e80b08f47d21d393401ac5211ed3560e196b4ef14d0efd04e1ea2e",
     "0089_wait_result_receipts": "a2ab3b4fb8dde477ac70a239b0ff63719d0470ab3cbe84b3a3fbc85b2042ffe4",
     "0090_goal_dependencies": "48515ad996c5ff79b49fcce765afd2bd312e1f5c94350b309924927e625ea5ab",
-    "0091_saved_decision_cards": "02419fbb4f6e0df6fd041aea007a70a0df31dee27e7d3d182d1dff96b6ad03dd"
+    "0091_saved_decision_cards": "02419fbb4f6e0df6fd041aea007a70a0df31dee27e7d3d182d1dff96b6ad03dd",
+    "0092_transfer_notice_revision": "4e8eb96f2d170a494c582008cbf4a1b202f212e9e08ebac8262a629242ee3412"
   }
 }

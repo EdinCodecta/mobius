@@ -1628,6 +1628,7 @@ class AgentWorkClaim(Base):
   notification_revision = Column(
     Integer, nullable=False, default=1, server_default="1"
   )
+  transfer_notice_revision = Column(Integer, nullable=True)
   claimed_at = Column(DateTime, nullable=False, default=now_naive_utc)
   updated_at = Column(DateTime, nullable=False, default=now_naive_utc)
   released_at = Column(DateTime, nullable=True)

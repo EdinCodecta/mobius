@@ -141,3 +141,39 @@ def test_upgrade_startup_reconcile_delivery_never_wakes_legacy_but_new_follow_wo
     assert session.query(models.GoalDependency).count() == 1
     assert session.query(models.AgentWorkInterest).count() == 4
     session.commit()
+
+
+@pytest.mark.parametrize("foreign_keys", [False, True])
+def test_retired_audit_rows_have_no_guarantee_beyond_chat_purge(tmp_path, foreign_keys):
+  """Keep the existing FK policy; retained rows never become runtime follows."""
+  eng = create_engine(f"sqlite:///{tmp_path / 'audit.db'}")
+  models.Base.metadata.create_all(eng)
+  with Session(eng) as db:
+    db.add(models.Owner(id=1, username="owner", hashed_password="unused"))
+    db.add(create_chat(id="audit-chat", title="Old", messages=[]))
+    db.add(models.AgentWorkClaim(id="audit-claim", owner_id=1,
+      work_key="audit:work", summary="Work", owner_run_id="old-run"))
+    db.commit()
+    db.add(models.AgentWorkInterest(id="audit-row", claim_id="audit-claim",
+      chat_id="audit-chat", goal_id="old-goal"))
+    db.commit()
+  with eng.connect() as conn:
+    conn.exec_driver_sql(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
+    assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == int(foreign_keys)
+    conn.execute(text("DELETE FROM chats WHERE id='audit-chat'"))
+    assert conn.execute(text("SELECT count(*) FROM agent_work_interests")).scalar_one() == (0 if foreign_keys else 1)
+    assert conn.execute(text("SELECT count(*) FROM goal_dependencies")).scalar_one() == 0
+    conn.commit()
+  eng.dispose()
+
+
+def test_transfer_notice_migration_backfills_only_known_open_transfer_events(tmp_path):
+  eng = create_engine(f"sqlite:///{tmp_path / 'transfer.db'}")
+  with eng.begin() as conn:
+    conn.execute(text('CREATE TABLE agent_work_claims (id TEXT, revision INTEGER, notification_revision INTEGER, previous_owner_chat_id TEXT, completed_at TEXT, released_at TEXT)'))
+    conn.execute(text("INSERT INTO agent_work_claims VALUES ('pending', 2, 1, 'old', NULL, NULL), ('acknowledged', 2, 2, 'old', NULL, NULL), ('settled', 3, 1, 'old', 'now', NULL)"))
+  schema_migrations._add_transfer_notice_revision(eng)
+  schema_migrations._add_transfer_notice_revision(eng)
+  with eng.connect() as conn:
+    assert dict(conn.execute(text('SELECT id, transfer_notice_revision FROM agent_work_claims')).all()) == {'pending': 2, 'acknowledged': None, 'settled': None}
+  eng.dispose()

@@ -1281,12 +1281,17 @@ or saved cards. A persisted running marker is not proof of a live executor after
 startup recovery. Every `AgentWorkInterest` stays unchanged in the old table as
 non-waking audit history; only a new follow creates a `GoalDependency`. This
 avoids inventing acquisition identity, receipt or wake authority for old work.
-Runtime follows and chat retention never read or write that table. Its rows and
-schema remain as non-waking audit history under ordinary retention policy; no
-destructive migration is applied. Completion and release send no follower peer
+Runtime follows and chat retention never read or write that table. The original
+schema is retained: audit rows have no retention guarantee after their chat is
+hard-purged. The existing chat FK may cascade-delete them; with FK enforcement
+off they may remain as inert historical provenance. Nothing reads those rows or
+relies on their presence after purge. No audit-table rebuild or destructive
+migration is applied. Completion and release send no follower peer
 notice and use no notification latch: immutable dependency outcomes drive
 exact-Goal delivery. The retry-safe claim notice and `notification_revision`
 remain solely for prompt transfer/revocation interrupts to the former executor.
+A separate `transfer_notice_revision` preserves the transfer event identity when
+completion or release advances the claim revision before its interrupt is sent.
 Ordinary peer messages and ambiguous historical messages remain intact.
 
 The same exact dependency projection supplies drawer, runtime and Goal details.
@@ -1294,6 +1299,8 @@ Deliberate holds use a distinct quiet square; a stalled work source never promis
 an automatic dependency wake. Source cards and the Goal owning a live acquisition
 show deduplicated, owner-only `needed_by` chat backlinks in their existing details.
 These are read-side context, not requests, notifications or new attention.
+Exact-chat embeds receive only dependency facts already saved in their own chat,
+without foreign-chat enrichment or navigation IDs (including nested outcomes).
 Settled dependencies use Waiting's clock and typed outcome in transcript history,
 anchored only to a visible segment of the exact receiving or declaring run.
 Retiring an unresolved subscription retains safe source identity without inventing

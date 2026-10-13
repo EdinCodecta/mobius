@@ -109,6 +109,41 @@ def test_transfer_requires_current_owner_identity_and_records_reason(db):
   assert retried["notification_pending"] is True
 
 
+@pytest.mark.parametrize("release", [False, True])
+def test_transfer_notice_survives_settlement_between_commit_and_refresh(db, monkeypatch, release):
+  owner, first, second = _fixture(db)
+  key = "review:transfer-settlement"
+  claim_work(db, owner_id=owner.id, chat_id=first.id,
+             run_id="claim-run-first", work_key=key, summary="Repair")
+  original_commit = db.commit
+  settled = False
+
+  def settle_after_transfer_commit():
+    nonlocal settled
+    original_commit()
+    if not settled:
+      settled = True
+      finish_work(db, owner_id=owner.id, chat_id=second.id,
+                  work_key=key, outcome="Done", release=release)
+
+  monkeypatch.setattr(db, "commit", settle_after_transfer_commit)
+  moved = claim_work(db, owner_id=owner.id, chat_id=second.id,
+    run_id="claim-run-second", work_key=key, summary="Repair",
+    takeover_reason="The first executor is blocked", expected_owner_chat_id=first.id)
+  assert moved["state"] == "transferred"
+  assert moved["previous_owner_chat_id"] == first.id
+  assert moved["notification_pending"] is True
+  assert moved["transfer_notice_revision"] == 2
+  assert moved["revision"] == 3
+  from app.agent_work_claims import acknowledge_transfer_notice
+  acknowledge_transfer_notice(db, claim_id=moved["id"],
+                              revision=moved["transfer_notice_revision"])
+  db.expire_all()
+  row = db.get(models.AgentWorkClaim, moved["id"])
+  assert row.notification_revision == 2
+  assert row.transfer_notice_revision == 2
+
+
 def test_completion_resolves_followers_and_same_key_cannot_be_reclaimed(db):
   owner, first, second = _fixture(db)
   key = "github:mobius-os/mobius:pr:1079:3134e050:merge"

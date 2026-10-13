@@ -199,8 +199,9 @@ def purge_expired_chat_tombstones(db: Session) -> list[str]:
   ).update({
     models.AgentWorkClaim.owner_chat_id: None,
   }, synchronize_session=False)
-  # Legacy interest rows remain audit history. Their source chat identity is
-  # historical, not a live subscription or an instruction to wake anyone.
+  # Legacy interest audit history has no guarantee beyond chat retention.
+  # The existing FK may cascade on purge; without FK enforcement inert rows
+  # may remain. No runtime consumer relies on either their presence or absence.
   # Transcript rows, search entries and damage copies go with each chat
   # through the `chats_deleted` trigger, in this same transaction.
   db.query(models.Chat).filter(

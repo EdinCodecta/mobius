@@ -57,9 +57,10 @@ def _serialize(db: Session, row: models.AgentWorkClaim, state: str) -> dict:
     "acquisition_id": row.acquisition_id,
     "notification_pending": (
       row.previous_owner_chat_id is not None
-      and row.completed_at is None and row.released_at is None
-      and row.notification_revision < row.revision
+      and row.transfer_notice_revision is not None
+      and row.notification_revision < row.transfer_notice_revision
     ),
+    "transfer_notice_revision": row.transfer_notice_revision,
     "takeover_reason": row.takeover_reason,
     "completed_at": row.completed_at.isoformat() if row.completed_at else None,
     "outcome": row.outcome,
@@ -201,6 +202,7 @@ def claim_work(
       models.AgentWorkClaim.updated_at: now,
       models.AgentWorkClaim.revision: next_revision,
       models.AgentWorkClaim.notification_revision: next_revision,
+      models.AgentWorkClaim.transfer_notice_revision: None,
     }, synchronize_session=False)
     if changed != 1:
       db.rollback()
@@ -246,7 +248,8 @@ def claim_work(
     db.refresh(row)
     pending_transfer = (
       row.previous_owner_chat_id is not None
-      and row.notification_revision < row.revision
+      and row.transfer_notice_revision is not None
+      and row.notification_revision < row.transfer_notice_revision
     )
     result = _serialize(db, row, "transferred" if pending_transfer else "owned")
     if pending_transfer:
@@ -313,6 +316,7 @@ def claim_work(
     models.AgentWorkClaim.takeover_reason: reason,
     models.AgentWorkClaim.updated_at: now,
     models.AgentWorkClaim.revision: previous_revision + 1,
+    models.AgentWorkClaim.transfer_notice_revision: previous_revision + 1,
   }, synchronize_session=False)
   if changed != 1:
     db.rollback()
@@ -324,6 +328,11 @@ def claim_work(
   db.commit()
   db.refresh(row)
   result = _serialize(db, row, "transferred")
+  # Settlement may have committed between transfer and refresh. The event's
+  # recipient, identity and obligation belong to the transfer transaction,
+  # not the claim's later state.
+  result["transfer_notice_revision"] = previous_revision + 1
+  result["notification_pending"] = True
   result["previous_owner_chat_id"] = previous
   result["previous_follow_status"] = previous_follow_status
   return result
@@ -585,7 +594,7 @@ def acknowledge_transfer_notice(
   db: Session, *, claim_id: str, revision: int,
 ) -> None:
   row = db.get(models.AgentWorkClaim, claim_id)
-  if row is None or row.revision != revision:
+  if row is None or row.transfer_notice_revision != revision:
     return
   if row.notification_revision < revision:
     row.notification_revision = revision

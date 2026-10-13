@@ -129,7 +129,7 @@ async def claim_current_work(
       db,
       owner_id=principal.owner.id,
       claim_id=result["id"],
-      revision=result["revision"],
+      revision=result["transfer_notice_revision"],
       sender_chat_id=principal.chat_id,
       recipients=[previous],
       body=(
@@ -146,7 +146,7 @@ async def claim_current_work(
     # before this point leaves notification_pending true, so the exact same
     # transfer request retries idempotently instead of losing the wake.
     acknowledge_transfer_notice(
-      db, claim_id=result["id"], revision=result["revision"],
+      db, claim_id=result["id"], revision=result["transfer_notice_revision"],
     )
     result["notification_pending"] = False
     result["steered"] = delivery.steered

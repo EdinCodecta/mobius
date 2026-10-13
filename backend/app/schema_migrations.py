@@ -6668,6 +6668,26 @@ def _add_saved_decision_cards(eng) -> None:
     """))
 
 
+def _add_transfer_notice_revision(eng) -> None:
+  """Transfer identity must survive later completion/release revisions."""
+  from sqlalchemy import inspect, text
+  inspector = inspect(eng)
+  if "agent_work_claims" not in inspector.get_table_names() or "transfer_notice_revision" in {
+    column["name"] for column in inspector.get_columns("agent_work_claims")
+  }:
+    return
+  with eng.begin() as conn:
+    conn.execute(text("ALTER TABLE agent_work_claims ADD COLUMN transfer_notice_revision INTEGER"))
+    # An open pending transfer has a known event revision. Do not guess one
+    # from older settled rows whose later revisions erased that distinction.
+    conn.execute(text(
+      "UPDATE agent_work_claims SET transfer_notice_revision=revision "
+      "WHERE previous_owner_chat_id IS NOT NULL "
+      "AND completed_at IS NULL AND released_at IS NULL "
+      "AND notification_revision < revision"
+    ))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -6781,6 +6801,7 @@ _SCHEMA_MIGRATIONS = (
   ("0089_wait_result_receipts", _add_wait_result_receipts),
   ("0090_goal_dependencies", _add_goal_dependencies),
   ("0091_saved_decision_cards", _add_saved_decision_cards),
+  ("0092_transfer_notice_revision", _add_transfer_notice_revision),
 )
 
 
