@@ -124,13 +124,16 @@ def _manifest_from(raw: bytes | None) -> dict | None:
 def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
   """Whether the source differs from its accepted revision beyond a listing.
 
-  A save interrupted after writing, or one that failed after Git advanced,
+  Source with no accepted revision counts as unapplied as a whole. A save
+  interrupted after writing, or one that failed after Git advanced,
   leaves listing files changed but not yet accepted; the next save may carry
   them, committed or not. Anything else (code, or manifest fields other than
   the icon and ``store``) was never reviewed and must not be accepted by it.
   """
   if not accepted:
-    return app_git.worktree_dirty(root)
+    # With no accepted revision there is nothing to tell reviewed source from
+    # unreviewed commits; an apply records one first.
+    return True
   changed = app_git.worktree_diff_paths(root, accepted)
   if changed is None:
     return True
@@ -263,8 +266,17 @@ def _place_art(
   return rel
 
 
-def _manifest_text(manifest: dict) -> str:
-  return json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+def _manifest_text(manifest: dict, original: str) -> str:
+  """Serialize ``manifest`` in the layout of the file it replaces.
+
+  Keeping the author's indentation and final newline confines the diff to
+  the listing, so a later Store update does not conflict on whitespace. Key
+  order is already kept, since the edit updates the parsed dict in place.
+  """
+  match = re.match(r"\{[ \t]*\r?\n([ \t]+)\S", original)
+  indent = match.group(1) if match else ("  " if "\n" in original.strip() else None)
+  text = json.dumps(manifest, ensure_ascii=False, indent=indent)
+  return text + "\n" if original.endswith("\n") else text
 
 
 def _referenced_art(store: object) -> set[str]:
@@ -295,7 +307,8 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     manifest_path = _source_path(root, "mobius.json")
     if manifest_path.is_file():
       try:
-        current = json.loads(manifest_path.read_text(encoding="utf-8"))
+        original = manifest_path.read_text(encoding="utf-8")
+        current = json.loads(original)
       except json.JSONDecodeError as exc:
         raise ListingEditError(
           "manifest_invalid", "mobius.json is not valid JSON. Ask an agent to repair it.",
@@ -353,7 +366,7 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     if has_icon:
       manifest["icon"] = icon_rel
     manifest["store"] = store
-    changes.write("mobius.json", _manifest_text(manifest).encode("utf-8"))
+    changes.write("mobius.json", _manifest_text(manifest, original).encode("utf-8"))
 
     # Listing art the icon still uses is not stale, and only the editor's own
     # content-addressed files are removed.

@@ -973,7 +973,10 @@ async def preview_local_app_publication_asset(
     content,
     media_type=media_type,
     headers={
-      "Cache-Control": "public, max-age=31536000, immutable",
+      # Commit-keyed, so immutable; private because an incomplete listing's
+      # draft art must not sit in shared caches. Telling drafts apart here
+      # would need the whole review, and only the owner's editor reads it.
+      "Cache-Control": "private, max-age=31536000, immutable",
       "X-Content-Type-Options": "nosniff",
     },
   )

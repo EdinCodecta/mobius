@@ -217,7 +217,7 @@ async def test_publication_preview_asset_serves_commit_bound_bytes(monkeypatch):
 
   assert response.body == b"accepted-screen"
   assert response.media_type == "image/png"
-  assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
+  assert response.headers["cache-control"] == "private, max-age=31536000, immutable"
   assert seen == {
     "app": app,
     "commit": "a" * 40,

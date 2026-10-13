@@ -466,6 +466,27 @@ def _commit_files(repo, app, files):
   app.source_commit = _git(repo, "rev-parse", "HEAD")
 
 
+def test_a_tree_over_the_file_limit_reads_only_what_the_review_needs(
+  tmp_path, monkeypatch,
+):
+  repo, app, _ = _app_repo(tmp_path)
+  _commit_files(repo, app, {
+    f"src/file{index}.js": b"export {}" for index in range(community_publish.MAX_SOURCE_FILES + 50)
+  })
+  reads = []
+  real_blob = community_publish._blob
+  monkeypatch.setattr(
+    community_publish, "_blob",
+    lambda repo, entry: reads.append(entry.path) or real_blob(repo, entry),
+  )
+
+  _, files, problems = community_publish.read_public_snapshot(app)
+
+  assert [problem.code for problem in problems] == ["payload_too_large"]
+  assert [item["path"] for item in files] == ["mobius.json"]
+  assert set(reads) == {"mobius.json"} and len(reads) <= 2
+
+
 def test_snapshot_publishes_file_names_install_accepts(tmp_path):
   repo, app, _ = _app_repo(tmp_path)
   names = [

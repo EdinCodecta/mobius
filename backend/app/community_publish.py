@@ -12,7 +12,6 @@ import subprocess
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-import warnings
 
 from PIL import Image
 
@@ -423,12 +422,12 @@ def check_listing_image(content: bytes, what: str) -> str:
       f"{STORE_LISTING_IMAGE_MAX_BYTES // (1024 * 1024)} MB.",
       "listing_image_too_large", 422,
     )
+  # Opening reads only the header, and the pixel limit below sits under
+  # Pillow's decompression-bomb threshold, so no image is ever decoded here.
   try:
-    with warnings.catch_warnings():
-      warnings.simplefilter("error", Image.DecompressionBombWarning)
-      image = Image.open(io.BytesIO(content))
-      width, height = image.size
-      image.verify()
+    image = Image.open(io.BytesIO(content))
+    width, height = image.size
+    image.verify()
   except Exception as exc:
     raise CommunityPublicationError(
       f"The {what} is not a readable image.", "listing_image_invalid", 422,
@@ -870,6 +869,18 @@ def read_public_store_asset(
   return content
 
 
+def _listing_paths(manifest: object) -> set[str]:
+  """Every file path the manifest names as its icon or listing artwork."""
+  if not isinstance(manifest, dict):
+    return set()
+  store = manifest.get("store") if isinstance(manifest.get("store"), dict) else {}
+  shots = store.get("screenshots") if isinstance(store.get("screenshots"), list) else []
+  values = [manifest.get("icon"), store.get("hero")] + [
+    shot.get("src") for shot in shots if isinstance(shot, dict)
+  ]
+  return {value.strip() for value in values if isinstance(value, str) and value.strip()}
+
+
 def read_public_snapshot(
   app: models.App,
 ) -> tuple[str, list[dict[str, str]], list[CommunityPublicationError]]:
@@ -891,27 +902,29 @@ def read_public_snapshot(
     )
   commit = _accepted_commit(app, repo)
   entries, problems = _public_tree_entries(repo, commit)
-  if sum(entry.size for entry in entries) > PACKAGE_MAX_BYTES:
+  over_budget = sum(entry.size for entry in entries) > PACKAGE_MAX_BYTES
+  if over_budget:
     problems.append(CommunityPublicationError(
       "The public app snapshot is larger than the "
       f"{PACKAGE_MAX_BYTES // (1024 * 1024)} MiB app package limit.",
       "payload_too_large",
       413,
     ))
-    small = {
-      entry.path: entry for entry in entries
-      if entry.size <= STORE_LISTING_IMAGE_MAX_BYTES
-    }
-    icon = ""
-    if "mobius.json" in small:
+  if over_budget or len(entries) > MAX_SOURCE_FILES:
+    # Unpublishable as it stands: read no more than the review needs, so a
+    # huge tree costs a handful of reads under the source lock, not one each.
+    by_path = {entry.path: entry for entry in entries}
+    manifest: object = {}
+    manifest_entry = by_path.get("mobius.json")
+    if manifest_entry is not None and manifest_entry.size <= STORE_LISTING_IMAGE_MAX_BYTES:
       try:
-        declared = json.loads(_blob(repo, small["mobius.json"]))
-        icon = str(declared.get("icon") or "") if isinstance(declared, dict) else ""
+        manifest = json.loads(_blob(repo, manifest_entry))
       except ValueError:
-        pass
+        manifest = {}
+    wanted = {"mobius.json"} | _listing_paths(manifest)
     entries = [
-      entry for path, entry in small.items()
-      if path in {"mobius.json", icon} or path.startswith("static/store/")
+      entry for entry in entries
+      if entry.path in wanted and entry.size <= STORE_LISTING_IMAGE_MAX_BYTES
     ]
 
   files: list[dict[str, str]] = []
@@ -945,44 +958,4 @@ def build_public_snapshot(app: models.App) -> tuple[str, list[dict[str, str]]]:
     problems.extend(_manifest_problems(manifest, by_path))
   if problems:
     raise problems[0]
-  return commit, files
-  if manifest_item is None:
-    raise CommunityPublicationError(
-      "The accepted revision must include mobius.json before it can be public.",
-      "invalid_manifest",
-    )
-  try:
-    manifest = json.loads(base64.b64decode(manifest_item["content_base64"]))
-  except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-    raise CommunityPublicationError(
-      "mobius.json is not valid JSON.", "invalid_manifest",
-    ) from exc
-  if not isinstance(manifest, dict) or not manifest.get("id") or not manifest.get("entry"):
-    raise CommunityPublicationError(
-      "mobius.json is missing required publication fields.", "invalid_manifest",
-    )
-  try:
-    validate_manifest_contract(manifest)
-  except ManifestContractError as exc:
-    raise CommunityPublicationError(str(exc), "invalid_manifest") from exc
-  icon = manifest.get("icon")
-  icon_item = next((item for item in files if item["path"] == icon), None)
-  if icon:
-    if icon_item is None:
-      raise CommunityPublicationError(
-        f"The app icon {icon} is missing from the published snapshot.", "invalid_icon",
-      )
-    try:
-      icon_assets.normalize_icon(base64.b64decode(icon_item["content_base64"]))
-    except icon_assets.InvalidIcon as exc:
-      raise CommunityPublicationError(
-        f"The app icon {icon} cannot be used: {exc}", "invalid_icon",
-      ) from exc
-  # Install charges each declaration in full, so bound the same declared sum:
-  # every snapshot the Store accepts is then installable.
-  declared = package_bytes(manifest, lambda rel: sizes.get(rel, 0))
-  if declared > PACKAGE_MAX_BYTES:
-    raise CommunityPublicationError(
-      package_limit_message(declared), "payload_too_large", 413,
-    )
   return commit, files

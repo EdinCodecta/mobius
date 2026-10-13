@@ -5,7 +5,6 @@ import base64
 import io
 import json
 from pathlib import Path
-import threading
 from unittest.mock import patch
 
 from PIL import Image
@@ -430,6 +429,36 @@ def test_icon_is_not_automatic_while_unapplied_edits_block_the_save(client, auth
   (source / "index.jsx").write_text("export default function App() { return null }\n")
 
   assert "automatic" not in _item(_preview(client, auth, app_id), "icon")
+
+
+def test_saving_keeps_the_manifest_layout(client, auth):
+  source = _source()
+  manifest_text = json.dumps(json.loads(_MANIFEST), ensure_ascii=False, indent=4) + "\n"
+  (source / "mobius.json").write_text(manifest_text, encoding="utf-8")
+  app_id = _create(client, auth, source)
+
+  assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
+
+  saved = (source / "mobius.json").read_text(encoding="utf-8")
+  assert saved.startswith(manifest_text.rstrip().rstrip("}").rstrip())
+  assert '\n    "store": {\n        "tagline"' in saved
+  assert saved.endswith("}\n")
+  assert list(json.loads(saved))[:-1] == list(json.loads(manifest_text))
+
+
+def test_saving_needs_an_accepted_revision_to_tell_what_was_reviewed(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  (source / "index.jsx").write_text("export default function App() { return 'unreviewed' }\n")
+  app_git._run(source, "commit", "-qam", "never applied")
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  row.source_commit = None
+  db.commit()
+
+  refused = _save(client, auth, app_id, **_complete_listing())
+
+  assert refused.status_code == 409
+  assert refused.json()["detail"]["code"] == "source_has_draft"
 
 
 def test_saving_rejects_replaced_source_root(client, auth):
