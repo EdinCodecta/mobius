@@ -145,7 +145,7 @@ class Runner:
               app = db.get(models.App, app_id)
               if app is None or app.deleted_at or not app.runtime_revision:
                 continue
-              root = await asyncio.to_thread(applied_app_runtime.runtime_root, app)
+              root = await asyncio.to_thread(applied_app_runtime.runtime_root, app)  # unsettled: read-only
             path = root / "mobius.json"
             manifest = json.loads(path.read_text()) if path.exists() else {}
             validate_setup(manifest)

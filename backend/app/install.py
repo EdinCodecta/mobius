@@ -2012,7 +2012,7 @@ async def _sync_app_skills(
           # bytes before replacing them — never trade edits for an update.
           if (data_dir / ".git").is_dir():
             try:
-              ok, detail = await asyncio.to_thread(
+              ok, detail = await settled.run_settled(
                 data_git.snapshot_path,
                 data_dir,
                 f"shared/skills/{rel}",
@@ -5298,7 +5298,7 @@ async def _install_candidate(
     if equivalence_target_to_retire:
       try:
         async with fs_locks.source_dir_lock(str(app.source_dir)):
-          await asyncio.to_thread(
+          await settled.run_settled(
             app_git.retire_landed_equivalent_changes,
             app.source_dir, equivalence_target_to_retire,
           )

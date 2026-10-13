@@ -54,6 +54,7 @@ from app import (
   github_auth,
   models,
   providers,
+  settled,
   transcript_rows,
 )
 from app.config import get_settings
@@ -1304,7 +1305,7 @@ async def _inspect_prepared_review_locked(
       await source_locks.enter_async_context(
         fs_locks.source_dir_lock(lock_path)
       )
-    return await asyncio.to_thread(
+    return await asyncio.to_thread(  # unsettled: read-only
       _inspect_prepared_review,
       record,
       diff_path,
@@ -1566,24 +1567,24 @@ async def attest_contribution_source_continuity(
             fs_locks.source_dir_lock(lock_path)
           )
         branch = _validate_branch(plan.get("branch") or record.get("branch"))
-        await asyncio.to_thread(
+        await asyncio.to_thread(  # unsettled: read-only
           _assert_fresh, record, diff_path, review_repo, branch,
         )
-        if await asyncio.to_thread(
+        if await asyncio.to_thread(  # unsettled: read-only
           _reviewed_paths_dirty,
           source_repo, review_repo, str(body.base_sha), str(body.head_sha),
         ):
           raise ContributionSubmitError(
             "The installed source has uncommitted changes to reviewed files."
           )
-        current_source = await asyncio.to_thread(
+        current_source = await asyncio.to_thread(  # unsettled: read-only
           app_git.head_sha, source_repo, "HEAD",
         )
         if current_source != body.reviewed_through_sha:
           raise ContributionSubmitError(
             "The installed source changed during continuity review."
           )
-        source_advance = await asyncio.to_thread(
+        source_advance = await asyncio.to_thread(  # unsettled: read-only
           app_git._canonical_diff,
           source_repo,
           body.source_sha,
@@ -1598,7 +1599,7 @@ async def attest_contribution_source_continuity(
           raise ContributionSubmitError(
             "The local source advance differs from what the agent reviewed."
           )
-        witness = await asyncio.to_thread(
+        witness = await settled.run_settled(
           _record_prepublication_source_continuity,
           record,
           reviewed_through_sha=current_source,
@@ -1975,7 +1976,7 @@ async def stage_contribution(
       for lock_path in sorted({str(inputs["repo_path"]), str(inputs["source_repo"])}):
         await source_locks.enter_async_context(fs_locks.source_dir_lock(lock_path))
       try:
-        record, candidate = await asyncio.to_thread(
+        record, candidate = await settled.run_settled(
           _stage_record, record_id, previous, body, inputs, principal,
         )
       except ContributionSubmitError as exc:
@@ -2505,7 +2506,7 @@ async def _chat_contribution_documents(
 
   async with fs_locks.app_storage_lock(app_id):
     contribution_paths, app_settings, settlement_document = (
-      await asyncio.to_thread(snapshot)
+      await asyncio.to_thread(snapshot)  # unsettled: read-only
     )
   related_records, records = await asyncio.to_thread(
     _read_chat_related_records, app_id, contribution_paths, chat_id,
@@ -3519,11 +3520,10 @@ async def submit_contribution(
     equivalence_repos = _equivalence_source_repo(publication_record)
     if equivalence_repos is not None:
       lock_paths.add(str(equivalence_repos[0]))
-    async with AsyncExitStack() as source_locks:
-      for lock_path in sorted(lock_paths):
-        await source_locks.enter_async_context(
-          fs_locks.source_dir_lock(lock_path)
-        )
+
+    # Settled under the source locks: a cancelled request waits for these
+    # writes to end instead of releasing the locks while they still run.
+    async def publish_locked():
       # Review status is advisory; the source can move after that GET. Repeat
       # its exact proof under the same locks that cover the first public
       # mutation so Send cannot publish a change absent from installed source.
@@ -3561,6 +3561,16 @@ async def submit_contribution(
           "contribution equivalence witness failed %s/%s",
           app_id, record_id, exc_info=True,
         )
+      return pr_url, number, record_patch
+
+    async with AsyncExitStack() as source_locks:
+      for lock_path in sorted(lock_paths):
+        await source_locks.enter_async_context(
+          fs_locks.source_dir_lock(lock_path)
+        )
+      pr_url, number, record_patch = await settled.settle(
+        publish_locked(), what="Pull request submit",
+      )
   except ContributionSubmitError as exc:
     async with fs_locks.app_storage_lock(app_id):
       _recheck_submit_app(db, app_id, expected_nonce)
@@ -3954,6 +3964,7 @@ async def update_existing_contribution(
     )
   db.close()
 
+  successor_request = {"action": "advance_successor"}
   try:
     attempt_owner.assert_current()
     repo, number, head_repository, branch = _prepared_existing_pr_target(
@@ -3985,11 +3996,11 @@ async def update_existing_contribution(
     equivalence_repos = _equivalence_source_repo(publication_record)
     if equivalence_repos is not None:
       lock_paths.add(str(equivalence_repos[0]))
-    async with AsyncExitStack() as source_locks:
-      for lock_path in sorted(lock_paths):
-        await source_locks.enter_async_context(
-          fs_locks.source_dir_lock(lock_path)
-        )
+
+    # Settled under the source locks: a cancelled request waits for these
+    # writes to end instead of releasing the locks while they still run.
+    async def publish_locked():
+      nonlocal successor_request
       await asyncio.to_thread(
         _assert_personal_publication_source,
         publication_record,
@@ -4103,6 +4114,16 @@ async def update_existing_contribution(
           record_id,
           exc_info=True,
         )
+      return pr_url, record_patch
+
+    async with AsyncExitStack() as source_locks:
+      for lock_path in sorted(lock_paths):
+        await source_locks.enter_async_context(
+          fs_locks.source_dir_lock(lock_path)
+        )
+      pr_url, record_patch = await settled.settle(
+        publish_locked(), what="Pull request update",
+      )
   except ContributionSubmitError as exc:
     if (
       isinstance((claimed.get("plan") or {}).get("successor"), dict)
@@ -4111,7 +4132,7 @@ async def update_existing_contribution(
       try:
         attempt_owner.event(
           "pr_ambiguous",
-          locals().get("successor_request", {"action": "advance_successor"}),
+          successor_request,
           exc.record_patch,
         )
       except ContributionSubmitError:
@@ -4452,7 +4473,7 @@ async def update_contribution_stack(
     # proof while holding its source through the public mutation; this preserves
     # partial parent success without reversing app -> source lock order.
     async with _stack_publication_source_locks(rows):
-      await asyncio.to_thread(
+      await asyncio.to_thread(  # unsettled: read-only
         _preflight_prepared_stack,
         rows,
         source_preflight=lambda record: _assert_personal_publication_source(
@@ -4467,7 +4488,10 @@ async def update_contribution_stack(
       try:
         attempt_owner = attempt_owners[str(record.get("id") or "")]
         row_lock_paths = _stack_publication_lock_paths([row])
-        async with _stack_publication_source_locks([row]):
+
+        # Settled under the source locks: a cancelled request waits for these
+        # writes to end instead of releasing the locks while they still run.
+        async def publish_locked():
           await asyncio.to_thread(
             _assert_personal_publication_source,
             record,
@@ -4556,6 +4580,12 @@ async def update_contribution_stack(
               record.get("id"),
               exc_info=True,
             )
+          return pr_url, number, record_patch
+
+        async with _stack_publication_source_locks([row]):
+          pr_url, number, record_patch = await settled.settle(
+            publish_locked(), what="Stack pull request update",
+          )
       except ContributionSubmitError as exc:
         async with fs_locks.app_storage_lock(app_id):
           _recheck_submit_app(db, app_id, expected_nonce)
@@ -4757,7 +4787,7 @@ async def submit_contribution_stack(
 
   try:
     async with _stack_publication_source_locks(rows):
-      await asyncio.to_thread(
+      await asyncio.to_thread(  # unsettled: read-only
         _preflight_prepared_stack,
         rows,
         source_preflight=lambda record: _assert_personal_publication_source(
@@ -4773,7 +4803,10 @@ async def submit_contribution_stack(
       try:
         attempt_owner = attempt_owners[str(record.get("id") or "")]
         row_lock_paths = _stack_publication_lock_paths([row])
-        async with _stack_publication_source_locks([row]):
+
+        # Settled under the source locks: a cancelled request waits for these
+        # writes to end instead of releasing the locks while they still run.
+        async def publish_locked():
           await asyncio.to_thread(
             _assert_personal_publication_source,
             record,
@@ -4799,6 +4832,12 @@ async def submit_contribution_stack(
               "stack contribution equivalence witness failed %s/%s",
               app_id, record.get("id"), exc_info=True,
             )
+          return pr_url, number, record_patch
+
+        async with _stack_publication_source_locks([row]):
+          pr_url, number, record_patch = await settled.settle(
+            publish_locked(), what="Stack pull request submit",
+          )
       except ContributionSubmitError as exc:
         async with fs_locks.app_storage_lock(app_id):
           _recheck_submit_app(db, app_id, expected_nonce)
@@ -4955,11 +4994,10 @@ async def land_contribution_stack(
       if repos is not None:
         lock_paths.add(str(repos[0]))
     repo_paths = sorted(lock_paths)
-    async with AsyncExitStack() as source_locks:
-      for repo_path in repo_paths:
-        await source_locks.enter_async_context(
-          fs_locks.source_dir_lock(repo_path)
-        )
+
+    # Settled under the source locks: a cancelled request waits for these
+    # writes to end instead of releasing the locks while they still run.
+    async def land_locked():
       if landing_mode == "merged":
         target_branch = str(rows[0]["record"].get("last_land_target_branch") or "")
         landed_sha = str(rows[0]["record"].get("last_land_head_sha") or "")
@@ -4997,7 +5035,7 @@ async def land_contribution_stack(
             )
           else:
             async with fs_locks.source_dir_lock(str(repos[0])):
-              await asyncio.to_thread(
+              await settled.run_settled(
                 app_git.mark_equivalent_change_landed,
                 repos[0],
                 str(plan.get("diff_sha256") or ""),
@@ -5008,6 +5046,16 @@ async def land_contribution_stack(
             "landed stack equivalence promotion failed %s/%s",
             app_id, record.get("id"), exc_info=True,
           )
+      return target_branch, landed_sha
+
+    async with AsyncExitStack() as source_locks:
+      for repo_path in repo_paths:
+        await source_locks.enter_async_context(
+          fs_locks.source_dir_lock(repo_path)
+        )
+      target_branch, landed_sha = await settled.settle(
+        land_locked(), what="Stack landing",
+      )
   except ContributionSubmitError as exc:
     async with fs_locks.app_storage_lock(app_id):
       _recheck_submit_app(db, app_id, expected_nonce)
@@ -5188,7 +5236,10 @@ async def cleanup_contribution_staging(
           "terminal contribution upstream lookup failed %s/%s",
           app_id, record_id, exc_info=True,
         )
-  async with fs_locks.source_dir_lock(str(lock_repo)):
+
+  # Settled under the source locks: a cancelled request waits for these
+  # writes to end instead of releasing the locks while they still run.
+  async def settle_locked():
     if settled_record.get("status") != "merged" or upstream_sha is not None:
       try:
         await asyncio.to_thread(
@@ -5199,8 +5250,13 @@ async def cleanup_contribution_staging(
           "terminal contribution equivalence settlement failed %s/%s",
           app_id, record_id, exc_info=True,
         )
-    cleaned = await asyncio.to_thread(
+    return await asyncio.to_thread(
       _cleanup_terminal_staging_checkout, settled_record,
+    )
+
+  async with fs_locks.source_dir_lock(str(lock_repo)):
+    cleaned = await settled.settle(
+      settle_locked(), what="Terminal contribution cleanup",
     )
   # Terminal cleanup also ends autopilot: the PR merged/closed, so release any
   # claim and disable the grant (symmetric with the submit-time grant stamp).
@@ -5426,7 +5482,7 @@ async def connect_published_app(
   try:
     await install.fetch_app_commit(spec.source_repo, merge_sha)
     async with fs_locks.source_dir_lock(str(spec.source_repo)):
-      witnessed = await asyncio.to_thread(
+      witnessed = await asyncio.to_thread(  # unsettled: read-only
         app_git.verify_landed_equivalent_change,
         spec.source_repo,
         diff_sha256=spec.diff_sha256,
@@ -6677,11 +6733,10 @@ async def autopilot_update(
       equivalence_repos = _equivalence_source_repo(record)
       if equivalence_repos is not None:
         lock_paths.add(str(equivalence_repos[0]))
-      async with AsyncExitStack() as source_locks:
-        for lock_path in sorted(lock_paths):
-          await source_locks.enter_async_context(
-            fs_locks.source_dir_lock(lock_path)
-          )
+
+      # Settled under the source locks: a cancelled request waits for these
+      # writes to end instead of releasing the locks while they still run.
+      async def publish_locked():
         _assert_reviewed_update_contains_live_head(
           repo_path,
           str(live_target.get("head_sha") or ""),
@@ -6721,6 +6776,16 @@ async def autopilot_update(
             record_id,
             exc_info=True,
           )
+        return pr_url, number, record_patch
+
+      async with AsyncExitStack() as source_locks:
+        for lock_path in sorted(lock_paths):
+          await source_locks.enter_async_context(
+            fs_locks.source_dir_lock(lock_path)
+          )
+        pr_url, number, record_patch = await settled.settle(
+          publish_locked(), what="Autopilot pull request update",
+        )
     except ContributionSubmitError as exc:
       # A lost response can follow an accepted branch push. Preserve its exact
       # head witness before returning so the same run reconciles that public

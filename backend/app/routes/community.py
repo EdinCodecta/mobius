@@ -604,7 +604,7 @@ async def publish_local_app_to_github(
 
   try:
     async with fs_locks.source_dir_lock(str(app.source_dir)):
-      accepted_commit, files = await asyncio.to_thread(build_public_snapshot, app)
+      accepted_commit, files = await asyncio.to_thread(build_public_snapshot, app)  # unsettled: read-only
     await asyncio.to_thread(public_store_listing, files)
   except CommunityPublicationError as exc:
     raise HTTPException(
@@ -900,7 +900,7 @@ async def preview_local_app_publication(
     raise HTTPException(404, "App not found.")
   try:
     async with fs_locks.source_dir_lock(str(app.source_dir)):
-      accepted_commit, files = await asyncio.to_thread(build_public_snapshot, app)
+      accepted_commit, files = await asyncio.to_thread(build_public_snapshot, app)  # unsettled: read-only
     listing = await asyncio.to_thread(public_store_listing, files)
   except CommunityPublicationError as exc:
     raise HTTPException(
@@ -946,7 +946,7 @@ async def preview_local_app_publication_asset(
     raise HTTPException(404, "Listing asset not found.")
   try:
     async with fs_locks.source_dir_lock(str(app.source_dir)):
-      content = await asyncio.to_thread(
+      content = await asyncio.to_thread(  # unsettled: read-only
         read_public_store_asset, app, accepted_commit, asset_path,
       )
   except CommunityPublicationError as exc:

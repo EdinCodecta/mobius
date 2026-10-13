@@ -1,7 +1,9 @@
 """The shared settle primitive: cancellation waits for the work, then wins."""
 
+import ast
 import asyncio
 import logging
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -246,3 +248,85 @@ def test_teardown_is_not_fooled_by_a_cancel_handled_further_up_the_stack():
   assert outcome.args == ("held one",)
   assert ran == ["first", "second", "second ok=False"]
 
+
+_READ_ONLY = "# unsettled: read-only"
+# Settled by its caller: ``apply_platform_update`` waits out an admitted Apply.
+_SETTLED_ELSEWHERE = {("platform_update.py", "_apply_platform_update_sync")}
+
+
+def _locks(expr) -> bool:
+  """Whether an ``async with`` item takes a filesystem, transition or Apply lock."""
+  if isinstance(expr, ast.Name):
+    return expr.id == "_APPLY_LOCK"
+  if not isinstance(expr, ast.Call):
+    return False
+  func = expr.func
+  if isinstance(func, ast.Attribute):
+    if isinstance(func.value, ast.Name) and func.value.id == "fs_locks":
+      return True
+    name = func.attr
+  elif isinstance(func, ast.Name):
+    name = func.id
+  else:
+    return False
+  # Also the route-local wrappers around them, such as a stack's source locks.
+  return name == "get_transition_lock" or name.endswith(("_lock", "_locks"))
+
+
+def _held(node: ast.AsyncWith) -> bool:
+  if any(_locks(item.context_expr) for item in node.items):
+    return True
+  # An AsyncExitStack that enters such locks one by one.
+  return any(
+    isinstance(call, ast.Call)
+    and isinstance(call.func, ast.Attribute)
+    and call.func.attr == "enter_async_context"
+    and call.args and _locks(call.args[0])
+    for statement in node.body for call in ast.walk(statement)
+  )
+
+
+def _plain_to_thread_calls(body):
+  """Yield lexical ``asyncio.to_thread`` calls, not those in nested functions."""
+  pending = list(body)
+  while pending:
+    node = pending.pop()
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+      continue
+    if (
+      isinstance(node, ast.Call)
+      and isinstance(node.func, ast.Attribute)
+      and node.func.attr == "to_thread"
+      and isinstance(node.func.value, ast.Name)
+      and node.func.value.id == "asyncio"
+    ):
+      yield node
+    pending.extend(ast.iter_child_nodes(node))
+
+
+def test_lock_held_thread_work_is_settled_or_marked_read_only():
+  """Under a lock, a cancelled caller must not unwind while its thread writes.
+
+  Plain ``asyncio.to_thread`` releases the lock on cancel while the thread
+  runs on, so lock-held thread work goes through ``settled``. Read-only work
+  may stay plain, marked ``# unsettled: read-only`` on the call's line.
+  """
+  app_root = Path(__file__).resolve().parents[1] / "app"
+  offenders = []
+  for path in sorted(app_root.rglob("*.py")):
+    source = path.read_text()
+    lines = source.splitlines()
+    for node in ast.walk(ast.parse(source)):
+      if not isinstance(node, ast.AsyncWith) or not _held(node):
+        continue
+      for call in _plain_to_thread_calls(node.body):
+        callee = call.args[0] if call.args else None
+        name = getattr(callee, "id", getattr(callee, "attr", ""))
+        if (path.name, name) in _SETTLED_ELSEWHERE:
+          continue
+        if _READ_ONLY not in lines[call.lineno - 1]:
+          offenders.append(f"{path.relative_to(app_root)}:{call.lineno}")
+  assert not sorted(set(offenders)), (
+    "Lock-held asyncio.to_thread must use settled.run_settled, or be marked "
+    f"{_READ_ONLY!r} when the thread only reads: {sorted(set(offenders))}"
+  )
