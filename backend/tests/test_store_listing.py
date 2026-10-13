@@ -125,6 +125,27 @@ def test_review_of_an_app_without_details_still_lists_what_it_needs():
   assert review["draft"]["screenshots"] == []
 
 
+def test_review_keeps_the_draft_of_a_manifest_missing_publication_fields():
+  manifest = json.loads(_MANIFEST)
+  manifest.pop("entry")
+  manifest["store"] = {
+    "tagline": "Kept.", "description": "Still here.",
+    "screenshots": [{"src": "static/store/a.png", "alt": "A"}],
+  }
+  review = store_listing_review([
+    _file("mobius.json", json.dumps(manifest).encode()),
+    _file("icon.png"), _file("static/store/a.png"),
+  ])
+
+  details = next(item for item in review["checklist"] if item["id"] == "details")
+  assert details["done"] is False and details["code"] == "invalid_manifest"
+  assert review["ready"] is False
+  assert review["draft"]["tagline"] == "Kept."
+  assert review["draft"]["description"] == "Still here."
+  assert review["draft"]["icon"] == "icon.png"
+  assert review["draft"]["screenshots"][0]["src"] == "static/store/a.png"
+
+
 def test_listing_art_outside_static_store_is_flagged_but_still_editable():
   manifest = json.loads(_MANIFEST)
   manifest["store"] = {
@@ -209,6 +230,85 @@ def test_saving_refuses_to_sweep_in_unapplied_edits(client, auth):
   assert refused.json()["detail"]["code"] == "source_has_draft"
   assert (source / "mobius.json").read_text(encoding="utf-8") == _MANIFEST
   assert not (source / "static").exists()
+
+
+@pytest.mark.parametrize("edit", ["code", "manifest"])
+def test_saving_refuses_to_accept_committed_but_unapplied_edits(client, auth, db, edit):
+  source = _source()
+  app_id = _create(client, auth, source)
+  accepted = app_git.head_sha(source, "HEAD")
+  if edit == "code":
+    (source / "index.jsx").write_text("export default function App() { return 'unreviewed' }\n")
+  else:
+    manifest = json.loads(_MANIFEST)
+    manifest["permissions"] = {"network": True}
+    (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  app_git._run(source, "commit", "-qam", "committed, never applied")
+  head = app_git.head_sha(source, "HEAD")
+
+  refused = _save(client, auth, app_id, **_complete_listing())
+
+  assert refused.status_code == 409, refused.text
+  assert refused.json()["detail"]["code"] == "source_has_draft"
+  assert app_git.head_sha(source, "HEAD") == head
+  assert app_git._run(source, "status", "--porcelain").stdout == ""
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert row.source_commit == accepted
+
+
+def test_committed_listing_only_changes_may_ride_along(client, auth):
+  source = _source()
+  app_id = _create(client, auth, source)
+  manifest = json.loads(_MANIFEST)
+  manifest["store"] = {"tagline": "Committed by hand."}
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  (source / "static" / "store").mkdir(parents=True)
+  (source / "static" / "store" / "old.png").write_bytes(_png((3, 3, 3)))
+  (source / "icon.png").write_bytes(_png((4, 4, 4)))
+  app_git._run(source, "add", "-A")
+  app_git._run(source, "commit", "-qm", "listing files only")
+
+  saved = _save(client, auth, app_id, **_complete_listing())
+
+  assert saved.status_code == 200, saved.text
+
+
+def test_a_store_app_listing_save_explains_what_it_changes(client, auth, monkeypatch):
+  source = _source()
+  app_id = _create(client, auth, source)
+  real_apply = app_routes._apply_source_or_http
+
+  async def store_apply(*args, **kwargs):
+    result = await real_apply(*args, **kwargs)
+    return app_apply.ApplyResult(
+      app=result.app, mode=result.mode,
+      warnings=(app_apply._STORE_LOCAL_PACKAGE_DIVERGED,),
+    )
+
+  monkeypatch.setattr(app_routes, "_apply_source_or_http", store_apply)
+
+  saved = _save(client, auth, app_id, **_complete_listing())
+
+  assert saved.status_code == 200, saved.text
+  assert saved.json()["warnings"] == [app_routes._STORE_APP_LISTING_SAVED]
+
+
+def test_an_oversized_image_gets_a_clear_message_and_a_full_listing_fits():
+  from app.main import _MAX_REQUEST_BODY_BYTES
+  from app.manifest_contract import STORE_LISTING_IMAGE_MAX_BYTES
+  from pydantic import ValidationError
+
+  largest = "A" * (-(-STORE_LISTING_IMAGE_MAX_BYTES // 3) * 4)
+  body = schemas.StoreListingIn(
+    tagline="t" * 1000, description="d" * 20_000,
+    icon={"data_base64": largest}, hero={"data_base64": largest},
+    screenshots=[
+      {"data_base64": largest, "alt": "a" * 2000, "label": "l" * 1000}
+    ] * 5,
+  )
+  assert len(body.model_dump_json().encode()) < _MAX_REQUEST_BODY_BYTES
+  with pytest.raises(ValidationError, match="at most 6 MB"):
+    schemas.StoreListingImageIn(data_base64=largest + "AAAA")
 
 
 def test_saving_rejects_replaced_source_root(client, auth):
@@ -465,7 +565,8 @@ def test_an_older_app_requires_agent_migration_without_resetting_runtime(client,
   details = next(i for i in preview["checklist"] if i["id"] == "details")
   assert details["done"] is False and details["automatic"] is False
   icon = next(i for i in preview["checklist"] if i["id"] == "icon")
-  assert icon["done"] is False and icon["automatic"] is True
+  # The save is refused until an agent adds details, so it fixes no icon.
+  assert icon["done"] is False and "automatic" not in icon
 
   saved = _save(client, auth, app_id, **_complete_listing())
 
@@ -482,6 +583,9 @@ def test_an_older_app_with_a_scheduled_job_is_left_to_an_agent(client, auth, db)
   (source / "job.sh").write_text("#!/bin/sh\nexit 0\n")
   app_git._run(source, "add", "job.sh")
   app_git._run(source, "commit", "-q", "-m", "job")
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  row.source_commit = app_git.head_sha(source, "HEAD")
+  db.commit()
 
   details = next(
     i for i in _preview(client, auth, app_id)["checklist"] if i["id"] == "details"

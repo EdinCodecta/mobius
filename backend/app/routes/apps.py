@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
@@ -31,7 +31,7 @@ from app import (
   activity, app_activity, app_apply, app_badge, app_capability_acceptance,
   app_git, app_jobs, app_recency, chat_app_artifacts, chat_queue, drawer_pins, fs_locks,
   icon_cache, models, project_git, providers, schemas,
-  resource_access, settled, source_dirs, store_listing_source, workspace_files,
+  settled, source_dirs, store_listing_source, workspace_files,
 )
 from app.manifest_identity import (
   requested_manifest_source, stored_manifest_fetch_url,
@@ -2126,25 +2126,7 @@ async def apply_app_source(
             ),
           },
         )
-      app_id = matched.id
-      async with (
-        fs_locks.app_storage_lock(app_id),
-        fs_locks.source_dir_lock(source_dir),
-      ):
-        app = (
-          db.query(models.App)
-          .populate_existing()
-          .filter(models.App.id == app_id, models.App.deleted_at.is_(None))
-          .first()
-        )
-        if app is None or app.source_dir != source_dir:
-          raise HTTPException(
-            status_code=409,
-            detail={
-              "code": "source_identity_changed",
-              "message": "The app source identity changed; retry the apply.",
-            },
-          )
+      async with _locked_app_source(db, matched.id, source_dir) as app:
         result = await _apply(app)
     else:
       async with fs_locks.source_dir_lock(source_dir):
@@ -2173,6 +2155,34 @@ async def apply_app_source(
     app=result.app,
     warnings=list(result.warnings),
   )
+
+
+@asynccontextmanager
+async def _locked_app_source(db: Session, app_id: int, source_dir: str):
+  """Hold one app's storage and source locks, yielding its row re-read under them.
+
+  Callers hold the install lock, which already rules out an uninstall or
+  reinstall; this catches only the app's source moving in the meantime.
+  """
+  async with (
+    fs_locks.app_storage_lock(app_id),
+    fs_locks.source_dir_lock(source_dir),
+  ):
+    app = (
+      db.query(models.App)
+      .populate_existing()
+      .filter(models.App.id == app_id, models.App.deleted_at.is_(None))
+      .first()
+    )
+    if app is None or app.source_dir != source_dir:
+      raise HTTPException(
+        status_code=409,
+        detail={
+          "code": "source_identity_changed",
+          "message": "The app source identity changed; try again.",
+        },
+      )
+    yield app
 
 
 async def _apply_source_or_http(
@@ -2297,34 +2307,15 @@ async def save_store_listing(
         detail={"code": "app_not_found", "message": "App not found."},
       )
     source_dir = str(found.source_dir)
-    source_nonce = found.token_nonce
-    async with (
-      fs_locks.app_storage_lock(app_id),
-      fs_locks.source_dir_lock(source_dir),
-    ):
-      resource_access.recheck_app_identity(db, app_id, source_nonce)
-      app = (
-        db.query(models.App)
-        .populate_existing()
-        .filter(models.App.id == app_id, models.App.deleted_at.is_(None))
-        .first()
+    if _validate_source_dir(source_dir, get_settings().data_dir) != source_dir:
+      raise HTTPException(
+        status_code=409,
+        detail={
+          "code": "source_identity_changed",
+          "message": "The app source directory changed while saving. Try again.",
+        },
       )
-      if app is None or app.source_dir != source_dir:
-        raise HTTPException(
-          status_code=409,
-          detail={
-            "code": "source_identity_changed",
-            "message": "The app changed while saving. Try again.",
-          },
-        )
-      if _validate_source_dir(source_dir, get_settings().data_dir) != source_dir:
-        raise HTTPException(
-          status_code=409,
-          detail={
-            "code": "source_identity_changed",
-            "message": "The app source directory changed while saving. Try again.",
-          },
-        )
+    async with _locked_app_source(db, app_id, source_dir) as app:
       source = Path(source_dir)
       if not await asyncio.to_thread(app_git.is_repo, source):
         raise HTTPException(
@@ -2334,7 +2325,16 @@ async def save_store_listing(
             "message": "This app has no versioned source to hold a listing.",
           },
         )
-      if await asyncio.to_thread(app_git.worktree_dirty, source):
+      head_before_apply = await asyncio.to_thread(app_git.head_sha, source, "HEAD")
+      accepted_before_apply = app.source_commit
+      # Edits committed without being applied are unreviewed just like
+      # uncommitted ones; only a failed save's own listing commit may remain.
+      if await asyncio.to_thread(app_git.worktree_dirty, source) or (
+        accepted_before_apply and await asyncio.to_thread(
+          store_listing_source.changes_beyond_listing,
+          source, accepted_before_apply, head_before_apply,
+        )
+      ):
         raise HTTPException(
           status_code=409,
           detail={
@@ -2345,8 +2345,6 @@ async def save_store_listing(
             ),
           },
         )
-      head_before_apply = await asyncio.to_thread(app_git.head_sha, source, "HEAD")
-      accepted_before_apply = app.source_commit
       async def write_and_accept():
         try:
           undo = await settled.run_settled(
@@ -2389,11 +2387,19 @@ async def save_store_listing(
         write_and_accept(), what=what, abandoned=saved_after_cancel,
       )
   _publish_apply_events(result, None)
-  return schemas.AppApplyOut(
-    mode=result.mode,
-    app=result.app,
-    warnings=list(result.warnings),
-  )
+  warnings = list(result.warnings)
+  if app_apply._STORE_LOCAL_PACKAGE_DIVERGED in warnings:
+    # Addressed to agents applying by hand; say what it means for a listing.
+    warnings.remove(app_apply._STORE_LOCAL_PACKAGE_DIVERGED)
+    warnings.append(_STORE_APP_LISTING_SAVED)
+  return schemas.AppApplyOut(mode=result.mode, app=result.app, warnings=warnings)
+
+
+_STORE_APP_LISTING_SAVED = (
+  "This app was installed from the Store. The listing is saved in its source "
+  "and will be published from there, but the installed app keeps its current "
+  "icon and details until it is updated."
+)
 
 
 def _pending_store_update_app(

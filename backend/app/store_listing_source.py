@@ -19,7 +19,7 @@ import warnings
 
 from PIL import Image
 
-from app import icon_assets, models, workspace_files
+from app import app_git, icon_assets, models, workspace_files
 from app.community_publish import (
   DESCRIPTION_MAX_BYTES,
   MAX_STORE_SCREENSHOTS,
@@ -29,10 +29,11 @@ from app.community_publish import (
   CommunityPublicationError,
   read_accepted_file,
 )
+from app.manifest_contract import STORE_LISTING_IMAGE_MAX_BYTES
 
 
 STORE_ART_DIR = "static/store"
-MAX_LISTING_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_LISTING_IMAGE_BYTES = STORE_LISTING_IMAGE_MAX_BYTES
 MAX_LISTING_IMAGE_DIMENSION = 8192
 _IMAGE_SUFFIXES = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
 _DETAILS_NEED_AGENT = (
@@ -99,9 +100,57 @@ def note_what_saving_fixes(checklist: list[dict], root: Path, app: models.App) -
     details["automatic"] = False
     details["message"] = _DETAILS_NEED_AGENT
   icon = items["icon"]
-  if not icon["done"] and record_icon_for_save(root, app) is not None:
+  # Only a save that can go ahead keeps the icon; one refused for missing
+  # details fixes nothing.
+  if (
+    not icon["done"] and details.get("automatic") is not False
+    and record_icon_for_save(root, app) is not None
+  ):
     icon["automatic"] = True
     icon["message"] = "Saving the listing keeps the app's current icon."
+
+
+def _listing_fields_removed(manifest: dict) -> dict:
+  return {key: value for key, value in manifest.items() if key not in {"icon", "store"}}
+
+
+def _manifest_at(root: Path, ref: str) -> dict | None:
+  raw = app_git.ref_file(root, ref, "mobius.json")
+  try:
+    manifest = json.loads(raw) if raw is not None else None
+  except ValueError:
+    return None
+  return manifest if isinstance(manifest, dict) else None
+
+
+def changes_beyond_listing(root: Path, accepted: str, head: str) -> bool:
+  """Whether commits since the accepted revision change more than a listing.
+
+  A save that failed after Git advanced leaves its own commit as the retry
+  point, so listing files committed but not yet accepted may ride along with
+  the next save. Anything else (code, or manifest fields other than the icon
+  and ``store``) was never reviewed and must not be accepted by it.
+  """
+  if accepted == head:
+    return False
+  changed = app_git.endpoint_diff_paths(root, accepted, head, read_only=True)
+  if changed is None:
+    return True
+  manifests = [_manifest_at(root, ref) for ref in (accepted, head)]
+  # Listing saves write only PNG icons, so a code file can never pass as one.
+  icons = {"icon.png"} | {
+    str(manifest.get("icon") or "") for manifest in manifests
+    if manifest is not None and str(manifest.get("icon") or "").endswith(".png")
+  }
+  for path in changed:
+    if path.startswith(f"{STORE_ART_DIR}/") or path in icons:
+      continue
+    if path == "mobius.json" and None not in manifests and (
+      _listing_fields_removed(manifests[0]) == _listing_fields_removed(manifests[1])
+    ):
+      continue
+    return True
+  return False
 
 
 @dataclass
@@ -218,7 +267,7 @@ def _place_art(
 
   New art is content-addressed, so re-saving the same bytes is a no-op and
   reordering screenshots never overwrites another one. A kept file outside
-  ``static/store/`` (an older listing layout) moves into it.
+  ``static/store/`` (an older listing layout) is copied into it.
   """
   content = image.data if image.data is not None else _accepted_file(root, app, image.path)
   suffix = _image_suffix(content, what)

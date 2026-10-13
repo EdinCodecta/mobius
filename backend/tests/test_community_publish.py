@@ -81,6 +81,9 @@ def test_listing_art_is_direct_versioned_source_not_a_runtime_asset():
   assert "static_assets" not in manifest
 
 
+_PNG = b"\x89PNG\r\n\x1a\n"
+
+
 def test_preview_asset_reads_the_accepted_tree_not_the_editable_worktree(tmp_path):
   repo, app, _ = _app_repo(tmp_path)
   manifest = json.loads((repo / "mobius.json").read_text())
@@ -94,10 +97,10 @@ def test_preview_asset_reads_the_accepted_tree_not_the_editable_worktree(tmp_pat
     }],
   }
   (repo / "mobius.json").write_text(json.dumps(manifest), encoding="utf-8")
-  (repo / "icon.png").write_bytes(b"accepted-icon")
+  (repo / "icon.png").write_bytes(_PNG + b"accepted-icon")
   (repo / "static" / "store").mkdir(parents=True)
   screenshot = repo / "static" / "store" / "screen.png"
-  screenshot.write_bytes(b"accepted-screen")
+  screenshot.write_bytes(_PNG + b"accepted-screen")
   _git(repo, "add", "mobius.json", "icon.png", "static/store/screen.png")
   _git(repo, "commit", "-m", "accepted listing")
   accepted = _git(repo, "rev-parse", "HEAD")
@@ -106,7 +109,7 @@ def test_preview_asset_reads_the_accepted_tree_not_the_editable_worktree(tmp_pat
 
   assert read_public_store_asset(
     app, accepted, "static/store/screen.png",
-  ) == b"accepted-screen"
+  ) == _PNG + b"accepted-screen"
 
   with pytest.raises(CommunityPublicationError) as unavailable:
     read_public_store_asset(app, accepted, "index.jsx")
@@ -128,7 +131,7 @@ def test_incomplete_listing_cannot_make_other_source_public(tmp_path):
   (repo / "mobius.json").write_text(json.dumps(manifest), encoding="utf-8")
   (repo / "private-notes.txt").write_text("not public", encoding="utf-8")
   (repo / "static" / "store").mkdir(parents=True)
-  (repo / "static" / "store" / "screen.png").write_bytes(b"screen")
+  (repo / "static" / "store" / "screen.png").write_bytes(_PNG + b"screen")
   _git(repo, "add", "mobius.json", "private-notes.txt", "static/store/screen.png")
   _git(repo, "commit", "-m", "draft listing")
   accepted = _git(repo, "rev-parse", "HEAD")
@@ -137,7 +140,30 @@ def test_incomplete_listing_cannot_make_other_source_public(tmp_path):
   with pytest.raises(CommunityPublicationError) as private:
     read_public_store_asset(app, accepted, "private-notes.txt")
   assert private.value.code == "listing_asset_unavailable"
-  assert read_public_store_asset(app, accepted, "static/store/screen.png") == b"screen"
+  assert read_public_store_asset(app, accepted, "static/store/screen.png") == _PNG + b"screen"
+
+
+def test_preview_serves_only_images_even_for_the_declared_icon(tmp_path):
+  repo, app, _ = _app_repo(tmp_path)
+  manifest = json.loads((repo / "mobius.json").read_text())
+  # A Store-managed app's local manifest is never validated by apply, so its
+  # icon can name any tracked file.
+  manifest["icon"] = "index.jsx"
+  manifest["store"] = {"screenshots": [{"src": "static/store/big.png", "alt": "A"}]}
+  (repo / "mobius.json").write_text(json.dumps(manifest), encoding="utf-8")
+  (repo / "static" / "store").mkdir(parents=True)
+  (repo / "static" / "store" / "big.png").write_bytes(
+    _PNG + b"x" * community_publish.STORE_LISTING_IMAGE_MAX_BYTES,
+  )
+  _git(repo, "add", "mobius.json", "static/store/big.png")
+  _git(repo, "commit", "-m", "listing")
+  accepted = _git(repo, "rev-parse", "HEAD")
+  app.source_commit = accepted
+
+  for path in ("index.jsx", "static/store/big.png"):
+    with pytest.raises(CommunityPublicationError) as refused:
+      read_public_store_asset(app, accepted, path)
+    assert refused.value.code == "listing_asset_unavailable"
 
 
 def test_app_git_accepts_store_art_but_excludes_runtime_static_assets(tmp_path):

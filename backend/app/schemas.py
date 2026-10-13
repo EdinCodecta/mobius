@@ -11,6 +11,7 @@ from pydantic import (
   model_validator,
 )
 
+from app.manifest_contract import STORE_LISTING_IMAGE_MAX_BYTES
 from app.manifest_identity import requested_manifest_source
 from app.providers import PROVIDERS, _model_belongs_to_other_provider
 
@@ -108,8 +109,18 @@ class StoreListingImageIn(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   path: str | None = Field(default=None, max_length=512)
-  # 8 MiB of image bytes in base64.
-  data_base64: str | None = Field(default=None, max_length=11_184_812)
+  data_base64: str | None = None
+
+  @field_validator("data_base64")
+  @classmethod
+  def _bounded_upload(cls, value: str | None) -> str | None:
+    # Checked here, before decoding, so a too-large image gets a clear
+    # message; the bound also keeps a full listing under the body cap.
+    if value is not None and len(value) > -(-STORE_LISTING_IMAGE_MAX_BYTES // 3) * 4:
+      raise ValueError(
+        f"Each image must be at most {STORE_LISTING_IMAGE_MAX_BYTES // (1024 * 1024)} MB.",
+      )
+    return value
 
   @model_validator(mode="after")
   def _one_source(self):
@@ -124,7 +135,12 @@ class StoreListingScreenshotIn(StoreListingImageIn):
 
 
 class StoreListingIn(BaseModel):
-  """The whole Store listing as the owner wants it saved."""
+  """The whole Store listing as the owner wants it saved.
+
+  ``icon`` and ``hero`` differ on null because one is required and the other
+  optional: a null ``icon`` keeps the app's current icon, while a null
+  ``hero`` removes the banner.
+  """
 
   model_config = ConfigDict(extra="forbid")
 

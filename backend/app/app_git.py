@@ -428,6 +428,11 @@ def _git_env(
   return env
 
 
+def ref_file(source_dir: str | Path, ref: str, path: str) -> bytes | None:
+  """One file's bytes at ``ref``, or None when ``ref`` has no file there."""
+  return _ref_blob(Path(source_dir), ref, path, read_only=True)
+
+
 def _run(
   repo: Path,
   *args: str,

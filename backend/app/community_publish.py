@@ -16,6 +16,7 @@ from app import app_git, icon_assets, models
 from app.config import get_settings
 from app.manifest_contract import (
   PACKAGE_MAX_BYTES,
+  STORE_LISTING_IMAGE_MAX_BYTES,
   ManifestContractError,
   package_bytes,
   package_limit_message,
@@ -407,7 +408,7 @@ def _incomplete(message: str) -> CommunityPublicationError:
   return CommunityPublicationError(message, "listing_incomplete")
 
 
-def _listing_manifest(by_path: dict[str, dict]) -> dict:
+def _parsed_manifest(by_path: dict[str, dict]) -> dict:
   manifest_item = by_path.get("mobius.json")
   if manifest_item is None:
     raise CommunityPublicationError(
@@ -422,11 +423,14 @@ def _listing_manifest(by_path: dict[str, dict]) -> dict:
     ) from exc
   if not isinstance(manifest, dict):
     raise CommunityPublicationError("mobius.json must be an object.", "invalid_manifest")
+  return manifest
+
+
+def _listing_details(manifest: dict) -> None:
   if not manifest.get("id") or not manifest.get("entry"):
     raise CommunityPublicationError(
       "mobius.json is missing required publication fields.", "invalid_manifest",
     )
-  return manifest
 
 
 def _listing_text(store: dict, field: str, label: str, maximum: int) -> str:
@@ -541,8 +545,14 @@ def store_listing_review(files: list[dict[str, str]]) -> dict:
     except CommunityPublicationError as exc:
       problems[item] = exc
 
-  check("details", lambda: _listing_manifest(by_path))
-  manifest = results.get("details") if isinstance(results.get("details"), dict) else {}
+  # A manifest missing publication fields still holds an editable listing;
+  # only unreadable JSON leaves nothing to show.
+  check("manifest", lambda: _parsed_manifest(by_path))
+  manifest = results.get("manifest") or {}
+  if "manifest" in problems:
+    problems["details"] = problems.pop("manifest")
+  else:
+    check("details", lambda: _listing_details(manifest))
   store = manifest.get("store") if isinstance(manifest.get("store"), dict) else {}
 
   def icon() -> str:
@@ -739,12 +749,23 @@ def read_public_store_asset(
     )
   content = _git(repo, "cat-file", "-p", entry.oid, binary=True)
   assert isinstance(content, bytes)
-  if len(content) > PACKAGE_MAX_BYTES:
+  # An incomplete listing's draft is served too, so the editor can show it;
+  # its icon may name any tracked file, so only real images go out.
+  if len(content) > STORE_LISTING_IMAGE_MAX_BYTES or not _is_listing_image(content):
     raise CommunityPublicationError(
-      "The Store listing asset is too large.", "payload_too_large", 413,
+      "That file is not a Store listing image.", "listing_asset_unavailable", 404,
     )
   _scan_content(asset_path, content)
   return content
+
+
+def _is_listing_image(content: bytes) -> bool:
+  """Whether ``content`` starts like a PNG, JPEG or WebP file."""
+  return (
+    content.startswith(b"\x89PNG\r\n\x1a\n")
+    or content.startswith(b"\xff\xd8\xff")
+    or (content[:4] == b"RIFF" and content[8:12] == b"WEBP")
+  )
 
 
 def build_public_snapshot(
