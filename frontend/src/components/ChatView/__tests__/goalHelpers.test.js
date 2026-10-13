@@ -2,12 +2,12 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement as h } from 'react'
 import { renderToStaticMarkup as render } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 import { goalHelpers, helpersOutsideGoal, goalHelperWaitingLabel } from '../goalHelpers.js'
 import { progressRailViewModel } from '../goalProgress.js'
 import { goalContinuationHandoff } from '../chatHandoffPresentation.js'
 
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
+const vite = await createSsrRenderServer()
 after(() => vite.close())
 const load = async name => (await vite.ssrLoadModule(`/src/components/ChatView/${name}.jsx`)).default
 const Details = await load('GoalPlanDetails')
