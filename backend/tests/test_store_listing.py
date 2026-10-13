@@ -10,7 +10,9 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from app import app_apply, app_git, app_python_env, models, schemas
+from app import (
+  app_apply, app_git, app_python_env, fs_locks, models, schemas, store_listing_source,
+)
 from app.community_publish import public_store_listing, store_listing_review
 from app.config import get_settings
 from app.routes import apps as app_routes
@@ -18,6 +20,19 @@ from app.routes import apps as app_routes
 import pytest
 
 from app.community_publish import CommunityPublicationError
+from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+
+class _HeldCall(BlockedWorker):
+  """Block a real call until released, then run it with its own arguments."""
+
+  def __init__(self, fn):
+    super().__init__()
+    self.fn = fn
+
+  def __call__(self, *args, **kwargs):
+    self.then = lambda: self.fn(*args, **kwargs)
+    return super().__call__(*args, **kwargs)
 
 
 def _png(color=(40, 120, 200), size=(64, 40)) -> bytes:
@@ -258,37 +273,159 @@ def test_failure_after_durable_accept_never_undoes_listing(client, auth):
   assert _preview(client, auth, app_id)["ready"] is True
 
 
+def _save_task(app_id, db, **listing):
+  return lambda: app_routes.save_store_listing(
+    app_id, schemas.StoreListingIn(**_complete_listing(**listing)), db, None,
+  )
+
+
 @pytest.mark.asyncio
-async def test_cancel_during_git_commit_waits_for_coherent_accept(client, auth, db):
+async def test_cancel_during_git_commit_waits_for_coherent_accept(
+  client, auth, db, monkeypatch,
+):
   source = _source()
   app_id = _create(client, auth, source)
-  entered = threading.Event()
-  release = threading.Event()
-  original_commit = app_git.commit_worktree_tree
+  published = []
+  monkeypatch.setattr(
+    app_routes, "_publish_apply_events",
+    lambda result, chat_id: published.append((result.mode, chat_id)),
+  )
+  commit = _HeldCall(app_git.commit_worktree_tree)
+  monkeypatch.setattr(app_git, "commit_worktree_tree", commit)
 
-  def held_commit(*args):
-    entered.set()
-    assert release.wait(10), "test did not release commit"
-    return original_commit(*args)
+  outcome = await cancel_while_worker_blocked(
+    fs_locks.source_dir_lock(str(source)), _save_task(app_id, db), commit,
+  )
 
-  with patch.object(app_git, "commit_worktree_tree", side_effect=held_commit):
-    task = asyncio.create_task(app_routes.save_store_listing(
-      app_id, schemas.StoreListingIn(**_complete_listing()), db, None,
-    ))
-    try:
-      assert await asyncio.to_thread(entered.wait, 10)
-      task.cancel()
-      await asyncio.sleep(0)
-      assert not task.done()  # lock and transaction remain owned while Git runs
-    finally:
-      release.set()
-    with pytest.raises(asyncio.CancelledError):
-      await task
-
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
   row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
   assert row.source_commit == app_git.head_sha(source, "HEAD")
   assert app_git._run(source, "status", "--porcelain").stdout == ""
   assert "store" in json.loads((source / "mobius.json").read_text())
+  # Nobody awaits the response, but the accepted revision is still announced.
+  assert published == [("updated", None)]
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_listing_write_holds_the_source_lock(
+  client, auth, db, monkeypatch,
+):
+  source = _source()
+  app_id = _create(client, auth, source)
+  write = _HeldCall(store_listing_source.write_listing)
+  monkeypatch.setattr(store_listing_source, "write_listing", write)
+
+  outcome = await cancel_while_worker_blocked(
+    fs_locks.source_dir_lock(str(source)), _save_task(app_id, db), write,
+  )
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  # The write it waited for was accepted as one coherent revision.
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert row.source_commit == app_git.head_sha(source, "HEAD")
+  assert app_git._run(source, "status", "--porcelain").stdout == ""
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_undo_restores_source_before_releasing_lock(
+  client, auth, db, monkeypatch,
+):
+  source = _source()
+  app_id = _create(client, auth, source)
+  real_write = store_listing_source.write_listing
+  undo = BlockedWorker()
+
+  def write(*args):
+    undo.then = real_write(*args)
+    return undo
+
+  monkeypatch.setattr(store_listing_source, "write_listing", write)
+  monkeypatch.setattr(
+    app_apply, "apply_source_revision",
+    _raises(app_apply.AppApplyError("boom", "Apply failed.")),
+  )
+
+  outcome = await cancel_while_worker_blocked(
+    fs_locks.source_dir_lock(str(source)), _save_task(app_id, db), undo,
+    while_blocked=lambda: "store" in json.loads((source / "mobius.json").read_text()),
+  )
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  assert (source / "mobius.json").read_text(encoding="utf-8") == _MANIFEST
+  assert app_git._run(source, "status", "--porcelain").stdout == ""
+
+
+def _raises(error):
+  async def fail(*args, **kwargs):
+    raise error
+  return fail
+
+
+def test_ignored_worktree_images_cannot_become_listing_art(client, auth):
+  source = _source()
+  app_id = _create(client, auth, source)
+  (source / "static").mkdir()
+  (source / "static" / "private.png").write_bytes(_png((7, 7, 7)))
+  assert app_git._run(source, "status", "--porcelain").stdout == ""
+
+  for field in ("screenshots", "hero", "icon"):
+    image = {"path": "static/private.png"}
+    body = (
+      _complete_listing(screenshots=[{**image, "alt": "Private."}])
+      if field == "screenshots" else _complete_listing(**{field: image})
+    )
+    refused = _save(client, auth, app_id, **body)
+
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"]["code"] == "listing_image_missing"
+  assert (source / "mobius.json").read_text(encoding="utf-8") == _MANIFEST
+  assert not [path for path in source.rglob("static/store/*") if path.is_file()]
+  assert app_git._run(source, "status", "--porcelain").stdout == ""
+
+
+def test_removing_listing_art_keeps_the_icon_that_shares_it(client, auth):
+  source = _source()
+  app_id = _create(client, auth, source)
+  assert _save(client, auth, app_id, **_complete_listing(
+    hero={"data_base64": _b64(_png((1, 2, 3)))},
+  )).status_code == 200
+  hero = _preview(client, auth, app_id)["listing"]["hero"]["path"]
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["icon"] = hero
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  (source / "icon.png").unlink()
+  applied = client.post("/api/apps/apply", json={"source_dir": str(source)}, headers=auth)
+  assert applied.status_code == 200, applied.text
+
+  saved = _save(client, auth, app_id, **_complete_listing())
+
+  assert saved.status_code == 200, saved.text
+  assert (source / hero).read_bytes() == _png((1, 2, 3))
+  assert json.loads((source / "mobius.json").read_text())["icon"] == hero
+  assert _preview(client, auth, app_id)["ready"] is True
+
+
+def test_a_new_icon_never_overwrites_listing_art_it_shared(client, auth):
+  source = _source()
+  app_id = _create(client, auth, source)
+  assert _save(client, auth, app_id, **_complete_listing(
+    hero={"data_base64": _b64(_png((1, 2, 3)))},
+  )).status_code == 200
+  hero = _preview(client, auth, app_id)["listing"]["hero"]["path"]
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["icon"] = hero
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  assert client.post(
+    "/api/apps/apply", json={"source_dir": str(source)}, headers=auth,
+  ).status_code == 200
+
+  saved = _save(client, auth, app_id, **_complete_listing(
+    hero={"path": hero}, icon={"data_base64": _b64(_png((5, 5, 5), (64, 64)))},
+  ))
+
+  assert saved.status_code == 200, saved.text
+  assert (source / hero).read_bytes() == _png((1, 2, 3))
+  assert json.loads((source / "mobius.json").read_text())["icon"] == "icon.png"
 
 
 def test_invalid_images_are_refused_before_anything_is_written(client, auth):
@@ -391,7 +528,7 @@ def test_listing_paths_cannot_cross_symlinked_parents(tmp_path, operation):
 
   with pytest.raises(listing.ListingEditError):
     if operation == "read":
-      listing._source_file(root, "static/image.png")
+      listing._accepted_file(root, None, "static/image.png")
     elif operation == "write":
       changes.write("static/image.png", b"changed")
     else:

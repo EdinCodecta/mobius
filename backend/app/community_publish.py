@@ -662,6 +662,33 @@ def _public_tree_entries(repo: Path, commit: str) -> list[_PublicTreeEntry]:
   return entries
 
 
+def read_accepted_file(app: models.App, path: str, *, max_bytes: int) -> bytes | None:
+  """One regular file of the app's accepted revision, or None if it has none.
+
+  The editable worktree can also hold ignored or generated files that were
+  never accepted source, so anything that may become public reads from here.
+  """
+  repo = Path(app.source_dir)
+  commit = _accepted_commit(app, repo)
+  listing = _git(repo, "ls-tree", "-l", "-z", commit, "--", path, binary=True)
+  assert isinstance(listing, bytes)
+  for raw_entry in listing.split(b"\0"):
+    metadata, _, raw_path = raw_entry.partition(b"\t")
+    if raw_path != path.encode("utf-8"):
+      continue
+    mode, object_type, oid, size = metadata.decode("ascii").split()
+    if object_type != "blob" or mode not in {"100644", "100755"}:
+      return None
+    if int(size) > max_bytes:
+      raise CommunityPublicationError(
+        f"{path} is larger than {max_bytes} bytes.", "payload_too_large", 413,
+      )
+    content = _git(repo, "cat-file", "blob", oid, binary=True)
+    assert isinstance(content, bytes)
+    return content
+  return None
+
+
 def read_public_store_asset(
   app: models.App, accepted_commit: str, asset_path: str,
 ) -> bytes:

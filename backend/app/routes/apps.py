@@ -2382,7 +2382,7 @@ async def save_store_listing(
       accepted_before_apply = app.source_commit
       async def write_and_accept():
         try:
-          undo = await asyncio.to_thread(
+          undo = await settled.run_settled(
             store_listing_source.write_listing, source, app, edit,
           )
         except store_listing_source.ListingEditError as exc:
@@ -2403,26 +2403,24 @@ async def save_store_listing(
             accepted_now == accepted_before_apply
             and await asyncio.to_thread(app_git.head_sha, source, "HEAD") == head_before_apply
           ):
-            await asyncio.to_thread(undo)
+            await settled.run_settled(undo)
           raise
 
-      save_task = asyncio.create_task(write_and_accept())
-      try:
-        result = await asyncio.shield(save_task)
-      except asyncio.CancelledError:
-        # A cancelled request must keep the source lock until its in-flight
-        # thread/accept settles. Otherwise an undo can race a Git ref move.
-        while not save_task.done():
-          try:
-            await asyncio.shield(save_task)
-          except asyncio.CancelledError:
-            continue
-          except Exception:
-            break
-        if not save_task.cancelled():
-          if save_task.exception() is None:
-            _publish_apply_events(save_task.result(), None)
-        raise
+      what = f"Saving the Store listing of app {app_id}"
+
+      def saved_after_cancel(task: asyncio.Future) -> None:
+        # The revision is accepted even though nobody awaits the response, so
+        # the shell still hears about it.
+        if task.exception() is None:
+          _publish_apply_events(task.result(), None)
+        else:
+          settled.log_abandoned_failure(task, what)
+
+      # A cancelled request keeps the source lock until the write and accept
+      # settle; otherwise an undo could race the accept's Git ref move.
+      result = await settled.settle(
+        write_and_accept(), what=what, abandoned=saved_after_cancel,
+      )
   _publish_apply_events(result, None)
   return schemas.AppApplyOut(
     mode=result.mode,

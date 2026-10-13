@@ -26,6 +26,8 @@ from app.community_publish import (
   SCREENSHOT_ALT_MAX_BYTES,
   SCREENSHOT_LABEL_MAX_BYTES,
   TAGLINE_MAX_BYTES,
+  CommunityPublicationError,
+  read_accepted_file,
 )
 
 
@@ -155,13 +157,29 @@ def _source_path(root: Path, rel: str) -> Path:
     raise ListingEditError("listing_image_invalid", "That image path is not allowed.") from exc
 
 
-def _source_file(root: Path, rel: str) -> bytes:
-  target = _source_path(root, rel)
-  if not target.is_file():
+def _accepted_file(root: Path, app: models.App, rel: str) -> bytes:
+  """An image kept by path, read from the app's accepted revision.
+
+  The worktree may hold ignored or generated images that were never accepted
+  source; copying those into listing art would make them public.
+  """
+  _source_path(root, rel)
+  try:
+    content = read_accepted_file(app, rel, max_bytes=MAX_LISTING_IMAGE_BYTES)
+  except CommunityPublicationError as exc:
+    if exc.code == "payload_too_large":
+      raise ListingEditError(
+        "listing_image_too_large",
+        f"The image {rel} is larger than "
+        f"{MAX_LISTING_IMAGE_BYTES // (1024 * 1024)} MB.",
+      ) from exc
+    raise ListingEditError(exc.code, exc.detail, exc.status_code) from exc
+  if content is None:
     raise ListingEditError(
-      "listing_image_missing", f"The image {rel} no longer exists. Add it again.",
+      "listing_image_missing",
+      f"The image {rel} is not part of the app's applied source. Add it again.",
     )
-  return target.read_bytes()
+  return content
 
 
 def _image_suffix(content: bytes, what: str) -> str:
@@ -193,20 +211,21 @@ def _image_suffix(content: bytes, what: str) -> str:
   return suffix
 
 
-def _place_art(root: Path, changes: _SourceChanges, image: ListingImage, what: str) -> str:
+def _place_art(
+  root: Path, app: models.App, changes: _SourceChanges, image: ListingImage, what: str,
+) -> str:
   """Return the ``static/store/`` path holding this image, writing it if new.
 
   New art is content-addressed, so re-saving the same bytes is a no-op and
   reordering screenshots never overwrites another one. A kept file outside
   ``static/store/`` (an older listing layout) moves into it.
   """
-  if image.data is None and image.path.startswith(f"{STORE_ART_DIR}/"):
-    content = _source_file(root, image.path)
-    _image_suffix(content, what)
-    return image.path
-  content = image.data if image.data is not None else _source_file(root, image.path)
+  content = image.data if image.data is not None else _accepted_file(root, app, image.path)
   suffix = _image_suffix(content, what)
-  rel = f"{STORE_ART_DIR}/{hashlib.sha256(content).hexdigest()[:16]}{suffix}"
+  if image.data is None and image.path.startswith(f"{STORE_ART_DIR}/"):
+    rel = image.path
+  else:
+    rel = f"{STORE_ART_DIR}/{hashlib.sha256(content).hexdigest()[:16]}{suffix}"
   target = _source_path(root, rel)
   if not (target.is_file() and target.read_bytes() == content):
     changes.write(rel, content)
@@ -261,10 +280,11 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     if edit.icon is not None:
       icon_bytes = (
         edit.icon.data if edit.icon.data is not None
-        else _source_file(root, edit.icon.path)
+        else _accepted_file(root, app, edit.icon.path)
       )
-      # Normalized icons are PNG; never write PNG bytes under another suffix.
-      if not icon_rel.lower().endswith(".png"):
+      # Normalized icons are PNG; never write PNG bytes under another suffix,
+      # nor over content-addressed listing art the icon may share a file with.
+      if not icon_rel.lower().endswith(".png") or icon_rel.startswith(f"{STORE_ART_DIR}/"):
         icon_rel = "icon.png"
     else:
       icon_bytes = record_icon_for_save(root, app)
@@ -278,7 +298,7 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     screenshots = []
     for index, shot in enumerate(edit.screenshots, start=1):
       entry = {
-        "src": _place_art(root, changes, shot.image, f"screenshot {index}"),
+        "src": _place_art(root, app, changes, shot.image, f"screenshot {index}"),
         "alt": _bounded(shot.alt, SCREENSHOT_ALT_MAX_BYTES, f"screenshot {index} description"),
       }
       label = _bounded(shot.label, SCREENSHOT_LABEL_MAX_BYTES, f"screenshot {index} caption")
@@ -292,7 +312,7 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     store["tagline"] = tagline
     store["description"] = description
     if edit.hero is not None:
-      store["hero"] = _place_art(root, changes, edit.hero, "banner image")
+      store["hero"] = _place_art(root, app, changes, edit.hero, "banner image")
     else:
       store.pop("hero", None)
     store["screenshots"] = screenshots
@@ -304,7 +324,8 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     manifest["store"] = store
     changes.write("mobius.json", _manifest_text(manifest).encode("utf-8"))
 
-    for stale in previous_art - _referenced_art(store):
+    # Listing art the icon still uses is not stale.
+    for stale in previous_art - _referenced_art(store) - {manifest.get("icon")}:
       changes.delete(stale)
   except BaseException:
     changes.undo()
