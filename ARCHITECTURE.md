@@ -327,6 +327,7 @@ not part of the baked boot infrastructure.
 | `chat_log_redaction.py` | Server-side structural redaction for the gated chat-log read API |
 | `chat_media.py` | One-way startup migration that moves old chat images and stored URLs onto the canonical `/media/` path |
 | `http_caching.py` | Range/206 hardening for revalidating `FileResponse`s |
+| `settled.py` | Thread work a cancelled caller must wait out. Under a lock, each thread call uses `run_settled`, so a cancel lands at the next call and never starts a new step, such as a public GitHub write. A whole section is settled only where an in-process rollback must run (App Apply, the tombstone purge). A plain `asyncio.to_thread` is allowed only for a read, marked `# unsettled: read-only (<reason>)`. `test_settled.py` lints direct calls in lock blocks; the markers are reviewed claims |
 | `timeutil.py` | `now_naive_utc()` + `SOFT_DELETE_TTL`; SQLite stores naive datetimes (mixing aware/naive `TypeError`s on compare) |
 | `presence.py` | Chat-broadcast presence (`has_watchers(chat_id)`) — `push.notify_owner` uses it to skip a push when a live SSE subscriber is already watching |
 | `questions.py` | The AskUserQuestion pending-future registry + lifecycle (`_pending` dict; `register`/`deliver_answer`/`get`/`claim`/`claim_if`/`cancel`) — both SDK runners insert into it, `POST /messages` resolves, Stop cancels |

@@ -258,10 +258,10 @@ def test_cleanup_uses_signed_relay_terminal_state_over_mutable_status(
   assert not checkout.exists()
 
 
-def test_cancelled_cleanup_settles_its_source_section_before_unlocking(
+def test_cancelled_cleanup_holds_the_source_lock_through_its_settlement(
   client, auth, db, monkeypatch,
 ):
-  """A cancel cannot release the source lock mid-settlement or skip the cleanup."""
+  """The settlement's thread ends under the lock; the cancel then lands."""
   import asyncio
 
   from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
@@ -289,4 +289,4 @@ def test_cancelled_cleanup_settles_its_source_section_before_unlocking(
   ))
 
   assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
-  assert not checkout.exists()
+  assert checkout.exists()  # No cleanup step starts after the cancel.

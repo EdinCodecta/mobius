@@ -15703,7 +15703,8 @@ def test_cancelled_stack_submit_holds_source_locks_through_its_preflight(
   ), worker)
 
 
-def test_cancelled_stack_landing_holds_source_locks_until_it_lands(db, monkeypatch):
+def test_a_cancelled_stack_landing_never_starts_the_landing(db, monkeypatch):
+  """A cancel during the pre-landing proof lands before the public fast-forward."""
   from app.routes import github as routes
   from tests.cancel_helpers import BlockedWorker
 
@@ -15712,13 +15713,46 @@ def test_cancelled_stack_landing_holds_source_locks_until_it_lands(db, monkeypat
   monkeypatch.setattr(routes, "_validate_submit_app", lambda *_args: None)
   monkeypatch.setattr(routes, "_claim_stack_landing", lambda **_kwargs: (rows, "land"))
   monkeypatch.setattr(routes, "_equivalence_source_repo", lambda _record: None)
-  monkeypatch.setattr(routes, "_assert_pending_equivalence_preflight", lambda _record: None)
-  monkeypatch.setattr(routes, "_mark_stack_land_success", lambda *a, **k: landed.append(k))
-  worker = BlockedWorker(lambda: ("main", "a" * 40))
-  monkeypatch.setattr(routes, "_land_reviewed_stack", worker)
+  monkeypatch.setattr(routes, "_land_reviewed_stack", lambda rows: landed.append(rows))
+  worker = BlockedWorker()
+  monkeypatch.setattr(routes, "_assert_pending_equivalence_preflight", worker)
 
+  # The source lock stays held while the proof's thread runs, then the cancel
+  # lands without starting the landing.
   _cancel_under_source_lock(repo, lambda: routes.land_contribution_stack(
     None, 1, routes.ContributionStackLandRequest(record_ids=["layer-1"]), db, None,
   ), worker)
-  # The landing finished; the cancelled request records it on retry (recover).
   assert not landed
+
+
+def test_a_cancelled_submit_publishes_nothing(db, monkeypatch):
+  """A cancel during the source proof never goes on to push or open the PR."""
+  from app.routes import github as routes
+  from tests.cancel_helpers import BlockedWorker
+
+  repo, rows = _stack_rows("submit-cancel", "submitting")
+  published = []
+  owner = SimpleNamespace(
+    recovery_record=lambda record: record, event=lambda *a: None,
+    replay_phase=lambda: None, receipt=lambda: None,
+  )
+  monkeypatch.setattr(routes, "_validate_submit_app", lambda *_args: None)
+  monkeypatch.setattr(routes, "_personal_resume_allowed", lambda **_kwargs: False)
+  monkeypatch.setattr(
+    routes, "_personal_claim_owners", lambda **_kwargs: ({"layer-1": owner}, None),
+  )
+  monkeypatch.setattr(
+    routes, "_claim_record",
+    lambda **_kwargs: (rows[0]["record"], repo / "record.json", repo / "diff"),
+  )
+  monkeypatch.setattr(routes, "_equivalence_source_repo", lambda _record: None)
+  monkeypatch.setattr(
+    routes, "_submit_prepared_pr", lambda *a, **k: published.append(a),
+  )
+  worker = BlockedWorker()
+  monkeypatch.setattr(routes, "_assert_personal_publication_source", worker)
+
+  _cancel_under_source_lock(
+    repo, lambda: routes.submit_contribution(None, 1, "layer-1", None, db, None), worker,
+  )
+  assert not published

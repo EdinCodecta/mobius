@@ -257,22 +257,22 @@ _SETTLED_ELSEWHERE = {("platform_update.py", "_apply_platform_update_sync")}
 
 
 def _locks(expr) -> bool:
-  """Whether an ``async with`` item takes a filesystem, transition or Apply lock."""
-  if isinstance(expr, ast.Name):
-    return expr.id == "_APPLY_LOCK"
-  if not isinstance(expr, ast.Call):
-    return False
-  func = expr.func
-  if isinstance(func, ast.Attribute):
-    if isinstance(func.value, ast.Name) and func.value.id == "fs_locks":
+  """Whether an ``async with`` item looks like a lock.
+
+  Any lock-like name counts: ``fs_locks.*`` calls, the chat transition lock,
+  ``_APPLY_LOCK``, route-local wrappers such as a stack's source locks, and
+  plain ``lock`` or ``self._lock`` attributes.
+  """
+  if isinstance(expr, ast.Call):
+    func = expr.func
+    if (
+      isinstance(func, ast.Attribute)
+      and isinstance(func.value, ast.Name) and func.value.id == "fs_locks"
+    ):
       return True
-    name = func.attr
-  elif isinstance(func, ast.Name):
-    name = func.id
-  else:
-    return False
-  # Also the route-local wrappers around them, such as a stack's source locks.
-  return name == "get_transition_lock" or name.endswith(("_lock", "_locks"))
+    expr = func
+  name = getattr(expr, "attr", None) or getattr(expr, "id", "")
+  return "lock" in name.lower()
 
 
 def _held(node: ast.AsyncWith) -> bool:
@@ -314,7 +314,8 @@ def test_lock_held_thread_work_is_settled_or_marked_read_only():
   may stay plain, marked ``# unsettled: read-only (<what it reads>)`` on the
   call's line.
 
-  This only sees direct calls written inside a lock block. Thread work
+  The policy itself is in ``app/settled.py``. This only sees direct calls
+  written inside a lock block. Thread work
   reached through a called coroutine is not checked, and a marker is a claim
   that a reviewer checks by hand, not something this test can prove.
   """
