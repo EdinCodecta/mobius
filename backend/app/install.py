@@ -350,11 +350,8 @@ def _github_root_manifest_identity(url_or_base: str) -> tuple[str, str] | None:
 
 
 def _github_origin_url(url_or_base: str) -> str | None:
-  identity = _github_root_manifest_identity(url_or_base)
-  if identity is None:
-    return None
-  owner, repo = identity
-  return f"https://github.com/{owner}/{repo}.git"
+  root = parse_root_manifest(url_or_base)
+  return root.origin_url if root is not None else None
 
 
 def _reviewed_predecessor_source(
@@ -2437,6 +2434,32 @@ def _new_candidate(
   )
 
 
+_DERIVED_CANDIDATE_FIELDS = frozenset((
+  "capability_contract", "capability_digest", "candidate_digest",
+))
+
+
+def _with_source_identity(
+  candidate: InstallCandidate,
+  *,
+  source_identity: str | None,
+  predecessor_source_identity: str | None,
+  canonical_source_url: str | None,
+) -> InstallCandidate:
+  """The same package bound to resolved source identities, digests re-derived."""
+  package = {
+    item.name: getattr(candidate, item.name)
+    for item in dataclasses.fields(candidate)
+    if item.name not in _DERIVED_CANDIDATE_FIELDS
+  }
+  return _new_candidate(**{
+    **package,
+    "source_identity": source_identity,
+    "predecessor_source_identity": predecessor_source_identity,
+    "canonical_source_url": canonical_source_url,
+  })
+
+
 async def _resolve_package_identity(
   client: httpx.AsyncClient, manifest: dict, source_url: str,
 ) -> tuple[str | None, str | None, str | None]:
@@ -3215,17 +3238,8 @@ async def _staged_clone_candidate(
       source_identity, predecessor, canonical = await _resolve_package_identity(
         cli, candidate.manifest, source_url,
       )
-    candidate = _new_candidate(
-      manifest=candidate.manifest,
-      raw_base=candidate.raw_base,
-      entry_bytes=candidate.entry_bytes,
-      icon_processed=candidate.icon_processed,
-      icon_warning=candidate.icon_warning,
-      bundled_job=candidate.bundled_job,
-      static_assets=candidate.static_assets,
-      source_files=candidate.source_files,
-      seeds=candidate.seeds,
-      source_review_digest=candidate.source_review_digest,
+    candidate = _with_source_identity(
+      candidate,
       source_identity=source_identity,
       predecessor_source_identity=predecessor,
       canonical_source_url=canonical,
@@ -3359,9 +3373,10 @@ def resolve_package_row(
      ref of the same root GitHub package, or a proven legacy origin); when
      both find a row they must agree.
   2. Its ``previous_manifest_url`` under the same ``id``, for a permanent
-     package whose provider identity proves it is the same repository.
+     package whose resolved provider identity (``source_identity``) equals the
+     predecessor's, proving both addresses name one repository.
   3. A ``previous_id`` rename: under the current address, then (permanent
-     package) the proven predecessor address, or (otherwise) a predecessor
+     package) that proven predecessor address, or (otherwise) a predecessor
      owned by the same GitHub account. A deleted predecessor is not revived.
 
   A row holding a permanent ``package_id`` is only ever that package.
@@ -3379,8 +3394,10 @@ def resolve_package_row(
   renamed = False
   origin_migration = None
   if existing is None:
+    # Only a resolved provider identity proves one repository; two unknown
+    # identities (a legacy row's update, an unresolved fetch) prove nothing.
     same_repository = bool(
-      package_id and previous_source
+      package_id and previous_source and source_identity is not None
       and predecessor_identity == source_identity
     )
     # (address, manifest id, whether the row is a `previous_id` rename)

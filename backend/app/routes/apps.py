@@ -1,6 +1,7 @@
 """Routes for managing the mini-app registry."""
 
 import asyncio
+import functools
 import io
 import json
 import logging
@@ -786,13 +787,11 @@ async def preview_app_install(
       db=db,
     )
   )
+  # The row install would update, by its one rule. Source identities are not
+  # resolved here, so a move that only a provider repository id proves is
+  # previewed as a new install.
   source = body.manifest_url if body.manifest_url is not None else raw_base
-  existing = install._find_install_identity_row(
-    db,
-    source_url=source,
-    manifest_id=manifest["id"],
-    package_id=manifest.get("package_id"),
-  )
+  existing = install.resolve_package_row(db, manifest, source).row
   if existing is not None and existing.deleted_at is not None:
     existing = None
   installed_contract = existing.capability_contract if existing else None
@@ -1389,7 +1388,6 @@ def _read_pending_update(repo: Path, app_id: int) -> tuple[
 
 
 def _update_candidate_rejection(
-  db: Session,
   app_id: int,
   manifest: dict,
   manifest_url: str,
@@ -1403,21 +1401,22 @@ def _update_candidate_rejection(
   with a Store update's inputs), so it never offers an update that install
   would refuse, or apply to another row. The ``{code, message}`` is
   update-check's ``candidate_rejected`` and the update preview's 409 detail.
+  Blocking (database reads, and a Git origin read for a legacy row): callers
+  run it in a worker thread, in its own short session.
   """
-  from app import install
+  from app import database, install
 
   try:
     install.validate_manifest_address(
       manifest, manifest_url, package_id=package_id,
     )
-    row = install.resolve_update_row(
-      db, manifest, manifest_url, source_identity,
-    ).row
-    row_id = row.id if row is not None else None
+    with database.SessionLocal() as db:
+      row = install.resolve_update_row(
+        db, manifest, manifest_url, source_identity,
+      ).row
+      row_id = row.id if row is not None else None
   except HTTPException as exc:
     return {"code": "identity_mismatch", "message": str(exc.detail)}
-  finally:
-    db.close()  # Release the connection the identity lookup checked out.
   if row_id == app_id:
     return None
   return {
@@ -1584,13 +1583,14 @@ async def update_check(
       pending, pending_state = await asyncio.to_thread(
         _read_pending_update, repo, target_app_id,
       )
-      # Install's own identity rule; a database read, no network.
-      rejection = _update_candidate_rejection(
-        db, target_app_id, candidate.manifest,
+      # Install's own identity rule; database reads, no network.
+      rejection = await asyncio.to_thread(functools.partial(
+        _update_candidate_rejection,
+        target_app_id, candidate.manifest,
         manifest_url or installed_manifest_url,
         package_id=installed_package_id,
         source_identity=installed_source_identity,
-      )
+      ))
       if rejection is not None:
         return _unknown(rejection)
       # The durable pending receipt wins before parsing/comparing a baseline.
@@ -1731,11 +1731,12 @@ async def update_candidate_preview(
       candidate = await asyncio.to_thread(
         install.read_git_install_candidate, repo, commit, fetch_manifest_url,
       )
-      rejection = _update_candidate_rejection(
-        db, app_id, candidate.manifest, manifest_url or installed_manifest_url,
+      rejection = await asyncio.to_thread(functools.partial(
+        _update_candidate_rejection,
+        app_id, candidate.manifest, manifest_url or installed_manifest_url,
         package_id=installed_package_id,
         source_identity=installed_source_identity,
-      )
+      ))
       if rejection is not None:
         raise HTTPException(409, detail=rejection)
       previous_source = await asyncio.to_thread(

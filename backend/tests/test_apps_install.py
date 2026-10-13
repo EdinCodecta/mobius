@@ -6269,6 +6269,42 @@ def test_install_from_a_stored_manifest_url_keeps_its_package_binding(
   assert preview.status_code == 409, preview.text
 
 
+def test_install_preview_compares_a_renamed_app_with_the_row_install_updates(
+  client, auth, bypass_url_validation,
+):
+  """A `previous_id` rename previews against the installed row, not as new."""
+  base = "https://preview-rename.test/repo/"
+  manifest = {**MANIFEST_NEWS, "id": "preview-rename"}
+  installed = _install_v1(client, auth, base, manifest, JSX)
+  assert installed.status_code == 201, installed.text
+  renamed = {
+    **manifest, "id": "preview-renamed", "previous_id": "preview-rename",
+    "version": "2.0.0",
+  }
+  responses = {
+    base + "mobius.json": (200, json.dumps(renamed).encode()),
+    base + "index.jsx": (200, JSX.encode()),
+    base + "icon.png": (200, _png_bytes()),
+    base + "prompt.md": (200, PROMPT.encode()),
+    base + "fetch.sh": (200, b""),
+  }
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    preview = client.post("/api/apps/preview", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert preview.status_code == 200, preview.text
+  assert preview.json()["installed_contract"] is not None
+  assert preview.json()["installed_contract"] == preview.json()["capability_contract"]
+
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    applied = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert applied.status_code == 201, applied.text
+  assert applied.json()["mode"] == "update"
+  assert applied.json()["id"] == installed.json()["id"]
+
+
 def test_missing_reviewed_git_commit_is_a_stale_update(
   client, auth, bypass_url_validation,
 ):
@@ -9256,6 +9292,36 @@ def test_update_check_uses_identity_matched_live_candidate_for_pinned_install(
   assert response.json()["upstream_version"] == "2.0.0"
 
 
+@pytest.mark.parametrize("route", ["update-check", "update-candidate-preview"])
+def test_update_discovery_resolves_identity_off_the_event_loop(
+  client, auth, bypass_url_validation, route,
+):
+  """Its database (and legacy Git origin) reads never block the loop."""
+  base = "https://uc-off-loop.test/repo/"
+  manifest = {**MANIFEST_NEWS, "id": "uc-off-loop"}
+  installed = _install_v1(client, auth, base, manifest, JSX)
+  assert installed.status_code == 201, installed.text
+  on_loop = []
+  resolve = install.resolve_update_row
+
+  def recording_resolve(*args, **kwargs):
+    try:
+      asyncio.get_running_loop()
+      on_loop.append(True)
+    except RuntimeError:
+      on_loop.append(False)
+    return resolve(*args, **kwargs)
+
+  with _git_update_source(_git_candidate(manifest, JSX)), patch(
+    "app.install.resolve_update_row", recording_resolve,
+  ):
+    response = client.get(
+      f"/api/apps/{installed.json()['id']}/{route}", headers=auth,
+    )
+  assert response.status_code == 200, response.text
+  assert on_loop == [False]
+
+
 def test_update_check_ignores_candidate_from_different_package(
   client, auth, bypass_url_validation,
 ):
@@ -10928,7 +10994,9 @@ async def test_ancillary_source_check_and_tree_writes_leave_event_loop(monkeypat
 def test_raw_github_address_forms_agree_on_one_package(url):
   """Identity, origin and clone eligibility read a root address one way."""
   assert install._github_root_manifest_identity(url) == ("alice", "app-notes")
-  assert install._github_origin_url(url) == "https://github.com/alice/app-notes.git"
+  assert app_git.same_origin(
+    install._github_origin_url(url), "https://github.com/alice/app-notes.git",
+  )
   clone_url, ref = install._derive_repo_ref(url)
   assert app_git.same_origin(clone_url, "https://github.com/alice/app-notes.git")
   assert ref == "main"
@@ -10943,6 +11011,8 @@ def test_raw_github_address_forms_agree_on_one_package(url):
   "https://raw.githubusercontent.com:8443/alice/app-notes/main/mobius.json",
   "https://raw.githubusercontent.com/alice/../main/mobius.json",
   "https://raw.githubusercontent.com/-alice/app-notes/main/mobius.json",
+  "https://raw.githubusercontent.com/alice/app%2Fnotes/main/mobius.json",
+  "https://raw.githubusercontent.com/alice/app-notes/feature%2Fx/mobius.json",
   "https://example.test/alice/app-notes/main/mobius.json",
 ])
 def test_non_root_addresses_are_neither_identities_nor_clones(url):
@@ -11043,16 +11113,16 @@ _PARITY_BOB = "https://raw.githubusercontent.com/bob/app-notes/main/"
 @pytest.mark.parametrize("candidate_fields, catalog_base, offered", [
   # The same package, one release later.
   ({}, _PARITY_ALICE, True),
-  # A legacy row adopting a permanent package_id, renamed, whose predecessor
-  # address is under another owner: install resolves the predecessor address,
-  # so discovery offers it too (it used to refuse it as a cross-owner rename).
+  # Another owner's repository naming this app as its predecessor, with a new
+  # package_id: nothing proves both addresses are one repository (a legacy
+  # row has no provider identity), so neither discovery nor install adopts it.
   (
     {
       "id": "parity-renamed", "previous_id": "parity-notes",
       "package_id": "urn:uuid:6a1f0c2e-7b3d-5e4f-9a8b-1c2d3e4f5a6b",
       "previous_manifest_url": _PARITY_ALICE + "mobius.json",
     },
-    _PARITY_BOB, True,
+    _PARITY_BOB, False,
   ),
   # A rename across owners without a permanent identity is refused by both.
   (

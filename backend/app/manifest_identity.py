@@ -38,7 +38,8 @@ def parse_root_manifest(url: str) -> RootManifest | None:
   identity key carries one). The host compares case-insensitively and may name
   the default port. Anything else is not a root package and returns None: a
   manifest in a repository subdirectory, a ref containing a slash, another
-  file name, credentials, or an empty, dot, dash-leading or backslash segment.
+  file name, credentials, or an empty, dot, dash-leading, backslash or
+  encoded-slash segment.
   """
   if not isinstance(url, str) or not url:
     return None
@@ -60,7 +61,8 @@ def parse_root_manifest(url: str) -> RootManifest | None:
   if len(parts) == 4 and parts[3] == "mobius.json":
     filename = parts.pop()
   if len(parts) != 3 or any(
-    part in ("", ".", "..") or part.startswith("-") or "\\" in part
+    part in ("", ".", "..") or part.startswith("-")
+    or "\\" in part or "/" in part  # `%2F` decodes to a slash.
     for part in parts
   ):
     return None
