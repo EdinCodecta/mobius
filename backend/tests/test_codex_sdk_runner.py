@@ -4625,7 +4625,7 @@ def test_cancelled_turn_reap_finishes_then_closes_executor_and_cancel_wins(
     await asyncio.sleep(.02)
     assert not task.done() and order == []
     reap.release.set()
-    with pytest.raises(asyncio.CancelledError, match="turn stopped"):
+    with pytest.raises(asyncio.CancelledError, match="^turn stopped$"):
       await task
 
   asyncio.run(scenario())
@@ -4704,11 +4704,102 @@ def test_cancel_during_generated_file_capture_still_reaps_and_closes(monkeypatch
     await asyncio.sleep(.02)
     assert not task.done() and order == []
     finish_publish.set()
-    with pytest.raises(asyncio.CancelledError, match="turn stopped"):
+    with pytest.raises(asyncio.CancelledError, match="^turn stopped$"):
       await task
 
   asyncio.run(scenario())
   assert order == ["publish", "reap", "executor close"]
+
+
+def test_cancel_during_steer_settlement_still_unregisters_reaps_and_closes(monkeypatch):
+  """A second cancellation in the steer settlement skips nothing after it."""
+  body_ready = settle_started = finish_settle = None
+  order = []
+
+  class FakeAsyncCodex:
+    def __init__(self, config=None):
+      self.config = config
+      self._client = SimpleNamespace(
+        _sync=SimpleNamespace(
+          _proc=SimpleNamespace(pid=4321),
+          _approval_handler=None,
+        ),
+      )
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, _exc_type, _exc, _tb):
+      return None
+
+    async def thread_start(self, *_args, **_kwargs):
+      return _FakeThread("thread-steer", BlockedTurn())
+
+  class BlockedTurn(_FakeTurnHandle):
+    async def stream(self):
+      body_ready.set()
+      await asyncio.Future()
+      yield  # pragma: no cover
+
+  async def finish_steer(self):
+    settle_started.set()
+    await finish_settle.wait()
+    order.append("steer settled")
+
+  monkeypatch.setattr(
+    codex_sdk_runner, "_sdk_imports", lambda: _fake_sdk(FakeAsyncCodex),
+  )
+  monkeypatch.setattr(codex_sdk_runner.shutil, "which", lambda name: {
+    "codex": "/usr/local/bin/codex",
+    "setsid": "/usr/bin/setsid",
+  }.get(name))
+  monkeypatch.setattr(codex_sdk_runner.os, "getpgid", lambda _pid: 4321)
+  monkeypatch.setattr(codex_sdk_runner.os, "getpgrp", lambda: 9999)
+  monkeypatch.setattr(
+    codex_sdk_runner.ActiveCodexTurn, "finish_steer_before_turn_end", finish_steer,
+  )
+  monkeypatch.setattr(
+    codex_sdk_runner, "_persist_session_id", lambda *_args, **_kwargs: asyncio.sleep(0),
+  )
+  monkeypatch.setattr(
+    codex_sdk_runner, "_terminate_codex_processes",
+    lambda *_args: order.append("reap") or True,
+  )
+  monkeypatch.setattr(
+    codex_sdk_runner, "_install_codex_call_executor",
+    lambda *_args: SimpleNamespace(close=lambda: order.append("executor close")),
+  )
+
+  async def scenario():
+    nonlocal body_ready, settle_started, finish_settle
+    body_ready, settle_started, finish_settle = (
+      asyncio.Event(), asyncio.Event(), asyncio.Event(),
+    )
+    task = asyncio.create_task(codex_sdk_runner.run_codex_sdk_turn(
+      user_message="hello",
+      session_id=None,
+      base_env={},
+      cwd="/tmp",
+      chat_id="chat-cancel-during-steer-settlement",
+      bc=_FakeBroadcast(),
+      pending_questions={},
+      db=None,
+    ))
+    await body_ready.wait()
+    task.cancel("turn stopped")
+    await asyncio.wait_for(settle_started.wait(), 5)
+    task.cancel("turn stopped again")
+    await asyncio.sleep(.02)
+    assert not task.done() and order == []
+    finish_settle.set()
+    with pytest.raises(asyncio.CancelledError, match="^turn stopped$"):
+      await task
+
+  asyncio.run(scenario())
+  assert order == ["steer settled", "reap", "executor close"]
+  assert registry.get_handle(
+    "chat-cancel-during-steer-settlement", RunnerKind.CODEX_SDK,
+  ) is None
 
 
 def test_run_codex_sdk_turn_fallback_does_not_start_capture_poller(

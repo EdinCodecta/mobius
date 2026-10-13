@@ -2500,31 +2500,10 @@ async def _run_codex_sdk_turn(
       "error": _codex_user_error(str(exc)),
     })
   finally:
-    deferred_cancel: asyncio.CancelledError | None = None
-
-    async def finish_teardown_step(
-      work: Any, step: str, *, level: int = logging.ERROR,
-    ) -> None:
-      """Run one step to its end; defer a cancellation, log a failure."""
-      nonlocal deferred_cancel
-
-      async def logged() -> None:
-        try:
-          await work
-        except Exception:
-          log.log(
-            level, "Codex turn teardown: %s failed chat_id=%s", step, chat_id,
-            exc_info=True,
-          )
-
-      try:
-        await settled.settle(logged())
-      except asyncio.CancelledError as exc:
-        deferred_cancel = deferred_cancel or exc
-
+    teardown = settled.Teardown(log, f"chat_id={chat_id}")
     # A cancellation landing in any step below is deferred, so it cannot skip
     # the reap, unregister and executor close that follow.
-    await finish_teardown_step(
+    await teardown.step(
       generated_files.publish_inbox_files(
         bc,
         data_dir=runtime_data_dir,
@@ -2557,7 +2536,7 @@ async def _run_codex_sdk_turn(
           # A caller cancellation landed during the shielded join. Keep
           # waiting for the runner-owned task so initialization-failure cleanup
           # cannot lose the only observed PGID.
-          deferred_cancel = deferred_cancel or exc
+          teardown.defer(exc)
       try:
         captured_during_start = process_group_capture_task.result()
         if process_group_id is None:
@@ -2578,30 +2557,23 @@ async def _run_codex_sdk_turn(
     group_already_terminated = False
     if isinstance(current, ActiveCodexTurn) and current.turn is turn:
       group_already_terminated = current._force_stop_started
-      try:
-        await current.finish_steer_before_turn_end()
-      except asyncio.CancelledError as exc:
-        # A committing cut owns its durable queue row. Finish that bounded
-        # writer settlement before honoring cancellation so the wrapper's
-        # terminal Finalize cannot race it and reorder Q1/A1/Q2.
-        deferred_cancel = deferred_cancel or exc
-        await asyncio.shield(current.finish_steer_before_turn_end())
-      except Exception:
-        log.exception(
-          "Codex steer settlement failed during turn teardown chat_id=%s",
-          chat_id,
-        )
+      # A committing cut owns its durable queue row. Finish that bounded
+      # writer settlement before honoring cancellation so the wrapper's
+      # terminal Finalize cannot race it and reorder Q1/A1/Q2.
+      await teardown.step(
+        current.finish_steer_before_turn_end(), "Codex steer settlement",
+      )
       registry.unregister(chat_id, RunnerKind.CODEX_SDK)
       current.mark_finished()
     if helper_host is not None:
       # Unload this helper's thread (its tool servers exit with it) before
       # ending its leftover commands; the host itself stays up.
-      await finish_teardown_step(
+      await teardown.step(
         helper_host.unload_thread(current_session_id), "helper thread unload",
       )
       if not helper_host.alive:
         from app import helper_hosts
-        await finish_teardown_step(
+        await teardown.step(
           helper_hosts.MANAGER.discard(helper_host), "helper host discard",
         )
     if turn_env_file is not None:
@@ -2617,14 +2589,13 @@ async def _run_codex_sdk_turn(
       (process_group_id is not None or run_marker)
       and not group_already_terminated
     ):
-      await finish_teardown_step(
+      await teardown.step(
         asyncio.to_thread(_terminate_codex_processes, process_group_id, run_marker),
         "process reap",
       )
     if codex_call_executor is not None:
       codex_call_executor.close()
-    if deferred_cancel is not None:
-      raise deferred_cancel
+    teardown.finish()
 
 
 async def run_codex_sdk_turn(
