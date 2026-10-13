@@ -182,6 +182,60 @@ def test_a_cancelled_lease_finishes_closing_the_old_host_under_its_lock(monkeypa
   assert not replacements  # No new host started after the cancel.
 
 
+def test_a_codex_host_cancelled_while_starting_ends_its_process_group_under_the_lock(
+  monkeypatch,
+):
+  """A second cancel during start's own close never releases the lease lock."""
+  from types import SimpleNamespace
+
+  from app import codex_sdk_runner, process_groups
+  from tests.cancel_helpers import BlockedWorker
+
+  manager = helper_hosts.HostManager()
+  killed = []
+  worker = BlockedWorker(wraps=lambda pgid, **_: killed.append(pgid))
+  monkeypatch.setattr(process_groups, "terminate_process_group", worker)
+  monkeypatch.setattr(
+    codex_sdk_runner, "_install_codex_call_executor", lambda *a: None,
+  )
+  monkeypatch.setattr(codex_sdk_runner, "_codex_process_group_id", lambda c: 4242)
+
+  async def entered_then_cancelled(context):
+    return SimpleNamespace(), asyncio.CancelledError("cancelled while starting")
+
+  monkeypatch.setattr(
+    codex_sdk_runner, "_enter_codex_context_owned", entered_then_cancelled,
+  )
+
+  class _Context:
+    async def __aexit__(self, *exc):
+      return None
+
+  sdk = {"AsyncCodex": lambda config: _Context()}
+
+  async def scenario():
+    async def lease():
+      async with manager.lease(
+        _key(), lambda: helper_hosts.CodexHelperHost(_key(), sdk=sdk, config=None),
+      ):
+        raise AssertionError("a cancelled start must not lease its host")
+
+    task = asyncio.create_task(lease())
+    assert await asyncio.to_thread(worker.entered.wait, 5)
+    for _ in range(2):
+      task.cancel()
+      await asyncio.sleep(0.02)
+      assert not task.done() and manager._lock(_key()).locked()
+    worker.release.set()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+    assert worker.exited.is_set() and not manager._lock(_key()).locked()
+    assert manager.live_hosts() == []
+
+  asyncio.run(scenario())
+  assert killed == [4242]
+
+
 def test_host_digest_separates_parents_and_setups_without_changing_write_identity():
   assert _key("a").digest != _key("b").digest
   assert helper_hosts.HostKey("a", "codex", "/data", "other-setup").digest != _key("a").digest

@@ -446,10 +446,14 @@ class CodexHelperHost(Host):
     )
     client, cancel = await _enter_codex_context_owned(self._context)
     self.client = client
-    if cancel is not None:
-      await self.close()
-      raise cancel
+    # Captured before the cancel check, so close also ends the process group.
     self.process_group_id = _codex_process_group_id(client)
+    if cancel is not None:
+      # Settled: a second cancel must not release the lease lock while the
+      # process group is still being killed.
+      with contextlib.suppress(Exception):
+        await settled.settle(self.close(), what="Helper host close")
+      raise cancel
     lower_process_group_priority(
       self.process_group_id, logger=log, label="Codex helper host",
     )

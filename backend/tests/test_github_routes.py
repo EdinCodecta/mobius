@@ -15756,3 +15756,98 @@ def test_a_cancelled_submit_publishes_nothing(db, monkeypatch):
     repo, lambda: routes.submit_contribution(None, 1, "layer-1", None, db, None), worker,
   )
   assert not published
+
+
+def test_a_cancel_just_after_the_pr_opens_is_recovered_from_its_receipt(
+  client, owner_token, db, monkeypatch,
+):
+  """A client gone right after the public write never republishes or sticks.
+
+  The signed receipt already says the PR is open, so the next Send settles that
+  exact PR from it instead of pushing or creating again.
+  """
+  import threading
+
+  from app import models
+  from app.deps import Principal
+
+  _write_token(login="octocat")
+  app_id, _ = _app_token(client, owner_token, github_access=True)
+  record_id = "cancel-after-open"
+  head = "a" * 40
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
+  (repo / ".git").mkdir(parents=True)
+  record = {
+    "id": record_id, "type": "pr", "status": "prepared",
+    "repo": "mobius-os/app-demo", "branch": "fix/cancel-after-open",
+    "plan": {
+      "action": "pr", "repo": "mobius-os/app-demo", "repo_path": str(repo),
+      "branch": "fix/cancel-after-open", "base_sha": "b" * 40,
+      "head_sha": head, "diff_sha256": "c" * 64, "title": "Cancel safe",
+      "body_draft": "Exact body",
+    },
+  }
+  _write_contribution(app_id, record_id, record, "reviewed")
+  url = "https://github.com/mobius-os/app-demo/pull/77"
+  patch = {
+    "last_submit_stage": "pr_created", "last_submit_push_sha": head,
+    "head_repository": "octocat/app-demo", "publication_stage": "draft",
+  }
+  monkeypatch.setattr(
+    github_routes, "_assert_personal_publication_source", lambda *_a: "exact",
+  )
+  monkeypatch.setattr(github_routes, "_equivalence_source_repo", lambda _r: None)
+
+  async def no_witness(*_args, **_kwargs):
+    return None
+
+  monkeypatch.setattr(github_routes, "_record_pending_equivalence_locked", no_witness)
+  opened, finish = threading.Event(), threading.Event()
+  calls = []
+
+  def publish(_record, _diff, **kwargs):
+    calls.append(kwargs["prior_attempt_phase"])
+    if kwargs["prior_attempt_phase"] == "armed":
+      kwargs["attempt_event"]("complete", {
+        "action": "create_pr", "url": url, "number": 77, "head_sha": head,
+      }, patch)
+      opened.set()
+      assert finish.wait(5)
+    return url, 77, {**patch, "url": url, "number": 77}
+
+  monkeypatch.setattr(github_routes, "_submit_prepared_pr", publish)
+  principal = Principal(owner=db.query(models.Owner).first(), app_id=None)
+
+  async def cancelled_send():
+    task = asyncio.create_task(
+      github_routes.submit_contribution(None, app_id, record_id, None, db, principal),
+    )
+    assert await asyncio.to_thread(opened.wait, 5)
+    task.cancel()
+    await asyncio.sleep(.02)
+    assert not task.done()  # The public write's thread finishes first.
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+
+  asyncio.run(cancelled_send())
+  receipt_path = github_routes.contribution_runtime.personal_attempt_path(
+    app_id, record_id,
+  )
+  record_path = (
+    Path(get_settings().data_dir) / "apps" / str(app_id)
+    / "contributions" / f"{record_id}.json"
+  )
+  assert json.loads(record_path.read_text())["status"] == "submitting"
+  assert receipt_path.exists()
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record_id}/submit",
+    headers={"Authorization": f"Bearer {owner_token}"},
+  )
+  assert response.status_code == 200, response.text
+  # The retry resumed from the receipt: no fresh publication.
+  assert calls == ["armed", "complete"]
+  settled_record = response.json()["record"]
+  assert (settled_record["status"], settled_record["number"]) == ("draft", 77)
+  assert not receipt_path.exists()

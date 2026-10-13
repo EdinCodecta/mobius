@@ -258,8 +258,8 @@ class AppUpdateBatches:
       wake.set()
 
   def _save(self, record: dict) -> None:
-    """Save on the calling thread: admission (no await before the receipt
-    exists) and boot, where nothing else runs yet."""
+    """Save on the calling thread, for admission: no await may come before
+    the receipt exists."""
     try:
       self._write(record["id"], self._encode(record))
     except OSError:
@@ -274,8 +274,12 @@ class AppUpdateBatches:
     state when its turn comes, so the last write always holds the latest
     progress. The write finishes even if its caller is cancelled.
     """
+    if self.records.get(record["id"]) is not record:
+      return  # Pruned already: never write it back, nor leave a lock behind.
     lock = self._save_locks.setdefault(record["id"], asyncio.Lock())
     async with lock:
+      if self.records.get(record["id"]) is not record:
+        return  # Pruned while this save waited: never write it back.
       text = self._encode(record)
       try:
         await settled.run_settled(self._write, record["id"], text)
@@ -294,12 +298,26 @@ class AppUpdateBatches:
     try:
       # Settled: a retry cancelled mid-read keeps the previous failure, so the
       # next request retries again, and the read never races that retry.
-      await settled.run_settled(self._load_receipts)
+      loaded = await settled.run_settled(self._load_receipts)
+      # A retry runs while the server serves requests, so the outcomes are
+      # applied here, on the loop, and the records appear only once saved.
+      records, settled_texts = {}, {}
+      for record, outcomes in loaded:
+        records[record["id"]] = record
+        if outcomes is not None:
+          _apply(record, outcomes)
+          settled_texts[record["id"]] = self._encode(record)
+      try:
+        await settled.run_settled(self._write_all, settled_texts)
+      except OSError:
+        self._write_failed()
+        raise
+      self.records = records
     except Exception:
       # A damaged receipt or a failed settlement read (including a database
       # error) must not fail readiness for unrelated chats and apps. Disable
       # only this owner, visibly, and keep the evidence for repair. A failed
-      # settlement write is a write failure (_save set it): never retried.
+      # settlement write is a write failure (_write_failed set it): never retried.
       self._read_failed = self.failure != _UNSAVED
       if self._read_failed:
         self.failure = _UNREADABLE
@@ -317,13 +335,20 @@ class AppUpdateBatches:
       if self._read_failed and not self.tasks:
         await self._start()
 
-  def _load_receipts(self) -> None:
+  def _write_all(self, texts: dict[str, str]) -> None:
+    for key, text in texts.items():
+      self._write(key, text)
+
+  def _load_receipts(self) -> list[tuple[dict, dict | None]]:
+    """Off the loop: read the receipts and what their unfinished entries
+    settled to. Touches no shared state; ``_start`` applies the result."""
     self.root.mkdir(parents=True, exist_ok=True)
-    # A crash mid-write leaves only atomic_write's temporary file; no writer
-    # runs yet, so any that remain are abandoned.
+    # A crash mid-write leaves only atomic_write's temporary file. No batch is
+    # loaded yet, so no writer runs and any that remain are abandoned.
     for leftover in self.root.glob(".*.tmp"):
       leftover.unlink(missing_ok=True)
     expired = (datetime.now(UTC) - _RETAIN_COMPLETE).isoformat()
+    loaded = []
     for path in self.root.glob("*.json"):
       # A corrupt receipt is not "no work". Fail visibly rather than silently
       # discarding an accepted batch.
@@ -333,12 +358,9 @@ class AppUpdateBatches:
       if record["phase"] == "complete" and record["updated_at"] < expired:
         path.unlink()
         continue
-      self.records[record["id"]] = record
-      # Boot: nothing else runs yet, so this thread may apply the outcomes.
       unfinished = _unfinished(record, record["entries"])
-      if unfinished:
-        _apply(record, _settled_outcomes(unfinished))
-        self._save(record)
+      loaded.append((record, _settled_outcomes(unfinished) if unfinished else None))
+    return loaded
 
   async def stop(self) -> None:
     """Stop admitting, then cancel running entries.
@@ -406,6 +428,9 @@ class AppUpdateBatches:
     """Forget finished batches past retention, as boot does."""
     expired = (datetime.now(UTC) - _RETAIN_COMPLETE).isoformat()
     for key, record in list(self.records.items()):
+      lock = self._save_locks.get(key)
+      if lock is not None and lock.locked():
+        continue  # Its save would write it back; the next prune takes it.
       if record["phase"] == "complete" and record["updated_at"] < expired:
         (self.root / f"{key}.json").unlink(missing_ok=True)
         self.records.pop(key)
