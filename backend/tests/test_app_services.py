@@ -209,7 +209,7 @@ async def test_cancel_wins_over_a_spawn_that_then_fails_unexpectedly(monkeypatch
   await asyncio.sleep(0)
   assert not task.done() and not released
   finish_spawn.set()
-  with pytest.raises(asyncio.CancelledError, match="request gone"):
+  with pytest.raises(asyncio.CancelledError, match="^request gone$"):
     await asyncio.wait_for(task, timeout=3)
   assert released
   assert "failed to start" in caplog.text and "bad spawn argument" in caplog.text

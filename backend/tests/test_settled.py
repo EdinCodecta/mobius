@@ -172,3 +172,59 @@ def test_without_a_cancel_the_result_or_exception_passes_through():
       await settled.run_settled(fail)
 
   asyncio.run(run())
+
+
+async def _teardown_under_cancel(raise_first, caplog_logger):
+  """A finally whose first step is cancelled twice; return (task, ran)."""
+  ran, started, finish = [], asyncio.Event(), asyncio.Event()
+
+  async def first():
+    started.set()
+    await finish.wait()
+    ran.append("first")
+
+  async def second():
+    ran.append("second")
+    raise RuntimeError("second step broke")
+
+  async def turn():
+    try:
+      if raise_first:
+        raise asyncio.CancelledError("original")
+    finally:
+      teardown = settled.Teardown(caplog_logger, "chat_id=t")
+      await teardown.step(first(), "first step")
+      ok = await teardown.step(second(), "second step")
+      ran.append(f"second ok={ok}")
+      teardown.finish()
+
+  task = asyncio.create_task(turn())
+  await started.wait()
+  task.cancel("held one")
+  await asyncio.sleep(0)
+  task.cancel("held two")
+  await asyncio.sleep(0)
+  assert not task.done() and ran == []
+  finish.set()
+  try:
+    await task
+  except asyncio.CancelledError as exc:
+    return exc, ran
+  raise AssertionError("teardown swallowed the cancellation")
+
+
+def test_teardown_holds_a_cancel_until_every_step_ran_then_raises_it(caplog):
+  outcome, ran = asyncio.run(
+    _teardown_under_cancel(False, logging.getLogger("mobius.test_teardown")),
+  )
+  assert outcome.args == ("held one",)
+  assert ran == ["first", "second", "second ok=False"]
+  assert "second step failed during teardown chat_id=t" in caplog.text
+
+
+def test_teardown_lets_the_original_unwinding_cancel_propagate():
+  outcome, ran = asyncio.run(
+    _teardown_under_cancel(True, logging.getLogger("mobius.test_teardown")),
+  )
+  assert outcome.args == ("original",)
+  assert ran == ["first", "second", "second ok=False"]

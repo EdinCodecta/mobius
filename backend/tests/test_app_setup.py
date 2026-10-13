@@ -301,6 +301,6 @@ async def test_cancelled_cleanup_finishes_the_kill_and_keeps_the_cancel_message(
     await asyncio.sleep(.02)
     assert not task.done() and not closed
   worker.release.set()
-  with pytest.raises(asyncio.CancelledError, match="server stopping"):
+  with pytest.raises(asyncio.CancelledError, match="^server stopping$"):
     await task
   assert worker.exited.is_set() and closed == [True]

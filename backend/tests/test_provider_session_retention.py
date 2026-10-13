@@ -199,7 +199,7 @@ def _cancel_acquire(monkeypatch, then):
     await asyncio.sleep(.02)
     assert not task.done()
     worker.release.set()
-    with pytest.raises(asyncio.CancelledError, match="turn stopped"):
+    with pytest.raises(asyncio.CancelledError, match="^turn stopped$"):
       await task
 
   asyncio.run(run())

@@ -3634,7 +3634,9 @@ async def _join_browser_close(chat_id: str) -> bool:
   A cancelled caller waits for the teardown: releasing the gate while a worker
   thread still sends signals would endanger the successor.
   """
-  return await settled.settle(_close_browser_session(chat_id))
+  return await settled.settle(
+    _close_browser_session(chat_id), what=f"Browser close for chat {chat_id}",
+  )
 
 
 async def reap_unowned_browsers(*, memory_budget_bytes: int | None) -> dict:

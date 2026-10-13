@@ -266,10 +266,10 @@ def test_cancelled_browser_close_waits_and_the_cancel_wins_over_its_failure(
       await asyncio.sleep(0)
       assert not task.done() and lock.locked()
     finish.set()
-    with pytest.raises(asyncio.CancelledError, match="handoff"):
+    with pytest.raises(asyncio.CancelledError, match="^handoff$"):
       await task
     assert finished == ["closing"] and not lock.locked()
 
   asyncio.run(scenario())
-  assert "Work failed after its caller was cancelled" in caplog.text
+  assert "Browser close for chat closing failed after its caller was cancelled" in caplog.text
   assert "signal failed" in caplog.text
