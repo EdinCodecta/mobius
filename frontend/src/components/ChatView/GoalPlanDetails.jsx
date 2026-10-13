@@ -1,7 +1,8 @@
 /* GoalPlanDetails renders the expanded dependency-aware todo list. */
+import DependencyBacklinks from './DependencyBacklinks.jsx'
 
 import { Check, Clock } from '@openai/apps-sdk-ui/components/Icon'
-import { goalTaskDisplayStatus, goalDependencyLabel, goalDecisionOutcomeLabel, goalDependencyHref } from './goalProgress'
+import { goalTaskDisplayStatus, goalDependencyOutcomeLabel, goalDependencyHref } from './goalProgress'
 import { goalHelpers } from './goalHelpers'
 import {
   HELPER_AWAITING_PARENT_LABEL, isHelperAwaitingParent, isWorkingHelperStatus,
@@ -90,10 +91,10 @@ function GoalPlanRow({ title, status, meta, depth, emphasized, children }) {
   )
 }
 
-export default function GoalPlanDetails({ plan, holdReason = null, dependencies = [], dependencyHistory = [], onInternalNav }) {
+export default function GoalPlanDetails({ plan, holdReason = null, dependencies = [], dependencyHistory = [], neededBy = [], onInternalNav }) {
   const reason = typeof holdReason === 'string' ? holdReason.trim() : ''
   const tasks = Array.isArray(plan?.tasks) ? plan.tasks : []
-  if (!tasks.length && !plan?.delegations?.length && !reason && !dependencies.length && !dependencyHistory.length) return null
+  if (!tasks.length && !plan?.delegations?.length && !reason && !dependencies.length && !dependencyHistory.length && !neededBy.length) return null
   const tasksById = new Map(tasks.map(task => [task.id, task]))
   const delegations = Array.isArray(plan?.delegations) ? plan.delegations : []
   // Execution is evidence for task status, never another checklist step.
@@ -128,6 +129,7 @@ export default function GoalPlanDetails({ plan, holdReason = null, dependencies 
   }
   return (
     <div className="chat__goal-plan" role="region" aria-label="Goal details" tabIndex={0}>
+      <DependencyBacklinks chats={neededBy} onInternalNav={onInternalNav} />
       {reason && <p className="chat__goal-result">{reason}</p>}
       {!!(dependencies.length + dependencyHistory.length) && <div role="list" aria-label="Work and decisions in other chats">
         {[...dependencies, ...dependencyHistory].map(dependency => {
@@ -137,14 +139,8 @@ export default function GoalPlanDetails({ plan, holdReason = null, dependencies 
           return <div role="listitem" key={dependency.id} className="chat__goal-task">
             <Clock width={14} height={14} aria-hidden="true" />
             <span className="chat__goal-task-copy">
-              <span className="chat__goal-task-title">{settled
-                ? `${dependency.condition} in ${dependency.source_chat_title}` : goalDependencyLabel(dependency)}</span>
-              <span className="chat__goal-task-meta">{decision && dependency.outcome
-                ? goalDecisionOutcomeLabel(dependency)
-                : settled ? 'Stopped following'
-                : SOURCE_RECOVERY_BLOCKERS.has(dependency.resume_blocker)
-                  ? 'Source not progressing · manual recovery needed'
-                  : dependency.automatic ? 'Continues automatically when eligible' : 'Result kept until this Goal continues'}</span>
+              <span className="chat__goal-task-title">{dependency.condition}</span>
+              <span className="chat__goal-task-meta">{decision ? 'Decision in' : 'Work owned by'} {dependency.source_chat_title}</span>
               {dependency.source_deleted && <span className="chat__goal-task-meta">The source chat was deleted</span>}
               {href && <a href={href} aria-label={`${decision ? 'Open decision' : 'Open chat'}: ${dependency.condition} in ${dependency.source_chat_title}`}
                 onClick={event => {
@@ -152,6 +148,11 @@ export default function GoalPlanDetails({ plan, holdReason = null, dependencies 
                   event.preventDefault()
                   onInternalNav(new URL(href, window.location.origin))
                 }}>{decision ? 'Open decision' : 'Open chat'}</a>}
+              <span className="chat__goal-task-meta">{dependency.outcome || settled
+                ? goalDependencyOutcomeLabel(dependency)
+                : SOURCE_RECOVERY_BLOCKERS.has(dependency.resume_blocker)
+                  ? 'Source not progressing · manual recovery needed'
+                  : dependency.automatic ? 'Continues automatically when eligible' : 'Result kept until this Goal continues'}</span>
             </span>
           </div>
         })}

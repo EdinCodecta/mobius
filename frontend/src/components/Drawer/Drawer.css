@@ -1106,3 +1106,14 @@
   color: var(--border);
   user-select: none;
 }
+
+/* A quiet solid square is deliberate hold, not Waiting's two-bar silhouette. */
+.drawer__hold-icon {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+}

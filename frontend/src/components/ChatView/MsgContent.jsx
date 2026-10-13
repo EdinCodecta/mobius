@@ -472,6 +472,8 @@ function MsgContentInner({
               questions={block.questions || []}
               questionId={block.question_id}
               answeredMap={answers}
+              neededBy={block.needed_by}
+              onInternalNav={onInternalNav}
               platformAction={block.platform_action}
               submittedOptions={block.selected_options}
               attachments={block.attachments}

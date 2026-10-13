@@ -6,7 +6,6 @@ import {
   canResumeGoal, goalStatusLabel, compactGoalObjective, draftGoalObjective,
   goalMessageObjectiveFromText, goalPresentationFromRuntime, goalTaskDisplayStatus,
   normalizeGoalPresentation, progressRailViewModel, visibleGoalTasks,
-  goalDependencyLabel,
 } from '../goalProgress.js'
 const chatView = readFileSync(new URL('../ChatView.jsx', import.meta.url), 'utf8')
 const streamConnection = readFileSync(new URL('../useStreamConnection.js', import.meta.url), 'utf8')
@@ -41,12 +40,10 @@ test('runtime is authoritative including explicit clear and ordinary absence', (
   assert.doesNotMatch(chatView, /goal_activated|goal_plan_updated|goal_cleared|activeGoalPlan|newestGoalPlan|planForGoal|\/goal-plan/)
 })
 
-test('claim follow copy names the work and source without invented checks', () => {
+test('claim follow presentation preserves its exact work and source', () => {
   const dependency = { id: 'dep', condition: 'Host repair', source_chat_title: 'Watch platform update', automatic: true }
-  assert.equal(goalDependencyLabel(dependency), 'Waiting · Host repair in Watch platform update')
   assert.deepEqual(goalPresentationFromRuntime({ goal: { ...goal, dependencies: [dependency] } }).dependencies, [dependency])
   assert.match(goalPlanDetails, /Source not progressing · manual recovery needed/)
-  assert.doesNotMatch(goalDependencyLabel(dependency), /deadline|check|poll/i)
 })
 
 test('same Goal reattachment keeps its plan and disclosure identity until a new snapshot arrives', () => {
@@ -453,7 +450,6 @@ test('foreign card is purple Waiting rather than local owner-input attention', (
   const dependency = { id: 'card-dep', target_kind: 'owner_card', condition: 'Which release?', source_chat_title: 'Repair', automatic: true }
   const waiting = goalPresentationFromRuntime({ goal: { ...goal, status: 'paused', dependencies: [dependency], handoff: { kind: 'automatic', reason: 'dependency' } } })
   assert.equal(goalStatusLabel(waiting), 'Waiting')
-  assert.equal(goalDependencyLabel(dependency), 'Waiting · Which release? in Repair')
   const history = [{ ...dependency, disposition: 'delivered', outcome: { kind: 'answered' } }]
   assert.deepEqual(goalPresentationFromRuntime({ goal: { ...goal, dependency_history: history } }).dependency_history, history)
 })

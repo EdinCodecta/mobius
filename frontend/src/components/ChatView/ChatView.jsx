@@ -5839,11 +5839,12 @@ export default function ChatView({
         actionError: goalResumeState.error,
       } : {}),
       icon: <Flag width={14} height={14} aria-hidden="true" />,
-      ...(goalPresentation?.plan || goalPresentation?.hold_reason || continuationHandoff || goalPresentation?.dependencies?.length || goalPresentation?.dependency_history?.length
+      ...(goalPresentation?.plan || goalPresentation?.hold_reason || continuationHandoff || goalPresentation?.dependencies?.length || goalPresentation?.dependency_history?.length || goalPresentation?.needed_by?.length
         ? { details: <GoalPlanDetails
             plan={goalPresentation?.plan}
             dependencies={goalPresentation?.dependencies}
             dependencyHistory={goalPresentation?.dependency_history}
+            neededBy={goalPresentation?.needed_by}
             onInternalNav={internalNav}
             holdReason={continuationHandoff
               ? `${continuationHandoff.description} ${continuationHandoff.boundary}`

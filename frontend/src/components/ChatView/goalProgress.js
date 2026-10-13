@@ -68,6 +68,7 @@ export function normalizeGoalPresentation(goal) {
     status: goal.status,
     resumable: goal.resumable === true,
     plan: goal.plan || null,
+    ...(goal.needed_by?.length ? { needed_by: goal.needed_by } : {}),
     ...(Array.isArray(goal.dependency_history) && goal.dependency_history.length ? { dependency_history: goal.dependency_history } : {}),
     ...(Array.isArray(goal.dependencies) && goal.dependencies.length ? { dependencies: goal.dependencies } : {}),
     ...(goal.status === 'paused' && ['owner', 'agent', 'unknown', 'deferred'].includes(goal.pause_reason)
@@ -79,22 +80,18 @@ export function normalizeGoalPresentation(goal) {
   }
 }
 
-/** A claim follow is not a monitor: do not invent checks or a deadline. */
-export function goalDependencyLabel(dependency) {
-  const work = String(dependency?.condition || 'shared work').trim()
-  const chat = String(dependency?.source_chat_title || 'another chat').trim()
-  return `Waiting · ${work} in ${chat}`
-}
-
-/** A decision outcome is a saved fact, not evidence that an answer started. */
-export function goalDecisionOutcomeLabel(dependency) {
+/** A dependency outcome is a saved fact, never permission or a Goal outcome. */
+export function goalDependencyOutcomeLabel(dependency) {
   const kind = dependency?.outcome?.kind
   const answer = Object.values(dependency?.outcome?.answers || {}).filter(value => typeof value === 'string').join(' · ')
   const label = {
     answered: 'Answered', closed_without_reply: 'Answered without a source reply',
     cancelled: 'Cancelled by Stop', superseded: 'Replaced', source_deleted: 'Source chat deleted',
-  }[kind] || (dependency?.disposition === 'withdrawn' ? 'Stopped following' : 'Result retired')
-  return answer ? `${label} · ${answer}` : label
+    completed: 'Work completed', released: 'Work released', owner_deleted: 'Work owner deleted',
+    owner_not_progressing: 'Work interrupted',
+  }[kind] || (dependency?.disposition === 'withdrawn' ? 'Stopped following' : 'Waiting ended with this Goal')
+  const detail = answer || dependency?.outcome?.outcome
+  return detail ? `${label} · ${detail}` : label
 }
 
 export function goalDependencyHref(dependency) {
