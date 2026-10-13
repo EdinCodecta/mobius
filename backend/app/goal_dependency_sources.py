@@ -37,8 +37,7 @@ def _eligible_goal(db: Session, chat_id: str, run_id: str, waiting_goal_id=None)
   ).first()
 
 
-def _direct_cycle(db: Session, *, waiting_goal_id: str, source_goal_id: str | None,
-                  ignore_acquisition_id: str | None = None) -> bool:
+def _direct_cycle(db: Session, *, waiting_goal_id: str, source_goal_id: str | None) -> bool:
   if source_goal_id is None:
     return False
   if source_goal_id == waiting_goal_id:
@@ -55,8 +54,6 @@ def _direct_cycle(db: Session, *, waiting_goal_id: str, source_goal_id: str | No
     models.GoalDependency.target_kind == 'claim_acquisition',
     models.AgentWorkClaim.owner_goal_id == waiting_goal_id,
     models.AgentWorkClaim.acquisition_id == models.GoalDependency.target_acquisition_id)
-  if ignore_acquisition_id is not None:
-    claims = claims.filter(models.GoalDependency.target_acquisition_id != ignore_acquisition_id)
   cards = pending.join(models.SavedDecisionCard,
     (models.SavedDecisionCard.chat_id == models.GoalDependency.target_chat_id) &
     (models.SavedDecisionCard.question_id == models.GoalDependency.target_question_id)).filter(
@@ -102,9 +99,6 @@ def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
   if claim.owner_goal_id == goal.id or (
       claim.owner_chat_id == chat_id and not restore_owner_follow):
     return 'self_dependency'
-  if _direct_cycle(db, waiting_goal_id=goal.id,
-                   source_goal_id=claim.owner_goal_id):
-    return 'direct_cycle'
   if not claim.acquisition_id:
     return 'unidentified_acquisition'
   target_key = f'claim:{claim.acquisition_id}'
@@ -121,6 +115,11 @@ def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
       return 'followed' if existing.resolved_at is None else 'result_owed'
     if not restore_owner_follow or existing.resolved_at is not None:
       return 'owner_suppressed'
+  # Only adding or restoring an edge can create a cycle. In particular, an
+  # explicitly withdrawn follow stays withdrawn across ownership changes.
+  if _direct_cycle(db, waiting_goal_id=goal.id,
+                   source_goal_id=claim.owner_goal_id):
+    return 'direct_cycle'
   count = db.query(func.count(models.GoalDependency.id)).filter(
     models.GoalDependency.waiting_goal_id == goal.id,
     models.GoalDependency.target_kind == 'claim_acquisition',

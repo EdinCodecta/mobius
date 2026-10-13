@@ -129,6 +129,8 @@ def _stage_goal_owner_change(db: Session, row: models.AgentWorkClaim, *,
       run_id=previous_run_id, waiting_goal_id=previous_goal_id, restore_owner_follow=True)
     if previous_follow_status not in {"followed", "result_owed", "no_open_top_level_goal", "withdrawn"}:
       db.rollback()
+      if previous_follow_status == "direct_cycle":
+        raise ValueError("Transfer would create a direct Goal dependency cycle.")
       raise ValueError("Transfer cannot preserve the former Goal's follow: " + previous_follow_status)
   return previous_follow_status
 
@@ -293,14 +295,8 @@ def claim_work(
   previous_goal_id = row.owner_goal_id
   previous_revision = row.revision
   now = now_naive_utc()
-  # Transfer makes the former owner a follower. Reject an existing reverse
-  # dependency from the new owner's Goal to the former owner's Goal, except
-  # the exact executor's follow on this acquisition, suppressed below.
-  from app.goal_dependency_sources import _direct_cycle
-  if goal_id and previous_goal_id and _direct_cycle(db,
-      waiting_goal_id=previous_goal_id, source_goal_id=goal_id,
-      ignore_acquisition_id=row.acquisition_id):
-    raise ValueError("Transfer would create a direct Goal dependency cycle.")
+  # Check the resulting graph in _stage_goal_owner_change under this fence:
+  # the former owner's exact edge may already be withdrawn, not restored.
   changed = db.query(models.AgentWorkClaim).filter(
     models.AgentWorkClaim.id == row.id,
     models.AgentWorkClaim.owner_chat_id == expected_owner_chat_id,

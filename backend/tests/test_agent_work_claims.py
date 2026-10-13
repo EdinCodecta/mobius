@@ -617,6 +617,56 @@ def test_direct_cycle_is_not_registered(db):
   assert db.query(models.GoalDependency).count() == 1
 
 
+@pytest.mark.parametrize("withdraw", [True, False])
+def test_return_transfer_checks_only_the_former_owners_live_follow(db, withdraw):
+  from app.chat_writer import WithdrawGoalDependency, get_writer
+
+  owner, a, b = _fixture(db)
+
+  def claim(chat, key, **kwargs):
+    run = "claim-run-first" if chat.id == a.id else "claim-run-second"
+    return claim_work(db, owner_id=owner.id, chat_id=chat.id, run_id=run,
+      work_key=key, summary=key, **kwargs)
+
+  claim(b, "work-x")
+  assert claim(a, "work-x")["follow_status"] == "followed"
+  edge_id = db.query(models.GoalDependency).one().id
+  if withdraw:
+    assert get_writer().submit(WithdrawGoalDependency(
+      chat_id=a.id, dependency_id=edge_id)).result(5) == "withdrawn"
+    db.expire_all()
+  assert claim(a, "work-x", takeover_reason="Authorized transfer",
+    expected_owner_chat_id=b.id)["state"] == "transferred"
+  claim(a, "work-z")
+  assert claim(b, "work-z")["follow_status"] == "followed"
+
+  # B -> A's Z remains live. Returning X creates A -> B only if A did not
+  # withdraw that exact follow; automatic executor suppression may restore it.
+  if withdraw:
+    result = claim(b, "work-x", takeover_reason="Authorized return",
+      expected_owner_chat_id=a.id)
+    assert result["state"] == "transferred"
+    assert result["previous_follow_status"] == "withdrawn"
+  else:
+    with pytest.raises(ValueError, match="direct Goal dependency cycle"):
+      claim(b, "work-x", takeover_reason="Authorized return",
+        expected_owner_chat_id=a.id)
+  db.expire_all()
+  x = db.query(models.AgentWorkClaim).filter_by(work_key="work-x").one()
+  assert x.owner_chat_id == (b.id if withdraw else a.id)
+  edge = db.get(models.GoalDependency, edge_id)
+  assert edge.result_disposition == ("withdrawn" if withdraw else None)
+  assert (edge.withdrawn_at is not None) == withdraw
+  if not withdraw:
+    assert edge.owner_suppressed_at is not None
+  z = db.query(models.AgentWorkClaim).filter_by(work_key="work-z").one()
+  z_follow = db.query(models.GoalDependency).filter_by(target_claim_id=z.id).one()
+  assert z.owner_chat_id == a.id
+  assert z_follow.waiting_chat_id == b.id and z_follow.target_chat_id == a.id
+  assert z_follow.withdrawn_at is None and z_follow.owner_suppressed_at is None
+  assert z_follow.result_disposition is None and z_follow.resolved_at is None
+
+
 def test_goal_less_completed_source_does_not_promise_future_progress(db):
   from app.goal_dependency_sources import stage_reconcile_claim_sources
   owner, first, second = _fixture(db)
