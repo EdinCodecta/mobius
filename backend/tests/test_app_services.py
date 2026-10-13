@@ -54,7 +54,7 @@ async def test_queued_service_pins_runtime_until_cancelled(monkeypatch, blocked_
     return SimpleNamespace(close=lambda: events.append("released"))
 
   monkeypatch.setattr(app_services, "hold_runtime", pin)
-  task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1), None, {}))
+  task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1, slug="test"), None, {}))
   try:
     await asyncio.wait_for(gate.waiting.wait(), timeout=1)
     assert events == ["pinned"], "queued old-runtime requests must prevent a false drain verdict"
@@ -89,12 +89,12 @@ async def test_one_apps_backlog_does_not_take_other_apps_execution_slots(monkeyp
     raise HTTPException(418, "second app admitted")
 
   monkeypatch.setattr(app_services, "service_entry", entered)
-  first = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1), None, {}))
+  first = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1, slug="test"), None, {}))
   try:
     await asyncio.wait_for(busy.waiting.wait(), timeout=1)
     with pytest.raises(HTTPException, match="second app admitted"):
       await asyncio.wait_for(
-        app_services.invoke_service(SimpleNamespace(id=2), None, {}), timeout=1,
+        app_services.invoke_service(SimpleNamespace(id=2, slug="test"), None, {}), timeout=1,
       )
   finally:
     first.cancel()
@@ -130,13 +130,13 @@ async def test_public_callback_does_not_queue_behind_private_request(monkeypatch
 
   monkeypatch.setattr(app_services, "service_entry", entered)
   private = asyncio.create_task(
-    app_services.invoke_service(SimpleNamespace(id=1), None, {"public": False}),
+    app_services.invoke_service(SimpleNamespace(id=1, slug="test"), None, {"public": False}),
   )
   try:
     await asyncio.wait_for(busy.waiting.wait(), timeout=1)
     with pytest.raises(HTTPException, match="public callback admitted"):
       await asyncio.wait_for(
-        app_services.invoke_service(SimpleNamespace(id=1), None, {"public": True}),
+        app_services.invoke_service(SimpleNamespace(id=1, slug="test"), None, {"public": True}),
         timeout=1,
       )
   finally:
@@ -168,7 +168,7 @@ async def test_cancel_during_spawn_reaps_process_before_releasing_runtime(monkey
     close=lambda: released.append(processes[0].returncode),
   ))
   monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
-  task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1), None, {}))
+  task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1, slug="test"), None, {}))
   try:
     await asyncio.wait_for(created.wait(), timeout=3)
     task.cancel()
@@ -1350,8 +1350,9 @@ async def test_costly_big_ints_are_still_refused_and_cancellation_releases_their
 
 # Ordinary numbers an 8 MiB service accepted before number work was charged:
 # short and repr-length small exponents and 19-digit nanosecond timestamps.
+_exponent_rng = random.Random(7)
 _ORDINARY_EXPONENTS_AND_TIMESTAMPS = {
-  "small-repr-exponents-30k": [10 ** random.Random(7).uniform(-9, -4.1) for _ in range(30_000)],
+  "small-repr-exponents-30k": [10 ** _exponent_rng.uniform(-9, -4.1) for _ in range(30_000)],
   "short-exponents-60k": [float(f"{1 + i % 9}.{1 + i % 7}e-0{5 + i % 5}") for i in range(60_000)],
   "ns-timestamps-150k": [1697040000123456789 + i for i in range(150_000)],
 }
@@ -1828,7 +1829,7 @@ async def test_queued_http_payloads_keep_their_envelope_admission_and_reject_new
     with app_services.ServiceExchangeAdmission(1024) as admission:
       admissions.append(admission)
       envelope = await _envelope(request, "echo", public=False, actor={}, max_bytes=1024, admission=admission)
-      return await app_services.invoke_service(SimpleNamespace(id=1), None, envelope, admission=admission)
+      return await app_services.invoke_service(SimpleNamespace(id=1, slug="service-test"), None, envelope, admission=admission)
 
   first = asyncio.create_task(http_call())
   try:
@@ -3584,3 +3585,103 @@ async def test_wide_list_item_rendering_fits_a_reservation_without_unheld_copies
     # Separator concatenation and UTF-8 encoding never coexist.
     assert held < peak + 80 * MIB
   assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.parametrize("source, status, category", [
+  ('print("not JSON private")', 502, "invalid_json"),
+  ('print("[]")', 502, "invalid_envelope"),
+  ('print(\'{"status":true}\')', 502, "invalid_status"),
+  # A boundary failure outranks the app's own 5xx status.
+  ('print(\'{"status":503,"headers":[]}\')', 502, "invalid_headers"),
+  ('print(\'{"body_base64":123}\')', 502, "invalid_binary_response"),
+  ('print(\'{"media_type":"text/plain"}\')', 502, "invalid_media_type"),
+  ('print(\'{"body_base64":"!","media_type":"text/plain"}\')', 502, "invalid_binary_data"),
+  ('import sys\nprint("private", file=sys.stderr)\nsys.exit(3)', 502, "process_failed"),
+  ('print(\'{"status":503,"body":{"detail":"private"}}\')', 503, "app_http_error"),
+  ('print(\'{"body":{"ok":"private"}}\')', 200, None),
+])
+def test_service_traces_record_app_and_platform_category_never_request_data(
+  client, auth, db, monkeypatch, source, status, category,
+):
+  recorded = []
+  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
+  app = _service_app(db)
+  (runtime_parent(app.id) / app.runtime_revision / "service.py").write_text(source)
+  response = client.get(
+    f"/api/apps/{app.id}/service/private-id?token=private-query", headers=auth,
+  )
+  assert response.status_code == status
+  assert recorded == [
+    {"mobius.app.slug": "service-test"},
+    *([{"mobius.service.error_type": category}] if category else []),
+  ]
+
+
+def test_tracing_wrapper_preserves_http_admission_through_response_render(
+  client, auth, db, monkeypatch,
+):
+  created, rendered = [], []
+  real_init = app_services.ServiceExchangeAdmission.__init__
+  real_render = app_services.render_json
+
+  def capture_admission(admission, *args, **kwargs):
+    created.append(admission)
+    real_init(admission, *args, **kwargs)
+
+  async def capture_render(value):
+    rendered.append((len(created), created[0].response_cost, app_services._admitted_exchange_cost))
+    return await real_render(value)
+
+  monkeypatch.setattr(app_services.ServiceExchangeAdmission, "__init__", capture_admission)
+  monkeypatch.setattr(app_services, "render_json", capture_render)
+  app = _service_app(db)
+  response = client.post(
+    f"/api/apps/{app.id}/service/echo", headers=auth, json={"values": [1.5] * 1000},
+  )
+  assert response.status_code == 201
+  [(count, response_cost, held)] = rendered
+  assert count == 1, "tracing replaced the route's admission instead of forwarding it"
+  assert response_cost > 0 and held >= response_cost, "rendering lost its response reservation"
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,status,category", [
+  ("busy", 503, "exchange_busy"),
+  ("response", 502, "response_limit"),
+  ("transfer-declaration", 503, "invalid_declaration"),
+  ("route-declaration", 503, "invalid_declaration"),
+])
+async def test_service_traces_categorize_exchange_failures_without_changing_responses(
+  db, auth, monkeypatch, failure, status, category,
+):
+  from app import service_preload
+
+  cap = 64 * 1024
+  app = _service_app(db, max_bytes=cap)
+  owner = db.query(models.Owner).first()
+  recorded = []
+  monkeypatch.setattr(app_services.tracing, "annotate", lambda _h, attrs: recorded.append(attrs))
+  monkeypatch.setattr(service_preload, "ready_host", lambda *_: None)
+
+  async def reply(*_args):
+    assert failure == "response", "a refused exchange started a service"
+    monkeypatch.setattr(app_services, "MAX_JSON_DECODE_COST", 1)
+    return b'{"body":{"value":"private"}}', b"", 0
+
+  monkeypatch.setattr(app_services, "_run_spawned", reply)
+  if failure == "busy":
+    monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", 3 * cap - 1)
+  elif failure == "transfer-declaration":
+    app.capability_contract["service"]["max_request_bytes"] = 0
+  elif failure == "route-declaration":
+    app.capability_contract["service"]["route_limits"] = [_route_limit("GET", "/echo", cap + 1)]
+
+  with pytest.raises(HTTPException) as caught:
+    await app_services.invoke_service(app, owner, {"actor": {}, "body": "private"})
+  assert caught.value.status_code == status
+  assert caught.value.headers == ({"Retry-After": "1"} if failure == "busy" else None)
+  assert recorded == [
+    {"mobius.app.slug": "service-test"}, {"mobius.service.error_type": category},
+  ]
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0

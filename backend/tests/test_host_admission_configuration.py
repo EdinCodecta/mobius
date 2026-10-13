@@ -620,7 +620,9 @@ def test_named_data_volume_does_not_replace_frozen_container_name(tmp_path, monk
     def execute(args, **kwargs):
         if args[1:3] == ['volume', 'inspect']:
             assert args[-1] == 'persistent_app_data'
-            return subprocess.CompletedProcess(args, 0, str(config['data_dir']), '')
+            return subprocess.CompletedProcess(args, 0, json.dumps({
+                'Name': 'persistent_app_data', 'Driver': 'local',
+                'Mountpoint': str(config['data_dir']), 'Options': None}), '')
         assert 'config' in args
         return subprocess.CompletedProcess(args, 0, json.dumps(resolved), '')
     monkeypatch.setattr(host, 'docker_command', execute)

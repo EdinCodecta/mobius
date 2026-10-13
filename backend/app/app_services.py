@@ -30,7 +30,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from app import app_python_env, auth, models, service_preload
+from app import app_python_env, auth, models, service_preload, tracing
 from app.applied_app_runtime import AppliedRuntimeUnavailable, hold_runtime, runtime_root
 from app.browser_access import BrowserLineage, require_live
 from app.config import get_settings
@@ -68,6 +68,20 @@ _global_slots = {
 _app_slots: weakref.WeakValueDictionary[tuple[int, str], asyncio.Semaphore] = (
   weakref.WeakValueDictionary()
 )
+
+
+class ServiceBoundaryError(HTTPException):
+  """A platform-boundary failure with a stable trace category.
+
+  The category, never the detail text, reaches tracing: details can quote
+  runtime paths or header names and may be reworded without changing meaning.
+  """
+
+  def __init__(
+    self, category: str, status_code: int, detail: str, *, headers: dict[str, str] | None = None,
+  ):
+    super().__init__(status_code, detail, headers=headers)
+    self.category = category
 
 
 # This is an exchange allocation budget, not another transfer grant. It is
@@ -264,8 +278,12 @@ class ServiceExchangeAdmission:
     if direction == "execution":
       # Nothing was serialized or started; the same request can succeed once
       # another exchange releases its transfer allowance.
-      raise HTTPException(503, "App service is busy; retry shortly.", headers={"Retry-After": "1"})
-    raise HTTPException(502 if direction == "response" else 413, f"App service {direction} {detail}.")
+      raise ServiceBoundaryError(
+        "exchange_busy", 503, "App service is busy; retry shortly.", headers={"Retry-After": "1"},
+      )
+    if direction == "response":
+      raise ServiceBoundaryError("response_limit", 502, f"App service response {detail}.")
+    raise HTTPException(413, f"App service {direction} {detail}.")
 
   def _hold(
     self, direction: str, *, transfer: int | None = None,
@@ -714,7 +732,7 @@ def _json_exponent_value(state: int) -> int | None:
 
 def _json_number_work(
   length: int, shape: int, signed: bool = False, exponent: int = _JSON_NO_EXPONENT,
-) -> int:
+) -> float:
   """Parse work of one number token beyond its mark and characters, in units.
 
   Calibrated in thread CPU time against the per-element cost of a small int
@@ -739,8 +757,10 @@ def _json_number_work(
   An int is charged by its digits: a ``signed`` one's minus sign changes
   neither path (measured within noise), so it costs only its character,
   wherever a chunk boundary or materialization puts it. An exponent token
-  whose ``exponent`` state is unknown gets the costliest charge. Fractions are
-  exact sixteenths, summed per document.
+  whose ``exponent`` state is unknown gets the costliest charge. Invalid
+  short fields use the cheap tier: stdlib stops at the first syntax error,
+  after at most the mantissa and one exponent digit. Fractions are exact
+  sixteenths, summed per document.
   """
   if not length:
     return 0
@@ -835,7 +855,7 @@ def service_contract(app, *, access: str) -> dict:
     raise HTTPException(403, "This app service is private.")
   entry = service.get("entry")
   if not isinstance(entry, str) or not entry.endswith(".py"):
-    raise HTTPException(503, "Accepted app service declaration is invalid.")
+    raise ServiceBoundaryError("invalid_declaration", 503, "Accepted app service declaration is invalid.")
   _accepted_transfer_limits(service)
   return service
 
@@ -844,7 +864,7 @@ def service_max_bytes(service: dict) -> int:
   """The one reviewed serialized request/response ceiling, including old grants."""
   ceiling = accepted_service_max_bytes(service)
   if ceiling is None:
-    raise HTTPException(503, "Accepted app service transfer limit is invalid.")
+    raise ServiceBoundaryError("invalid_declaration", 503, "Accepted app service transfer limit is invalid.")
   return ceiling
 
 
@@ -858,7 +878,7 @@ def _accepted_transfer_limits(service: dict) -> tuple[int, dict[tuple[str, str],
   ceiling = service_max_bytes(service)
   routes = accepted_service_route_limits(service.get("route_limits", []), ceiling)
   if routes is None:
-    raise HTTPException(503, "Accepted app service route limits are invalid.")
+    raise ServiceBoundaryError("invalid_declaration", 503, "Accepted app service route limits are invalid.")
   return ceiling, routes
 
 
@@ -996,13 +1016,15 @@ def service_entry(app, service: dict) -> Path:
   try:
     root = runtime_root(app)
   except AppliedRuntimeUnavailable as exc:
-    raise HTTPException(503, str(exc)) from exc
+    raise ServiceBoundaryError("runtime_unavailable", 503, str(exc)) from exc
   entry = root / service["entry"]
   try:
     if entry.is_symlink() or not entry.is_file() or entry.parent != root:
-      raise HTTPException(503, "Accepted app service entry is unavailable.")
+      raise ServiceBoundaryError("entry_unavailable", 503, "Accepted app service entry is unavailable.")
   except OSError as exc:
-    raise HTTPException(503, "Accepted app service entry is unavailable.") from exc
+    raise ServiceBoundaryError(
+      "entry_unavailable", 503, "Accepted app service entry is unavailable.",
+    ) from exc
   return entry
 
 
@@ -1012,7 +1034,7 @@ def service_python_env(app, entry: Path) -> Path | None:
     return app_python_env.resolve_env(get_settings().data_dir, app.id, entry.parent)
   except app_python_env.PythonEnvUnavailable as exc:
     log.warning("App service %s cannot start: %s", app.slug, exc)
-    raise HTTPException(503, str(exc)) from exc
+    raise ServiceBoundaryError("python_env_unavailable", 503, str(exc)) from exc
 
 
 def service_environment(app, owner, service: dict, *, public: bool, browser: BrowserLineage | None = None) -> dict[str, str]:
@@ -1138,7 +1160,7 @@ async def _run_spawned(
           continue
       raise
   except OSError as exc:
-    raise HTTPException(502, "App service could not start.") from exc
+    raise ServiceBoundaryError("start_failed", 502, "App service could not start.") from exc
   assert process.stdin is not None
   assert process.stdout is not None
   assert process.stderr is not None
@@ -1152,10 +1174,12 @@ async def _run_spawned(
     )
   except (TimeoutError, ValueError) as exc:
     await _stop_process(process, write_task, stdout_task, stderr_task)
-    raise HTTPException(503, "App service exceeded its execution limits.")
+    raise ServiceBoundaryError("execution_limit", 503, "App service exceeded its execution limits.")
   except OSError as exc:
     await _stop_process(process, write_task, stdout_task, stderr_task)
-    raise HTTPException(502, "App service failed before accepting its request.") from exc
+    raise ServiceBoundaryError(
+      "request_not_accepted", 502, "App service failed before accepting its request.",
+    ) from exc
   except asyncio.CancelledError:
     await _stop_process(process, write_task, stdout_task, stderr_task)
     raise
@@ -1195,7 +1219,7 @@ async def cancel_browser_grant_calls(grant_id: str) -> None:
   await asyncio.gather(*(task for task in tasks if task is not asyncio.current_task()), return_exceptions=True)
 
 
-async def invoke_service(
+async def _invoke_service(
   app, owner, request_envelope: dict, *,
   timeout_seconds: float = SERVICE_TIMEOUT_SECONDS,
   lane: str | None = None,
@@ -1217,6 +1241,28 @@ async def invoke_service(
       app, owner, request_envelope, timeout_seconds=timeout_seconds, lane=lane,
       admission=admitted,
     )
+
+
+async def invoke_service(
+  app, owner, request_envelope: dict, *,
+  timeout_seconds: float = SERVICE_TIMEOUT_SECONDS,
+  lane: str | None = None,
+  admission: ServiceExchangeAdmission | None = None,
+) -> tuple[int, object, dict[str, str], str | None]:
+  # Traces record only the app slug and platform-authored categories, never
+  # request values or app-supplied text.
+  tracing.annotate(None, {"mobius.app.slug": app.slug})
+  try:
+    result = await _invoke_service(
+      app, owner, request_envelope, timeout_seconds=timeout_seconds, lane=lane,
+      admission=admission,
+    )
+  except ServiceBoundaryError as exc:
+    tracing.annotate(None, {"mobius.service.error_type": exc.category})
+    raise
+  if result[0] >= 500:
+    tracing.annotate(None, {"mobius.service.error_type": "app_http_error"})
+  return result
 
 
 async def _invoke_admitted_service(
@@ -1295,9 +1341,13 @@ async def _invoke_admitted_service(
         except service_preload.PreloadUnavailable:
           pass
         except (TimeoutError, ValueError) as exc:
-          raise HTTPException(503, "App service exceeded its execution limits.") from exc
+          raise ServiceBoundaryError(
+            "execution_limit", 503, "App service exceeded its execution limits.",
+          ) from exc
         except OSError as exc:
-          raise HTTPException(502, "App service failed before accepting its request.") from exc
+          raise ServiceBoundaryError(
+            "request_not_accepted", 502, "App service failed before accepting its request.",
+          ) from exc
       if outcome is None:
         outcome = await _run_spawned(
           python, entry, environment, request_bytes, timeout_seconds, max_bytes,
@@ -1308,21 +1358,21 @@ async def _invoke_admitted_service(
       if returncode != 0:
         detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
         log.warning("App service %s failed: %s", app.slug, detail or "no diagnostics")
-        raise HTTPException(502, "App service failed.")
+        raise ServiceBoundaryError("process_failed", 502, "App service failed.")
   finally:
     pin.close()
   try:
     response = await admission.decode_response(stdout)
   except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
-    raise HTTPException(502, "App service returned invalid JSON.") from exc
+    raise ServiceBoundaryError("invalid_json", 502, "App service returned invalid JSON.") from exc
   _validate_browser_call(owner, browser)
   if not isinstance(response, dict) or set(response) - {
     "status", "body", "body_base64", "headers", "media_type",
   }:
-    raise HTTPException(502, "App service returned an invalid response envelope.")
+    raise ServiceBoundaryError("invalid_envelope", 502, "App service returned an invalid response envelope.")
   status = response.get("status", 200)
   if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status <= 599:
-    raise HTTPException(502, "App service returned an invalid status.")
+    raise ServiceBoundaryError("invalid_status", 502, "App service returned an invalid status.")
   if status >= 500 and stderr:
     detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
     if detail:
@@ -1334,23 +1384,27 @@ async def _invoke_admitted_service(
       response.get("headers"), public=bool(request_envelope.get("public")),
     )
   except ValueError as exc:
-    raise HTTPException(502, str(exc)) from exc
+    raise ServiceBoundaryError("invalid_headers", 502, str(exc)) from exc
   encoded = response.get("body_base64")
   media_type = response.get("media_type")
   if encoded is not None:
     if response.get("body") is not None or not isinstance(encoded, str):
-      raise HTTPException(502, "App service returned an invalid binary response.")
+      raise ServiceBoundaryError(
+        "invalid_binary_response", 502, "App service returned an invalid binary response.",
+      )
     if not isinstance(media_type, str) or _MEDIA_TYPE.fullmatch(media_type) is None:
-      raise HTTPException(502, "App service returned an invalid media type.")
+      raise ServiceBoundaryError("invalid_media_type", 502, "App service returned an invalid media type.")
     try:
       body = base64.b64decode(encoded, validate=True)
     except (ValueError, binascii.Error) as exc:
-      raise HTTPException(502, "App service returned invalid binary data.") from exc
+      raise ServiceBoundaryError(
+        "invalid_binary_data", 502, "App service returned invalid binary data.",
+      ) from exc
     if len(body) > max_bytes:
-      raise HTTPException(502, "App service returned too much binary data.")
+      raise ServiceBoundaryError("response_limit", 502, "App service returned too much binary data.")
     return status, body, headers, media_type
   if media_type is not None:
-    raise HTTPException(502, "App service returned an invalid media type.")
+    raise ServiceBoundaryError("invalid_media_type", 502, "App service returned an invalid media type.")
   return status, response.get("body"), headers, None
 
 

@@ -1435,12 +1435,16 @@ def test_generated_units_allow_the_bounded_recovery_budget(tmp_path):
   watcher = configparser.ConfigParser()
   watcher.read(tmp_path / "mobius-rebuild.path")
   assert "PathChanged" in watcher["Path"] and "PathExists" not in watcher["Path"]
+  # Each unit waits for the stable data source to be mounted, so neither the
+  # watcher nor recovery can bind to the directory underneath that mount.
+  for unit in (main, reconcile, watcher):
+    assert unit["Unit"]["RequiresMountsFor"] == str(tmp_path / "data")
   assert "systemctl enable --now mobius-rebuild-reconcile.timer" in source
   assert host.ROLLBACK_HEALTH_SECONDS == 600
   assert host.WORKER_REVISION > 2
   marker = SCRIPT.parents[1] / "deployment" / "self-hosted-helper.required"
-  assert marker.read_text().strip() == "5"
-  assert "# Helper protocol revision: 5 " in source
+  assert marker.read_text().strip() == "6"
+  assert "# Helper protocol revision: 6 " in source
   impact = platform_activation.classify_activation(
     ["deployment/self-hosted-helper.required"], deployment="self_hosted",
   )

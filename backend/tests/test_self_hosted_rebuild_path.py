@@ -186,7 +186,18 @@ def deployment(tmp_path, monkeypatch):
     raise AssertionError("self-hosted replacement must not use a managed controller")
 
   monkeypatch.setattr(dc, "_managed_request", no_connect)
-  # The installer's capability publication, not a hand-written status file.
+  # Synthetic targets are not commits here; they require what is served.
+  served = dc._required_helper_protocol()
+  monkeypatch.setattr(dc, "_required_helper_protocol", lambda target_sha=None: served)
+  # The installer certifies its completed protocol, then publishes capability;
+  # not a hand-written status file.
+  certified = tmp_path / "helper-protocol"
+  certified.write_text(dc._REQUIRED_HELPER_PROTOCOL.read_text())
+  certified.chmod(0o600)
+  monkeypatch.setattr(host, "HELPER_PROTOCOL", certified)
+  installed = host.installed_helper_protocol
+  monkeypatch.setattr(host, "installed_helper_protocol",
+                      lambda: installed(trusted_uid=os.getuid()))
   assert host.publish_capabilities() == 0
   return SimpleNamespace(host=host, legacy=legacy, docker=docker, stores=stores, config=config,
                          control=control, inbox=control / "inbox", adopted=adopted, clock=clock,

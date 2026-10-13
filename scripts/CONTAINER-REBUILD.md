@@ -139,6 +139,22 @@ under its locks, and refuses before changing controller state otherwise:
   name in the reviewed Compose input that created the app, then rerun the
   installer. Multi-replica app layouts are not managed.
 
+`data_dir` is the host directory that **is** the app's `/data` whether or not
+a container runs, because replacement and recovery act exactly while no app
+container exists. For a bind mount it is the bind source; for a plain `local`
+volume it is Docker's Mountpoint; for a `local` volume created with bind options
+(`type=none`, `o=bind`, `device=DIR`, the usual way to put data on a separate
+disk) it is `DIR`. Docker mounts such a volume at its Mountpoint only while a
+container uses it, so that path is an unrelated hidden directory after the old
+app is removed; helper protocol 5 and earlier recorded it and silently used that
+hidden directory for the request watcher, status, and handoff evidence. The
+worker's `data-source` resolver supplies the stable path to the installer, every
+unit adds `RequiresMountsFor=` on it, and the worker refuses (before draining)
+any configuration whose `data_dir` is not the resolved stable source. Volumes the
+host cannot reach while the app is stopped (other drivers or driver options) are
+refused at installation. A reinstall accepts an existing configuration that
+recorded the same volume's Mountpoint and rewrites the stable spelling.
+
 The released version-3 `/etc/mobius-rebuild/config.json` is read only as the
 source of this migration and is never rewritten; the new worker never reads it,
 and the released worker never reads `config.v4.json`. The installer still checks
@@ -519,9 +535,19 @@ leave a serviceable rollback with manual chat recovery still required. Never
 clear that transaction merely because health is green.
 
 The root status records `worker_revision`, `launcher_revision` and the last
-`worker_adoption` outcome for operators. Fixed helpers keep working: the app does not require the launcher, and
-`deployment/self-hosted-helper.required` advances only for a change the
-launcher itself or an older fixed helper cannot provide.
+`worker_adoption` outcome for operators. It also reports `helper_protocol`: the
+protocol the last *completed* installer run certified in the root-owned
+`/var/lib/mobius-rebuild/helper-protocol` (written after the launcher, units,
+and dispatch are in place). The app refuses to queue a replacement while that
+value is below the served source's `deployment/self-hosted-helper.required`, so
+a helper fix that was released but never installed on this host cannot be
+bypassed by running the old cutover path; status of an older helper, including
+an unresolved recovery, stays readable. The requirement is the larger of the
+served source's and the target release's
+`deployment/self-hosted-helper.required`, which advances only for a change the
+launcher itself or an older fixed helper cannot provide. Every installation
+from before protocol 6, including fixed helpers without the launcher, must
+therefore rerun the installer once before its next replacement.
 
 **Trust.** The worker runs as root on the host, so the authority to publish
 `ghcr.io/mobius-os/mobius:sha-*` becomes authority to publish host-root code on
