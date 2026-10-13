@@ -55,7 +55,11 @@ def _serialize(db: Session, row: models.AgentWorkClaim, state: str) -> dict:
     "owner_goal_id": row.owner_goal_id,
     "revision": row.revision,
     "acquisition_id": row.acquisition_id,
-    "notification_pending": row.notification_revision < row.revision,
+    "notification_pending": (
+      row.previous_owner_chat_id is not None
+      and row.completed_at is None and row.released_at is None
+      and row.notification_revision < row.revision
+    ),
     "takeover_reason": row.takeover_reason,
     "completed_at": row.completed_at.isoformat() if row.completed_at else None,
     "outcome": row.outcome,
@@ -326,39 +330,17 @@ def claim_work(
 
 
 @dataclass(frozen=True)
-class FinishedClaim:
-  claim: dict
-  interested_chat_ids: list[str]
-
-
-@dataclass(frozen=True)
 class ReleasedClaim:
   """One open exact action settled because its owner can no longer act."""
 
   claim_id: str
   work_key: str
   revision: int
-  interested_chat_ids: list[str]
   state: str = "released"
   outcome: str = ""
-  owner_id: int | None = None
 
 
 _DELETED_OWNER_OUTCOME = "Owning chat was deleted before this action completed."
-
-
-def work_claim_notice_body(work_key: str, state: str, outcome: str) -> str:
-  """One notice text for every completed or released claim, however settled."""
-  body = f"Work claim {work_key} was {state}: {outcome}".strip()
-  if state == "released":
-    body += " You may claim it now if your Goal still needs this exact action."
-  return body
-
-
-def _live_follower_ids(db: Session, claim_id: str,
-                       owner_chat_id: str) -> list[str]:
-  # Exact-Goal delivery now owns follower notification; no chat-wide peer wake.
-  return []
 
 
 def _stage_settle(
@@ -370,7 +352,7 @@ def _stage_settle(
   no-op instead of overwriting an outcome the owner already recorded.
   """
   now = now_naive_utc()
-  claim_id, work_key, owner_id = row.id, row.work_key, row.owner_id
+  claim_id, work_key = row.id, row.work_key
   previous_revision = row.revision
   owner_chat_id = row.owner_chat_id
   changed = db.query(models.AgentWorkClaim).filter(
@@ -400,10 +382,8 @@ def _stage_settle(
     claim_id=claim_id,
     work_key=work_key,
     revision=previous_revision + 1,
-    interested_chat_ids=_live_follower_ids(db, claim_id, owner_chat_id),
     state="completed" if complete else "released",
     outcome=outcome[:1000],
-    owner_id=owner_id,
   )
 
 
@@ -563,35 +543,6 @@ def stage_settle_claims_with_owner(
   return settled
 
 
-def pending_settlement_notices(
-  db: Session, chat_id: str,
-) -> list[ReleasedClaim]:
-  """Legacy settlement latch awaiting a latency nudge and acknowledgement.
-
-  Outcomes are already durable on exact Goal dependencies. This latch no longer
-  authorizes chat-wide follower notices or receipts; transfer still has its own
-  prompt revocation notice. Retained until the legacy cleanup stage.
-  """
-  rows = db.query(models.AgentWorkClaim).filter(
-    models.AgentWorkClaim.owner_chat_id == chat_id,
-    models.AgentWorkClaim.notification_revision < models.AgentWorkClaim.revision,
-    (models.AgentWorkClaim.completed_at.is_not(None))
-    | (models.AgentWorkClaim.released_at.is_not(None)),
-  ).all()
-  return [
-    ReleasedClaim(
-      claim_id=row.id,
-      work_key=row.work_key,
-      revision=row.revision,
-      interested_chat_ids=_live_follower_ids(db, row.id, chat_id),
-      state="completed" if row.completed_at is not None else "released",
-      outcome=row.outcome or "",
-      owner_id=row.owner_id,
-    )
-    for row in rows
-  ]
-
-
 def finish_work(
   db: Session,
   *,
@@ -600,7 +551,7 @@ def finish_work(
   work_key: str,
   outcome: str,
   release: bool,
-) -> FinishedClaim:
+) -> dict:
   key = clean_work_key(work_key)
   clean_outcome = outcome.strip()
   if not clean_outcome or len(clean_outcome) > 1000:
@@ -624,18 +575,14 @@ def finish_work(
   ):
     db.rollback()
     raise ValueError("The claim changed while finishing; inspect it before retrying.")
-  recipients = _live_follower_ids(db, row.id, chat_id)
   db.commit()
   db.refresh(row)
   state = "completed" if row.completed_at is not None else "released"
-  return FinishedClaim(
-    claim=_serialize(db, row, state),
-    interested_chat_ids=recipients,
-  )
+  return _serialize(db, row, state)
 
 
-def acknowledge_notice(
-  db: Session, *, claim_id: str, revision: int, resolve_interests: bool,
+def acknowledge_transfer_notice(
+  db: Session, *, claim_id: str, revision: int,
 ) -> None:
   row = db.get(models.AgentWorkClaim, claim_id)
   if row is None or row.revision != revision:

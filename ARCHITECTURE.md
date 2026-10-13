@@ -1281,11 +1281,25 @@ or saved cards. A persisted running marker is not proof of a live executor after
 startup recovery. Every `AgentWorkInterest` stays unchanged in the old table as
 non-waking audit history; only a new follow creates a `GoalDependency`. This
 avoids inventing acquisition identity, receipt or wake authority for old work.
-Runtime follows no longer read/write that table. At cutover, only proven terminal
-claim-notice reservations are retired without acknowledging their peer cursor;
-ordinary peer interrupts, transfer revocations and ambiguous historical messages
-remain intact. Saved-card dependencies and final legacy-table retirement belong
-to the later redesign stages.
+Runtime follows and chat retention never read or write that table. Its rows and
+schema remain as non-waking audit history under ordinary retention policy; no
+destructive migration is applied. Completion and release send no follower peer
+notice and use no notification latch: immutable dependency outcomes drive
+exact-Goal delivery. The retry-safe claim notice and `notification_revision`
+remain solely for prompt transfer/revocation interrupts to the former executor.
+Ordinary peer messages and ambiguous historical messages remain intact.
+
+The same exact dependency projection supplies drawer, runtime and Goal details.
+Deliberate holds use a distinct quiet square; a stalled work source never promises
+an automatic dependency wake. Source cards and the Goal owning a live acquisition
+show deduplicated, owner-only `needed_by` chat backlinks in their existing details.
+These are read-side context, not requests, notifications or new attention.
+Settled dependencies use Waiting's clock and typed outcome in transcript history,
+anchored only to a visible segment of the exact receiving or declaring run.
+Retiring an unresolved subscription retains safe source identity without inventing
+a source result or receiving-run receipt. The bounded unfinished-settlement error
+code remains durable, but reads as calm recovery with explicit Resume rather than
+an alarm; unrelated execution failures retain their failure presentation.
 
 Persisted plans use the same task validation as plan writes. An unreadable
 plan keeps its Goal open, cannot authorize completion, and can be repaired

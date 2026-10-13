@@ -7,7 +7,6 @@ from app.timeutil import now_naive_utc
 
 from app import models
 from app.agent_work_claims import (
-  acknowledge_notice,
   claim_work,
   finish_work,
   stage_release_claims_for_chat,
@@ -126,13 +125,8 @@ def test_completion_resolves_followers_and_same_key_cannot_be_reclaimed(db):
     outcome="Merged as 0b44dc9d", release=False,
   )
 
-  assert finished.interested_chat_ids == []
   assert db.query(models.GoalDependency).one().outcome_json["kind"] == "completed"
-  assert finished.claim["state"] == "completed"
-  acknowledge_notice(
-    db, claim_id=finished.claim["id"], revision=finished.claim["revision"],
-    resolve_interests=True,
-  )
+  assert finished["state"] == "completed"
   later = claim_work(
     db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second",
     work_key=key, summary="Try the completed operation again",
@@ -165,7 +159,6 @@ def test_deleted_follower_cannot_suppress_live_follower_notification(db):
   finished = finish_work(db, owner_id=owner.id, chat_id=first.id,
                          work_key=key, outcome="Done", release=False)
 
-  assert finished.interested_chat_ids == []
   assert db.query(models.GoalDependency).filter_by(waiting_chat_id=live.id).one().resolved_at is not None
 
 
@@ -185,7 +178,6 @@ def test_deleting_owner_releases_only_unfinished_exact_action(db):
   db.commit()
 
   assert len(released) == 1
-  assert released[0].interested_chat_ids == []
   assert db.query(models.GoalDependency).one().outcome_json["kind"] == "owner_deleted"
   row = db.query(models.AgentWorkClaim).one()
   assert row.released_at is not None
@@ -232,7 +224,6 @@ def _claim_row(db):
   ("Merged as 0b44dc9d; CI green", "Owning Goal completed: Merged as 0b44dc9d; CI green"),
 ])
 def test_goal_completion_completes_the_claims_it_names(db, complete, expected):
-  from app.agent_work_claims import pending_settlement_notices
   from app.goals import update_goal_record
 
   owner, first, second = _owned_goal_claim(db)
@@ -245,9 +236,6 @@ def test_goal_completion_completes_the_claims_it_names(db, complete, expected):
   row = _claim_row(db)
   assert row.completed_at is not None and row.released_at is None
   assert row.outcome == expected
-  # The follower notice is owed durably until a seam delivers it.
-  [pending] = pending_settlement_notices(db, first.id)
-  assert (pending.state, pending.interested_chat_ids) == ("completed", [])
   assert db.query(models.GoalDependency).one().outcome_json["kind"] == "completed"
   again = claim_work(
     db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second",
@@ -334,7 +322,7 @@ def test_post_commit_seam_repairs_claims_of_a_goal_ended_elsewhere(db):
 
   [settled] = stage_settle_claims_with_owner(db, first.id)
   db.commit()
-  assert (settled.state, settled.interested_chat_ids) == ("released", [])
+  assert settled.state == "released"
   assert stage_settle_claims_with_owner(db, first.id) == []
 
 
@@ -372,7 +360,7 @@ def test_new_claim_after_goal_ends_is_not_released_as_old_work(db, status):
   assert _claim_row(db).released_at is None
   finished = finish_work(db, owner_id=owner.id, chat_id=first.id,
                          work_key=KEY, outcome="New action verified", release=False)
-  assert finished.claim["state"] == "completed"
+  assert finished["state"] == "completed"
 
 
 def test_racing_first_claims_leave_one_owner_and_one_follower(db):
@@ -415,7 +403,6 @@ def test_racing_first_claims_leave_one_owner_and_one_follower(db):
 
 def test_goal_completion_releases_a_declined_action_it_did_not_name(db):
   """A declined approval's claim must not read as done: completed is terminal."""
-  from app.agent_work_claims import pending_settlement_notices
   from app.goals import update_goal_record
 
   owner, first, second = _owned_goal_claim(db)
@@ -430,8 +417,6 @@ def test_goal_completion_releases_a_declined_action_it_did_not_name(db):
   assert row.outcome.startswith(
     "Owning Goal completed without recording this action as done: Owner declined"
   )
-  [pending] = pending_settlement_notices(db, first.id)
-  assert pending.state == "released"
   taken = claim_work(
     db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second",
     work_key=KEY, summary="Merge once the owner approves",
@@ -483,7 +468,7 @@ def test_finishing_a_retyped_key_names_the_exact_keys_this_chat_holds(db):
   db.rollback()
   finished = finish_work(db, owner_id=owner.id, chat_id=first.id,
                          work_key=held, outcome="Merged", release=False)
-  assert finished.claim["state"] == "completed"
+  assert finished["state"] == "completed"
 
   with pytest.raises(ValueError, match="No open work claims are held here"):
     finish_work(db, owner_id=owner.id, chat_id=first.id,
@@ -1161,3 +1146,35 @@ def test_same_chat_goal_rebind_moves_only_exact_executor_suppression(db):
   db.expire_all()
   assert db.query(models.GoalDependency).filter_by(
     waiting_goal_id=b2.goal_id).one().outcome_json["kind"] == "completed"
+
+
+def test_retired_interest_rows_are_audit_only_during_new_follow_and_settlement(db):
+  """New follows neither adopt nor update the old chat-wide interest ledger."""
+  owner, first, second = _fixture(db)
+  result = claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first",
+    work_key=KEY, summary="Merge the reviewed change")
+  interest = models.AgentWorkInterest(id="audit-only", claim_id=result["id"],
+    chat_id=second.id, goal_id="claim-goal-second")
+  db.add(interest); db.commit()
+  before = {column.name: getattr(interest, column.name) for column in models.AgentWorkInterest.__table__.columns}
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second",
+    work_key=KEY, summary="Merge once")
+  finish_work(db, owner_id=owner.id, chat_id=first.id, work_key=KEY, outcome="Done", release=False)
+  db.expire_all()
+  assert {column: getattr(interest, column) for column in before} == before
+  assert db.query(models.GoalDependency).one().outcome_json["kind"] == "completed"
+
+
+def test_legacy_interest_model_has_no_runtime_consumers():
+  """The retained table is a schema/audit artifact, not another follow path."""
+  import ast
+  from pathlib import Path
+  app = Path(__file__).parents[1] / "app"
+  for path in app.rglob("*.py"):
+    if path.name in {"models.py", "schema_migrations.py"}:
+      continue
+    tree = ast.parse(path.read_text())
+    assert not any((isinstance(node, ast.Attribute) and node.attr == "AgentWorkInterest")
+      or (isinstance(node, ast.Name) and node.id == "AgentWorkInterest")
+      or (isinstance(node, ast.ImportFrom) and any(name.name == "AgentWorkInterest" for name in node.names))
+      for node in ast.walk(tree)), path

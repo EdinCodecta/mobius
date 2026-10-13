@@ -1766,7 +1766,7 @@ def test_settlement_outcome_survives_lost_postcommit_nudge(
   before = db.query(models.GoalDependency).one()
   assert before.resolved_at is not None
   assert before.outcome_json["kind"] == "released"
-  assert asyncio.run(settle_claims_with_owner("claim-owner")) == []
+  asyncio.run(settle_claims_with_owner("claim-owner"))
   after = db.query(models.GoalDependency).one()
   assert after.outcome_json == before.outcome_json
 

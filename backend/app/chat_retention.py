@@ -199,10 +199,8 @@ def purge_expired_chat_tombstones(db: Session) -> list[str]:
   ).update({
     models.AgentWorkClaim.owner_chat_id: None,
   }, synchronize_session=False)
-  # Do not rely on SQLite FK enforcement for the follower side either.
-  db.query(models.AgentWorkInterest).filter(
-    models.AgentWorkInterest.chat_id.in_(chat_ids),
-  ).delete(synchronize_session=False)
+  # Legacy interest rows remain audit history. Their source chat identity is
+  # historical, not a live subscription or an instruction to wake anyone.
   # Transcript rows, search entries and damage copies go with each chat
   # through the `chats_deleted` trigger, in this same transaction.
   db.query(models.Chat).filter(

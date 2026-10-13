@@ -20,14 +20,13 @@ from app.agent_coordination import (
   owner_project_snapshot,
   scope_for_chat,
   send_agent_message,
-  send_work_claim_notice,
+  send_work_claim_transfer_notice,
   visible_peer_messages,
 )
 from app.agent_work_claims import (
-  acknowledge_notice,
+  acknowledge_transfer_notice,
   claim_work,
   finish_work,
-  work_claim_notice_body,
 )
 from app.database import get_db
 from app.deps import (
@@ -126,7 +125,7 @@ async def claim_current_work(
     raise HTTPException(409, str(exc)) from exc
   previous = result.get("previous_owner_chat_id")
   if previous and result.get("notification_pending"):
-    send_work_claim_notice(
+    send_work_claim_transfer_notice(
       db,
       owner_id=principal.owner.id,
       claim_id=result["id"],
@@ -146,9 +145,8 @@ async def claim_current_work(
     # its requested live/wake/queue delivery path. A crash or delivery error
     # before this point leaves notification_pending true, so the exact same
     # transfer request retries idempotently instead of losing the wake.
-    acknowledge_notice(
+    acknowledge_transfer_notice(
       db, claim_id=result["id"], revision=result["revision"],
-      resolve_interests=False,
     )
     result["notification_pending"] = False
     result["steered"] = delivery.steered
@@ -179,12 +177,8 @@ async def finish_current_work(
   # only reduces latency; it never makes the result durable.
   from app.goal_dependencies import deliver_pending_dependencies
   delivery = await deliver_pending_dependencies()
-  acknowledge_notice(
-    db, claim_id=finished.claim["id"], revision=finished.claim["revision"],
-    resolve_interests=False,
-  )
   return {
-    **finished.claim, "notification_pending": False,
+    **finished,
     "dependency_delivery": delivery,
   }
 

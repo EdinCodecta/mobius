@@ -1636,7 +1636,7 @@ class AgentWorkClaim(Base):
 
 
 class AgentWorkInterest(Base):
-  """A Goal following work that another chat currently owns."""
+  """Non-waking audit history of the retired chat-wide claim follow."""
 
   __tablename__ = "agent_work_interests"
   __table_args__ = (

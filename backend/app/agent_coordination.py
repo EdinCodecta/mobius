@@ -1563,7 +1563,7 @@ def send_agent_message(
   )
 
 
-def send_work_claim_notice(
+def send_work_claim_transfer_notice(
   db: Session,
   *,
   owner_id: int,
@@ -1573,7 +1573,7 @@ def send_work_claim_notice(
   recipients: list[str],
   body: str,
 ) -> list[dict[str, Any]]:
-  """Persist a retry-safe claim notice across physical agent turns."""
+  """Persist a retry-safe ownership-revocation interrupt for the former executor."""
   unique_recipients = list(dict.fromkeys(str(value) for value in recipients))
   if not unique_recipients:
     return []
@@ -1946,33 +1946,15 @@ async def deliver_peer_recipients(
   )
 
 
-async def notify_settled_claims(
-  db: Session, *, owner_id: int, sender_chat_id: str, settled: list[Any],
-) -> list[str]:
-  """Nudge exact-Goal dependency delivery after a claim settlement commit."""
-  from app.agent_work_claims import acknowledge_notice
-  from app.goal_dependencies import deliver_pending_dependencies
-
-  await deliver_pending_dependencies()
-  for item in settled:
-    acknowledge_notice(
-      db, claim_id=item.claim_id, revision=item.revision,
-      resolve_interests=False,
-    )
-  return []
-
-
-async def settle_claims_with_owner(chat_id: str) -> list[str]:
-  """Post-commit legacy repair and exact-Goal result delivery nudge.
+async def settle_claims_with_owner(chat_id: str) -> None:
+  """Post-commit claim repair and exact-Goal result delivery nudge.
 
   Lifecycle writes settle claims atomically with their Goal or tombstone.
   This seam repairs source rows ended by older paths, then nudges dependency
-  reconciliation. No follower chat-wide interrupt is sent (the retained list
-  return is empty). Failure leaves durable outcomes for the next supervisor
-  pass, never a false receipt.
+  reconciliation. No follower chat-wide interrupt is sent. Failure leaves
+  durable outcomes for the next supervisor pass, never a false receipt.
   """
   from app.agent_work_claims import (
-    pending_settlement_notices,
     stage_settle_claims_with_owner,
   )
   from app.database import SessionLocal
@@ -1983,19 +1965,10 @@ async def settle_claims_with_owner(chat_id: str) -> list[str]:
         db.commit()
       else:
         db.rollback()
-      pending = pending_settlement_notices(db, chat_id)
-      by_owner: dict[int, list[Any]] = {}
-      for item in pending:
-        by_owner.setdefault(item.owner_id, []).append(item)
-      notified: list[str] = []
-      for owner_id, items in by_owner.items():
-        notified.extend(await notify_settled_claims(
-          db, owner_id=owner_id, sender_chat_id=chat_id, settled=items,
-        ))
-      return notified
+      from app.goal_dependencies import deliver_pending_dependencies
+      await deliver_pending_dependencies()
   except Exception:
     log.warning("claim settlement failed chat=%s", chat_id, exc_info=True)
-    return []
 
 
 _SETTLEMENT_TASKS: set[asyncio.Task] = set()

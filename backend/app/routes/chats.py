@@ -2623,18 +2623,16 @@ async def delete_chat(
           chat_id,
         )
   # Destructive cleanup has settled before releasing transition ownership.
-  # The tombstone and releases are already durable. Notify/wake followers as a
-  # best-effort delivery layer; failure cannot roll back an owner-requested
+  # The tombstone and releases are already durable. Nudge exact-Goal delivery as a
+  # best-effort layer; failure cannot roll back an owner-requested
   # deletion, and the released claim itself remains reclaimable by exact key.
   if released_claims:
-    from app.agent_coordination import notify_settled_claims
+    from app.goal_dependencies import deliver_pending_dependencies
     try:
-      await notify_settled_claims(
-        db, owner_id=owner.id, sender_chat_id=chat_id, settled=released_claims,
-      )
+      await deliver_pending_dependencies()
     except Exception:
       log.exception(
-        "Chat %s was deleted but claim followers were not notified", chat_id,
+        "Chat %s was deleted but claim dependencies were not nudged", chat_id,
       )
   # The current chat has just entered its recovery window and therefore cannot
   # be selected when this existing lifecycle boundary reclaims older tombstones.
