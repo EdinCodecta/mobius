@@ -803,31 +803,23 @@ async def _resolve_source_identity(
   an exact URL-derived identity and can still move through the explicit
   old-source handoff contract.
   """
-  repository = _github_root_manifest_identity(source_url)
-  if repository is None:
+  root = parse_root_manifest(source_url)
+  if root is None:
     base = _canonical_base(source_url)
     digest = hashlib.sha256(base.encode("utf-8")).hexdigest()
     return f"url:{digest}", source_url
 
-  owner, repo = repository
-  repository_id = _TRUSTED_CATALOG_REPOSITORY_IDS.get(repository)
+  repository_id = _TRUSTED_CATALOG_REPOSITORY_IDS.get(root.repository)
   if repository_id is not None:
-    canonical_owner, canonical_repo = repository
+    canonical_owner, canonical_repo = root.repository
   else:
     repository_id, canonical_owner, canonical_repo = (
-      await _fetch_github_repository(client, owner, repo)
+      await _fetch_github_repository(client, root.owner, root.repo)
     )
-
-  parsed = urlparse(source_url)
-  parts = [part for part in parsed.path.split("/") if part]
-  if len(parts) < 3:
-    raise HTTPException(400, "GitHub package source is not a root manifest.")
-  parts[0] = canonical_owner
-  parts[1] = canonical_repo
-  trailing_slash = parsed.path.endswith("/")
-  canonical_path = "/" + "/".join(parts) + ("/" if trailing_slash else "")
-  canonical_url = parsed._replace(path=canonical_path).geturl()
-  return f"github:{repository_id}", canonical_url
+  canonical = dataclasses.replace(
+    root, owner=canonical_owner, repo=canonical_repo,
+  )
+  return f"github:{repository_id}", canonical.url
 
 
 async def _fetch_github_repository(
@@ -2435,32 +2427,6 @@ def _new_candidate(
   )
 
 
-_DERIVED_CANDIDATE_FIELDS = frozenset((
-  "capability_contract", "capability_digest", "candidate_digest",
-))
-
-
-def _with_source_identity(
-  candidate: InstallCandidate,
-  *,
-  source_identity: str | None,
-  predecessor_source_identity: str | None,
-  canonical_source_url: str | None,
-) -> InstallCandidate:
-  """The same package bound to resolved source identities, digests re-derived."""
-  package = {
-    item.name: getattr(candidate, item.name)
-    for item in dataclasses.fields(candidate)
-    if item.name not in _DERIVED_CANDIDATE_FIELDS
-  }
-  return _new_candidate(**{
-    **package,
-    "source_identity": source_identity,
-    "predecessor_source_identity": predecessor_source_identity,
-    "canonical_source_url": canonical_source_url,
-  })
-
-
 async def _resolve_package_identity(
   client: httpx.AsyncClient, manifest: dict, source_url: str,
 ) -> tuple[str | None, str | None, str | None]:
@@ -3178,36 +3144,62 @@ async def prepare_package(
     raise
 
 
+def _read_staged_manifest(staged: app_git.Staged) -> dict | None:
+  """The staged commit's bounded, valid root manifest, or None.
+
+  None defers to the full package read, which reports why it is unusable.
+  """
+  raw = app_git.read_committed_file(
+    staged.path, staged.sha, "mobius.json", max_bytes=_MANIFEST_MAX_BYTES,
+  )
+  if raw is None:
+    return None
+  try:
+    return _read_git_package_manifest({"mobius.json": raw}, strict=True)
+  except (ValueError, HTTPException):
+    return None
+
+
 async def _staged_clone_candidate(
   manifest_url: str, staged: app_git.Staged, *, db: Session | None,
 ) -> InstallCandidate:
-  """Read a root Git package from its staged clone, binding its identity."""
+  """Read a root Git package from its staged clone, binding its identity.
+
+  Identity comes from the bounded manifest alone, so the package is read
+  (and its digests derived) once, already bound to it.
+  """
   source_url = requested_manifest_source(manifest_url)[0]
+  manifest = await asyncio.to_thread(_read_staged_manifest, staged)
+  identity: dict[str, str | None] = {}
+  if manifest is not None:
+    validate_manifest_address(manifest, manifest_url, db=db)
+    if db is not None:
+      db.rollback()
+    if manifest.get("package_id"):
+      async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
+        source_identity, predecessor, canonical = (
+          await _resolve_package_identity(cli, manifest, source_url)
+        )
+      identity = dict(
+        source_identity=source_identity,
+        predecessor_source_identity=predecessor,
+        canonical_source_url=canonical,
+      )
   try:
-    candidate = (await asyncio.to_thread(
+    candidate = (await asyncio.to_thread(functools.partial(
       read_git_install_candidate, staged.path, staged.sha, source_url,
-    )).candidate
+      **identity,
+    ))).candidate
   except PackageTooLarge as exc:
     raise HTTPException(
       413, detail={"code": "package_too_large", "message": str(exc)},
     ) from exc
   except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
     raise HTTPException(422, f"The app's Git package is unusable: {exc}") from exc
-  validate_manifest_address(candidate.manifest, manifest_url, db=db)
-  if db is not None:
-    db.rollback()
-  if candidate.manifest.get("package_id"):
-    # Resolved from the bounded manifest the reader just accepted.
-    async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
-      source_identity, predecessor, canonical = await _resolve_package_identity(
-        cli, candidate.manifest, source_url,
-      )
-    candidate = _with_source_identity(
-      candidate,
-      source_identity=source_identity,
-      predecessor_source_identity=predecessor,
-      canonical_source_url=canonical,
-    )
+  if manifest is None:
+    # The full read accepted a manifest the bounded read could not: never
+    # bind a package to an identity it was not resolved for.
+    raise HTTPException(422, "The app's Git package manifest is unreadable.")
   return candidate
 
 
@@ -3866,16 +3858,14 @@ async def _prepare_app_row(
     if target.origin_migration and app_git.has_origin(app.source_dir):
       old_origin, new_origin = target.origin_migration
       current_origin = app_git.origin_url(app.source_dir)
-      normalized_origin = (
-        current_origin.rstrip("/").lower() if current_origin else None
-      )
-      if normalized_origin and normalized_origin not in {
-        old_origin.rstrip("/").lower(), new_origin.rstrip("/").lower(),
-      }:
+      if current_origin and not (
+        app_git.same_origin(current_origin, old_origin)
+        or app_git.same_origin(current_origin, new_origin)
+      ):
         raise HTTPException(
           409, "Installed app origin no longer matches its trusted source.",
         )
-      if normalized_origin and normalized_origin != new_origin.rstrip("/").lower():
+      if current_origin and not app_git.same_origin(current_origin, new_origin):
         app_git.set_origin_url(app.source_dir, new_origin)
         journal.rollback_actions.append(
           lambda p=app.source_dir, u=current_origin:

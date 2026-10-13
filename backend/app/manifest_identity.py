@@ -29,6 +29,12 @@ class RootManifest:
   def origin_url(self) -> str:
     return f"https://github.com/{self.owner}/{self.repo}.git"
 
+  @property
+  def url(self) -> str:
+    """The raw address: the manifest file, or the package base with a slash."""
+    base = f"https://{RAW_GITHUB_HOST}/{self.owner}/{self.repo}/{self.ref}/"
+    return base + (self.filename or "")
+
 
 def parse_root_manifest(url: str) -> RootManifest | None:
   """The one parser for raw-GitHub package addresses.

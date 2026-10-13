@@ -7017,8 +7017,12 @@ def test_package_identity_handoff_accepts_old_source_whose_id_changed(
   assert moved.json()["package_id"] == package_id
 
 
+# Git accepts a remote with or without `.git`; either names the predecessor.
+@pytest.mark.parametrize("old_origin", [
+  "https://github.com/acme/app-old.git", "https://github.com/acme/app-old",
+])
 def test_rename_adopts_predecessor_across_same_owner_repository_move(
-  client, auth, bypass_url_validation,
+  client, auth, bypass_url_validation, old_origin,
 ):
   """A package and repository rename preserves the row, storage, and data."""
   old_base = "https://raw.githubusercontent.com/acme/app-old/main/"
@@ -7032,10 +7036,7 @@ def test_rename_adopts_predecessor_across_same_owner_repository_move(
     app_id = first.json()["id"]
     old_source = Path(get_settings().data_dir) / "apps" / "old"
     subprocess.run(
-      [
-        "git", "remote", "add", "origin",
-        "https://github.com/acme/app-old.git",
-      ],
+      ["git", "remote", "add", "origin", old_origin],
       cwd=old_source,
       check=True,
     )
@@ -11047,6 +11048,7 @@ def test_changed_source_on_a_fresh_install_asks_for_a_new_review(
 
 _PARITY_ALICE = "https://raw.githubusercontent.com/alice/app-notes/main/"
 _PARITY_BOB = "https://raw.githubusercontent.com/bob/app-notes/main/"
+_PARITY_MOVED = "https://raw.githubusercontent.com/alice/app-notes-moved/main/"
 
 
 @pytest.mark.parametrize("candidate_fields, catalog_base, offered", [
@@ -11073,6 +11075,16 @@ _PARITY_BOB = "https://raw.githubusercontent.com/bob/app-notes/main/"
   ),
   # Another app's package at another address: install would add a new app.
   ({"id": "parity-other"}, _PARITY_BOB, False),
+  # A same-owner repository move and rename without a permanent identity (the
+  # shape the pages and integrations apps shipped): the reviewed predecessor
+  # address proves the move, so all three update this row.
+  (
+    {
+      "id": "parity-renamed", "previous_id": "parity-notes",
+      "previous_manifest_url": _PARITY_ALICE + "mobius.json",
+    },
+    _PARITY_MOVED, True,
+  ),
 ])
 def test_update_discovery_and_install_resolve_the_same_row(
   client, auth, db, tmp_path, bypass_url_validation, candidate_fields,
@@ -11135,10 +11147,122 @@ def test_update_discovery_and_install_resolve_the_same_row(
     assert applied.json()["id"] == app_id
     assert applied.json()["version"] == "2.0.0"
     db.expire_all()
-    owner = catalog_base.split("/")[3]
+    owner, repo = catalog_base.split("/")[3:5]
     assert app_git.same_origin(
       app_git.origin_url(db.get(models.App, app_id).source_dir),
-      f"https://github.com/{owner}/app-notes.git",
+      f"https://github.com/{owner}/{repo}.git",
     )
   else:
     assert applied.status_code in (400, 409), applied.text
+
+
+@pytest.mark.parametrize("route", ["update-check", "update-candidate-preview"])
+def test_update_discovery_explains_an_unverifiable_legacy_repository_move(
+  client, auth, tmp_path, bypass_url_validation, route,
+):
+  """A row with no recorded repository identity cannot prove a permanent
+  package's move here, but a fresh install would: it is not "a separate app"."""
+  manifest = {
+    "id": "parity-notes", "name": "Parity notes", "version": "1.0.0",
+    "description": "Identity parity", "entry": "index.jsx",
+    "source_files": ["cards.js"],
+  }
+  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(manifest)})
+  installed = _install_clone_fixture(
+    client, auth, _PARITY_ALICE, manifest, CLONE_INDEX_V1, CLONE_CARDS_V1,
+    bare, include_source_file=True,
+  )
+  assert installed.status_code == 201, installed.text
+  moved = {
+    **manifest, "version": "2.0.0", "id": "parity-moved",
+    "previous_id": "parity-notes",
+    "package_id": "urn:uuid:2c4e6a8b-1d3f-5a7c-9e0b-2d4f6a8c0e1a",
+    "previous_manifest_url": _PARITY_ALICE + "mobius.json",
+  }
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(moved)})
+  with patch("app.install._derive_repo_ref", return_value=(bare.as_uri(), "main")):
+    response = client.get(
+      f"/api/apps/{installed.json()['id']}/{route}", headers=auth,
+      params={"manifest_url": _PARITY_MOVED + "mobius.json"},
+    )
+  if route == "update-check":
+    assert response.status_code == 200, response.text
+    assert response.json()["update_available"] is None
+    rejection = response.json()["candidate_rejected"]
+  else:
+    assert response.status_code == 409, response.text
+    rejection = response.json()["detail"]
+  assert rejection["code"] == "identity_mismatch"
+  assert "separate app" not in rejection["message"]
+  assert "before repository identities were recorded" in rejection["message"]
+
+
+def test_install_preview_resolves_its_row_off_the_event_loop(
+  client, auth, bypass_url_validation,
+):
+  """Its database (and legacy Git origin) reads never block the loop."""
+  base = "https://preview-off-loop.test/repo/"
+  manifest = {**MANIFEST_NEWS, "id": "preview-off-loop"}
+  installed = _install_v1(client, auth, base, manifest, JSX)
+  assert installed.status_code == 201, installed.text
+  on_loop = []
+  resolve = install.resolve_package_row
+
+  def recording_resolve(*args, **kwargs):
+    try:
+      asyncio.get_running_loop()
+      on_loop.append(True)
+    except RuntimeError:
+      on_loop.append(False)
+    return resolve(*args, **kwargs)
+
+  responses = {base + "mobius.json": (200, json.dumps(manifest).encode())}
+  with patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
+  ), patch("app.install.resolve_package_row", recording_resolve):
+    preview = client.post("/api/apps/preview", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert preview.status_code == 200, preview.text
+  assert preview.json()["installed_contract"] is not None
+  assert on_loop == [False]
+
+
+def test_staged_clone_binds_identity_before_its_one_package_read(
+  db, tmp_path, monkeypatch,
+):
+  """A permanent package's identity comes from its bounded manifest, so the
+  package is read and its digests derived once, already bound."""
+  manifest = {
+    "id": "staged-once", "name": "Staged once", "version": "1.0.0",
+    "description": "Identity", "entry": "index.jsx",
+    "source_files": ["cards.js"],
+    "package_id": "urn:uuid:8e1a3c5d-7f9b-5d2e-a4c6-8e0a2c4e6b8d",
+  }
+  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(manifest)})
+
+  async def resolve(_client, resolved_manifest, source_url):
+    assert resolved_manifest["package_id"] == manifest["package_id"]
+    return "github:42", None, source_url
+
+  built = []
+  new_candidate = install._new_candidate
+
+  def counting_new_candidate(**kwargs):
+    built.append(kwargs["source_identity"])
+    return new_candidate(**kwargs)
+
+  monkeypatch.setattr(install, "_resolve_package_identity", resolve)
+  monkeypatch.setattr(install, "_new_candidate", counting_new_candidate)
+  staged = app_git.stage_clone(bare.as_uri(), "main", tmp_path / "transfers")
+  try:
+    candidate = asyncio.run(install._staged_clone_candidate(
+      "https://raw.githubusercontent.com/acme/staged-once/main/mobius.json",
+      staged, db=None,
+    ))
+  finally:
+    install.discard_staged(staged)
+  assert built == ["github:42"]
+  assert candidate.source_identity == "github:42"

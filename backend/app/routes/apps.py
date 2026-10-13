@@ -789,14 +789,10 @@ async def preview_app_install(
       db=db,
     )
   )
-  # The row install would update, by its one rule. Source identities are not
-  # resolved here, so a move that only a provider repository id proves is
-  # previewed as a new install.
   source = body.manifest_url if body.manifest_url is not None else raw_base
-  existing = install.resolve_package_row(db, manifest, source).row
-  if existing is not None and existing.deleted_at is not None:
-    existing = None
-  installed_contract = existing.capability_contract if existing else None
+  installed_contract = await settled.run_settled(
+    _installed_contract_for_preview, manifest, source,
+  )
   return schemas.AppPreviewOut(
     manifest=manifest,
     capability_contract=contract,
@@ -804,6 +800,24 @@ async def preview_app_install(
     installed_contract=installed_contract,
     capability_diff=diff_contracts(installed_contract, contract),
   )
+
+
+def _installed_contract_for_preview(manifest: dict, source: str) -> dict | None:
+  """The capability contract of the live row install would update, or None.
+
+  Install's one identity rule (``install.resolve_package_row``). Source
+  identities are not resolved here, so a move that only a provider repository
+  id proves is previewed as a new install. Blocking (database reads, and a Git
+  origin read for a legacy row): run it in a worker thread, in its own short
+  session, like update discovery's ``_update_candidate_rejection``.
+  """
+  from app import database, install
+
+  with database.SessionLocal() as db:
+    existing = install.resolve_package_row(db, manifest, source).row
+    if existing is None or existing.deleted_at is not None:
+      return None
+    return existing.capability_contract
 
 
 @router.post(
@@ -1386,15 +1400,28 @@ def _update_candidate_rejection(
     return {"code": "identity_mismatch", "message": str(exc.detail)}
   if row_id == app_id:
     return None
-  return {
-    "code": "identity_mismatch",
-    "message": (
+  if row_id is not None:
+    message = "This update source belongs to another installed app."
+  elif (
+    source_identity is None
+    and manifest.get("package_id")
+    and manifest.get("previous_manifest_url")
+  ):
+    # Only provider repository ids prove a permanent package's move, and this
+    # row predates them. A fresh install resolves both ids, so it would
+    # update this app rather than add another.
+    message = (
+      "This app was installed before repository identities were recorded, "
+      "so this check cannot confirm that the source's repository move keeps "
+      "it the same app. Installing it again confirms the move and updates "
+      "this app."
+    )
+  else:
+    message = (
       "This update source is a different app; installing it would add a "
       "separate app."
-      if row_id is None else
-      "This update source belongs to another installed app."
-    ),
-  }
+    )
+  return {"code": "identity_mismatch", "message": message}
 
 
 def _update_manifest_source(
