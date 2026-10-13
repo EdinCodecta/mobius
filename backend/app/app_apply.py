@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from app import (
   app_git, app_python_env, chat_app_artifacts, icon_assets, managed_paths, models,
-  service_preload, timeutil, tracing,
+  pending_update, service_preload, timeutil, tracing,
 )
 from app.app_capabilities import (
   contract_from_app_state,
@@ -698,9 +698,7 @@ async def _apply_source_revision(
       status_code=409,
     )
   if accept_local_package and app is not None:
-    from app import install
-
-    if install.pending_update_receipt_file(source_path).is_file():
+    if pending_update.pending_update_receipt_file(source_path).is_file():
       # Finishing the pending update installs its reviewed package metadata;
       # accepting local metadata now would be silently overwritten by it.
       raise AppApplyError(

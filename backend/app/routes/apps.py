@@ -29,7 +29,7 @@ from app import (
   activity, app_activity, app_apply, app_badge, app_capability_acceptance,
   app_git, app_jobs, app_recency, chat_app_artifacts, chat_queue, drawer_pins, fs_locks,
   icon_cache, models, project_git, providers, schemas,
-  settled, source_dirs, workspace_files,
+  pending_update, settled, source_dirs, workspace_files,
 )
 from app.manifest_identity import (
   requested_manifest_source, stored_manifest_fetch_url,
@@ -1066,16 +1066,18 @@ def _validate_pending_update(repo: Path, receipt: dict) -> _PendingUpdatePlan:
   if app_git.merge_in_progress(repo):
     raise _earlier_resolver_merge(repo)
   upstream = receipt["upstream_commit"]
-  if install.pending_update_resolved(repo, upstream):
+  if pending_update.pending_update_resolved(repo, upstream):
     return _PendingUpdatePlan(conflict_paths=[])
-  worktree = install.pending_update_worktree(repo)
+  worktree = pending_update.pending_update_worktree(repo)
   if (worktree / ".git").exists():
     if app_git.merge_in_progress(worktree):
       return _PendingUpdatePlan(
         conflict_paths=_unmerged_status_paths(worktree), checkout=worktree,
       )
     if app_git.ref_is_ancestor(worktree, upstream, "HEAD") is True:
-      marked = install.committed_conflict_marker_paths(worktree, "HEAD", upstream) or []
+      marked = pending_update.committed_conflict_marker_paths(
+        worktree, "HEAD", upstream,
+      ) or []
       changed = app_git._run(
         worktree, "status", "--porcelain=v1", "-z", "--no-renames",
       ).stdout.split("\0")
@@ -1104,8 +1106,6 @@ def _park_pending_update(
   repo: Path, receipt: dict, plan: _PendingUpdatePlan,
 ) -> list[str]:
   """Consume a validated plan; preparation is retryable, not transactional."""
-  from app import install
-
   if plan.conflict_paths is not None:
     # Resolver Git operations do not take route locks. A removed checkout
     # invalidates a reuse plan rather than silently recreating agent work.
@@ -1113,7 +1113,7 @@ def _park_pending_update(
       raise _conflict_state_changed()
     return plan.conflict_paths
   merge = plan.merge
-  worktree = install.pending_update_worktree(repo)
+  worktree = pending_update.pending_update_worktree(repo)
   if (worktree / ".git").exists():
     app_git.remove_overlay_worktree(repo, worktree)
   worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -1147,14 +1147,12 @@ def _require_pending_resolution(repo: Path, upstream_commit: str) -> None:
   stages on its behalf. A merge an earlier release left in the served folder is
   finished there the way that release did.
   """
-  from app import install
-
   if app_git.merge_in_progress(repo):
     if app_git.commit_local(repo, "resolve app update") is None:
       raise _earlier_resolver_merge(repo)
-  if install.pending_update_resolved(repo, upstream_commit):
+  if pending_update.pending_update_resolved(repo, upstream_commit):
     return
-  worktree = install.pending_update_worktree(repo)
+  worktree = pending_update.pending_update_worktree(repo)
   if not (worktree / ".git").exists():
     raise _resolution_error(
       "resolution_not_started",
@@ -1196,8 +1194,6 @@ def _conflict_resolver_prompt(
   items: list[tuple[models.App, Path, list[str], str | None]],
 ) -> str:
   """One bounded seed message covering every app in a reviewed issue batch."""
-  from app import install
-
   intro = ["Please finish every blocked app update listed below.", ""]
   instructions = [
     "Read /data/shared/skills/resolving-app-git.md once, then work through EVERY "
@@ -1217,7 +1213,7 @@ def _conflict_resolver_prompt(
     app, repo, conflict_paths, upstream_version = item
     name = _prompt_value(app.name, 120) or "this app"
     target = _prompt_value(upstream_version or "latest", 32) or "latest"
-    checkout = install.pending_update_worktree(repo)
+    checkout = pending_update.pending_update_worktree(repo)
     omitted = len(conflict_paths) - len(shown)
     return [
       f"## {name} to v{target}",
@@ -1334,13 +1330,12 @@ def _pending_update_state(repo: Path, upstream_commit: str) -> Literal[
   """Classify a validated pending receipt without changing repository state.
 
   ``replay_pending`` means only installation is left (see
-  ``install.pending_update_resolved``); rerunning the update or the resolver's
-  finish promotes it. Anything short of that is still resolution work.
+  ``pending_update.pending_update_resolved``); rerunning the update or the
+  resolver's finish promotes it. Anything short of that is still resolution
+  work.
   """
-  from app import install
-
   try:
-    resolved = install.pending_update_resolved(repo, upstream_commit)
+    resolved = pending_update.pending_update_resolved(repo, upstream_commit)
   except (OSError, subprocess.SubprocessError):
     return "unknown"
   return "replay_pending" if resolved else "needs_resolution"
@@ -1355,10 +1350,8 @@ def _read_pending_update(repo: Path, app_id: int) -> tuple[
   Callers hold the app's source-dir lock, so update-check and the candidate
   preview report the same state.
   """
-  from app import install
-
   current_upstream = app_git.head_sha(repo, app_git.UPSTREAM_BRANCH)
-  receipt = install.read_pending_conflict_update_receipt(
+  receipt = pending_update.read_pending_conflict_update_receipt(
     repo, app_id=app_id, upstream_commit=current_upstream,
   )
   state = (
@@ -2272,7 +2265,7 @@ def _pending_store_update_app(
 def _pending_store_update_receipt(app: models.App, source_dir: str) -> dict:
   from app import install
 
-  receipt = install.read_pending_conflict_update_receipt(
+  receipt = pending_update.read_pending_conflict_update_receipt(
     source_dir,
     app_id=app.id,
     upstream_commit=app.upstream_commit,
@@ -2335,7 +2328,7 @@ async def resolve_app_update(
       fs_locks.source_dir_lock(source_dir),
     ):
       app = _pending_store_update_app(db, source_dir, app_id=app_id)
-      if not install.pending_update_receipt_file(source_dir).is_file() and (
+      if not pending_update.pending_update_receipt_file(source_dir).is_file() and (
         app.upstream_commit
         and app_git.ref_is_ancestor(
           source_dir, app.upstream_commit, app_git.LOCAL_BRANCH,
@@ -2343,7 +2336,7 @@ async def resolve_app_update(
       ):
         # Already installed: a retry after a lost response, or a finish that
         # stopped after removing its receipt. Clear any leftover checkout.
-        await install.clear_pending_conflict_update(db, app)
+        await pending_update.clear_pending_conflict_update(db, app)
         get_system_broadcast().publish(
           {"type": "app_updated", "appId": str(app.id)}
         )
@@ -2389,7 +2382,7 @@ async def resolve_app_update(
           fs_locks.app_storage_lock(app_id),
           fs_locks.source_dir_lock(source_dir),
         ):
-          await install.clear_pending_conflict_update(db, app)
+          await pending_update.clear_pending_conflict_update(db, app)
       raise
 
   reapplied = result.app

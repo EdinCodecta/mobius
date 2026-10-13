@@ -26,7 +26,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from app import app_apply, app_git, install, models, transcript_rows
+from app import app_apply, app_cron, app_git, install, models, pending_update, transcript_rows
 from app.config import get_settings
 from test_app_fixtures import create_local_app
 from tests.cancel_helpers import assert_cancellation_drains_worker_under_lock
@@ -820,7 +820,7 @@ def test_crontab_without_app_is_prefix_safe_and_preserves_header():
   )
 
   # Removing "news" keeps the PATH header AND every news-2 line.
-  out = install._crontab_without_app(crontab, Path("/data/apps/news"))
+  out = app_cron.crontab_without_app(crontab, Path("/data/apps/news"))
   assert out is not None
   assert "/data/apps/news/fetch.sh" not in out
   assert "/data/apps/news/sync-cron.sh" not in out
@@ -828,7 +828,7 @@ def test_crontab_without_app_is_prefix_safe_and_preserves_header():
   assert "PATH=/usr/local/bin:/usr/bin:/bin" in out   # header preserved
 
   # Removing "news-2" leaves both news lines untouched.
-  out2 = install._crontab_without_app(crontab, Path("/data/apps/news-2"))
+  out2 = app_cron.crontab_without_app(crontab, Path("/data/apps/news-2"))
   assert out2 is not None
   assert "/data/apps/news-2/fetch.sh" not in out2
   assert "/data/apps/news/fetch.sh 12" in out2
@@ -839,17 +839,17 @@ def test_crontab_without_app_is_prefix_safe_and_preserves_header():
     "0 9 * * * /data/apps/news/fetch.sh 12\n"
     "0 6 * * * /data/apps/agg/run.sh --feed /data/apps/news/headlines\n"
   )
-  out3 = install._crontab_without_app(with_argref, Path("/data/apps/news"))
+  out3 = app_cron.crontab_without_app(with_argref, Path("/data/apps/news"))
   assert out3 is not None
   assert "/data/apps/news/fetch.sh" not in out3
   assert "/data/apps/agg/run.sh --feed /data/apps/news/headlines" in out3
 
   # No matching entry → None (caller skips the rewrite entirely).
-  assert install._crontab_without_app(crontab, Path("/data/apps/ghost")) is None
+  assert app_cron.crontab_without_app(crontab, Path("/data/apps/ghost")) is None
 
   # Removing the only entries yields an empty crontab (not None).
   single = "0 9 * * * /data/apps/solo/job.sh\n"
-  assert install._crontab_without_app(single, Path("/data/apps/solo")) == ""
+  assert app_cron.crontab_without_app(single, Path("/data/apps/solo")) == ""
 
   # Edge shapes: @shorthand schedules + inline VAR=val command prefixes are
   # cleaned; comments + env lines that merely contain the path are kept.
@@ -860,7 +860,7 @@ def test_crontab_without_app_is_prefix_safe_and_preserves_header():
     "0 6 * * * TZ=UTC /data/apps/news/fetch.sh\n"
     "@reboot /data/apps/other/boot.sh\n"
   )
-  out4 = install._crontab_without_app(edge, Path("/data/apps/news"))
+  out4 = app_cron.crontab_without_app(edge, Path("/data/apps/news"))
   assert out4 is not None
   assert "@daily /data/apps/news/fetch.sh" not in out4        # shorthand dropped
   assert "TZ=UTC /data/apps/news/fetch.sh" not in out4        # env-prefixed dropped
@@ -4260,7 +4260,7 @@ def test_clean_store_install_clears_pending_receipt_and_resolver_binding(
   opened = client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth)
   assert opened.status_code == 200, opened.text
   assert install.pending_update_receipt_file(app_dir).exists()
-  drop_worktree = install._drop_pending_update_worktree
+  drop_worktree = pending_update._drop_pending_update_worktree
 
   def cleanup_under_source_lock(source_dir):
     # This callback runs in the cleanup worker, after install released its
@@ -4268,7 +4268,7 @@ def test_clean_store_install_clears_pending_receipt_and_resolver_binding(
     assert fs_locks.source_dir_lock(str(source_dir)).locked()
     drop_worktree(source_dir)
 
-  monkeypatch.setattr(install, "_drop_pending_update_worktree", cleanup_under_source_lock)
+  monkeypatch.setattr(pending_update, "_drop_pending_update_worktree", cleanup_under_source_lock)
   # A later Store release agrees with the owner's local title, so a normal
   # install supersedes the blocked update without using resolve-update.
   updated = _update_v2(
@@ -4305,7 +4305,7 @@ def test_successful_install_is_not_failed_by_pending_cleanup(
       with patch.object(db, "commit", side_effect=SQLAlchemyError("cleanup commit failed")):
         await clear_pending(db, app)
     else:
-      with patch.object(install, "_drop_pending_update_worktree", side_effect=OSError("cleanup failed")):
+      with patch.object(pending_update, "_drop_pending_update_worktree", side_effect=OSError("cleanup failed")):
         await clear_pending(db, app)
 
   monkeypatch.setattr(install, "clear_pending_conflict_update", fail_cleanup)
@@ -4675,7 +4675,7 @@ def test_cancelled_pending_cleanup_drains_worktree_removal_before_releasing_sour
       await install.clear_pending_conflict_update(db, app)
 
   assert_cancellation_drains_worker_under_lock(
-    _source_lock(repo), cleanup, monkeypatch, install, "_drop_pending_update_worktree",
+    _source_lock(repo), cleanup, monkeypatch, pending_update, "_drop_pending_update_worktree",
   )
   assert not receipt_file.exists()
   assert app.conflict_resolver_upstream_commit is None
@@ -4686,8 +4686,8 @@ def test_incomplete_history_tells_the_owner_why(tmp_path, monkeypatch):
   from app.routes import apps as routes
 
   monkeypatch.setattr(routes.app_git, "merge_in_progress", lambda repo: False)
-  monkeypatch.setattr(install, "pending_update_resolved", lambda *args: False)
-  monkeypatch.setattr(install, "pending_update_worktree", lambda repo: tmp_path / "none")
+  monkeypatch.setattr(pending_update, "pending_update_resolved", lambda *args: False)
+  monkeypatch.setattr(pending_update, "pending_update_worktree", lambda repo: tmp_path / "none")
 
   def hidden_base(repo):
     raise app_git.HistoryIncomplete(

@@ -5025,10 +5025,10 @@ def test_adopt_clone_undo_restores_the_staged_checkout(tmp_path):
 
 
 def test_boot_sweep_removes_unfinished_transfers(tmp_path, monkeypatch):
-  from app import install, startup
+  from app import git_transfers, startup
 
-  monkeypatch.setattr(install, "get_settings", lambda: type("S", (), {"data_dir": str(tmp_path)})())
-  root = install.git_transfer_root()
+  monkeypatch.setattr(git_transfers, "get_settings", lambda: type("S", (), {"data_dir": str(tmp_path)})())
+  root = git_transfers.git_transfer_root()
   assert root == tmp_path / "apps" / ".git-transfers"
   from app import source_dirs
   # Staging can never be claimed as an app's source, which the sweep would delete.

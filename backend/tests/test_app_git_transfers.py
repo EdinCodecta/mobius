@@ -24,7 +24,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from app import app_git, fs_locks, install, models
+from app import app_git, fs_locks, git_transfers, install, models
 from app.config import get_settings
 from tests.test_apps_install import (  # noqa: F401 - fixture
   JSX, _fake_async_client, _fixture_commit, bypass_url_validation,
@@ -725,7 +725,7 @@ def test_cancelled_import_keeps_the_source_lock_until_it_finishes(
     while fs_locks.source_dir_lock(str(repo)).locked() and time.monotonic() < deadline:
       await asyncio.sleep(0.05)
     assert not fs_locks.source_dir_lock(str(repo)).locked()
-    while install._FETCHES and time.monotonic() < deadline:
+    while git_transfers._FETCHES and time.monotonic() < deadline:
       await asyncio.sleep(0.05)
 
   asyncio.run(scenario())
@@ -832,7 +832,7 @@ def test_concurrent_fetches_share_one_transfer(
 
   assert asyncio.run(scenario()) == [head, head]
   assert len(transfers) == count + 1
-  assert not install._FETCHES
+  assert not git_transfers._FETCHES
   assert _no_leftovers()
 
 
@@ -886,7 +886,7 @@ def test_transfers_run_on_their_own_bounded_pool(
   monkeypatch.setattr(app_git, "_transfer", recorded)
   asyncio.run(install.fetch_app_commit(_repo("pooled"), "main"))
   assert threads and all(name.startswith("git-transfer") for name in threads)
-  assert install._TRANSFER_EXECUTOR._max_workers == install._GIT_TRANSFER_WORKERS
+  assert git_transfers._TRANSFER_EXECUTOR._max_workers == git_transfers._GIT_TRANSFER_WORKERS
 
 
 def test_history_falls_back_to_the_origin_branch(

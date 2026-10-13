@@ -53,6 +53,7 @@ from app import (
   fs_locks,
   github_auth,
   models,
+  pending_update,
   providers,
   settled,
   transcript_rows,
@@ -5477,14 +5478,14 @@ async def connect_published_app(
       # leaves the served source alone. Its private receipt is therefore the
       # package-level proof for a lost-response retry; accept it only when all
       # fetched candidate inputs still match this exact reviewed merge.
-      pending_conflict = install.read_pending_conflict_update_receipt(
+      pending_conflict = pending_update.read_pending_conflict_update_receipt(
         current.source_dir,
         app_id=current.id,
         upstream_commit=current.upstream_commit,
       )
       if (
         pending_conflict is None
-        and install.pending_conflict_update_receipt_present(current.source_dir)
+        and pending_update.pending_conflict_update_receipt_present(current.source_dir)
       ):
         raise HTTPException(
           409,

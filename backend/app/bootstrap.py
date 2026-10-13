@@ -32,9 +32,8 @@ from sqlalchemy.orm import Session
 from app import app_git, fs_locks, models
 from app.broadcast import get_system_broadcast
 from app.manifest_identity import canonical_manifest_identity_key
-from app.install import (
-  discard_staged, install_from_manifest, prepare_package, transient_failure,
-)
+from app.git_transfers import discard_staged
+from app.install import install_from_manifest, prepare_package, transient_failure
 from app.timeutil import now_naive_utc
 
 log = logging.getLogger("mobius.bootstrap")
