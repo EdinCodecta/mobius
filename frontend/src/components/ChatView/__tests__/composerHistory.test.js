@@ -71,6 +71,18 @@ test('history contains only visible owner-authored text, keyed by message cid', 
   ])
 })
 
+test('an added side question is context, so ↑ never offers it to resend', () => {
+  assert.deepEqual(composerHistoryFromMessages([
+    { role: 'user', content: 'first' },
+    {
+      role: 'user',
+      kind: 'side_question',
+      content: 'Side question: what do the tests cover?\n\nAnswer (from a temporary copy of this chat): Saving and moving cards.',
+      side_question: { question: 'what do the tests cover?', answer: 'Saving and moving cards.' },
+    },
+  ]), [sent('sent-0', 'first')])
+})
+
 test('queued messages join the newest end, except rejected rows and rows that already started', () => {
   const queuedRows = composerQueuedEntries([
     { cid: 'q1', content: 'Then check the dark theme' },

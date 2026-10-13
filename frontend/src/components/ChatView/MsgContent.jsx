@@ -20,7 +20,8 @@ import SecureInputCard from './SecureInputCard.jsx'
 import Attachments from './Attachments.jsx'
 import CompactionCard from './CompactionCard.jsx'
 import ContinuationCard from './ContinuationCard.jsx'
-import { isContinuationMessage } from './chatRuntimeState.js'
+import SideQuestionNote from './SideQuestionNote.jsx'
+import { isContinuationMessage, isSideQuestionMessage } from './chatRuntimeState.js'
 import { questionKey } from './questionKey.js'
 import {
   legacyRestartActivityOwners,
@@ -244,6 +245,10 @@ function MsgContentInner({
 
   if (isContinuationMessage(msg)) {
     return <ContinuationCard msg={msg} />
+  }
+
+  if (isSideQuestionMessage(msg)) {
+    return <SideQuestionNote msg={msg} />
   }
 
   if (msg.blocks?.length || positionedNotes?.length) {
