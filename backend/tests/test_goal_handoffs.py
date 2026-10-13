@@ -101,7 +101,8 @@ def test_claim_dependency_is_exact_goal_handoff_and_blocks_settlement(db, chat, 
   from app import goal_dependencies
   first, goal_a = _run(db, chat, "dependency-first", "dependency-a")
   second, goal_b = _run(db, chat, "dependency-second", "dependency-b")
-  def projection(_db, goal):
+  def projection(_db, goal, *, include_foreign_context):
+    assert include_foreign_context is True
     return [{"id": "follow-a", "target_kind": "claim_acquisition", "condition": "Host repair",
       "source_chat_id": "source-chat", "source_chat_title": "Watch platform update",
       "automatic": True, "delivery_pending": False, "resume_blocker": None, "outcome": None}] if goal.id == goal_a.id else []
@@ -117,11 +118,14 @@ def test_claim_dependency_is_exact_goal_handoff_and_blocks_settlement(db, chat, 
 def test_lost_claim_source_is_recovery_not_healthy_handoff(db, chat, monkeypatch):
   from app import goal_dependencies
   run, goal = _run(db, chat, "dependency-lost", "dependency-lost-goal")
-  monkeypatch.setattr(goal_dependencies, "goal_dependency_handoffs", lambda *_: [{
-    "id": "lost", "target_kind": "claim_acquisition", "condition": "Host repair",
-    "source_chat_id": None, "source_chat_title": None, "automatic": False,
-    "delivery_pending": False, "resume_blocker": "source_missing", "outcome": None,
-  }])
+  def projection(_db, _goal, *, include_foreign_context):
+    assert include_foreign_context is True
+    return [{
+      "id": "lost", "target_kind": "claim_acquisition", "condition": "Host repair",
+      "source_chat_id": None, "source_chat_title": None, "automatic": False,
+      "delivery_pending": False, "resume_blocker": "source_missing", "outcome": None,
+    }]
+  monkeypatch.setattr(goal_dependencies, "goal_dependency_handoffs", projection)
   assert not goal_handoffs(db, goal).prevents_settlement
   assert _goal_handoff(db, run, goal) == {"kind": "recovery", "reason": "dependency_source"}
 
@@ -133,7 +137,10 @@ def test_owed_claim_result_remains_a_handoff_until_receipt(db, chat, monkeypatch
     "source_chat_id": "source", "source_chat_title": "Watch platform update",
     "automatic": True, "delivery_pending": True, "resume_blocker": None,
     "outcome": {"kind": "completed"}}
-  monkeypatch.setattr(goal_dependencies, "goal_dependency_handoffs", lambda *_: [row])
+  def projection(_db, _goal, *, include_foreign_context):
+    assert include_foreign_context is True
+    return [row]
+  monkeypatch.setattr(goal_dependencies, "goal_dependency_handoffs", projection)
   assert goal_handoffs(db, goal).prevents_settlement
   assert _goal_handoff(db, run, goal) == {"kind": "automatic", "reason": "dependency"}
   row["delivery_pending"] = False

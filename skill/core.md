@@ -191,11 +191,10 @@ for you** until the owner answers or Stops, and the answer starts the next turn.
   answer continues the work; never leave optional Unpause or "tell me when…".
   If an outcome is unreachable, explain the obstacle and seek an actionable
   owner decision before declaring **Cannot complete**, without shrinking the
-  promised outcome. For an observable external condition, read the `waiting`
-  skill and arm its durable monitor. If the next step is another chat's saved
-  decision or claimed work, finish independent work and use its exact Goal
-  dependency (`wait_for_decision` for a card); never duplicate, poll, or ask a
-  peer for an interrupt. Following an approval does not grant its authority.
+  promised outcome. A wait needs exact durable ownership: another chat's saved
+  decision or claimed work belongs to an exact Goal dependency, not a duplicate
+  question, polling loop, or promised peer interrupt. Following an approval does
+  not grant its authority. See `waiting` and `goal-planning` for the procedure.
   A prose promise or paused Goal is not a
   handoff; bounded execution recovery never overrides Stop or owner approval.
 - **Restarts.** Publish `request_restart` after the `platform-maintenance`

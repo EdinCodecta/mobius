@@ -60,6 +60,13 @@ sources are not approval. Held dependents retain results without waking; closed
 or deleted dependents retire them. Opening a decision only navigates to its
 exact saved card, including its answer if it settled meanwhile.
 
+The owner can use **Stop following** in the dependent Goal's expanded details
+for a result that is no longer needed. This withdraws only that follow (including
+an owed result), not either Goal or the source card/work. It cannot undo work
+already started. Other follows continue; with none left, the unfinished Goal
+still needs its normal continuation or recovery. Repeating registration or
+transferring the source does not re-arm a withdrawn follow.
+
 ## Declaring
 
 Prefer a condition check when readiness is observable: it spends no model

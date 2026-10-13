@@ -1304,7 +1304,14 @@ without foreign-chat enrichment or navigation IDs (including nested outcomes).
 Settled dependencies use Waiting's clock and typed outcome in transcript history,
 anchored only to a visible segment of the exact receiving or declaring run.
 Retiring an unresolved subscription retains safe source identity without inventing
-a source result or receiving-run receipt. The bounded unfinished-settlement error
+a source result or receiving-run receipt. The owner can **Stop following** one
+pending or owed dependency in expanded Goal details. Its authenticated route
+submits `WithdrawGoalDependency`: the writer preserves any saved outcome, stamps
+`withdrawn`, removes only its queued notices and invalidates its unentered
+carrier. Already-entered work is not stopped, but cannot receipt that withdrawn
+edge. Source cards/claims, other follows and the open/held Goal are unchanged;
+with no handoff left, ordinary settlement or Resume remains accountable.
+Repeat registration and transfers never re-arm a withdrawn edge. The bounded unfinished-settlement error
 code remains durable, but reads as calm recovery with explicit Resume rather than
 an alarm; unrelated execution failures retain their failure presentation.
 
@@ -1464,7 +1471,8 @@ The ordinary Wait lifecycle remains:
 Deletion/restore timing for ordinary results is unchanged: restore before the
 supervisor observes deletion can retain an owed result. Goal-less waits also
 retain their existing Stop behavior. Neither is a new cross-chat dependency
-policy; dependencies join the shared handoff seam in a later slice.
+policy: dependencies share the handoff projection and exact-Goal receipt seam,
+but retain their own source-outcome and withdrawal lifecycle.
 
 History markers derive from durable wait rows, using exact receiving-run identity
 for new receipts and timestamps only for legacy or temporary anchors; no duplicate outcomes are written into chat messages.
