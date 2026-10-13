@@ -173,8 +173,10 @@ of the app's source, so it is reviewed, versioned and published with the code:
   each with concrete `alt` text (at most 300 bytes) and an optional `label`
   (at most 120 bytes).
 - Every listing image, the icon included, must be a real PNG, JPEG or WebP
-  file of at most 6 MB and 8192 px on its longest side; the file extension
-  alone does not count.
+  file of at most 6 MB, 8192 px on its longest side, and 32 million pixels in
+  all (so 8192x8192 is too large; 5000x5000 fits). The file extension alone
+  does not count. Images saved through the Store editor lose their EXIF,
+  location and text metadata; commit your own art without it too.
 - Screenshots must be truthful and private: capture the app's real UI in an
   empty, demo, or fixture state, never the owner's own records, names,
   accounts, chats, or machines. Build a small demo state if the app has none.

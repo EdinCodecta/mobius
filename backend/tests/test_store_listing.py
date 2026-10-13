@@ -35,6 +35,13 @@ class _HeldCall(BlockedWorker):
     return super().__call__(*args, **kwargs)
 
 
+def _content_name(content: bytes) -> str:
+  """The name the editor gives art holding ``content``."""
+  import hashlib
+
+  return hashlib.sha256(content).hexdigest()[:16]
+
+
 def _png(color=(40, 120, 200), size=(64, 40)) -> bytes:
   output = io.BytesIO()
   Image.new("RGB", size, color).save(output, format="PNG")
@@ -266,7 +273,8 @@ def test_committed_listing_only_changes_may_ride_along(client, auth):
   manifest["icon"] = "icon.png"
   (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
   (source / "static" / "store").mkdir(parents=True)
-  (source / "static" / "store" / "0123456789abcdef.png").write_bytes(_png((3, 3, 3)))
+  art = _png((3, 3, 3))
+  (source / "static" / "store" / f"{_content_name(art)}.png").write_bytes(art)
   (source / "icon.png").write_bytes(_png((4, 4, 4)))
   app_git._run(source, "add", "-A")
   app_git._run(source, "commit", "-qm", "listing files only")
@@ -354,6 +362,44 @@ def test_one_image_rule_for_readiness_preview_and_save(client, auth, db):
   ))
   assert refused.status_code == 422
   assert refused.json()["detail"]["code"] == "listing_image_invalid"
+  assert "Use a PNG, JPEG, or WebP" in refused.json()["detail"]["message"]
+
+
+def test_images_over_the_pixel_cap_are_refused_plainly():
+  from app import icon_assets
+  from app.community_publish import CommunityPublicationError, check_listing_image
+
+  raw = io.BytesIO()
+  Image.new("L", (8192, 8192)).save(raw, format="PNG")
+  with pytest.raises(CommunityPublicationError) as refused:
+    check_listing_image(raw.getvalue(), "banner image")
+
+  assert refused.value.code == "listing_image_too_large"
+  assert f"{icon_assets.MAX_IMAGE_PIXELS // 1_000_000} million pixels" in refused.value.detail
+
+
+def test_uploaded_photos_lose_their_location_and_camera_data(client, auth):
+  import hashlib
+
+  source = _source()
+  app_id = _create(client, auth, source)
+  exif = Image.Exif()
+  exif[0x010F] = "Camera maker"
+  exif[0x8825] = {1: "N", 2: (51.0, 30.0, 0.0), 3: "W", 4: (0.0, 7.0, 0.0)}
+  photo = io.BytesIO()
+  Image.new("RGB", (64, 40), (200, 120, 40)).save(photo, format="JPEG", exif=exif)
+  assert Image.open(io.BytesIO(photo.getvalue())).getexif().get_ifd(0x8825)
+
+  saved = _save(client, auth, app_id, **_complete_listing(
+    screenshots=[{"data_base64": _b64(photo.getvalue()), "alt": "A photo."}],
+  ))
+
+  assert saved.status_code == 200, saved.text
+  src = json.loads((source / "mobius.json").read_text())["store"]["screenshots"][0]["src"]
+  stored = (source / src).read_bytes()
+  assert not Image.open(io.BytesIO(stored)).getexif()
+  assert b"Camera maker" not in stored
+  assert Path(src).stem == hashlib.sha256(stored).hexdigest()[:16]
 
 
 @pytest.mark.parametrize("problem", ["no_entry", "bad_json", "secret"])
@@ -392,7 +438,8 @@ def test_a_save_interrupted_before_its_commit_recovers(client, auth):
   manifest["store"] = {"tagline": "Left behind."}
   (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
   (source / "static" / "store").mkdir(parents=True)
-  (source / "static" / "store" / "0123456789abcdef.png").write_bytes(_png((3, 3, 3)))
+  art = _png((3, 3, 3))
+  (source / "static" / "store" / f"{_content_name(art)}.png").write_bytes(art)
 
   saved = _save(client, auth, app_id, **_complete_listing())
 
@@ -458,6 +505,33 @@ def test_saving_needs_an_accepted_revision_to_tell_what_was_reviewed(client, aut
   row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
   row.source_commit = None
   db.commit()
+
+  refused = _save(client, auth, app_id, **_complete_listing())
+
+  assert refused.status_code == 409
+  assert refused.json()["detail"]["code"] == "source_has_draft"
+
+
+def test_a_save_interrupted_with_an_uppercase_png_icon_recovers(client, auth):
+  source = _source()
+  (source / "icon.png").rename(source / "icon.PNG")
+  manifest = json.loads(_MANIFEST)
+  manifest["icon"] = "icon.PNG"
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  app_id = _create(client, auth, source)
+  # What an interrupted save leaves: the new icon written, not yet accepted.
+  (source / "icon.PNG").write_bytes(_png((1, 99, 1), (64, 64)))
+
+  saved = _save(client, auth, app_id, **_complete_listing())
+
+  assert saved.status_code == 200, saved.text
+
+
+def test_editor_named_art_must_hold_the_bytes_its_name_hashes(client, auth):
+  source = _source()
+  app_id = _create(client, auth, source)
+  (source / "static" / "store").mkdir(parents=True)
+  (source / "static" / "store" / "0123456789abcdef.png").write_bytes(_png((3, 3, 3)))
 
   refused = _save(client, auth, app_id, **_complete_listing())
 
@@ -819,7 +893,7 @@ def test_only_editor_art_and_the_declared_icon_ride_along_unreviewed(tmp_path):
   art = root / "static" / "store"
   art.mkdir(parents=True)
 
-  (art / "0123456789abcdef.png").write_bytes(b"png")
+  (art / f"{_content_name(b'png')}.png").write_bytes(b"png")
   assert store_listing_source.has_unapplied_changes(root, accepted) is False
 
   (art / "loader.js").write_text("alert(1)")

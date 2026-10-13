@@ -13,7 +13,7 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from app import app_git, icon_assets, models
 from app.config import get_settings
@@ -422,26 +422,37 @@ def check_listing_image(content: bytes, what: str) -> str:
       f"{STORE_LISTING_IMAGE_MAX_BYTES // (1024 * 1024)} MB.",
       "listing_image_too_large", 422,
     )
-  # Opening reads only the header, and the pixel limit below sits under
-  # Pillow's decompression-bomb threshold, so no image is ever decoded here.
+  # Only the header is read: the pixel cap is checked before any decoding,
+  # against the same process-wide limit icon_assets sets for Pillow.
+  too_many_pixels = CommunityPublicationError(
+    f"The {what} has more than {icon_assets.MAX_IMAGE_PIXELS // 1_000_000} "
+    "million pixels. Use a smaller image.",
+    "listing_image_too_large", 422,
+  )
   try:
-    image = Image.open(io.BytesIO(content), formats=["PNG", "JPEG", "WEBP"])
+    image = Image.open(io.BytesIO(content), formats=list(_LISTING_IMAGE_SUFFIXES))
     width, height = image.size
+    if width * height > icon_assets.MAX_IMAGE_PIXELS:
+      raise too_many_pixels
     image.verify()
+  except CommunityPublicationError:
+    raise
+  except Image.DecompressionBombError as exc:
+    raise too_many_pixels from exc
+  except UnidentifiedImageError as exc:
+    raise CommunityPublicationError(
+      f"Use a PNG, JPEG, or WebP file for the {what}.", "listing_image_invalid", 422,
+    ) from exc
   except Exception as exc:
     raise CommunityPublicationError(
       f"The {what} is not a readable image.", "listing_image_invalid", 422,
     ) from exc
-  suffix = _LISTING_IMAGE_SUFFIXES.get(str(image.format or ""))
-  if suffix is None:
-    raise CommunityPublicationError(
-      f"Use a PNG, JPEG, or WebP file for the {what}.", "listing_image_invalid", 422,
-    )
   if max(width, height) > LISTING_IMAGE_MAX_DIMENSION:
     raise CommunityPublicationError(
       f"The {what} is larger than {LISTING_IMAGE_MAX_DIMENSION} pixels.",
       "listing_image_too_large", 422,
     )
+  suffix = _LISTING_IMAGE_SUFFIXES[str(image.format)]
   return suffix
 
 

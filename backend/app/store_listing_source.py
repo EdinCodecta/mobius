@@ -11,10 +11,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import io
 import json
 from pathlib import Path, PurePosixPath
 import re
 from typing import Callable
+
+from PIL import Image, ImageOps
 
 from app import app_git, icon_assets, models, workspace_files
 from app.community_publish import (
@@ -121,6 +124,15 @@ def _manifest_from(raw: bytes | None) -> dict | None:
   return manifest if isinstance(manifest, dict) else None
 
 
+def _named_by_content(root: Path, rel: str) -> bool:
+  """Whether editor art at ``rel`` is absent or holds the bytes its name hashes."""
+  target = root / rel
+  if not target.is_file():
+    return True
+  digest = hashlib.sha256(target.read_bytes()).hexdigest()[:16]
+  return PurePosixPath(rel).stem == digest
+
+
 def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
   """Whether the source differs from its accepted revision beyond a listing.
 
@@ -149,10 +161,11 @@ def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
   # ride along unreviewed.
   icons = {
     str(manifest.get("icon") or "") for manifest in manifests
-    if manifest is not None and str(manifest.get("icon") or "").endswith(".png")
+    if manifest is not None
+    and str(manifest.get("icon") or "").lower().endswith(".png")
   }
   for path in changed:
-    if _EDITOR_ART.fullmatch(path) or path in icons:
+    if path in icons or (_EDITOR_ART.fullmatch(path) and _named_by_content(root, path)):
       continue
     if path == "mobius.json" and None not in manifests and (
       _listing_fields_removed(manifests[0]) == _listing_fields_removed(manifests[1])
@@ -247,12 +260,79 @@ def _image_suffix(content: bytes, what: str) -> str:
     raise ListingEditError(exc.code, exc.detail, exc.status_code) from exc
 
 
+_PNG_PRIVATE_CHUNKS = {b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"tIME"}
+_WEBP_PRIVATE_CHUNKS = {b"EXIF", b"XMP "}
+_EXIF_ORIENTATION = 0x0112
+
+
+def _without_png_metadata(content: bytes) -> bytes:
+  out, at = [content[:8]], 8
+  while at + 12 <= len(content):
+    length = int.from_bytes(content[at:at + 4], "big")
+    end = at + 12 + length
+    if content[at + 4:at + 8] not in _PNG_PRIVATE_CHUNKS:
+      out.append(content[at:end])
+    at = end
+  return b"".join(out)
+
+
+def _without_webp_metadata(content: bytes) -> bytes:
+  chunks, at = [], 12
+  while at + 8 <= len(content):
+    kind = content[at:at + 4]
+    size = int.from_bytes(content[at + 4:at + 8], "little")
+    end = at + 8 + size + (size & 1)
+    chunk = content[at:end]
+    if kind == b"VP8X":
+      # Clear the EXIF and XMP presence flags along with their chunks.
+      chunk = chunk[:8] + bytes([chunk[8] & ~0x0C]) + chunk[9:]
+    if kind not in _WEBP_PRIVATE_CHUNKS:
+      chunks.append(chunk)
+    at = end
+  body = b"WEBP" + b"".join(chunks)
+  return b"RIFF" + len(body).to_bytes(4, "little") + body
+
+
+def _without_metadata(content: bytes) -> bytes:
+  """The image without camera, location, or text metadata, as it looks.
+
+  PNG and WebP drop their metadata chunks losslessly. JPEG has no such clean
+  split (EXIF can carry thumbnails and trailing images), so it is re-encoded
+  with its own quantization tables, which keeps its quality. An image that
+  relies on EXIF orientation is turned upright first, since that tag goes.
+  """
+  with Image.open(io.BytesIO(content)) as image:
+    orientation = image.getexif().get(_EXIF_ORIENTATION, 1)
+    image_format = image.format
+    if orientation == 1 and image_format == "PNG":
+      return _without_png_metadata(content)
+    if orientation == 1 and image_format == "WEBP":
+      return _without_webp_metadata(content)
+    icc = image.info.get("icc_profile")
+    output = io.BytesIO()
+    options = {"icc_profile": icc} if icc else {}
+    if orientation == 1:
+      image.save(
+        output, format="JPEG", quality="keep", subsampling="keep",
+        progressive=bool(image.info.get("progressive")), **options,
+      )
+    else:
+      upright = ImageOps.exif_transpose(image)
+      if image_format == "JPEG":
+        options.update(quality=95)
+      elif image_format == "WEBP":
+        options.update(quality=95, lossless=bool(image.info.get("lossless")))
+      upright.save(output, format=image_format, **options)
+  return output.getvalue()
+
+
 def _place_art(
   root: Path, app: models.App, changes: _SourceChanges, image: ListingImage, what: str,
 ) -> str:
   """Return the ``static/store/`` path holding this image, writing it if new.
 
-  New art is content-addressed, so re-saving the same bytes is a no-op and
+  New art is stripped of metadata and content-addressed, so re-saving the
+  same upload is a no-op and
   reordering screenshots never overwrites another one. A kept file outside
   ``static/store/`` (an older listing layout) is copied into it.
   """
@@ -261,6 +341,10 @@ def _place_art(
   if image.data is None and image.path.startswith(f"{STORE_ART_DIR}/"):
     rel = image.path
   else:
+    # New art becomes public, so it never carries camera or location data;
+    # its name hashes the bytes actually stored.
+    content = _without_metadata(content)
+    suffix = _image_suffix(content, what)
     rel = f"{STORE_ART_DIR}/{hashlib.sha256(content).hexdigest()[:16]}{suffix}"
   target = _source_path(root, rel)
   if not (target.is_file() and target.read_bytes() == content):
