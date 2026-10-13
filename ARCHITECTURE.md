@@ -1253,9 +1253,11 @@ per Goal, independent of the eight-Wait cap. Longer cycles are not forbidden by
 admission; a detected chain of stalled sources is recovery, not promised progress.
 Graph mutation holds the tenant fence and refreshes acquisition ownership before
 checking any edge, including an existing follow. A former follower becoming the
-executor is suppressed, not withdrawn: a valid round-trip transfer can restore
+executor is suppressed by exact Goal, not by chat and not withdrawn: other
+Goals in that chat remain subscribed. A valid round-trip transfer can restore
 its pending follow after quota and cycle checks. Withdrawn or settled rows never
-revive this way.
+revive this way. Same-chat Goal ownership rebinds use this same transition,
+so changing physical executors cannot strand a previously suppressed Goal.
 
 `goal_dependency_sources` owns registration and immutable source outcomes. Finish,
 release, Goal hold/end and chat deletion stamp subscribed outcomes in the same
@@ -1273,12 +1275,12 @@ Goals retain results without reopening; terminal Goals retire them; dependent
 chat deletion withdraws them even if the chat is restored. Exhausted/ambiguous
 carriers surface manual recovery; there is no unlimited retry or new runner.
 
-Migrations 0090–0092 retain `AgentWorkInterest` as historical storage and backfill
-only provable live acquisitions. The append-only 0092 correction keeps pending
-legacy follows only with exact source-Goal running/card evidence; uncertain
-historical handoffs remain in the old table for manual reconciliation, rather
-than becoming newly owed failure wakes. Ambiguous, dismissed and unsafe old links
-are not adopted into the newest Goal, and resolved history never wakes old work.
+Migration 0090 creates the dependency schema and claim acquisition identities.
+It performs **no legacy interest backfill**, even for apparently running sources
+or saved cards. A persisted running marker is not proof of a live executor after
+startup recovery. Every `AgentWorkInterest` stays unchanged in the old table as
+non-waking audit history; only a new follow creates a `GoalDependency`. This
+avoids inventing acquisition identity, receipt or wake authority for old work.
 Runtime follows no longer read/write that table. At cutover, only proven terminal
 claim-notice reservations are retired without acknowledging their peer cursor;
 ordinary peer interrupts, transfer revocations and ambiguous historical messages

@@ -100,8 +100,6 @@
     "0088_chat_compaction_drafts": "19c32b7c6cb3a5b7e3892b84c636ca3f1b8f6d292feda19befb821b72ace037e",
     "0086_goal_execution_identity": "8cfac7d944e80b08f47d21d393401ac5211ed3560e196b4ef14d0efd04e1ea2e",
     "0089_wait_result_receipts": "a2ab3b4fb8dde477ac70a239b0ff63719d0470ab3cbe84b3a3fbc85b2042ffe4",
-    "0090_goal_dependencies": "6870f8a333e1e3cedb4065bac22b621ad574fc6cac903d2dcbd76c1a9d7f1b0e",
-    "0091_repair_legacy_goal_dependency_classification": "f5269b414af0d67a3b1dc42109668d4bbbee43416f9966be4f808c98d1e30e93",
-    "0092_narrow_legacy_dependency_wakes_and_add_owner_suppression": "23486091385dd42c79d3d3de6c3eb837fe187d4de2bd751c846f14e62ca75adb"
+    "0090_goal_dependencies": "48515ad996c5ff79b49fcce765afd2bd312e1f5c94350b309924927e625ea5ab"
   }
 }

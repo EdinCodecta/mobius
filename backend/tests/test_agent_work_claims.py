@@ -832,7 +832,7 @@ def test_same_chat_goal_ownership_refresh_cannot_create_a_direct_cycle(db):
   claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=other_key, summary="Second action")
   claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY, summary="Follow original")
   claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="same-chat-new-run", work_key=other_key, summary="Follow second")
-  with pytest.raises(ValueError, match="refresh would create a direct Goal dependency cycle"):
+  with pytest.raises(ValueError, match="direct Goal dependency cycle"):
     claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="same-chat-new-run", work_key=KEY, summary="Refresh under new Goal")
   assert _claim_row(db).owner_goal_id == "claim-goal-first"
 
@@ -882,7 +882,9 @@ def test_follow_rechecks_rebound_ownership_after_graph_fence(db, monkeypatch):
   monkeypatch.setattr(agent_work_claims, "_follow", rebind_between_read_and_fence)
   result = claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY, summary="B follows X")
   assert result["follow_status"] == "direct_cycle"
-  assert db.query(models.GoalDependency).count() == 1
+  assert {dep.waiting_goal_id for dep in db.query(models.GoalDependency)} == {
+    "a2", "claim-goal-first",  # The former exact owner now follows A2.
+  }
   assert _claim_row(db).owner_goal_id == "a2"
 
 
@@ -1037,3 +1039,125 @@ def test_source_progress_shares_legacy_helper_exact_root_rules(db, monkeypatch, 
   assert get_writer().submit(ReconcileClaimSources()).result(timeout=5) == (0 if exact_root else 1)
   db.expire_all()
   assert (db.query(models.GoalDependency).one().resolved_at is None) == exact_root
+
+
+def _next_shared_chat_attempt(db, chat, goal_id, run_id):
+  """One physical executor at a time, with distinct durable Goals in this chat."""
+  db.query(models.ChatRun).filter(models.ChatRun.chat_id == chat.id).update(
+    {models.ChatRun.status: "completed"}, synchronize_session=False)
+  if db.get(models.ChatGoal, goal_id) is None:
+    db.add(models.ChatGoal(id=goal_id, chat_id=chat.id, objective=goal_id))
+  run = models.ChatRun(id=run_id, chat_id=chat.id, goal_id=goal_id,
+    root_run_id=run_id, status="running", provider="codex")
+  db.add(run)
+  db.commit()
+  return run
+
+
+@pytest.mark.parametrize("transfer_out", [False, True])
+@pytest.mark.parametrize("release", [False, True])
+def test_transfer_only_suppresses_executing_goal_not_its_chats_other_followers(
+    db, monkeypatch, transfer_out, release):
+  import asyncio
+  from app import chat as chat_mod, goal_dependencies as deps
+  from app.chat_handoffs import goal_handoffs
+  from app.chat_writer import AdmitProviderExecution, AcknowledgeProviderSuccess, get_writer
+  owner, first, second = _owned_goal_claim(db)
+  acquisition = _claim_row(db).acquisition_id
+  b2 = _next_shared_chat_attempt(db, second, "second-independent-goal", "b2-follow")
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id=b2.id,
+    work_key=KEY, summary="B2 follows separately")
+  b1 = _next_shared_chat_attempt(db, second, "claim-goal-second", "b1-takeover")
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id=b1.id, work_key=KEY,
+    summary="B1 executes", expected_owner_chat_id=first.id,
+    takeover_reason="B1 accepts ownership of this exact action")
+  db.expire_all()
+  b2_dep = db.query(models.GoalDependency).filter_by(waiting_goal_id=b2.goal_id).one()
+  assert b2_dep.owner_suppressed_at is None and b2_dep.withdrawn_at is None
+  assert goal_handoffs(db, db.get(models.ChatGoal, b2.goal_id)).prevents_settlement
+  assert db.query(models.GoalDependency).filter_by(
+    waiting_goal_id=b1.goal_id).one().owner_suppressed_at is not None
+  source = second
+  if transfer_out:
+    source = _third_executor(db)
+    claim_work(db, owner_id=owner.id, chat_id=source.id, run_id="claim-run-third",
+      work_key=KEY, summary="C executes", expected_owner_chat_id=second.id,
+      takeover_reason="C accepts ownership of this exact action")
+  finish_work(db, owner_id=owner.id, chat_id=source.id, work_key=KEY,
+    outcome="Exact acquisition settled", release=release)
+  db.expire_all()
+  assert b2_dep.target_acquisition_id == acquisition
+  assert b2_dep.outcome_json["kind"] == ("released" if release else "completed")
+  assert b2_dep.outcome_json["source_chat_id"] == source.id
+  assert b2_dep.received_run_id is None
+  # Close only physical attempts; both independent Goals remain open. Verify
+  # that the preserved subscription really reaches B2, not the latest B1 Goal.
+  db.query(models.ChatRun).filter(models.ChatRun.chat_id == second.id).update(
+    {models.ChatRun.status: "completed"}, synchronize_session=False)
+  db.commit()
+  scheduled = []
+  monkeypatch.setattr(chat_mod, "_schedule_continuation", lambda **kw: scheduled.append(kw))
+  assert asyncio.run(deps.deliver_dependency(b2_dep.id))
+  db.expire_all()
+  receiving = db.get(models.ChatRun, "dependency-resume-" + b2_dep.id)
+  assert receiving.goal_id == b2.goal_id and len(scheduled) == 1
+  writer = get_writer()
+  writer.submit(AdmitProviderExecution(chat_id=second.id, run_token=receiving.id,
+    dependency_results=(b2_dep.id,))).result(timeout=5)
+  writer.submit(AcknowledgeProviderSuccess(chat_id=second.id, run_token=receiving.id,
+    dependency_results=(b2_dep.id,))).result(timeout=5)
+  db.expire_all()
+  assert b2_dep.received_run_id == receiving.id
+  assert not asyncio.run(deps.deliver_dependency(b2_dep.id))
+
+
+def test_transfer_checks_reverse_edges_from_other_goals_in_acquiring_chat(db):
+  owner, first, second = _fixture(db)
+  third = _third_executor(db)
+  other_key = "platform:other-shared-chat-action"
+  claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first",
+    work_key=KEY, summary="X")
+  claim_work(db, owner_id=owner.id, chat_id=third.id, run_id="claim-run-third",
+    work_key=other_key, summary="Y")
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second",
+    work_key=other_key, summary="B1 follows Y")
+  b2 = _next_shared_chat_attempt(db, second, "b2-cycle-goal", "b2-cycle-run")
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id=b2.id,
+    work_key=KEY, summary="B2 follows X")
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id=b2.id, work_key=other_key,
+    summary="B2 takes Y", expected_owner_chat_id=third.id,
+    takeover_reason="B2 accepts this exact action")
+  b1 = _next_shared_chat_attempt(db, second, "claim-goal-second", "b1-cycle-run")
+  with pytest.raises(ValueError, match="direct Goal dependency cycle"):
+    claim_work(db, owner_id=owner.id, chat_id=second.id, run_id=b1.id, work_key=KEY,
+      summary="B1 takes X", expected_owner_chat_id=first.id,
+      takeover_reason="B1 accepts this exact action")
+  assert _claim_row(db).owner_chat_id == first.id
+  assert db.query(models.GoalDependency).filter_by(waiting_goal_id=b2.goal_id,
+    target_claim_id=_claim_row(db).id).one().owner_suppressed_at is None
+
+
+def test_same_chat_goal_rebind_moves_only_exact_executor_suppression(db):
+  owner, first, second = _owned_goal_claim(db)
+  b2 = _next_shared_chat_attempt(db, second, "b2-rebind-goal", "b2-rebind-follow")
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id=b2.id,
+    work_key=KEY, summary="B2 follows X")
+  b1 = _next_shared_chat_attempt(db, second, "claim-goal-second", "b1-rebind-take")
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id=b1.id, work_key=KEY,
+    summary="B1 takes X", expected_owner_chat_id=first.id,
+    takeover_reason="B1 accepts exact action ownership")
+  for goal, run_id, former in [(b2.goal_id, "b2-rebind-take", b1.goal_id),
+                                (b1.goal_id, "b1-rebind-return", b2.goal_id)]:
+    run = _next_shared_chat_attempt(db, second, goal, run_id)
+    claim_work(db, owner_id=owner.id, chat_id=second.id, run_id=run.id,
+      work_key=KEY, summary="The new exact Goal owns X")
+    db.expire_all()
+    assert db.query(models.GoalDependency).filter_by(
+      waiting_goal_id=goal).one().owner_suppressed_at is not None
+    assert db.query(models.GoalDependency).filter_by(
+      waiting_goal_id=former).one().owner_suppressed_at is None
+  finish_work(db, owner_id=owner.id, chat_id=second.id, work_key=KEY,
+    outcome="Completed in B1", release=False)
+  db.expire_all()
+  assert db.query(models.GoalDependency).filter_by(
+    waiting_goal_id=b2.goal_id).one().outcome_json["kind"] == "completed"

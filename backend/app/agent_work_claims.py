@@ -75,6 +75,59 @@ def _follow(db: Session, row: models.AgentWorkClaim, *, chat_id: str,
   return stage_follow_claim(db, row, chat_id=chat_id, run_id=run_id)
 
 
+def _stage_goal_owner_change(db: Session, row: models.AgentWorkClaim, *,
+                             previous: str, previous_run_id: str,
+                             previous_goal_id: str | None) -> str:
+  """Move executor responsibility, preserving every other exact Goal edge.
+
+  Caller holds the tenant graph fence and has staged the claim's new owner.
+  A same-chat Goal rebind is the same graph transition as a cross-chat transfer.
+  """
+  goal_id, chat_id = row.owner_goal_id, row.owner_chat_id
+  now = now_naive_utc()
+  # Existing subscribers change source owner too. Check every affected edge,
+  # not just the reverse link newly created for the former executor.
+  from app.goal_dependency_sources import _direct_cycle
+  if goal_id:
+    follower_goals = db.query(models.GoalDependency.waiting_goal_id).filter(
+      models.GoalDependency.target_acquisition_id == row.acquisition_id,
+      models.GoalDependency.waiting_goal_id != goal_id,
+      models.GoalDependency.resolved_at.is_(None),
+      models.GoalDependency.result_disposition.is_(None),
+      models.GoalDependency.withdrawn_at.is_(None),
+      models.GoalDependency.owner_suppressed_at.is_(None),
+    ).all()
+    if any(_direct_cycle(db, waiting_goal_id=follower_goal, source_goal_id=goal_id)
+           for (follower_goal,) in follower_goals):
+      db.rollback()
+      raise ValueError("Transfer would create a direct Goal dependency cycle.")
+  db.query(models.GoalDependency).filter(
+    models.GoalDependency.target_acquisition_id == row.acquisition_id,
+    models.GoalDependency.resolved_at.is_(None),
+    models.GoalDependency.result_disposition.is_(None),
+    models.GoalDependency.withdrawn_at.is_(None),
+    models.GoalDependency.owner_suppressed_at.is_(None),
+  ).update({models.GoalDependency.target_chat_id: chat_id}, synchronize_session=False)
+  # Only the acquiring Goal becomes executor. Other Goals in the same chat
+  # remain subscribed, even when the acquisition completes before transfer out.
+  db.query(models.GoalDependency).filter(
+    models.GoalDependency.target_acquisition_id == row.acquisition_id,
+    models.GoalDependency.waiting_goal_id == goal_id,
+    models.GoalDependency.resolved_at.is_(None),
+    models.GoalDependency.result_disposition.is_(None),
+    models.GoalDependency.withdrawn_at.is_(None),
+    models.GoalDependency.owner_suppressed_at.is_(None),
+  ).update({models.GoalDependency.owner_suppressed_at: now}, synchronize_session=False)
+  previous_follow_status = "no_open_top_level_goal"
+  if previous_goal_id and previous_goal_id != goal_id:
+    previous_follow_status = stage_follow_claim(db, row, chat_id=previous,
+      run_id=previous_run_id, waiting_goal_id=previous_goal_id, restore_owner_follow=True)
+    if previous_follow_status not in {"followed", "result_owed", "no_open_top_level_goal"}:
+      db.rollback()
+      raise ValueError("Transfer cannot preserve the former Goal's follow: " + previous_follow_status)
+  return previous_follow_status
+
+
 def claim_work(
   db: Session,
   *,
@@ -162,21 +215,8 @@ def claim_work(
     if row.owner_chat_id != chat_id:
       db.rollback()
       raise ValueError("The claim changed while refreshing; inspect it before retrying.")
-    if goal_id and goal_id != row.owner_goal_id:
-      from app.goal_dependency_sources import _direct_cycle
-      followers = db.query(models.GoalDependency.waiting_goal_id).filter(
-        models.GoalDependency.target_acquisition_id == row.acquisition_id,
-        models.GoalDependency.waiting_chat_id != chat_id,
-        models.GoalDependency.resolved_at.is_(None),
-        models.GoalDependency.result_disposition.is_(None),
-        models.GoalDependency.withdrawn_at.is_(None),
-        models.GoalDependency.owner_suppressed_at.is_(None),
-      ).all()
-      if any(_direct_cycle(db, waiting_goal_id=follower, source_goal_id=goal_id)
-             for (follower,) in followers):
-        db.rollback()
-        raise ValueError("Claim refresh would create a direct Goal dependency cycle.")
     previous_revision = row.revision
+    previous_goal_id, previous_run_id = row.owner_goal_id, row.owner_run_id
     changed = db.query(models.AgentWorkClaim).filter(
       models.AgentWorkClaim.id == row.id,
       models.AgentWorkClaim.owner_chat_id == chat_id,
@@ -193,8 +233,12 @@ def claim_work(
     if changed != 1:
       db.rollback()
       raise ValueError("The claim changed while refreshing; inspect it before retrying.")
-    db.commit()
     db.expire(row)
+    db.refresh(row)
+    if row.owner_goal_id != previous_goal_id:
+      _stage_goal_owner_change(db, row, previous=chat_id,
+        previous_run_id=previous_run_id, previous_goal_id=previous_goal_id)
+    db.commit()
     db.refresh(row)
     pending_transfer = (
       row.previous_owner_chat_id is not None
@@ -243,8 +287,8 @@ def claim_work(
   previous_revision = row.revision
   now = now_naive_utc()
   # Transfer makes the former owner a follower. Reject an existing reverse
-  # dependency from the new owner's Goal to the former owner's chat, except
-  # the self-follow on this acquisition which is withdrawn below.
+  # dependency from the new owner's Goal to the former owner's Goal, except
+  # the exact executor's follow on this acquisition, suppressed below.
   if goal_id and previous_goal_id and db.query(models.GoalDependency.id).join(
     models.AgentWorkClaim,
     models.AgentWorkClaim.id == models.GoalDependency.target_claim_id,
@@ -281,45 +325,8 @@ def claim_work(
     raise ValueError("The claim changed during transfer; inspect it before retrying.")
   db.expire(row)
   db.refresh(row)
-  # Existing subscribers change source owner too. Check every affected edge,
-  # not just the reverse link newly created for the former executor.
-  from app.goal_dependency_sources import _direct_cycle
-  if goal_id:
-    follower_goals = db.query(models.GoalDependency.waiting_goal_id).filter(
-      models.GoalDependency.target_acquisition_id == row.acquisition_id,
-      models.GoalDependency.waiting_chat_id != chat_id,
-      models.GoalDependency.resolved_at.is_(None),
-      models.GoalDependency.result_disposition.is_(None),
-      models.GoalDependency.withdrawn_at.is_(None),
-      models.GoalDependency.owner_suppressed_at.is_(None),
-    ).all()
-    if any(_direct_cycle(db, waiting_goal_id=follower_goal, source_goal_id=goal_id)
-           for (follower_goal,) in follower_goals):
-      db.rollback()
-      raise ValueError("Transfer would create a direct Goal dependency cycle.")
-  db.query(models.GoalDependency).filter(
-    models.GoalDependency.target_acquisition_id == row.acquisition_id,
-    models.GoalDependency.resolved_at.is_(None),
-    models.GoalDependency.result_disposition.is_(None),
-    models.GoalDependency.withdrawn_at.is_(None),
-    models.GoalDependency.owner_suppressed_at.is_(None),
-  ).update({models.GoalDependency.target_chat_id: chat_id}, synchronize_session=False)
-  # A new owner must not keep a self-follow on its own acquisition.
-  db.query(models.GoalDependency).filter(
-    models.GoalDependency.target_acquisition_id == row.acquisition_id,
-    models.GoalDependency.waiting_chat_id == chat_id,
-    models.GoalDependency.resolved_at.is_(None),
-    models.GoalDependency.result_disposition.is_(None),
-    models.GoalDependency.withdrawn_at.is_(None),
-    models.GoalDependency.owner_suppressed_at.is_(None),
-  ).update({models.GoalDependency.owner_suppressed_at: now}, synchronize_session=False)
-  previous_follow_status = "no_open_top_level_goal"
-  if previous_goal_id and previous != chat_id:
-    previous_follow_status = stage_follow_claim(db, row, chat_id=previous,
-      run_id=previous_run_id, waiting_goal_id=previous_goal_id, restore_owner_follow=True)
-    if previous_follow_status not in {"followed", "result_owed", "no_open_top_level_goal"}:
-      db.rollback()
-      raise ValueError("Transfer cannot preserve the former Goal's follow: " + previous_follow_status)
+  previous_follow_status = _stage_goal_owner_change(db, row, previous=previous,
+    previous_run_id=previous_run_id, previous_goal_id=previous_goal_id)
   db.commit()
   db.refresh(row)
   result = _serialize(db, row, "transferred")

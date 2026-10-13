@@ -245,8 +245,8 @@ async def deliver_dependency(row_id):
       return False
     chat_id, content, source_id = row.waiting_chat_id, dependency_notice(row), row.created_by_run_id
     source = db.get(models.ChatRun, source_id) if source_id else None
-    # A migrated subscription has no fabricated source lineage. Queue admission
-    # below uses the deterministic result run itself as its new physical root.
+    # A preserved former Goal may have no provable subscribing physical run.
+    # Queue admission then uses the result run as its root, never invented lineage.
     root_id = ((source.root_run_id or source.id) if source is not None and source.chat_id == chat_id
       else (carrier.root_run_id or carrier.id) if carrier is not None else None)
   cid = "dependency-result-" + run_id.removeprefix("dependency-resume-")

@@ -89,7 +89,10 @@ def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
   goal = _eligible_goal(db, chat_id, run_id, waiting_goal_id)
   if goal is None:
     return 'no_open_top_level_goal'
-  if claim.owner_chat_id == chat_id or claim.owner_goal_id == goal.id:
+  # An ownership change can preserve a former Goal in the same chat; the
+  # exact executing Goal itself can never subscribe to its own acquisition.
+  if claim.owner_goal_id == goal.id or (
+      claim.owner_chat_id == chat_id and not restore_owner_follow):
     return 'self_dependency'
   if _direct_cycle(db, waiting_goal_id=goal.id,
                    source_goal_id=claim.owner_goal_id):

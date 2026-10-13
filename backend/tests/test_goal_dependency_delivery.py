@@ -188,7 +188,7 @@ def test_closed_goal_retires_without_receipt(db, chat, state):
   assert row.result_disposition == "retired_by_goal_outcome" and row.received_run_id is None
 
 
-def test_missing_legacy_source_run_queues_exact_goal_without_invented_lineage(db, chat):
+def test_missing_subscribing_run_queues_exact_goal_without_invented_lineage(db, chat):
   a = _run(db, chat, "a", "goal-a")
   row = _dependency(db, chat, a)
   row.created_by_run_id = None
