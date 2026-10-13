@@ -53,9 +53,9 @@ test('full dependency condition precedes secondary source, with no invented chec
   const condition = 'Choose the exact release to install after preserving the local work and checking the host'
   const dependency = { id: 'd', target_kind: 'owner_card', condition, source_chat_id: 'source', source_question_id: 'choice', source_chat_title: 'Repair', automatic: true }
   const html = render(h(Details, { dependencies: [dependency] }))
-  assert.ok(html.indexOf(condition) < html.indexOf('Decision in Repair'))
-  assert.match(html, /Continues automatically when eligible/)
-  assert.doesNotMatch(html, /next check|deadline|Möbius checks|<input/)
+  assert.ok(html.indexOf(condition) < html.indexOf('Open decision'))
+  assert.match(html, /Continues automatically/)
+  assert.doesNotMatch(html, /next check|deadline|Möbius checks|<input|when eligible|Source not progressing/)
   for (const blocker of ['goal_held', 'source_held', 'source_failed']) {
     const held = render(h(Details, { dependencies: [{ ...dependency, automatic: false, resume_blocker: blocker }] }))
     assert.doesNotMatch(held, /Continues automatically/)
@@ -75,7 +75,7 @@ test('settlement code is calm recovery while unrelated resumable failures stay a
   assert.doesNotMatch(failed, /chat__text--parked/)
 })
 
-for (const [kind, label] of [['completed', 'Work completed'], ['released', 'Work released'], ['owner_deleted', 'Work owner deleted'], ['answered', 'Answered'], ['closed_without_reply', 'Answered without a source reply'], ['superseded', 'Replaced'], ['cancelled', 'Cancelled by Stop'], ['source_deleted', 'Source chat deleted']]) {
+for (const [kind, label] of [['completed', 'Work completed'], ['released', 'Work handed back'], ['owner_deleted', 'The chat was deleted'], ['answered', 'Answered'], ['closed_without_reply', 'Closed without a reply'], ['superseded', 'Replaced'], ['cancelled', 'Stopped'], ['source_deleted', 'The chat was deleted']]) {
   test(`settled ${kind} retains clock, typed outcome and expandable full condition`, () => {
     const html = render(h(History, { summary: { id: 'd', target_kind: ['completed', 'released', 'owner_deleted'].includes(kind) ? 'claim_acquisition' : 'owner_card', condition: 'Host repair', disposition: 'delivered', result_disposition: 'delivered', source_chat_title: 'Repair', outcome: { kind } } }))
     assert.match(html, /chat__wait-history/)
@@ -85,3 +85,38 @@ for (const [kind, label] of [['completed', 'Work completed'], ['released', 'Work
     assert.doesNotMatch(html, /Checks finished|next check|deadline|Continues automatically|chat__lifecycle-outcome/)
   })
 }
+
+
+test('quiet decisions show the saved choice once, never an inferred approval', () => {
+  const summary = { id: 'd', target_kind: 'owner_card', condition: 'Release choice',
+    source_chat_id: 'repair', source_question_id: 'choice', source_chat_title: 'Repair',
+    disposition: 'delivered', outcome: { kind: 'closed_without_reply', answers: { release: 'Not now' } } }
+  const html = render(h(History, { summary }))
+  // Strip attributes: accessible names legitimately include the condition too.
+  const visible = html.replace(/<[^>]+>/g, '')
+  assert.equal(visible.split('Release choice').length - 1, 1)
+  assert.equal(visible.split('You chose Not now').length - 1, 1)
+  assert.equal(visible.split('Open decision').length - 1, 1)
+  assert.doesNotMatch(visible, /source|eligible|disposition|approved/i)
+  assert.doesNotMatch(html, /chat__goal-plan|chat__goal-task-title/)
+})
+
+test('held and broken work use plain recovery copy without promising continuation', () => {
+  const dependency = { id: 'd', condition: 'Repair host', source_chat_title: 'Repair', automatic: false }
+  for (const blocker of ['source_held', 'source_failed', 'source_missing']) {
+    const html = render(h(Details, { dependencies: [{ ...dependency, resume_blocker: blocker }] }))
+    assert.match(html, /This work needs recovery in Repair/)
+    assert.doesNotMatch(html, /Source|eligible|Continues automatically/)
+  }
+  assert.match(render(h(Details, { dependencies: [{ ...dependency, resume_blocker: 'goal_held' }] })), /Saved until you continue this Goal/)
+})
+
+
+test('deleted chat receipt states its outcome once without an empty disclosure', () => {
+  const html = render(h(History, { summary: { id: 'gone', target_kind: 'owner_card',
+    condition: 'Release choice', source_deleted: true, source_chat_title: 'Deleted chat',
+    outcome: { kind: 'source_deleted' }, disposition: 'delivered' } }))
+  const visible = html.replace(/<[^>]+>/g, '')
+  assert.equal(visible.split('The chat was deleted').length - 1, 1)
+  assert.doesNotMatch(html, /<details|<a /)
+})

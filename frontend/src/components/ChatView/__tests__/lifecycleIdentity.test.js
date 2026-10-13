@@ -102,19 +102,19 @@ test('foreign decision has one exact Open decision link and no answer control', 
  const Details = await load('GoalPlanDetails')
  const dependency = { id: 'decision', target_kind: 'owner_card', condition: 'Release choice', source_chat_id: 'source', source_question_id: 'card-1', source_chat_title: 'Repair', automatic: true }
  const html = render(h(Details, { dependencies: [dependency] }))
- assert.match(html, /Release choice/); assert.match(html, /Decision in Repair/)
+ assert.match(html, /Release choice/); assert.match(html, /Open decision/)
  assert.match(html, /href="\/shell\/\?chat=source&amp;focus=question&amp;question=card-1"/)
- assert.match(html, />Open decision<\/a>/)
+ assert.match(html, />Open decision · Repair<\/a>/)
  assert.doesNotMatch(html, /<input|<button|deadline|next check|Waiting for you/)
  const deleted = render(h(Details, { dependencies: [{ ...dependency, source_deleted: true }] }))
  assert.doesNotMatch(deleted, /<a /)
- assert.match(deleted, /source chat was deleted/)
+ assert.match(deleted, /The chat was deleted/)
 })
 
 test('decision history preserves quiet close and never invents an answer start', async () => {
  const Details = await load('GoalPlanDetails')
  const dependency = { id: 'decision', target_kind: 'owner_card', condition: 'Release choice', source_chat_title: 'Repair', disposition: 'retired_by_goal_outcome', received_run_id: null, outcome: { kind: 'closed_without_reply', answers: { release: 'Not now' } } }
  const html = render(h(Details, { dependencyHistory: [dependency] }))
- assert.match(html, /Answered without a source reply · Not now/)
+ assert.match(html, /You chose Not now/)
  assert.doesNotMatch(html, /Continues automatically|Started|Waiting ·|resumed/)
 })

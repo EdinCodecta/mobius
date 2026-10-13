@@ -972,6 +972,7 @@
 /* The owner-input handoff is the one diamond-shaped row marker; it leads the
    title so it reads as "you are needed here". */
 .drawer__attention-diamond {
+  display: inline-block;
   flex-shrink: 0;
   width: 6px;
   height: 6px;

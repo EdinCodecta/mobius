@@ -43,7 +43,6 @@ test('runtime is authoritative including explicit clear and ordinary absence', (
 test('claim follow presentation preserves its exact work and source', () => {
   const dependency = { id: 'dep', condition: 'Host repair', source_chat_title: 'Watch platform update', automatic: true }
   assert.deepEqual(goalPresentationFromRuntime({ goal: { ...goal, dependencies: [dependency] } }).dependencies, [dependency])
-  assert.match(goalPlanDetails, /Source not progressing · manual recovery needed/)
 })
 
 test('same Goal reattachment keeps its plan and disclosure identity until a new snapshot arrives', () => {

@@ -84,13 +84,15 @@ export function normalizeGoalPresentation(goal) {
 export function goalDependencyOutcomeLabel(dependency) {
   const kind = dependency?.outcome?.kind
   const answer = Object.values(dependency?.outcome?.answers || {}).filter(value => typeof value === 'string').join(' · ')
+  if (kind === 'answered' || kind === 'closed_without_reply') {
+    return answer ? `You chose ${answer}` : kind === 'answered' ? 'Answered' : 'Closed without a reply'
+  }
   const label = {
-    answered: 'Answered', closed_without_reply: 'Answered without a source reply',
-    cancelled: 'Cancelled by Stop', superseded: 'Replaced', source_deleted: 'Source chat deleted',
-    completed: 'Work completed', released: 'Work released', owner_deleted: 'Work owner deleted',
+    cancelled: 'Stopped', superseded: 'Replaced', source_deleted: 'The chat was deleted',
+    completed: 'Work completed', released: 'Work handed back', owner_deleted: 'The chat was deleted',
     owner_not_progressing: 'Work interrupted',
   }[kind] || (dependency?.disposition === 'withdrawn' ? 'Stopped following' : 'Waiting ended with this Goal')
-  const detail = answer || dependency?.outcome?.outcome
+  const detail = dependency?.outcome?.outcome
   return detail ? `${label} · ${detail}` : label
 }
 

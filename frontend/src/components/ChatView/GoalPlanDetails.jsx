@@ -1,8 +1,9 @@
 /* GoalPlanDetails renders the expanded dependency-aware todo list. */
 import DependencyBacklinks from './DependencyBacklinks.jsx'
+import DependencyLink from './DependencyLink.jsx'
 
 import { Check, Clock } from '@openai/apps-sdk-ui/components/Icon'
-import { goalTaskDisplayStatus, goalDependencyOutcomeLabel, goalDependencyHref } from './goalProgress'
+import { goalTaskDisplayStatus, goalDependencyOutcomeLabel } from './goalProgress'
 import { goalHelpers } from './goalHelpers'
 import {
   HELPER_AWAITING_PARENT_LABEL, isHelperAwaitingParent, isWorkingHelperStatus,
@@ -134,25 +135,17 @@ export default function GoalPlanDetails({ plan, holdReason = null, dependencies 
       {!!(dependencies.length + dependencyHistory.length) && <div role="list" aria-label="Work and decisions in other chats">
         {[...dependencies, ...dependencyHistory].map(dependency => {
           const settled = !!dependency.disposition
-          const decision = dependency.target_kind === 'owner_card'
-          const href = goalDependencyHref(dependency)
           return <div role="listitem" key={dependency.id} className="chat__goal-task">
             <Clock width={14} height={14} aria-hidden="true" />
             <span className="chat__goal-task-copy">
               <span className="chat__goal-task-title">{dependency.condition}</span>
-              <span className="chat__goal-task-meta">{decision ? 'Decision in' : 'Work owned by'} {dependency.source_chat_title}</span>
-              {dependency.source_deleted && <span className="chat__goal-task-meta">The source chat was deleted</span>}
-              {href && <a href={href} aria-label={`${decision ? 'Open decision' : 'Open chat'}: ${dependency.condition} in ${dependency.source_chat_title}`}
-                onClick={event => {
-                  if (!onInternalNav || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
-                  event.preventDefault()
-                  onInternalNav(new URL(href, window.location.origin))
-                }}>{decision ? 'Open decision' : 'Open chat'}</a>}
+              <DependencyLink dependency={dependency} onInternalNav={onInternalNav} />
               <span className="chat__goal-task-meta">{dependency.outcome || settled
                 ? goalDependencyOutcomeLabel(dependency)
+                : dependency.source_deleted ? 'The chat was deleted'
                 : SOURCE_RECOVERY_BLOCKERS.has(dependency.resume_blocker)
-                  ? 'Source not progressing · manual recovery needed'
-                  : dependency.automatic ? 'Continues automatically when eligible' : 'Result kept until this Goal continues'}</span>
+                  ? `This work needs recovery in ${dependency.source_chat_title || 'the other chat'}`
+                  : dependency.automatic ? 'Continues automatically' : 'Saved until you continue this Goal'}</span>
             </span>
           </div>
         })}

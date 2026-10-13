@@ -6,6 +6,9 @@ import '../ChatView.css'
 import '../QuestionCard.css'
 import '../../Drawer/Drawer.css'
 import GoalPlanDetails from '../GoalPlanDetails.jsx'
+import ProgressRail from '../ProgressRail.jsx'
+import GoalHistoryCard from '../GoalHistoryCard.jsx'
+import { Flag } from '@openai/apps-sdk-ui/components/Icon'
 import QuestionCard from '../QuestionCard.jsx'
 import WaitHistoryCard from '../WaitHistoryCard.jsx'
 import ErrorCard from '../ErrorCard.jsx'
@@ -15,17 +18,31 @@ const dependency = { id: 'd', target_kind: 'owner_card', condition: 'Choose the 
 window.navigations = []
 window.resumes = 0
 const navigate = url => window.navigations.push(url.href)
-function Fixture({ held = false } = {}) {
-  return <main style={{ maxWidth: 680, margin: '24px auto', padding: 16, fontFamily: 'var(--font)', color: 'var(--text)' }}>
+function Fixture({ held = false, receiptCondition = dependency.condition, wrapped = false, kind = 'owner_card', comparisons = false } = {}) {
+  const active = { ...dependency, target_kind: kind, automatic: !held, resume_blocker: held ? 'goal_held' : null }
+  const receipt = <WaitHistoryCard onInternalNav={navigate} summary={{ ...active, condition: receiptCondition,
+    disposition: 'delivered', result_disposition: 'delivered', received_run_id: 'received',
+    outcome: { kind: 'closed_without_reply', answers: { release: 'Not now' } } }} />
+  return <main className="chat" style={{ maxWidth: 680, height: 'auto', margin: '24px auto', padding: 16, fontFamily: 'var(--font)', color: 'var(--text)' }}>
     <h2>Goal handoffs</h2>
     <div style={{ display: 'flex', gap: 20, margin: '16px 0' }}>
-      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><DrawerStatusMarker waiting />Waiting</span>
-      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><DrawerStatusMarker onHold />On hold</span>
-      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><DrawerStatusMarker ownerRequired />Your input</span>
+      <span><DrawerStatusMarker waiting /> Waiting</span>
+      <span><DrawerStatusMarker onHold /> On hold</span>
+      <span><DrawerStatusMarker ownerRequired /> Your input</span>
     </div>
     <QuestionCard chatId="source" questionId="choice" questions={[{ question: 'Which release should we install?', options: [{ id: 'later', label: 'Not now' }] }]} neededBy={chats} onInternalNav={navigate} />
-    <section aria-label="Dependent Goal"><GoalPlanDetails dependencies={[{ ...dependency, automatic: !held, resume_blocker: held ? 'goal_held' : null }]} onInternalNav={navigate} /></section>
-    <WaitHistoryCard summary={{ ...dependency, disposition: 'delivered', result_disposition: 'delivered', received_run_id: 'received', outcome: { kind: 'closed_without_reply', answers: { release: 'Not now' } } }} />
+    <section aria-label="Dependent Goal" style={{ marginTop: 12 }}><ProgressRail ariaLabel="Goal progress" items={[{
+      key: 'goal', label: 'Waiting · Finish the blocked update', icon: <Flag width={14} height={14} aria-hidden="true" />, expandable: true,
+      details: <GoalPlanDetails dependencies={[active]} onInternalNav={navigate} />,
+    }]} /></section>
+    <div className="chat__msg chat__msg--assistant" data-testid="receipt">
+      {wrapped ? <div className="chat__answer-cause">{receipt}</div> : receipt}
+    </div>
+    {comparisons && <div className="chat__msg chat__msg--assistant" data-testid="siblings">
+      <WaitHistoryCard summary={{ ...dependency, condition: 'Release choice', disposition: 'delivered', outcome: { kind: 'closed_without_reply' } }} />
+      <div className="chat__answer-cause"><WaitHistoryCard summary={{ id: 'native', description: 'Build finishes', status: 'met' }} /></div>
+      <GoalHistoryCard summary={{ id: 'finished', status: 'completed', objective: 'Repair verified' }} />
+    </div>}
     <ErrorCard block={{ code: 'goal_settlement_unfinished', resumable: true }}>
       <button className="chat__resume chat__recovery-action" onClick={() => { window.resumes++ }}>Resume</button>
     </ErrorCard>

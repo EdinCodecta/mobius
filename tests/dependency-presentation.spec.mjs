@@ -13,7 +13,7 @@ test.beforeAll(async () => {
   const theme = themeSource.split('DEFAULT_THEME = ')[1].split('\"\"\"')[1].replace(/^\\\n/, '')
   cacheDir = await mkdtemp(join(tmpdir(), 'dependency-panels-'))
   server = await createServer({ root: fileURLToPath(new URL('../frontend', import.meta.url)),
-    configFile: false, cacheDir, plugins: [tailwindcss()], appType: 'custom', logLevel: 'error', esbuild: { jsx: 'automatic' },
+    configFile: false, cacheDir, optimizeDeps: { entries: ['src/components/ChatView/__tests__/dependencyPresentationFixture.jsx'] }, plugins: [tailwindcss()], appType: 'custom', logLevel: 'error', esbuild: { jsx: 'automatic' },
     server: { host: '127.0.0.1', port: 0, hmr: false, ws: false } })
   server.middlewares.use(async (req, res, next) => {
     if (req.url !== '/') return next()
@@ -25,9 +25,11 @@ test.beforeAll(async () => {
 })
 test.afterAll(async () => { await server?.close(); if (cacheDir) await rm(cacheDir, { recursive: true, force: true }) })
 async function open(page) {
+  page.on('pageerror', error => console.error('Fixture error:', error.message))
   await page.goto(base)
   await expect(page.getByRole('heading', { name: 'Goal handoffs' })).toBeVisible()
   await page.evaluate(() => document.fonts.ready)
+  await page.getByRole('button', { name: 'Expand: Waiting · Finish the blocked update' }).click()
 }
 
 test('card backlink disclosures are keyboard accessible and navigate without answering', async ({ page }) => {
@@ -38,6 +40,7 @@ test('card backlink disclosures are keyboard accessible and navigate without ans
   await many.focus(); await page.keyboard.press('Enter')
   const link = page.getByRole('link', { name: 'Finish the blocked update' })
   await expect(link).toBeVisible()
+  await expect(link).toHaveCSS('text-decoration-line', 'underline')
   await link.click()
   expect(await page.evaluate(() => window.navigations)).toEqual([base + '/shell/?chat=dependent'])
   await expect(page.locator('.qcard')).not.toHaveClass(/qcard--answered/)
@@ -47,11 +50,16 @@ test('exact decision link is distinct from source backlinks and preserves full c
   await open(page)
   const details = page.getByRole('region', { name: 'Dependent Goal' })
   await expect(details).toContainText('after preserving local work and checking the host')
-  await details.getByRole('link', { name: /^Open decision/ }).click()
+  const link = details.getByRole('link', { name: /^Open decision/ })
+  await expect(link).toHaveCSS('text-decoration-line', 'underline')
+  await link.focus(); await page.keyboard.press('Tab'); await page.keyboard.press('Shift+Tab')
+  await expect(link).toBeFocused()
+  await expect(link).toHaveCSS('outline-style', 'solid')
+  await page.keyboard.press('Enter')
   expect(await page.evaluate(() => window.navigations.at(-1))).toBe(base + '/shell/?chat=source&focus=question&question=choice')
   await page.evaluate(() => window.mountFixture({ held: true }))
   await expect(details).not.toContainText('Continues automatically')
-  await expect(details).toContainText('Result kept until this Goal continues')
+  await expect(details).toContainText('Saved until you continue this Goal')
 })
 
 test('recovery action remains actionable and saved outcome expands as a quiet clock record', async ({ page }) => {
@@ -59,24 +67,69 @@ test('recovery action remains actionable and saved outcome expands as a quiet cl
   await expect(page.getByRole('alert')).toHaveCount(0)
   await page.getByRole('button', { name: 'Resume', exact: true }).click()
   expect(await page.evaluate(() => window.resumes)).toBe(1)
-  const history = page.locator('.chat__wait-history')
+  const history = page.getByTestId('receipt').locator('.chat__wait-history')
   await history.locator('summary').click()
-  await expect(history).toContainText('Answered without a source reply · Not now')
+  await expect(history).toContainText('You chose Not now')
   await expect(history.getByRole('link', { name: /^Open decision/ })).toBeVisible()
 })
 
-for (const width of [390, 960]) test(`panels fill the message column without overflow at ${width}px`, async ({ page }) => {
+test('owner-input diamond is painted in the existing slot even in an inline legend', async ({ page }) => {
+  await open(page)
+  const diamond = page.getByRole('img', { name: 'Your input is needed' })
+  const bounds = await diamond.boundingBox()
+  expect(bounds.width).toBeGreaterThan(5)
+  expect(bounds.height).toBeGreaterThan(5)
+  await expect(diamond).not.toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+  const rgb = await diamond.evaluate(el => getComputedStyle(el).backgroundColor)
+  expect(rgb).not.toBe('rgb(139, 108, 247)')
+})
+
+for (const width of [390, 960]) test(`short and long receipts fill the real assistant column at ${width}px`, async ({ page }) => {
   await page.setViewportSize({ width, height: 1100 })
   await open(page)
+  for (const wrapped of [false, true]) for (const condition of ['Release choice', 'Choose the exact release to install after preserving local work and checking the host']) {
+    await page.evaluate(props => window.mountFixture(props), { wrapped, receiptCondition: condition, comparisons: true })
+    const message = page.getByTestId('receipt')
+    const card = message.locator('.chat__wait-history')
+    const details = card.locator('details')
+    await details.evaluate(el => { el.open = false })
+    for (const expanded of [false, true]) {
+      if (expanded) await card.locator('summary').click()
+      const column = await message.boundingBox()
+      const box = await card.boundingBox()
+      expect(Math.round(box.width)).toBe(Math.round(column.width))
+      expect((await card.innerText()).split(condition).length - 1).toBe(1)
+      expect((await card.innerText()).split('You chose Not now').length - 1).toBe(1)
+      await expect(card.locator('.chat__goal-history-objective')).toHaveCSS('font-size', '13px')
+      await expect(card.locator('.chat__goal-task-title')).toHaveCount(0)
+      if (expanded) {
+        const link = card.getByRole('link', { name: /^Open decision/ })
+        await expect(link).toHaveCSS('text-decoration-line', 'underline')
+        await expect(link).toHaveCSS('font-size', '12px')
+        await link.focus(); await page.keyboard.press('Enter')
+        expect(await page.evaluate(() => window.navigations.at(-1))).toBe(base + '/shell/?chat=source&focus=question&question=choice')
+      }
+    }
+    const siblings = page.getByTestId('siblings')
+    const column = await siblings.boundingBox()
+    for (const sibling of await siblings.locator('.chat__goal-history').all()) {
+      expect(Math.round((await sibling.boundingBox()).width)).toBe(Math.round(column.width))
+    }
+  }
+  // Exercise the same visible action for claimed work, not just decisions.
+  await page.evaluate(() => window.mountFixture({ kind: 'claim_acquisition', comparisons: true }))
+  const workLink = page.getByRole('region', { name: 'Dependent Goal' }).getByRole('link', { name: /^Open chat/ })
+  await expect(workLink).toHaveCSS('text-decoration-line', 'underline')
+  await workLink.focus(); await page.keyboard.press('Enter')
+  expect(await page.evaluate(() => window.navigations.at(-1))).toBe(base + '/shell/?chat=source')
+  await page.evaluate(() => window.mountFixture({ comparisons: true }))
   await page.locator('.qcard__related-work > summary').click()
   await page.locator('.chat__dependency-backlinks > summary').click()
-  await page.locator('.chat__wait-history summary').click()
+  const receiptDetails = page.getByTestId('receipt').locator('details')
+  if (!await receiptDetails.evaluate(el => el.open)) await receiptDetails.locator('summary').click()
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
-  const main = await page.locator('main').boundingBox()
-  const card = await page.locator('.chat__wait-history').boundingBox()
-  expect(Math.round(card.width)).toBe(Math.round(main.width - 32))
   if (process.env.MOBIUS_PRESENTATION_SCREENS) {
     await mkdir(process.env.MOBIUS_PRESENTATION_SCREENS, { recursive: true })
-    await page.screenshot({ path: join(process.env.MOBIUS_PRESENTATION_SCREENS, `stage4-${width}.png`), fullPage: true })
+    await page.screenshot({ path: join(process.env.MOBIUS_PRESENTATION_SCREENS, `final-${width}.png`), fullPage: true })
   }
 })

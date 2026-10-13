@@ -4349,6 +4349,8 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 }
 
 .chat__goal-history {
+  width: 100%;
+  min-width: 0;
   --lifecycle-tone: var(--green);
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr);
@@ -4371,6 +4373,8 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 
 /* What started an answer sits above its first line. */
 .chat__answer-cause {
+  width: 100%;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -4897,7 +4901,7 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
   overflow-wrap: anywhere;
 }
 .chat__dependency-backlinks { margin: 8px 0; }
-.chat__dependency-backlinks a { color: var(--text); text-underline-offset: 3px; }
+.chat__dependency-backlinks a { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
 .chat__dependency-backlinks ul { margin: 8px 0; padding-left: 20px; }
 .chat__dependency-backlinks summary, .qcard__related-work > summary {
   display: flex;
@@ -4912,3 +4916,20 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 .chat__dependency-backlinks summary:focus-visible,
 .qcard__related-work > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .qcard__related-work { margin: 10px 0; }
+
+/* Dependency navigation keeps the same small type in the rail and transcript. */
+.chat__dependency-link {
+  display: inline-block;
+  align-self: flex-start;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 3px 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  overflow-wrap: anywhere;
+}
+.chat__dependency-link:hover { color: var(--accent); }
+.chat__dependency-backlinks a:focus-visible,
+.chat__dependency-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+.chat__dependency-history-detail { margin: 6px 0 0 38px; font-size: 12px; }
