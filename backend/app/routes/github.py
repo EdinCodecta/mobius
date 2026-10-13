@@ -1305,7 +1305,7 @@ async def _inspect_prepared_review_locked(
       await source_locks.enter_async_context(
         fs_locks.source_dir_lock(lock_path)
       )
-    return await asyncio.to_thread(  # unsettled: read-only
+    return await settled.run_settled(
       _inspect_prepared_review,
       record,
       diff_path,
@@ -1567,24 +1567,24 @@ async def attest_contribution_source_continuity(
             fs_locks.source_dir_lock(lock_path)
           )
         branch = _validate_branch(plan.get("branch") or record.get("branch"))
-        await asyncio.to_thread(  # unsettled: read-only
+        await settled.run_settled(
           _assert_fresh, record, diff_path, review_repo, branch,
         )
-        if await asyncio.to_thread(  # unsettled: read-only
+        if await settled.run_settled(
           _reviewed_paths_dirty,
           source_repo, review_repo, str(body.base_sha), str(body.head_sha),
         ):
           raise ContributionSubmitError(
             "The installed source has uncommitted changes to reviewed files."
           )
-        current_source = await asyncio.to_thread(  # unsettled: read-only
+        current_source = await settled.run_settled(
           app_git.head_sha, source_repo, "HEAD",
         )
         if current_source != body.reviewed_through_sha:
           raise ContributionSubmitError(
             "The installed source changed during continuity review."
           )
-        source_advance = await asyncio.to_thread(  # unsettled: read-only
+        source_advance = await settled.run_settled(
           app_git._canonical_diff,
           source_repo,
           body.source_sha,
@@ -2506,7 +2506,7 @@ async def _chat_contribution_documents(
 
   async with fs_locks.app_storage_lock(app_id):
     contribution_paths, app_settings, settlement_document = (
-      await asyncio.to_thread(snapshot)  # unsettled: read-only
+      await asyncio.to_thread(snapshot)  # unsettled: read-only (lists and reads JSON records)
     )
   related_records, records = await asyncio.to_thread(
     _read_chat_related_records, app_id, contribution_paths, chat_id,
@@ -4473,7 +4473,7 @@ async def update_contribution_stack(
     # proof while holding its source through the public mutation; this preserves
     # partial parent success without reversing app -> source lock order.
     async with _stack_publication_source_locks(rows):
-      await asyncio.to_thread(  # unsettled: read-only
+      await settled.run_settled(
         _preflight_prepared_stack,
         rows,
         source_preflight=lambda record: _assert_personal_publication_source(
@@ -4787,7 +4787,7 @@ async def submit_contribution_stack(
 
   try:
     async with _stack_publication_source_locks(rows):
-      await asyncio.to_thread(  # unsettled: read-only
+      await settled.run_settled(
         _preflight_prepared_stack,
         rows,
         source_preflight=lambda record: _assert_personal_publication_source(
@@ -5482,7 +5482,7 @@ async def connect_published_app(
   try:
     await install.fetch_app_commit(spec.source_repo, merge_sha)
     async with fs_locks.source_dir_lock(str(spec.source_repo)):
-      witnessed = await asyncio.to_thread(  # unsettled: read-only
+      witnessed = await settled.run_settled(
         app_git.verify_landed_equivalent_change,
         spec.source_repo,
         diff_sha256=spec.diff_sha256,

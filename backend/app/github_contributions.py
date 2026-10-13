@@ -839,7 +839,7 @@ async def _record_pending_equivalence_locked(
     return None
   source_repo, _review_repo = repos
   if str(source_repo) in already_locked:
-    return await asyncio.to_thread(_record_pending_equivalence, record)
+    return await settled.run_settled(_record_pending_equivalence, record)
   async with fs_locks.source_dir_lock(str(source_repo)):
     return await settled.run_settled(_record_pending_equivalence, record)
 

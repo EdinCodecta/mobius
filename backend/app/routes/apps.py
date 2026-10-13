@@ -1515,7 +1515,7 @@ async def update_check(
 
   async with fs_locks.source_dir_lock(str(repo)):
     try:
-      pending, pending_state = await asyncio.to_thread(  # unsettled: read-only
+      pending, pending_state = await settled.run_settled(
         _read_pending_update, repo, target_app_id,
       )
     except (OSError, subprocess.SubprocessError):
@@ -1544,14 +1544,14 @@ async def update_check(
   async with fs_locks.source_dir_lock(str(repo)):
     try:
       # Discovery needs only the complete package identity, not its payload.
-      candidate = await asyncio.to_thread(  # unsettled: read-only
+      candidate = await settled.run_settled(
         install.read_git_package_summary, repo, commit,
       )
-      pending, pending_state = await asyncio.to_thread(  # unsettled: read-only
+      pending, pending_state = await settled.run_settled(
         _read_pending_update, repo, target_app_id,
       )
       # Install's own identity rule; database reads, no network.
-      rejection = await asyncio.to_thread(functools.partial(  # unsettled: read-only
+      rejection = await settled.run_settled(functools.partial(
         _update_candidate_rejection,
         target_app_id, candidate.manifest,
         manifest_url or installed_manifest_url,
@@ -1564,7 +1564,7 @@ async def update_check(
       # This fence stays inside the source lock after the fetch/identity check.
       if pending is not None:
         return _pending_result(pending, pending_state)
-      recorded_package = await asyncio.to_thread(  # unsettled: read-only
+      recorded_package = await settled.run_settled(
         install.package_content_digest_from_git, repo, app_git.UPSTREAM_BRANCH,
       )
       # Real legacy owner data has no package manifest. Preserve its bridge /
@@ -1573,14 +1573,14 @@ async def update_check(
       if recorded_package is None:
         # Only real pre-manifest owner data needs source bytes. Re-read the
         # immutable candidate already fetched above, never another network ref.
-        legacy_candidate = await asyncio.to_thread(  # unsettled: read-only
+        legacy_candidate = await settled.run_settled(
           install.read_git_install_candidate,
           repo, candidate.commit, fetch_manifest_url, strict=False,
         )
-        recorded_tree = await asyncio.to_thread(  # unsettled: read-only
+        recorded_tree = await settled.run_settled(
           install.read_recorded_update_source, repo, legacy_candidate.runtime_tree,
         )
-        trusted_origin = await asyncio.to_thread(  # unsettled: read-only
+        trusted_origin = await settled.run_settled(
           install.trusted_catalog_checkout,
           installed_manifest_url, repo, fetch_manifest_url,
           candidate.manifest.get("id"),
@@ -1695,10 +1695,10 @@ async def update_candidate_preview(
     ) from exc
   async with fs_locks.source_dir_lock(str(repo)):
     try:
-      candidate = await asyncio.to_thread(  # unsettled: read-only
+      candidate = await settled.run_settled(
         install.read_git_install_candidate, repo, commit, fetch_manifest_url,
       )
-      rejection = await asyncio.to_thread(functools.partial(  # unsettled: read-only
+      rejection = await settled.run_settled(functools.partial(
         _update_candidate_rejection,
         app_id, candidate.manifest, manifest_url or installed_manifest_url,
         package_id=installed_package_id,
@@ -1706,11 +1706,11 @@ async def update_candidate_preview(
       ))
       if rejection is not None:
         raise HTTPException(409, detail=rejection)
-      previous_source = await asyncio.to_thread(  # unsettled: read-only
+      previous_source = await settled.run_settled(
         install.read_recorded_update_source, repo, candidate.runtime_tree,
       )
       # Same source-lock snapshot as the candidate, as update-check reports it.
-      _, pending_state = await asyncio.to_thread(  # unsettled: read-only
+      _, pending_state = await settled.run_settled(
         _read_pending_update, repo, app_id,
       )
     except HTTPException:
@@ -1970,7 +1970,7 @@ async def _create_conflict_resolver_chat(
     for app, repo, receipt in prepared:
       try:
         plan = await settled.run_settled(_validate_pending_update, repo, receipt)
-        upstream_version = await asyncio.to_thread(  # unsettled: read-only
+        upstream_version = await settled.run_settled(
           _upstream_version, repo, app.upstream_commit,
         )
       except HTTPException as exc:
@@ -2624,7 +2624,7 @@ async def update_app(
               "message": "Only a local app can attach a separate distribution manifest.",
             },
           )
-        accepted_id, accepted_digest = await asyncio.to_thread(  # unsettled: read-only
+        accepted_id, accepted_digest = await settled.run_settled(
           _accepted_local_distribution_package, app,
         )
         if distribution_candidate.manifest["id"] != accepted_id:
@@ -3352,7 +3352,11 @@ async def recover_app(
           # recompile_app_bundle commits internally, but the row remains
           # tombstoned until the separate commit below. A crash or compile error
           # therefore cannot expose a stale or partially rebuilt app.
-          await recompile_app_bundle(db, app, app.jsx_source)
+          # Settled: it writes and publishes the bundle under these locks.
+          await settled.settle(
+            recompile_app_bundle(db, app, app.jsx_source),
+            what="App recovery rebuild",
+          )
         except RuntimeError as exc:
           db.rollback()
           raise HTTPException(

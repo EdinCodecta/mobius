@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -249,7 +250,8 @@ def test_teardown_is_not_fooled_by_a_cancel_handled_further_up_the_stack():
   assert ran == ["first", "second", "second ok=False"]
 
 
-_READ_ONLY = "# unsettled: read-only"
+# The reason names what the thread does, e.g. "(git status, optional locks off)".
+_READ_ONLY = re.compile(r"# unsettled: read-only \((?P<reason>[^)]*\S[^)]*)\)")
 # Settled by its caller: ``apply_platform_update`` waits out an admitted Apply.
 _SETTLED_ELSEWHERE = {("platform_update.py", "_apply_platform_update_sync")}
 
@@ -309,7 +311,12 @@ def test_lock_held_thread_work_is_settled_or_marked_read_only():
 
   Plain ``asyncio.to_thread`` releases the lock on cancel while the thread
   runs on, so lock-held thread work goes through ``settled``. Read-only work
-  may stay plain, marked ``# unsettled: read-only`` on the call's line.
+  may stay plain, marked ``# unsettled: read-only (<what it reads>)`` on the
+  call's line.
+
+  This only sees direct calls written inside a lock block. Thread work
+  reached through a called coroutine is not checked, and a marker is a claim
+  that a reviewer checks by hand, not something this test can prove.
   """
   app_root = Path(__file__).resolve().parents[1] / "app"
   offenders = []
@@ -324,9 +331,19 @@ def test_lock_held_thread_work_is_settled_or_marked_read_only():
         name = getattr(callee, "id", getattr(callee, "attr", ""))
         if (path.name, name) in _SETTLED_ELSEWHERE:
           continue
-        if _READ_ONLY not in lines[call.lineno - 1]:
+        if not _READ_ONLY.search(lines[call.lineno - 1]):
           offenders.append(f"{path.relative_to(app_root)}:{call.lineno}")
   assert not sorted(set(offenders)), (
     "Lock-held asyncio.to_thread must use settled.run_settled, or be marked "
-    f"{_READ_ONLY!r} when the thread only reads: {sorted(set(offenders))}"
+    "'# unsettled: read-only (<reason>)' when the thread only reads: "
+    f"{sorted(set(offenders))}"
   )
+
+
+@pytest.mark.parametrize("line, marked", [
+  ("x = await asyncio.to_thread(f)  # unsettled: read-only (git status)", True),
+  ("x = await asyncio.to_thread(f)  # unsettled: read-only", False),
+  ("x = await asyncio.to_thread(f)  # unsettled: read-only ( )", False),
+])
+def test_a_read_only_marker_must_give_its_reason(line, marked):
+  assert bool(_READ_ONLY.search(line)) is marked

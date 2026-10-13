@@ -1952,7 +1952,7 @@ async def submit_through_mobius(
           await source_locks.enter_async_context(
             fs_locks.source_dir_lock(lock_path)
           )
-        await asyncio.to_thread(_assert_pending_equivalence_preflight, claimed)  # unsettled: read-only
+        await settled.run_settled(_assert_pending_equivalence_preflight, claimed)
         _initial_merge, initial_payload = await settled.run_settled(
           _relay_snapshot_payload, claimed, diff_path, record_id,
         )
@@ -2029,7 +2029,7 @@ async def submit_through_mobius(
           )
           claim_receipt_witness = str(claim_receipt.get("witness") or "")
           claimed = journaled
-          lock_paths = await asyncio.to_thread(  # unsettled: read-only
+          lock_paths = await asyncio.to_thread(  # unsettled: read-only (computes lock paths)
             _relay_source_lock_paths,
             claimed,
             include_installed_source=True,
@@ -2039,7 +2039,7 @@ async def submit_through_mobius(
               fs_locks.source_dir_lock(lock_path)
             )
 
-        await asyncio.to_thread(_assert_pending_equivalence_preflight, claimed)  # unsettled: read-only
+        await settled.run_settled(_assert_pending_equivalence_preflight, claimed)
         merge, payload = await settled.run_settled(
           _relay_snapshot_payload, claimed, diff_path, record_id,
         )

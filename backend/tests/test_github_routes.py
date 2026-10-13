@@ -15659,3 +15659,66 @@ def test_assignment_choices_reject_missing_github_capability(client, owner_token
     headers={"Authorization": f"Bearer {app_token}"},
   )
   assert response.status_code == 403
+
+
+def _stack_rows(tmp_name: str, status: str) -> tuple[Path, list[dict]]:
+  repo = Path(get_settings().data_dir) / "contrib" / tmp_name / "repo"
+  repo.mkdir(parents=True)
+  record = {"id": "layer-1", "status": status, "plan": {"repo_path": str(repo)}}
+  return repo, [{"record": record}]
+
+
+def _cancel_under_source_lock(repo, operation, worker):
+  from app import fs_locks
+  from tests.cancel_helpers import cancel_while_worker_blocked
+
+  outcome = asyncio.run(cancel_while_worker_blocked(
+    fs_locks.source_dir_lock(str(repo)), operation, worker,
+  ))
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+
+
+def test_cancelled_stack_submit_holds_source_locks_through_its_preflight(
+  db, monkeypatch,
+):
+  """The preflight checks out branches and writes trees: it ends under the lock."""
+  from app.routes import github as routes
+  from tests.cancel_helpers import BlockedWorker
+
+  repo, rows = _stack_rows("stack-submit-cancel", "submitting")
+  monkeypatch.setattr(routes, "_validate_submit_app", lambda *_args: None)
+  monkeypatch.setattr(routes, "_cleanup_durable_complete_attempt", lambda *a, **k: None)
+  monkeypatch.setattr(routes, "_personal_resume_allowed", lambda *a, **k: None)
+  owner = SimpleNamespace(recovery_record=lambda record: record)
+  monkeypatch.setattr(
+    routes, "_personal_claim_owners", lambda **_kwargs: ({"layer-1": owner}, None),
+  )
+  monkeypatch.setattr(routes, "_claim_stack_records", lambda **_kwargs: rows)
+  monkeypatch.setattr(routes, "_equivalence_source_repo", lambda _record: None)
+  worker = BlockedWorker()
+  monkeypatch.setattr(routes, "_preflight_prepared_stack", worker)
+
+  _cancel_under_source_lock(repo, lambda: routes.submit_contribution_stack(
+    None, 1, routes.ContributionStackSubmitRequest(record_ids=["layer-1"]), db, None,
+  ), worker)
+
+
+def test_cancelled_stack_landing_holds_source_locks_until_it_lands(db, monkeypatch):
+  from app.routes import github as routes
+  from tests.cancel_helpers import BlockedWorker
+
+  repo, rows = _stack_rows("stack-land-cancel", "landing")
+  landed = []
+  monkeypatch.setattr(routes, "_validate_submit_app", lambda *_args: None)
+  monkeypatch.setattr(routes, "_claim_stack_landing", lambda **_kwargs: (rows, "land"))
+  monkeypatch.setattr(routes, "_equivalence_source_repo", lambda _record: None)
+  monkeypatch.setattr(routes, "_assert_pending_equivalence_preflight", lambda _record: None)
+  monkeypatch.setattr(routes, "_mark_stack_land_success", lambda *a, **k: landed.append(k))
+  worker = BlockedWorker(lambda: ("main", "a" * 40))
+  monkeypatch.setattr(routes, "_land_reviewed_stack", worker)
+
+  _cancel_under_source_lock(repo, lambda: routes.land_contribution_stack(
+    None, 1, routes.ContributionStackLandRequest(record_ids=["layer-1"]), db, None,
+  ), worker)
+  # The landing finished; the cancelled request records it on retry (recover).
+  assert not landed
