@@ -5415,8 +5415,7 @@ async def connect_published_app(
   candidate = await install.fetch_install_candidate(pinned_manifest_url)
   if (
     candidate.manifest.get("id") != spec.manifest_id
-    or install.install_candidate_content_digest(candidate)
-    != spec.package_digest
+    or candidate.source_review_digest != spec.package_digest
     or candidate.capability_digest != spec.capability_digest
   ):
     raise HTTPException(
@@ -5425,10 +5424,8 @@ async def connect_published_app(
     )
 
   try:
+    await install.fetch_app_commit(spec.source_repo, merge_sha)
     async with fs_locks.source_dir_lock(str(spec.source_repo)):
-      await asyncio.to_thread(
-        app_git.fetch_origin_commit, spec.source_repo, merge_sha,
-      )
       witnessed = await asyncio.to_thread(
         app_git.verify_landed_equivalent_change,
         spec.source_repo,
@@ -5525,6 +5522,7 @@ async def connect_published_app(
         source="publication_handoff",
         reviewed_capability_digest=spec.capability_digest,
         publication_handoff_app_id=spec.target_app_id,
+        prepared=install.PreparedPackage(candidate),
       )
       connected_app = result.app
       mode = result.mode
@@ -5910,9 +5908,7 @@ async def autopilot_respond(
   if status == "escalate":
     await _autopilot_escalate_and_notify(
       db, app_id, record_id, owner_id,
-      "Autopilot reached its five-round limit without resolving the reviews."
-      if verdict.get("reason") == "round_limit"
-      else "Autopilot's follow-up rounds keep failing to complete.",
+      "Autopilot's follow-up rounds keep failing to complete.",
     )
     await autopilot.mirror_to_ledger(app_id, record_id)
     return {"status": "escalated", "reason": verdict.get("reason")}
