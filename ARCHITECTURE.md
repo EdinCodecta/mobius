@@ -254,6 +254,7 @@ FastAPI app. `main.py` is the factory (CORS, rate limiting, routers, static serv
 | `app_git.py` | Per-app git repo (`/data/apps/<slug>/.git`): pristine `upstream` history + a local working branch |
 | `app_apply.py` | Explicitly validates, commits, compiles, and publishes one coherent mini-app source revision |
 | `storage_io.py` | Filesystem helpers for per-app + shared storage; lives apart from `routes/storage.py` so `install.py` can reuse it. Also owns `etag_matches()`, the If-Match CAS compare — RFC 9110-correct (wildcard, weak tags, multi-value) plus deliberate tolerance for a proxy content-encoding suffix (Caddy `encode` rewrites `"<tok>"` to `"<tok>-gzip"`; a strict compare would 412 every compressible CAS write) |
+| `streaming.py` | `ClosingStreamingResponse`: closes a server-sent event generator as soon as ASGI abandons a send, so a dropped reader's resources go promptly (system notify and update-batch progress streams) |
 | `fs_locks.py` | In-process async locks serializing storage-tree / source-tree mutations against app uninstall |
 | `app_compile_contract.py` | Canonical self-contained mini-app compiler contract, dependency list, and runtime ABI |
 | `app_runtime_inject.js` | React + `mobius-runtime` bridge injected into every compiled app bundle |

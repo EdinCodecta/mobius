@@ -227,30 +227,60 @@ class AppUpdateBatches:
     self._read_failed = False
     self._slots: asyncio.Semaphore | None = None
     self._starting = asyncio.Lock()
+    self._save_locks: dict[str, asyncio.Lock] = {}
 
-  def _save(self, record: dict) -> None:
+  def _encode(self, record: dict) -> str:
     record["updated_at"] = _now()
     record["phase"] = (
       "applying" if any(e["status"] in _ACTIVE for e in record["entries"])
       else "complete"
     )
-    try:
-      atomic_write(
-        self.root / f"{record['id']}.json",
-        json.dumps(record, ensure_ascii=False) + "\n",
-        mode=0o600,
-      )
-    except OSError:
-      # Progress that cannot be recorded must not keep admitting work.
-      self.accepting = False
-      self.failure = _UNSAVED
-      for listeners in self.listeners.values():
-        for wake in listeners:
-          wake.set()
-      raise
+    return json.dumps(record, ensure_ascii=False) + "\n"
+
+  def _write(self, key: str, text: str) -> None:
+    atomic_write(self.root / f"{key}.json", text, mode=0o600)
+
+  def _write_failed(self) -> None:
+    # Progress that cannot be recorded must not keep admitting work.
+    self.accepting = False
+    self.failure = _UNSAVED
+    for listeners in self.listeners.values():
+      for wake in listeners:
+        wake.set()
+
+  def _saved(self, record: dict) -> None:
     self.records[record["id"]] = record
     for wake in self.listeners.get(record["id"], ()):
       wake.set()
+
+  def _save(self, record: dict) -> None:
+    """Save on the calling thread: admission (no await before the receipt
+    exists) and boot, where nothing else runs yet."""
+    try:
+      self._write(record["id"], self._encode(record))
+    except OSError:
+      self._write_failed()
+      raise
+    self._saved(record)
+
+  async def _save_off_loop(self, record: dict) -> None:
+    """Save progress without syncing the disk on the event loop.
+
+    One lock per batch keeps writes in order, and each encodes the newest
+    state when its turn comes, so the last write always holds the latest
+    progress. The write finishes even if its caller is cancelled.
+    """
+    from app.install import _to_completion
+
+    lock = self._save_locks.setdefault(record["id"], asyncio.Lock())
+    async with lock:
+      text = self._encode(record)
+      try:
+        await _to_completion(self._write, record["id"], text)
+      except OSError:
+        self._write_failed()
+        raise
+      self._saved(record)
 
   async def start(self) -> None:
     async with self._starting:
@@ -285,6 +315,10 @@ class AppUpdateBatches:
 
   def _load_receipts(self) -> None:
     self.root.mkdir(parents=True, exist_ok=True)
+    # A crash mid-write leaves only atomic_write's temporary file; no writer
+    # runs yet, so any that remain are abandoned.
+    for leftover in self.root.glob(".*.tmp"):
+      leftover.unlink(missing_ok=True)
     expired = (datetime.now(UTC) - _RETAIN_COMPLETE).isoformat()
     for path in self.root.glob("*.json"):
       # A corrupt receipt is not "no work". Fail visibly rather than silently
@@ -413,7 +447,10 @@ class AppUpdateBatches:
       if app_id not in failed or patch["status"] == "updated"
     }
     if _apply(record, outcomes):
-      self._save(record)
+      try:
+        await self._save_off_loop(record)
+      except OSError as exc:
+        raise HTTPException(503, self.failure) from exc
 
   async def snapshots(self, key: str):
     """Coalesce slow readers to the newest durable snapshot, never a backlog."""
@@ -450,7 +487,7 @@ class AppUpdateBatches:
         async with self._slots:
           started = time.monotonic()
           entry["status"] = "applying"
-          self._save(record)
+          await self._save_off_loop(record)
           try:
             entry.update(await self.execute(update))
             entry.update(error="", error_code=None, retryable=False)
@@ -461,7 +498,7 @@ class AppUpdateBatches:
               log.exception("app update failed for %s", update["app_id"])
             entry.update(_failure(exc))
           entry["duration_ms"] = round((time.monotonic() - started) * 1000)
-          self._save(record)
+          await self._save_off_loop(record)
       except asyncio.CancelledError:
         # Shutdown, queued or running: the installer has settled. Read what
         # actually landed off the loop, then apply it here, where siblings
@@ -469,7 +506,7 @@ class AppUpdateBatches:
         _apply(record, await asyncio.to_thread(
           _settled_outcomes, _unfinished(record, [entry]),
         ))
-        self._save(record)
+        await self._save_off_loop(record)
         raise
       activity.log_event(
         "app_update_outcome", batch_id=record["id"], app_id=entry["app_id"],

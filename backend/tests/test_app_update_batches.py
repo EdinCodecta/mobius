@@ -904,3 +904,80 @@ async def test_shutdown_wait_is_bounded(tmp_path, app_rows, monkeypatch):
   monkeypatch.setattr(batches, "_settled_outcomes",
     lambda reviewed: {1: {"status": "updated"}})
   await drain(owner)
+
+
+def test_guest_progress_stream_does_not_lose_its_principal(client, owner_token, monkeypatch, tmp_path):
+  """A shared-browser guest's stream copies the owner before the session closes."""
+  from app.config import get_settings
+  from app.main import app as application
+  from app.routes.browser_access import _limiter
+  from tests.test_browser_access_routes import invite
+
+  _limiter.reset()
+  monkeypatch.setattr(get_settings(), "frontend_origin", "https://shared.example")
+  client.base_url = "https://shared.example"
+  client.headers["Origin"] = "https://shared.example"
+  _grant, token, _secret = invite(client)
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  owner.accepting = True
+  owner.root.mkdir(parents=True)
+  key = str(uuid4())
+  owner._save({"id": key, "created_at": _now(), "updates": [],
+    "entries": [{"app_id": 1, "status": "updated", "name": "One"}]})
+  monkeypatch.setattr(application.state, "runtime_supervisors",
+    SimpleNamespace(app_updates=owner), raising=False)
+  guest = {"Authorization": f"Bearer {token}"}
+  assert client.get(f"/api/apps/update-batches/{key}", headers=guest).status_code == 200
+  with client.stream("GET", f"/api/apps/update-batches/{key}/events", headers=guest) as response:
+    assert response.status_code == 200
+    frames = [line for line in response.iter_lines() if line]
+  assert len(frames) == 1 and json.loads(frames[0][len("data: "):])["id"] == key
+
+
+@pytest.mark.asyncio
+async def test_refresh_save_failure_reports_the_pause(tmp_path, db, git_state, monkeypatch):
+  app_id = add_app(db, tmp_path, "pause", version="1.0", source_commit=LANDED)
+
+  async def execute(update):
+    raise HTTPException(409, detail={"code": "update_changed", "message": "Changed."})
+
+  owner = batches.AppUpdateBatches(str(tmp_path), execute=execute)
+  await owner.start()
+  key = owner.submit(request(app_id), db)["id"]
+  await drain(owner)
+  def no_space(*args, **kwargs):
+    raise OSError("disk full")
+  monkeypatch.setattr(batches, "atomic_write", no_space)
+  with pytest.raises(HTTPException) as paused:
+    await owner.refresh_results(key, db)  # the update landed; saving fails
+  assert paused.value.status_code == 503
+  assert paused.value.detail == batches._UNSAVED
+
+
+@pytest.mark.asyncio
+async def test_off_loop_saves_keep_the_latest_progress(tmp_path):
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  await owner.start()
+  key = str(uuid4())
+  record = {"id": key, "created_at": _now(), "updates": [],
+            "entries": [{"app_id": 1, "status": "applying"}]}
+  owner._save(record)
+
+  async def change(status):
+    record["entries"][0]["status"] = status
+    await owner._save_off_loop(record)
+
+  await asyncio.gather(change("applying"), change("failed"), change("updated"))
+  saved = json.loads((owner.root / f"{key}.json").read_text())
+  assert saved["entries"][0]["status"] == record["entries"][0]["status"] == "updated"
+
+
+@pytest.mark.asyncio
+async def test_boot_removes_temporary_files_a_crash_left(tmp_path):
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  owner.root.mkdir()
+  leftover = owner.root / f".{uuid4()}.json.abc123.tmp"
+  leftover.write_text('{"partial')
+  await owner.start()
+  assert owner.accepting
+  assert not leftover.exists()
