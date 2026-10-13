@@ -175,7 +175,7 @@ import {
 } from '../../lib/chatSearchReveal.js'
 import {
   chatQuestionRevealFor,
-  consumeChatQuestionReveal,
+  consumeChatQuestionReveal, questionRevealElement,
   subscribeChatQuestionReveal,
 } from '../../lib/chatQuestionReveal.js'
 import {
@@ -436,6 +436,7 @@ export default function ChatView({
   artifactsAppId = null,
   onOpenArtifact = null,
   focusPendingQuestion = false,
+  focusQuestionId = null,
 }) {
   const queryClient = useQueryClient()
   const provisionalNewChat = !!newChatSession && !newChatSession.materialized
@@ -474,6 +475,15 @@ export default function ChatView({
     setQuestionRevealVersion(version => version + 1)
   }), [chatId])
   const questionReveal = chatQuestionRevealFor(chatId)
+  const decisionActivationRef = useRef({ chatId, questionId: focusQuestionId, requestId: null })
+  if (decisionActivationRef.current.chatId !== chatId) {
+    decisionActivationRef.current = { chatId, questionId: focusQuestionId, requestId: null }
+  }
+  if (questionReveal && decisionActivationRef.current.requestId !== questionReveal.id) {
+    decisionActivationRef.current = { chatId, questionId: questionReveal.questionId || null, requestId: questionReveal.id }
+  }
+  const decisionQuestionId = decisionActivationRef.current.questionId
+  const decisionAnchorKey = decisionQuestionId ? `question:${decisionQuestionId}` : null
   const inputRef = useRef(null)
   const handleInternalNav = useCallback((url) => {
     onInternalNav?.(url)
@@ -522,7 +532,7 @@ export default function ChatView({
   // saved coordinate; an incomplete restoration window stays hidden until the
   // anchor-addressed read repairs or retires that coordinate.
   const initialSavedAnchorKey = savedReadingAnchorKey(chatId)
-  const initialActivationAnchorKey = searchReveal?.anchorKey || initialSavedAnchorKey
+  const initialActivationAnchorKey = decisionAnchorKey || searchReveal?.anchorKey || initialSavedAnchorKey
   const initialCacheEntryState = chatCacheEntryState(
     cached,
     initialActivationAnchorKey,
@@ -1143,7 +1153,7 @@ export default function ChatView({
     hidden,
     loadNonce,
     provisionalNewChat,
-    searchAnchorKey: searchReveal?.anchorKey,
+    searchAnchorKey: decisionAnchorKey || searchReveal?.anchorKey,
     searchRevealId: searchReveal?.id,
     loadingOlderRef: loadingOlder,
     pageRef: olderPageRef,
@@ -2483,7 +2493,7 @@ export default function ChatView({
     setChatInfo(activationCache?.chatInfo ?? null)
     setContinuationWait(activationCache?.continuationWait || null)
     const savedAnchorKey = savedReadingAnchorKey(chatId)
-    const searchAnchorKey = searchReveal?.anchorKey || null
+    const searchAnchorKey = decisionAnchorKey || searchReveal?.anchorKey || null
     // A search selection is a deliberate one-shot navigation, so it wins over
     // the stored reader coordinate for this activation. It never remaps or
     // retires that saved position.
@@ -2952,6 +2962,7 @@ export default function ChatView({
     provisionalNewChat,
     searchReveal?.anchorKey,
     searchReveal?.id,
+    decisionAnchorKey,
     commitRuntimeSnapshot,
     inspectRuntimeSnapshot,
     onRuntimeSettledIdle,
@@ -5653,11 +5664,17 @@ export default function ChatView({
   useLayoutEffect(() => {
     const requestId = questionReveal?.id ?? (focusPendingQuestion ? 'deep-link' : null)
     if (!requestId || questionRevealConsumedRef.current === requestId) return
-    if (!hasPendingQuestion || !pendingQuestionEl) return
+    // Exact-card navigation may target an answered historical card. Never
+    // redirect that request to whichever newer question is pending now.
+    const exact = decisionQuestionId ? questionRevealElement(scrollRef.current, decisionQuestionId, null) : null
+    if (decisionQuestionId ? !exact : (!hasPendingQuestion || !pendingQuestionEl)) return
     questionRevealConsumedRef.current = requestId
-    revealPendingQuestion(pendingQuestionEl)
+    if (exact) {
+      revealPendingQuestion(exact)
+      exact.focus({ preventScroll: true })
+    } else revealPendingQuestion(pendingQuestionEl)
     if (questionReveal?.id != null) consumeChatQuestionReveal(chatId, questionReveal.id)
-  }, [chatId, focusPendingQuestion, hasPendingQuestion, pendingQuestionEl, questionReveal, revealPendingQuestion])
+  }, [chatId, focusPendingQuestion, decisionQuestionId, hasPendingQuestion, pendingQuestionEl, questionReveal, revealPendingQuestion, messages, displayReady])
   const resumeNudgeShown = hasPendingResume && resumeCardOffscreen
   const jumpToLatestVisible = jumpToLatestShown({
     // A send-owned PIN_USER_MSG is the expected latest-turn location, not a
@@ -5847,10 +5864,12 @@ export default function ChatView({
         actionError: goalResumeState.error,
       } : {}),
       icon: <Flag width={14} height={14} aria-hidden="true" />,
-      ...(goalPresentation?.plan || goalPresentation?.hold_reason || continuationHandoff || goalPresentation?.dependencies?.length
+      ...(goalPresentation?.plan || goalPresentation?.hold_reason || continuationHandoff || goalPresentation?.dependencies?.length || goalPresentation?.dependency_history?.length
         ? { details: <GoalPlanDetails
             plan={goalPresentation?.plan}
             dependencies={goalPresentation?.dependencies}
+            dependencyHistory={goalPresentation?.dependency_history}
+            onInternalNav={internalNav}
             holdReason={continuationHandoff
               ? `${continuationHandoff.description} ${continuationHandoff.boundary}`
               : goalPresentation?.hold_reason}

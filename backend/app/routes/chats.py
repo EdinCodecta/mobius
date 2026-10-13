@@ -534,6 +534,9 @@ def _chat_message_matches_key(
   if not isinstance(message, dict):
     return False
   target = str(key)
+  if target.startswith("question:"):
+    return any(block.get("type") == "question" and block.get("question_id") == target[9:]
+               for block in message.get("blocks") or [])
   message_id = message.get("id")
   if message_id is not None and str(message_id) == target:
     return True
@@ -559,7 +562,7 @@ def _chat_detail_window(
   total = len(messages)
   if anchor_key is not None:
     anchor_index = next((
-      index for index, message in enumerate(metadata if metadata is not None else messages)
+      index for index, message in enumerate(metadata if metadata is not None and not anchor_key.startswith("question:") else messages)
       if _chat_message_matches_key(message, index, anchor_key)
     ), None)
     if anchor_index is not None:

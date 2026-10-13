@@ -2668,7 +2668,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     } else if (target?.view === 'canvas') {
       void openAppWithIntent(target.app, target.intent)
     } else if (target?.view === 'chat') {
-      if (target.focusQuestion === true) requestChatQuestionReveal(target.chatId)
+      if (target.focusQuestion === true) requestChatQuestionReveal(target.chatId, target.questionId)
       navToRef.current('chat', { chatId: target.chatId })
       if (target.focusComposer === true && supportsDesktopPaneComposerFocus()) {
         requestComposer(target.chatId, { focus: true })
@@ -5085,6 +5085,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
               <PaneChatView
                 chatId={chatId}
                 paneId={paneId}
+                focusQuestionId={deepLink?.view === 'chat' && String(deepLink.chatId) === String(chatId) ? deepLink.questionId : null}
                 focusPendingQuestion={deepLink?.view === 'chat'
                   && String(deepLink.chatId) === String(chatId)
                   && deepLink.focusQuestion === true}

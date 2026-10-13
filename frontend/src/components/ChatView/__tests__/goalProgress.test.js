@@ -448,3 +448,12 @@ test('parallel helpers and retries label their work once, not their execution ro
   assert.deepEqual(visibleGoalTasks(plan).map(task => task.id), ['check'])
   assert.deepEqual(visibleGoalTasks({ tasks: [], delegations: plan.delegations }), [])
 })
+
+test('foreign card is purple Waiting rather than local owner-input attention', () => {
+  const dependency = { id: 'card-dep', target_kind: 'owner_card', condition: 'Which release?', source_chat_title: 'Repair', automatic: true }
+  const waiting = goalPresentationFromRuntime({ goal: { ...goal, status: 'paused', dependencies: [dependency], handoff: { kind: 'automatic', reason: 'dependency' } } })
+  assert.equal(goalStatusLabel(waiting), 'Waiting')
+  assert.equal(goalDependencyLabel(dependency), 'Waiting · Which release? in Repair')
+  const history = [{ ...dependency, disposition: 'delivered', outcome: { kind: 'answered' } }]
+  assert.deepEqual(goalPresentationFromRuntime({ goal: { ...goal, dependency_history: history } }).dependency_history, history)
+})

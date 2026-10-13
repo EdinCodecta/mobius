@@ -319,3 +319,12 @@ test('continuation wait is retained on reopen and cleared by a resumed snapshot'
   assert.equal(chatDetailCacheValue({ messages: [], continuation_wait: null }).continuationWait, null)
   assert.equal(chatDetailCacheValue({ messages: [] }).continuationWait, null)
 })
+
+test('exact decision coordinate matches the saved card after answer, not another pending question', () => {
+  const answered = { role: 'assistant', id: 'old', blocks: [{ type: 'question', question_id: 'choice', answers: { q: 'Not now' } }] }
+  const pending = { role: 'assistant', id: 'new', blocks: [{ type: 'question', question_id: 'new-choice' }] }
+  assert.equal(messageMatchesKey(answered, 1, 'question:choice'), true)
+  assert.equal(messageMatchesKey(pending, 2, 'question:choice'), false)
+  assert.equal(chatCacheEntryState({ restorationWindowComplete: true, messages: [answered], offset: 1 }, 'question:choice'), 'paintable')
+  assert.equal(chatCacheEntryState({ restorationWindowComplete: true, messages: [pending], offset: 2 }, 'question:choice'), 'missing')
+})

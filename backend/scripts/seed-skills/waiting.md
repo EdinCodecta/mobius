@@ -6,8 +6,8 @@ dies with the turn's process group with no record anyone is waiting. This file
 is the mechanics for the observable/timed owner — `declare_wait`, which runs a
 read-only check on an interval and resumes this exact Goal, when one owns it,
 or otherwise this chat when the condition is met,
-surviving server restarts. (Owner actions go to the clarifying-question tool;
-recurring work is a cron app.)
+surviving server restarts. Owner actions belong to saved cards, including
+`wait_for_decision` for an existing card in another chat; recurring work is a cron app.
 
 ## When to declare a wait
 
@@ -27,7 +27,9 @@ When NOT to use it:
   exact acquisition and delivers its outcome without a command check or
   deadline. Do not poll the peer chat, add a timer, or ask for an interrupt.
 - **Something finishing within the current turn** — poll it inline.
-- **Waiting on the partner** — ask through the real clarifying-question tool;
+- **Polling the partner** — never monitor whether the owner has acted. If the
+  decision already has a saved card elsewhere, use `wait_for_decision` below.
+  Otherwise ask through the real clarifying-question tool;
   an owner question already parks the turn durably and keeps the action visible.
   For an outside-chat action, use concrete choices such as **Done**, **Need
   help**, and **Not now**, adapted to the task. Do not end with only “tell me
@@ -35,6 +37,28 @@ When NOT to use it:
   destructive confirmations still follow core policy.
 - **Recurring scheduled work** — that's a cron app (`cron.md`), not a wait.
   A wait fires once.
+
+## Another chat owns the next step
+
+Do independent work first. If your remaining next step is another chat's
+saved Q&A or approval, call `wait_for_decision(chat_id: "SOURCE_CHAT",
+question_id: "EXACT_CARD")`. Only an open top-level Goal can subscribe;
+helpers return the condition to their parent. Use the existing card: never
+copy it, poll its answer, or ask a peer to interrupt you later. Claim-owned
+work uses the confirmed claim dependency instead; approval is not completion.
+
+A successful subscription gives this exact Goal a visible **Waiting** handoff
+and **Open decision** link. End normally; no deadline applies to human choices.
+Already-settled cards return their saved outcome immediately. Restart cards and
+sealed secure-input cards cannot be followed; use their own owning workflows.
+
+Results are facts, never permission. An approval authorizes only its own
+executor. Interpret the actual **Not now** answer within your own Goal's
+existing authority. A quiet-close answer does not resume the source Goal,
+though the dependent receives that disposition. Cancelled, replaced and deleted
+sources are not approval. Held dependents retain results without waking; closed
+or deleted dependents retire them. Opening a decision only navigates to its
+exact saved card, including its answer if it settled meanwhile.
 
 ## Declaring
 

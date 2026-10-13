@@ -30,7 +30,7 @@ export default function GoalHistoryCard({ summary }) {
           {heading}
           <ChevronRight className="chat__panel-chevron" width={14} height={14} aria-hidden="true" />
         </summary>
-        <GoalPlanDetails plan={summary.plan} />
+        <GoalPlanDetails plan={summary.plan} dependencyHistory={summary.dependency_history} />
       </details> : heading}
     </aside>
   )

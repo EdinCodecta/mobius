@@ -97,3 +97,24 @@ test('provider-limit continuation reports a retry without promising availability
  assert.match(html, /Retry check due — trying the provider again/)
  assert.doesNotMatch(html, /[Uu]sage available|[Ll]imit (has )?reset|[Qq]uota restored/)
 })
+
+test('foreign decision has one exact Open decision link and no answer control', async () => {
+ const Details = await load('GoalPlanDetails')
+ const dependency = { id: 'decision', target_kind: 'owner_card', condition: 'Release choice', source_chat_id: 'source', source_question_id: 'card-1', source_chat_title: 'Repair', automatic: true }
+ const html = render(h(Details, { dependencies: [dependency] }))
+ assert.match(html, /Waiting · Release choice in Repair/)
+ assert.match(html, /href="\/shell\/\?chat=source&amp;focus=question&amp;question=card-1"/)
+ assert.match(html, />Open decision<\/a>/)
+ assert.doesNotMatch(html, /<input|<button|deadline|next check|Waiting for you/)
+ const deleted = render(h(Details, { dependencies: [{ ...dependency, source_deleted: true }] }))
+ assert.doesNotMatch(deleted, /<a /)
+ assert.match(deleted, /source chat was deleted/)
+})
+
+test('decision history preserves quiet close and never invents an answer start', async () => {
+ const Details = await load('GoalPlanDetails')
+ const dependency = { id: 'decision', target_kind: 'owner_card', condition: 'Release choice', source_chat_title: 'Repair', disposition: 'retired_by_goal_outcome', received_run_id: null, outcome: { kind: 'closed_without_reply', answers: { release: 'Not now' } } }
+ const html = render(h(Details, { dependencyHistory: [dependency] }))
+ assert.match(html, /Answered without a source reply · Not now/)
+ assert.doesNotMatch(html, /Continues automatically|Started|Waiting ·|resumed/)
+})

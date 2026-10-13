@@ -68,6 +68,7 @@ export function normalizeGoalPresentation(goal) {
     status: goal.status,
     resumable: goal.resumable === true,
     plan: goal.plan || null,
+    ...(Array.isArray(goal.dependency_history) && goal.dependency_history.length ? { dependency_history: goal.dependency_history } : {}),
     ...(Array.isArray(goal.dependencies) && goal.dependencies.length ? { dependencies: goal.dependencies } : {}),
     ...(goal.status === 'paused' && ['owner', 'agent', 'unknown', 'deferred'].includes(goal.pause_reason)
       ? { pause_reason: goal.pause_reason } : {}),
@@ -83,6 +84,28 @@ export function goalDependencyLabel(dependency) {
   const work = String(dependency?.condition || 'shared work').trim()
   const chat = String(dependency?.source_chat_title || 'another chat').trim()
   return `Waiting · ${work} in ${chat}`
+}
+
+/** A decision outcome is a saved fact, not evidence that an answer started. */
+export function goalDecisionOutcomeLabel(dependency) {
+  const kind = dependency?.outcome?.kind
+  const answer = Object.values(dependency?.outcome?.answers || {}).filter(value => typeof value === 'string').join(' · ')
+  const label = {
+    answered: 'Answered', closed_without_reply: 'Answered without a source reply',
+    cancelled: 'Cancelled by Stop', superseded: 'Replaced', source_deleted: 'Source chat deleted',
+  }[kind] || (dependency?.disposition === 'withdrawn' ? 'Stopped following' : 'Result retired')
+  return answer ? `${label} · ${answer}` : label
+}
+
+export function goalDependencyHref(dependency) {
+  if (!dependency?.source_chat_id || dependency.source_deleted) return null
+  const params = new URLSearchParams({ chat: dependency.source_chat_id })
+  if (dependency.target_kind === 'owner_card') {
+    if (!dependency.source_question_id) return null
+    params.set('focus', 'question')
+    params.set('question', dependency.source_question_id)
+  }
+  return `/shell/?${params}`
 }
 
 /** One status vocabulary for the Goal rail and its accessible announcement.

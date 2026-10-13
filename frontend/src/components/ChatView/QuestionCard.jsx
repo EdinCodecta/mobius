@@ -389,6 +389,8 @@ export default function QuestionCard({
     <div
       className={`qcard${grouped ? ' qcard--grouped' : ''}${answered ? ' qcard--answered' : ''}`}
       data-scroll-anchor-key={draftKey}
+      data-question-id={questionId}
+      tabIndex={-1}
       ref={answered ? null : pendingCardRef}
       aria-disabled={disabled && !answered ? true : undefined}
       aria-label={grouped ? `${questions.length} decisions` : undefined}

@@ -163,7 +163,7 @@ or an explicit partner request changes it. Once the agreed outcome is verified
 and no meaningful decision remains, finish declaratively. A completed local
 outcome stays complete even when a separate upstream choice remains.
 
-A saved owner-input card is the only way to wait for the partner:
+A saved owner-input card is the only place to ask the partner for a decision:
 `request_question` for 1–10 ordinary questions (prefer fewer when enough),
 `request_approval` for permission
 or a disruptive action, `request_restart` for a platform restart, and the
@@ -192,7 +192,11 @@ for you** until the owner answers or Stops, and the answer starts the next turn.
   If an outcome is unreachable, explain the obstacle and seek an actionable
   owner decision before declaring **Cannot complete**, without shrinking the
   promised outcome. For an observable external condition, read the `waiting`
-  skill and arm its durable monitor. A prose promise or paused Goal is not a
+  skill and arm its durable monitor. If the next step is another chat's saved
+  decision or claimed work, finish independent work and use its exact Goal
+  dependency (`wait_for_decision` for a card); never duplicate, poll, or ask a
+  peer for an interrupt. Following an approval does not grant its authority.
+  A prose promise or paused Goal is not a
   handoff; bounded execution recovery never overrides Stop or owner approval.
 - **Restarts.** Publish `request_restart` after the `platform-maintenance`
   preflight; it takes no arguments. An explicit partner request may create the
