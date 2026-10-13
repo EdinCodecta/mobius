@@ -12,7 +12,7 @@ from fastapi import HTTPException
 import pytest
 
 from app import app_update_batches as batches
-from app import fs_locks, install, models, settled
+from app import fs_locks, install, models, pending_update, settled
 
 COMMIT = "a" * 40
 
@@ -43,7 +43,7 @@ class _Receipts:
     self.paths = []
 
   def add(self, source_dir, app_id, commit=COMMIT):
-    path = install.pending_update_receipt_file(source_dir)
+    path = pending_update.pending_update_receipt_file(source_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
       "schema": 4, "app_id": app_id, "upstream_commit": commit,
@@ -827,10 +827,10 @@ def test_landed_update_with_a_leftover_pending_directory_reads_updated(tmp_path,
     source_dir=str(repo), source_commit=served, upstream_commit=reviewed, version="2.0")
   db.add(app)
   db.commit()
-  receipt = install.pending_update_receipt_file(repo)
+  receipt = pending_update.pending_update_receipt_file(repo)
   receipt.parent.mkdir(parents=True)
   (receipt.parent / "checkout").mkdir()  # the checkout not yet removed
-  assert install.pending_conflict_update_receipt_present(repo)
+  assert pending_update.pending_conflict_update_receipt_present(repo)
   outcome = batches._settled_outcomes({app.id: reviewed})[app.id]
   assert (outcome["status"], outcome["version"]) == ("updated", "2.0")
   # A later update's receipt does not unseat the one that landed.

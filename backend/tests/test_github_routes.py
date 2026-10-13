@@ -1098,7 +1098,7 @@ def test_connect_published_app_reuses_reviewed_local_row_idempotently(
   for a fast-forward landing. A retry after a real merge commit must still
   take the full proof path so a pending conflict receipt is honoured.
   """
-  from app import app_git, install, models
+  from app import app_git, install, models, pending_update
   from app.app_capabilities import contract_and_digest
   from app.database import SessionLocal
 
@@ -1279,7 +1279,7 @@ def test_connect_published_app_reuses_reviewed_local_row_idempotently(
 
   # Simulate the narrow crash window after a conflicting handoff committed
   # the app identity and pending receipt but before its ledger mirror landed.
-  install.stage_pending_conflict_update(
+  pending_update.stage_pending_conflict_update(
     source,
     app_id=target["id"],
     upstream_commit=landed,
@@ -1303,7 +1303,7 @@ def test_connect_published_app_reuses_reviewed_local_row_idempotently(
   assert recovered.json()["connection"]["conflict_paths"] == []
   assert installs == 1
 
-  install.stage_pending_conflict_update(
+  pending_update.stage_pending_conflict_update(
     source,
     app_id=target["id"],
     upstream_commit=landed,
@@ -15851,3 +15851,47 @@ def test_a_cancel_just_after_the_pr_opens_is_recovered_from_its_receipt(
   settled_record = response.json()["record"]
   assert (settled_record["status"], settled_record["number"]) == ("draft", 77)
   assert not receipt_path.exists()
+
+
+_CANONICAL_PUBLICATION = (
+  "https://raw.githubusercontent.com/mobius-os/app-notes/main/mobius.json"
+)
+
+
+@pytest.mark.parametrize("manifest_url, accepted", [
+  (_CANONICAL_PUBLICATION, True),
+  (_CANONICAL_PUBLICATION.replace("https://", "HTTPS://"), False),
+  (_CANONICAL_PUBLICATION.replace(".com/", ".com//"), False),
+  (_CANONICAL_PUBLICATION.replace(".com/", ".com:443/"), False),
+  (_CANONICAL_PUBLICATION.replace("raw.github", "RAW.GITHUB"), False),
+  (_CANONICAL_PUBLICATION + "?token=1", False),
+  (_CANONICAL_PUBLICATION + "#manifest-id=notes", False),
+  (_CANONICAL_PUBLICATION.replace("app-notes", "app%2Dnotes"), False),
+  (_CANONICAL_PUBLICATION.replace("/main/", "/dev/"), False),
+  (_CANONICAL_PUBLICATION.replace("mobius-os/", "someone/"), False),
+  (_CANONICAL_PUBLICATION.replace("app-notes", "notes"), False),
+  (_CANONICAL_PUBLICATION.replace("mobius.json", "other.json"), False),
+  ("https://raw.githubusercontent.com/mobius-os/app-notes/main", False),
+])
+def test_publication_handoff_requires_the_canonical_manifest_spelling(
+  manifest_url, accepted,
+):
+  """Only the exact canonical address identifies a published catalog app."""
+  from app.contribution_errors import ContributionSubmitError
+  from app.github_contributions import publication_handoff_identity
+
+  record = {
+    "id": "publish-notes", "type": "pr", "status": "merged",
+    "repo": "mobius-os/app-notes",
+    "plan": {"after_merge": {
+      "action": "connect_app", "app_id": 7, "manifest_url": manifest_url,
+    }},
+  }
+  if not accepted:
+    with pytest.raises(ContributionSubmitError):
+      publication_handoff_identity(record)
+    return
+  identity = publication_handoff_identity(record)
+  assert identity.repo_slug == "mobius-os/app-notes"
+  assert identity.manifest_id == "notes"
+  assert identity.target_app_id == 7

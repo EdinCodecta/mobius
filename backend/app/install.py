@@ -24,8 +24,6 @@ See feature ticket 062 for the design rationale.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
-import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -39,7 +37,6 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 from urllib.parse import quote, urljoin, urlparse
@@ -55,7 +52,6 @@ from app import (
   app_git,
   app_python_env,
   applied_app_runtime,
-  data_git,
   drawer_pins,
   fs_locks,
   icon_assets,
@@ -90,7 +86,6 @@ from app.manifest_contract import (
   EXECUTABLE_MANIFEST_FIELDS,
   MANIFEST_MAX_BYTES as _CONTRACT_MANIFEST_MAX_BYTES,
   PACKAGE_MAX_BYTES as _CONTRACT_PACKAGE_MAX_BYTES,
-  SKILL_MAX_BYTES as _CONTRACT_SKILL_MAX_BYTES,
   SYSTEM_PROMPT_MAX_BYTES as _CONTRACT_SYSTEM_PROMPT_MAX_BYTES,
   REQUIRED_STRING_FIELDS,
   ManifestContractError,
@@ -98,7 +93,6 @@ from app.manifest_contract import (
   package_bytes,
   package_limit_message,
   python_lock,
-  skill_member_paths,
   static_asset_entries,
   validate_manifest_contract,
   validate_schedule_job,
@@ -114,6 +108,19 @@ from app.net_utils import (
   validate_url_safe as _validate_url_safe,
 )
 from app.storage_io import atomic_write
+# Moved out of this module and imported by name: tests patch `_stage`,
+# `fetch_app_commit`, `_sync_app_skills` and `clear_pending_conflict_update`
+# here to reach the install path, and routes call `fetch_app_commit` and
+# apply calls `_sync_app_skills` through this module for the same reason.
+from app.app_skills import _sync_app_skills
+from app.git_transfers import (
+  _stage, discard_staged, fetch_app_commit, git_transfer_root,
+)
+from app.pending_update import (
+  clear_pending_conflict_update,
+  committed_pending_resolution,
+  stage_pending_conflict_update,
+)
 from app.terminal_output import strip_terminal_noise
 from app.app_identity import (
   allocate_unique_slug,
@@ -210,47 +217,11 @@ def _compile_error_detail(app_name: str, exc: CompileError) -> str:
 _STATIC_ASSETS_MANIFEST = managed_paths.STATIC_ASSETS_MANIFEST
 _STATIC_ASSETS_BACKUP_ASSET_PREFIX = "assets"
 _STATIC_ASSETS_BACKUP_METADATA_PREFIX = "metadata"
-_PENDING_UPDATE_DIR = "mobius-pending-update"
 
-# Shared skill files an app declares via manifest `skills`: a root-level
-# `<id>.md` or a `<id>/` folder (SKILL.md + sibling markdown) whose
-# `source_files` the post-commit sync phase copies into /data/shared/skills/.
-# Records key by that relative path. Small caps — skills are prose, not data.
-_SKILL_MAX_BYTES = _CONTRACT_SKILL_MAX_BYTES
 
 # A system-prompt fragment is more privileged than a skill because it is read
 # every turn. It uses the same root-level markdown and byte-size contract.
 _SYSTEM_PROMPT_MAX_BYTES = _CONTRACT_SYSTEM_PROMPT_MAX_BYTES
-
-# Installer-owned ownership/provenance sidecar inside the skills dir. A
-# dotfile that is not `*.md`, so the skill loaders (the app-skills catalog
-# app, the SDK skill-load observers) never list or read it.
-_APP_SKILLS_SIDECAR = ".app-skills.json"
-
-
-def _app_skill_id(rel: str) -> str:
-  """The shared-skill id a recorded app skill path belongs to."""
-  folder, sep, _ = rel.partition("/")
-  return folder if sep else Path(rel).stem
-
-
-def _is_app_skill_rel(rel: str) -> bool:
-  """A record path the installer may touch: `<id>.md` or `<id>/<file>.md`."""
-  parts = rel.split("/")
-  if len(parts) == 1:
-    return rel.endswith(".md") and Path(rel).name == rel and rel[0] != "."
-  return (
-    len(parts) == 2
-    and all(part and not part.startswith(".") for part in parts)
-    and parts[1].endswith(".md")
-  )
-
-
-def _prune_empty_skill_folder(root: Path, rel: str) -> None:
-  """Drop a folder skill's directory once its last member has moved away."""
-  if "/" in rel:
-    with contextlib.suppress(OSError):
-      (root / rel.partition("/")[0]).rmdir()
 
 
 # Tracked files in a merged tree that are NOT hand-written app source: the
@@ -264,6 +235,8 @@ _HTTP_TIMEOUT = 15.0
 
 # Tests override this module attribute to prevent production cron mutation.
 CRON_SCAFFOLD = app_cron.BAKED_CRON_SCAFFOLD
+# Moved to `app_cron`; this name stays for callers and tests that patch it here.
+_unregister_cron = app_cron.unregister_cron
 
 
 def _validate_manifest(m: dict) -> None:
@@ -803,31 +776,23 @@ async def _resolve_source_identity(
   an exact URL-derived identity and can still move through the explicit
   old-source handoff contract.
   """
-  repository = _github_root_manifest_identity(source_url)
-  if repository is None:
+  root = parse_root_manifest(source_url)
+  if root is None:
     base = _canonical_base(source_url)
     digest = hashlib.sha256(base.encode("utf-8")).hexdigest()
     return f"url:{digest}", source_url
 
-  owner, repo = repository
-  repository_id = _TRUSTED_CATALOG_REPOSITORY_IDS.get(repository)
+  repository_id = _TRUSTED_CATALOG_REPOSITORY_IDS.get(root.repository)
   if repository_id is not None:
-    canonical_owner, canonical_repo = repository
+    canonical_owner, canonical_repo = root.repository
   else:
     repository_id, canonical_owner, canonical_repo = (
-      await _fetch_github_repository(client, owner, repo)
+      await _fetch_github_repository(client, root.owner, root.repo)
     )
-
-  parsed = urlparse(source_url)
-  parts = [part for part in parsed.path.split("/") if part]
-  if len(parts) < 3:
-    raise HTTPException(400, "GitHub package source is not a root manifest.")
-  parts[0] = canonical_owner
-  parts[1] = canonical_repo
-  trailing_slash = parsed.path.endswith("/")
-  canonical_path = "/" + "/".join(parts) + ("/" if trailing_slash else "")
-  canonical_url = parsed._replace(path=canonical_path).geturl()
-  return f"github:{repository_id}", canonical_url
+  canonical = dataclasses.replace(
+    root, owner=canonical_owner, repo=canonical_repo,
+  )
+  return f"github:{repository_id}", canonical.url
 
 
 async def _fetch_github_repository(
@@ -1167,93 +1132,6 @@ def _write_static_assets(
     )
 
 
-def stage_pending_conflict_update(
-  source_dir: str | Path,
-  *,
-  app_id: int,
-  upstream_commit: str,
-  manifest: dict,
-  raw_base: str,
-  capability_digest: str,
-  candidate_digest: str,
-  merge_base_override: str | None = None,
-) -> None:
-  """Persist everything explicit resolution needs to finish an update.
-
-  A conflict deliberately returns before install materialization. The resolver
-  may run minutes later (or after a restart), so its exact identity must
-  outlive the request. The digest binds every fetched source/static/icon/seed
-  byte; replay refetches and refuses to promote if any byte moved. The receipt
-  lives under ``.git`` and is replaced atomically, so a restart sees either the
-  previous complete candidate or the new complete candidate, never a gap. A
-  newer conflicting release supersedes any resolution parked for an older one;
-  the same release conflicting again keeps the resolver's checkout.
-  """
-  repo = Path(source_dir)
-  git_dir = repo / ".git"
-  target = git_dir / _PENDING_UPDATE_DIR
-  if target.is_symlink():
-    raise ValueError("pending update path must not be a symlink")
-  target.mkdir(parents=True, exist_ok=True)
-  try:
-    previous = json.loads((target / "receipt.json").read_text(encoding="utf-8"))
-  except (OSError, ValueError):
-    previous = None
-  if not isinstance(previous, dict) or (
-    previous.get("upstream_commit") != upstream_commit
-  ):
-    _drop_pending_update_worktree(repo)
-  atomic_write(target / "receipt.json", json.dumps({
-    "schema": 4,
-    "app_id": app_id,
-    "upstream_commit": upstream_commit,
-    "manifest": manifest,
-    "raw_base": raw_base,
-    "capability_digest": capability_digest,
-    "candidate_digest": candidate_digest,
-    "merge_base_override": merge_base_override,
-  }, ensure_ascii=False, sort_keys=True) + "\n")
-
-
-def pending_update_worktree(source_dir: str | Path) -> Path:
-  """The private checkout where a resolver reconciles one pending update.
-
-  It lives inside the app's own git directory, so the served source directory
-  never holds a half-merged tree: ordinary edits and applies keep working
-  while a resolver works, and finalization merges those late edits with the
-  resolution through the same three-way merge every update uses.
-  """
-  return Path(source_dir) / ".git" / _PENDING_UPDATE_DIR / "worktree"
-
-
-_CONFLICT_MARKER = r"^(<{7,} |>{7,} )"
-
-
-def committed_conflict_marker_paths(
-  repo: str | Path, ref: str, upstream_commit: str,
-) -> list[str] | None:
-  """Paths the resolution changed from upstream that commit a conflict
-  boundary. Unchanged upstream content is never a conflict, even if it
-  legitimately contains such a line. None when Git cannot tell."""
-  repo = Path(repo)
-  changed = app_git._run(
-    repo, "diff", "--name-only", "-z", upstream_commit, ref, check=False,
-  )
-  if changed.returncode != 0:
-    return None
-  paths = [path for path in changed.stdout.split("\0") if path]
-  if not paths:
-    return []
-  found = app_git._run(
-    repo, "grep", "-z", "-lE", _CONFLICT_MARKER, ref, "--",
-    *(f":(literal){path}" for path in paths),
-    check=False,
-  )
-  if found.returncode > 1:
-    return None
-  return [p.removeprefix(f"{ref}:") for p in found.stdout.split("\0") if p]
-
-
 def _update_package_paths(
   source_dir: str | Path, incoming_manifest: dict,
 ) -> set[str] | None:
@@ -1345,107 +1223,6 @@ async def _kept_local_bundle_unchanged(
       return False
   finally:
     await asyncio.to_thread(shutil.rmtree, temp, ignore_errors=True)
-
-
-def committed_pending_resolution(
-  source_dir: str | Path, upstream_commit: str,
-) -> str | None:
-  """The resolver's committed answer for ``upstream_commit``, if it has one.
-
-  The answer is the private checkout's commit, and only when it contains the
-  pending upstream, nothing is left uncommitted or mid-merge, and it commits no
-  conflict markers. Git has already refused to commit any unresolved path.
-  """
-  worktree = pending_update_worktree(source_dir)
-  if (
-    not (worktree / ".git").exists()
-    or app_git.merge_in_progress(worktree)
-    or app_git.worktree_dirty(worktree)
-    or app_git.ref_is_ancestor(worktree, upstream_commit, "HEAD") is not True
-    or committed_conflict_marker_paths(worktree, "HEAD", upstream_commit) != []
-  ):
-    return None
-  return app_git._run(worktree, "rev-parse", "HEAD").stdout.strip()
-
-
-def pending_update_resolved(source_dir: str | Path, upstream_commit: str) -> bool:
-  """Whether nothing but installation is left for this pending update.
-
-  Either the private checkout holds a committed answer, or ``main`` already
-  contains the upstream: a resolver from an earlier release committed there,
-  or an install moved ``main`` and was interrupted before completing. In both
-  cases rerunning the installer promotes it; the receipt stays until then.
-  """
-  return (
-    app_git.ref_is_ancestor(source_dir, upstream_commit, app_git.LOCAL_BRANCH)
-    is True
-    or committed_pending_resolution(source_dir, upstream_commit) is not None
-  )
-
-
-def _drop_pending_update_worktree(source_dir: str | Path) -> None:
-  worktree = pending_update_worktree(source_dir)
-  if os.path.lexists(worktree):
-    app_git.remove_overlay_worktree(source_dir, worktree)
-
-
-def pending_update_receipt_file(source_dir: str | Path) -> Path:
-  """The durable "not installed yet" marker of a pending update."""
-  return Path(source_dir) / ".git" / _PENDING_UPDATE_DIR / "receipt.json"
-
-
-def pending_conflict_update_receipt_present(source_dir: str | Path) -> bool:
-  """Whether any pending-receipt filesystem entry needs validation."""
-  root = Path(source_dir) / ".git" / _PENDING_UPDATE_DIR
-  receipt_path = root / "receipt.json"
-  return os.path.lexists(root) or os.path.lexists(receipt_path)
-
-
-def read_pending_conflict_update_receipt(
-  source_dir: str | Path, *, app_id: int, upstream_commit: str | None,
-) -> dict | None:
-  """Read validated pending metadata without loading potentially large assets.
-
-  Receipts written by earlier releases (schemas 1-3) carried a resolution
-  policy and a reviewed tree; both are ignored because the resolver's own
-  commit is now the complete answer.
-  """
-  root = Path(source_dir) / ".git" / _PENDING_UPDATE_DIR
-  receipt_path = root / "receipt.json"
-  if root.is_symlink() or receipt_path.is_symlink():
-    return None
-  try:
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-  except (OSError, ValueError):
-    return None
-  if not isinstance(receipt, dict):
-    return None
-  schema = receipt.get("schema")
-  merge_base_override = (
-    receipt.get("merge_base_override") if schema in (3, 4) else None
-  )
-  if (
-    schema not in (1, 2, 3, 4)
-    or receipt.get("app_id") != app_id
-    or not upstream_commit
-    or receipt.get("upstream_commit") != upstream_commit
-    or not isinstance(receipt.get("manifest"), dict)
-    or not isinstance(receipt.get("raw_base"), str)
-    or not isinstance(receipt.get("capability_digest"), str)
-    or not re.fullmatch(r"[0-9a-f]{64}", receipt.get("candidate_digest", ""))
-    or (
-      merge_base_override is not None
-      and (
-        not isinstance(merge_base_override, str)
-        or not re.fullmatch(
-          r"(?:[0-9a-f]{40}|[0-9a-f]{64})", merge_base_override,
-        )
-      )
-    )
-  ):
-    return None
-  receipt["merge_base_override"] = merge_base_override
-  return receipt
 
 
 PackageContentBytes = bytes | app_git.GitTreeBlob
@@ -1678,23 +1455,6 @@ def _require_git_candidate(
   })
 
 
-async def clear_pending_conflict_update(db: Session, app: models.App) -> None:
-  """Remove the receipt and resolver binding; caller holds the source lock."""
-  source_dir = app.source_dir
-  # The receipt is the durable "not installed yet" marker, so it goes first. A
-  # crash afterwards leaves only a stray checkout, which the next conflict or
-  # resolver replaces.
-  pending_update_receipt_file(source_dir).unlink(missing_ok=True)
-  app.conflict_resolver_chat_id = None
-  app.conflict_resolver_upstream_commit = None
-  db.commit()
-  await settled.run_settled(_drop_pending_update_worktree, source_dir)
-  shutil.rmtree(
-    Path(source_dir) / ".git" / _PENDING_UPDATE_DIR,
-    ignore_errors=True,
-  )
-
-
 def _reconcile_cron_after_install_rollback() -> None:
   """Best-effort safe restoration after an adopted source-dir move fails.
 
@@ -1720,72 +1480,6 @@ def _reconcile_cron_after_install_rollback() -> None:
     # Rollback is already a best-effort failure path. Log without masking the
     # original install exception that caused it.
     log.warning("install rollback cron reconciliation failed: %s", exc)
-
-
-def _crontab_without_app(current: str, source_dir: Path) -> str | None:
-  """Return `current` crontab text with every line whose COMMAND runs a
-  script under `source_dir` removed — or None if nothing matched, so the
-  caller can skip rewriting entirely.
-
-  Matches on the command's executable path (see `app_cron.crontab_command_path`),
-  NOT a whole-line substring: that keeps the news/news-2 prefix safe AND
-  avoids dropping an unrelated app whose ARGUMENTS merely reference this
-  app's dir (e.g. `... /data/apps/agg/run.sh --feed /data/apps/news/x`).
-  Comments, blanks, and `PATH=`/env lines run no command and are preserved;
-  `@daily`/`@reboot` shorthand and inline `VAR=val <cmd>` are handled too.
-  """
-  needle = f"{str(source_dir).rstrip('/')}/"
-  kept, dropped = [], False
-  for ln in current.splitlines():
-    if app_cron.crontab_command_path(ln).startswith(needle):
-      dropped = True
-    else:
-      kept.append(ln)
-  if not dropped:
-    return None
-  return ("\n".join(kept) + "\n") if kept else ""
-
-
-def _unregister_cron(source_dir: Path) -> None:
-  """Remove crontab entries that invoke scripts under `source_dir`.
-
-  Called on app delete so a removed app does not leave a crontab entry
-  firing a now-missing script. The spool isn't on the /data volume, so
-  an orphan self-clears on the next container restart anyway — this just
-  stops it firing (and erroring) in the meantime, and prevents stale
-  lines like the `news-2/job.sh` orphan from accumulating across
-  reinstalls. Best-effort: every failure is swallowed, exactly like the
-  source-tree rmtree this accompanies. Runs `crontab -u mobius` (the
-  server runs as mobius, which may edit its own crontab).
-  """
-  if app_cron.cron_mutation_blocked_in_test_runtime():
-    return
-  try:
-    listing = subprocess.run(
-      ["crontab", "-u", "mobius", "-l"],
-      capture_output=True, text=True, timeout=10,
-    )
-  except (OSError, subprocess.SubprocessError):
-    return
-  if listing.returncode != 0:
-    # No crontab yet, or no crontab binary (as in the test image) —
-    # nothing to clean.
-    return
-  new_crontab = _crontab_without_app(listing.stdout, source_dir)
-  if new_crontab is None:
-    return  # no entry referenced this app — leave the crontab untouched
-  try:
-    proc = subprocess.run(
-      ["crontab", "-u", "mobius", "-"],
-      input=new_crontab, text=True, timeout=10, check=False,
-    )
-  except (OSError, subprocess.SubprocessError):
-    return
-  if proc.returncode != 0:
-    log.warning(
-      "cron: failed to rewrite mobius crontab on app delete (rc=%s)",
-      proc.returncode,
-    )
 
 
 def _drop_app_cron(source_dir: Path) -> None:
@@ -1823,397 +1517,6 @@ def _storage_path(app_id: int, sub: str) -> Path:
   except ManifestContractError as exc:
     raise HTTPException(400, str(exc)) from exc
   return data_dir / "apps" / str(app_id) / sub
-
-
-async def _sync_app_skills(
-  db: Session,
-  app: "models.App",
-  manifest: dict,
-  warnings: list[str],
-) -> None:
-  """Materializes manifest-declared skill files into /data/shared/skills.
-
-  Post-commit best-effort phase (same contract as cron): the app row is
-  already durable, so every failure appends a warning instead of raising.
-  Bytes come from the app's FINAL on-disk source tree, which is uniform
-  across the synthetic, clone, and post-merge update paths (validation
-  guarantees skills ⊆ root source_files, so the tree carries them).
-
-  The never-lose-work contract: a present skill file whose bytes differ
-  from what this installer last recorded (agent edits) is git-snapshotted
-  into the /data repo BEFORE being
-  overwritten, and left untouched when the snapshot cannot be guaranteed.
-  Ownership rides the installer-owned sidecar so one app can never
-  silently take over another live app's skill file.
-  """
-  skills = skill_member_paths(manifest)
-  data_dir = Path(get_settings().data_dir)
-  skills_dir = data_dir / "shared" / "skills"
-  source_dir = Path(app.source_dir)
-  version = str(manifest.get("version", "unknown"))
-  async with fs_locks.shared_skills_lock():
-    from app import skills as skills_mod
-
-    # Resolve any crash-interrupted /api/skills install FIRST, so a pending
-    # directory skill is either a fully-owned collision below or gone — the
-    # same reconciliation the direct install/uninstall paths run under this
-    # lock. Then read the installed-skills sidecar so this writer honors the
-    # SAME basename-collision policy as a direct install: a flat `foo.md` must
-    # never coexist with an installed directory skill `foo/` under one id.
-    skills_mod.reconcile_installed(skills_dir)
-    installed_records = skills_mod._read_sidecar(
-      skills_dir / skills_mod.INSTALLED_SKILLS_SIDECAR
-    )
-    # Platform seeds have a recorded owner too. An app may continue managing a
-    # basename it already owns, but may not silently adopt a platform skill
-    # merely because both use the historical flat-file shape.
-    seed_sidecar = skills_dir / skills_mod.SEED_SKILLS_SIDECAR
-    if seed_sidecar.is_symlink():
-      warnings.append("skills: platform ownership unreadable — sync skipped")
-      return
-    if seed_sidecar.exists():
-      try:
-        seed_records = json.loads(seed_sidecar.read_text(encoding="utf-8"))
-      except (OSError, ValueError):
-        seed_records = None
-      if (
-        not isinstance(seed_records, dict)
-        or any(not isinstance(name, str) or not isinstance(rec, dict)
-               for name, rec in seed_records.items())
-      ):
-        warnings.append("skills: platform ownership unreadable — sync skipped")
-        return
-    else:
-      seed_records = {}
-    seed_owned = {
-      name for name, rec in seed_records.items()
-      if isinstance(rec, dict) and rec.get("status") != "retired"
-    } | {
-      f"{name}.md" for name in skills_mod._seed_names()
-    }
-    sidecar_path = skills_dir / _APP_SKILLS_SIDECAR
-    records: dict = {}
-    if sidecar_path.exists():
-      try:
-        loaded = json.loads(sidecar_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-          records = loaded
-      except (OSError, ValueError):
-        # A corrupt sidecar downgrades every present file to the
-        # modified-or-unrecorded case — snapshot-then-overwrite — which is
-        # the safe direction: work is preserved, ownership is re-earned.
-        warnings.append("skills: ownership sidecar unreadable — rebuilding")
-    desired = set(skills)
-    # An update that drops a previously-owned skill must deactivate it just as
-    # surely as an uninstall. Preserve the exact bytes in a retired archive,
-    # then release the basename for another app.
-    for rel, rec in list(records.items()):
-      if not isinstance(rec, dict) or rec.get("app_id") != app.id:
-        continue
-      if rel in desired:
-        continue
-      target = skills_dir / rel
-      retired = (
-        skills_dir / ".inactive" / str(app.id) / "retired" / rel
-      )
-      inactive = skills_dir / ".inactive" / str(app.id) / rel
-      source = target if target.is_file() else inactive
-      if source.is_file():
-        retired.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(source, retired)
-      _prune_empty_skill_folder(skills_dir, rel)
-      records.pop(rel, None)
-      warnings.append(f"skill {rel}: retired by update")
-    # Ownership and shape collisions are decided per skill id, so a folder
-    # skill lands or is skipped as a whole rather than file by file.
-    ours = {
-      key for key, rec in records.items()
-      if isinstance(rec, dict) and rec.get("app_id") == app.id
-    }
-    refused_ids: dict[str, str] = {}
-    for skill_id in dict.fromkeys(_app_skill_id(rel) for rel in skills):
-      is_folder = f"{skill_id}.md" not in skills
-      flat, folder = skills_dir / f"{skill_id}.md", skills_dir / skill_id
-      owners = {
-        rec.get("app_id") for key, rec in records.items()
-        if isinstance(rec, dict) and _app_skill_id(key) == skill_id
-      } - {app.id, None}
-      live_owner = None
-      for owner_id in owners:
-        live_owner = db.query(models.App).filter(models.App.id == owner_id).first()
-        if live_owner is not None:
-          break
-      if f"{skill_id}.md" in seed_owned and f"{skill_id}.md" not in ours:
-        refused_ids[skill_id] = "owned by the platform"
-      elif live_owner is not None:
-        # A hard-purged recorded owner no longer reserves the id.
-        refused_ids[skill_id] = f"owned by app {live_owner.slug}"
-      elif isinstance(installed_records.get(skill_id), dict) or (
-        not is_folder and folder.is_dir()
-      ):
-        # Cross-SHAPE collision: an install-provenance skill may hold the same
-        # logical id in the other on-disk shape. Refuse a second skill under
-        # one id; the owner resolves it by removing one deliberately.
-        refused_ids[skill_id] = (
-          f"an installed skill already holds id {skill_id!r} "
-          "(directory shape)"
-        )
-      elif is_folder and (
-        flat.exists()
-        # A folder is someone else's when it holds none of this app's recorded
-        # members and a file this app does not declare. A folder of only our
-        # declared files (e.g. after a sidecar rebuild) re-earns ownership
-        # through the snapshot-then-overwrite path, like a flat skill.
-        or (folder.is_dir()
-            and not any(key.startswith(f"{skill_id}/") for key in ours)
-            and any(f"{skill_id}/{child.name}" not in skills
-                    for child in folder.iterdir()))
-      ):
-        refused_ids[skill_id] = (
-          f"id {skill_id!r} is already held by another file or folder"
-        )
-    for rel in skills:
-      if _app_skill_id(rel) in refused_ids:
-        warnings.append(f"skill {rel}: {refused_ids[_app_skill_id(rel)]} — skipped")
-        continue
-      try:
-        content = (source_dir / rel).read_bytes()
-      except OSError:
-        # Validation checked the manifest's declaration, not the repo's
-        # contents — a clone whose tree lacks the file lands here.
-        warnings.append(f"skill {rel}: missing from installed source tree")
-        continue
-      if len(content) > _SKILL_MAX_BYTES:
-        warnings.append(
-          f"skill {rel}: exceeds {_SKILL_MAX_BYTES} bytes — skipped"
-        )
-        continue
-      rec = records.get(rel)
-      owner_id = rec.get("app_id") if isinstance(rec, dict) else None
-      if (
-        isinstance(rec, dict)
-        and owner_id == app.id
-        and rec.get("active", True) is False
-      ):
-        inactive = skills_dir / ".inactive" / str(app.id) / rel
-        if inactive.is_file():
-          retired = (
-            skills_dir / ".inactive" / str(app.id) / "retired" / rel
-          )
-          retired.parent.mkdir(parents=True, exist_ok=True)
-          os.replace(inactive, retired)
-      target = skills_dir / rel
-      recorded_sha = rec.get("sha256") if isinstance(rec, dict) else None
-      if target.exists():
-        current_sha = hashlib.sha256(target.read_bytes()).hexdigest()
-        if current_sha != recorded_sha:
-          # Modified since last recorded, or never recorded (an agent
-          # edit): snapshot the current
-          # bytes before replacing them — never trade edits for an update.
-          if (data_dir / ".git").is_dir():
-            try:
-              ok, detail = await settled.run_settled(
-                data_git.snapshot_path,
-                data_dir,
-                f"shared/skills/{rel}",
-                f"pre-install snapshot of {rel} (app {app.slug} v{version})",
-              )
-            except Exception as exc:
-              ok, detail = False, repr(exc)
-            if not ok:
-              warnings.append(
-                f"skill {rel}: left unchanged (snapshot failed: {detail}); "
-                "will retry next update"
-              )
-              continue
-            warnings.append(f"skill {rel}: snapshotted then updated")
-          else:
-            warnings.append(
-              f"skill {rel}: updated, no /data repo for snapshot"
-            )
-      target.parent.mkdir(parents=True, exist_ok=True)
-      atomic_write(target, content)
-      # 0o664 mirrors init_skills' boot convention — group-writable so the
-      # agent can edit the skill no matter which uid materialized it.
-      os.chmod(target, 0o664)
-      records[rel] = {
-        "app_id": app.id,
-        "slug": app.slug,
-        "manifest_url": app.manifest_url,
-        "sha256": hashlib.sha256(content).hexdigest(),
-        "installed_at": datetime.now(UTC).isoformat(),
-        "active": True,
-      }
-      # Persist provenance immediately after each file lands: a crash
-      # between files must never leave an installed skill without its
-      # ownership record (the next install would treat it as agent-modified
-      # and snapshot-then-overwrite — safe, but noisy). Installs are rare
-      # and the JSON is tiny, so a per-file write costs nothing.
-      atomic_write(
-        sidecar_path,
-        json.dumps(records, indent=2, sort_keys=True) + "\n",
-      )
-    # Persist the final reconciliation too: a non-empty desired set can still
-    # skip every file, and removals above must not be retried forever. Keep the
-    # per-file writes for crash safety between successful materializations.
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write(
-      sidecar_path,
-      json.dumps(records, indent=2, sort_keys=True) + "\n",
-    )
-    # The skill set changed (or may have) — refresh the generated tier-1 index
-    # INSIDE the lock. Regenerating after release let a concurrent direct
-    # install/uninstall's newer index be overwritten by this writer's stale
-    # snapshot. Best-effort like everything else in this post-commit phase.
-    _regenerate_skills_index(skills_dir)
-
-
-def _read_app_skill_records(skills_dir: Path) -> tuple[Path, dict]:
-  sidecar = skills_dir / _APP_SKILLS_SIDECAR
-  try:
-    value = json.loads(sidecar.read_text(encoding="utf-8"))
-  except (OSError, ValueError):
-    value = {}
-  return sidecar, value if isinstance(value, dict) else {}
-
-
-async def deactivate_app_skills(app_id: int) -> list[str]:
-  """Remove one app's skills from discovery while preserving exact bytes."""
-  warnings: list[str] = []
-  skills_dir = Path(get_settings().data_dir) / "shared" / "skills"
-  async with fs_locks.shared_skills_lock():
-    sidecar, records = _read_app_skill_records(skills_dir)
-    changed = False
-    for rel, rec in records.items():
-      if not isinstance(rec, dict) or rec.get("app_id") != app_id:
-        continue
-      if not _is_app_skill_rel(rel):
-        warnings.append(f"skill record {rel!r}: invalid path")
-        continue
-      target = skills_dir / rel
-      inactive = skills_dir / ".inactive" / str(app_id) / rel
-      try:
-        if target.is_file():
-          inactive.parent.mkdir(parents=True, exist_ok=True)
-          os.replace(target, inactive)
-          _prune_empty_skill_folder(skills_dir, rel)
-        if inactive.is_file():
-          # Keep ``sha256`` as the last app-supplied baseline. The inactive
-          # digest records the exact preserved bytes separately; otherwise an
-          # owner-edited skill would become its own new baseline and a later
-          # app update could overwrite it without taking the normal snapshot.
-          rec["inactive_sha256"] = hashlib.sha256(
-            inactive.read_bytes()
-          ).hexdigest()
-          rec["active"] = False
-          rec["inactive_path"] = str(inactive.relative_to(skills_dir))
-          rec["deactivated_at"] = datetime.now(UTC).isoformat()
-          changed = True
-      except OSError as exc:
-        warnings.append(f"skill {rel}: could not deactivate ({exc})")
-    if changed:
-      atomic_write(
-        sidecar,
-        json.dumps(records, indent=2, sort_keys=True) + "\n",
-      )
-    # Inside the lock: a stale post-release regen could clobber a concurrent
-    # mutation's newer index.
-    _regenerate_skills_index(skills_dir)
-  return warnings
-
-
-async def restore_app_skills(app_id: int) -> list[str]:
-  """Restore exact tombstoned skill bytes and their discovery records."""
-  warnings: list[str] = []
-  skills_dir = Path(get_settings().data_dir) / "shared" / "skills"
-  async with fs_locks.shared_skills_lock():
-    sidecar, records = _read_app_skill_records(skills_dir)
-    changed = False
-    for rel, rec in records.items():
-      if (
-        not isinstance(rec, dict)
-        or rec.get("app_id") != app_id
-        or rec.get("active", True) is not False
-      ):
-        continue
-      if not _is_app_skill_rel(rel):
-        warnings.append(f"skill record {rel!r}: invalid path")
-        continue
-      inactive = skills_dir / ".inactive" / str(app_id) / rel
-      target = skills_dir / rel
-      if not inactive.is_file():
-        warnings.append(f"skill {rel}: preserved bytes are missing")
-        continue
-      try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-          if target.read_bytes() != inactive.read_bytes():
-            conflict = (
-              skills_dir / ".inactive" / str(app_id) / "conflicts" / rel
-            )
-            conflict.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(target, conflict)
-            warnings.append(
-              f"skill {rel}: preserved a file created while app was inactive"
-            )
-          else:
-            target.unlink()
-        os.replace(inactive, target)
-        rec["active"] = True
-        rec.pop("inactive_path", None)
-        rec.pop("inactive_sha256", None)
-        rec["restored_at"] = datetime.now(UTC).isoformat()
-        changed = True
-      except OSError as exc:
-        warnings.append(f"skill {rel}: could not restore ({exc})")
-    if changed:
-      atomic_write(
-        sidecar,
-        json.dumps(records, indent=2, sort_keys=True) + "\n",
-      )
-    # Inside the lock: a stale post-release regen could clobber a concurrent
-    # mutation's newer index.
-    _regenerate_skills_index(skills_dir)
-  return warnings
-
-
-async def purge_app_skills(app_id: int) -> None:
-  """Release records and inactive archives after the recovery TTL expires."""
-  skills_dir = Path(get_settings().data_dir) / "shared" / "skills"
-  async with fs_locks.shared_skills_lock():
-    sidecar, records = _read_app_skill_records(skills_dir)
-    for rel, rec in list(records.items()):
-      if isinstance(rec, dict) and rec.get("app_id") == app_id:
-        target = skills_dir / rel
-        if rec.get("active", True) and target.is_file():
-          try:
-            digest = hashlib.sha256(target.read_bytes()).hexdigest()
-            if digest == rec.get("sha256"):
-              target.unlink()
-              _prune_empty_skill_folder(skills_dir, rel)
-          except OSError:
-            pass
-        records.pop(rel, None)
-    shutil.rmtree(
-      skills_dir / ".inactive" / str(app_id), ignore_errors=True,
-    )
-    atomic_write(
-      sidecar,
-      json.dumps(records, indent=2, sort_keys=True) + "\n",
-    )
-    # Inside the lock: a stale post-release regen could clobber a concurrent
-    # mutation's newer index.
-    _regenerate_skills_index(skills_dir)
-
-
-def _regenerate_skills_index(skills_dir: Path) -> None:
-  """Best-effort refresh of the generated skills-index.md after a change."""
-  try:
-    from app import skills as skills_mod
-
-    skills_mod.write_index(skills_dir)
-  except Exception:  # noqa: BLE001 - the index is a convenience surface
-    log.warning("skills index regeneration failed", exc_info=True)
 
 
 def _source_completeness(
@@ -2433,32 +1736,6 @@ def _new_candidate(
       source_review_digest or package_content_digest(**package)
     ),
   )
-
-
-_DERIVED_CANDIDATE_FIELDS = frozenset((
-  "capability_contract", "capability_digest", "candidate_digest",
-))
-
-
-def _with_source_identity(
-  candidate: InstallCandidate,
-  *,
-  source_identity: str | None,
-  predecessor_source_identity: str | None,
-  canonical_source_url: str | None,
-) -> InstallCandidate:
-  """The same package bound to resolved source identities, digests re-derived."""
-  package = {
-    item.name: getattr(candidate, item.name)
-    for item in dataclasses.fields(candidate)
-    if item.name not in _DERIVED_CANDIDATE_FIELDS
-  }
-  return _new_candidate(**{
-    **package,
-    "source_identity": source_identity,
-    "predecessor_source_identity": predecessor_source_identity,
-    "canonical_source_url": canonical_source_url,
-  })
 
 
 async def _resolve_package_identity(
@@ -2844,93 +2121,6 @@ def git_source_error(
   })
 
 
-def git_transfer_root() -> Path:
-  """Private staging for Git transfers; swept at boot, never a live app."""
-  return Path(get_settings().data_dir) / "apps" / ".git-transfers"
-
-
-def discard_staged(staged: app_git.Staged | None) -> None:
-  if staged is not None:
-    shutil.rmtree(staged.path, ignore_errors=True)
-
-
-# Transfers may each hold a thread for the full transfer ceiling, so they get
-# their own small pool instead of the default one the rest of the server uses.
-_GIT_TRANSFER_WORKERS = 4
-_TRANSFER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-  max_workers=_GIT_TRANSFER_WORKERS, thread_name_prefix="git-transfer",
-)
-
-
-async def _stage(stage: Callable[..., app_git.Staged], *args) -> app_git.Staged:
-  """Run a staging transfer; a cancelled caller still discards its result.
-
-  The transfer thread cannot be interrupted, so cancellation hands its
-  eventual staging directory to a callback instead of leaking it on disk.
-  """
-  loop = asyncio.get_running_loop()
-  transfer = loop.run_in_executor(
-    _TRANSFER_EXECUTOR, functools.partial(stage, *args),
-  )
-  try:
-    return await asyncio.shield(transfer)
-  except asyncio.CancelledError:
-    transfer.add_done_callback(
-      lambda done: not done.cancelled() and done.exception() is None
-      and loop.run_in_executor(None, discard_staged, done.result())
-    )
-    raise
-
-
-# One transfer per (repository, origin, ref) at a time; concurrent requests,
-# such as parallel Store update checks, share it instead of repeating it.
-_FETCHES: dict[tuple[str, str, str], asyncio.Future] = {}
-
-
-def _forget_fetch(key: tuple[str, str, str], done: asyncio.Future) -> None:
-  if _FETCHES.get(key) is done:
-    del _FETCHES[key]
-  if not done.cancelled():
-    done.exception()  # Retrieved even when every waiting request has gone.
-
-
-async def fetch_app_commit(
-  source_dir: str | Path, ref: str, *, expected_origin: str | None = None,
-) -> str:
-  """Make ``ref``'s commit present, with full history, in an app repository.
-
-  Callers hold no app lock: the transfer runs in a private staging repository
-  and only the local import takes this app's source lock, after checking the
-  repository and its origin are still the ones the transfer started from.
-  """
-  repo = Path(source_dir)
-  url = await asyncio.to_thread(app_git.origin_url, repo)
-  if expected_origin is not None and not app_git.same_origin(url, expected_origin):
-    raise ValueError("installed Git origin does not match update source")
-  present = await asyncio.to_thread(app_git.present_commit, repo, ref)
-  if present is not None:
-    return present
-  if url is None:
-    raise RuntimeError("source repository has no origin")
-  key = (str(repo.resolve()), url, ref)
-  shared = _FETCHES.get(key)
-  if shared is None or shared.get_loop() is not asyncio.get_running_loop():
-    shared = asyncio.ensure_future(_fetch_and_import(repo, url, ref))
-    _FETCHES[key] = shared
-    shared.add_done_callback(lambda done: _forget_fetch(key, done))
-  # A request that goes away leaves the shared transfer running for the rest.
-  return await asyncio.shield(shared)
-
-
-async def _fetch_and_import(repo: Path, url: str, ref: str) -> str:
-  staged = await _stage(app_git.stage_fetch, repo, url, ref, git_transfer_root())
-  try:
-    async with fs_locks.source_dir_lock(str(repo)):
-      return await settled.run_settled(app_git.import_staged, repo, staged)
-  finally:
-    await settled.run_settled(discard_staged, staged)
-
-
 def _url_update_commit(
   repo: Path, ref: str, staged_clone: app_git.Staged | None,
 ) -> str:
@@ -3178,37 +2368,88 @@ async def prepare_package(
     raise
 
 
-async def _staged_clone_candidate(
-  manifest_url: str, staged: app_git.Staged, *, db: Session | None,
-) -> InstallCandidate:
-  """Read a root Git package from its staged clone, binding its identity."""
-  source_url = requested_manifest_source(manifest_url)[0]
+def _read_staged_manifest(staged: app_git.Staged) -> dict | None:
+  """The staged commit's bounded, valid root manifest, or None.
+
+  None when it is absent, oversized or invalid, or when Git could not read
+  it; the full package read then reports which.
+  """
+  raw = app_git.read_committed_file(
+    staged.path, staged.sha, "mobius.json", max_bytes=_MANIFEST_MAX_BYTES,
+  )
+  if raw is None:
+    return None
   try:
-    candidate = (await asyncio.to_thread(
+    return _read_git_package_manifest({"mobius.json": raw}, strict=True)
+  except (ValueError, HTTPException):
+    return None
+
+
+async def _staged_package_identity(
+  manifest: dict, manifest_url: str, source_url: str, db: Session | None,
+) -> dict[str, str | None]:
+  """Check a staged manifest's address, then resolve a permanent identity.
+
+  The address is checked before any identity request, so a package at the
+  wrong address never reaches the network.
+  """
+  validate_manifest_address(manifest, manifest_url, db=db)
+  if db is not None:
+    db.rollback()
+  if not manifest.get("package_id"):
+    return {}
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
+    source_identity, predecessor, canonical = await _resolve_package_identity(
+      cli, manifest, source_url,
+    )
+  return dict(
+    source_identity=source_identity,
+    predecessor_source_identity=predecessor,
+    canonical_source_url=canonical,
+  )
+
+
+async def _read_staged_candidate(
+  staged: app_git.Staged, source_url: str, identity: dict[str, str | None],
+) -> InstallCandidate:
+  try:
+    return (await asyncio.to_thread(functools.partial(
       read_git_install_candidate, staged.path, staged.sha, source_url,
-    )).candidate
+      **identity,
+    ))).candidate
   except PackageTooLarge as exc:
     raise HTTPException(
       413, detail={"code": "package_too_large", "message": str(exc)},
     ) from exc
   except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
     raise HTTPException(422, f"The app's Git package is unusable: {exc}") from exc
-  validate_manifest_address(candidate.manifest, manifest_url, db=db)
-  if db is not None:
-    db.rollback()
-  if candidate.manifest.get("package_id"):
-    # Resolved from the bounded manifest the reader just accepted.
-    async with pinned_client(timeout=_HTTP_TIMEOUT) as cli:
-      source_identity, predecessor, canonical = await _resolve_package_identity(
-        cli, candidate.manifest, source_url,
-      )
-    candidate = _with_source_identity(
-      candidate,
-      source_identity=source_identity,
-      predecessor_source_identity=predecessor,
-      canonical_source_url=canonical,
+
+
+async def _staged_clone_candidate(
+  manifest_url: str, staged: app_git.Staged, *, db: Session | None,
+) -> InstallCandidate:
+  """Read a root Git package from its staged clone, binding its identity.
+
+  Identity comes from the bounded manifest alone, so the package is read
+  (and its digests derived) once, already bound to it.
+  """
+  source_url = requested_manifest_source(manifest_url)[0]
+  manifest = await asyncio.to_thread(_read_staged_manifest, staged)
+  if manifest is None:
+    # The full read reports an absent, oversized or invalid manifest. If it
+    # accepts the package, only the bounded read failed (a transient Git read
+    # error): bind identity from the manifest the full read accepted instead.
+    candidate = await _read_staged_candidate(staged, source_url, {})
+    identity = await _staged_package_identity(
+      candidate.manifest, manifest_url, source_url, db,
     )
-  return candidate
+    if not identity:
+      return candidate
+  else:
+    identity = await _staged_package_identity(
+      manifest, manifest_url, source_url, db,
+    )
+  return await _read_staged_candidate(staged, source_url, identity)
 
 
 def _require_reviewed_capabilities(
@@ -3866,16 +3107,14 @@ async def _prepare_app_row(
     if target.origin_migration and app_git.has_origin(app.source_dir):
       old_origin, new_origin = target.origin_migration
       current_origin = app_git.origin_url(app.source_dir)
-      normalized_origin = (
-        current_origin.rstrip("/").lower() if current_origin else None
-      )
-      if normalized_origin and normalized_origin not in {
-        old_origin.rstrip("/").lower(), new_origin.rstrip("/").lower(),
-      }:
+      if current_origin and not (
+        app_git.same_origin(current_origin, old_origin)
+        or app_git.same_origin(current_origin, new_origin)
+      ):
         raise HTTPException(
           409, "Installed app origin no longer matches its trusted source.",
         )
-      if normalized_origin and normalized_origin != new_origin.rstrip("/").lower():
+      if current_origin and not app_git.same_origin(current_origin, new_origin):
         app_git.set_origin_url(app.source_dir, new_origin)
         journal.rollback_actions.append(
           lambda p=app.source_dir, u=current_origin:

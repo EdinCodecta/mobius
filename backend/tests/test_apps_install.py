@@ -26,7 +26,10 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from app import app_apply, app_git, install, models, transcript_rows
+from app import (
+  app_apply, app_cron, app_git, git_transfers, install, models, pending_update,
+  transcript_rows,
+)
 from app.config import get_settings
 from test_app_fixtures import create_local_app
 from tests.cancel_helpers import assert_cancellation_drains_worker_under_lock
@@ -820,7 +823,7 @@ def test_crontab_without_app_is_prefix_safe_and_preserves_header():
   )
 
   # Removing "news" keeps the PATH header AND every news-2 line.
-  out = install._crontab_without_app(crontab, Path("/data/apps/news"))
+  out = app_cron.crontab_without_app(crontab, Path("/data/apps/news"))
   assert out is not None
   assert "/data/apps/news/fetch.sh" not in out
   assert "/data/apps/news/sync-cron.sh" not in out
@@ -828,7 +831,7 @@ def test_crontab_without_app_is_prefix_safe_and_preserves_header():
   assert "PATH=/usr/local/bin:/usr/bin:/bin" in out   # header preserved
 
   # Removing "news-2" leaves both news lines untouched.
-  out2 = install._crontab_without_app(crontab, Path("/data/apps/news-2"))
+  out2 = app_cron.crontab_without_app(crontab, Path("/data/apps/news-2"))
   assert out2 is not None
   assert "/data/apps/news-2/fetch.sh" not in out2
   assert "/data/apps/news/fetch.sh 12" in out2
@@ -839,17 +842,17 @@ def test_crontab_without_app_is_prefix_safe_and_preserves_header():
     "0 9 * * * /data/apps/news/fetch.sh 12\n"
     "0 6 * * * /data/apps/agg/run.sh --feed /data/apps/news/headlines\n"
   )
-  out3 = install._crontab_without_app(with_argref, Path("/data/apps/news"))
+  out3 = app_cron.crontab_without_app(with_argref, Path("/data/apps/news"))
   assert out3 is not None
   assert "/data/apps/news/fetch.sh" not in out3
   assert "/data/apps/agg/run.sh --feed /data/apps/news/headlines" in out3
 
   # No matching entry → None (caller skips the rewrite entirely).
-  assert install._crontab_without_app(crontab, Path("/data/apps/ghost")) is None
+  assert app_cron.crontab_without_app(crontab, Path("/data/apps/ghost")) is None
 
   # Removing the only entries yields an empty crontab (not None).
   single = "0 9 * * * /data/apps/solo/job.sh\n"
-  assert install._crontab_without_app(single, Path("/data/apps/solo")) == ""
+  assert app_cron.crontab_without_app(single, Path("/data/apps/solo")) == ""
 
   # Edge shapes: @shorthand schedules + inline VAR=val command prefixes are
   # cleaned; comments + env lines that merely contain the path are kept.
@@ -860,7 +863,7 @@ def test_crontab_without_app_is_prefix_safe_and_preserves_header():
     "0 6 * * * TZ=UTC /data/apps/news/fetch.sh\n"
     "@reboot /data/apps/other/boot.sh\n"
   )
-  out4 = install._crontab_without_app(edge, Path("/data/apps/news"))
+  out4 = app_cron.crontab_without_app(edge, Path("/data/apps/news"))
   assert out4 is not None
   assert "@daily /data/apps/news/fetch.sh" not in out4        # shorthand dropped
   assert "TZ=UTC /data/apps/news/fetch.sh" not in out4        # env-prefixed dropped
@@ -1349,7 +1352,7 @@ def test_cancelled_install_rolls_back_only_after_its_git_worker_exits(
         prepared=prepared,
       )
     finally:
-      install.discard_staged(prepared.staged_clone)
+      git_transfers.discard_staged(prepared.staged_clone)
 
   def refused():
     raise HTTPException(409, "The adopted clone cannot be committed.")
@@ -2720,7 +2723,7 @@ def test_trusted_origin_first_adoption_conflict_resolves_and_finalizes(
     f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth,
   )
   assert selected.status_code == 200, selected.text
-  checkout = install.pending_update_worktree(repo)
+  checkout = pending_update.pending_update_worktree(repo)
   assert app_git.merge_in_progress(checkout)
   assert not (repo / ".git" / "MERGE_HEAD").exists()
   _resolve_in(checkout, {
@@ -2754,7 +2757,7 @@ def test_trusted_origin_first_adoption_conflict_resolves_and_finalizes(
   )
   assert row.manage_apps is True
   assert row.connect_manage is True
-  assert install.read_pending_conflict_update_receipt(
+  assert pending_update.read_pending_conflict_update_receipt(
     repo,
     app_id=app_id,
     upstream_commit=row.upstream_commit,
@@ -2798,7 +2801,7 @@ def test_trusted_origin_pending_adoption_rejects_mismatched_and_stale_receipts(
     "permissions": {"manage_apps": True},
   }
 
-  install.stage_pending_conflict_update(
+  pending_update.stage_pending_conflict_update(
     repo,
     app_id=app_id,
     upstream_commit=upstream_commit,
@@ -2815,9 +2818,9 @@ def test_trusted_origin_pending_adoption_rejects_mismatched_and_stale_receipts(
   )
   assert mismatched.status_code == 409, mismatched.text
   assert mismatched.json()["detail"]["code"] == "pending_update_identity_changed"
-  assert not install.pending_update_worktree(repo).exists()
+  assert not pending_update.pending_update_worktree(repo).exists()
 
-  install.stage_pending_conflict_update(
+  pending_update.stage_pending_conflict_update(
     repo,
     app_id=app_id,
     upstream_commit="0" * 40,
@@ -2833,7 +2836,7 @@ def test_trusted_origin_pending_adoption_rejects_mismatched_and_stale_receipts(
     f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth,
   )
   assert stale.status_code == 409, stale.text
-  assert not install.pending_update_worktree(repo).exists()
+  assert not pending_update.pending_update_worktree(repo).exists()
   db.expire_all()
   row = db.query(models.App).filter(models.App.id == app_id).one()
   assert row.manifest_url is None
@@ -3306,7 +3309,7 @@ def test_recover_stays_successful_after_post_commit_skill_cleanup_failure(
   assert client.delete(f"/api/apps/{app_id}", headers=auth).status_code == 204
 
   with patch(
-    "app.install.restore_app_skills",
+    "app.app_skills.restore_app_skills",
     new=AsyncMock(side_effect=RuntimeError("restore failed")),
   ):
     recovered = client.post(f"/api/apps/{app_id}/recover", headers=auth)
@@ -3397,7 +3400,7 @@ def test_pending_update_receipts_from_earlier_releases_stay_readable(
     receipt |= {"resolution_policy": "preserve_local", "reviewed_tree_oid": None}
   (pending / "receipt.json").write_text(json.dumps(receipt))
 
-  legacy = install.read_pending_conflict_update_receipt(
+  legacy = pending_update.read_pending_conflict_update_receipt(
     source, app_id=42, upstream_commit="a" * 40,
   )
   assert legacy is not None
@@ -3913,7 +3916,7 @@ def test_conflict_resolver_merges_in_private_checkout_before_its_turn(
   data_dir = Path(get_settings().data_dir)
   app_dir = data_dir / "apps" / "click-conflict"
   jsx_file = app_dir / "index.jsx"
-  checkout = install.pending_update_worktree(app_dir)
+  checkout = pending_update.pending_update_worktree(app_dir)
 
   local = JSX_MULTI.replace("ORIGINAL TITLE", "AGENT TITLE")
   jsx_file.write_text(local)
@@ -4038,7 +4041,7 @@ def test_conflict_resolver_batch_uses_one_chat_for_every_selected_app(
   # One real merge per app, each in its private checkout; the served source
   # directories are never half-merged.
   assert all(
-    app_git.merge_in_progress(install.pending_update_worktree(path))
+    app_git.merge_in_progress(pending_update.pending_update_worktree(path))
     and not (path / ".git" / "MERGE_HEAD").exists()
     for _id, path, _name in apps
   )
@@ -4229,7 +4232,7 @@ def test_conflict_resolver_start_is_serialized_with_overlapping_request(
         # while its durable start is still awaiting the writer.
         assert lifecycle.locked()
         assert not second.done()
-        assert not install.pending_update_worktree(apps[2][1]).exists()
+        assert not pending_update.pending_update_worktree(apps[2][1]).exists()
         release_start.set()
         opened = await first
         with pytest.raises(HTTPException) as blocked:
@@ -4259,8 +4262,8 @@ def test_clean_store_install_clears_pending_receipt_and_resolver_binding(
   app_id, app_dir, _name = apps[0]
   opened = client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth)
   assert opened.status_code == 200, opened.text
-  assert install.pending_update_receipt_file(app_dir).exists()
-  drop_worktree = install._drop_pending_update_worktree
+  assert pending_update.pending_update_receipt_file(app_dir).exists()
+  drop_worktree = pending_update._drop_pending_update_worktree
 
   def cleanup_under_source_lock(source_dir):
     # This callback runs in the cleanup worker, after install released its
@@ -4268,7 +4271,7 @@ def test_clean_store_install_clears_pending_receipt_and_resolver_binding(
     assert fs_locks.source_dir_lock(str(source_dir)).locked()
     drop_worktree(source_dir)
 
-  monkeypatch.setattr(install, "_drop_pending_update_worktree", cleanup_under_source_lock)
+  monkeypatch.setattr(pending_update, "_drop_pending_update_worktree", cleanup_under_source_lock)
   # A later Store release agrees with the owner's local title, so a normal
   # install supersedes the blocked update without using resolve-update.
   updated = _update_v2(
@@ -4279,8 +4282,8 @@ def test_clean_store_install_clears_pending_receipt_and_resolver_binding(
   )
   assert updated.status_code == 201, updated.text
   assert updated.json()["mode"] == "update"
-  assert not install.pending_update_receipt_file(app_dir).exists()
-  assert not install.pending_update_worktree(app_dir).exists()
+  assert not pending_update.pending_update_receipt_file(app_dir).exists()
+  assert not pending_update.pending_update_worktree(app_dir).exists()
   with SessionLocal() as db:
     app = db.get(models.App, app_id)
     assert app.conflict_resolver_chat_id is None
@@ -4305,7 +4308,7 @@ def test_successful_install_is_not_failed_by_pending_cleanup(
       with patch.object(db, "commit", side_effect=SQLAlchemyError("cleanup commit failed")):
         await clear_pending(db, app)
     else:
-      with patch.object(install, "_drop_pending_update_worktree", side_effect=OSError("cleanup failed")):
+      with patch.object(pending_update, "_drop_pending_update_worktree", side_effect=OSError("cleanup failed")):
         await clear_pending(db, app)
 
   monkeypatch.setattr(install, "clear_pending_conflict_update", fail_cleanup)
@@ -4317,7 +4320,7 @@ def test_successful_install_is_not_failed_by_pending_cleanup(
   assert updated.status_code == 201, updated.text
   assert updated.json()["mode"] == "update"
   assert updated.json()["version"] == "3.0.0"
-  assert install.pending_update_worktree(app_dir).exists()
+  assert pending_update.pending_update_worktree(app_dir).exists()
   with SessionLocal() as db:
     app = db.get(models.App, app_id)
     assert app.version == "3.0.0"
@@ -4394,7 +4397,7 @@ def test_conflict_resolver_validates_all_receipts_before_parking_any_app(
   client, auth, bypass_url_validation,
 ):
   apps = _prepare_conflict_resolver_apps(client, auth, ("one", "two"))
-  install.pending_update_receipt_file(apps[1][1]).unlink()
+  pending_update.pending_update_receipt_file(apps[1][1]).unlink()
   response = client.post(
     "/api/apps/conflict-resolver-batch", headers=auth,
     json={"app_ids": [app_id for app_id, _path, _name in apps]},
@@ -4403,7 +4406,7 @@ def test_conflict_resolver_validates_all_receipts_before_parking_any_app(
   assert response.json()["detail"]["code"] == "pending_update_missing"
   assert response.json()["detail"]["app_id"] == apps[1][0]
   assert all(
-    not install.pending_update_worktree(path).exists()
+    not pending_update.pending_update_worktree(path).exists()
     for _id, path, _name in apps
   )
   from app.database import SessionLocal
@@ -4433,7 +4436,7 @@ def test_conflict_resolver_reuses_remaining_batch_after_app_leaves(
       db.commit()
   else:
     app_dir = apps[0][1]
-    _resolve_in(install.pending_update_worktree(app_dir), {
+    _resolve_in(pending_update.pending_update_worktree(app_dir), {
       "index.jsx": JSX_MULTI.replace("ORIGINAL TITLE", "RESOLVED TITLE"),
     })
     base = "https://batch-conflict-one.test/repo/"
@@ -4526,7 +4529,7 @@ def test_conflict_resolver_preconditions_fail_before_any_checkout_is_parked(
   assert response.status_code == status, response.text
   assert response.json()["detail"]["code"] == code
   assert response.json()["detail"]["app_id"] == ids[1]
-  assert all(not install.pending_update_worktree(path).exists()
+  assert all(not pending_update.pending_update_worktree(path).exists()
              for _id, path, _name in apps)
 
 
@@ -4629,7 +4632,7 @@ def test_cancelled_resolver_finish_drains_merge_commit_before_releasing_source(
   from app.routes import apps as routes
 
   repo = tmp_path / "finish"
-  receipt_file = install.pending_update_receipt_file(repo)
+  receipt_file = pending_update.pending_update_receipt_file(repo)
   receipt_file.parent.mkdir(parents=True)
   receipt_file.write_text("pending")
   app = models.App(
@@ -4659,7 +4662,7 @@ def test_cancelled_pending_cleanup_drains_worktree_removal_before_releasing_sour
   from app import fs_locks
 
   repo = tmp_path / "cleanup"
-  receipt_file = install.pending_update_receipt_file(repo)
+  receipt_file = pending_update.pending_update_receipt_file(repo)
   receipt_file.parent.mkdir(parents=True)
   receipt_file.write_text("pending")
   app = models.App(
@@ -4675,7 +4678,7 @@ def test_cancelled_pending_cleanup_drains_worktree_removal_before_releasing_sour
       await install.clear_pending_conflict_update(db, app)
 
   assert_cancellation_drains_worker_under_lock(
-    _source_lock(repo), cleanup, monkeypatch, install, "_drop_pending_update_worktree",
+    _source_lock(repo), cleanup, monkeypatch, pending_update, "_drop_pending_update_worktree",
   )
   assert not receipt_file.exists()
   assert app.conflict_resolver_upstream_commit is None
@@ -4686,8 +4689,8 @@ def test_incomplete_history_tells_the_owner_why(tmp_path, monkeypatch):
   from app.routes import apps as routes
 
   monkeypatch.setattr(routes.app_git, "merge_in_progress", lambda repo: False)
-  monkeypatch.setattr(install, "pending_update_resolved", lambda *args: False)
-  monkeypatch.setattr(install, "pending_update_worktree", lambda repo: tmp_path / "none")
+  monkeypatch.setattr(pending_update, "pending_update_resolved", lambda *args: False)
+  monkeypatch.setattr(pending_update, "pending_update_worktree", lambda repo: tmp_path / "none")
 
   def hidden_base(repo):
     raise app_git.HistoryIncomplete(
@@ -4792,8 +4795,8 @@ def test_conflict_resolver_partial_parking_is_private_and_retryable(
   )
   assert response.status_code == 409, response.text
   assert response.json()["detail"]["app_id"] == ids[1]
-  assert app_git.merge_in_progress(install.pending_update_worktree(apps[0][1]))
-  assert not install.pending_update_worktree(apps[1][1]).exists()
+  assert app_git.merge_in_progress(pending_update.pending_update_worktree(apps[0][1]))
+  assert not pending_update.pending_update_worktree(apps[1][1]).exists()
   assert all(not app_git.merge_in_progress(repo) for _id, repo, _name in apps)
   for _id, repo, _name in apps:
     assert "LOCAL" in repo.joinpath("index.jsx").read_text()
@@ -4802,7 +4805,7 @@ def test_conflict_resolver_partial_parking_is_private_and_retryable(
     "/api/apps/conflict-resolver-batch", headers=auth, json={"app_ids": ids},
   )
   assert retry.status_code == 200, retry.text
-  assert all(app_git.merge_in_progress(install.pending_update_worktree(repo))
+  assert all(app_git.merge_in_progress(pending_update.pending_update_worktree(repo))
              for _id, repo, _name in apps)
 
 
@@ -4858,7 +4861,7 @@ def test_finishing_installs_only_a_committed_resolution(
 
   base = "https://finish-guard.test/repo/"
   app_id, app_dir, replay = _conflicted_app(client, auth, base, "finish-guard")
-  checkout = install.pending_update_worktree(app_dir)
+  checkout = pending_update.pending_update_worktree(app_dir)
 
   uncommitted = _finish(client, auth, app_dir, replay)
   assert uncommitted.status_code == 409, uncommitted.text
@@ -4902,7 +4905,7 @@ def test_interrupted_or_legacy_finish_converges_by_rerunning(
 
   base = "https://legacy-finish.test/repo/"
   app_id, app_dir, replay = _conflicted_app(client, auth, base, "legacy-finish")
-  app_git.remove_overlay_worktree(app_dir, install.pending_update_worktree(app_dir))
+  app_git.remove_overlay_worktree(app_dir, pending_update.pending_update_worktree(app_dir))
   # The earlier release merged in the served folder and committed there.
   app_git._run(app_dir, "merge", "--no-commit", "--no-ff", "upstream", check=False)
   (app_dir / "index.jsx").write_text(
@@ -4959,16 +4962,16 @@ def test_resolver_checkout_removed_after_validation_requires_a_fresh_plan(
     receipt = routes._pending_store_update_receipt(db.get(models.App, app_id), str(repo))
   merge = routes._validate_pending_update(repo, receipt)
   assert merge.checkout is not None  # plan reuses the in-progress merge
-  app_git.remove_overlay_worktree(repo, install.pending_update_worktree(repo))
+  app_git.remove_overlay_worktree(repo, pending_update.pending_update_worktree(repo))
   with pytest.raises(HTTPException) as caught:
     routes._park_pending_update(repo, receipt, merge)
   assert caught.value.status_code == 409
   assert caught.value.detail["code"] == "conflict_state_changed"
-  assert not install.pending_update_worktree(repo).exists()
+  assert not pending_update.pending_update_worktree(repo).exists()
 
   retry = client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth)
   assert retry.status_code == 200, retry.text
-  assert app_git.merge_in_progress(install.pending_update_worktree(repo))
+  assert app_git.merge_in_progress(pending_update.pending_update_worktree(repo))
 
 
 def test_files_the_resolver_deletes_stay_deleted(client, auth, bypass_url_validation):
@@ -4979,7 +4982,7 @@ def test_files_the_resolver_deletes_stay_deleted(client, auth, bypass_url_valida
   _app_id, app_dir, replay, _upstream = _conflicted_app_with_local_file(
     client, auth, base, "resolver-delete",
   )
-  checkout = install.pending_update_worktree(app_dir)
+  checkout = pending_update.pending_update_worktree(app_dir)
   (checkout / "index.jsx").write_text(
     JSX_MULTI.replace("ORIGINAL TITLE", "RESOLVED TITLE"),
   )
@@ -5001,7 +5004,7 @@ def test_taking_the_update_exactly_removes_local_only_files(
   _app_id, app_dir, replay, upstream = _conflicted_app_with_local_file(
     client, auth, base, "resolver-exact",
   )
-  checkout = install.pending_update_worktree(app_dir)
+  checkout = pending_update.pending_update_worktree(app_dir)
   app_git._run(checkout, "read-tree", "-u", "--reset", "upstream")
   _resolve_in(checkout, {})
 
@@ -5020,7 +5023,7 @@ def test_a_finish_that_stopped_after_its_receipt_is_repeat_safe(
 
   base = "https://finish-residue.test/repo/"
   app_id, app_dir, replay = _conflicted_app(client, auth, base, "finish-residue")
-  checkout = install.pending_update_worktree(app_dir)
+  checkout = pending_update.pending_update_worktree(app_dir)
   _resolve_in(checkout, {
     "index.jsx": JSX_MULTI.replace("ORIGINAL TITLE", "RESOLVED TITLE"),
   })
@@ -5051,7 +5054,7 @@ def test_a_newer_release_never_installs_an_older_resolution(
 
   base = "https://newer-release.test/repo/"
   _app_id, app_dir, _replay = _conflicted_app(client, auth, base, "newer-release")
-  checkout = install.pending_update_worktree(app_dir)
+  checkout = pending_update.pending_update_worktree(app_dir)
   _resolve_in(checkout, {
     "index.jsx": JSX_MULTI.replace("ORIGINAL TITLE", "RESOLVED TITLE"),
   })
@@ -5096,7 +5099,7 @@ def test_overlapping_live_edit_sends_finish_back_to_the_resolver(
 
   base = "https://late-overlap.test/repo/"
   app_id, app_dir, replay = _conflicted_app(client, auth, base, "late-overlap")
-  checkout = install.pending_update_worktree(app_dir)
+  checkout = pending_update.pending_update_worktree(app_dir)
   entry = app_dir / "index.jsx"
   _resolve_in(checkout, {
     "index.jsx": JSX_MULTI.replace("ORIGINAL TITLE", "RESOLVED TITLE"),
@@ -5593,7 +5596,7 @@ def test_store_update_of_a_resolved_release_finishes_it(
   assert press_update().json()["mode"] == "conflict"
   opened = client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth)
   assert opened.status_code == 200, opened.text
-  checkout = install.pending_update_worktree(source_dir)
+  checkout = pending_update.pending_update_worktree(source_dir)
   resolved = JSX_MULTI.replace("ORIGINAL TITLE", "RESOLVED TITLE")
   (checkout / "index.jsx").write_text(resolved)
 
@@ -5833,7 +5836,7 @@ def test_undeclared_package_version_conflict_uses_existing_auto_merge(
   assert updated.status_code == 201, updated.text
   assert updated.json()["mode"] == "update"
   assert json.loads((source_dir / "package.json").read_text())["version"] == "2.0.0"
-  assert not install.pending_conflict_update_receipt_present(source_dir)
+  assert not pending_update.pending_conflict_update_receipt_present(source_dir)
 
 
 def test_directory_file_conflict_goes_to_resolver_on_retries(
@@ -5858,7 +5861,7 @@ def test_directory_file_conflict_goes_to_resolver_on_retries(
     updated = _press_reviewed_update(client, auth, app_id, bare, base + "mobius.json")
     assert updated.status_code == 201, updated.text
     assert updated.json()["mode"] == "conflict"
-    assert install.pending_conflict_update_receipt_present(source_dir)
+    assert pending_update.pending_conflict_update_receipt_present(source_dir)
     assert (source_dir / "notes").read_text() == "owner notes\n"
     assert not (source_dir / "notes~main").exists()
 
@@ -5918,7 +5921,7 @@ def test_conflict_outside_the_package_keeps_local_and_updates(
   assert updated.json()["reconciliation"]["kept_local_paths"] == ["README.md"]
   assert (source_dir / "README.md").read_text() == "readme local\n"
   assert (source_dir / "index.jsx").read_text() == index_v2
-  assert not install.pending_conflict_update_receipt_present(source_dir)
+  assert not pending_update.pending_conflict_update_receipt_present(source_dir)
   assert app_git.ref_is_ancestor(source_dir, upstream_v2, "main") is True
 
   # The advanced base keeps later releases ordinary merges.
@@ -6096,10 +6099,10 @@ def test_conflict_in_a_declared_file_still_needs_the_resolver(
   assert conflicted.json()["mode"] == "conflict"
   assert "README.md" in conflicted.json()["conflict_paths"]
   assert (source_dir / "README.md").read_text() == "readme local\n"
-  assert install.pending_conflict_update_receipt_present(source_dir)
+  assert pending_update.pending_conflict_update_receipt_present(source_dir)
   opened = client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth)
   assert opened.status_code == 200, opened.text
-  checkout = install.pending_update_worktree(source_dir)
+  checkout = pending_update.pending_update_worktree(source_dir)
   assert "<<<<<<<" in (checkout / "README.md").read_text()
 
 
@@ -7017,8 +7020,12 @@ def test_package_identity_handoff_accepts_old_source_whose_id_changed(
   assert moved.json()["package_id"] == package_id
 
 
+# Git accepts a remote with or without `.git`; either names the predecessor.
+@pytest.mark.parametrize("old_origin", [
+  "https://github.com/acme/app-old.git", "https://github.com/acme/app-old",
+])
 def test_rename_adopts_predecessor_across_same_owner_repository_move(
-  client, auth, bypass_url_validation,
+  client, auth, bypass_url_validation, old_origin,
 ):
   """A package and repository rename preserves the row, storage, and data."""
   old_base = "https://raw.githubusercontent.com/acme/app-old/main/"
@@ -7032,10 +7039,7 @@ def test_rename_adopts_predecessor_across_same_owner_repository_move(
     app_id = first.json()["id"]
     old_source = Path(get_settings().data_dir) / "apps" / "old"
     subprocess.run(
-      [
-        "git", "remote", "add", "origin",
-        "https://github.com/acme/app-old.git",
-      ],
+      ["git", "remote", "add", "origin", old_origin],
       cwd=old_source,
       check=True,
     )
@@ -9364,7 +9368,7 @@ def test_update_check_final_fence_preserves_concurrent_pending_conflict(
       base + "mobius.json",
       "2.0.0",
     )
-    install.stage_pending_conflict_update(
+    pending_update.stage_pending_conflict_update(
       repo,
       app_id=app_id,
       upstream_commit=current_upstream,
@@ -10284,7 +10288,7 @@ def test_committed_resolution_keeps_late_edits_outside_the_package(
   assert parked.json()["mode"] == "conflict", parked.text
   opened = client.post(f"/api/apps/{app_id}/conflict-resolver-chat", headers=auth)
   assert opened.status_code == 200, opened.text
-  checkout = install.pending_update_worktree(app_dir)
+  checkout = pending_update.pending_update_worktree(app_dir)
   _resolve_in(checkout, {
     "index.jsx": CLONE_INDEX_V1.replace("TITLE_V1", "RESOLVED_TITLE"),
     "README.md": "resolution\n",
@@ -10477,7 +10481,7 @@ def test_ancillary_build_slot_timeout_is_transient_not_a_conflict(
   with patch("app.install.compile_jsx", side_effect=busy):
     updated = _press_reviewed_update(client, auth, app_id, bare, base + "mobius.json")
   assert updated.status_code == 503, updated.text
-  assert not install.pending_conflict_update_receipt_present(source_dir)
+  assert not pending_update.pending_conflict_update_receipt_present(source_dir)
   assert (source_dir / "README.md").read_text() == "local\n"
   retried = _press_reviewed_update(client, auth, app_id, bare, base + "mobius.json")
   assert retried.status_code == 201, retried.text
@@ -10581,7 +10585,7 @@ def test_busy_resolver_retry_does_not_recreate_aborted_checkout(
   assert opened.status_code == 200, opened.text
   chat_id = opened.json()["chat_id"]
   monkeypatch.setattr("app.chat.is_chat_running", lambda cid: cid == chat_id)
-  checkout = install.pending_update_worktree(apps[0][1])
+  checkout = pending_update.pending_update_worktree(apps[0][1])
   app_git.remove_overlay_worktree(apps[0][1], checkout)
   retry = client.post(
     "/api/apps/conflict-resolver-batch" if selection == "exact" else
@@ -10707,7 +10711,7 @@ def test_conflict_resolver_rejects_oversized_prompt_before_parking_any_checkout(
   )
   assert rejected.status_code == 413, rejected.text
   assert "select fewer apps" in rejected.json()["detail"]
-  assert all(not install.pending_update_worktree(repo).exists()
+  assert all(not pending_update.pending_update_worktree(repo).exists()
              for _app_id, repo, _name in apps)
   with SessionLocal() as db:
     assert all(db.get(models.App, app_id).conflict_resolver_chat_id is None
@@ -10866,7 +10870,7 @@ def test_shallow_history_never_transfers_under_locks_and_preserves_installed_app
     assert failed.json()["detail"]["code"] == "git_transfer_timeout"
   assert (repo / "index.jsx").read_text() == local
   assert app_git.head_sha(repo, app_git.UPSTREAM_BRANCH) == upstream_before
-  assert not install.pending_update_worktree(repo).exists()
+  assert not pending_update.pending_update_worktree(repo).exists()
   db.expire_all()
   assert db.get(models.App, app_id).version == manifest["version"]
 
@@ -11001,7 +11005,7 @@ def test_staged_clone_binds_identity_only_from_the_bounded_manifest(
         staged, db=None,
       ))
   finally:
-    install.discard_staged(staged)
+    git_transfers.discard_staged(staged)
   assert refused.value.status_code in (413, 422), refused.value.detail
   assert resolved == []
 
@@ -11047,58 +11051,93 @@ def test_changed_source_on_a_fresh_install_asks_for_a_new_review(
 
 _PARITY_ALICE = "https://raw.githubusercontent.com/alice/app-notes/main/"
 _PARITY_BOB = "https://raw.githubusercontent.com/bob/app-notes/main/"
+_PARITY_MOVED = "https://raw.githubusercontent.com/alice/app-notes-moved/main/"
+_PARITY_MANIFEST = {
+  "id": "parity-notes", "name": "Parity notes", "version": "1.0.0",
+  "description": "Identity parity", "entry": "index.jsx",
+  "source_files": ["cards.js"],
+}
 
 
-@pytest.mark.parametrize("candidate_fields, catalog_base, offered", [
+@contextmanager
+def _github_transport(
+  repositories: dict[str, Path], manifests: dict[str, dict] | None = None,
+):
+  """Serve GitHub repositories from local bare ones, and raw manifests from
+  ``manifests``, patching only the network transfer: addresses, origins and
+  origin checks stay production's."""
+  real = app_git._transfer
+
+  def transfer(stage, url, ref, **kwargs):
+    for name, bare in repositories.items():
+      if app_git.same_origin(url, f"https://github.com/{name}.git"):
+        return real(stage, bare.as_uri(), ref, **kwargs)
+    raise AssertionError(f"unexpected Git transfer from {url}")
+
+  with patch.object(app_git, "_transfer", transfer), patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client({
+      url: (200, json.dumps(manifest).encode())
+      for url, manifest in (manifests or {}).items()
+    }),
+  ):
+    yield
+
+
+def _install_parity_app(client, auth, tmp_path):
+  """Install the parity app from alice/app-notes, as a real Store install."""
+  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(_PARITY_MANIFEST)})
+  with _github_transport(
+    {"alice/app-notes": bare},
+    {_PARITY_ALICE + "mobius.json": _PARITY_MANIFEST},
+  ):
+    installed = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _PARITY_ALICE + "mobius.json",
+    })
+  assert installed.status_code == 201, installed.text
+  source_dir = Path(get_settings().data_dir) / "apps" / "parity-notes"
+  assert app_git.origin_url(source_dir) == "https://github.com/alice/app-notes.git"
+  return installed.json()["id"], work, bare
+
+
+@pytest.mark.parametrize("candidate_fields, catalog_base, verdict", [
   # The same package, one release later.
-  ({}, _PARITY_ALICE, True),
-  # Another owner's repository naming this app as its predecessor, with a new
-  # package_id: nothing proves both addresses are one repository (a legacy
-  # row has no provider identity), so neither discovery nor install adopts it.
+  ({}, _PARITY_ALICE, "offered"),
+  # Another app's package in this app's own repository: install would add a
+  # new app, so discovery reports it.
+  ({"id": "parity-other"}, _PARITY_ALICE, "identity_mismatch"),
+  # A listing in another owner's repository is never fetched into this app,
+  # with or without a permanent identity naming this app as predecessor.
   (
     {
       "id": "parity-renamed", "previous_id": "parity-notes",
       "package_id": "urn:uuid:6a1f0c2e-7b3d-5e4f-9a8b-1c2d3e4f5a6b",
       "previous_manifest_url": _PARITY_ALICE + "mobius.json",
     },
-    _PARITY_BOB, False,
+    _PARITY_BOB, "repository_moved",
   ),
-  # A rename across owners without a permanent identity is refused by both.
   (
     {
       "id": "parity-renamed", "previous_id": "parity-notes",
       "previous_manifest_url": _PARITY_ALICE + "mobius.json",
     },
-    _PARITY_BOB, False,
+    _PARITY_BOB, "repository_moved",
   ),
-  # Another app's package at another address: install would add a new app.
-  ({"id": "parity-other"}, _PARITY_BOB, False),
+  ({"id": "parity-other"}, _PARITY_BOB, "repository_moved"),
 ])
 def test_update_discovery_and_install_resolve_the_same_row(
   client, auth, db, tmp_path, bypass_url_validation, candidate_fields,
-  catalog_base, offered,
+  catalog_base, verdict,
 ):
   """Update-check, the update preview and the reviewed install share one verdict."""
-  from app import install
-
-  manifest = {
-    "id": "parity-notes", "name": "Parity notes", "version": "1.0.0",
-    "description": "Identity parity", "entry": "index.jsx",
-    "source_files": ["cards.js"],
-  }
-  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
-  _publish_clone_files(work, bare, {"mobius.json": json.dumps(manifest)})
-  installed = _install_clone_fixture(
-    client, auth, _PARITY_ALICE, manifest, CLONE_INDEX_V1, CLONE_CARDS_V1,
-    bare, include_source_file=True,
-  )
-  assert installed.status_code == 201, installed.text
-  app_id = installed.json()["id"]
-  candidate = {**manifest, "version": "2.0.0", **candidate_fields}
+  app_id, work, bare = _install_parity_app(client, auth, tmp_path)
+  candidate = {**_PARITY_MANIFEST, "version": "2.0.0", **candidate_fields}
   head = _publish_clone_files(work, bare, {"mobius.json": json.dumps(candidate)})
   catalog_url = catalog_base + "mobius.json"
 
-  with patch("app.install._derive_repo_ref", return_value=(bare.as_uri(), "main")):
+  # Each repository serves the same published commit; only the app's own
+  # origin may be fetched for discovery.
+  with _github_transport({"alice/app-notes": bare, "bob/app-notes": bare}):
     check = client.get(
       f"/api/apps/{app_id}/update-check", headers=auth,
       params={"manifest_url": catalog_url},
@@ -11108,37 +11147,203 @@ def test_update_discovery_and_install_resolve_the_same_row(
       params={"manifest_url": catalog_url},
     )
   assert check.status_code == 200, check.text
-  if offered:
+  if verdict == "offered":
     assert check.json()["update_available"] is True, check.text
     assert preview.status_code == 200, preview.text
   else:
     assert check.json()["update_available"] is None
-    assert check.json()["candidate_rejected"]["code"] == "identity_mismatch"
+    assert check.json()["candidate_rejected"]["code"] == verdict
     assert preview.status_code == 409, preview.text
     assert preview.json()["detail"] == check.json()["candidate_rejected"]
 
-  # Install the same reviewed commit, already fetched above, as an update of
-  # this row. The fixture clones from a local bare repository; give the
-  # checkout the GitHub origin a real install records.
-  source_dir = db.get(models.App, app_id).source_dir
-  app_git.set_origin_url(source_dir, "https://github.com/alice/app-notes.git")
+  # Install the same reviewed commit as an update of this row.
   reviewed_digest = install.read_git_package_summary(bare, head).source_digest
-  with patch("app.install.httpx.AsyncClient"):
+  with _github_transport({"alice/app-notes": bare, "bob/app-notes": bare}):
     applied = client.post("/api/apps/install", headers=auth, json={
       "manifest_url": catalog_url,
       "reviewed_source_digest": reviewed_digest,
       "update_app_id": app_id,
       "reviewed_upstream_commit": head,
     })
-  if offered:
+  if verdict == "offered":
     assert applied.status_code == 201, applied.text
     assert applied.json()["id"] == app_id
     assert applied.json()["version"] == "2.0.0"
-    db.expire_all()
-    owner = catalog_base.split("/")[3]
-    assert app_git.same_origin(
-      app_git.origin_url(db.get(models.App, app_id).source_dir),
-      f"https://github.com/{owner}/app-notes.git",
-    )
   else:
     assert applied.status_code in (400, 409), applied.text
+    db.expire_all()
+    assert db.get(models.App, app_id).version == "1.0.0"
+
+
+def test_repository_move_is_reported_by_discovery_and_followed_by_reinstall(
+  client, auth, db, tmp_path, bypass_url_validation,
+):
+  """A same-owner repository move and rename without `package_id` (the shape
+  the pages and integrations apps shipped). Discovery reads only the app's own
+  origin, so it says the repository moved; reinstalling from the Store follows
+  the reviewed predecessor address onto the same row."""
+  app_id, work, bare = _install_parity_app(client, auth, tmp_path)
+  storage_file = Path(get_settings().data_dir) / "apps" / str(app_id) / "data.json"
+  storage_file.parent.mkdir(parents=True, exist_ok=True)
+  storage_file.write_text('{"kept": true}')
+  moved = {
+    **_PARITY_MANIFEST, "version": "2.0.0", "id": "parity-renamed",
+    "previous_id": "parity-notes",
+    "previous_manifest_url": _PARITY_ALICE + "mobius.json",
+  }
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(moved)})
+  transport = {"alice/app-notes": bare, "alice/app-notes-moved": bare}
+
+  with _github_transport(transport):
+    check = client.get(
+      f"/api/apps/{app_id}/update-check", headers=auth,
+      params={"manifest_url": _PARITY_MOVED + "mobius.json"},
+    )
+    preview = client.get(
+      f"/api/apps/{app_id}/update-candidate-preview", headers=auth,
+      params={"manifest_url": _PARITY_MOVED + "mobius.json"},
+    )
+  assert check.status_code == 200, check.text
+  assert check.json()["update_available"] is None
+  rejection = check.json()["candidate_rejected"]
+  assert rejection["code"] == "repository_moved"
+  assert "reinstalling it from the Store" in rejection["message"]
+  assert preview.status_code == 409, preview.text
+  assert preview.json()["detail"] == rejection
+
+  with _github_transport(transport, {_PARITY_MOVED + "mobius.json": moved}):
+    reinstalled = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": _PARITY_MOVED + "mobius.json",
+    })
+  assert reinstalled.status_code == 201, reinstalled.text
+  assert reinstalled.json()["mode"] == "update"
+  assert reinstalled.json()["id"] == app_id
+  assert reinstalled.json()["slug"] == "parity-renamed"
+  assert storage_file.read_text() == '{"kept": true}'
+  db.expire_all()
+  assert app_git.same_origin(
+    app_git.origin_url(db.get(models.App, app_id).source_dir),
+    "https://github.com/alice/app-notes-moved.git",
+  )
+
+
+def test_install_preview_resolves_its_row_off_the_event_loop(
+  client, auth, bypass_url_validation,
+):
+  """Its database (and legacy Git origin) reads never block the loop."""
+  base = "https://preview-off-loop.test/repo/"
+  manifest = {**MANIFEST_NEWS, "id": "preview-off-loop"}
+  installed = _install_v1(client, auth, base, manifest, JSX)
+  assert installed.status_code == 201, installed.text
+  on_loop = []
+  resolve = install.resolve_package_row
+
+  def recording_resolve(*args, **kwargs):
+    try:
+      asyncio.get_running_loop()
+      on_loop.append(True)
+    except RuntimeError:
+      on_loop.append(False)
+    return resolve(*args, **kwargs)
+
+  responses = {base + "mobius.json": (200, json.dumps(manifest).encode())}
+  with patch(
+    "app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses),
+  ), patch("app.install.resolve_package_row", recording_resolve):
+    preview = client.post("/api/apps/preview", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert preview.status_code == 200, preview.text
+  assert preview.json()["installed_contract"] is not None
+  assert on_loop == [False]
+
+
+def test_staged_clone_binds_identity_before_its_one_package_read(
+  db, tmp_path, monkeypatch,
+):
+  """A permanent package's identity comes from its bounded manifest, so the
+  package is read and its digests derived once, already bound."""
+  manifest = {
+    "id": "staged-once", "name": "Staged once", "version": "1.0.0",
+    "description": "Identity", "entry": "index.jsx",
+    "source_files": ["cards.js"],
+    "package_id": "urn:uuid:8e1a3c5d-7f9b-5d2e-a4c6-8e0a2c4e6b8d",
+  }
+  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(manifest)})
+
+  async def resolve(_client, resolved_manifest, source_url):
+    assert resolved_manifest["package_id"] == manifest["package_id"]
+    return "github:42", None, source_url
+
+  built = []
+  new_candidate = install._new_candidate
+
+  def counting_new_candidate(**kwargs):
+    built.append(kwargs["source_identity"])
+    return new_candidate(**kwargs)
+
+  monkeypatch.setattr(install, "_resolve_package_identity", resolve)
+  monkeypatch.setattr(install, "_new_candidate", counting_new_candidate)
+  staged = app_git.stage_clone(bare.as_uri(), "main", tmp_path / "transfers")
+  try:
+    candidate = asyncio.run(install._staged_clone_candidate(
+      "https://raw.githubusercontent.com/acme/staged-once/main/mobius.json",
+      staged, db=None,
+    ))
+  finally:
+    git_transfers.discard_staged(staged)
+  assert built == ["github:42"]
+  assert candidate.source_identity == "github:42"
+
+
+@pytest.mark.parametrize("address", [
+  "https://raw.githubusercontent.com/mobius-os/app-store/fix%231/mobius.json",
+  "https://raw.githubusercontent.com/mobius-os/app-store/v1%2B2/",
+])
+def test_resolved_source_address_keeps_an_encoded_ref_one_segment(address):
+  """The canonical address re-encodes what the parser decoded: a ref `fix#1`
+  must not turn into the ref `fix` with a fragment."""
+  from app.manifest_identity import parse_root_manifest
+
+  root = parse_root_manifest(address)
+  assert root.url == address
+  assert parse_root_manifest(root.url) == root
+  identity, canonical = asyncio.run(
+    install._resolve_source_identity(None, address),
+  )
+  assert identity == "github:1253755424"
+  assert canonical == address
+
+
+def test_staged_clone_binds_identity_when_only_the_bounded_read_fails(
+  db, tmp_path, monkeypatch,
+):
+  """A failed bounded manifest read is not a permanent 422: the full read's
+  accepted manifest binds the identity instead."""
+  manifest = {
+    "id": "staged-fallback", "name": "Staged fallback", "version": "1.0.0",
+    "description": "Identity", "entry": "index.jsx",
+    "source_files": ["cards.js"],
+    "package_id": "urn:uuid:4b6d8f0a-2c4e-5a6b-8d0f-2a4c6e8a0b2d",
+  }
+  work, bare, _ = _make_clone_fixture(tmp_path, CLONE_INDEX_V1, CLONE_CARDS_V1)
+  _publish_clone_files(work, bare, {"mobius.json": json.dumps(manifest)})
+  resolved = []
+
+  async def resolve(_client, resolved_manifest, source_url):
+    resolved.append(resolved_manifest["package_id"])
+    return "github:42", None, source_url
+
+  monkeypatch.setattr(app_git, "read_committed_file", lambda *a, **k: None)
+  monkeypatch.setattr(install, "_resolve_package_identity", resolve)
+  staged = app_git.stage_clone(bare.as_uri(), "main", tmp_path / "transfers")
+  try:
+    candidate = asyncio.run(install._staged_clone_candidate(
+      "https://raw.githubusercontent.com/acme/staged-fallback/main/mobius.json",
+      staged, db=None,
+    ))
+  finally:
+    git_transfers.discard_staged(staged)
+  assert resolved == [manifest["package_id"]]
+  assert candidate.source_identity == "github:42"
