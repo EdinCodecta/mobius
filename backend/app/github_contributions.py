@@ -32,6 +32,7 @@ from app import (
   github_auth,
   github_contribution_git as _git_ops,
   models,
+  settled,
 )
 from app.config import get_settings
 from app.contribution_errors import ContributionSubmitError, push_rejected
@@ -838,9 +839,9 @@ async def _record_pending_equivalence_locked(
     return None
   source_repo, _review_repo = repos
   if str(source_repo) in already_locked:
-    return await asyncio.to_thread(_record_pending_equivalence, record)
+    return await settled.run_settled(_record_pending_equivalence, record)
   async with fs_locks.source_dir_lock(str(source_repo)):
-    return await asyncio.to_thread(_record_pending_equivalence, record)
+    return await settled.run_settled(_record_pending_equivalence, record)
 
 
 def _merged_upstream_sha(record: dict, repo: Path) -> str | None:

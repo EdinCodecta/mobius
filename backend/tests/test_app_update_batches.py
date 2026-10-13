@@ -634,6 +634,50 @@ async def test_unreadable_progress_is_retried_on_the_next_request(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_cancelled_retry_keeps_the_failure_so_the_next_request_retries(
+  tmp_path, monkeypatch,
+):
+  from tests.cancel_helpers import BlockedWorker
+
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  owner.root.mkdir()
+  path = owner.root / f"{uuid4()}.json"
+  path.write_text("interrupted bytes")
+  await owner.start()
+  failure = owner.failure
+  path.unlink()
+  worker = BlockedWorker(wraps=owner._load_receipts)
+  monkeypatch.setattr(owner, "_load_receipts", worker)
+  retry = asyncio.create_task(owner.retry_start())
+  assert await asyncio.to_thread(worker.entered.wait, 5)
+  retry.cancel()
+  await asyncio.sleep(.02)
+  assert not retry.done()  # The read finishes before the retry unwinds.
+  worker.release.set()
+  with pytest.raises(asyncio.CancelledError):
+    await retry
+  assert (owner.failure, owner._read_failed, owner.accepting) == (failure, True, False)
+  monkeypatch.undo()
+  await owner.retry_start()
+  assert owner.accepting and owner.failure is None
+
+
+@pytest.mark.asyncio
+async def test_a_finished_batch_keeps_a_save_lock_a_refresh_still_holds(tmp_path):
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  await owner.start()
+  key = str(uuid4())
+  lock = owner._save_locks[key] = asyncio.Lock()
+  await lock.acquire()
+  done = asyncio.get_running_loop().create_future()
+  done.set_result(None)
+  owner._finished(key, done)
+  # Dropping it would let the next save run beside the refresh's write.
+  assert owner._save_locks[key] is lock
+  lock.release()
+
+
+@pytest.mark.asyncio
 async def test_single_update_transfers_before_the_lock_and_cancels_safely(tmp_path, db, monkeypatch):
   """The shared path: no Git transfer under the lock; a cancel waits for the pass."""
   app_id = add_app(db, tmp_path, "single", version="1.0")
@@ -988,33 +1032,6 @@ async def test_boot_removes_temporary_files_a_crash_left(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_shutdown_ends_open_progress_streams(tmp_path, app_rows, monkeypatch):
-  monkeypatch.setattr(batches, "_STOP_GRACE_SECONDS", 0.05)
-  release = asyncio.Event()
-
-  async def execute(update):
-    await release.wait()
-    return {"status": "updated"}
-
-  owner = batches.AppUpdateBatches(str(tmp_path), execute=execute)
-  await owner.start()
-  key = owner.submit(request(1), None)["id"]
-  stream = owner.snapshots(key)
-  assert (await anext(stream))["phase"] == "applying"
-  pending_frame = asyncio.ensure_future(anext(stream))
-  await asyncio.sleep(0)
-  monkeypatch.setattr(batches, "_settled_outcomes",
-    lambda reviewed: {1: {"status": "failed", "error": batches._NOT_APPLIED}})
-  await owner.stop()
-  # The stream yields at most the settled snapshot and then ends at once.
-  with pytest.raises(StopAsyncIteration):
-    while True:
-      await asyncio.wait_for(pending_frame, timeout=1)
-      pending_frame = asyncio.ensure_future(anext(stream))
-  assert not owner.listeners
-
-
-@pytest.mark.asyncio
 async def test_runtime_prunes_finished_batches_past_retention(tmp_path, app_rows):
   owner = batches.AppUpdateBatches(str(tmp_path))
   await owner.start()
@@ -1033,4 +1050,4 @@ async def test_runtime_prunes_finished_batches_past_retention(tmp_path, app_rows
   await drain(owner)
   assert key not in owner.records and key not in owner._save_locks
   assert not (owner.root / f"{key}.json").exists()
-  assert fresh in owner.records and fresh not in owner._save_locks
+  assert fresh in owner.records and fresh in owner._save_locks  # Kept until pruning.

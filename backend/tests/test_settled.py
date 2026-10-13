@@ -1,7 +1,10 @@
 """The shared settle primitive: cancellation waits for the work, then wins."""
 
+import ast
 import asyncio
 import logging
+import re
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -174,7 +177,7 @@ def test_without_a_cancel_the_result_or_exception_passes_through():
   asyncio.run(run())
 
 
-async def _teardown_under_cancel(raise_first, caplog_logger):
+async def _teardown_under_cancel(raise_first, caplog_logger, handled_above=False):
   """A finally whose first step is cancelled twice; return (task, ran)."""
   ran, started, finish = [], asyncio.Event(), asyncio.Event()
 
@@ -198,7 +201,15 @@ async def _teardown_under_cancel(raise_first, caplog_logger):
       ran.append(f"second ok={ok}")
       teardown.finish()
 
-  task = asyncio.create_task(turn())
+  async def turn_while_a_caller_handles_a_cancel():
+    try:
+      raise asyncio.CancelledError("handled above")
+    except asyncio.CancelledError:
+      await turn()
+
+  task = asyncio.create_task(
+    turn_while_a_caller_handles_a_cancel() if handled_above else turn(),
+  )
   await started.wait()
   task.cancel("held one")
   await asyncio.sleep(0)
@@ -228,3 +239,112 @@ def test_teardown_lets_the_original_unwinding_cancel_propagate():
   )
   assert outcome.args == ("original",)
   assert ran == ["first", "second", "second ok=False"]
+
+
+def test_teardown_is_not_fooled_by_a_cancel_handled_further_up_the_stack():
+  """Only an exception unwinding the teardown's own block counts as unwinding."""
+  outcome, ran = asyncio.run(_teardown_under_cancel(
+    False, logging.getLogger("mobius.test_teardown"), handled_above=True,
+  ))
+  assert outcome.args == ("held one",)
+  assert ran == ["first", "second", "second ok=False"]
+
+
+# The reason names what the thread does, e.g. "(git status, optional locks off)".
+_READ_ONLY = re.compile(r"# unsettled: read-only \((?P<reason>[^)]*\S[^)]*)\)")
+# Settled by its caller: ``apply_platform_update`` waits out an admitted Apply.
+_SETTLED_ELSEWHERE = {("platform_update.py", "_apply_platform_update_sync")}
+
+
+def _locks(expr) -> bool:
+  """Whether an ``async with`` item looks like a lock.
+
+  Any lock-like name counts: ``fs_locks.*`` calls, the chat transition lock,
+  ``_APPLY_LOCK``, route-local wrappers such as a stack's source locks, and
+  plain ``lock`` or ``self._lock`` attributes.
+  """
+  if isinstance(expr, ast.Call):
+    func = expr.func
+    if (
+      isinstance(func, ast.Attribute)
+      and isinstance(func.value, ast.Name) and func.value.id == "fs_locks"
+    ):
+      return True
+    expr = func
+  name = getattr(expr, "attr", None) or getattr(expr, "id", "")
+  return "lock" in name.lower()
+
+
+def _held(node: ast.AsyncWith) -> bool:
+  if any(_locks(item.context_expr) for item in node.items):
+    return True
+  # An AsyncExitStack that enters such locks one by one.
+  return any(
+    isinstance(call, ast.Call)
+    and isinstance(call.func, ast.Attribute)
+    and call.func.attr == "enter_async_context"
+    and call.args and _locks(call.args[0])
+    for statement in node.body for call in ast.walk(statement)
+  )
+
+
+def _plain_to_thread_calls(body):
+  """Yield lexical ``asyncio.to_thread`` calls, not those in nested functions."""
+  pending = list(body)
+  while pending:
+    node = pending.pop()
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+      continue
+    if (
+      isinstance(node, ast.Call)
+      and isinstance(node.func, ast.Attribute)
+      and node.func.attr == "to_thread"
+      and isinstance(node.func.value, ast.Name)
+      and node.func.value.id == "asyncio"
+    ):
+      yield node
+    pending.extend(ast.iter_child_nodes(node))
+
+
+def test_lock_held_thread_work_is_settled_or_marked_read_only():
+  """Under a lock, a cancelled caller must not unwind while its thread writes.
+
+  Plain ``asyncio.to_thread`` releases the lock on cancel while the thread
+  runs on, so lock-held thread work goes through ``settled``. Read-only work
+  may stay plain, marked ``# unsettled: read-only (<what it reads>)`` on the
+  call's line.
+
+  The policy itself is in ``app/settled.py``. This only sees direct calls
+  written inside a lock block. Thread work
+  reached through a called coroutine is not checked, and a marker is a claim
+  that a reviewer checks by hand, not something this test can prove.
+  """
+  app_root = Path(__file__).resolve().parents[1] / "app"
+  offenders = []
+  for path in sorted(app_root.rglob("*.py")):
+    source = path.read_text()
+    lines = source.splitlines()
+    for node in ast.walk(ast.parse(source)):
+      if not isinstance(node, ast.AsyncWith) or not _held(node):
+        continue
+      for call in _plain_to_thread_calls(node.body):
+        callee = call.args[0] if call.args else None
+        name = getattr(callee, "id", getattr(callee, "attr", ""))
+        if (path.name, name) in _SETTLED_ELSEWHERE:
+          continue
+        if not _READ_ONLY.search(lines[call.lineno - 1]):
+          offenders.append(f"{path.relative_to(app_root)}:{call.lineno}")
+  assert not sorted(set(offenders)), (
+    "Lock-held asyncio.to_thread must use settled.run_settled, or be marked "
+    "'# unsettled: read-only (<reason>)' when the thread only reads: "
+    f"{sorted(set(offenders))}"
+  )
+
+
+@pytest.mark.parametrize("line, marked", [
+  ("x = await asyncio.to_thread(f)  # unsettled: read-only (git status)", True),
+  ("x = await asyncio.to_thread(f)  # unsettled: read-only", False),
+  ("x = await asyncio.to_thread(f)  # unsettled: read-only ( )", False),
+])
+def test_a_read_only_marker_must_give_its_reason(line, marked):
+  assert bool(_READ_ONLY.search(line)) is marked

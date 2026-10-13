@@ -5,10 +5,14 @@ import threading
 
 
 class BlockedWorker:
-  """A thread body that blocks until released, then returns ``then()``."""
+  """A thread body that blocks until released, then returns ``then()``.
 
-  def __init__(self, then=lambda: None):
+  With ``wraps``, it runs the real callable with the call's arguments instead.
+  """
+
+  def __init__(self, then=lambda: None, *, wraps=None):
     self.then = then
+    self.wraps = wraps
     self.entered = threading.Event()
     self.release = threading.Event()
     self.exited = threading.Event()
@@ -17,7 +21,7 @@ class BlockedWorker:
     self.entered.set()
     try:
       assert self.release.wait(10)
-      return self.then()
+      return self.wraps(*args, **kwargs) if self.wraps else self.then()
     finally:
       self.exited.set()
 

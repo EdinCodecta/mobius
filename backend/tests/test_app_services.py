@@ -188,6 +188,57 @@ async def test_cancel_during_spawn_reaps_process_before_releasing_runtime(monkey
 
 
 @pytest.mark.asyncio
+async def test_a_second_cancel_cannot_interrupt_stopping_a_running_service(
+  monkeypatch, tmp_path,
+):
+  entry = tmp_path / "service.py"
+  entry.write_text("import time; time.sleep(60)")
+  processes, released = [], []
+  stopping, finish_stop = asyncio.Event(), asyncio.Event()
+  real_spawn, real_stop = asyncio.create_subprocess_exec, app_services._stop_process
+
+  async def spawn(*args, **kwargs):
+    processes.append(await real_spawn(*args, **kwargs))
+    return processes[-1]
+
+  async def gated_stop(process, *tasks):
+    stopping.set()
+    await finish_stop.wait()
+    await real_stop(process, *tasks)
+
+  monkeypatch.setattr(app_services, "service_contract", lambda *a, **k: {})
+  monkeypatch.setattr(app_services, "service_entry", lambda *a: entry)
+  monkeypatch.setattr(app_services, "service_environment", lambda *a, **k: {})
+  monkeypatch.setattr(app_services, "hold_runtime", lambda *_: SimpleNamespace(
+    close=lambda: released.append(processes[0].returncode),
+  ))
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+  monkeypatch.setattr(app_services, "_stop_process", gated_stop)
+  task = asyncio.create_task(app_services.invoke_service(SimpleNamespace(id=1, slug="test"), None, {}))
+  try:
+    while not processes:
+      await asyncio.sleep(.01)
+    await asyncio.sleep(.05)  # Past admission, into execution.
+    task.cancel("request gone")
+    await asyncio.wait_for(stopping.wait(), timeout=3)
+    task.cancel()  # A shutdown cancels the stop itself.
+    await asyncio.sleep(.02)
+    assert not task.done() and not released
+    finish_stop.set()
+    with pytest.raises(asyncio.CancelledError):
+      await asyncio.wait_for(task, timeout=3)
+    assert released and released[0] is not None, "runtime released before child was reaped"
+  finally:
+    finish_stop.set()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    for process in processes:
+      if process.returncode is None:
+        os.killpg(process.pid, signal.SIGKILL)
+      await process.wait()
+
+
+@pytest.mark.asyncio
 async def test_cancel_wins_over_a_spawn_that_then_fails_unexpectedly(monkeypatch, tmp_path, caplog):
   started, finish_spawn, released = asyncio.Event(), asyncio.Event(), []
 
