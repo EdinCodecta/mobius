@@ -12,7 +12,7 @@ from fastapi import HTTPException
 import pytest
 
 from app import app_update_batches as batches
-from app import fs_locks, install, models
+from app import fs_locks, install, models, settled
 
 COMMIT = "a" * 40
 
@@ -262,7 +262,7 @@ async def test_shutdown_settles_running_installs_and_records_what_landed(tmp_pat
     started.add(update["app_id"])
     if len(started) == 2:
       entered.set()
-    return await install._settle_before_cancel(pass_in_thread(update["app_id"]))
+    return await settled.settle(pass_in_thread(update["app_id"]))
 
   async def resident():
     try:
@@ -651,7 +651,7 @@ async def test_single_update_transfers_before_the_lock_and_cancels_safely(tmp_pa
     events.append(("pass settled", fs_locks.install_uninstall_lock().locked()))
 
   async def install_from_manifest(session, **kwargs):
-    return await install._settle_before_cancel(locked_pass())
+    return await settled.settle(locked_pass())
 
   monkeypatch.setattr(install, "fetch_app_commit", fetch_app_commit)
   monkeypatch.setattr(install, "install_from_manifest", install_from_manifest)
@@ -892,7 +892,7 @@ async def test_shutdown_wait_is_bounded(tmp_path, app_rows, monkeypatch):
 
   async def execute(update):
     entered.set()
-    return await install._settle_before_cancel(stuck_pass())
+    return await settled.settle(stuck_pass())
 
   owner = batches.AppUpdateBatches(str(tmp_path), execute=execute)
   await owner.start()

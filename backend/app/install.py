@@ -41,7 +41,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Awaitable, Callable, Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 from urllib.parse import quote, urljoin, urlparse
 
 import httpx
@@ -61,6 +61,7 @@ from app import (
   icon_assets,
   managed_paths,
   models,
+  settled,
 )
 from app import app_cron
 from app.build_admission import BuildLeaseUnavailable
@@ -1687,7 +1688,7 @@ async def clear_pending_conflict_update(db: Session, app: models.App) -> None:
   app.conflict_resolver_chat_id = None
   app.conflict_resolver_upstream_commit = None
   db.commit()
-  await _to_completion(_drop_pending_update_worktree, source_dir)
+  await settled.run_settled(_drop_pending_update_worktree, source_dir)
   shutil.rmtree(
     Path(source_dir) / ".git" / _PENDING_UPDATE_DIR,
     ignore_errors=True,
@@ -2881,43 +2882,6 @@ async def _stage(stage: Callable[..., app_git.Staged], *args) -> app_git.Staged:
     raise
 
 
-async def _to_completion(function: Callable, *args):
-  """Run a thread that must finish before its caller releases a lock."""
-  return await _settle_before_cancel(asyncio.to_thread(function, *args))
-
-
-async def _settle_before_cancel(
-  work: Awaitable, *, abandoned: asyncio.Event | None = None,
-):
-  """Await ``work`` to its end even if the caller is cancelled meanwhile.
-
-  Cancelling an ``asyncio.to_thread`` await does not stop its thread. A
-  cancelled caller re-raises only once ``work`` settles, so it never releases a
-  lock or rolls back under writes that are still running. ``abandoned`` is set
-  on the first cancellation, so multi-step work can stop at its next safe point.
-  """
-  work = asyncio.ensure_future(work)
-  cancelled = False
-  while not work.done():
-    try:
-      await asyncio.wait({work})
-    except asyncio.CancelledError:
-      cancelled = True
-      if abandoned is not None:
-        abandoned.set()
-  if cancelled:
-    # The caller's outcome is its cancellation, so nobody takes ``work``'s.
-    outcome = None if work.cancelled() else work.exception()
-    if isinstance(outcome, HTTPException):
-      log.info("Work refused after its caller was cancelled: %s", outcome.detail)
-    elif outcome is not None:
-      log.error(
-        "Work failed after its caller was cancelled", exc_info=outcome,
-      )
-    raise asyncio.CancelledError
-  return work.result()
-
-
 # One transfer per (repository, origin, ref) at a time; concurrent requests,
 # such as parallel Store update checks, share it instead of repeating it.
 _FETCHES: dict[tuple[str, str, str], asyncio.Future] = {}
@@ -2962,9 +2926,9 @@ async def _fetch_and_import(repo: Path, url: str, ref: str) -> str:
   staged = await _stage(app_git.stage_fetch, repo, url, ref, git_transfer_root())
   try:
     async with fs_locks.source_dir_lock(str(repo)):
-      return await _to_completion(app_git.import_staged, repo, staged)
+      return await settled.run_settled(app_git.import_staged, repo, staged)
   finally:
-    await _to_completion(discard_staged, staged)
+    await settled.run_settled(discard_staged, staged)
 
 
 def _url_update_commit(
@@ -3646,7 +3610,7 @@ async def _converge_manifest_schedule_zones_unlocked(
         zone = _manifest_default_timezone(choice.cron, owner_zone)
         if zone == choice.timezone:
           continue
-        await app_cron.run_schedule_mutation(
+        await settled.run_settled(
           _move_manifest_schedule_zone, app,
           dataclasses.replace(choice, timezone=zone), scaffold,
         )
@@ -3681,7 +3645,7 @@ async def _sync_manifest_cron_unlocked(
   contract (``app_cron.owner_schedule_to_keep``); otherwise the manifest
   default is registered, in ``owner_zone`` when it is a fixed wall time.
   """
-  await app_cron.run_schedule_mutation(
+  await settled.run_settled(
     _sync_manifest_cron, app, manifest, drop_prior_cron,
     bundled_job, warnings, owner_zone,
   )
@@ -3865,7 +3829,7 @@ async def _prepare_app_row(
                 _reconcile_cron_after_install_rollback
               )
               try:
-                await app_cron.run_schedule_mutation(
+                await settled.run_settled(
                   _unregister_cron, Path(old_source_dir),
                 )
               except asyncio.CancelledError:
@@ -3873,7 +3837,7 @@ async def _prepare_app_row(
                 # row and filesystem journal while both lifecycle/source locks
                 # still exclude competitors, then propagate the cancellation.
                 db.rollback()
-                await app_cron.run_schedule_mutation(
+                await settled.run_settled(
                   journal.rollback_materialization,
                 )
                 raise
@@ -4360,8 +4324,7 @@ async def install_requested_app(
   one path. Network transfers (``fetch_app_commit`` for a reviewed update,
   ``prepare_package`` for an install) finish before the lifecycle lock, so
   one slow package never holds up other apps' installs, updates or
-  uninstalls; the
-  local install then runs under that lock (``fs_locks.install_uninstall_lock``
+  uninstalls; the local install then runs under that lock (``fs_locks.install_uninstall_lock``
   has the full rationale), and its passes settle before a cancellation.
   """
   prepared = None
@@ -4401,7 +4364,7 @@ async def install_requested_app(
       )
   finally:
     if prepared is not None:
-      await _to_completion(discard_staged, prepared.staged_clone)
+      await settled.run_settled(discard_staged, prepared.staged_clone)
 
 
 async def install_from_manifest(
@@ -4600,32 +4563,31 @@ async def install_from_manifest(
   )
   # Each pass holds the source lock across many Git threads and rolls back on
   # failure, and the env check runs threads from the handed-out runtime, all
-  # under the caller's lifecycle lock. So the passes and the check settle as
-  # one unit: a cancelled caller waits for the step in flight, which then
-  # stops at its next safe point.
-  abandoned = asyncio.Event()
-  return await _settle_before_cancel(
-    _install_in_passes(install_candidate, abandoned), abandoned=abandoned,
+  # under the caller's lifecycle lock. So each step settles before a cancelled
+  # caller unwinds, and the cancellation then stops the install between steps.
+  try:
+    return await settled.settle(
+      install_candidate(python_check=None), abandoned=_abandon_install_step,
+    )
+  except _UncheckedPythonTree as unchecked:
+    pending = unchecked
+  python_check = await settled.settle(
+    _check_reconciled_python(pending), abandoned=_abandon_install_step,
+  )
+  return await settled.settle(
+    install_candidate(python_check=python_check), abandoned=_abandon_install_step,
   )
 
 
-async def _install_in_passes(
-  install_candidate: Callable[..., Awaitable[InstallResult]],
-  abandoned: asyncio.Event,
-) -> InstallResult:
-  """Run the install's passes; once ``abandoned``, discard and stop between steps."""
-  try:
-    return await install_candidate(python_check=None)
-  except _UncheckedPythonTree as unchecked:
-    pending = unchecked
-  if abandoned.is_set():
-    pending.discard()
-    raise asyncio.CancelledError
-  python_check = await _check_reconciled_python(pending)
-  if abandoned.is_set():
-    app_python_env.discard_env(python_check.env)
-    raise asyncio.CancelledError
-  return await install_candidate(python_check=python_check)
+def _abandon_install_step(step: asyncio.Future) -> None:
+  """Release what a step left once its caller was cancelled."""
+  outcome = step.exception()
+  if isinstance(outcome, _UncheckedPythonTree):
+    outcome.discard()
+  elif outcome is not None:
+    settled.log_abandoned_failure(step, "Install step")
+  elif isinstance(step.result(), CheckedPythonTree):
+    app_python_env.discard_env(step.result().env)
 
 
 async def _install_candidate(
@@ -4905,7 +4867,7 @@ async def _install_candidate(
             if reviewed_upstream_commit is not None:
               upstream_sha = reviewed_upstream_commit
             else:
-              upstream_sha = await _to_completion(
+              upstream_sha = await settled.run_settled(
                 _url_update_commit, git_source_dir, repo_ref[1], staged_clone,
               )
               if staged_clone is None:
@@ -5197,7 +5159,7 @@ async def _install_candidate(
               409, "The app's Git repository must be fetched before install.",
             )
           try:
-            journal.rollback_actions.append(await _to_completion(
+            journal.rollback_actions.append(await settled.run_settled(
               app_git.adopt_clone, staged_clone, git_source_dir,
             ))
             app.upstream_commit = staged_clone.sha

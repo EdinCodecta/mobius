@@ -29,7 +29,7 @@ from uuid import UUID
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app import activity, app_git, models
+from app import activity, app_git, models, settled
 from app.broadcast import get_system_broadcast
 from app.database import SessionLocal
 from app.resource_access import live_app_or_404
@@ -270,13 +270,11 @@ class AppUpdateBatches:
     state when its turn comes, so the last write always holds the latest
     progress. The write finishes even if its caller is cancelled.
     """
-    from app.install import _to_completion
-
     lock = self._save_locks.setdefault(record["id"], asyncio.Lock())
     async with lock:
       text = self._encode(record)
       try:
-        await _to_completion(self._write, record["id"], text)
+        await settled.run_settled(self._write, record["id"], text)
       except OSError:
         self._write_failed()
         raise

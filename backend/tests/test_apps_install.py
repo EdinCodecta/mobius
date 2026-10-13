@@ -29,6 +29,7 @@ from fastapi import HTTPException
 from app import app_apply, app_git, install, models, transcript_rows
 from app.config import get_settings
 from test_app_fixtures import create_local_app
+from tests.cancel_helpers import assert_cancellation_drains_worker_under_lock
 
 
 @pytest.fixture(autouse=True)
@@ -1353,9 +1354,9 @@ def test_cancelled_install_rolls_back_only_after_its_git_worker_exits(
   def refused():
     raise HTTPException(409, "The adopted clone cannot be committed.")
 
-  caplog.set_level(logging.INFO, logger="mobius.install")
-  _assert_cancellation_drains_worker_under_lock(
-    source_dir, cancelled_install, monkeypatch,
+  caplog.set_level(logging.INFO, logger="mobius.settled")
+  assert_cancellation_drains_worker_under_lock(
+    _source_lock(source_dir), cancelled_install, monkeypatch,
     install.app_git, "commit_local",
     while_blocked=lambda: source_dir.is_dir(), then=refused,
   )
@@ -1366,28 +1367,6 @@ def test_cancelled_install_rolls_back_only_after_its_git_worker_exits(
   # an expected, rolled-back refusal is not reported as an error either.
   assert "refused after its caller was cancelled" in caplog.text
   assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
-
-
-def test_cancelled_caller_logs_an_unexpected_failure_of_settling_work(caplog):
-  async def run():
-    started, finish = asyncio.Event(), asyncio.Event()
-
-    async def failing_work():
-      started.set()
-      await finish.wait()
-      raise RuntimeError("unexpected")
-
-    task = asyncio.create_task(install._settle_before_cancel(failing_work()))
-    await started.wait()
-    task.cancel()
-    await asyncio.sleep(0)
-    finish.set()
-    with pytest.raises(asyncio.CancelledError):
-      await task
-
-  asyncio.run(run())
-  assert [record.levelno for record in caplog.records] == [logging.ERROR]
-  assert "failed after its caller was cancelled" in caplog.text
 
 
 def test_update_dropping_schedule_unregisters_orphan_cron(
@@ -4604,50 +4583,10 @@ def test_conflict_resolver_batch_cannot_deadlock_contribute_publication(
   asyncio.run(run_competing_operations())
 
 
-def _assert_cancellation_drains_worker_under_lock(
-  source_dir, operation, monkeypatch, target, attr, *,
-  while_blocked=lambda: True, then=lambda: None,
-):
-  """A lock-held disk mutation must finish before cancellation frees the lock.
-
-  Cancelling an ``asyncio.to_thread`` await does not stop its thread, so a
-  caller that unwinds at once releases the source lock while Git still writes.
-  ``while_blocked`` checks state the cancelled caller must not yet undo;
-  ``then`` is the worker's own outcome once released.
-  """
-  import threading
+def _source_lock(source_dir):
   from app import fs_locks
 
-  entered, release, exited = threading.Event(), threading.Event(), threading.Event()
-
-  def blocked(*args):
-    entered.set()
-    try:
-      assert release.wait(10)
-      return then()
-    finally:
-      exited.set()
-
-  monkeypatch.setattr(target, attr, blocked)
-
-  async def run():
-    lock = fs_locks.source_dir_lock(str(Path(source_dir).resolve()))
-    task = asyncio.create_task(operation())
-    try:
-      assert await asyncio.to_thread(entered.wait, 5)
-      for _ in range(2):
-        task.cancel()
-        await asyncio.sleep(.02)
-        assert not task.done() and not exited.is_set()
-        assert lock.locked(), "source lock released while its worker still ran"
-        assert while_blocked(), "cancelled caller undid state under its worker"
-    finally:
-      release.set()
-      outcome = await asyncio.gather(task, return_exceptions=True)
-    assert exited.is_set() and not lock.locked()
-    assert isinstance(outcome[0], asyncio.CancelledError), repr(outcome)
-
-  asyncio.run(run())
+  return fs_locks.source_dir_lock(str(Path(source_dir).resolve()))
 
 
 @pytest.mark.parametrize("step", ["_validate_pending_update", "_park_pending_update"])
@@ -4677,8 +4616,8 @@ def test_cancelled_resolver_batch_drains_worker_before_releasing_source(
   )
   monkeypatch.setattr(routes, "_upstream_version", lambda *args: "2")
   monkeypatch.setattr(routes, "_park_pending_update", lambda *args: [])
-  _assert_cancellation_drains_worker_under_lock(
-    repo, lambda: routes._create_conflict_resolver_chat(db, [app.id]),
+  assert_cancellation_drains_worker_under_lock(
+    _source_lock(repo), lambda: routes._create_conflict_resolver_chat(db, [app.id]),
     monkeypatch, routes, step,
   )
 
@@ -4705,8 +4644,8 @@ def test_cancelled_resolver_finish_drains_merge_commit_before_releasing_source(
     routes, "_pending_store_update_receipt",
     lambda *args: {"upstream_commit": "upstream"},
   )
-  _assert_cancellation_drains_worker_under_lock(
-    repo,
+  assert_cancellation_drains_worker_under_lock(
+    _source_lock(repo),
     lambda: routes.resolve_app_update(
       schemas.AppResolveUpdate(source_dir=str(repo)), db, None,
     ),
@@ -4735,8 +4674,8 @@ def test_cancelled_pending_cleanup_drains_worktree_removal_before_releasing_sour
     async with fs_locks.source_dir_lock(str(repo.resolve())):
       await install.clear_pending_conflict_update(db, app)
 
-  _assert_cancellation_drains_worker_under_lock(
-    repo, cleanup, monkeypatch, install, "_drop_pending_update_worktree",
+  assert_cancellation_drains_worker_under_lock(
+    _source_lock(repo), cleanup, monkeypatch, install, "_drop_pending_update_worktree",
   )
   assert not receipt_file.exists()
   assert app.conflict_resolver_upstream_commit is None
