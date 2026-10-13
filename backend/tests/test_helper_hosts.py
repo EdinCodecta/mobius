@@ -142,6 +142,46 @@ def test_an_idle_host_closes_and_a_dead_one_is_replaced(monkeypatch):
   assert third is not second
 
 
+def test_a_cancelled_lease_finishes_closing_the_old_host_under_its_lock(monkeypatch):
+  """A new host for the conversation never starts beside a half-closed one."""
+  monkeypatch.setattr(helper_hosts, "HOST_IDLE_SECONDS", 60)
+  manager = helper_hosts.HostManager()
+  replacements = []
+
+  async def scenario():
+    closing, finish = asyncio.Event(), asyncio.Event()
+
+    class SlowClose(_FakeHost):
+      async def close(self):
+        closing.set()
+        await finish.wait()
+        await super().close()
+
+    async with manager.lease(_key(), lambda: SlowClose(_key())) as dead:
+      dead._closed = True  # the provider process died
+
+    async def lease_again():
+      async with manager.lease(
+        _key(), lambda: replacements.append(1) or _FakeHost(_key()),
+      ):
+        pass
+
+    task = asyncio.create_task(lease_again())
+    await closing.wait()
+    for _ in range(2):
+      task.cancel()
+      await asyncio.sleep(0.01)
+      assert not task.done() and manager._lock(_key()).locked()
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+    assert dead.closed and not manager._lock(_key()).locked()
+    await manager.close_all()
+
+  asyncio.run(scenario())
+  assert not replacements  # No new host started after the cancel.
+
+
 def test_host_digest_separates_parents_and_setups_without_changing_write_identity():
   assert _key("a").digest != _key("b").digest
   assert helper_hosts.HostKey("a", "codex", "/data", "other-setup").digest != _key("a").digest

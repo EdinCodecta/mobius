@@ -211,6 +211,15 @@ async def _stop_process(process, *tasks) -> None:
   await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def _settled_stop(process, *tasks) -> None:
+  """Stop a running child even if this request is cancelled meanwhile.
+
+  SIGKILL is sent at once, but reaping the child, cancelling its pipe readers
+  and, after that, releasing the runtime pin must not be cut short.
+  """
+  await settled.settle(_stop_process(process, *tasks), what="App service stop")
+
+
 async def _stop_spawned(spawn: asyncio.Task) -> None:
   """Stop a child whose request was cancelled; the cancellation still wins."""
   try:
@@ -285,15 +294,15 @@ async def _run_spawned(
       timeout=timeout_seconds,
     )
   except (TimeoutError, ValueError) as exc:
-    await _stop_process(process, write_task, stdout_task, stderr_task)
+    await _settled_stop(process, write_task, stdout_task, stderr_task)
     raise ServiceBoundaryError("execution_limit", 503, "App service exceeded its execution limits.")
   except OSError as exc:
-    await _stop_process(process, write_task, stdout_task, stderr_task)
+    await _settled_stop(process, write_task, stdout_task, stderr_task)
     raise ServiceBoundaryError(
       "request_not_accepted", 502, "App service failed before accepting its request.",
     ) from exc
   except asyncio.CancelledError:
-    await _stop_process(process, write_task, stdout_task, stderr_task)
+    await _settled_stop(process, write_task, stdout_task, stderr_task)
     raise
   try:
     os.killpg(process.pid, signal.SIGKILL)

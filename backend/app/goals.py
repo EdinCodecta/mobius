@@ -280,7 +280,7 @@ class CompactionBriefRefresh:
       if need <= self._delivered:
         return ""
       try:
-        brief = await asyncio.to_thread(self._load)
+        brief = await asyncio.to_thread(self._load)  # unsettled: read-only (loads the Goal brief)
       except Exception:
         log.warning("Goal brief refresh failed; retrying at the next boundary",
                     exc_info=True)

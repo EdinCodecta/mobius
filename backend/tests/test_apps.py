@@ -508,6 +508,64 @@ def test_delete_then_purge_preserves_platform_core_source(client, auth, db):
   assert (source_dir / "index.jsx").exists()
 
 
+@pytest.mark.parametrize("action", ["purge", "uninstall", "clear storage"])
+def test_cancelled_removal_holds_its_lock_until_its_thread_ends(
+  client, auth, db, monkeypatch, action,
+):
+  """A cancelled uninstall, purge or data wipe keeps its lock while it writes."""
+  import asyncio
+  from datetime import UTC, datetime, timedelta
+  from app import fs_locks
+  from app.routes import apps as routes
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  data_dir = Path(get_settings().data_dir)
+  source_dir = data_dir / "apps" / "removal"
+  source_dir.mkdir(parents=True)
+  (source_dir / "index.jsx").write_text("export default function App() {}")
+  app = models.App(
+    name="Removal", jsx_source="", source_dir=str(source_dir), slug="removal",
+  )
+  db.add(app)
+  db.commit()
+  app_id = app.id
+  storage = data_dir / "apps" / str(app_id)
+  storage.mkdir()
+  (storage / "notes.json").write_text("{}")
+  if action == "purge":
+    app.deleted_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=8)
+    db.commit()
+  owner = db.query(models.Owner).one()
+  target, attr, lock, operation = {
+    "purge": (
+      routes, "_rmtree_strict", fs_locks.install_uninstall_lock(),
+      lambda: routes.list_apps(db, None),
+    ),
+    "uninstall": (
+      routes.app_jobs, "terminate_app_jobs", fs_locks.install_uninstall_lock(),
+      lambda: routes.delete_app(app_id, db, owner),
+    ),
+    "clear storage": (
+      routes, "_rmtree_strict", fs_locks.app_storage_lock(app_id),
+      lambda: routes.delete_app_data(app_id, db, None),
+    ),
+  }[action]
+  worker = BlockedWorker(wraps=getattr(target, attr))
+  monkeypatch.setattr(target, attr, worker)
+
+  outcome = asyncio.run(cancel_while_worker_blocked(lock, operation, worker))
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  db.expire_all()
+  row = db.get(models.App, app_id)
+  if action == "purge":
+    assert row is None  # The purge ran to its end, not half-way.
+  elif action == "uninstall":
+    assert row.deleted_at is not None
+  else:
+    assert not storage.exists()
+
+
 def test_delete_scheduled_app_disables_own_cron_replay(
   client, auth,
 ):

@@ -15,6 +15,20 @@ the work has settled. ``settle`` is the one place that rule lives:
 ``Teardown`` applies the same rule to a sequence of cleanup steps, such as a
 turn's ``finally``: each step runs to its end, a cancellation landing in one
 is held until every step has run, and a step's failure is logged.
+
+Policy for thread work under a lock:
+
+* Per call by default: each lock-held thread call goes through
+  ``run_settled``. A cancel then lands at the next call boundary, so it never
+  starts a new step, such as a public GitHub write, after the caller is gone.
+* A whole section, ``async with lock: await settle(section())``, only where an
+  in-process rollback must run once the section fails, as App Apply and the
+  tombstone purge do. A settled section also finishes steps that had not
+  started when the cancel came.
+* A plain ``asyncio.to_thread`` only for a read, marked on its line with
+  ``# unsettled: read-only (<what it reads>)``. ``tests/test_settled.py``
+  enforces this for direct calls inside lock blocks; it cannot see thread work
+  reached through a called coroutine, and a marker is a reviewed claim.
 """
 
 from __future__ import annotations
@@ -92,7 +106,7 @@ class Teardown:
   def __init__(self, logger: logging.Logger, context: str) -> None:
     self._log = logger
     self._context = context
-    self._unwinding = sys.exc_info()[1]
+    self._unwinding = _unwinding(sys._getframe(1))
     self.cancel: asyncio.CancelledError | None = None
 
   def defer(self, cancel: asyncio.CancelledError) -> None:
@@ -117,7 +131,7 @@ class Teardown:
         )
 
     try:
-      await settle(logged(), what=what)
+      await settle(logged())
     except asyncio.CancelledError as exc:
       self.defer(exc)
     return succeeded
@@ -128,3 +142,19 @@ class Teardown:
       self._unwinding, asyncio.CancelledError,
     ):
       raise self.cancel
+
+
+def _unwinding(frame) -> BaseException | None:
+  """The exception unwinding through ``frame``, if any.
+
+  ``sys.exc_info`` also reports an exception a caller further up the stack is
+  only handling. One unwinding this frame has already passed through it, so
+  its traceback holds the frame.
+  """
+  error = sys.exc_info()[1]
+  trace = error.__traceback__ if error is not None else None
+  while trace is not None:
+    if trace.tb_frame is frame:
+      return error
+    trace = trace.tb_next
+  return None

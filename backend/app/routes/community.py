@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app import fs_locks, github_auth, models, store_listing_source
+from app import fs_locks, github_auth, models, settled, store_listing_source
 from app.community_broker import (
   COMMUNITY_PREFIX,
   CommunityBrokerError,
@@ -607,7 +607,7 @@ async def publish_local_app_to_github(
 
   try:
     async with fs_locks.source_dir_lock(str(app.source_dir)):
-      accepted_commit, files = await asyncio.to_thread(build_public_snapshot, app)
+      accepted_commit, files = await settled.run_settled(build_public_snapshot, app)
     await asyncio.to_thread(public_store_listing, files)
   except CommunityPublicationError as exc:
     raise HTTPException(
@@ -905,11 +905,11 @@ async def preview_local_app_publication(
     async with fs_locks.source_dir_lock(str(app.source_dir)):
       # Lenient: whatever publication would refuse becomes a checklist item,
       # so the editor always gets a draft to fix it from.
-      accepted_commit, files, problems = await asyncio.to_thread(
+      accepted_commit, files, problems = await settled.run_settled(
         read_public_snapshot, app,
       )
-      review = await asyncio.to_thread(store_listing_review, files, problems)
-      await asyncio.to_thread(
+      review = await settled.run_settled(store_listing_review, files, problems)
+      await settled.run_settled(
         store_listing_source.note_what_saving_fixes,
         review["checklist"], Path(str(app.source_dir)), app,
       )
@@ -961,7 +961,7 @@ async def preview_local_app_publication_asset(
     raise HTTPException(404, "Listing asset not found.")
   try:
     async with fs_locks.source_dir_lock(str(app.source_dir)):
-      content = await asyncio.to_thread(
+      content = await settled.run_settled(
         read_public_store_asset, app, accepted_commit, asset_path,
       )
   except CommunityPublicationError as exc:
