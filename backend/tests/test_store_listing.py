@@ -819,7 +819,7 @@ def test_an_app_accepted_with_older_ignore_rules_can_save_a_listing(client, auth
   (source / ".gitignore").write_text(older)
   _commit_accepted(db, source, app_id, "older ignore rules")
 
-  preview = _preview(client, auth, app_id)
+  _preview(client, auth, app_id)
 
   # A read-only preview never rewrites the app's ignore rules.
   assert (source / ".gitignore").read_text() == older
@@ -867,6 +867,56 @@ def test_undo_leaves_a_file_someone_edited_since_the_save(tmp_path):
 
   assert (tmp_path / "mobius.json").read_text() == "an agent's edit"
   assert not (tmp_path / "static" / "store" / "new.png").exists()
+
+
+def test_an_unapplied_icon_redirect_cannot_replace_a_tracked_file(client, auth, db):
+  source = _source()
+  (source / "notes.txt").write_text("Plain notes.\n")
+  app_id = _create(client, auth, source)
+  manifest = json.loads(_MANIFEST)
+  manifest["icon"] = "notes.txt"
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  (source / "notes.txt").write_bytes(_png((1, 2, 3), (64, 64)))
+
+  refused = _save(client, auth, app_id, **_complete_listing())
+
+  assert refused.status_code == 409
+  assert refused.json()["detail"]["code"] == "source_has_draft"
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert app_git._run(source, "show", f"{row.source_commit}:notes.txt").stdout == "Plain notes.\n"
+
+
+def test_a_long_software_text_chunk_counts_as_metadata():
+  from PIL import PngImagePlugin
+
+  from app.community_publish import listing_image_has_metadata
+
+  for value, flagged in (("An image editor 3.2", False), ("x" * 300, True)):
+    info = PngImagePlugin.PngInfo()
+    info.add_text("Software", value)
+    image = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(image, format="PNG", pnginfo=info)
+    assert listing_image_has_metadata(image.getvalue()) is flagged
+
+
+def test_the_public_preview_serves_draft_art_without_its_metadata(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  (source / "static" / "store").mkdir(parents=True)
+  (source / "static" / "store" / "shot.jpg").write_bytes(_gps_jpeg())
+  manifest = json.loads(_MANIFEST)
+  manifest["store"] = {"screenshots": [{"src": "static/store/shot.jpg", "alt": "A"}]}
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  _commit_accepted(db, source, app_id, "an incomplete draft with a GPS photo")
+  preview = _preview(client, auth, app_id)
+  assert preview["ready"] is False
+
+  served = client.get(preview["asset_root"] + "static/store/shot.jpg")
+
+  assert served.status_code == 200
+  assert served.headers["content-type"] == "image/jpeg"
+  image = Image.open(io.BytesIO(served.content))
+  assert image.size == (64, 40) and not image.getexif()
 
 
 def test_an_unexpected_image_error_is_a_checklist_item_not_a_crash(monkeypatch):
@@ -1442,9 +1492,9 @@ def test_a_malformed_image_anywhere_never_takes_down_the_review(monkeypatch):
 
 
 def test_a_declared_icon_rides_along_only_as_a_clean_image(tmp_path):
-  """A changed path named as the icon passes the guard only if it is a clean
-  listing image, so arbitrary bytes can't be accepted by pointing the icon at
-  them."""
+  """A changed icon passes the guard only at a path the save could have
+  written, and only as a clean listing image, so pointing the icon at a
+  file cannot get arbitrary bytes accepted."""
   root = tmp_path / "app"
   root.mkdir()
   app_git.ensure_repo(root)  # As real app sources are: managed ignore rules on main.
@@ -1458,5 +1508,14 @@ def test_a_declared_icon_rides_along_only_as_a_clean_image(tmp_path):
   (root / "mobius.json").write_text(json.dumps({"id": "demo", "icon": "payload.png"}))
   (root / "payload.png").write_text("<script>alert(1)</script>")
   assert store_listing_source.has_unapplied_changes(root, accepted) is True
+  # An unreviewed redirect of the icon is refused even with clean bytes:
+  # only a path the save itself could have written may ride along.
   (root / "payload.png").write_bytes(_png((1, 2, 3)))
+  assert store_listing_source.has_unapplied_changes(root, accepted) is True
+  (root / "payload.png").unlink()
+  clean = _png((1, 2, 3))
+  named = f"static/store/{_content_name(clean)}.png"
+  (root / "static" / "store").mkdir(parents=True)
+  (root / named).write_bytes(clean)
+  (root / "mobius.json").write_text(json.dumps({"id": "demo", "icon": named}))
   assert store_listing_source.has_unapplied_changes(root, accepted) is False

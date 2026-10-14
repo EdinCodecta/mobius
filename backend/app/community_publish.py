@@ -480,6 +480,8 @@ _PNG_HARMLESS_CHUNKS = _PNG_KEPT_CHUNKS | {b"tIME"}
 # A text chunk keyed exactly "Software" names the tool that wrote the file,
 # not a person or place; every other key (Author, Comment, XMP...) counts.
 _PNG_TEXT_CHUNKS = {b"tEXt", b"zTXt", b"iTXt"}
+# A tool name is short; a longer "Software" chunk could carry anything.
+_PNG_SOFTWARE_TEXT_MAX_BYTES = 256
 _WEBP_KEPT_CHUNKS = {b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ANIM", b"ANMF", b"ICCP"}
 # Tables, frame headers, restart intervals and scans: what draws a JPEG.
 _JPEG_DRAWING_MARKERS = {0xC4, 0xCC, 0xDA, 0xDB, 0xDD} | {
@@ -495,7 +497,8 @@ def _png_chunk_draws(kind: bytes, data: bytes) -> bool:
 def _png_chunk_harmless(kind: bytes, data: bytes) -> bool:
   """Drawing chunks, a bare timestamp, or text naming only the producing tool."""
   return kind in _PNG_HARMLESS_CHUNKS or (
-    kind in _PNG_TEXT_CHUNKS and data.split(b"\0", 1)[0] == b"Software"
+    kind in _PNG_TEXT_CHUNKS and len(data) <= _PNG_SOFTWARE_TEXT_MAX_BYTES
+    and data.split(b"\0", 1)[0] == b"Software"
   )
 
 
@@ -1144,6 +1147,10 @@ def read_public_store_asset(
     raise CommunityPublicationError(
       "That file is not a Store listing image.", "listing_asset_unavailable", 404,
     ) from exc
+  if listing_image_has_metadata(content):
+    # Unauthenticated: an incomplete listing's draft art may still carry
+    # location or camera data, which the preview must never hand out.
+    content = strip_listing_image_metadata(content)
   _scan_content(asset_path, content)
   return content, LISTING_MEDIA_TYPES[suffix]
 

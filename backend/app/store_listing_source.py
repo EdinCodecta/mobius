@@ -199,9 +199,7 @@ def changes_beyond_listing(root: Path, accepted: str, tree: str | None = None) -
     _manifest_from(app_git.ref_file(root, accepted, "mobius.json")),
     _manifest_from(read("mobius.json")),
   ]
-  icons = {
-    str(manifest.get("icon") or "") for manifest in manifests if manifest is not None
-  } - {""}
+  icons = _carried_icon_paths(*manifests)
   for path in changed:
     content = read(path)
     # A deleted file carries nothing; a present one must be a clean image,
@@ -219,6 +217,25 @@ def changes_beyond_listing(root: Path, accepted: str, tree: str | None = None) -
       continue
     return True
   return False
+
+
+def _carried_icon_paths(accepted: dict | None, candidate: dict | None) -> set[str]:
+  """Icon paths a save may carry: the reviewed one, or one it could have written.
+
+  The candidate manifest's icon value can itself be an unreviewed edit, so it
+  only counts where write_listing itself could have put an icon: icon.png
+  when none was declared, or content-named art under static/store/.
+  """
+  reviewed = str((accepted or {}).get("icon") or "").strip()
+  proposed = str((candidate or {}).get("icon") or "").strip()
+  paths = {reviewed} if reviewed else set()
+  if proposed and (
+    proposed == reviewed
+    or (not reviewed and proposed == "icon.png")
+    or EDITOR_ART.fullmatch(proposed)
+  ):
+    paths.add(proposed)
+  return paths
 
 
 def has_unapplied_changes(root: Path, accepted: str | None) -> bool:

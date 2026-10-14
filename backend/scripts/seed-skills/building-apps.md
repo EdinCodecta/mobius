@@ -182,8 +182,9 @@ of the app's source, so it is reviewed, versioned and published with the code:
   metadata: EXIF and GPS, XMP, PNG text chunks, C2PA provenance, JPEG
   comments and thumbnails, and bytes after the image ends. The preview's
   `details` item names every such file. Clean one by re-saving its pixels,
-  e.g. `python3 -c "from PIL import Image, ImageOps; im = ImageOps.exif_transpose(Image.open('f.jpg')); im.info.clear(); im.save('f.jpg', quality=95)"`
-  (turning it upright first, since the orientation tag goes with the rest;
+  e.g. `python3 -c "from PIL import Image, ImageOps; im = ImageOps.exif_transpose(Image.open('f.jpg')); icc = im.info.get('icc_profile'); im.info.clear(); im.save('f.jpg', quality=95, icc_profile=icc)"`
+  (turning it upright first, since the orientation tag goes with the rest,
+  and keeping its colour profile;
   the same works for PNG and WebP without `quality`), or remove it if
   nothing uses it. A bare PNG `tIME` timestamp and a PNG text chunk keyed
   exactly `Software` (the tool that wrote it) are allowed; any other text key
