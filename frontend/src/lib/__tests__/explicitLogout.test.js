@@ -166,7 +166,7 @@ test('failed local preparation stop still reaches server revocation', async () =
 })
 
 test('explicit logout records that it was deliberate for the sign-in screen', async () => {
-  sessionStorage.removeItem('mobius_signed_out')
+  localStorage.removeItem('mobius_signed_out')
 
   await clearExplicitOwnerSession({
     stopInstallHandoffPreparation: async () => {},
@@ -175,5 +175,5 @@ test('explicit logout records that it was deliberate for the sign-in screen', as
     clearOwnerCache: async () => {},
   })
 
-  assert.equal(sessionStorage.getItem('mobius_signed_out'), '1')
+  assert.equal(localStorage.getItem('mobius_signed_out'), '1')
 })

@@ -4,38 +4,50 @@
 // so the redirect never traps anyone:
 //   - an installed standalone app, whose storage is separate from the shell's:
 //     the round trip would land the session in the wrong place;
-//   - the owner just signed out here on purpose, so signing straight back in
-//     would silently undo it;
+//   - the owner signed out on purpose, so signing straight back in would
+//     silently undo it, in every tab: that mark lives in localStorage, which
+//     is shared by the browser, and the sign-in itself (a token written to the
+//     same localStorage) is shared too;
 //   - this tab already went to mobius.you and came back without signing in
-//     (Back button, a failed round trip): the card is the way to retry.
-// The marks live in sessionStorage, so they end with the tab and never leak
-// across browsers or owners, and a completed sign-in clears them.
+//     (Back button, a failed round trip): that mark is per tab, in
+//     sessionStorage, and the card is the way to retry.
+// A completed sign-in clears both marks.
 
 const SIGNED_OUT_KEY = 'mobius_signed_out'
 const REDIRECTED_KEY = 'mobius_sign_in_redirected'
 const PROBE_KEY = 'mobius_sign_in_probe'
+// Set when a credential expires and cleared by the login card; an automatic
+// redirect never shows the card, so a completed sign-in clears it here.
+const EXPIRED_KEY = 'auth_expired'
 
-function sessionStore() {
+function browserStore(name) {
   try {
-    return globalThis.sessionStorage ?? null
+    return globalThis[name] ?? null
   } catch {
     return null
   }
 }
 
-export function markExplicitSignOut(storage = sessionStore()) {
-  try { storage?.setItem(SIGNED_OUT_KEY, '1') } catch { /* private mode: card is the safe default */ }
+function browserStores() {
+  return { local: browserStore('localStorage'), session: browserStore('sessionStorage') }
 }
 
-/** Forget both marks once a sign-in has completed. */
-export function clearSignInMarks(storage = sessionStore()) {
+export function markExplicitSignOut(stores = browserStores()) {
+  try { stores.local?.setItem(SIGNED_OUT_KEY, '1') } catch { /* private mode: card is the safe default */ }
+  // An earlier expiry no longer describes why the card is showing.
+  try { stores.session?.removeItem(EXPIRED_KEY) } catch { /* ignore */ }
+}
+
+/** Forget the marks once a sign-in has completed. */
+export function clearSignInMarks(stores = browserStores()) {
+  try { stores.local?.removeItem(SIGNED_OUT_KEY) } catch { /* ignore */ }
   try {
-    storage?.removeItem(SIGNED_OUT_KEY)
-    storage?.removeItem(REDIRECTED_KEY)
+    stores.session?.removeItem(REDIRECTED_KEY)
+    stores.session?.removeItem(EXPIRED_KEY)
   } catch { /* ignore */ }
 }
 
-// Readable is not enough: with a full or read-only store the marks below would
+// Readable is not enough: with a full or read-only store the marks would
 // silently fail to persist, and a sign-out could be undone or a redirect could
 // repeat. Only a store that takes a write counts as usable.
 function storageAcceptsWrites(storage) {
@@ -52,24 +64,25 @@ function storageAcceptsWrites(storage) {
 export function shouldRedirectToMobiusSignIn({
   authMode,
   standalone = false,
-  storage = sessionStore(),
+  stores = browserStores(),
 }) {
   if (authMode !== 'mobius' || standalone) return false
-  // Without a usable store we cannot tell a loop from a first visit, so the
+  // Without usable stores we cannot tell a loop from a first visit, so the
   // card stays: it is always safe and one tap from the same place.
-  if (!storage || !storageAcceptsWrites(storage)) return false
+  const { local, session } = stores
+  if (!local || !session || !storageAcceptsWrites(local) || !storageAcceptsWrites(session)) return false
   try {
-    return !storage.getItem(SIGNED_OUT_KEY) && !storage.getItem(REDIRECTED_KEY)
+    return !local.getItem(SIGNED_OUT_KEY) && !session.getItem(REDIRECTED_KEY)
   } catch {
     return false
   }
 }
 
 /** Returns whether the mark was stored; navigate only when it was. */
-export function recordSignInRedirect(storage = sessionStore()) {
+export function recordSignInRedirect(stores = browserStores()) {
   try {
-    storage.setItem(REDIRECTED_KEY, '1')
-    return storage.getItem(REDIRECTED_KEY) === '1'
+    stores.session.setItem(REDIRECTED_KEY, '1')
+    return stores.session.getItem(REDIRECTED_KEY) === '1'
   } catch {
     return false
   }
