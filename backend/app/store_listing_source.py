@@ -32,7 +32,7 @@ from app.community_publish import (
   strip_listing_image_metadata,
   read_accepted_file,
 )
-from app.manifest_contract import STORE_LISTING_IMAGE_MAX_BYTES
+from app.manifest_contract import MANIFEST_MAX_BYTES, STORE_LISTING_IMAGE_MAX_BYTES
 
 
 STORE_ART_DIR = "static/store"
@@ -182,14 +182,19 @@ def changes_beyond_listing(root: Path, accepted: str, tree: str | None = None) -
   if tree is None:
     changed = app_git.worktree_diff_paths(root, accepted)
 
-    def read(path: str) -> bytes | None:
+    def read(path: str, limit: int) -> bytes | None:
       target = root / path
-      return target.read_bytes() if target.is_file() and not target.is_symlink() else None
+      if not target.is_file() or target.is_symlink():
+        return None
+      return target.read_bytes() if target.stat().st_size <= limit else b""
   else:
     changed = app_git.endpoint_diff_paths(root, accepted, tree, read_only=True)
 
-    def read(path: str) -> bytes | None:
-      return app_git.ref_file(root, tree, path)
+    def read(path: str, limit: int) -> bytes | None:
+      size = app_git.ref_file_size(root, tree, path)
+      if size is None:
+        return None
+      return app_git.ref_file(root, tree, path) if size <= limit else b""
   if changed is None:
     return True
   changed -= app_git.ignore_migration_paths(root, accepted, tree)
@@ -197,26 +202,57 @@ def changes_beyond_listing(root: Path, accepted: str, tree: str | None = None) -
     return False
   manifests = [
     _manifest_from(app_git.ref_file(root, accepted, "mobius.json")),
-    _manifest_from(read("mobius.json")),
+    _manifest_from(read("mobius.json", MANIFEST_MAX_BYTES)),
   ]
   icons = _carried_icon_paths(*manifests)
   for path in changed:
-    content = read(path)
-    # A deleted file carries nothing; a present one must be a clean image,
-    # which a code file can never pass as.
-    carried = content is None or _is_clean_listing_image(content)
-    if path in icons and carried:
+    if path == "mobius.json":
+      if None in manifests or not _manifest_change_is_listing(*manifests):
+        return True
       continue
-    if EDITOR_ART.fullmatch(path) and (
-      content is None or (_named_by_its_content(path, content) and carried)
+    # Only a listing file may differ; nothing else is even read.
+    if path not in icons and not EDITOR_ART.fullmatch(path):
+      return True
+    content = read(path, STORE_LISTING_IMAGE_MAX_BYTES)
+    if content is None:
+      continue  # A deleted listing file carries nothing.
+    # A present one must be a clean image, which a code file can never pass
+    # as; editor art must also hold the bytes its name hashes.
+    if not _is_clean_listing_image(content) or (
+      path not in icons and not _named_by_its_content(path, content)
     ):
-      continue
-    if path == "mobius.json" and None not in manifests and (
-      _listing_fields_removed(manifests[0]) == _listing_fields_removed(manifests[1])
-    ):
-      continue
-    return True
+      return True
   return False
+
+
+# The store fields the editor writes. Any other store key is curated
+# elsewhere and must not change through a listing save.
+_EDITOR_STORE_FIELDS = frozenset({"tagline", "description", "hero", "screenshots"})
+
+
+def _manifest_change_is_listing(accepted: dict, candidate: dict) -> bool:
+  """Whether the manifest changed only as a listing save would change it.
+
+  Everything outside ``store`` and ``icon`` is unchanged; store keys the
+  editor does not manage are unchanged; and the icon is the accepted one or
+  a path the save itself writes. The owner sees only the applied listing,
+  so anything else would be accepted unseen.
+  """
+  if _listing_fields_removed(accepted) != _listing_fields_removed(candidate):
+    return False
+
+  def unmanaged(manifest: dict) -> dict:
+    store = manifest.get("store")
+    return {
+      key: value for key, value in (store.items() if isinstance(store, dict) else ())
+      if key not in _EDITOR_STORE_FIELDS
+    }
+
+  if unmanaged(accepted) != unmanaged(candidate):
+    return False
+  icon = str(candidate.get("icon") or "").strip()
+  reviewed = str(accepted.get("icon") or "").strip()
+  return icon == reviewed or (bool(icon) and icon in _carried_icon_paths(accepted, candidate))
 
 
 def _carried_icon_paths(accepted: dict | None, candidate: dict | None) -> set[str]:
@@ -335,6 +371,13 @@ def _accepted_file(root: Path, app: models.App, rel: str) -> bytes:
   return content
 
 
+def _stripped(content: bytes, what: str) -> bytes:
+  try:
+    return strip_listing_image_metadata(content)
+  except CommunityPublicationError as exc:
+    raise ListingEditError(exc.code, f"The {what} could not be read.", exc.status_code) from exc
+
+
 def _image_suffix(content: bytes, what: str) -> str:
   try:
     return check_listing_image(content, what)
@@ -365,8 +408,11 @@ def _place_art(
   if kept and not listing_image_has_metadata(content):
     rel = image.path
   else:
-    content = strip_listing_image_metadata(content)
-    suffix = _image_suffix(content, what)
+    # PNG and WebP strip losslessly; a JPEG is re-encoded only when it has
+    # something to lose, so saving clean photos again never degrades them.
+    if suffix != ".jpg" or listing_image_has_metadata(content):
+      content = _stripped(content, what)
+      suffix = _image_suffix(content, what)
     rel = _content_named(content, suffix)
   target = _source_path(root, rel)
   if not (target.is_file() and target.read_bytes() == content):
@@ -505,7 +551,10 @@ def _icon_with_metadata(root: Path, declared: str) -> bytes | None:
   if not declared:
     return None
   try:
-    content = _source_path(root, declared).read_bytes()
+    target = _source_path(root, declared)
+    if target.stat().st_size > STORE_LISTING_IMAGE_MAX_BYTES:
+      return None  # Too large to be a listing image; readiness says so.
+    content = target.read_bytes()
     check_listing_image(content, "app icon")
     return content if listing_image_has_metadata(content) else None
   except (OSError, ListingEditError, CommunityPublicationError):
@@ -553,7 +602,7 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
       # The icon is published as it is, so only its metadata goes, losslessly
       # and in place; it keeps its size and shape. One sharing editor art is
       # written beside it instead, since art is named by its bytes.
-      clean = strip_listing_image_metadata(declared)
+      clean = _stripped(declared, "app icon")
       if not _icon_cleaned_in_place(icon_rel):
         icon_rel = _content_named(clean, check_listing_image(clean, "app icon"))
       changes.write(icon_rel, clean)

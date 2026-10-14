@@ -430,8 +430,9 @@ def check_listing_image(content: bytes, what: str) -> str:
       f"{STORE_LISTING_IMAGE_MAX_BYTES // (1024 * 1024)} MB.",
       "listing_image_too_large", 422,
     )
-  # Only the header is read: the pixel cap is checked before any decoding,
-  # against the same process-wide limit icon_assets sets for Pillow.
+  # The pixel cap is checked from the header before any decoding, against
+  # the same process-wide limit icon_assets sets for Pillow; only then is
+  # every pixel decoded, so truncated or corrupt data is caught here.
   too_many_pixels = CommunityPublicationError(
     f"The {what} has more than {icon_assets.MAX_IMAGE_PIXELS // 1_000_000} "
     "million pixels. Use a smaller image.",
@@ -446,6 +447,8 @@ def check_listing_image(content: bytes, what: str) -> str:
     if suffix is None:
       raise UnidentifiedImageError(image.format)
     image.verify()
+    with Image.open(io.BytesIO(content), formats=["PNG", "JPEG", "WEBP"]) as decoded:
+      decoded.load()
   except CommunityPublicationError:
     raise
   except Image.DecompressionBombError as exc:
@@ -595,6 +598,17 @@ def listing_image_has_metadata(content: bytes) -> bool:
 
 
 def strip_listing_image_metadata(content: bytes) -> bytes:
+  """The image without hidden metadata; any failure is an invalid image."""
+  try:
+    return _stripped_image(content)
+  except Exception as exc:
+    raise CommunityPublicationError(
+      "The image could not be read to remove its metadata.",
+      "listing_image_invalid", 422,
+    ) from exc
+
+
+def _stripped_image(content: bytes) -> bytes:
   """The image as it looks, without camera, location, text or other metadata.
 
   PNG and WebP keep only the chunks that draw the image, losslessly. A JPEG
@@ -1150,7 +1164,12 @@ def read_public_store_asset(
   if listing_image_has_metadata(content):
     # Unauthenticated: an incomplete listing's draft art may still carry
     # location or camera data, which the preview must never hand out.
-    content = strip_listing_image_metadata(content)
+    try:
+      content = strip_listing_image_metadata(content)
+    except CommunityPublicationError as exc:
+      raise CommunityPublicationError(
+        "That file is not a Store listing image.", "listing_asset_unavailable", 404,
+      ) from exc
   _scan_content(asset_path, content)
   return content, LISTING_MEDIA_TYPES[suffix]
 

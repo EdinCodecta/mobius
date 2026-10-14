@@ -919,6 +919,87 @@ def test_the_public_preview_serves_draft_art_without_its_metadata(client, auth, 
   assert image.size == (64, 40) and not image.getexif()
 
 
+def _truncated_jpeg() -> bytes:
+  import random
+
+  noise = Image.frombytes(
+    "RGB", (128, 96), bytes(random.Random(1).getrandbits(8) for _ in range(128 * 96 * 3)),
+  )
+  photo = io.BytesIO()
+  noise.save(photo, format="JPEG", quality=95)
+  data = photo.getvalue()
+  scan = data.index(b"\xff\xda")
+  return data[:scan + (len(data) - scan) // 2]  # Cut inside the image data.
+
+
+def test_a_broken_jpeg_upload_is_refused_not_a_crash(client, auth):
+  source = _source()
+  app_id = _create(client, auth, source)
+  broken = _truncated_jpeg()
+  assert Image.open(io.BytesIO(broken)).size == (128, 96)  # The header reads fine.
+
+  refused = _save(client, auth, app_id, **_complete_listing(
+    screenshots=[{"data_base64": _b64(broken), "alt": "A broken photo."}],
+  ))
+
+  assert refused.status_code == 422, refused.text
+  assert refused.json()["detail"]["code"] == "listing_image_invalid"
+  assert (source / "mobius.json").read_text(encoding="utf-8") == _MANIFEST
+
+
+def test_a_committed_broken_jpeg_is_not_ready_and_not_served(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  (source / "static" / "store").mkdir(parents=True)
+  (source / "static" / "store" / "shot.jpg").write_bytes(_truncated_jpeg())
+  manifest = json.loads(_MANIFEST)
+  manifest["store"] = {
+    "tagline": "t", "description": "d",
+    "screenshots": [{"src": "static/store/shot.jpg", "alt": "A"}],
+  }
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  _commit_accepted(db, source, app_id, "a broken photo")
+
+  preview = _preview(client, auth, app_id)
+
+  assert preview["ready"] is False
+  assert _item(preview, "screenshots")["code"] == "listing_image_invalid"
+  assert client.get(preview["asset_root"] + "static/store/shot.jpg").status_code == 404
+
+
+@pytest.mark.parametrize("edit", ["icon", "store_flag"])
+def test_unreviewed_manifest_edits_cannot_ride_along(client, auth, db, edit):
+  source = _source()
+  (source / "other.png").write_bytes(_png((4, 5, 6), (64, 64)))
+  app_id = _create(client, auth, source)
+  manifest = json.loads(_MANIFEST)
+  if edit == "icon":
+    manifest["icon"] = "other.png"  # Another tracked, clean, unchanged image.
+  else:
+    manifest["store"] = {"unreviewed_flag": True}
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+
+  refused = _save(client, auth, app_id, **_complete_listing())
+
+  assert refused.status_code == 409
+  assert refused.json()["detail"]["code"] == "source_has_draft"
+
+
+def test_a_clean_jpeg_upload_is_stored_byte_for_byte(client, auth):
+  source = _source()
+  app_id = _create(client, auth, source)
+  photo = io.BytesIO()
+  Image.new("RGB", (64, 40), (90, 30, 200)).save(photo, format="JPEG", quality=70)
+
+  saved = _save(client, auth, app_id, **_complete_listing(
+    screenshots=[{"data_base64": _b64(photo.getvalue()), "alt": "A clean photo."}],
+  ))
+
+  assert saved.status_code == 200, saved.text
+  src = json.loads((source / "mobius.json").read_text())["store"]["screenshots"][0]["src"]
+  assert (source / src).read_bytes() == photo.getvalue()
+
+
 def test_an_unexpected_image_error_is_a_checklist_item_not_a_crash(monkeypatch):
   from app import community_publish
 

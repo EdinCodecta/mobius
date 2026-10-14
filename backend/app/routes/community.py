@@ -907,7 +907,10 @@ async def preview_local_app_publication(
       accepted_commit, files, problems = await settled.run_settled(
         read_public_snapshot, app,
       )
-      review = await settled.run_settled(store_listing_review, files, problems)
+    # The review is pure work on the bytes already read (decoding images,
+    # scanning for metadata), so it holds no lock.
+    review = await asyncio.to_thread(store_listing_review, files, problems)
+    async with fs_locks.source_dir_lock(str(app.source_dir)):
       await settled.run_settled(
         store_listing_source.note_what_saving_fixes,
         review["checklist"], Path(str(app.source_dir)), app,

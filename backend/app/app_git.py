@@ -428,6 +428,12 @@ def _git_env(
   return env
 
 
+def ref_file_size(source_dir: str | Path, ref: str, path: str) -> int | None:
+  """One file's size at ``ref`` without reading it, or None when it has none."""
+  proc = _run(Path(source_dir), "cat-file", "-s", f"{ref}:{path}", check=False, read_only=True)
+  return int(proc.stdout.strip()) if proc.returncode == 0 else None
+
+
 def ref_file(source_dir: str | Path, ref: str, path: str) -> bytes | None:
   """One file's bytes at ``ref``, or None when ``ref`` has no file there."""
   return _ref_blob(Path(source_dir), ref, path, read_only=True)
