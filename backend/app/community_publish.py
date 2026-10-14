@@ -509,17 +509,23 @@ def _png_short_software_text(kind: bytes, data: bytes) -> bool:
   """Whether a text chunk is keyed "Software" with a short value, decompressed.
 
   zTXt and iTXt may be compressed, so the cap applies to the inflated text,
-  inflating at most one byte past it; anything longer counts as metadata.
+  inflating at most one byte past it. Compressed text must be exactly one
+  zlib stream (PNG's only method); anything longer, cut short, or followed by
+  more bytes counts as metadata.
   """
   keyword, separator, rest = data.partition(b"\0")
   if keyword != b"Software" or not separator:
     return False
   if kind == b"zTXt":
+    if rest[:1] != b"\0":
+      return False
     compressed, text = True, rest[1:]
   elif kind == b"iTXt":
-    if len(rest) < 2:
+    if len(rest) < 2 or rest[0] not in (0, 1):
       return False
     compressed = rest[0] == 1
+    if compressed and rest[1] != 0:
+      return False
     # Language tag and translated keyword, each NUL-terminated, then text.
     parts = rest[2:].split(b"\0", 2)
     if len(parts) < 3:
@@ -534,7 +540,10 @@ def _png_short_software_text(kind: bytes, data: bytes) -> bool:
     value = inflate.decompress(text, _PNG_SOFTWARE_TEXT_MAX_BYTES + 1)
   except zlib.error:
     return False
-  return len(value) <= _PNG_SOFTWARE_TEXT_MAX_BYTES and not inflate.unconsumed_tail
+  return (
+    len(value) <= _PNG_SOFTWARE_TEXT_MAX_BYTES
+    and inflate.eof and not inflate.unused_data
+  )
 
 
 def _png_chunks_kept(

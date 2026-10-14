@@ -1057,6 +1057,34 @@ def test_the_software_text_cap_applies_after_decompression(compressed):
     assert listing_image_has_metadata(base[:end] + chunk + base[end:]) is flagged
 
 
+def test_a_compressed_software_chunk_hides_nothing_past_its_tool_name():
+  import zlib
+
+  from app.community_publish import listing_image_has_metadata
+
+  plain = io.BytesIO()
+  Image.new("RGB", (8, 8)).save(plain, format="PNG")
+  base = plain.getvalue()
+  end = base.rindex(b"IEND") - 4
+  name = zlib.compress(b"Editor 1.0")
+  hidden = b"A name and a street address"
+
+  def flagged(kind, data):
+    chunk = _png_chunk(kind, b"Software\0" + data)
+    return listing_image_has_metadata(base[:end] + chunk + base[end:])
+
+  assert flagged(b"zTXt", b"\0" + name) is False
+  assert flagged(b"iTXt", b"\1\0\0\0" + name) is False
+  # Bytes after the stream ends, a stream cut short, or a compression flag or
+  # method PNG does not define are not a short tool name.
+  assert flagged(b"zTXt", b"\0" + name + hidden) is True
+  assert flagged(b"iTXt", b"\1\0\0\0" + name + hidden) is True
+  assert flagged(b"zTXt", b"\0" + name[:-4]) is True
+  assert flagged(b"zTXt", b"\1" + name) is True
+  assert flagged(b"iTXt", b"\1\1\0\0" + name) is True
+  assert flagged(b"iTXt", b"\2\0\0\0Editor 1.0") is True
+
+
 def test_an_unexpected_image_error_is_a_checklist_item_not_a_crash(monkeypatch):
   from app import community_publish
 
