@@ -45,6 +45,10 @@ os.environ["MOEBIUS_SKIP_BOOTSTRAP"] = "1"
 os.environ["MOBIUS_SSO_ISSUER"] = ""
 os.environ["MOBIUS_SSO_INSTANCE_ID"] = ""
 os.environ["MOBIUS_IDENTITY_BROKER_SOCKET"] = f"{_tmp}/no-identity-broker.sock"
+# Nor may it inherit a Railway host's deployment identity: those markers switch
+# update, domain, and version behavior. Railway tests opt in with monkeypatch.
+for _name in [name for name in os.environ if name.startswith("RAILWAY_")]:
+  del os.environ[_name]
 
 # Production entrypoint proves the image-owned filesystem half before FastAPI
 # starts. Reproduce that boundary in the host-only runtime so startup can
@@ -64,7 +68,7 @@ _file_receipt.touch()
 # created when missing, so a real build is never clobbered.
 from pathlib import Path as _Path
 
-_static = _Path(__file__).resolve().parents[1] / "static"
+_static = _Path(_tmp) / "static"
 # The warm publisher validates emitted JavaScript with a checked-in Node
 # script. Production uses /data/platform/frontend; host CI must point at the
 # checkout under test before importing app.frontend_watcher.
@@ -418,6 +422,10 @@ def fresh_db():
   # test seeing an earlier test's immutable artifact for the same numeric id.
   for _sub in ("apps", "app-secrets", "app-runtime", "app-envs", "shared", "compiled", "cli-auth"):
     _shutil.rmtree(_os.path.join(_data_dir, _sub), ignore_errors=True)
+  # The shared Möbius provider holds broker identity/balance reads briefly;
+  # one test's linked account must not answer the next test's auth check.
+  from app.providers import mobius_account_changed as _forget_mobius_reads
+  _forget_mobius_reads()
 
   # Installed apps' model-provider declarations are projected into the
   # process-global provider registry, and that projection is read-throttled
@@ -512,6 +520,19 @@ def chat(db, owner_token):
   db.commit()
   db.refresh(c)
   return c
+
+
+@pytest.fixture
+def healthy_data_disk(monkeypatch):
+  """A data disk with room to spare, whatever the host's real free space.
+
+  Background transcript conversion pauses at the "constrained" disk tier, so
+  a test that runs it must not depend on how full the test host is. A test of
+  the floor itself replaces this stub with its own pressure.
+  """
+  from app import resource_pressure
+  monkeypatch.setattr(resource_pressure, "resource_status",
+                      lambda _dir=None, **_kw: {"pressure": {"disk": {"state": "normal"}}})
 
 
 # ── Parallel shards ──────────────────────────────────────────────────────
