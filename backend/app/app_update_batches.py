@@ -29,7 +29,7 @@ from uuid import UUID
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app import activity, app_git, models, settled
+from app import activity, app_git, models, pending_update, settled
 from app.broadcast import get_system_broadcast
 from app.database import SessionLocal
 from app.resource_access import live_app_or_404
@@ -118,11 +118,9 @@ def _reviewed_commit_landed(
   it is still pending: a leftover pending directory or checkout is harmless,
   and a receipt for a later update does not unseat an earlier one that landed.
   """
-  from app.install import read_pending_conflict_update_receipt
-
   return bool(source_commit) and (
     app_git.ref_is_ancestor(source_dir, reviewed_commit, source_commit) is True
-  ) and read_pending_conflict_update_receipt(
+  ) and pending_update.read_pending_conflict_update_receipt(
     source_dir, app_id=app_id, upstream_commit=reviewed_commit,
   ) is None
 
@@ -136,8 +134,6 @@ def _settled_outcomes(reviewed: dict[int, str]) -> dict[int, dict]:
   commit (with the resolver chat opened for it); otherwise not applied.
   Callers apply the returned patches to their record on the event loop.
   """
-  from app import install
-
   with SessionLocal() as db:
     rows = {
       row.id: (
@@ -166,7 +162,7 @@ def _settled_outcomes(reviewed: dict[int, str]) -> dict[int, dict]:
           "error_code": None, "retryable": False, "resolver_chat_id": None,
         }
         continue
-      pending = install.read_pending_conflict_update_receipt(
+      pending = pending_update.read_pending_conflict_update_receipt(
         source_dir, app_id=app_id, upstream_commit=commit,
       )
     except (OSError, RuntimeError):

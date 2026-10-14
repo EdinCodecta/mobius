@@ -570,8 +570,11 @@ class UpdateCandidateRejection(BaseModel):
   ``identity_mismatch``: the candidate is not this installed package under
   install's identity rule (another or no installed row, a changed permanent
   ``package_id``, or a rename install does not accept).
+  ``repository_moved``: the candidate lives in another repository than the
+  app's Git origin, so discovery does not fetch it; reinstalling from the
+  Store follows a move the new repository proves.
   """
-  code: Literal["identity_mismatch"]
+  code: Literal["identity_mismatch", "repository_moved"]
   message: str
 
 

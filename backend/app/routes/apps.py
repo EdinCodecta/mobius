@@ -30,7 +30,7 @@ from app import chat_writer
 from app import (
   activity, app_activity, app_apply, app_badge, app_capability_acceptance,
   app_git, app_jobs, app_recency, chat_app_artifacts, chat_queue, drawer_pins, fs_locks,
-  icon_cache, models, project_git, providers, schemas,
+  git_transfers, icon_cache, models, pending_update, project_git, providers, schemas,
   settled, source_dirs, store_listing_source, workspace_files,
 )
 from app.manifest_identity import (
@@ -609,7 +609,7 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
   get_system_broadcast().publish(
     {"type": "app_deleted", "appId": str(deleted_app_id)}
   )
-  from app.install import purge_app_skills
+  from app.app_skills import purge_app_skills
   try:
     await purge_app_skills(deleted_app_id)
   except Exception:
@@ -791,14 +791,12 @@ async def preview_app_install(
       db=db,
     )
   )
-  # The row install would update, by its one rule. Source identities are not
-  # resolved here, so a move that only a provider repository id proves is
-  # previewed as a new install.
   source = body.manifest_url if body.manifest_url is not None else raw_base
-  existing = install.resolve_package_row(db, manifest, source).row
-  if existing is not None and existing.deleted_at is not None:
-    existing = None
-  installed_contract = existing.capability_contract if existing else None
+  # Release the request session first: the worker opens its own short one.
+  db.close()
+  installed_contract = await settled.run_settled(
+    _installed_contract_for_preview, manifest, source,
+  )
   return schemas.AppPreviewOut(
     manifest=manifest,
     capability_contract=contract,
@@ -806,6 +804,24 @@ async def preview_app_install(
     installed_contract=installed_contract,
     capability_diff=diff_contracts(installed_contract, contract),
   )
+
+
+def _installed_contract_for_preview(manifest: dict, source: str) -> dict | None:
+  """The capability contract of the live row install would update, or None.
+
+  Install's one identity rule (``install.resolve_package_row``). Source
+  identities are not resolved here, so a move that only a provider repository
+  id proves is previewed as a new install. Blocking (database reads, and a Git
+  origin read for a legacy row): run it in a worker thread, in its own short
+  session, like update discovery's ``_update_candidate_rejection``.
+  """
+  from app import database, install
+
+  with database.SessionLocal() as db:
+    existing = install.resolve_package_row(db, manifest, source).row
+    if existing is None or existing.deleted_at is not None:
+      return None
+    return existing.capability_contract
 
 
 @router.post(
@@ -1054,16 +1070,18 @@ def _validate_pending_update(repo: Path, receipt: dict) -> _PendingUpdatePlan:
   if app_git.merge_in_progress(repo):
     raise _earlier_resolver_merge(repo)
   upstream = receipt["upstream_commit"]
-  if install.pending_update_resolved(repo, upstream):
+  if pending_update.pending_update_resolved(repo, upstream):
     return _PendingUpdatePlan(conflict_paths=[])
-  worktree = install.pending_update_worktree(repo)
+  worktree = pending_update.pending_update_worktree(repo)
   if (worktree / ".git").exists():
     if app_git.merge_in_progress(worktree):
       return _PendingUpdatePlan(
         conflict_paths=_unmerged_status_paths(worktree), checkout=worktree,
       )
     if app_git.ref_is_ancestor(worktree, upstream, "HEAD") is True:
-      marked = install.committed_conflict_marker_paths(worktree, "HEAD", upstream) or []
+      marked = pending_update.committed_conflict_marker_paths(
+        worktree, "HEAD", upstream,
+      ) or []
       changed = app_git._run(
         worktree, "status", "--porcelain=v1", "-z", "--no-renames",
       ).stdout.split("\0")
@@ -1092,8 +1110,6 @@ def _park_pending_update(
   repo: Path, receipt: dict, plan: _PendingUpdatePlan,
 ) -> list[str]:
   """Consume a validated plan; preparation is retryable, not transactional."""
-  from app import install
-
   if plan.conflict_paths is not None:
     # Resolver Git operations do not take route locks. A removed checkout
     # invalidates a reuse plan rather than silently recreating agent work.
@@ -1101,7 +1117,7 @@ def _park_pending_update(
       raise _conflict_state_changed()
     return plan.conflict_paths
   merge = plan.merge
-  worktree = install.pending_update_worktree(repo)
+  worktree = pending_update.pending_update_worktree(repo)
   if (worktree / ".git").exists():
     app_git.remove_overlay_worktree(repo, worktree)
   worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -1135,14 +1151,12 @@ def _require_pending_resolution(repo: Path, upstream_commit: str) -> None:
   stages on its behalf. A merge an earlier release left in the served folder is
   finished there the way that release did.
   """
-  from app import install
-
   if app_git.merge_in_progress(repo):
     if app_git.commit_local(repo, "resolve app update") is None:
       raise _earlier_resolver_merge(repo)
-  if install.pending_update_resolved(repo, upstream_commit):
+  if pending_update.pending_update_resolved(repo, upstream_commit):
     return
-  worktree = install.pending_update_worktree(repo)
+  worktree = pending_update.pending_update_worktree(repo)
   if not (worktree / ".git").exists():
     raise _resolution_error(
       "resolution_not_started",
@@ -1184,8 +1198,6 @@ def _conflict_resolver_prompt(
   items: list[tuple[models.App, Path, list[str], str | None]],
 ) -> str:
   """One bounded seed message covering every app in a reviewed issue batch."""
-  from app import install
-
   intro = ["Please finish every blocked app update listed below.", ""]
   instructions = [
     "Read /data/shared/skills/resolving-app-git.md once, then work through EVERY "
@@ -1205,7 +1217,7 @@ def _conflict_resolver_prompt(
     app, repo, conflict_paths, upstream_version = item
     name = _prompt_value(app.name, 120) or "this app"
     target = _prompt_value(upstream_version or "latest", 32) or "latest"
-    checkout = install.pending_update_worktree(repo)
+    checkout = pending_update.pending_update_worktree(repo)
     omitted = len(conflict_paths) - len(shown)
     return [
       f"## {name} to v{target}",
@@ -1322,13 +1334,12 @@ def _pending_update_state(repo: Path, upstream_commit: str) -> Literal[
   """Classify a validated pending receipt without changing repository state.
 
   ``replay_pending`` means only installation is left (see
-  ``install.pending_update_resolved``); rerunning the update or the resolver's
-  finish promotes it. Anything short of that is still resolution work.
+  ``pending_update.pending_update_resolved``); rerunning the update or the
+  resolver's finish promotes it. Anything short of that is still resolution
+  work.
   """
-  from app import install
-
   try:
-    resolved = install.pending_update_resolved(repo, upstream_commit)
+    resolved = pending_update.pending_update_resolved(repo, upstream_commit)
   except (OSError, subprocess.SubprocessError):
     return "unknown"
   return "replay_pending" if resolved else "needs_resolution"
@@ -1343,10 +1354,8 @@ def _read_pending_update(repo: Path, app_id: int) -> tuple[
   Callers hold the app's source-dir lock, so update-check and the candidate
   preview report the same state.
   """
-  from app import install
-
   current_upstream = app_git.head_sha(repo, app_git.UPSTREAM_BRANCH)
-  receipt = install.read_pending_conflict_update_receipt(
+  receipt = pending_update.read_pending_conflict_update_receipt(
     repo, app_id=app_id, upstream_commit=current_upstream,
   )
   state = (
@@ -1397,6 +1406,20 @@ def _update_candidate_rejection(
       "This update source belongs to another installed app."
     ),
   }
+
+
+# Discovery reads a candidate only from the app's own Git origin, so a Store
+# listing at another repository is reported, not fetched. Install follows a
+# move whose new repository proves it is the same app (``resolve_package_row``).
+_REPOSITORY_MOVED = {
+  "code": "repository_moved",
+  "message": (
+    "The Store lists this app at a different repository than the one it was "
+    "installed from, so its update can't be checked here. If the app moved "
+    "there, reinstalling it from the Store updates this app when the new "
+    "repository proves it is the same app; otherwise it adds a separate app."
+  ),
+}
 
 
 def _update_manifest_source(
@@ -1538,6 +1561,8 @@ async def update_check(
   )
   try:
     commit = await _fetch_update_commit(repo, fetch_manifest_url)
+  except git_transfers.OriginMismatch:
+    return _unknown(dict(_REPOSITORY_MOVED))
   except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):
     return _unknown()
   # This lock is the response's linearization point. A concurrent install
@@ -1689,6 +1714,8 @@ async def update_candidate_preview(
   )
   try:
     commit = await _fetch_update_commit(repo, fetch_manifest_url)
+  except git_transfers.OriginMismatch:
+    raise HTTPException(409, detail=dict(_REPOSITORY_MOVED)) from None
   except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
     raise install.git_source_error(
       "The installed version was left unchanged.",
@@ -2431,7 +2458,7 @@ def _pending_store_update_app(
 def _pending_store_update_receipt(app: models.App, source_dir: str) -> dict:
   from app import install
 
-  receipt = install.read_pending_conflict_update_receipt(
+  receipt = pending_update.read_pending_conflict_update_receipt(
     source_dir,
     app_id=app.id,
     upstream_commit=app.upstream_commit,
@@ -2494,7 +2521,7 @@ async def resolve_app_update(
       fs_locks.source_dir_lock(source_dir),
     ):
       app = _pending_store_update_app(db, source_dir, app_id=app_id)
-      if not install.pending_update_receipt_file(source_dir).is_file() and (
+      if not pending_update.pending_update_receipt_file(source_dir).is_file() and (
         app.upstream_commit
         and app_git.ref_is_ancestor(
           source_dir, app.upstream_commit, app_git.LOCAL_BRANCH,
@@ -2502,7 +2529,7 @@ async def resolve_app_update(
       ):
         # Already installed: a retry after a lost response, or a finish that
         # stopped after removing its receipt. Clear any leftover checkout.
-        await install.clear_pending_conflict_update(db, app)
+        await pending_update.clear_pending_conflict_update(db, app)
         get_system_broadcast().publish(
           {"type": "app_updated", "appId": str(app.id)}
         )
@@ -2548,7 +2575,7 @@ async def resolve_app_update(
           fs_locks.app_storage_lock(app_id),
           fs_locks.source_dir_lock(source_dir),
         ):
-          await install.clear_pending_conflict_update(db, app)
+          await pending_update.clear_pending_conflict_update(db, app)
       raise
 
   reapplied = result.app
@@ -3321,7 +3348,7 @@ async def delete_app(
         "App %s was deleted but its supervised jobs could not be terminated",
         app_id,
       )
-    from app.install import deactivate_app_skills
+    from app.app_skills import deactivate_app_skills
     try:
       for warning in await deactivate_app_skills(app_id):
         log.warning("uninstall: %s", warning)
@@ -3611,7 +3638,7 @@ async def recover_app(
         "App %s was recovered but cron supervision could not be reconciled",
         app_id,
       )
-    from app.install import restore_app_skills
+    from app.app_skills import restore_app_skills
     try:
       for warning in await restore_app_skills(app_id):
         log.warning("recover: %s", warning)

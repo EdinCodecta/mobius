@@ -24,7 +24,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from app import app_git, fs_locks, install, models
+from app import app_git, fs_locks, git_transfers, install, models, pending_update
 from app.config import get_settings
 from tests.test_apps_install import (  # noqa: F401 - fixture
   JSX, _fake_async_client, _fixture_commit, bypass_url_validation,
@@ -218,7 +218,7 @@ def _repo(name: str) -> Path:
 
 
 def _no_leftovers() -> bool:
-  root = install.git_transfer_root()
+  root = git_transfers.git_transfer_root()
   return not root.exists() or not any(root.iterdir())
 
 
@@ -245,7 +245,7 @@ def _run_async(scenario, *responses):
 
 
 def _stage_clone(url: str, ref: str = "main"):
-  return install._stage(app_git.stage_clone, url, ref, install.git_transfer_root())
+  return install._stage(app_git.stage_clone, url, ref, git_transfers.git_transfer_root())
 
 
 async def _paused(server: _GitServer) -> None:
@@ -579,13 +579,13 @@ def test_process_killed_during_staging_leaves_a_clean_repo(
   child = subprocess.Popen([sys.executable, "-c", (
     "import sys; from pathlib import Path; from app import app_git;"
     "app_git.stage_fetch(sys.argv[1], sys.argv[2], 'main', Path(sys.argv[3]))"
-  ), str(repo), git_server.url("killed"), str(install.git_transfer_root())], cwd=backend)
+  ), str(repo), git_server.url("killed"), str(git_transfers.git_transfer_root())], cwd=backend)
   try:
     assert git_server.waiting.wait(30)
     os.kill(child.pid, signal.SIGKILL)
     child.wait(10)
     # Its Git child runs in its own session; a dying host would lose it too.
-    subprocess.run(["pkill", "-KILL", "-f", str(install.git_transfer_root())])
+    subprocess.run(["pkill", "-KILL", "-f", str(git_transfers.git_transfer_root())])
   finally:
     git_server.release()
   assert not _no_leftovers(), "a killed process leaves its staging behind"
@@ -725,7 +725,7 @@ def test_cancelled_import_keeps_the_source_lock_until_it_finishes(
     while fs_locks.source_dir_lock(str(repo)).locked() and time.monotonic() < deadline:
       await asyncio.sleep(0.05)
     assert not fs_locks.source_dir_lock(str(repo)).locked()
-    while install._FETCHES and time.monotonic() < deadline:
+    while git_transfers._FETCHES and time.monotonic() < deadline:
       await asyncio.sleep(0.05)
 
   asyncio.run(scenario())
@@ -832,7 +832,7 @@ def test_concurrent_fetches_share_one_transfer(
 
   assert asyncio.run(scenario()) == [head, head]
   assert len(transfers) == count + 1
-  assert not install._FETCHES
+  assert not git_transfers._FETCHES
   assert _no_leftovers()
 
 
@@ -886,7 +886,7 @@ def test_transfers_run_on_their_own_bounded_pool(
   monkeypatch.setattr(app_git, "_transfer", recorded)
   asyncio.run(install.fetch_app_commit(_repo("pooled"), "main"))
   assert threads and all(name.startswith("git-transfer") for name in threads)
-  assert install._TRANSFER_EXECUTOR._max_workers == install._GIT_TRANSFER_WORKERS
+  assert git_transfers._TRANSFER_EXECUTOR._max_workers == git_transfers._GIT_TRANSFER_WORKERS
 
 
 def test_history_falls_back_to_the_origin_branch(
@@ -1214,7 +1214,7 @@ def test_update_batch_entry_that_really_conflicts_names_the_reviewed_commit(
   final = _run_async(scenario, responses)
   entry = final["entries"][0]
   assert (entry["status"], entry["version"]) == ("conflict", "1.0.0"), final
-  assert install.read_pending_conflict_update_receipt(
+  assert pending_update.read_pending_conflict_update_receipt(
     repo, app_id=app_id, upstream_commit=head,
   ) is not None
   # The one landing rule agrees with the installer's result.
