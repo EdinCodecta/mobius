@@ -669,6 +669,82 @@ def test_an_author_file_that_only_looks_like_editor_art_survives(client, auth, d
   assert author.read_bytes() == _png((8, 8, 8))
 
 
+def test_a_save_with_no_icon_anywhere_leaves_the_icon_unset(client, auth, db):
+  source = _source()
+  manifest = json.loads(_MANIFEST)
+  manifest.pop("icon")
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  (source / "icon.png").unlink()
+  app_id = _create(client, auth, source)
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert row.icon_png is None and row.icon_override_png is None
+
+  saved = _save(client, auth, app_id, **_complete_listing())
+
+  assert saved.status_code == 200, saved.text
+  assert "icon" not in json.loads((source / "mobius.json").read_text())
+
+
+def test_a_png_timestamp_alone_does_not_hold_the_listing_back(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  icon = (source / "icon.png").read_bytes()
+  end = icon.rindex(b"IEND") - 4
+  stamped = icon[:end] + _png_chunk(b"tIME", bytes([7, 234, 10, 14, 1, 2, 3])) + icon[end:]
+  (source / "icon.png").write_bytes(stamped)
+  _commit_accepted(db, source, app_id, "icon with a timestamp")
+  assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
+
+  assert _preview(client, auth, app_id)["ready"] is True
+
+
+def test_every_image_with_metadata_is_named_in_one_item(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
+  (source / "photos").mkdir()
+  for index in range(7):
+    (source / "photos" / f"p{index}.jpg").write_bytes(_gps_jpeg((index, 9, 9)))
+  _commit_accepted(db, source, app_id, "seven photos with GPS")
+
+  details = _item(_preview(client, auth, app_id), "details")
+
+  assert details["code"] == "listing_image_metadata"
+  assert details["message"].startswith("7 images in the source")
+  assert all(f"photos/p{index}.jpg" in details["message"] for index in range(5))
+  assert "and 2 more" in details["message"]
+
+
+def test_a_manifest_with_a_byte_order_mark_keeps_it(client, auth):
+  source = _source()
+  (source / "mobius.json").write_bytes(b"\xef\xbb\xbf" + _MANIFEST.encode())
+  app_id = _create(client, auth, source)
+
+  saved = _save(client, auth, app_id, **_complete_listing())
+
+  assert saved.status_code == 200, saved.text
+  raw = (source / "mobius.json").read_bytes()
+  assert raw.startswith(b"\xef\xbb\xbf" + _MANIFEST.encode().rstrip().rstrip(b"}").rstrip())
+  assert json.loads(raw.decode("utf-8-sig"))["store"]["tagline"] == "Small and exact."
+
+
+def test_a_jfif_thumbnail_counts_as_metadata():
+  from app.community_publish import listing_image_has_metadata
+
+  plain = io.BytesIO()
+  Image.new("RGB", (16, 16), (5, 5, 5)).save(plain, format="JPEG")
+  content = plain.getvalue()
+  assert not listing_image_has_metadata(content)
+  start = content.index(b"JFIF\0")
+  thumb = bytes([1, 1]) + bytes(3)  # 1x1 thumbnail, three RGB bytes.
+  payload = content[start:start + 12] + thumb
+  segment = b"\xff\xe0" + (len(payload) + 2).to_bytes(2, "big") + payload
+  old_length = int.from_bytes(content[start - 2:start], "big")
+  with_thumb = content[:start - 4] + segment + content[start - 2 + old_length:]
+
+  assert listing_image_has_metadata(with_thumb)
+
+
 def test_an_unexpected_image_error_is_a_checklist_item_not_a_crash(monkeypatch):
   from app import community_publish
 

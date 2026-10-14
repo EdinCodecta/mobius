@@ -472,6 +472,10 @@ _PNG_KEPT_CHUNKS = {
   b"sBIT", b"sRGB", b"cICP", b"mDCV", b"cLLI", b"bKGD", b"pHYs",
   b"acTL", b"fcTL", b"fdAT",
 }
+# A bare last-modified timestamp (tIME) says nothing about who or where, and
+# many editors add one to every PNG; stripping still drops it, but it alone
+# does not hold a listing back.
+_PNG_HARMLESS_CHUNKS = _PNG_KEPT_CHUNKS | {b"tIME"}
 _WEBP_KEPT_CHUNKS = {b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ANIM", b"ANMF", b"ICCP"}
 # Tables, frame headers, restart intervals and scans: what draws a JPEG.
 _JPEG_DRAWING_MARKERS = {0xC4, 0xCC, 0xDA, 0xDB, 0xDD} | {
@@ -480,13 +484,13 @@ _JPEG_DRAWING_MARKERS = {0xC4, 0xCC, 0xDA, 0xDB, 0xDD} | {
 _EXIF_ORIENTATION = 0x0112
 
 
-def _png_chunks_kept(content: bytes) -> bytes:
+def _png_chunks_kept(content: bytes, kept: set[bytes] = _PNG_KEPT_CHUNKS) -> bytes:
   out, at = [content[:8]], 8
   while at + 12 <= len(content):
     length = int.from_bytes(content[at:at + 4], "big")
     kind = content[at + 4:at + 8]
     end = at + 12 + length
-    if kind in _PNG_KEPT_CHUNKS:
+    if kind in kept:
       out.append(content[at:end])
     if kind == b"IEND":
       break  # Anything after the end of the image is not part of it.
@@ -515,7 +519,8 @@ def _webp_chunks_kept(content: bytes) -> bytes:
 def _jpeg_drawing_segment(marker: int, payload: bytes) -> bool:
   return (
     marker in _JPEG_DRAWING_MARKERS
-    or (marker == 0xE0 and payload.startswith(b"JFIF\0"))
+    # JFIF without an embedded thumbnail, which could be a different picture.
+    or (marker == 0xE0 and payload.startswith(b"JFIF\0") and payload[12:14] == b"\0\0")
     or (marker == 0xE2 and payload.startswith(b"ICC_PROFILE\0"))
     or (marker == 0xEE and payload.startswith(b"Adobe"))
   )
@@ -561,7 +566,7 @@ def listing_image_has_metadata(content: bytes) -> bool:
   multi-picture JPEG's extra images count, through its MPF segment.
   """
   if content.startswith(b"\x89PNG\r\n\x1a\n"):
-    return _png_chunks_kept(content) != content
+    return _png_chunks_kept(content, _PNG_HARMLESS_CHUNKS) != content
   if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
     return _webp_chunks_kept(content) != content
   if content.startswith(b"\xff\xd8\xff"):
@@ -797,21 +802,25 @@ def _published_images_with_metadata(
   Publishing ships the whole source, so an original photo stays public even
   after a save copies it into clean listing art, wherever it lives. Such
   files may be loaded by app code under their own names, so they are
-  reported for an agent to clean or remove rather than deleted. Detection
-  reads bytes the snapshot already holds and decodes nothing.
+  reported for an agent to clean or remove rather than deleted, all in one
+  problem so they can be fixed in one pass. Detection reads bytes the
+  snapshot already holds and decodes nothing.
   """
-  problems = []
-  for path in sorted(by_path):
-    if path in listed:
-      continue  # Listed art and the icon are checked under their own items.
-    if listing_image_has_metadata(_file_bytes(by_path[path])):
-      problems.append(CommunityPublicationError(
-        f"{path} carries camera, location or other hidden metadata that "
-        "publishing would make public. Ask an agent to remove it or save it "
-        "without the metadata.",
-        "listing_image_metadata",
-      ))
-  return problems
+  paths = [
+    path for path in sorted(by_path)
+    if path not in listed  # Listed art and the icon have their own items.
+    and listing_image_has_metadata(_file_bytes(by_path[path]))
+  ]
+  if not paths:
+    return []
+  named = ", ".join(paths[:5]) + (f", and {len(paths) - 5} more" if len(paths) > 5 else "")
+  return [CommunityPublicationError(
+    f"{len(paths)} image{'s' if len(paths) > 1 else ''} in the source "
+    f"carr{'y' if len(paths) > 1 else 'ies'} camera, location or other hidden "
+    f"metadata that publishing would make public: {named}. Ask an agent to "
+    "remove them or save them without the metadata.",
+    "listing_image_metadata",
+  )]
 
 
 def store_listing_review(
@@ -1038,8 +1047,12 @@ def read_accepted_file(app: models.App, path: str, *, max_bytes: int) -> bytes |
 
 def read_public_store_asset(
   app: models.App, accepted_commit: str, asset_path: str,
-) -> bytes:
-  """Read one listing asset from the exact currently accepted Git tree."""
+) -> tuple[bytes, str]:
+  """Read one listing asset from the exact accepted Git tree, with its media type.
+
+  The type comes from the image rule's verdict on the bytes, never the name,
+  so a file that is also valid HTML cannot be served as a page.
+  """
   repo = Path(app.source_dir)
   if not repo.is_dir() or not app_git.is_repo(repo):
     raise CommunityPublicationError(
@@ -1078,13 +1091,13 @@ def read_public_store_asset(
   # An incomplete listing's draft is served too, so the editor can show it;
   # its icon may name any tracked file, so only real listing images go out.
   try:
-    check_listing_image(content, "listing image")
+    suffix = check_listing_image(content, "listing image")
   except CommunityPublicationError as exc:
     raise CommunityPublicationError(
       "That file is not a Store listing image.", "listing_asset_unavailable", 404,
     ) from exc
   _scan_content(asset_path, content)
-  return content
+  return content, LISTING_MEDIA_TYPES[suffix]
 
 
 def _listing_paths(manifest: object) -> set[str]:

@@ -176,7 +176,15 @@ of the app's source, so it is reviewed, versioned and published with the code:
   file of at most 6 MB, 8192 px on its longest side, and 32 million pixels in
   all (so 8192x8192 is too large; 5000x5000 fits). The file extension alone
   does not count. Images saved through the Store editor lose their EXIF,
-  location and text metadata; commit your own art without it too.
+  location and text metadata.
+- Publishing makes the whole source public, so before it does, every
+  committed PNG, JPEG and WebP (not only listing art) is checked for hidden
+  metadata: EXIF and GPS, XMP, PNG text chunks, C2PA provenance, JPEG
+  comments and thumbnails, and bytes after the image ends. The preview's
+  `details` item names every such file. Clean one by re-saving its pixels,
+  e.g. `python3 -c "from PIL import Image; im = Image.open('f.jpg'); im.info.clear(); im.save('f.jpg', quality=95)"`
+  (the same works for PNG and WebP without `quality`), or remove it if
+  nothing uses it. A bare PNG `tIME` timestamp is allowed.
 - Screenshots must be truthful and private: capture the app's real UI in an
   empty, demo, or fixture state, never the owner's own records, names,
   accounts, chats, or machines. Build a small demo state if the app has none.

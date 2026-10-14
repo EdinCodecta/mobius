@@ -25,8 +25,6 @@ from app.community_broker import (
   community_broker,
 )
 from app.community_publish import (
-  LISTING_MEDIA_TYPES,
-  check_listing_image,
   CommunityPublicationJournal,
   CommunityPublicationError,
   accepted_history_contains,
@@ -962,16 +960,13 @@ async def preview_local_app_publication_asset(
     raise HTTPException(404, "Listing asset not found.")
   try:
     async with fs_locks.source_dir_lock(str(app.source_dir)):
-      content = await settled.run_settled(
+      content, media_type = await settled.run_settled(
         read_public_store_asset, app, accepted_commit, asset_path,
       )
   except CommunityPublicationError as exc:
     raise HTTPException(
       exc.status_code, {"code": exc.code, "message": exc.detail},
     ) from exc
-  # The type comes from the bytes the image rule accepted, never the name, so
-  # a file that is also valid HTML cannot be served as a page.
-  media_type = LISTING_MEDIA_TYPES[check_listing_image(content, "listing image")]
   return Response(
     content,
     media_type=media_type,

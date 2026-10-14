@@ -9,6 +9,7 @@ committed revision remains intact as the normal retry point.
 
 from __future__ import annotations
 
+import codecs
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -437,7 +438,7 @@ def _spliced_manifest(original: str, manifest: dict, keys: tuple[str, ...]) -> s
       text = text[:start] + replacement + text[end:]
     if json.loads(text) == manifest:
       return text
-  except (IndexError, ValueError):
+  except Exception:  # Any surprise in the splice falls back to a rewrite.
     pass
   return _manifest_text(manifest, original)
 
@@ -469,7 +470,10 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     if manifest_path.is_file():
       try:
         # Bytes, not text mode, which would fold CRLF line endings away.
-        original = manifest_path.read_bytes().decode("utf-8")
+        raw = manifest_path.read_bytes()
+        # A byte-order mark is kept as it was; JSON itself never holds one.
+        bom = codecs.BOM_UTF8 if raw.startswith(codecs.BOM_UTF8) else b""
+        original = raw[len(bom):].decode("utf-8")
         current = json.loads(original)
       except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ListingEditError(
@@ -534,7 +538,9 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     manifest["store"] = store
     changes.write(
       "mobius.json",
-      _spliced_manifest(original, manifest, ("icon", "store")).encode("utf-8"),
+      bom + _spliced_manifest(
+        original, manifest, tuple(key for key in ("icon", "store") if key in manifest),
+      ).encode("utf-8"),
     )
 
     # Listing art the icon still uses is not stale, and only the editor's own

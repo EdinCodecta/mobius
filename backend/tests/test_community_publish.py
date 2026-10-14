@@ -111,7 +111,7 @@ def test_preview_asset_reads_the_accepted_tree_not_the_editable_worktree(tmp_pat
 
   assert read_public_store_asset(
     app, accepted, "static/store/screen.png",
-  ) == _ACCEPTED_SCREEN
+  ) == (_ACCEPTED_SCREEN, "image/png")
 
   with pytest.raises(CommunityPublicationError) as unavailable:
     read_public_store_asset(app, accepted, "index.jsx")
@@ -120,6 +120,23 @@ def test_preview_asset_reads_the_accepted_tree_not_the_editable_worktree(tmp_pat
   with pytest.raises(CommunityPublicationError) as changed:
     read_public_store_asset(app, "f" * 40, "static/store/screen.png")
   assert changed.value.code == "accepted_revision_changed"
+
+
+def test_preview_asset_type_follows_the_bytes_not_the_name(tmp_path):
+  repo, app, _ = _app_repo(tmp_path)
+  manifest = json.loads((repo / "mobius.json").read_text())
+  manifest["store"] = {"screenshots": [{"src": "static/store/shot.png", "alt": "A"}]}
+  (repo / "mobius.json").write_text(json.dumps(manifest), encoding="utf-8")
+  (repo / "static" / "store").mkdir(parents=True)
+  jpeg = _png((9, 9, 9), image_format="JPEG")
+  (repo / "static" / "store" / "shot.png").write_bytes(jpeg)
+  _git(repo, "add", "mobius.json", "static/store/shot.png")
+  _git(repo, "commit", "-m", "jpeg under a png name")
+  app.source_commit = accepted = _git(repo, "rev-parse", "HEAD")
+
+  assert read_public_store_asset(app, accepted, "static/store/shot.png") == (
+    jpeg, "image/jpeg",
+  )
 
 
 def test_incomplete_listing_cannot_make_other_source_public(tmp_path):
@@ -142,7 +159,9 @@ def test_incomplete_listing_cannot_make_other_source_public(tmp_path):
   with pytest.raises(CommunityPublicationError) as private:
     read_public_store_asset(app, accepted, "private-notes.txt")
   assert private.value.code == "listing_asset_unavailable"
-  assert read_public_store_asset(app, accepted, "static/store/screen.png") == _SCREEN
+  assert read_public_store_asset(app, accepted, "static/store/screen.png") == (
+    _SCREEN, "image/png",
+  )
 
 
 def test_preview_serves_only_images_even_for_the_declared_icon(tmp_path):

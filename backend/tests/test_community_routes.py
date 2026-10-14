@@ -205,13 +205,13 @@ async def test_publication_preview_asset_serves_commit_bound_bytes(monkeypatch):
 
   seen = {}
 
-  # JPEG bytes behind a .png name: the type follows the bytes, not the name.
+  # The reader decides the type from the bytes; the route serves what it says.
   jpeg = io.BytesIO()
   Image.new("RGB", (8, 8), (1, 2, 3)).save(jpeg, format="JPEG")
 
   def exact_asset(value, commit, path):
     seen.update(app=value, commit=commit, path=path)
-    return jpeg.getvalue()
+    return jpeg.getvalue(), "image/jpeg"
 
   monkeypatch.setattr(community.fs_locks, "source_dir_lock", source_lock)
   monkeypatch.setattr(community, "read_public_store_asset", exact_asset)
