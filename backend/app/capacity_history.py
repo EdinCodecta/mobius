@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from app.capacity import GIB, TIER_RANK
+from app.capacity import TIER_RANK
 
 _HISTORY_HIGH_WATER = 2200
 _HISTORY_TRIM_TARGET = 2000
@@ -191,8 +191,14 @@ def alert_notification_id(tier: str, *, day: str | None = None) -> str:
   return f"capacity-{tier}-{day}"
 
 
+# Hosts quote volume sizes in decimal GB, and owners compare this alert with
+# them, so its math uses the same decimal units its GB/MB labels name.
+_GB = 1000 ** 3
+_MB = 1000 ** 2
+
+
 def _size(value: int) -> str:
-  return f"{value / GIB:.1f} GB" if value >= GIB else f"{value // (1024 * 1024)} MB"
+  return f"{value / _GB:.1f} GB" if value >= _GB else f"{value // _MB} MB"
 
 
 def alert_body(snapshot: dict[str, Any], forecast_result: dict[str, Any] | None) -> str:

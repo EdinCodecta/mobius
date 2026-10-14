@@ -53,14 +53,23 @@ def test_small_volume_alert_tiers_scale_so_running_out_still_alerts(free, expect
 
 def test_alert_body_names_the_pause_floor_in_plain_words():
   snap = {
-    "data_free_bytes": 600 * MIB,
-    "data_total_bytes": 8 * GIB,
-    "mounts": {"data": {"critical_below_bytes": 410 * MIB}},
+    "data_free_bytes": 600 * 10**6,
+    "data_total_bytes": 8 * 10**9,
+    "mounts": {"data": {"critical_below_bytes": 410 * 10**6}},
   }
   body = capacity_history.alert_body(snap, None)
   assert body == (
     "Möbius has 600 MB of 8.0 GB storage left. Chats pause automatically "
     "below 410 MB. Ask Möbius in a chat to free up space, or grow the volume."
+  )
+
+
+def test_alert_sizes_use_the_decimal_units_their_labels_name():
+  # A nominal 5 GB host volume after filesystem overhead. Binary math under a
+  # "GB" label would read it as 4.4 GB, further from what the host shows.
+  snap = {"data_free_bytes": 1_540_000_000, "data_total_bytes": 4_690_000_000}
+  assert capacity_history.alert_body(snap, None).startswith(
+    "Möbius has 1.5 GB of 4.7 GB storage left."
   )
 
 
@@ -280,7 +289,7 @@ def test_alert_notification_id_is_per_tier_per_day():
 
 def test_alert_body_includes_top_domain_and_forecast():
   snap = {
-    "data_free_bytes": int(1.5 * GIB),
+    "data_free_bytes": 1_500_000_000,
     "alert_tier": "critical",
     "domains": {
       "database": {"bytes": 1 * GIB},
