@@ -88,6 +88,11 @@ def record_icon_for_save(root: Path, app: models.App) -> bytes | None:
   return app.icon_override_png or app.icon_png or None
 
 
+def _icon_cleaned_in_place(declared: str) -> bool:
+  """Whether a save rewrites the declared icon file itself, not a copy."""
+  return declared.lower().endswith(".png") and not declared.startswith(f"{STORE_ART_DIR}/")
+
+
 def note_what_saving_fixes(checklist: list[dict], root: Path, app: models.App) -> None:
   """Mark the checklist items that saving the listing completes by itself.
 
@@ -100,11 +105,22 @@ def note_what_saving_fixes(checklist: list[dict], root: Path, app: models.App) -
     details["automatic"] = False
     details["message"] = _DETAILS_NEED_AGENT
   icon = items["icon"]
-  # Only a save that can go ahead keeps the icon; one refused for missing
-  # details or unapplied source changes fixes nothing.
-  if icon["done"] or details.get("automatic") is False:
+  # Only a save that can go ahead keeps the icon; one refused for missing or
+  # unreadable details, or unapplied source changes, fixes nothing.
+  manifest_path = root / "mobius.json"
+  manifest = _manifest_from(manifest_path.read_bytes() if manifest_path.is_file() else None)
+  if icon["done"] or details.get("automatic") is False or manifest is None:
     return
   if icon.get("code") == "listing_image_metadata":
+    declared = str(manifest.get("icon") or "").strip()
+    if not _icon_cleaned_in_place(declared):
+      # The save writes a clean icon.png, but the original stays published.
+      icon["message"] = (
+        f"Saving the listing writes a clean icon.png, but {declared} is "
+        "published with the source too; ask an agent to remove it or save "
+        "it without the metadata."
+      )
+      return
     message = "Saving the listing removes the icon's hidden metadata."
   elif record_icon_for_save(root, app) is not None:
     message = "Saving the listing keeps the app's current icon."
@@ -127,13 +143,17 @@ def _manifest_from(raw: bytes | None) -> dict | None:
   return manifest if isinstance(manifest, dict) else None
 
 
+def _named_by_its_content(rel: str, content: bytes) -> bool:
+  return PurePosixPath(rel).stem == hashlib.sha256(content).hexdigest()[:16]
+
+
 def _clean_editor_art(root: Path, rel: str) -> bool:
   """Whether editor-named art is absent, or a clean image its name hashes."""
   target = root / rel
   if not target.is_file():
     return True
   content = target.read_bytes()
-  if PurePosixPath(rel).stem != hashlib.sha256(content).hexdigest()[:16]:
+  if not _named_by_its_content(rel, content):
     return False
   try:
     check_listing_image(content, "listing image")
@@ -476,7 +496,7 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     if icon_bytes is not None and declared_icon:
       # Normalized icons are PNG; never write PNG bytes under another suffix,
       # nor over content-addressed listing art the icon may share a file with.
-      if not icon_rel.lower().endswith(".png") or icon_rel.startswith(f"{STORE_ART_DIR}/"):
+      if not _icon_cleaned_in_place(icon_rel):
         icon_rel = "icon.png"
     if icon_bytes is not None:
       try:
@@ -520,7 +540,13 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
     # Listing art the icon still uses is not stale, and only the editor's own
     # content-addressed files are removed.
     for stale in previous_art - _referenced_art(store) - {manifest.get("icon")}:
-      if not _EDITOR_ART.fullmatch(stale):
+      # The editor's own files hold the bytes their names hash; an author's
+      # file that merely looks like one is left alone.
+      target = root / stale
+      if not (
+        _EDITOR_ART.fullmatch(stale) and target.is_file()
+        and _named_by_its_content(stale, target.read_bytes())
+      ):
         continue
       changes.delete(stale)
   except BaseException:

@@ -582,6 +582,93 @@ def test_saving_changes_only_the_listing_in_the_manifest_text(client, auth, styl
     assert "\n" not in saved and ", " not in saved and '": ' not in saved
 
 
+def _gps_jpeg(color=(1, 120, 40), size=(64, 40)) -> bytes:
+  exif = Image.Exif()
+  exif[0x8825] = {1: "N", 2: (51.0, 30.0, 0.0)}
+  photo = io.BytesIO()
+  Image.new("RGB", size, color).save(photo, format="JPEG", exif=exif)
+  return photo.getvalue()
+
+
+def test_an_original_banner_outside_the_art_folder_keeps_the_listing_unready(
+  client, auth, db,
+):
+  source = _source()
+  app_id = _create(client, auth, source)
+  (source / "listing").mkdir()
+  (source / "listing" / "hero.jpg").write_bytes(_gps_jpeg())
+  _commit_accepted(db, source, app_id, "banner photo with GPS")
+
+  saved = _save(client, auth, app_id, **_complete_listing(hero={"path": "listing/hero.jpg"}))
+
+  assert saved.status_code == 200, saved.text
+  hero = json.loads((source / "mobius.json").read_text())["store"]["hero"]
+  assert hero.startswith("static/store/") and not Image.open(source / hero).getexif()
+  preview = _preview(client, auth, app_id)
+  assert preview["ready"] is False
+  assert "listing/hero.jpg" in _item(preview, "details")["message"]
+
+  (source / "listing" / "hero.jpg").unlink()
+  _commit_accepted(db, source, app_id, "agent removes the original")
+  assert _preview(client, auth, app_id)["ready"] is True
+
+
+def test_a_copied_icon_says_its_original_must_go_too(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  manifest = json.loads(_MANIFEST)
+  manifest["icon"] = "icon.jpg"
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  (source / "icon.png").unlink()
+  (source / "icon.jpg").write_bytes(_gps_jpeg((200, 40, 40), (64, 64)))
+  _commit_accepted(db, source, app_id, "icon photo with GPS")
+
+  icon = _item(_preview(client, auth, app_id), "icon")
+
+  assert icon["code"] == "listing_image_metadata" and "automatic" not in icon
+  assert "icon.jpg" in icon["message"]
+  assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
+  assert json.loads((source / "mobius.json").read_text())["icon"] == "icon.png"
+  preview = _preview(client, auth, app_id)
+  assert preview["ready"] is False
+  assert "icon.jpg" in _item(preview, "details")["message"]
+  (source / "icon.jpg").unlink()
+  _commit_accepted(db, source, app_id, "agent removes the original icon")
+  assert _preview(client, auth, app_id)["ready"] is True
+
+
+def test_the_icon_is_not_fixed_by_a_save_that_invalid_json_refuses(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  (source / "icon.png").unlink()
+  (source / "mobius.json").write_text("{not json")
+  _commit_accepted(db, source, app_id, "broken manifest")
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  row.icon_png = _png((10, 200, 10), (32, 32))
+  db.commit()
+
+  assert "automatic" not in _item(_preview(client, auth, app_id), "icon")
+  refused = _save(client, auth, app_id, **_complete_listing())
+  assert refused.json()["detail"]["code"] == "manifest_invalid"
+
+
+def test_an_author_file_that_only_looks_like_editor_art_survives(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  (source / "static" / "store").mkdir(parents=True)
+  author = source / "static" / "store" / "0123456789abcdef.png"
+  author.write_bytes(_png((8, 8, 8)))
+  manifest = json.loads(_MANIFEST)
+  manifest["store"] = {"hero": "static/store/0123456789abcdef.png"}
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  _commit_accepted(db, source, app_id, "author file with a hash-like name")
+
+  assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
+
+  assert "hero" not in json.loads((source / "mobius.json").read_text())["store"]
+  assert author.read_bytes() == _png((8, 8, 8))
+
+
 def test_an_unexpected_image_error_is_a_checklist_item_not_a_crash(monkeypatch):
   from app import community_publish
 

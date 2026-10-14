@@ -544,22 +544,29 @@ def _jpeg_has_metadata(content: bytes) -> bool:
     if marker == 0xDA:
       # Entropy-coded data runs to the next marker; 0xFF is only ever
       # followed there by a stuffed zero or a restart marker.
-      while at + 1 < size and not (
-        content[at] == 0xFF and content[at + 1] != 0 and not 0xD0 <= content[at + 1] <= 0xD7
+      while (at := content.find(b"\xff", at)) != -1 and at + 1 < size and (
+        content[at + 1] == 0 or 0xD0 <= content[at + 1] <= 0xD7
       ):
-        at += 1
+        at += 2
+      if at == -1:
+        return True
   return True  # No end-of-image marker.
 
 
 def listing_image_has_metadata(content: bytes) -> bool:
-  """Whether a valid listing image carries anything beyond how it looks."""
-  with Image.open(io.BytesIO(content)) as image:
-    image_format = image.format
-  if image_format == "PNG":
+  """Whether a PNG, JPEG or WebP file carries anything beyond how it looks.
+
+  Decided from the bytes alone, without decoding, so it is cheap enough to
+  run on every image in a source tree. Anything else returns False. A
+  multi-picture JPEG's extra images count, through its MPF segment.
+  """
+  if content.startswith(b"\x89PNG\r\n\x1a\n"):
     return _png_chunks_kept(content) != content
-  if image_format == "WEBP":
+  if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
     return _webp_chunks_kept(content) != content
-  return image_format == "MPO" or _jpeg_has_metadata(content)
+  if content.startswith(b"\xff\xd8\xff"):
+    return _jpeg_has_metadata(content)
+  return False
 
 
 def strip_listing_image_metadata(content: bytes) -> bytes:
@@ -782,27 +789,22 @@ def _listing_draft(manifest: dict, store: dict, by_path: dict[str, dict]) -> dic
   }
 
 
-def _unlisted_art_with_metadata(
+def _published_images_with_metadata(
   by_path: dict[str, dict], listed: set[str],
 ) -> list[CommunityPublicationError]:
-  """Images under ``static/store/`` the listing does not name, still carrying metadata.
+  """Every image in the snapshot, other than listed ones, still carrying metadata.
 
-  Publishing ships the whole source, so an author's original photo stays
-  public even after a save copies it into clean art. Those files may be
-  loaded by app code under their own names, so they are reported for an
-  agent to clean or remove rather than deleted.
+  Publishing ships the whole source, so an original photo stays public even
+  after a save copies it into clean listing art, wherever it lives. Such
+  files may be loaded by app code under their own names, so they are
+  reported for an agent to clean or remove rather than deleted. Detection
+  reads bytes the snapshot already holds and decodes nothing.
   """
   problems = []
   for path in sorted(by_path):
-    if not path.startswith("static/store/") or path in listed:
+    if path in listed:
       continue  # Listed art and the icon are checked under their own items.
-    content = _file_bytes(by_path[path])
-    try:
-      check_listing_image(content, path)
-      carries = listing_image_has_metadata(content)
-    except Exception:
-      continue  # Not a listing image; the rest of the source rules apply to it.
-    if carries:
+    if listing_image_has_metadata(_file_bytes(by_path[path])):
       problems.append(CommunityPublicationError(
         f"{path} carries camera, location or other hidden metadata that "
         "publishing would make public. Ask an agent to remove it or save it "
@@ -856,7 +858,7 @@ def store_listing_review(
   manifest_problems = _manifest_problems(manifest, by_path) if not details else []
   details += source_problems
   details += [p for p in manifest_problems if p.code != "invalid_icon"]
-  details += _unlisted_art_with_metadata(by_path, _listing_paths(manifest))
+  details += _published_images_with_metadata(by_path, _listing_paths(manifest))
   if details:
     problems["details"] = details[0]
   store = manifest.get("store") if isinstance(manifest.get("store"), dict) else {}
