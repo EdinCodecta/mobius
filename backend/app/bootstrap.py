@@ -32,9 +32,8 @@ from sqlalchemy.orm import Session
 from app import app_git, fs_locks, models
 from app.broadcast import get_system_broadcast
 from app.manifest_identity import canonical_manifest_identity_key
-from app.install import (
-  discard_staged, install_from_manifest, stage_package_clone, transient_failure,
-)
+from app.git_transfers import discard_staged
+from app.install import install_from_manifest, prepare_package, transient_failure
 from app.timeutil import now_naive_utc
 
 log = logging.getLogger("mobius.bootstrap")
@@ -230,13 +229,13 @@ async def ensure_bootstrap_apps_installed(
   rate_limited = False
   retry_after: int | None = None
   for bootstrap_app in _CORE_BOOTSTRAP_APPS:
-    staged_clone = None
+    prepared = None
     stage_error: Exception | None = None
     if retry is not None and bootstrap_app.manifest_id in retry:
       # A retry holds the lifecycle lock below; no network may run under it,
-      # so the clone is staged first and simply discarded if it goes unused.
+      # so the package is fetched first and simply discarded if it goes unused.
       try:
-        staged_clone = await stage_package_clone(bootstrap_app.manifest_url)
+        prepared = await prepare_package(bootstrap_app.manifest_url)
       except Exception as exc:
         stage_error = exc
     try:
@@ -247,9 +246,13 @@ async def ensure_bootstrap_apps_installed(
         fs_locks.install_uninstall_lock() if retry is not None
         else contextlib.nullcontext()
       ):
-        # Use the installer's identity resolver here too: bootstrap and an
+        # Use the installer's address lookup here too: bootstrap and an
         # explicit Store action must agree across ref moves and legacy rows whose
-        # matching catalog origin predates persisted manifest identity.
+        # matching catalog origin predates persisted manifest identity. This is
+        # only the address half of `install.resolve_package_row`: it runs before
+        # any package is fetched, so there is no `package_id` to check, and it
+        # must see a deleted predecessor to keep an owner's uninstall. The
+        # install below applies the whole rule to the fetched package.
         existing = _find_install_identity_row(
           db,
           source_url=bootstrap_app.manifest_url,
@@ -318,15 +321,15 @@ async def ensure_bootstrap_apps_installed(
           if stage_error is not None:
             raise stage_error
           if retry is None:
-            # First boot holds no lock, so the clone is staged here.
-            staged_clone = await stage_package_clone(bootstrap_app.manifest_url)
+            # First boot holds no lock, so the package is fetched here.
+            prepared = await prepare_package(bootstrap_app.manifest_url)
           result = await install_from_manifest(
             db,
             manifest_url=bootstrap_app.manifest_url,
             manifest=None,
             raw_base=None,
             source="bootstrap",
-            staged_clone=staged_clone,
+            prepared=prepared,
           )
           app = result.app
           mode = result.mode
@@ -360,7 +363,8 @@ async def ensure_bootstrap_apps_installed(
       # pin) installed after the page loaded appears without a reload.
       _publish_app_updated(app.id)
     finally:
-      await asyncio.to_thread(discard_staged, staged_clone)
+      if prepared is not None:
+        await asyncio.to_thread(discard_staged, prepared.staged_clone)
   return BootstrapOutcome(tuple(pending), rate_limited, retry_after)
 
 

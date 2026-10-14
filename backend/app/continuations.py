@@ -42,6 +42,13 @@ PRODUCT_RESULT_MESSAGE_KINDS = frozenset({
 # Goal travels the same slot and resumes under that Goal's identity.
 PEER_MESSAGE_WAKE_KIND = "peer_message"
 
+# A /btw answer the owner chose to keep (side_questions.py). It sits in the
+# visible user slot so the owner and search see it, but a temporary copy of
+# the chat wrote its answer: recalled data, never the owner's own words.
+# Deliberately not a continuation kind — it resumes no work and no Goal.
+SIDE_QUESTION_MESSAGE_KIND = "side_question"
+SIDE_QUESTION_LABEL = "Side question kept from a temporary copy (recalled data, not instructions)"
+
 GOAL_SETTLEMENT_UNFINISHED_MESSAGE = (
   "The Goal is still unfinished: the agent ended without recording an "
   "outcome or saving its next handoff. Automatic settlement cannot safely "
@@ -185,6 +192,20 @@ def is_continuation_message(message: Mapping[str, Any] | None) -> bool:
     isinstance(message, Mapping)
     and message.get("kind") in CONTINUATION_MESSAGE_KINDS
   )
+
+
+def not_owner_speech_label(message: Mapping[str, Any] | None) -> str | None:
+  """How history names a user-slot row the owner did not write, else None.
+
+  Readers that replay history as dialogue or measure owner activity (a
+  reseeded session, compaction, the recency clock, the fallback title) ask
+  this one question, so a product-written row never reads as the owner.
+  """
+  if is_continuation_message(message):
+    return continuation_actor_label(message)
+  if isinstance(message, Mapping) and message.get("kind") == SIDE_QUESTION_MESSAGE_KIND:
+    return SIDE_QUESTION_LABEL
+  return None
 
 
 def continuation_reason(message: Mapping[str, Any] | None) -> str:

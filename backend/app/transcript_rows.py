@@ -41,6 +41,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Session, object_session
 
 from app import models
+from app.continuations import SIDE_QUESTION_MESSAGE_KIND
 
 EDIT_PREVIEW = 1
 HIDDEN = 8
@@ -48,6 +49,8 @@ GOAL_COMPLETION = 16
 PROSE = 32
 DERIVED_CID = 64
 ATTACHMENTS = 128
+# An added /btw answer the agent has not received yet (side_questions.py).
+SIDE_QUESTION_OWED = 256
 
 _PROSE_ROLES = ("user", "assistant")
 # Set by chat_writer on the actor's own Session.
@@ -91,6 +94,8 @@ def attributes(body) -> dict:
       flags |= EDIT_PREVIEW
     if _is_goal_tool(block):
       flags |= GOAL_COMPLETION
+  if body.get("kind") == SIDE_QUESTION_MESSAGE_KIND and body.get("delivered_to_agent") is not True:
+    flags |= SIDE_QUESTION_OWED
   role = body.get("role") if isinstance(body.get("role"), str) else None
   content = body.get("content")
   # Search prose: the previous release's indexing rule, decided only here.
@@ -604,6 +609,21 @@ def attachment_bodies(db, chat) -> list:
   return list(db.execute(select(_M.body).where(
     _M.chat_id == _id(chat), _M.flags.op("&")(ATTACHMENTS) != 0,
   ).order_by(_M.seq)).scalars())
+
+
+def owed_side_questions(db, chat) -> list[tuple[int, dict]]:
+  """(position, body) of added side questions the agent has not received.
+
+  Only those rows carry SIDE_QUESTION_OWED, so the check every turn makes
+  never decodes the rest of a converted chat's history.
+  """
+  legacy = legacy_messages(db, chat)
+  if legacy is not None:
+    return [(seq, body) for seq, body in enumerate(legacy)
+            if attributes(body)["flags"] & SIDE_QUESTION_OWED]
+  return [tuple(row) for row in db.execute(select(_M.seq, _M.body).where(
+    _M.chat_id == _id(chat), _M.flags.op("&")(SIDE_QUESTION_OWED) != 0,
+  ).order_by(_M.seq)).all()]
 
 
 def _numeric_ts(value) -> bool:

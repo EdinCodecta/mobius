@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from app import generated_files
+from app import generated_files, settled
 from app.codex_sdk_contract import (
   app_server_exit_code,
   app_server_pid,
@@ -2500,14 +2500,18 @@ async def _run_codex_sdk_turn(
       "error": _codex_user_error(str(exc)),
     })
   finally:
-    try:
-      await generated_files.publish_inbox_files(
+    teardown = settled.Teardown(log, f"chat_id={chat_id}")
+    # A cancellation landing in any step below is deferred, so it cannot skip
+    # the reap, unregister and executor close that follow.
+    await teardown.step(
+      generated_files.publish_inbox_files(
         bc,
         data_dir=runtime_data_dir,
         chat_id=chat_id,
-      )
-    except Exception:
-      log.debug("generated-file turn capture failed", exc_info=True)
+      ),
+      "generated-file capture",
+      level=logging.DEBUG,
+    )
     if helper_progress_task is not None:
       helper_progress_task.cancel()
     if task_host_open and task_host_tool_use_id is not None:
@@ -2520,7 +2524,6 @@ async def _run_codex_sdk_turn(
         "type": "tool_end",
         "tool_use_id": task_host_tool_use_id,
       })
-    deferred_cancel: asyncio.CancelledError | None = None
     if process_group_capture_stop is not None:
       process_group_capture_stop.set()
     if process_group_capture_task is not None:
@@ -2533,7 +2536,7 @@ async def _run_codex_sdk_turn(
           # A caller cancellation landed during the shielded join. Keep
           # waiting for the runner-owned task so initialization-failure cleanup
           # cannot lose the only observed PGID.
-          deferred_cancel = deferred_cancel or exc
+          teardown.defer(exc)
       try:
         captured_during_start = process_group_capture_task.result()
         if process_group_id is None:
@@ -2554,57 +2557,45 @@ async def _run_codex_sdk_turn(
     group_already_terminated = False
     if isinstance(current, ActiveCodexTurn) and current.turn is turn:
       group_already_terminated = current._force_stop_started
-      try:
-        await current.finish_steer_before_turn_end()
-      except asyncio.CancelledError as exc:
-        # A committing cut owns its durable queue row. Finish that bounded
-        # writer settlement before honoring cancellation so the wrapper's
-        # terminal Finalize cannot race it and reorder Q1/A1/Q2.
-        deferred_cancel = deferred_cancel or exc
-        await asyncio.shield(current.finish_steer_before_turn_end())
-      except Exception:
-        log.exception(
-          "Codex steer settlement failed during turn teardown chat_id=%s",
-          chat_id,
-        )
+      # A committing cut owns its durable queue row. Finish that bounded
+      # writer settlement before honoring cancellation so the wrapper's
+      # terminal Finalize cannot race it and reorder Q1/A1/Q2.
+      await teardown.step(
+        current.finish_steer_before_turn_end(), "Codex steer settlement",
+      )
       registry.unregister(chat_id, RunnerKind.CODEX_SDK)
       current.mark_finished()
-    # AsyncCodex.close() terminates only its direct Popen PID.  Reap the
-    # isolated group and every command this run started in its own session
-    # after that context exit, so a tool child cannot be re-parented to
-    # container init and consume CPU/RAM after the turn.  A
-    # worker keeps the short grace period off the FastAPI event loop; shield
-    # ensures task cancellation cannot prevent the SIGKILL backstop from
-    # running in that worker once cleanup has started.
     if helper_host is not None:
       # Unload this helper's thread (its tool servers exit with it) before
       # ending its leftover commands; the host itself stays up.
-      await asyncio.shield(helper_host.unload_thread(current_session_id))
+      await teardown.step(
+        helper_host.unload_thread(current_session_id), "helper thread unload",
+      )
       if not helper_host.alive:
         from app import helper_hosts
-        await asyncio.shield(helper_hosts.MANAGER.discard(helper_host))
+        await teardown.step(
+          helper_hosts.MANAGER.discard(helper_host), "helper host discard",
+        )
     if turn_env_file is not None:
       turn_env_file.remove()
+    # AsyncCodex.close() terminates only its direct Popen PID. Reap the
+    # isolated group and every command this run started in its own session
+    # after that context exit, so a tool child cannot be re-parented to
+    # container init and consume CPU/RAM after the turn. The worker finishes
+    # its bounded TERM/KILL sequence before any cancellation is raised, and
+    # neither a cancellation nor a failure skips the executor close.
     run_marker = base_env.get(RUN_MARKER_ENV)
     if (
       (process_group_id is not None or run_marker)
       and not group_already_terminated
     ):
-      reap_task = asyncio.create_task(asyncio.to_thread(
-        _terminate_codex_processes, process_group_id, run_marker,
-      ))
-      while not reap_task.done():
-        try:
-          await asyncio.shield(reap_task)
-        except asyncio.CancelledError as exc:
-          # shield keeps the worker alive. Defer every caller cancellation
-          # until its bounded TERM/KILL sequence has completed.
-          deferred_cancel = deferred_cancel or exc
-      reap_task.result()
+      await teardown.step(
+        asyncio.to_thread(_terminate_codex_processes, process_group_id, run_marker),
+        "process reap",
+      )
     if codex_call_executor is not None:
       codex_call_executor.close()
-    if deferred_cancel is not None:
-      raise deferred_cancel
+    teardown.finish()
 
 
 async def run_codex_sdk_turn(

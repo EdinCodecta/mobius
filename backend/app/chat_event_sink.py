@@ -74,6 +74,7 @@ from app.owner_card_receipts import (
   turn_end_receipt_id as _turn_end_receipt_id,
 )
 from app.runtime_types import ChatEvent
+from app.screenshot_steps import SAVED_IMAGE_FIELD, saved_screenshot_file
 from app.secure_inputs import redact_reveal_markers
 from app.tool_edit_preview import edit_diff_sidecar_id
 
@@ -377,6 +378,8 @@ class ChatEventSink:
       run_token or f"assistant-{uuid.uuid4().hex}"
     )
     self.assistant_blocks: list = []
+    # Exact helper report for this assistant segment; not live prose.
+    self._assistant_result: tuple[str, str] | None = None
     self._activity_frontier = None
     self._activity_raw_length = 0
     self.session_id: str | None = None
@@ -522,6 +525,15 @@ class ChatEventSink:
     """Build a bounded transcript snapshot plus its full-text sidecars."""
     snapshot = copy.deepcopy(build_assistant_message(blocks))
     snapshot["id"] = assistant_message_id or self.assistant_message_id
+    report = self._assistant_result
+    if report is not None and report[0] == snapshot["id"]:
+      # The ordinary last text already carries most final answers. Persist a
+      # separate result only when it differs (including an explicit empty one).
+      texts = [block["content"].strip() for block in snapshot.get("blocks") or []
+               if block.get("type") == "text" and isinstance(block.get("content"), str)
+               and block["content"].strip()]
+      if not texts or texts[-1] != report[1].strip():
+        snapshot["result"] = report[1]
     stashes: list[StashThinkingTrace] = []
     for source, persisted in zip(
       [b for b in blocks if b.get("type") != "text_boundary"],
@@ -729,6 +741,21 @@ class ChatEventSink:
         pm = blk.get("peer_message")
         return pm if isinstance(pm, dict) else None
     return None
+
+  def _stamp_saved_screenshot(self, event: ChatEvent) -> None:
+    """Name the chat-media file a screenshot step saved (screenshot_steps).
+
+    Read from the full result before reduction, so the step can render its
+    picture without the chat downloading that result again.
+    """
+    blk = _tool_block_for_event(self.assistant_blocks, event.get("tool_use_id"))
+    name = saved_screenshot_file(
+      blk.get("tool") if blk is not None else None,
+      event.get("content"),
+      self.chat_id,
+    )
+    if name is not None:
+      event[SAVED_IMAGE_FIELD] = name
 
   def _stamp_peer_message(self, event: ChatEvent) -> None:
     """Name a Möbius peer-network exchange on the event, in two phases.
@@ -1090,6 +1117,13 @@ class ChatEventSink:
     not enter this ordinary broadcast-before-save path.
     """
     event_type = event.get("type")
+    if event_type == "assistant_result":
+      # Projection metadata belongs to the exact segment and goes through the
+      # normal writer snapshot, never a second user-visible text broadcast.
+      content = event.get("content")
+      if isinstance(content, str):
+        self._assistant_result = (self.assistant_message_id, content)
+      return True
     assert event_type != "question", (
       "question events must go through publish_question(), not publish()"
     )
@@ -1142,6 +1176,7 @@ class ChatEventSink:
       # Settle a peer-network exchange from the FULL result JSON before it can be
       # carved by reduction (the envelope is one object, not a tail-safe line).
       self._stamp_peer_message(event)
+      self._stamp_saved_screenshot(event)
       if (
         event.get("output_complete") is True
         and event.get("output_exit_code") in (None, 0)
@@ -1326,6 +1361,11 @@ class ChatEventSink:
       if self._last_error:
         # Synthesize an error block so the failure is durable in the transcript.
         blocks = [{"type": "error", "message": self._last_error}]
+      elif (self._assistant_result is not None
+            and self._assistant_result[0] == self.assistant_message_id
+            and self._assistant_result[1]):
+        # A provider report without renderable prose is still a real answer.
+        blocks = [{"type": "text", "content": self._assistant_result[1]}]
       elif getattr(self, "_lost_reply_marker", False):
         # Defense-in-depth: a normally-owned run reached a CLEAN provider
         # terminal but produced zero renderable content (a Claude synthetic-

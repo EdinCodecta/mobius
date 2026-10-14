@@ -465,7 +465,7 @@ def _reap_staging_bundles(_context: StartupContext) -> None:
 
 def _sweep_git_transfers(_context: StartupContext) -> None:
   """Discard Git transfers an earlier process left unfinished."""
-  from app.install import git_transfer_root
+  from app.git_transfers import git_transfer_root
 
   shutil.rmtree(git_transfer_root(), ignore_errors=True)
 
