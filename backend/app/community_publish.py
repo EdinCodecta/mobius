@@ -782,6 +782,36 @@ def _listing_draft(manifest: dict, store: dict, by_path: dict[str, dict]) -> dic
   }
 
 
+def _unlisted_art_with_metadata(
+  by_path: dict[str, dict], listed: set[str],
+) -> list[CommunityPublicationError]:
+  """Images under ``static/store/`` the listing does not name, still carrying metadata.
+
+  Publishing ships the whole source, so an author's original photo stays
+  public even after a save copies it into clean art. Those files may be
+  loaded by app code under their own names, so they are reported for an
+  agent to clean or remove rather than deleted.
+  """
+  problems = []
+  for path in sorted(by_path):
+    if not path.startswith("static/store/") or path in listed:
+      continue  # Listed art and the icon are checked under their own items.
+    content = _file_bytes(by_path[path])
+    try:
+      check_listing_image(content, path)
+      carries = listing_image_has_metadata(content)
+    except Exception:
+      continue  # Not a listing image; the rest of the source rules apply to it.
+    if carries:
+      problems.append(CommunityPublicationError(
+        f"{path} carries camera, location or other hidden metadata that "
+        "publishing would make public. Ask an agent to remove it or save it "
+        "without the metadata.",
+        "listing_image_metadata",
+      ))
+  return problems
+
+
 def store_listing_review(
   files: list[dict[str, str]],
   source_problems: list[CommunityPublicationError] | tuple = (),
@@ -826,6 +856,7 @@ def store_listing_review(
   manifest_problems = _manifest_problems(manifest, by_path) if not details else []
   details += source_problems
   details += [p for p in manifest_problems if p.code != "invalid_icon"]
+  details += _unlisted_art_with_metadata(by_path, _listing_paths(manifest))
   if details:
     problems["details"] = details[0]
   store = manifest.get("store") if isinstance(manifest.get("store"), dict) else {}

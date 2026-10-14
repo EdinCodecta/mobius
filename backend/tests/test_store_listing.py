@@ -11,7 +11,8 @@ from unittest.mock import patch
 from PIL import Image
 
 from app import (
-  app_apply, app_git, app_python_env, fs_locks, models, schemas, store_listing_source,
+  app_apply, app_git, app_python_env, community_publish, fs_locks, models, schemas,
+  store_listing_source,
 )
 from app.community_publish import public_store_listing, store_listing_review
 from app.config import get_settings
@@ -472,6 +473,24 @@ def test_committed_art_with_metadata_is_flagged_and_cleaned_by_a_save(client, au
   src = json.loads((source / "mobius.json").read_text())["store"]["screenshots"][0]["src"]
   assert src != "static/store/shot.jpg" and src.endswith(".jpg")
   assert not Image.open(source / src).getexif()
+  # The original is still published with the source, so the listing stays
+  # unready, and the file is left for an agent, never deleted by the save.
+  assert (source / "static" / "store" / "shot.jpg").is_file()
+  preview = _preview(client, auth, app_id)
+  details = _item(preview, "details")
+  assert preview["ready"] is False
+  assert details["code"] == "listing_image_metadata"
+  assert "static/store/shot.jpg" in details["message"]
+  # Publish reads the same review, so it refuses the same way.
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  _, files = community_publish.build_public_snapshot(row)
+  with pytest.raises(CommunityPublicationError) as refused:
+    community_publish.public_store_listing(files)
+  assert refused.value.code == "listing_image_metadata"
+
+  (source / "static" / "store" / "shot.jpg").unlink()
+  _commit_accepted(db, source, app_id, "agent removes the original photo")
+
   assert _preview(client, auth, app_id)["ready"] is True
 
 
@@ -509,6 +528,9 @@ def test_any_non_drawing_jpeg_segment_or_trailing_bytes_count_as_metadata(
     src = json.loads((source / "mobius.json").read_text())["store"]["screenshots"][0]["src"]
     stored = (source / src).read_bytes()
     assert payload not in stored and b"appended" not in stored
+    assert _preview(client, auth, app_id)["ready"] is False
+    (source / "static" / "store" / "shot.jpg").unlink()
+    _commit_accepted(db, source, app_id, "agent removes the original")
     assert _preview(client, auth, app_id)["ready"] is True
 
 
