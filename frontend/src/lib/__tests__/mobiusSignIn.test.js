@@ -61,3 +61,17 @@ test('unreadable storage keeps the card, the always-safe choice', () => {
   assert.doesNotThrow(() => markExplicitSignOut(throwing))
   assert.doesNotThrow(() => recordSignInRedirect(throwing))
 })
+
+test('storage that reads but rejects writes keeps the card, so a sign-out cannot be undone', () => {
+  const full = {
+    getItem: () => null,
+    setItem() { throw new DOMException('quota', 'QuotaExceededError') },
+    removeItem() {},
+  }
+  assert.equal(shouldRedirectToMobiusSignIn({ authMode: 'mobius', storage: full }), false)
+  assert.equal(recordSignInRedirect(full), false)
+})
+
+test('a successful redirect mark reports that it was stored', () => {
+  assert.equal(recordSignInRedirect(memoryStorage()), true)
+})

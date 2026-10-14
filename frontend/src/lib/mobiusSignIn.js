@@ -13,6 +13,7 @@
 
 const SIGNED_OUT_KEY = 'mobius_signed_out'
 const REDIRECTED_KEY = 'mobius_sign_in_redirected'
+const PROBE_KEY = 'mobius_sign_in_probe'
 
 function sessionStore() {
   try {
@@ -34,15 +35,29 @@ export function clearSignInMarks(storage = sessionStore()) {
   } catch { /* ignore */ }
 }
 
+// Readable is not enough: with a full or read-only store the marks below would
+// silently fail to persist, and a sign-out could be undone or a redirect could
+// repeat. Only a store that takes a write counts as usable.
+function storageAcceptsWrites(storage) {
+  try {
+    storage.setItem(PROBE_KEY, '1')
+    const ok = storage.getItem(PROBE_KEY) === '1'
+    storage.removeItem(PROBE_KEY)
+    return ok
+  } catch {
+    return false
+  }
+}
+
 export function shouldRedirectToMobiusSignIn({
   authMode,
   standalone = false,
   storage = sessionStore(),
 }) {
   if (authMode !== 'mobius' || standalone) return false
-  // Without readable storage we cannot tell a loop from a first visit, so the
+  // Without a usable store we cannot tell a loop from a first visit, so the
   // card stays: it is always safe and one tap from the same place.
-  if (!storage) return false
+  if (!storage || !storageAcceptsWrites(storage)) return false
   try {
     return !storage.getItem(SIGNED_OUT_KEY) && !storage.getItem(REDIRECTED_KEY)
   } catch {
@@ -50,6 +65,12 @@ export function shouldRedirectToMobiusSignIn({
   }
 }
 
+/** Returns whether the mark was stored; navigate only when it was. */
 export function recordSignInRedirect(storage = sessionStore()) {
-  try { storage?.setItem(REDIRECTED_KEY, '1') } catch { /* ignore */ }
+  try {
+    storage.setItem(REDIRECTED_KEY, '1')
+    return storage.getItem(REDIRECTED_KEY) === '1'
+  } catch {
+    return false
+  }
 }

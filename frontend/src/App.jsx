@@ -347,11 +347,13 @@ function AppRoot() {
           standalone: Boolean(STANDALONE_APP),
         })
       ) {
-        mobiusRedirectStarted.current = true
-        recordSignInRedirect()
-        setStatus('mobius-redirect')
-        window.location.replace(api.auth.mobius.startUrl())
-        return
+        // Navigate only once the mark that prevents a repeat is stored.
+        if (recordSignInRedirect()) {
+          mobiusRedirectStarted.current = true
+          setStatus('mobius-redirect')
+          window.location.replace(api.auth.mobius.startUrl())
+          return
+        }
       }
       setStatus(setupStatusQuery.data.configured ? 'login' : 'setup')
       removeSplash()
