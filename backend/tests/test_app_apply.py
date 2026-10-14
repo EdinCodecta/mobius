@@ -1458,7 +1458,7 @@ def test_store_ordinary_apply_warns_when_local_package_declarations_diverge(
   diverged = _apply(client, auth, source)
   assert diverged.status_code == 200, diverged.text
   assert diverged.json()["warnings"] == [
-    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+    app_apply.STORE_LOCAL_PACKAGE_DIVERGED
   ]
   row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
   assert not (row.capability_contract.get("agent") or {}).get("tools")
@@ -1484,7 +1484,7 @@ def test_store_ordinary_apply_warns_on_any_dropped_manifest_edit(
 
   assert applied.status_code == 200, applied.text
   assert applied.json()["warnings"] == [
-    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+    app_apply.STORE_LOCAL_PACKAGE_DIVERGED
   ]
 
 

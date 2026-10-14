@@ -72,7 +72,7 @@ _LOCAL_PACKAGE_WARNING = (
   "and skills; a future reviewed Store update may replace them."
 )
 
-_STORE_LOCAL_PACKAGE_DIVERGED = (
+STORE_LOCAL_PACKAGE_DIVERGED = (
   "This app is Store-managed, so its live package comes from the accepted "
   "manifest. Your local mobius.json changes were NOT applied by this "
   "ordinary apply. Re-apply with --accept-local-package to make the local "
@@ -396,7 +396,7 @@ def _store_local_package_divergence(app: models.App, snapshot_dir: Path) -> str 
     )
   except (OSError, ValueError, applied_app_runtime.AppliedRuntimeUnavailable):
     return None
-  return _STORE_LOCAL_PACKAGE_DIVERGED if local != accepted else None
+  return STORE_LOCAL_PACKAGE_DIVERGED if local != accepted else None
 
 
 def _entry_source(snapshot_dir: Path, relative: str) -> str:
@@ -651,8 +651,13 @@ async def apply_source_revision(
   app: models.App | None,
   chat_id: str | None,
   accept_local_package: bool = False,
+  expected_tree: app_git.WorktreeTree | None = None,
 ) -> ApplyResult:
-  """Compile, accept, and publish one source revision (traced as app.apply)."""
+  """Compile, accept, and publish one source revision (traced as app.apply).
+
+  ``expected_tree`` pins the exact candidate a caller already checked; any
+  other snapshot is refused as ``source_changed``.
+  """
   with tracing.span("app.apply", {
     "mobius.app_id": app.id if app is not None else None,
     "mobius.chat_id": chat_id,
@@ -663,6 +668,7 @@ async def apply_source_revision(
       app=app,
       chat_id=chat_id,
       accept_local_package=accept_local_package,
+      expected_tree=expected_tree,
     )
 
 
@@ -673,6 +679,7 @@ async def _apply_source_revision(
   app: models.App | None,
   chat_id: str | None,
   accept_local_package: bool = False,
+  expected_tree: app_git.WorktreeTree | None = None,
 ) -> ApplyResult:
   """Compile, accept, and publish one source revision.
 
@@ -719,6 +726,13 @@ async def _apply_source_revision(
   candidate = await _git_operation(
     "snapshot", app_git.snapshot_worktree, source_path,
   )
+  if expected_tree is not None and candidate != expected_tree:
+    raise AppApplyError(
+      "source_changed",
+      "App source changed after it was checked; retry once the current edit "
+      "is complete.",
+      status_code=409,
+    )
   previous_bundle = None
   published = None
   staged = None

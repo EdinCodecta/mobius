@@ -1,6 +1,8 @@
 """Routes for managing the mini-app registry."""
 
 import asyncio
+import base64
+import binascii
 import functools
 import io
 import json
@@ -13,7 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
@@ -28,8 +30,8 @@ from app import chat_writer
 from app import (
   activity, app_activity, app_apply, app_badge, app_capability_acceptance,
   app_git, app_jobs, app_recency, chat_app_artifacts, chat_queue, drawer_pins, fs_locks,
-  git_transfers, icon_cache, models, project_git, providers, schemas,
-  pending_update, settled, source_dirs, workspace_files,
+  git_transfers, icon_cache, models, pending_update, project_git, providers, schemas,
+  settled, source_dirs, store_listing_source, workspace_files,
 )
 from app.manifest_identity import (
   requested_manifest_source, stored_manifest_fetch_url,
@@ -2127,38 +2129,13 @@ async def apply_app_source(
   # Settled under the locks: a cancelled request must not release them while
   # Apply's threads still write, nor cut Apply short before its rollback.
   async def _apply(app: models.App | None):
-    try:
-      return await app_apply.apply_source_revision(
-        db,
-        source_dir=source_dir,
-        app=app,
-        chat_id=body.chat_id,
-        accept_local_package=body.accept_local_package,
-      )
-    except app_apply.AppApplyError as exc:
-      raise HTTPException(
-        status_code=exc.status_code,
-        detail={"code": exc.code, "message": str(exc)},
-      ) from exc
-    except app_git.SourceTreeChanged as exc:
-      raise HTTPException(
-        status_code=409,
-        detail={"code": "source_changed", "message": str(exc)},
-      ) from exc
-    except CompileError as exc:
-      detail = {
-        "code": "compile_failed",
-        "message": str(exc),
-      }
-      # Strip colour before capping: escape codes inflate the text several
-      # times over, so a raw tail can lose the error line and its location.
-      stderr = readable_output(exc.stderr, limit=4000)
-      if stderr:
-        detail["stderr"] = stderr
-      raise HTTPException(status_code=422, detail=detail) from exc
-    except RolldownStalled as exc:
-      # Distinct from compile_failed: the source was not judged.
-      raise HTTPException(status_code=503, detail=exc.detail()) from exc
+    return await _apply_source_or_http(
+      db,
+      source_dir=source_dir,
+      app=app,
+      chat_id=body.chat_id,
+      accept_local_package=body.accept_local_package,
+    )
 
   async with fs_locks.install_uninstall_lock():
     matched = (
@@ -2178,25 +2155,7 @@ async def apply_app_source(
             ),
           },
         )
-      app_id = matched.id
-      async with (
-        fs_locks.app_storage_lock(app_id),
-        fs_locks.source_dir_lock(source_dir),
-      ):
-        app = (
-          db.query(models.App)
-          .populate_existing()
-          .filter(models.App.id == app_id, models.App.deleted_at.is_(None))
-          .first()
-        )
-        if app is None or app.source_dir != source_dir:
-          raise HTTPException(
-            status_code=409,
-            detail={
-              "code": "source_identity_changed",
-              "message": "The app source identity changed; retry the apply.",
-            },
-          )
+      async with _locked_app_source(db, matched.id, source_dir) as app:
         result = await settled.settle(_apply(app), what="App apply")
     else:
       async with fs_locks.source_dir_lock(source_dir):
@@ -2219,27 +2178,270 @@ async def apply_app_source(
           )
         result = await settled.settle(_apply(None), what="App apply")
 
-  event_type = "app_created" if result.mode == "created" else "app_updated"
-  if result.mode != "unchanged":
-    event = {"type": event_type, "appId": str(result.app.id)}
-    if result.mode == "created" and result.app.chat_id is not None:
-      event["chatId"] = str(result.app.chat_id)
-    get_system_broadcast().publish(event)
-    # Lifecycle refresh and workspace reveal are separate contracts. A preview
-    # action carries the REQUESTING chat (which may be modifying an app created
-    # elsewhere) and is emitted only after the coherent revision committed, so
-    # the shell never opens a half-written or failed build.
-    if body.chat_id:
-      get_system_broadcast().publish({
-        "type": "app_preview_ready",
-        "appId": str(result.app.id),
-        "chatId": str(body.chat_id),
-      })
+  _publish_apply_events(result, body.chat_id)
   return schemas.AppApplyOut(
     mode=result.mode,
     app=result.app,
     warnings=list(result.warnings),
   )
+
+
+@asynccontextmanager
+async def _locked_app_source(db: Session, app_id: int, source_dir: str):
+  """Hold one app's storage and source locks, yielding its row re-read under them.
+
+  Callers hold the install lock, which already rules out an uninstall or
+  reinstall; this catches only the app's source moving in the meantime.
+  """
+  async with (
+    fs_locks.app_storage_lock(app_id),
+    fs_locks.source_dir_lock(source_dir),
+  ):
+    app = (
+      db.query(models.App)
+      .populate_existing()
+      .filter(models.App.id == app_id, models.App.deleted_at.is_(None))
+      .first()
+    )
+    if app is None or app.source_dir != source_dir:
+      raise HTTPException(
+        status_code=409,
+        detail={
+          "code": "source_identity_changed",
+          "message": "The app source identity changed; try again.",
+        },
+      )
+    yield app
+
+
+async def _apply_source_or_http(
+  db: Session,
+  *,
+  source_dir: str,
+  app: models.App | None,
+  chat_id: str | None,
+  accept_local_package: bool = False,
+  expected_tree: app_git.WorktreeTree | None = None,
+):
+  """Accept one source revision, reporting failures as API errors."""
+  try:
+    return await app_apply.apply_source_revision(
+      db,
+      source_dir=source_dir,
+      app=app,
+      chat_id=chat_id,
+      accept_local_package=accept_local_package,
+      expected_tree=expected_tree,
+    )
+  except app_apply.AppApplyError as exc:
+    raise HTTPException(
+      status_code=exc.status_code,
+      detail={"code": exc.code, "message": str(exc)},
+    ) from exc
+  except app_git.SourceTreeChanged as exc:
+    raise HTTPException(
+      status_code=409,
+      detail={"code": "source_changed", "message": str(exc)},
+    ) from exc
+  except CompileError as exc:
+    detail = {
+      "code": "compile_failed",
+      "message": str(exc),
+    }
+    # Strip colour before capping: escape codes inflate the text several
+    # times over, so a raw tail can lose the error line and its location.
+    stderr = readable_output(exc.stderr, limit=4000)
+    if stderr:
+      detail["stderr"] = stderr
+    raise HTTPException(status_code=422, detail=detail) from exc
+  except RolldownStalled as exc:
+    # Distinct from compile_failed: the source was not judged.
+    raise HTTPException(status_code=503, detail=exc.detail()) from exc
+
+
+def _publish_apply_events(result, chat_id: str | None) -> None:
+  event_type = "app_created" if result.mode == "created" else "app_updated"
+  if result.mode == "unchanged":
+    return
+  event = {"type": event_type, "appId": str(result.app.id)}
+  if result.mode == "created" and result.app.chat_id is not None:
+    event["chatId"] = str(result.app.chat_id)
+  get_system_broadcast().publish(event)
+  # Lifecycle refresh and workspace reveal are separate contracts. A preview
+  # action carries the REQUESTING chat (which may be modifying an app created
+  # elsewhere) and is emitted only after the coherent revision committed, so
+  # the shell never opens a half-written or failed build.
+  if chat_id:
+    get_system_broadcast().publish({
+      "type": "app_preview_ready",
+      "appId": str(result.app.id),
+      "chatId": str(chat_id),
+    })
+
+
+def _listing_image(value: schemas.StoreListingImageIn | None, what: str):
+  if value is None:
+    return None
+  if value.data_base64 is not None:
+    try:
+      data = base64.b64decode(value.data_base64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+      raise HTTPException(
+        status_code=422,
+        detail={"code": "listing_image_invalid", "message": f"The {what} upload is damaged."},
+      ) from exc
+    return store_listing_source.ListingImage(data=data)
+  return store_listing_source.ListingImage(path=value.path or "")
+
+
+def _unapplied_changes() -> HTTPException:
+  return HTTPException(
+    status_code=409,
+    detail={
+      "code": "source_has_draft",
+      "message": (
+        "This app has changes that haven't been applied yet. Finish "
+        "them first, or ask an agent to."
+      ),
+    },
+  )
+
+
+@router.put(
+  "/{app_id}/store-listing",
+  response_model=schemas.AppApplyOut,
+  dependencies=[Depends(reject_cross_site)],
+)
+async def save_store_listing(
+  app_id: int,
+  body: schemas.StoreListingIn,
+  db: Session = Depends(get_db),
+  _: models.Owner = Depends(get_owner_or_app_with_manage_apps),
+):
+  """Write the owner's Store listing into the app source and accept it.
+
+  The save is one accepted revision containing only the listing: an app with
+  unaccepted edits in progress is refused rather than swept into it. A failed
+  accept restores edited bytes only before Git advances; afterward its clean
+  Git revision remains as the normal retry point.
+  """
+  edit = store_listing_source.ListingEdit(
+    tagline=body.tagline,
+    description=body.description,
+    icon=_listing_image(body.icon, "app icon"),
+    hero=_listing_image(body.hero, "banner image"),
+    screenshots=tuple(
+      store_listing_source.ListingScreenshot(
+        image=_listing_image(shot, f"screenshot {index}"),
+        alt=shot.alt,
+        label=shot.label or "",
+      )
+      for index, shot in enumerate(body.screenshots, start=1)
+    ),
+  )
+  async with fs_locks.install_uninstall_lock():
+    found = (
+      db.query(models.App)
+      .filter(models.App.id == app_id, models.App.deleted_at.is_(None))
+      .first()
+    )
+    if found is None or not found.source_dir:
+      raise HTTPException(
+        status_code=404,
+        detail={"code": "app_not_found", "message": "App not found."},
+      )
+    source_dir = str(found.source_dir)
+    if _validate_source_dir(source_dir, get_settings().data_dir) != source_dir:
+      raise HTTPException(
+        status_code=409,
+        detail={
+          "code": "source_identity_changed",
+          "message": "The app source directory changed while saving. Try again.",
+        },
+      )
+    async with _locked_app_source(db, app_id, source_dir) as app:
+      source = Path(source_dir)
+      if not await settled.run_settled(app_git.is_repo, source):
+        raise HTTPException(
+          status_code=409,
+          detail={
+            "code": "source_unavailable",
+            "message": "This app has no versioned source to hold a listing.",
+          },
+        )
+      head_before_apply = await settled.run_settled(app_git.head_sha, source, "HEAD")
+      accepted_before_apply = app.source_commit
+      # Unapplied edits, committed or not, are unreviewed; only listing files
+      # an interrupted or failed save left behind may ride along.
+      if await settled.run_settled(
+        store_listing_source.has_unapplied_changes, source, accepted_before_apply,
+      ):
+        raise _unapplied_changes()
+      async def write_and_accept():
+        try:
+          undo = await settled.run_settled(
+            store_listing_source.write_listing, source, app, edit,
+          )
+        except store_listing_source.ListingEditError as exc:
+          raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": str(exc)},
+          ) from exc
+        try:
+          # Check the exact tree apply will accept, then accept only that
+          # tree: hidden index flags or an edit landing after this check
+          # cannot slip unreviewed source in.
+          candidate = await settled.run_settled(app_git.snapshot_worktree, source)
+          if await settled.run_settled(
+            store_listing_source.changes_beyond_listing,
+            source, accepted_before_apply, candidate.tree_oid,
+          ):
+            raise _unapplied_changes()
+          return await _apply_source_or_http(
+            db, source_dir=source_dir, app=app, chat_id=None,
+            expected_tree=candidate,
+          )
+        except BaseException:
+          # Apply may have committed Git before a later build/publish step
+          # failed. That commit is its intentional retry point; restoring only
+          # worktree bytes would instead strand a dirty tree behind HEAD.
+          accepted_now = db.query(models.App.source_commit).filter_by(id=app_id).scalar()
+          if (
+            accepted_now == accepted_before_apply
+            and await settled.run_settled(app_git.head_sha, source, "HEAD") == head_before_apply
+          ):
+            await settled.run_settled(undo)
+          raise
+
+      what = f"Saving the Store listing of app {app_id}"
+
+      def saved_after_cancel(task: asyncio.Future) -> None:
+        # The revision is accepted even though nobody awaits the response, so
+        # the shell still hears about it.
+        if task.exception() is None:
+          _publish_apply_events(task.result(), None)
+        else:
+          settled.log_abandoned_failure(task, what)
+
+      # A cancelled request keeps the source lock until the write and accept
+      # settle; otherwise an undo could race the accept's Git ref move.
+      result = await settled.settle(
+        write_and_accept(), what=what, abandoned=saved_after_cancel,
+      )
+  _publish_apply_events(result, None)
+  warnings = list(result.warnings)
+  if app_apply.STORE_LOCAL_PACKAGE_DIVERGED in warnings:
+    # Addressed to agents applying by hand; say what it means for a listing.
+    warnings.remove(app_apply.STORE_LOCAL_PACKAGE_DIVERGED)
+    warnings.append(_STORE_APP_LISTING_SAVED)
+  return schemas.AppApplyOut(mode=result.mode, app=result.app, warnings=warnings)
+
+
+_STORE_APP_LISTING_SAVED = (
+  "This app was installed from the Store. The listing is saved in its source "
+  "and will be published from there, but the installed app keeps its current "
+  "icon and details until it is updated."
+)
 
 
 def _pending_store_update_app(

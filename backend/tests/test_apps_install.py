@@ -9939,7 +9939,7 @@ def test_store_install_then_manifest_edit_apply_warns(
 
   assert applied.status_code == 200, applied.text
   assert applied.json()["warnings"] == [
-    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+    app_apply.STORE_LOCAL_PACKAGE_DIVERGED
   ]
 
 
