@@ -613,7 +613,7 @@ def test_an_original_banner_outside_the_art_folder_keeps_the_listing_unready(
   assert _preview(client, auth, app_id)["ready"] is True
 
 
-def test_a_copied_icon_says_its_original_must_go_too(client, auth, db):
+def test_an_icon_photo_is_cleaned_in_place_keeping_its_size(client, auth, db):
   source = _source()
   app_id = _create(client, auth, source)
   manifest = json.loads(_MANIFEST)
@@ -625,16 +625,83 @@ def test_a_copied_icon_says_its_original_must_go_too(client, auth, db):
 
   icon = _item(_preview(client, auth, app_id), "icon")
 
-  assert icon["code"] == "listing_image_metadata" and "automatic" not in icon
-  assert "icon.jpg" in icon["message"]
+  assert icon["code"] == "listing_image_metadata" and icon["automatic"] is True
   assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
-  assert json.loads((source / "mobius.json").read_text())["icon"] == "icon.png"
-  preview = _preview(client, auth, app_id)
-  assert preview["ready"] is False
-  assert "icon.jpg" in _item(preview, "details")["message"]
-  (source / "icon.jpg").unlink()
-  _commit_accepted(db, source, app_id, "agent removes the original icon")
+  assert json.loads((source / "mobius.json").read_text())["icon"] == "icon.jpg"
+  cleaned = Image.open(source / "icon.jpg")
+  assert cleaned.format == "JPEG" and cleaned.size == (64, 64) and not cleaned.getexif()
   assert _preview(client, auth, app_id)["ready"] is True
+
+
+def test_cleaning_icon_metadata_keeps_a_wide_icon_uncropped(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  exif = Image.Exif()
+  exif[0x8825] = {1: "N", 2: (51.0, 30.0, 0.0)}
+  wide = io.BytesIO()
+  Image.new("RGB", (1600, 400), (30, 60, 90)).save(wide, format="PNG", exif=exif)
+  (source / "icon.png").write_bytes(wide.getvalue())
+  _commit_accepted(db, source, app_id, "wide icon with GPS")
+
+  assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
+
+  cleaned = Image.open(source / "icon.png")
+  assert cleaned.size == (1600, 400) and not cleaned.getexif()
+
+
+def test_an_icon_sharing_editor_art_says_its_original_must_go_too(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  (source / "static" / "store").mkdir(parents=True)
+  (source / "static" / "store" / "logo.jpg").write_bytes(_gps_jpeg((9, 9, 9), (64, 64)))
+  manifest = json.loads(_MANIFEST)
+  manifest["icon"] = "static/store/logo.jpg"
+  (source / "mobius.json").write_text(json.dumps(manifest, indent=2))
+  _commit_accepted(db, source, app_id, "icon kept with the art")
+
+  icon = _item(_preview(client, auth, app_id), "icon")
+
+  assert icon["code"] == "listing_image_metadata" and "automatic" not in icon
+  assert "static/store/logo.jpg" in icon["message"] and "copy" in icon["message"]
+
+
+def test_a_skip_worktree_edit_cannot_ride_along(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  app_git._run(source, "update-index", "--skip-worktree", "index.jsx")
+  (source / "index.jsx").write_text("export default function App() { return 'hidden' }\n")
+  assert app_git._run(source, "status", "--porcelain").stdout == ""
+
+  refused = _save(client, auth, app_id, **_complete_listing())
+
+  assert refused.status_code == 409
+  assert refused.json()["detail"]["code"] == "source_has_draft"
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert row.source_commit == app_git.head_sha(source, "HEAD")
+  assert "hidden" not in app_git._run(source, "show", "HEAD:index.jsx").stdout
+
+
+def test_an_edit_after_the_check_is_refused_by_apply(client, auth, db, monkeypatch):
+  source = _source()
+  app_id = _create(client, auth, source)
+  accepted = db.query(models.App).filter_by(id=app_id).one().source_commit
+  real_apply = app_routes._apply_source_or_http
+
+  async def edit_then_apply(*args, **kwargs):
+    # A concurrent edit lands after the candidate tree was checked.
+    (source / "index.jsx").write_text("export default function App() { return 'late' }\n")
+    return await real_apply(*args, **kwargs)
+
+  monkeypatch.setattr(app_routes, "_apply_source_or_http", edit_then_apply)
+
+  refused = _save(client, auth, app_id, **_complete_listing())
+
+  assert refused.status_code == 409
+  assert refused.json()["detail"]["code"] == "source_changed"
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert row.source_commit == accepted
+  assert "late" not in app_git._run(source, "show", f"{accepted}:index.jsx").stdout
+  assert "store" not in json.loads((source / "mobius.json").read_text())
 
 
 def test_the_icon_is_not_fixed_by_a_save_that_invalid_json_refuses(client, auth, db):
@@ -1262,7 +1329,7 @@ def test_only_editor_art_and_the_declared_icon_ride_along_unreviewed(tmp_path):
   unreviewed edit."""
   root = tmp_path / "app"
   root.mkdir()
-  subprocess.run(["git", "init", "-q", str(root)], check=True)
+  app_git.ensure_repo(root)  # As real app sources are: managed ignore rules on main.
   (root / "mobius.json").write_text(json.dumps({"id": "demo", "icon": "assets/logo.svg"}))
   subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
   subprocess.run(
@@ -1319,7 +1386,7 @@ def test_a_declared_icon_rides_along_only_as_a_clean_image(tmp_path):
   them."""
   root = tmp_path / "app"
   root.mkdir()
-  subprocess.run(["git", "init", "-q", str(root)], check=True)
+  app_git.ensure_repo(root)  # As real app sources are: managed ignore rules on main.
   (root / "mobius.json").write_text(json.dumps({"id": "demo", "icon": "assets/logo.svg"}))
   subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
   subprocess.run(

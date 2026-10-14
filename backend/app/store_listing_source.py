@@ -18,12 +18,14 @@ import re
 from typing import Callable
 
 from app import app_git, icon_assets, models, workspace_files
+from app.storage_io import atomic_write
 from app.community_publish import (
   DESCRIPTION_MAX_BYTES,
   MAX_STORE_SCREENSHOTS,
   SCREENSHOT_ALT_MAX_BYTES,
   SCREENSHOT_LABEL_MAX_BYTES,
   TAGLINE_MAX_BYTES,
+  EDITOR_ART,
   CommunityPublicationError,
   check_listing_image,
   listing_image_has_metadata,
@@ -34,9 +36,6 @@ from app.manifest_contract import STORE_LISTING_IMAGE_MAX_BYTES
 
 
 STORE_ART_DIR = "static/store"
-# Art the editor writes is named by its content; only those files are the
-# listing's own to delete. Other static/store/ files may also be app media.
-_EDITOR_ART = re.compile(r"static/store/[0-9a-f]{16}\.(?:png|jpg|webp)")
 _DETAILS_NEED_AGENT = (
   "This older app needs an agent to create its app details without "
   "changing its permissions, capabilities, or scheduled jobs."
@@ -90,8 +89,17 @@ def record_icon_for_save(root: Path, app: models.App) -> bytes | None:
 
 
 def _icon_cleaned_in_place(declared: str) -> bool:
-  """Whether a save rewrites the declared icon file itself, not a copy."""
-  return declared.lower().endswith(".png") and not declared.startswith(f"{STORE_ART_DIR}/")
+  """Whether removing an icon's metadata rewrites the declared file itself.
+
+  An icon sharing content-named editor art gets a clean copy beside it, so
+  the original stays published until an agent removes it.
+  """
+  return not declared.startswith(f"{STORE_ART_DIR}/")
+
+
+def _icon_normalized_in_place(declared: str) -> bool:
+  """Whether a new icon (always a PNG) can replace the declared file."""
+  return declared.lower().endswith(".png") and _icon_cleaned_in_place(declared)
 
 
 def note_what_saving_fixes(checklist: list[dict], root: Path, app: models.App) -> None:
@@ -115,9 +123,9 @@ def note_what_saving_fixes(checklist: list[dict], root: Path, app: models.App) -
   if icon.get("code") == "listing_image_metadata":
     declared = str(manifest.get("icon") or "").strip()
     if not _icon_cleaned_in_place(declared):
-      # The save writes a clean icon.png, but the original stays published.
+      # The save writes a clean copy, but the original stays published.
       icon["message"] = (
-        f"Saving the listing writes a clean icon.png, but {declared} is "
+        f"Saving the listing writes a clean copy of the icon, but {declared} is "
         "published with the source too; ask an agent to remove it or save "
         "it without the metadata."
       )
@@ -148,14 +156,7 @@ def _named_by_its_content(rel: str, content: bytes) -> bool:
   return PurePosixPath(rel).stem == hashlib.sha256(content).hexdigest()[:16]
 
 
-def _clean_editor_art(root: Path, rel: str) -> bool:
-  """Whether editor-named art is absent, or a clean image its name hashes."""
-  target = root / rel
-  if not target.is_file():
-    return True
-  content = target.read_bytes()
-  if not _named_by_its_content(rel, content):
-    return False
+def _clean_listing_image(content: bytes) -> bool:
   try:
     check_listing_image(content, "listing image")
   except CommunityPublicationError:
@@ -163,53 +164,37 @@ def _clean_editor_art(root: Path, rel: str) -> bool:
   return not listing_image_has_metadata(content)
 
 
-def _clean_icon(root: Path, rel: str) -> bool:
-  """Whether a declared PNG icon path is absent, or a clean listing image."""
-  target = root / rel
-  if not target.is_file():
-    return True
-  content = target.read_bytes()
-  try:
-    check_listing_image(content, "icon")
-  except CommunityPublicationError:
-    return False
-  return not listing_image_has_metadata(content)
+def changes_beyond_listing(root: Path, accepted: str, tree: str) -> bool:
+  """Whether ``tree`` differs from the accepted revision beyond a listing.
 
-
-def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
-  """Whether the source differs from its accepted revision beyond a listing.
-
-  Source with no accepted revision counts as unapplied as a whole. A save
-  interrupted after writing, or one that failed after Git advanced,
-  leaves listing files changed but not yet accepted; the next save may carry
-  them, committed or not. Anything else (code, or manifest fields other than
-  the icon and ``store``) was never reviewed and must not be accepted by it.
+  ``tree`` is the exact candidate apply will accept, read through Git, so
+  nothing the worktree hides from a plain diff (skip-worktree or
+  assume-unchanged entries) slips past. A save interrupted after writing,
+  or one that failed after Git advanced, leaves listing files the next save
+  may carry: the editor's hash-named art and the declared icon, each a clean
+  listing image, and mobius.json's icon and store fields. Anything else
+  (code, or other manifest fields) was never reviewed.
   """
-  if not accepted:
-    # With no accepted revision there is nothing to tell reviewed source from
-    # unreviewed commits; an apply records one first.
-    return True
-  changed = app_git.worktree_diff_paths(root, accepted)
+  changed = app_git.endpoint_diff_paths(root, accepted, tree, read_only=True)
   if changed is None:
     return True
   if not changed:
     return False
-  manifest_path = root / "mobius.json"
   manifests = [
-    _manifest_from(app_git.ref_file(root, accepted, "mobius.json")),
-    _manifest_from(manifest_path.read_bytes() if manifest_path.is_file() else None),
+    _manifest_from(app_git.ref_file(root, ref, "mobius.json")) for ref in (accepted, tree)
   ]
-  # A listing save writes only its own hash-named art and a declared PNG icon,
-  # so nothing else under the art folder (a script, a hand-placed file) can
-  # ride along unreviewed.
   icons = {
-    str(manifest.get("icon") or "") for manifest in manifests
-    if manifest is not None
-    and str(manifest.get("icon") or "").lower().endswith(".png")
-  }
+    str(manifest.get("icon") or "") for manifest in manifests if manifest is not None
+  } - {""}
   for path in changed:
-    if (path in icons and _clean_icon(root, path)) or (
-      _EDITOR_ART.fullmatch(path) and _clean_editor_art(root, path)
+    content = app_git.ref_file(root, tree, path)
+    # A deleted file carries nothing; a present one must be a clean image,
+    # which a code file can never pass as.
+    carried = content is None or _clean_listing_image(content)
+    if path in icons and carried:
+      continue
+    if EDITOR_ART.fullmatch(path) and (
+      content is None or (_named_by_its_content(path, content) and carried)
     ):
       continue
     if path == "mobius.json" and None not in manifests and (
@@ -218,6 +203,23 @@ def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
       continue
     return True
   return False
+
+
+def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
+  """Whether the source apply would accept differs beyond a listing.
+
+  It snapshots the worktree with apply's own method and checks that exact
+  tree. Source with no accepted revision counts as unapplied as a whole:
+  with nothing to tell reviewed source from unreviewed commits, an apply
+  records one first.
+  """
+  if not accepted or not app_git.is_repo(root):
+    return True
+  try:
+    tree = app_git.snapshot_worktree(root).tree_oid
+  except Exception:  # No readable candidate is no candidate to carry.
+    return True
+  return changes_beyond_listing(root, accepted, tree)
 
 
 @dataclass
@@ -236,7 +238,7 @@ class _SourceChanges:
   def write(self, rel: str, content: bytes) -> None:
     target = self._remember(rel)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(content)
+    atomic_write(target, content)
 
   def delete(self, rel: str) -> None:
     self._remember(rel).unlink(missing_ok=True)
@@ -248,7 +250,7 @@ class _SourceChanges:
         target.unlink(missing_ok=True)
       else:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
+        atomic_write(target, content)
 
 
 def _bounded(value: str, maximum: int, what: str) -> str:
@@ -508,14 +510,19 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
         else _accepted_file(root, app, edit.icon.path)
       )
     elif (declared := _icon_with_metadata(root, declared_icon)) is not None:
-      # The icon is published as it is; normalizing it drops hidden metadata.
-      icon_bytes = declared
+      # The icon is published as it is, so only its metadata goes, losslessly
+      # and in place; it keeps its size and shape. One sharing editor art is
+      # written beside it instead, since art is named by its bytes.
+      clean = strip_listing_image_metadata(declared)
+      if not _icon_cleaned_in_place(icon_rel):
+        icon_rel = "icon" + check_listing_image(clean, "app icon")
+      changes.write(icon_rel, clean)
     else:
       icon_bytes = record_icon_for_save(root, app)
     if icon_bytes is not None and declared_icon:
       # Normalized icons are PNG; never write PNG bytes under another suffix,
       # nor over content-addressed listing art the icon may share a file with.
-      if not _icon_cleaned_in_place(icon_rel):
+      if not _icon_normalized_in_place(icon_rel):
         icon_rel = "icon.png"
     if icon_bytes is not None:
       try:
@@ -565,7 +572,7 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
       # file that merely looks like one is left alone.
       target = root / stale
       if not (
-        _EDITOR_ART.fullmatch(stale) and target.is_file()
+        EDITOR_ART.fullmatch(stale) and target.is_file()
         and _named_by_its_content(stale, target.read_bytes())
       ):
         continue

@@ -2221,6 +2221,7 @@ async def _apply_source_or_http(
   app: models.App | None,
   chat_id: str | None,
   accept_local_package: bool = False,
+  expected_tree: app_git.WorktreeTree | None = None,
 ):
   """Accept one source revision, reporting failures as API errors."""
   try:
@@ -2230,6 +2231,7 @@ async def _apply_source_or_http(
       app=app,
       chat_id=chat_id,
       accept_local_package=accept_local_package,
+      expected_tree=expected_tree,
     )
   except app_apply.AppApplyError as exc:
     raise HTTPException(
@@ -2290,6 +2292,19 @@ def _listing_image(value: schemas.StoreListingImageIn | None, what: str):
       ) from exc
     return store_listing_source.ListingImage(data=data)
   return store_listing_source.ListingImage(path=value.path or "")
+
+
+def _unapplied_changes() -> HTTPException:
+  return HTTPException(
+    status_code=409,
+    detail={
+      "code": "source_has_draft",
+      "message": (
+        "This app has changes that haven't been applied yet. Finish "
+        "them first, or ask an agent to."
+      ),
+    },
+  )
 
 
 @router.put(
@@ -2361,16 +2376,7 @@ async def save_store_listing(
       if await settled.run_settled(
         store_listing_source.has_unapplied_changes, source, accepted_before_apply,
       ):
-        raise HTTPException(
-          status_code=409,
-          detail={
-            "code": "source_has_draft",
-            "message": (
-              "This app has changes that haven't been applied yet. Finish "
-              "them first, or ask an agent to."
-            ),
-          },
-        )
+        raise _unapplied_changes()
       async def write_and_accept():
         try:
           undo = await settled.run_settled(
@@ -2382,8 +2388,18 @@ async def save_store_listing(
             detail={"code": exc.code, "message": str(exc)},
           ) from exc
         try:
+          # Check the exact tree apply will accept, then accept only that
+          # tree: hidden index flags or an edit landing after this check
+          # cannot slip unreviewed source in.
+          candidate = await settled.run_settled(app_git.snapshot_worktree, source)
+          if await settled.run_settled(
+            store_listing_source.changes_beyond_listing,
+            source, accepted_before_apply, candidate.tree_oid,
+          ):
+            raise _unapplied_changes()
           return await _apply_source_or_http(
             db, source_dir=source_dir, app=app, chat_id=None,
+            expected_tree=candidate,
           )
         except BaseException:
           # Apply may have committed Git before a later build/publish step

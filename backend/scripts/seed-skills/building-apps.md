@@ -182,8 +182,9 @@ of the app's source, so it is reviewed, versioned and published with the code:
   metadata: EXIF and GPS, XMP, PNG text chunks, C2PA provenance, JPEG
   comments and thumbnails, and bytes after the image ends. The preview's
   `details` item names every such file. Clean one by re-saving its pixels,
-  e.g. `python3 -c "from PIL import Image; im = Image.open('f.jpg'); im.info.clear(); im.save('f.jpg', quality=95)"`
-  (the same works for PNG and WebP without `quality`), or remove it if
+  e.g. `python3 -c "from PIL import Image, ImageOps; im = ImageOps.exif_transpose(Image.open('f.jpg')); im.info.clear(); im.save('f.jpg', quality=95)"`
+  (turning it upright first, since the orientation tag goes with the rest;
+  the same works for PNG and WebP without `quality`), or remove it if
   nothing uses it. A bare PNG `tIME` timestamp is allowed.
 - Screenshots must be truthful and private: capture the app's real UI in an
   empty, demo, or fixture state, never the owner's own records, names,

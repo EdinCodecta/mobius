@@ -704,15 +704,34 @@ def _listing_text(store: dict, field: str, label: str, maximum: int) -> str:
   return value
 
 
-def _clean_listing_image(content: bytes, label: str) -> None:
+# Art the editor writes is named by its content; only those files are the
+# listing's own. Other static/store/ files may also be app media.
+EDITOR_ART = re.compile(r"static/store/[0-9a-f]{16}\.(?:png|jpg|webp)")
+
+
+def _clean_listing_image(content: bytes, label: str, path: str, *, icon: bool = False) -> None:
   """Apply the image rule, then refuse hidden metadata publishing would expose."""
   check_listing_image(content, label)
-  if listing_image_has_metadata(content):
-    raise CommunityPublicationError(
-      f"The {label} carries camera, location or other hidden metadata that "
-      "publishing would make public. Saving the listing again removes it.",
-      "listing_image_metadata",
+  if not listing_image_has_metadata(content):
+    return
+  editor_art = (
+    EDITOR_ART.fullmatch(path) is not None
+    and PurePosixPath(path).stem == hashlib.sha256(content).hexdigest()[:16]
+  )
+  if editor_art or (icon and not path.startswith("static/store/")):
+    # The save replaces the editor's own file, or cleans the icon in place.
+    fix = "Saving the listing again removes it."
+  else:
+    fix = (
+      f"Saving the listing writes a clean copy, but {path} stays published "
+      "with the source until an agent removes it or saves it without the "
+      "metadata."
     )
+  raise CommunityPublicationError(
+    f"The {label} carries camera, location or other hidden metadata that "
+    f"publishing would make public. {fix}",
+    "listing_image_metadata",
+  )
 
 
 def _listing_asset(value: object, label: str, by_path: dict[str, dict]) -> str:
@@ -730,7 +749,7 @@ def _listing_asset(value: object, label: str, by_path: dict[str, dict]) -> str:
       f"The {label} must be saved under static/store/. Saving the listing "
       "again copies it there.",
     )
-  _clean_listing_image(_file_bytes(by_path[source]), label)
+  _clean_listing_image(_file_bytes(by_path[source]), label, source)
   return source
 
 
@@ -891,7 +910,7 @@ def store_listing_review(
     source = str(manifest.get("icon") or "").strip()
     if not source or source not in by_path:
       raise _incomplete("Add an app icon.")
-    _clean_listing_image(_file_bytes(by_path[source]), "app icon")
+    _clean_listing_image(_file_bytes(by_path[source]), "app icon", source, icon=True)
     return source
 
   check("icon", icon)
