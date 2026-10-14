@@ -849,6 +849,21 @@ def test_proxy_get_error_policy_is_request_local_and_does_not_grant_freshness():
   }
 
 
+def test_single_hop_max_age_survives_float_rounding_of_the_monotonic_clock(
+  monkeypatch,
+):
+  from app.routes.proxy import _PrivateBrowserCacheHeaders
+
+  # (now + 60) - now is 59.99999999999999 at this clock value, which a bare
+  # int() would grant as max-age=59.
+  now = 43.27670679050534
+  assert (now + 60) - now < 60
+  monkeypatch.setattr("app.routes.proxy.monotonic", lambda: now)
+  assert _PrivateBrowserCacheHeaders()(
+    _upstream(200, {"cache-control": "max-age=60"}),
+  ) == {"cache-control": "private, max-age=60", "vary": "Authorization"}
+
+
 @pytest.mark.parametrize("vary, expected_vary", [
   ("Accept-Language, AUTHORIZATION", "Accept-Language, AUTHORIZATION, Accept-Encoding"),
   ("*", "*"),
@@ -1700,7 +1715,13 @@ def test_admitted_same_host_burst_waits_for_a_connection_instead_of_timing_out(
   exchange deadline, instead of failing early with a pool-timeout 504."""
   upstream = _HeldUpstream()
   _pin_to_local_upstream(monkeypatch, upstream.port)
-  pool = _consumer_pool(monkeypatch, consumer, io_timeout=0.3)
+  # The upstream shares this process's GIL with 16 busy handlers, and on a
+  # loaded CI runner its single accept loop can stall for a few hundred
+  # milliseconds. A request that stalls past io_timeout is abandoned with a
+  # 504 before it ever arrives, so the timeout leaves several times that much
+  # headroom while the extra request is still held longer than it.
+  io_timeout = 1.0
+  pool = _consumer_pool(monkeypatch, consumer, io_timeout=io_timeout)
   burst = _HOST_CONNECTION_LIMIT + 1
 
   async def exercise():
@@ -1709,9 +1730,11 @@ def test_admitted_same_host_burst_waits_for_a_connection_instead_of_timing_out(
         asyncio.create_task(_proxy_status(consumer, _BURST_URL))
         for _ in range(burst)
       ]
-      await _until(lambda: upstream.arrived == _HOST_CONNECTION_LIMIT)
-      # Keep the extra request queued far longer than any one network phase.
-      await asyncio.sleep(1)
+      # ">=": a late arrival from a stalled attempt must not skip past the
+      # exact count; the limit itself is asserted below.
+      await _until(lambda: upstream.arrived >= _HOST_CONNECTION_LIMIT)
+      # Keep the extra request queued longer than any one network phase.
+      await asyncio.sleep(io_timeout * 1.5)
       assert [call.result() for call in calls if call.done()] == []
       # The per-host connection limit still holds while the extra one waits.
       assert upstream.arrived == _HOST_CONNECTION_LIMIT

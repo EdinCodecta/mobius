@@ -3,17 +3,12 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 import { upsertTerminalErrorItem } from '../streamReducers.js'
 import { ownsRecoveryAction } from '../recoveryCard.js'
 import { isProviderLimitPause, pauseTiming } from '../resetTime.js'
 
-const vite = await createServer({
-  appType: 'custom',
-  logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui'] },
-})
+const vite = await createSsrRenderServer()
 const { default: ErrorCard } = await vite.ssrLoadModule(
   '/src/components/ChatView/ErrorCard.jsx',
 )

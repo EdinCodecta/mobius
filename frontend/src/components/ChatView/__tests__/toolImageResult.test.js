@@ -207,12 +207,8 @@ test('image-load failures settle without fetching unrelated app metadata', () =>
 test('an interrupted screenshot keeps its result text; only a saved capture becomes an image', async () => {
   const React = await import('react')
   const { renderToStaticMarkup } = await import('react-dom/server')
-  const { createServer } = await import('vite')
-  const vite = await createServer({
-    appType: 'custom', logLevel: 'error',
-    server: { middlewareMode: true, hmr: false, ws: false },
-    ssr: { noExternal: ['@openai/apps-sdk-ui'] },
-  })
+  const { createSsrRenderServer } = await import('../../../lib/__tests__/ssrRenderServer.mjs')
+  const vite = await createSsrRenderServer()
   try {
     const { default: ToolBlock } = await vite.ssrLoadModule('/src/components/ChatView/ToolBlock.jsx')
     const { persistDisclosureOpen } = await vite.ssrLoadModule('/src/components/ChatView/disclosureState.js')
