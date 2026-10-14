@@ -1,6 +1,7 @@
 """Explicit mini-app source application."""
 from app.chat_writer import create_chat
 
+import asyncio
 import io
 import json
 from pathlib import Path
@@ -8,7 +9,7 @@ from unittest.mock import call, patch
 
 import pytest
 
-from app import app_apply, app_git, icon_assets, models
+from app import app_apply, app_git, applied_app_runtime, icon_assets, models
 from app.config import get_settings
 from app.database import SessionLocal
 
@@ -1193,6 +1194,55 @@ def test_reapply_unchanged_source_has_no_commit_or_timestamp_change(
   assert app_git.head_sha(source, app_git.LOCAL_BRANCH) == head
 
 
+@pytest.mark.parametrize("module, step, served_while_blocked", [
+  (app_git, "materialize_tree", b"screen-v1"),
+  (applied_app_runtime, "prepare_runtime", b"screen-v2"),
+])
+def test_cancelled_apply_finishes_under_its_locks(
+  client, auth, db, monkeypatch, module, step, served_while_blocked,
+):
+  """A cancelled Apply keeps its locks until its writes end, and is not cut short.
+
+  Unsettled, the cancel released the source lock while the thread still wrote,
+  and skipped Apply's rollback, leaving new static assets on an old revision.
+  """
+  from app import fs_locks, schemas
+  from app.routes import apps as routes
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  source = _source()
+  asset = source / "listing-assets" / "screen.png"
+  asset.parent.mkdir()
+  asset.write_bytes(b"screen-v1")
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["static_assets"] = {"listing/screen.png": "listing-assets/screen.png"}
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  assert _apply(client, auth, source).status_code == 200
+  served = source / "static" / "listing" / "screen.png"
+  asset.write_bytes(b"screen-v2")
+  (source / "index.jsx").write_text(
+    "export default function App() { return <div>second</div> }\n"
+  )
+  worker = BlockedWorker(wraps=getattr(module, step))
+  monkeypatch.setattr(module, step, worker)
+
+  outcome = asyncio.run(cancel_while_worker_blocked(
+    fs_locks.source_dir_lock(str(source)),
+    lambda: routes.apply_app_source(
+      schemas.AppApply(source_dir=str(source)), db, None,
+    ),
+    worker,
+    while_blocked=lambda: served.read_bytes() == served_while_blocked,
+  ))
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  db.expire_all()
+  row = db.query(models.App).filter_by(slug="demo").one()
+  assert "second" in row.jsx_source
+  assert row.source_commit == app_git.head_sha(source, app_git.LOCAL_BRANCH)
+  assert served.read_bytes() == b"screen-v2"
+
+
 def test_local_source_revision_clears_previously_verified_distribution_manifest(
   client, auth, db,
 ):
@@ -1408,7 +1458,7 @@ def test_store_ordinary_apply_warns_when_local_package_declarations_diverge(
   diverged = _apply(client, auth, source)
   assert diverged.status_code == 200, diverged.text
   assert diverged.json()["warnings"] == [
-    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+    app_apply.STORE_LOCAL_PACKAGE_DIVERGED
   ]
   row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
   assert not (row.capability_contract.get("agent") or {}).get("tools")
@@ -1434,7 +1484,7 @@ def test_store_ordinary_apply_warns_on_any_dropped_manifest_edit(
 
   assert applied.status_code == 200, applied.text
   assert applied.json()["warnings"] == [
-    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+    app_apply.STORE_LOCAL_PACKAGE_DIVERGED
   ]
 
 

@@ -24,7 +24,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from app import app_git, fs_locks, install, models
+from app import app_git, fs_locks, git_transfers, install, models, pending_update
 from app.config import get_settings
 from tests.test_apps_install import (  # noqa: F401 - fixture
   JSX, _fake_async_client, _fixture_commit, bypass_url_validation,
@@ -218,7 +218,7 @@ def _repo(name: str) -> Path:
 
 
 def _no_leftovers() -> bool:
-  root = install.git_transfer_root()
+  root = git_transfers.git_transfer_root()
   return not root.exists() or not any(root.iterdir())
 
 
@@ -245,7 +245,7 @@ def _run_async(scenario, *responses):
 
 
 def _stage_clone(url: str, ref: str = "main"):
-  return install._stage(app_git.stage_clone, url, ref, install.git_transfer_root())
+  return install._stage(app_git.stage_clone, url, ref, git_transfers.git_transfer_root())
 
 
 async def _paused(server: _GitServer) -> None:
@@ -579,13 +579,13 @@ def test_process_killed_during_staging_leaves_a_clean_repo(
   child = subprocess.Popen([sys.executable, "-c", (
     "import sys; from pathlib import Path; from app import app_git;"
     "app_git.stage_fetch(sys.argv[1], sys.argv[2], 'main', Path(sys.argv[3]))"
-  ), str(repo), git_server.url("killed"), str(install.git_transfer_root())], cwd=backend)
+  ), str(repo), git_server.url("killed"), str(git_transfers.git_transfer_root())], cwd=backend)
   try:
     assert git_server.waiting.wait(30)
     os.kill(child.pid, signal.SIGKILL)
     child.wait(10)
     # Its Git child runs in its own session; a dying host would lose it too.
-    subprocess.run(["pkill", "-KILL", "-f", str(install.git_transfer_root())])
+    subprocess.run(["pkill", "-KILL", "-f", str(git_transfers.git_transfer_root())])
   finally:
     git_server.release()
   assert not _no_leftovers(), "a killed process leaves its staging behind"
@@ -725,7 +725,7 @@ def test_cancelled_import_keeps_the_source_lock_until_it_finishes(
     while fs_locks.source_dir_lock(str(repo)).locked() and time.monotonic() < deadline:
       await asyncio.sleep(0.05)
     assert not fs_locks.source_dir_lock(str(repo)).locked()
-    while install._FETCHES and time.monotonic() < deadline:
+    while git_transfers._FETCHES and time.monotonic() < deadline:
       await asyncio.sleep(0.05)
 
   asyncio.run(scenario())
@@ -832,7 +832,7 @@ def test_concurrent_fetches_share_one_transfer(
 
   assert asyncio.run(scenario()) == [head, head]
   assert len(transfers) == count + 1
-  assert not install._FETCHES
+  assert not git_transfers._FETCHES
   assert _no_leftovers()
 
 
@@ -886,7 +886,7 @@ def test_transfers_run_on_their_own_bounded_pool(
   monkeypatch.setattr(app_git, "_transfer", recorded)
   asyncio.run(install.fetch_app_commit(_repo("pooled"), "main"))
   assert threads and all(name.startswith("git-transfer") for name in threads)
-  assert install._TRANSFER_EXECUTOR._max_workers == install._GIT_TRANSFER_WORKERS
+  assert git_transfers._TRANSFER_EXECUTOR._max_workers == git_transfers._GIT_TRANSFER_WORKERS
 
 
 def test_history_falls_back_to_the_origin_branch(
@@ -1012,6 +1012,8 @@ def test_permanent_fetch_failures_are_not_retryable(
   assert failed.status_code == 409, failed.text
   assert failed.json()["detail"]["code"] == "git_install_unavailable"
   assert failed.json()["detail"]["retryable"] is False
+  # A permanent failure never tells the owner to retry.
+  assert "retry" not in failed.json()["detail"]["message"].lower()
   assert _no_leftovers()
 
 
@@ -1115,3 +1117,107 @@ def test_present_commit_check_accepts_the_same_package_and_names_a_mismatch(
     assert refused.value.detail["code"] == "git_source_mismatch"
     assert refused.value.detail["reason"].startswith(reason)
     assert reason in caplog.text
+
+def test_update_batch_entries_run_the_real_reviewed_install(
+  client, auth, git_server, transfers, bypass_url_validation, tmp_path,
+):
+  """Two reviewed entries through install_from_manifest, transfers unlocked."""
+  from uuid import uuid4
+
+  from app import app_update_batches
+
+  updates, responses = [], {}
+  for name in ("batch-one", "batch-two"):
+    app_id, manifest = _install_served(client, auth, git_server, name)
+    v2 = {**manifest, "version": "2.0.0"}
+    head = git_server.commit(name, v2, JSX.replace("ok", "v2"), push=True)
+    responses.update(_responses(name, v2, JSX.replace("ok", "v2")))
+    with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+      access = client.post("/api/apps/preview", headers=auth, json={
+        "manifest_url": _base(name) + "mobius.json",
+      })
+    assert access.status_code == 200, access.text
+    preview = client.get(f"/api/apps/{app_id}/update-candidate-preview", headers=auth)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["upstream_commit"] == head
+    updates.append({
+      "app_id": app_id, "manifest_url": _base(name) + "mobius.json",
+      "upstream_commit": head, "source_digest": preview.json()["source_digest"],
+      "capability_digest": access.json()["capability_digest"],
+    })
+
+  async def scenario(_http):
+    owner = app_update_batches.AppUpdateBatches(str(tmp_path))
+    await owner.start()
+    from app.database import SessionLocal
+    with SessionLocal() as db:
+      accepted = owner.submit(app_update_batches.ReviewedUpdateBatch(
+        id=uuid4(), updates=updates,
+      ), db)
+    while owner.tasks:
+      await asyncio.gather(*list(owner.tasks.values()), return_exceptions=True)
+    return owner.snapshot(accepted["id"])
+
+  final = _run_async(scenario, responses)
+  assert final["phase"] == "complete"
+  assert [(e["status"], e["version"]) for e in final["entries"]] == [
+    ("updated", "2.0.0"), ("updated", "2.0.0"),
+  ], final
+  for update, name in zip(updates, ("batch-one", "batch-two")):
+    assert app_git.head_sha(_repo(name), app_git.UPSTREAM_BRANCH) == update["upstream_commit"]
+  assert all(call == (False, []) for call in transfers), transfers
+  assert _no_leftovers()
+
+
+def test_update_batch_entry_that_really_conflicts_names_the_reviewed_commit(
+  client, auth, git_server, transfers, bypass_url_validation, tmp_path,
+):
+  """A real conflict leaves a receipt for exactly the reviewed commit."""
+  from uuid import uuid4
+
+  from app import app_update_batches
+
+  name = "batch-conflict"
+  app_id, manifest = _install_served(client, auth, git_server, name)
+  repo = _repo(name)
+  # The owner's local edit and the release change the same line.
+  (repo / "index.jsx").write_text(JSX.replace("ok", "local edit"))
+  v2 = {**manifest, "version": "2.0.0"}
+  head = git_server.commit(name, v2, JSX.replace("ok", "v2"), push=True)
+  responses = _responses(name, v2, JSX.replace("ok", "v2"))
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    access = client.post("/api/apps/preview", headers=auth, json={
+      "manifest_url": _base(name) + "mobius.json",
+    })
+  assert access.status_code == 200, access.text
+  preview = client.get(f"/api/apps/{app_id}/update-candidate-preview", headers=auth)
+  assert preview.status_code == 200, preview.text
+  update = {
+    "app_id": app_id, "manifest_url": _base(name) + "mobius.json",
+    "upstream_commit": head, "source_digest": preview.json()["source_digest"],
+    "capability_digest": access.json()["capability_digest"],
+  }
+
+  async def scenario(_http):
+    owner = app_update_batches.AppUpdateBatches(str(tmp_path))
+    await owner.start()
+    from app.database import SessionLocal
+    with SessionLocal() as db:
+      accepted = owner.submit(app_update_batches.ReviewedUpdateBatch(
+        id=uuid4(), updates=[update],
+      ), db)
+    while owner.tasks:
+      await asyncio.gather(*list(owner.tasks.values()), return_exceptions=True)
+    await owner.refresh_results(accepted["id"])
+    return owner.snapshot(accepted["id"])
+
+  final = _run_async(scenario, responses)
+  entry = final["entries"][0]
+  assert (entry["status"], entry["version"]) == ("conflict", "1.0.0"), final
+  assert pending_update.read_pending_conflict_update_receipt(
+    repo, app_id=app_id, upstream_commit=head,
+  ) is not None
+  # The one landing rule agrees with the installer's result.
+  assert app_update_batches._settled_outcomes({app_id: head})[app_id]["status"] == "conflict"
+  assert (repo / "index.jsx").read_text() == JSX.replace("ok", "local edit")
+  assert all(call == (False, []) for call in transfers), transfers

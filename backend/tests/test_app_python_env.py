@@ -1035,8 +1035,10 @@ def test_cancelled_install_discards_its_unchecked_python_runtime(
   monkeypatch.setattr(app_git, "snapshot_worktree", blocked_snapshot)
 
   async def run():
+    prepared = await install.prepare_package(base + "mobius.json")
     task = asyncio.create_task(install.install_from_manifest(
       db, manifest_url=base + "mobius.json", manifest=None, raw_base=None,
+      prepared=prepared,
     ))
     try:
       assert await asyncio.to_thread(entered.wait, 5)
@@ -1092,8 +1094,10 @@ def test_cancelled_install_settles_its_python_check_before_discarding(
   monkeypatch.setattr(app_python_env, "_build", blocked_build)
 
   async def run():
+    prepared = await install.prepare_package(base + "mobius.json")
     task = asyncio.create_task(install.install_from_manifest(
       db, manifest_url=base + "mobius.json", manifest=None, raw_base=None,
+      prepared=prepared,
     ))
     try:
       assert await asyncio.to_thread(entered.wait, 5)
