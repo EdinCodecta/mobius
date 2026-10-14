@@ -32,9 +32,8 @@ from sqlalchemy.orm import Session
 from app import app_git, fs_locks, models
 from app.broadcast import get_system_broadcast
 from app.manifest_identity import canonical_manifest_identity_key
-from app.install import (
-  discard_staged, install_from_manifest, prepare_package, transient_failure,
-)
+from app.git_transfers import discard_staged
+from app.install import install_from_manifest, prepare_package, transient_failure
 from app.timeutil import now_naive_utc
 
 log = logging.getLogger("mobius.bootstrap")
@@ -247,9 +246,13 @@ async def ensure_bootstrap_apps_installed(
         fs_locks.install_uninstall_lock() if retry is not None
         else contextlib.nullcontext()
       ):
-        # Use the installer's identity resolver here too: bootstrap and an
+        # Use the installer's address lookup here too: bootstrap and an
         # explicit Store action must agree across ref moves and legacy rows whose
-        # matching catalog origin predates persisted manifest identity.
+        # matching catalog origin predates persisted manifest identity. This is
+        # only the address half of `install.resolve_package_row`: it runs before
+        # any package is fetched, so there is no `package_id` to check, and it
+        # must see a deleted predecessor to keep an owner's uninstall. The
+        # install below applies the whole rule to the fetched package.
         existing = _find_install_identity_row(
           db,
           source_url=bootstrap_app.manifest_url,
