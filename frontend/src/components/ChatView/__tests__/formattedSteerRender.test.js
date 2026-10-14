@@ -2,20 +2,20 @@
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 import { renderWithModels } from './modelRegistryRender.js'
 
 const location = { origin: 'http://localhost', href: 'http://localhost/shell/' }
 globalThis.window = { location, innerWidth: 900 }
 globalThis.location = location
-const vite = await createServer({ appType: 'custom', logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui', 'dompurify'] },
+const vite = await createSsrRenderServer({
+  noExternal: ['dompurify'],
   // SSR has no DOM; image fixtures use safe source URLs, not sanitizer behavior.
   plugins: [{ name: 'dompurify-ssr-stub', enforce: 'pre',
     resolveId: id => id === 'dompurify' ? '\0dompurify-stub' : null,
     load: id => id === '\0dompurify-stub'
-      ? 'export default { sanitize: value => String(value) }' : null }] })
+      ? 'export default { sanitize: value => String(value) }' : null }],
+})
 after(() => vite.close())
 const { default: Message } = await vite.ssrLoadModule('/src/components/ChatView/MsgContent.jsx')
 const { default: Reply } = await vite.ssrLoadModule('/src/components/ChatView/AssistantReply.jsx')
