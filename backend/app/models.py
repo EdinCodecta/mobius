@@ -1800,6 +1800,108 @@ class PushSubscription(Base):
   created_at = Column(DateTime, default=lambda: datetime.now(UTC))
 
 
+class PushDevice(Base):
+  """A phone running the Möbius mobile app that receives native push.
+
+  The app's web page registers its FCM token (and, on iOS, optionally the raw
+  APNs token) through ``PUT /api/push/devices``. Möbius never holds FCM or
+  APNs credentials: delivery goes through the mobius.you push relay via the
+  identity broker, which authenticates this installation per request.
+
+  ``relay_state`` tracks whether the relay knows this token belongs to this
+  installation. A token is sent only once ``bound``; ``unbind_pending`` rows
+  are signed-out devices kept just long enough to tell the relay, then
+  deleted. ``disabled_at`` marks a token the relay reported invalid (app
+  uninstalled, token expired); such rows are never sent to and are purged
+  later.
+
+  This is a new table, so ``create_all`` adds it to existing installations.
+  """
+
+  __tablename__ = "push_devices"
+  __table_args__ = (
+    Index("ix_push_devices_owner", "owner_id", "disabled_at"),
+    Index("ix_push_devices_relay_due", "relay_state", "relay_next_attempt_at"),
+  )
+
+  id = Column(String(64), primary_key=True)
+  owner_id = Column(
+    Integer, ForeignKey("owner.id", ondelete="CASCADE"), nullable=False,
+  )
+  # The token's issuer: "fcm" today on both platforms.
+  provider = Column(String(16), nullable=False, default="fcm")
+  token = Column(Text, nullable=False, unique=True)
+  platform = Column(String(16), nullable=False)
+  # Raw APNs device token (hex) and its environment, iOS only and optional.
+  apns_token = Column(Text, nullable=True)
+  apns_environment = Column(String(16), nullable=True)
+  created_at = Column(DateTime, nullable=False, default=now_naive_utc)
+  # Last time the device's page registered this token.
+  last_seen_at = Column(DateTime, nullable=False, default=now_naive_utc)
+  last_sent_at = Column(DateTime, nullable=True)
+  last_success_at = Column(DateTime, nullable=True)
+  disabled_at = Column(DateTime, nullable=True)
+  disabled_reason = Column(String(32), nullable=True)
+  # "bind_pending" | "bound" | "unbind_pending".
+  relay_state = Column(
+    String(16), nullable=False, default="bind_pending",
+    server_default="bind_pending",
+  )
+  relay_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+  relay_next_attempt_at = Column(DateTime, nullable=True)
+
+
+class PushDelivery(Base):
+  """Outbox row: one notification owed to one native push device.
+
+  ``(notification_id, device_id)`` is the idempotency key: a notification is
+  queued for a device at most once, and every retry of that row reuses the
+  same relay target id so the relay can drop a duplicate send. The row holds
+  no notification content; the worker reads title and body from the
+  ``notifications`` row, and a row whose notification was cleared is dropped.
+
+  Terminal statuses are ``ok``, ``invalid``, ``failed`` and ``expired``;
+  ``pending`` and ``retry`` rows are due at ``next_attempt_at``; ``sending``
+  rows are leased until ``lease_until`` so a crash mid-send is picked up again.
+
+  This is a new table, so ``create_all`` adds it to existing installations.
+  """
+
+  __tablename__ = "push_deliveries"
+  __table_args__ = (
+    UniqueConstraint(
+      "notification_id", "device_id", name="uq_push_delivery_notification_device",
+    ),
+    Index("ix_push_deliveries_due", "status", "next_attempt_at"),
+    Index("ix_push_deliveries_created", "created_at"),
+  )
+
+  id = Column(Integer, primary_key=True, autoincrement=True)
+  notification_id = Column(
+    String(64), ForeignKey("notifications.id", ondelete="CASCADE"),
+    nullable=False,
+  )
+  device_id = Column(
+    String(64), ForeignKey("push_devices.id", ondelete="CASCADE"),
+    nullable=False,
+  )
+  # "fcm" or "apns", chosen when queued; an APNs rejection falls back to FCM.
+  transport = Column(String(8), nullable=False)
+  status = Column(String(16), nullable=False, default="pending")
+  attempts = Column(Integer, nullable=False, default=0)
+  next_attempt_at = Column(DateTime, nullable=False, default=now_naive_utc)
+  lease_until = Column(DateTime, nullable=True)
+  # A notification older than its time-to-live is no longer worth showing.
+  expires_at = Column(DateTime, nullable=False)
+  collapse_key = Column(String(64), nullable=False)
+  # Short machine code only, never a token or notification content.
+  last_error = Column(String(64), nullable=True)
+  created_at = Column(DateTime, nullable=False, default=now_naive_utc)
+  updated_at = Column(
+    DateTime, nullable=False, default=now_naive_utc, onupdate=now_naive_utc,
+  )
+
+
 class Notification(Base):
   """Record of a sent push notification."""
 

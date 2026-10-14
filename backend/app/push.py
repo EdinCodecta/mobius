@@ -24,6 +24,9 @@ _vapid: Vapid | None = None
 _QUIET_PUSH_SOURCE_TYPES = frozenset({
   "platform_conflict",
   "platform_update",
+  # Native push relay problems: telling the owner by push about push failing
+  # would loop, so the notice stays in the bell.
+  "push_relay",
   "shell",
   "shell_rebuild",
   "shell_rebuilding",
@@ -291,6 +294,22 @@ def _prepare_owner_notification(
     "actions": actions,
     "tag": f"{source_type}:{source_id or ''}:{tag}" if tag else None,
   }
+
+  # Native push to the mobile app passes the same gates as Web Push, is only
+  # queued here, and is sent by push_native's worker. Queueing is a separate
+  # transaction after the history row, so its failure must not cost the
+  # owner's Web Push.
+  from app import push_native
+  try:
+    push_native.queue_notification(
+      db, owner_id, notification_id,
+      collapse_key=push_native.collapse_key_for(payload["tag"], notification_id),
+    )
+  except Exception:
+    db.rollback()
+    logger.exception(
+      "native push queueing failed for notification %s", notification_id[:8],
+    )
 
   subscriptions = [
     {
