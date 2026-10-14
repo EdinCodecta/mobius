@@ -71,6 +71,7 @@ test('actual frame init and subsequent block init carry the checkpoint envelope'
     readAppFrameStorage() { return {} }, appId: 'app', appSlug: 'app', capabilityContract: null,
     blockSessionRef: { current: blockSession }, swap: { liveVersion: 'v1', liveLoaded: true },
     blockSession, postToFrame(_version, message) { messages.push(message) }, useEffect(fn) { fn() },
+    frameNavRef: { current: new Map() }, readAppNavLocation() { return null },
   }
   const init = canvas.slice(canvas.indexOf('  function sendInit(v) {'), canvas.indexOf('  // Keep the swap state machine'))
   new Function('scope', `with(scope) { ${init}; sendInit('v1') }`)(scope)
@@ -98,6 +99,7 @@ function reloadCanvasLifecycle() {
     ]) },
     liveVersionRef: { current: 'live' }, blockDocumentsRef: { current: new Map() },
     reportedBlockDocumentRef: { current: null }, blockSessionRef: { current: session },
+    frameNavRef: { current: new Map() }, readAppNavLocation() { return null }, onNavReset() {},
     accountLinkRef: { current: null }, capabilityHostRef: { current: { detachSource() {} } },
     storageHostRef: { current: { detachSource() {} } }, frameVisibleRef: { current: false },
     interactiveRef: { current: false }, token: 'fixture', appId: 'app', appSlug: 'app', theme: null,
@@ -187,6 +189,8 @@ function passiveLoad({ admitted, supported = false, importError = null }) {
     observed, _FRAME_PASSIVE_BLOCK_DIGEST: admitted ? 'a'.repeat(64) : null,
     currentBlockSession: { sessionId: 'passive' }, currentToken: 'test-token',
     _FRAME_APP_ID: '42', currentCapabilityContract: null, supportsAppBlocks: false,
+    currentNavLocation: null, waitForNavigationReady: false, frameVisible: true,
+    handleUncaughtAppError() {},
     globalThis: { __mobiusCompiledRuntime: {
       abi: 1, createRoot() { observed.roots++ }, createElement() {}, Fragment: {} } },
     COMPILED_RUNTIME_ABI: 1, document: { getElementById() { return {} } },
@@ -257,7 +261,7 @@ function blockCanvasLifecycle() {
     liveVersionRef: { current: 'old' }, blockDocumentsRef: { current: new Map([
       ['old', { supported: null }], ['new', { supported: null }],
     ]) },
-    reportedBlockDocumentRef: { current: null },
+    reportedBlockDocumentRef: { current: null }, frameNavRef: { current: new Map() },
     onBlockCapabilityRef: { current: (supported, metadata) => reports.push({ supported, ...metadata }) },
     blockSessionRef: { current: { sessionId: 'block', retain: false } },
     blockSession: { sessionId: 'block', retain: false },
