@@ -16,6 +16,10 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts/install-rebuild-helper.sh"
 SOURCE = INSTALLER.read_text()
+# The checkout's worker revision: what this installer migrates hosts to.
+NEW = int(re.search(r"^WORKER_REVISION = ([0-9]+)$",
+                    (ROOT / "scripts/mobius-rebuild-host.py").read_text(), re.M).group(1))
+PROTOCOL = int((ROOT / "deployment/self-hosted-helper.required").read_text())
 
 
 def _heredoc(tag: str) -> str:
@@ -274,14 +278,14 @@ def test_base_snapshot_cannot_capture_attempt_wrapper(tmp_path, app, accepted):
     assert "image.override.yml" not in snapshot
 
 
-def test_gate_is_reviewed_input_and_revision_is_five():
+def test_gate_is_reviewed_input_and_revision_is_six():
     for section in (SOURCE.split("ls-files --error-unmatch", 1)[1].split("# The running", 1)[0],
                     SOURCE.split("diff --quiet HEAD --", 1)[1].split("ARGS=()", 1)[0]):
         assert "scripts/mobius-boot-admission.py" in section
         assert "scripts/mobius-manual-cutover.py" in section
     assert SOURCE.count("scripts/mobius-rebuild-launcher.py scripts/mobius-boot-admission.py") == 3
-    assert "# Helper protocol revision: 5 " in SOURCE
-    assert (ROOT / "deployment/self-hosted-helper.required").read_text().strip() == "5"
+    assert "# Helper protocol revision: 6 " in SOURCE
+    assert (ROOT / "deployment/self-hosted-helper.required").read_text().strip() == "6"
 
 
 def test_installer_does_not_boot_or_clear_application_state():
@@ -359,7 +363,7 @@ def _wrapped_identity(tmp_path, *, deployment="original-app-1", source="generate
               "Cmd": app["command"], "Labels": {**labels,
               "com.docker.compose.project": attempt_project, "com.docker.compose.service": "app",
               "com.docker.compose.container-number": "1", "com.docker.compose.oneoff": "False",
-              "com.docker.compose.project.working_dir": str(frozen),
+              "com.docker.compose.project.working_dir": str(attempts),
               "com.docker.compose.project.config_files": str(attempt)},
               "Mounts": [
                   {"Destination": "/run/mobius-boot-admission.py", "Source": "/usr/local/libexec/mobius-boot-admission.py", "Type": "bind", "RW": False},
@@ -379,7 +383,8 @@ def _wrapped_identity(tmp_path, *, deployment="original-app-1", source="generate
                                      "duplicate_mount", "config_files", "immutable_changed", "immutable_symlink",
                                      "immutable_writable", "immutable_directory_symlink", "config_v3",
                                      "name_source", "live_renamed", "token_derived_name",
-                                     "attempt_shares_original_project", "frozen_name_changed"])
+                                     "attempt_shares_original_project", "frozen_name_changed",
+                                     "stable_spelling", "frozen_data_dir", "working_dir"])
 def test_wrapped_reinstall_requires_frozen_identity_and_immutable_attempt(tmp_path, mutation):
     frozen, attempt, actual, code, cid = _wrapped_identity(tmp_path)
     configuration = json.loads((frozen / "config.v4.json").read_text())
@@ -427,6 +432,9 @@ def test_wrapped_reinstall_requires_frozen_identity_and_immutable_attempt(tmp_pa
         actual["Mounts"][2]["Source"] = "/wrong-data"
     elif mutation == "duplicate_mount":
         actual["Mounts"].append(actual["Mounts"][0])
+    elif mutation == "working_dir":
+        # Not where Compose put this attempt's project (the worker's cwd).
+        actual["Labels"]["com.docker.compose.project.working_dir"] = str(frozen)
     elif mutation == "config_files":
         actual["Labels"]["com.docker.compose.project.config_files"] = "/arbitrary/label/path"
     elif mutation == "immutable_changed":
@@ -440,9 +448,15 @@ def test_wrapped_reinstall_requires_frozen_identity_and_immutable_attempt(tmp_pa
         relocated = frozen / "other"
         attempt.parent.rename(relocated)
         attempt.parent.symlink_to(relocated, target_is_directory=True)
-    result = subprocess.run([sys.executable, "-c", code, "original", cid, json.dumps(actual)],
+    # The resolved stable source and Docker's view of /data; the frozen
+    # data_dir must be one of them (the Mountpoint spelling predates protocol 6).
+    paths = {"stable_spelling": ["/srv/data", "/host/data"],
+             "frozen_data_dir": ["/srv/data", "/host/mountpoint"]}.get(mutation, ["/host/data", "/host/data"])
+    if mutation == "frozen_data_dir":
+        actual["Mounts"][2]["Source"] = "/host/mountpoint"
+    result = subprocess.run([sys.executable, "-c", code, "original", cid, json.dumps(actual), *paths],
                             capture_output=True, text=True)
-    assert (result.returncode == 0) is (mutation is None), result.stderr
+    assert (result.returncode == 0) is (mutation in {None, "stable_spelling"}), result.stderr
 
 
 def test_wrapped_reinstall_preserves_current_pointer_not_wrapped_base():
@@ -673,7 +687,8 @@ def test_wrapped_reinstall_preserves_literal_argv_and_empty_command(tmp_path, ob
     actual["Cmd"] = observed_command
     attempt.write_text(json.dumps(document))
     (frozen / "image.override.yml").write_text(json.dumps(document))
-    result = subprocess.run([sys.executable, "-c", code, "original", cid, json.dumps(actual)],
+    result = subprocess.run([sys.executable, "-c", code, "original", cid, json.dumps(actual),
+                             "/host/data", "/host/data"],
                             capture_output=True, text=True)
     assert (result.returncode == 0) is (observed_command is None or observed_command == []), result.stderr
 
@@ -1019,7 +1034,7 @@ class _Host:
             # v4 and an immutable attempt pointer as its live override.
             files["config.v4.json"] = json.dumps(self.expected_v4).encode()
             files["image.override.yml"] = json.dumps({"name": "mobius-admission-" + "b" * 32}).encode()
-            launcher, active, high_water = self.launcher, self._store(14, self.worker), 14
+            launcher, active, high_water = self.launcher, self._store(NEW, self.worker), NEW
             for unit in UNITS:
                 (host / "etc/systemd/system" / unit).write_text("# installed by the previous run\n")
         else:
@@ -1038,9 +1053,9 @@ class _Host:
         if candidate == "published12":
             entry, high_water = self._store(12, PUBLISHED_12.format(config=str(self.legacy)).encode()), 12
         elif candidate == "exact14":
-            entry, high_water = self._store(14, self.worker), 14
+            entry, high_water = self._store(NEW, self.worker), NEW
         elif candidate == "tried14":
-            high_water = 14  # an exact revision-14 trial was already consumed
+            high_water = NEW  # an exact trial of this revision was already consumed
         self.write_index({"version": 1, "high_water": high_water, "active": active, "candidate": entry})
 
     def _store(self, revision: int, data: bytes) -> dict:
@@ -1065,7 +1080,7 @@ export SECTION_PID=$$
 ROOT={host}/src; PROJECT=original; DATA_SOURCE={host}/data; CURRENT_IMAGE=sha256:{"a" * 64}
 ADMISSION_MANAGED={1 if self.managed else 0}; FROZEN_SOURCE={frozen}; ARGS=(-p original)
 APP_UID={os.getuid()}; APP_GID={os.getgid()}; IDENTITY='{json.dumps(IDENTITY, separators=(",", ":"))}'
-CONFIG_V4={self.v4}
+CONFIG_V4={self.v4}; HELPER_PROTOCOL={PROTOCOL}
 RESOLVED=$(mktemp)
 point() {{
   [[ -z ${{EVENTS:-}} ]] || printf 'point %s\n' "${{1// /_}}" >>"$EVENTS"
@@ -1135,10 +1150,14 @@ MIGRATION_COMPLETE=0
     def assert_coherent(self):
         launcher2, active, candidate = self.selected()
         assert self.accepts_own_config(active), "the selected worker rejects the config it reads"
+        # The app dispatches only to a certified protocol, so certification
+        # must never precede the selected worker, launcher and units it implies.
+        if (self.state / "helper-protocol").exists():
+            assert launcher2 and active["revision"] == NEW
         # Launcher 2 never runs beside the released worker: it is published
         # only after the new worker is durably selected.
-        assert not (launcher2 and active["revision"] < 14)
-        if active["revision"] == 14:
+        assert not (launcher2 and active["revision"] < NEW)
+        if active["revision"] == NEW:
             # The commit happened only after every input it reads was durable.
             assert json.loads(self.v4.read_text()) == self.expected_v4
             for unit in UNITS:
@@ -1158,7 +1177,8 @@ MIGRATION_COMPLETE=0
         self.assert_coherent()
         launcher2, active, candidate = self.selected()
         assert launcher2 and active["sha256"] == _digest(self.worker) and candidate is None
-        assert self.index()["high_water"] == 14
+        assert self.index()["high_water"] == NEW
+        assert (self.state / "helper-protocol").read_text() == f"{PROTOCOL}\n"
         for name, mode in (("config.v4.json", 0o600), ("compose.yml", 0o600), ("image.override.yml", 0o600)):
             assert stat.S_IMODE((self.etc / name).stat().st_mode) == mode
         assert stat.S_IMODE((self.root / "usr/local/libexec/mobius-rebuild-host").stat().st_mode) == 0o755
@@ -1187,7 +1207,8 @@ def _reboot_dispatch(host: _Host) -> None:
 
 PRE_COMMIT = ([("KILL_REPLACE", n) for n in range(1, 8)] + [("FAIL_REPLACE", n) for n in range(1, 8)]
               + [("KILL_AT", "before-commit"), ("FAIL_AT", "before-commit")])
-POST_COMMIT = ([("KILL_REPLACE", 8), ("FAIL_REPLACE", 8)]
+# Replacement 9 is the protocol certification, after dispatch is restored.
+POST_COMMIT = ([("KILL_REPLACE", 8), ("FAIL_REPLACE", 8), ("KILL_REPLACE", 9), ("FAIL_REPLACE", 9)]
                + [(mode, point) for point in ("systemctl daemon-reload", "flock -u 9", "flock -u 8",
                                               "systemctl enable") for mode in ("KILL_AT", "FAIL_AT")])
 
@@ -1199,7 +1220,7 @@ def test_every_interruption_leaves_a_coherent_worker_and_rerun_converges(tmp_pat
     assert result.returncode != 0
     host.assert_coherent()
     launcher2, active, _ = host.selected()
-    assert (active["revision"] == 14) is ((mode, point) in POST_COMMIT)
+    assert (active["revision"] == NEW) is ((mode, point) in POST_COMMIT)
     # Launcher 2 is the first replacement after the commit (the 8th overall).
     assert launcher2 is ((mode, point) in POST_COMMIT and point not in (8,))
     if mode.startswith("FAIL"):
@@ -1223,13 +1244,13 @@ def test_uninterrupted_publication_commits_once_after_every_input(tmp_path):
     assert calls == ["daemon-reload", "enable mobius-rebuild-reconcile.service",
                      "enable --now mobius-rebuild-reconcile.timer", "enable --now mobius-rebuild.path"]
     status = json.loads((host.state / "status.json").read_text())
-    assert status["worker_revision"] == 14 and status["launcher_revision"] == 2
+    assert status["worker_revision"] == NEW and status["launcher_revision"] == 2
     # A second run is idempotent: same selection, same inputs.
     before = {path: path.read_bytes() for path in (host.v4, host.etc / "compose.yml",
                                                    host.state / "workers.json")}
     result, _ = host.run()
     assert result.returncode == 0, result.stderr
-    assert "current: revision 14" in result.stdout
+    assert f"current: revision {NEW}" in result.stdout
     assert {path: path.read_bytes() for path in before} == before
 
 
@@ -1252,7 +1273,7 @@ def test_pending_image_candidate_across_reboot_is_not_burned_and_converges(tmp_p
         assert index["candidate"] == pending and index["high_water"] == pending["revision"]
     else:
         # The commit consumed the pending candidate: an exact one became active.
-        assert index["candidate"] is None and index["active"]["revision"] == 14
+        assert index["candidate"] is None and index["active"]["revision"] == NEW
         if candidate == "exact14":
             assert index["active"]["sha256"] == pending["sha256"]
     host.assert_coherent()
@@ -1262,17 +1283,17 @@ def test_pending_image_candidate_across_reboot_is_not_burned_and_converges(tmp_p
     if candidate == "exact14":
         # The retry activated exactly the pending candidate's bytes and file.
         assert host.index()["active"]["file"] == pending["file"]
-        assert ("installed: revision 14" in result.stdout) is ((mode, point) in PRE_COMMIT)
+        assert (f"installed: revision {NEW}" in result.stdout) is ((mode, point) in PRE_COMMIT)
 
 
 def test_failed_exact_trial_is_never_readmitted_and_released_pair_stays_coherent(tmp_path):
     host = _Host(tmp_path, candidate="tried14")
     result, calls = host.run()
     assert result.returncode != 0
-    assert "rejected: revision 14 was already tried or superseded" in result.stdout + result.stderr
+    assert f"rejected: revision {NEW} was already tried or superseded" in result.stdout + result.stderr
     # The refusal is at the commit: the released selection keeps its own config
     # and launcher; staged new inputs are inert to it; dispatch is restored.
-    assert host.index()["active"]["revision"] == 10 and host.index()["high_water"] == 14
+    assert host.index()["active"]["revision"] == 10 and host.index()["high_water"] == NEW
     assert host.selected()[0] is False
     host.assert_coherent()
     assert calls[-2:] == ["start mobius-rebuild.path", "start mobius-rebuild-reconcile.timer"]
@@ -1315,11 +1336,15 @@ def test_each_input_is_durable_before_the_next_and_launcher_follows_the_commit(t
         str(host.root / "etc/systemd/system" / unit) for unit in UNITS]
     launcher = str(host.root / "usr/local/libexec/mobius-rebuild-host")
     # Phase 1 under the previous selection; launcher 2 only after the commit.
-    before = 14 if managed else 10
-    assert destinations == [(path, before) for path in staged] + [(launcher, 14)]
-    assert len(destinations) == (7 if managed else 8)
+    before = NEW if managed else 10
+    certified = str(host.state / "helper-protocol")
+    assert destinations == [(path, before) for path in staged] + [(launcher, NEW), (certified, NEW)]
+    assert len(destinations) == (8 if managed else 9)
     commit = log.index(["point", "before-commit"])
-    assert replaces[-2] < commit < replaces[-1]
+    assert replaces[-3] < commit < replaces[-2]
+    # Certification is the last replacement, after dispatch is restored.
+    enabled = max(i for i, item in enumerate(log) if item == ["point", "systemctl_enable"])
+    assert enabled < replaces[-1]
     # The inbox and its parents are synced before the first replacement.
     synced_first = {item[1] for item in log[:replaces[0]] if item[0] == "fsync"}
     assert {str(host.root / "data"), str(host.root / "data/mobius-rebuild"),
@@ -1354,7 +1379,11 @@ def test_commit_separates_staging_from_launcher_publication():
         'durable_publish "$ROOT/scripts/mobius-rebuild-launcher.py" \\', "systemctl daemon-reload",
         "flock -u 9", "exec 9>&-", "MOBIUS_REBUILD_LAUNCHER=2 \\", "flock -u 8", "exec 8>&-",
         "systemctl enable mobius-rebuild-reconcile.service",
-        "systemctl enable --now mobius-rebuild-reconcile.timer", "systemctl enable --now mobius-rebuild.path"]
+        "systemctl enable --now mobius-rebuild-reconcile.timer", "systemctl enable --now mobius-rebuild.path",
+        # Certification last, then its capability refresh (see test_host_data_dir).
+        "printf '%s\\n' \"$HELPER_PROTOCOL\" >\"$STAGE/helper-protocol\"",
+        'durable_publish "$STAGE/helper-protocol" /var/lib/mobius-rebuild/helper-protocol 0600 --',
+        "MOBIUS_REBUILD_LAUNCHER=2 \\"]
     # Nothing writes the released worker's config, in place or by rename.
     assert not re.search(r"(?:>|replace\(|mv )[^\n]*etc/mobius-rebuild/config\.json", SOURCE)
     assert "cat >/etc/" not in SOURCE and "mv -f" not in SOURCE and "install -D" not in SOURCE
@@ -1364,11 +1393,11 @@ def test_commit_separates_staging_from_launcher_publication():
 
 
 def test_new_worker_revision_exceeds_every_published_revision():
-    # Unreleased review heads used revisions 12 and 13 with different bytes. The
-    # checkout must be strictly newer, or a host holding that high-water mark
-    # (for example a pending revision-12 candidate) would refuse it.
+    # Unreleased review heads used revisions 12 and 13, and #1806 released 14.
+    # The checkout must be strictly newer, or a host holding that high-water
+    # mark (for example a pending revision-14 candidate) would refuse it.
     text = (ROOT / "scripts/mobius-rebuild-host.py").read_text()
-    assert re.search(r"^WORKER_REVISION = 14$", text, re.M)
+    assert re.search(r"^WORKER_REVISION = 15$", text, re.M)
 
 
 @pytest.mark.parametrize("problem", ["writable", "foreign_owner"])
@@ -1390,7 +1419,8 @@ def test_publication_refuses_an_untrusted_destination_before_replacing_anything(
     host.assert_coherent()
 
 
-def _existing(tmp_path, files, *, project="original", data="/host/data", directory_mode=0o700):
+def _existing(tmp_path, files, *, project="original", data="/host/data",
+              mount="/var/lib/docker/volumes/original_data/_data", directory_mode=0o700):
     etc = tmp_path / "etc/mobius-rebuild"
     etc.mkdir(parents=True)
     etc.chmod(directory_mode)
@@ -1402,7 +1432,7 @@ def _existing(tmp_path, files, *, project="original", data="/host/data", directo
         (etc / name).chmod(0o600)
     code = _heredoc("PY_EXISTING").replace("/etc/mobius-rebuild", str(etc)).replace(
         "TRUSTED_UID = 0", f"TRUSTED_UID = {os.getuid()}")
-    return subprocess.run([sys.executable, "-c", code, project, data], capture_output=True, text=True)
+    return subprocess.run([sys.executable, "-c", code, project, data, mount], capture_output=True, text=True)
 
 
 V3 = {"version": 3, "project": "original", "data_dir": "/host/data"}
@@ -1413,6 +1443,17 @@ V4 = {"version": 4, "project": "original", "data_dir": "/host/data", **IDENTITY}
                                    {"config.json": V3, "config.v4.json": V4}])
 def test_existing_configuration_matching_this_deployment_is_accepted(tmp_path, files):
     result = _existing(tmp_path, files)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("name,base", [("config.json", V3), ("config.v4.json", V4)])
+def test_existing_configuration_naming_the_volume_mountpoint_migrates_to_the_stable_path(
+        tmp_path, name, base):
+    # Helper protocol 5 and earlier recorded Docker's Mountpoint for a
+    # bind-option volume. It is the same data, so reinstalling proceeds and
+    # rewrites the stable spelling instead of refusing as another topology.
+    mount = "/var/lib/docker/volumes/original_data/_data"
+    result = _existing(tmp_path, {name: {**base, "data_dir": mount}}, mount=mount)
     assert result.returncode == 0, result.stderr
 
 
@@ -1442,18 +1483,20 @@ def test_existing_configuration_must_be_root_controlled(tmp_path):
     (tmp_path / "c/etc/mobius-rebuild/config.json").chmod(0o666)
     code = _heredoc("PY_EXISTING").replace("/etc/mobius-rebuild", str(tmp_path / "c/etc/mobius-rebuild"))
     code = code.replace("TRUSTED_UID = 0", f"TRUSTED_UID = {os.getuid()}")
-    result = subprocess.run([sys.executable, "-c", code, "original", "/host/data"], capture_output=True, text=True)
+    result = subprocess.run([sys.executable, "-c", code, "original", "/host/data", "/host/data"],
+                            capture_output=True, text=True)
     assert result.returncode != 0 and "not root-controlled" in result.stderr
 
 
 def test_invariance_is_checked_for_every_host_before_any_controller_change():
-    definition = SOURCE.index("\ncheck_existing_configuration() {\npython3 - \"$PROJECT\" \"$DATA_SOURCE\" <<'PY_EXISTING'\n")
+    definition = SOURCE.index("\ncheck_existing_configuration() {\npython3 - \"$PROJECT\" \"$DATA_SOURCE\" "
+                              "\"$DATA_MOUNT_SOURCE\" <<'PY_EXISTING'\n")
     # Not only for frozen-source hosts: both calls are unconditional top-level
     # commands (set -e makes a refusal fatal), never inside a branch.
     calls = [match.start() for match in re.finditer(r"^check_existing_configuration$", SOURCE, re.M)]
     assert len(calls) == 2
     preflight, locked = calls
-    assert SOURCE.index("DATA_SOURCE=$(docker inspect") < definition < preflight < SOURCE.index("umask 077")
+    assert SOURCE.index("DATA_SOURCE=$(python3") < definition < preflight < SOURCE.index("umask 077")
     assert preflight < SOURCE.index("systemctl stop")
     # Rechecked under both locks: a concurrent installer may have written one.
     assert (SOURCE.index("flock -w 30 9") < SOURCE.index("[[ $(deployment_identity) == \"$IDENTITY\" ]]")
@@ -1478,7 +1521,7 @@ def test_configuration_appearing_at_lock_acquisition_refuses_publication(tmp_pat
 flock() { if [ "${3:-}" = 9 ]; then printf '%s' "$WRITTEN" >"$ETC/$NAME"; fi; }
 discover_app() { printf '%s\\n' "$CID"; }
 deployment_identity() { printf '%s\\n' "$IDENTITY"; }
-PROJECT=original DATA_SOURCE=/host/data CID=c ADMISSION_MANAGED=0 IDENTITY=frozen
+PROJECT=original DATA_SOURCE=/host/data DATA_MOUNT_SOURCE=/host/data CID=c ADMISSION_MANAGED=0 IDENTITY=frozen
 ''' + code + '\ntouch "$PUBLISHED"\n'
     published = tmp_path / "controller-changed"
     result = subprocess.run(["bash", "-eu", "-c", code], capture_output=True, text=True,
