@@ -812,6 +812,63 @@ def test_a_jfif_thumbnail_counts_as_metadata():
   assert listing_image_has_metadata(with_thumb)
 
 
+def test_an_app_accepted_with_older_ignore_rules_can_save_a_listing(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  older = "# An older managed ignore file.\nnode_modules/\n"
+  (source / ".gitignore").write_text(older)
+  _commit_accepted(db, source, app_id, "older ignore rules")
+
+  preview = _preview(client, auth, app_id)
+
+  # A read-only preview never rewrites the app's ignore rules.
+  assert (source / ".gitignore").read_text() == older
+  saved = _save(client, auth, app_id, **_complete_listing())
+  assert saved.status_code == 200, saved.text
+  # The save's accepted revision carries apply's own ignore migration.
+  assert app_git._run(source, "show", "HEAD:.gitignore").stdout == app_git._GITIGNORE
+
+
+def test_a_png_naming_only_its_software_does_not_hold_the_listing_back(client, auth, db):
+  from PIL import PngImagePlugin
+
+  source = _source()
+  app_id = _create(client, auth, source)
+  info = PngImagePlugin.PngInfo()
+  info.add_text("Software", "An image editor 3.2")
+  icon = io.BytesIO()
+  Image.new("RGB", (64, 64), (200, 40, 40)).save(icon, format="PNG", pnginfo=info)
+  (source / "icon.png").write_bytes(icon.getvalue())
+  (source / "assets").mkdir()
+  info = PngImagePlugin.PngInfo()
+  info.add_text("Author", "A person")
+  authored = io.BytesIO()
+  Image.new("RGB", (8, 8)).save(authored, format="PNG", pnginfo=info)
+  (source / "assets" / "authored.png").write_bytes(authored.getvalue())
+  _commit_accepted(db, source, app_id, "a tool name and an author name")
+  assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
+
+  preview = _preview(client, auth, app_id)
+
+  assert _item(preview, "icon")["done"] is True
+  details = _item(preview, "details")
+  assert details["code"] == "listing_image_metadata"
+  assert "assets/authored.png" in details["message"] and "icon.png" not in details["message"]
+
+
+def test_undo_leaves_a_file_someone_edited_since_the_save(tmp_path):
+  changes = store_listing_source._SourceChanges(tmp_path)
+  (tmp_path / "mobius.json").write_text("original")
+  changes.write("mobius.json", b"saved")
+  changes.write("static/store/new.png", b"art")
+  (tmp_path / "mobius.json").write_text("an agent's edit")
+
+  changes.undo()
+
+  assert (tmp_path / "mobius.json").read_text() == "an agent's edit"
+  assert not (tmp_path / "static" / "store" / "new.png").exists()
+
+
 def test_an_unexpected_image_error_is_a_checklist_item_not_a_crash(monkeypatch):
   from app import community_publish
 
@@ -1182,6 +1239,7 @@ def test_removing_listing_art_keeps_the_icon_that_shares_it(client, auth):
 
 def test_a_new_icon_never_overwrites_listing_art_it_shared(client, auth):
   source = _source()
+  original_icon = (source / "icon.png").read_bytes()
   app_id = _create(client, auth, source)
   assert _save(client, auth, app_id, **_complete_listing(
     hero={"data_base64": _b64(_png((1, 2, 3)))},
@@ -1200,7 +1258,10 @@ def test_a_new_icon_never_overwrites_listing_art_it_shared(client, auth):
 
   assert saved.status_code == 200, saved.text
   assert (source / hero).read_bytes() == _png((1, 2, 3))
-  assert json.loads((source / "mobius.json").read_text())["icon"] == "icon.png"
+  icon = json.loads((source / "mobius.json").read_text())["icon"]
+  # A new icon gets its own content-named file, never another file's path.
+  assert icon != hero and icon.startswith("static/store/")
+  assert (source / "icon.png").read_bytes() == original_icon
 
 
 def test_invalid_images_are_refused_before_anything_is_written(client, auth):

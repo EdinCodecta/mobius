@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 from datetime import UTC, datetime
 import hashlib
 import io
@@ -476,6 +477,9 @@ _PNG_KEPT_CHUNKS = {
 # many editors add one to every PNG; stripping still drops it, but it alone
 # does not hold a listing back.
 _PNG_HARMLESS_CHUNKS = _PNG_KEPT_CHUNKS | {b"tIME"}
+# A text chunk keyed exactly "Software" names the tool that wrote the file,
+# not a person or place; every other key (Author, Comment, XMP...) counts.
+_PNG_TEXT_CHUNKS = {b"tEXt", b"zTXt", b"iTXt"}
 _WEBP_KEPT_CHUNKS = {b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ANIM", b"ANMF", b"ICCP"}
 # Tables, frame headers, restart intervals and scans: what draws a JPEG.
 _JPEG_DRAWING_MARKERS = {0xC4, 0xCC, 0xDA, 0xDB, 0xDD} | {
@@ -484,13 +488,26 @@ _JPEG_DRAWING_MARKERS = {0xC4, 0xCC, 0xDA, 0xDB, 0xDD} | {
 _EXIF_ORIENTATION = 0x0112
 
 
-def _png_chunks_kept(content: bytes, kept: set[bytes] = _PNG_KEPT_CHUNKS) -> bytes:
+def _png_chunk_draws(kind: bytes, data: bytes) -> bool:
+  return kind in _PNG_KEPT_CHUNKS
+
+
+def _png_chunk_harmless(kind: bytes, data: bytes) -> bool:
+  """Drawing chunks, a bare timestamp, or text naming only the producing tool."""
+  return kind in _PNG_HARMLESS_CHUNKS or (
+    kind in _PNG_TEXT_CHUNKS and data.split(b"\0", 1)[0] == b"Software"
+  )
+
+
+def _png_chunks_kept(
+  content: bytes, keep: Callable[[bytes, bytes], bool] = _png_chunk_draws,
+) -> bytes:
   out, at = [content[:8]], 8
   while at + 12 <= len(content):
     length = int.from_bytes(content[at:at + 4], "big")
     kind = content[at + 4:at + 8]
     end = at + 12 + length
-    if kind in kept:
+    if keep(kind, content[at + 8:at + 8 + length]):
       out.append(content[at:end])
     if kind == b"IEND":
       break  # Anything after the end of the image is not part of it.
@@ -566,7 +583,7 @@ def listing_image_has_metadata(content: bytes) -> bool:
   multi-picture JPEG's extra images count, through its MPF segment.
   """
   if content.startswith(b"\x89PNG\r\n\x1a\n"):
-    return _png_chunks_kept(content, _PNG_HARMLESS_CHUNKS) != content
+    return _png_chunks_kept(content, _png_chunk_harmless) != content
   if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
     return _webp_chunks_kept(content) != content
   if content.startswith(b"\xff\xd8\xff"):

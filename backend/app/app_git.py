@@ -685,6 +685,64 @@ def _refresh_ignore_rules(
     )
 
 
+def ignore_migration_paths(
+  source_dir: str | Path, accepted: str, tree: str | None = None,
+) -> set[str]:
+  """Paths that differ from ``accepted`` only through managed-ignore migration.
+
+  The read-only mirror of ``_refresh_ignore_rules``, which apply runs before
+  every snapshot: a synthetic repo's ``.gitignore`` rewritten to the managed
+  rules, a stale managed ``.gitignore`` dropped from a real-origin repo, and
+  managed runtime paths untracked. ``tree`` is the candidate to compare, or
+  ``None`` for the worktree, where untracking leaves files in place.
+  """
+  repo = Path(source_dir)
+  before = _ref_blob(repo, accepted, ".gitignore", read_only=True)
+  if tree is None:
+    gitignore = repo / ".gitignore"
+    after = gitignore.read_bytes() if gitignore.is_file() else None
+  else:
+    after = _ref_blob(repo, tree, ".gitignore", read_only=True)
+  paths: set[str] = set()
+  if before != after and (
+    after == _GITIGNORE.encode("utf-8")
+    or (
+      after is None and before is not None
+      and _looks_like_managed_gitignore(before.decode("utf-8", "replace"))
+    )
+  ):
+    paths.add(".gitignore")
+  if tree is not None:
+    untracked = _run(
+      repo, "diff", "--name-only", "--no-renames", "-z", "--diff-filter=D",
+      accepted, tree, "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+    )
+    if untracked.returncode == 0:
+      paths.update(path for path in untracked.stdout.split("\0") if path)
+  return paths
+
+
+def worktree_diff_paths(source_dir: str | Path, ref: str) -> set[str] | None:
+  """Paths whose worktree differs from ``ref``, untracked included, read-only.
+
+  Ignored files are left out, as apply never commits them. ``None`` when Git
+  cannot answer. Unlike a snapshot, this never touches ignore rules or any
+  index, so read-only views can use it.
+  """
+  repo = Path(source_dir)
+  diff = _run(
+    repo, "diff", "--name-only", "--no-renames", "-z", ref, "--",
+    check=False, read_only=True,
+  )
+  untracked = _run(
+    repo, "ls-files", "--others", "--exclude-standard", "-z",
+    check=False, read_only=True,
+  )
+  if diff.returncode or untracked.returncode:
+    return None
+  return {path for path in (diff.stdout + untracked.stdout).split("\0") if path}
+
+
 def is_repo(source_dir: str | Path) -> bool:
   """Whether `source_dir` already holds a git repo."""
   return (Path(source_dir) / ".git").exists()

@@ -185,7 +185,9 @@ of the app's source, so it is reviewed, versioned and published with the code:
   e.g. `python3 -c "from PIL import Image, ImageOps; im = ImageOps.exif_transpose(Image.open('f.jpg')); im.info.clear(); im.save('f.jpg', quality=95)"`
   (turning it upright first, since the orientation tag goes with the rest;
   the same works for PNG and WebP without `quality`), or remove it if
-  nothing uses it. A bare PNG `tIME` timestamp is allowed.
+  nothing uses it. A bare PNG `tIME` timestamp and a PNG text chunk keyed
+  exactly `Software` (the tool that wrote it) are allowed; any other text key
+  (`Author`, `Comment`, `Description`, XMP...) is not.
 - Screenshots must be truthful and private: capture the app's real UI in an
   empty, demo, or fixture state, never the owner's own records, names,
   accounts, chats, or machines. Build a small demo state if the app has none.

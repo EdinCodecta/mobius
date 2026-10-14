@@ -156,7 +156,7 @@ def _named_by_its_content(rel: str, content: bytes) -> bool:
   return PurePosixPath(rel).stem == hashlib.sha256(content).hexdigest()[:16]
 
 
-def _clean_listing_image(content: bytes) -> bool:
+def _is_clean_listing_image(content: bytes) -> bool:
   try:
     check_listing_image(content, "listing image")
   except CommunityPublicationError:
@@ -164,33 +164,49 @@ def _clean_listing_image(content: bytes) -> bool:
   return not listing_image_has_metadata(content)
 
 
-def changes_beyond_listing(root: Path, accepted: str, tree: str) -> bool:
-  """Whether ``tree`` differs from the accepted revision beyond a listing.
+def changes_beyond_listing(root: Path, accepted: str, tree: str | None = None) -> bool:
+  """Whether the candidate differs from the accepted revision beyond a listing.
 
   ``tree`` is the exact candidate apply will accept, read through Git, so
   nothing the worktree hides from a plain diff (skip-worktree or
-  assume-unchanged entries) slips past. A save interrupted after writing,
-  or one that failed after Git advanced, leaves listing files the next save
-  may carry: the editor's hash-named art and the declared icon, each a clean
-  listing image, and mobius.json's icon and store fields. Anything else
-  (code, or other manifest fields) was never reviewed.
+  assume-unchanged entries) slips past; the save checks that. ``None``
+  compares the worktree instead, read-only, for advisory checks that must
+  not run apply's snapshot (it rewrites managed ignore rules).
+
+  A save interrupted after writing, or one that failed after Git advanced,
+  leaves listing files the next save may carry: the editor's hash-named art
+  and the declared icon, each a clean listing image, and mobius.json's icon
+  and store fields. So may the managed-ignore migration apply itself makes.
+  Anything else (code, or other manifest fields) was never reviewed.
   """
-  changed = app_git.endpoint_diff_paths(root, accepted, tree, read_only=True)
+  if tree is None:
+    changed = app_git.worktree_diff_paths(root, accepted)
+
+    def read(path: str) -> bytes | None:
+      target = root / path
+      return target.read_bytes() if target.is_file() and not target.is_symlink() else None
+  else:
+    changed = app_git.endpoint_diff_paths(root, accepted, tree, read_only=True)
+
+    def read(path: str) -> bytes | None:
+      return app_git.ref_file(root, tree, path)
   if changed is None:
     return True
+  changed -= app_git.ignore_migration_paths(root, accepted, tree)
   if not changed:
     return False
   manifests = [
-    _manifest_from(app_git.ref_file(root, ref, "mobius.json")) for ref in (accepted, tree)
+    _manifest_from(app_git.ref_file(root, accepted, "mobius.json")),
+    _manifest_from(read("mobius.json")),
   ]
   icons = {
     str(manifest.get("icon") or "") for manifest in manifests if manifest is not None
   } - {""}
   for path in changed:
-    content = app_git.ref_file(root, tree, path)
+    content = read(path)
     # A deleted file carries nothing; a present one must be a clean image,
     # which a code file can never pass as.
-    carried = content is None or _clean_listing_image(content)
+    carried = content is None or _is_clean_listing_image(content)
     if path in icons and carried:
       continue
     if EDITOR_ART.fullmatch(path) and (
@@ -206,28 +222,25 @@ def changes_beyond_listing(root: Path, accepted: str, tree: str) -> bool:
 
 
 def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
-  """Whether the source apply would accept differs beyond a listing.
+  """Whether the worktree differs from the accepted revision beyond a listing.
 
-  It snapshots the worktree with apply's own method and checks that exact
-  tree. Source with no accepted revision counts as unapplied as a whole:
-  with nothing to tell reviewed source from unreviewed commits, an apply
-  records one first.
+  Read-only and advisory, for the preview and a save's early refusal; the
+  save's authoritative check runs on the exact tree apply accepts. Source
+  with no accepted revision counts as unapplied as a whole: with nothing to
+  tell reviewed source from unreviewed commits, an apply records one first.
   """
   if not accepted or not app_git.is_repo(root):
     return True
-  try:
-    tree = app_git.snapshot_worktree(root).tree_oid
-  except Exception:  # No readable candidate is no candidate to carry.
-    return True
-  return changes_beyond_listing(root, accepted, tree)
+  return changes_beyond_listing(root, accepted)
 
 
 @dataclass
 class _SourceChanges:
-  """Original bytes of every path this edit touched, for an exact undo."""
+  """Original and written bytes of every path this edit touched, for undo."""
 
   root: Path
   originals: dict[str, bytes | None] = field(default_factory=dict)
+  written: dict[str, bytes | None] = field(default_factory=dict)
 
   def _remember(self, rel: str) -> Path:
     target = _source_path(self.root, rel)
@@ -239,13 +252,18 @@ class _SourceChanges:
     target = self._remember(rel)
     target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(target, content)
+    self.written[rel] = content
 
   def delete(self, rel: str) -> None:
     self._remember(rel).unlink(missing_ok=True)
+    self.written[rel] = None
 
   def undo(self) -> None:
     for rel, content in self.originals.items():
       target = _source_path(self.root, rel)
+      current = target.read_bytes() if target.is_file() else None
+      if current != self.written.get(rel):
+        continue  # Someone edited it since; their bytes win over the undo.
       if content is None:
         target.unlink(missing_ok=True)
       else:
@@ -307,6 +325,11 @@ def _image_suffix(content: bytes, what: str) -> str:
     raise ListingEditError(exc.code, exc.detail, exc.status_code) from exc
 
 
+def _content_named(content: bytes, suffix: str) -> str:
+  """The editor's name for art holding ``content``: never another file's."""
+  return f"{STORE_ART_DIR}/{hashlib.sha256(content).hexdigest()[:16]}{suffix}"
+
+
 def _place_art(
   root: Path, app: models.App, changes: _SourceChanges, image: ListingImage, what: str,
 ) -> str:
@@ -327,7 +350,7 @@ def _place_art(
   else:
     content = strip_listing_image_metadata(content)
     suffix = _image_suffix(content, what)
-    rel = f"{STORE_ART_DIR}/{hashlib.sha256(content).hexdigest()[:16]}{suffix}"
+    rel = _content_named(content, suffix)
   target = _source_path(root, rel)
   if not (target.is_file() and target.read_bytes() == content):
     changes.write(rel, content)
@@ -515,20 +538,20 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
       # written beside it instead, since art is named by its bytes.
       clean = strip_listing_image_metadata(declared)
       if not _icon_cleaned_in_place(icon_rel):
-        icon_rel = "icon" + check_listing_image(clean, "app icon")
+        icon_rel = _content_named(clean, check_listing_image(clean, "app icon"))
       changes.write(icon_rel, clean)
     else:
       icon_bytes = record_icon_for_save(root, app)
-    if icon_bytes is not None and declared_icon:
-      # Normalized icons are PNG; never write PNG bytes under another suffix,
-      # nor over content-addressed listing art the icon may share a file with.
-      if not _icon_normalized_in_place(icon_rel):
-        icon_rel = "icon.png"
     if icon_bytes is not None:
       try:
-        changes.write(icon_rel, icon_assets.normalize_icon(icon_bytes))
+        normalized = icon_assets.normalize_icon(icon_bytes)
       except icon_assets.InvalidIcon as exc:
         raise ListingEditError("listing_image_invalid", f"App icon: {exc}") from exc
+      if declared_icon and not _icon_normalized_in_place(icon_rel):
+        # Normalized icons are PNG; never write PNG bytes under another
+        # suffix, nor over content-named art or an unrelated icon.png.
+        icon_rel = _content_named(normalized, ".png")
+      changes.write(icon_rel, normalized)
     has_icon = _source_path(root, icon_rel).is_file()
 
     screenshots = []
