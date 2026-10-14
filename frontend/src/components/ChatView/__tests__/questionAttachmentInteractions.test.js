@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { after, test } from 'node:test'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 import { createFileDragHandlers } from '../dragUpload.js'
 import { questionAnswerPatch, questionAnswersReady } from '../questionSubmission.js'
 import { questionDraftKey, writeQuestionDraft } from '../questionDraft.js'
@@ -9,10 +9,7 @@ import { questionDraftKey, writeQuestionDraft } from '../questionDraft.js'
 // Only these two modules use the existing hook harness; children remain React
 // elements so their props describe the actual card's presentation boundary.
 const hooksPath = '/src/components/ChatView/hooks/__tests__/react-hook-shim.mjs'
-const vite = await createServer({
-  appType: 'custom', logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui'] },
+const vite = await createSsrRenderServer({
   plugins: [{
     name: 'question-card-hooks', enforce: 'pre',
     transform(source, id) {

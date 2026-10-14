@@ -2,9 +2,9 @@
    whichever provider reported them. */
 import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false } })
+const vite = await createSsrRenderServer()
 after(() => vite.close())
 const { toolCallLabel, effectiveToolName, toolActivityIcon } = await vite.ssrLoadModule('/src/components/ChatView/toolActivityLabel.js')
 const { toolGroupSummary, toolGroupPastSummary } = await vite.ssrLoadModule('/src/components/ChatView/groupBlocks.js')

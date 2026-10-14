@@ -428,6 +428,17 @@ def _git_env(
   return env
 
 
+def ref_file_size(source_dir: str | Path, ref: str, path: str) -> int | None:
+  """One file's size at ``ref`` without reading it, or None when it has none."""
+  proc = _run(Path(source_dir), "cat-file", "-s", f"{ref}:{path}", check=False, read_only=True)
+  return int(proc.stdout.strip()) if proc.returncode == 0 else None
+
+
+def ref_file(source_dir: str | Path, ref: str, path: str) -> bytes | None:
+  """One file's bytes at ``ref``, or None when ``ref`` has no file there."""
+  return _ref_blob(Path(source_dir), ref, path, read_only=True)
+
+
 def _run(
   repo: Path,
   *args: str,
@@ -678,6 +689,79 @@ def _refresh_ignore_rules(
       "rm", "-r", "--cached", "--ignore-unmatch", "--",
       *_MANAGED_RUNTIME_PATHS, check=False,
     )
+
+
+def ignore_migration_paths(
+  source_dir: str | Path, accepted: str, tree: str | None = None,
+) -> set[str]:
+  """Paths that differ from ``accepted`` only through managed-ignore migration.
+
+  The read-only mirror of ``_refresh_ignore_rules``, which apply runs before
+  every snapshot: a synthetic repo's ``.gitignore`` rewritten to the managed
+  rules, a stale managed ``.gitignore`` dropped from a real-origin repo, and
+  managed runtime paths untracked. ``tree`` is the candidate to compare, or
+  ``None`` for the worktree, where untracking leaves files in place, so any
+  change to a managed runtime path there is part of the migration too.
+  """
+  repo = Path(source_dir)
+  before = _ref_blob(repo, accepted, ".gitignore", read_only=True)
+  if tree is None:
+    gitignore = repo / ".gitignore"
+    after = gitignore.read_bytes() if gitignore.is_file() else None
+  else:
+    after = _ref_blob(repo, tree, ".gitignore", read_only=True)
+  paths: set[str] = set()
+  if before != after and (
+    after == _GITIGNORE.encode("utf-8")
+    or (
+      after is None and before is not None
+      and _looks_like_managed_gitignore(before.decode("utf-8", "replace"))
+    )
+  ):
+    paths.add(".gitignore")
+  if tree is not None:
+    untracked = [_run(
+      repo, "diff", "--name-only", "--no-renames", "-z", "--diff-filter=D",
+      accepted, tree, "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+    )]
+  else:
+    # Apply untracks these runtime paths, so whatever they hold in the
+    # worktree (changed, or new under older ignore rules) never reaches it.
+    untracked = [
+      _run(
+        repo, "diff", "--name-only", "--no-renames", "-z", accepted,
+        "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+      ),
+      _run(
+        repo, "ls-files", "--others", "--exclude-standard", "-z",
+        "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+      ),
+    ]
+  for proc in untracked:
+    if proc.returncode == 0:
+      paths.update(path for path in proc.stdout.split("\0") if path)
+  return paths
+
+
+def worktree_diff_paths(source_dir: str | Path, ref: str) -> set[str] | None:
+  """Paths whose worktree differs from ``ref``, untracked included, read-only.
+
+  Ignored files are left out, as apply never commits them. ``None`` when Git
+  cannot answer. Unlike a snapshot, this never touches ignore rules or any
+  index, so read-only views can use it.
+  """
+  repo = Path(source_dir)
+  diff = _run(
+    repo, "diff", "--name-only", "--no-renames", "-z", ref, "--",
+    check=False, read_only=True,
+  )
+  untracked = _run(
+    repo, "ls-files", "--others", "--exclude-standard", "-z",
+    check=False, read_only=True,
+  )
+  if diff.returncode or untracked.returncode:
+    return None
+  return {path for path in (diff.stdout + untracked.stdout).split("\0") if path}
 
 
 def is_repo(source_dir: str | Path) -> bool:

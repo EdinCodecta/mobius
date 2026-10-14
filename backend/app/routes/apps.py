@@ -1,6 +1,9 @@
 """Routes for managing the mini-app registry."""
 
 import asyncio
+import base64
+import binascii
+import functools
 import io
 import json
 import logging
@@ -12,7 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
@@ -25,10 +28,10 @@ from sqlalchemy.orm import Session, defer
 
 from app import chat_writer
 from app import (
-  activity, app_activity, app_apply, app_badge, app_capability_acceptance, app_cron,
+  activity, app_activity, app_apply, app_badge, app_capability_acceptance,
   app_git, app_jobs, app_recency, chat_app_artifacts, chat_queue, drawer_pins, fs_locks,
-  icon_cache, models, project_git, providers, schemas,
-  source_dirs, workspace_files,
+  git_transfers, icon_cache, models, pending_update, project_git, providers, schemas,
+  settled, source_dirs, store_listing_source, workspace_files,
 )
 from app.manifest_identity import (
   requested_manifest_source, stored_manifest_fetch_url,
@@ -47,6 +50,7 @@ from app.routes.app_publication import (
   router as publication_router,
 )
 from app.routes.app_runtime import router as runtime_router
+from app.routes.app_update_batches import router as update_batches_router
 from app.storage_io import (
   delete_content_type_tree,
   make_parent_folders,
@@ -90,6 +94,7 @@ from app.timeutil import now_naive_utc, SOFT_DELETE_TTL
 
 router = APIRouter(prefix="/api/apps", tags=["apps"])
 router.include_router(schedules_router)
+router.include_router(update_batches_router)
 
 # Tombstoned apps are hard-purged this long after uninstall. Aliases the single
 # shared SOFT_DELETE_TTL (app.timeutil) — the same window chat soft-delete uses,
@@ -604,7 +609,7 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
   get_system_broadcast().publish(
     {"type": "app_deleted", "appId": str(deleted_app_id)}
   )
-  from app.install import purge_app_skills
+  from app.app_skills import purge_app_skills
   try:
     await purge_app_skills(deleted_app_id)
   except Exception:
@@ -620,7 +625,7 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
     resolved_source = _resolve_app_source_dir(app_source_dir)
     async with fs_locks.source_dir_lock(str(resolved_source)):
       if _safe_to_rmtree_source(resolved_source, apps_root, db, deleted_app_id):
-        await app_cron.run_schedule_mutation(
+        await settled.run_settled(
           _drop_cron_and_rmtree, resolved_source,
         )
   except Exception:
@@ -667,7 +672,7 @@ async def list_apps(
       for app in stale:
         async with fs_locks.app_storage_lock(app.id):
           try:
-            await _hard_delete_app(db, app)
+            await settled.settle(_hard_delete_app(db, app), what="App purge")
           except Exception:
             # A hard-delete now fails loudly when id-keyed storage can't be
             # removed (so a freed id can't expose orphaned data). One
@@ -787,15 +792,11 @@ async def preview_app_install(
     )
   )
   source = body.manifest_url if body.manifest_url is not None else raw_base
-  existing = install._find_install_identity_row(
-    db,
-    source_url=source,
-    manifest_id=manifest["id"],
-    package_id=manifest.get("package_id"),
+  # Release the request session first: the worker opens its own short one.
+  db.close()
+  installed_contract = await settled.run_settled(
+    _installed_contract_for_preview, manifest, source,
   )
-  if existing is not None and existing.deleted_at is not None:
-    existing = None
-  installed_contract = existing.capability_contract if existing else None
   return schemas.AppPreviewOut(
     manifest=manifest,
     capability_contract=contract,
@@ -803,6 +804,24 @@ async def preview_app_install(
     installed_contract=installed_contract,
     capability_diff=diff_contracts(installed_contract, contract),
   )
+
+
+def _installed_contract_for_preview(manifest: dict, source: str) -> dict | None:
+  """The capability contract of the live row install would update, or None.
+
+  Install's one identity rule (``install.resolve_package_row``). Source
+  identities are not resolved here, so a move that only a provider repository
+  id proves is previewed as a new install. Blocking (database reads, and a Git
+  origin read for a legacy row): run it in a worker thread, in its own short
+  session, like update discovery's ``_update_candidate_rejection``.
+  """
+  from app import database, install
+
+  with database.SessionLocal() as db:
+    existing = install.resolve_package_row(db, manifest, source).row
+    if existing is None or existing.deleted_at is not None:
+      return None
+    return existing.capability_contract
 
 
 @router.post(
@@ -834,52 +853,17 @@ async def install_app(
   # routes/apps.py at module top.
   from app import install
 
-  # Network transfers finish before the lifecycle lock, so one slow package
-  # never holds up other apps' installs, updates or uninstalls.
-  prepared = None
-  try:
-    if body.update_app_id is not None and body.reviewed_upstream_commit is not None:
-      reviewed = db.get(models.App, body.update_app_id)
-      reviewed_source = reviewed.source_dir if reviewed is not None else None
-      # Release the request's connection for the transfer, as update-check does.
-      db.rollback()
-      if reviewed_source is not None and app_git.is_repo(reviewed_source):
-        try:
-          await install.fetch_app_commit(
-            reviewed_source, body.reviewed_upstream_commit,
-          )
-        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-          raise install.git_source_error(
-            "Refresh the update and try again.",
-            exc,
-            code="update_changed",
-            failure="The reviewed Git update is no longer available.",
-          ) from exc
-    elif body.update_app_id is None:
-      prepared = await install.prepare_package(
-        body.manifest_url, body.manifest, body.raw_base,
-        reviewed_capability_digest=body.reviewed_capability_digest, db=db,
-      )
-    # Serialize the whole install against any concurrent uninstall — both are
-    # app-lifecycle operations over the same /data/apps trees, and letting them
-    # overlap lets one delete what the other just wrote
-    # (fs_locks.install_uninstall_lock has the full rationale).
-    async with fs_locks.install_uninstall_lock():
-      result = await install.install_from_manifest(
-        db,
-        manifest_url=body.manifest_url,
-        manifest=body.manifest,
-        raw_base=body.raw_base,
-        source="store",
-        reviewed_capability_digest=body.reviewed_capability_digest,
-        reviewed_source_digest=body.reviewed_source_digest,
-        reviewed_app_id=body.update_app_id,
-        reviewed_upstream_commit=body.reviewed_upstream_commit,
-        prepared=prepared,
-      )
-  finally:
-    if prepared is not None:
-      await asyncio.to_thread(install.discard_staged, prepared.staged_clone)
+  # The same path runs each entry of a server-owned update batch.
+  result = await install.install_requested_app(
+    db,
+    manifest_url=body.manifest_url,
+    manifest=body.manifest,
+    raw_base=body.raw_base,
+    reviewed_capability_digest=body.reviewed_capability_digest,
+    reviewed_source_digest=body.reviewed_source_digest,
+    update_app_id=body.update_app_id,
+    reviewed_upstream_commit=body.reviewed_upstream_commit,
+  )
   app = result.app
   mode = result.mode
   warnings = result.warnings
@@ -1086,16 +1070,18 @@ def _validate_pending_update(repo: Path, receipt: dict) -> _PendingUpdatePlan:
   if app_git.merge_in_progress(repo):
     raise _earlier_resolver_merge(repo)
   upstream = receipt["upstream_commit"]
-  if install.pending_update_resolved(repo, upstream):
+  if pending_update.pending_update_resolved(repo, upstream):
     return _PendingUpdatePlan(conflict_paths=[])
-  worktree = install.pending_update_worktree(repo)
+  worktree = pending_update.pending_update_worktree(repo)
   if (worktree / ".git").exists():
     if app_git.merge_in_progress(worktree):
       return _PendingUpdatePlan(
         conflict_paths=_unmerged_status_paths(worktree), checkout=worktree,
       )
     if app_git.ref_is_ancestor(worktree, upstream, "HEAD") is True:
-      marked = install.committed_conflict_marker_paths(worktree, "HEAD", upstream) or []
+      marked = pending_update.committed_conflict_marker_paths(
+        worktree, "HEAD", upstream,
+      ) or []
       changed = app_git._run(
         worktree, "status", "--porcelain=v1", "-z", "--no-renames",
       ).stdout.split("\0")
@@ -1124,8 +1110,6 @@ def _park_pending_update(
   repo: Path, receipt: dict, plan: _PendingUpdatePlan,
 ) -> list[str]:
   """Consume a validated plan; preparation is retryable, not transactional."""
-  from app import install
-
   if plan.conflict_paths is not None:
     # Resolver Git operations do not take route locks. A removed checkout
     # invalidates a reuse plan rather than silently recreating agent work.
@@ -1133,7 +1117,7 @@ def _park_pending_update(
       raise _conflict_state_changed()
     return plan.conflict_paths
   merge = plan.merge
-  worktree = install.pending_update_worktree(repo)
+  worktree = pending_update.pending_update_worktree(repo)
   if (worktree / ".git").exists():
     app_git.remove_overlay_worktree(repo, worktree)
   worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -1167,14 +1151,12 @@ def _require_pending_resolution(repo: Path, upstream_commit: str) -> None:
   stages on its behalf. A merge an earlier release left in the served folder is
   finished there the way that release did.
   """
-  from app import install
-
   if app_git.merge_in_progress(repo):
     if app_git.commit_local(repo, "resolve app update") is None:
       raise _earlier_resolver_merge(repo)
-  if install.pending_update_resolved(repo, upstream_commit):
+  if pending_update.pending_update_resolved(repo, upstream_commit):
     return
-  worktree = install.pending_update_worktree(repo)
+  worktree = pending_update.pending_update_worktree(repo)
   if not (worktree / ".git").exists():
     raise _resolution_error(
       "resolution_not_started",
@@ -1216,8 +1198,6 @@ def _conflict_resolver_prompt(
   items: list[tuple[models.App, Path, list[str], str | None]],
 ) -> str:
   """One bounded seed message covering every app in a reviewed issue batch."""
-  from app import install
-
   intro = ["Please finish every blocked app update listed below.", ""]
   instructions = [
     "Read /data/shared/skills/resolving-app-git.md once, then work through EVERY "
@@ -1237,7 +1217,7 @@ def _conflict_resolver_prompt(
     app, repo, conflict_paths, upstream_version = item
     name = _prompt_value(app.name, 120) or "this app"
     target = _prompt_value(upstream_version or "latest", 32) or "latest"
-    checkout = install.pending_update_worktree(repo)
+    checkout = pending_update.pending_update_worktree(repo)
     omitted = len(conflict_paths) - len(shown)
     return [
       f"## {name} to v{target}",
@@ -1354,13 +1334,12 @@ def _pending_update_state(repo: Path, upstream_commit: str) -> Literal[
   """Classify a validated pending receipt without changing repository state.
 
   ``replay_pending`` means only installation is left (see
-  ``install.pending_update_resolved``); rerunning the update or the resolver's
-  finish promotes it. Anything short of that is still resolution work.
+  ``pending_update.pending_update_resolved``); rerunning the update or the
+  resolver's finish promotes it. Anything short of that is still resolution
+  work.
   """
-  from app import install
-
   try:
-    resolved = install.pending_update_resolved(repo, upstream_commit)
+    resolved = pending_update.pending_update_resolved(repo, upstream_commit)
   except (OSError, subprocess.SubprocessError):
     return "unknown"
   return "replay_pending" if resolved else "needs_resolution"
@@ -1375,10 +1354,8 @@ def _read_pending_update(repo: Path, app_id: int) -> tuple[
   Callers hold the app's source-dir lock, so update-check and the candidate
   preview report the same state.
   """
-  from app import install
-
   current_upstream = app_git.head_sha(repo, app_git.UPSTREAM_BRANCH)
-  receipt = install.read_pending_conflict_update_receipt(
+  receipt = pending_update.read_pending_conflict_update_receipt(
     repo, app_id=app_id, upstream_commit=current_upstream,
   )
   state = (
@@ -1388,41 +1365,61 @@ def _read_pending_update(repo: Path, app_id: int) -> tuple[
   return receipt, state
 
 
-def _update_candidate_matches_installed(
-  installed_manifest_url: str,
-  candidate_manifest_url: str,
-  candidate_manifest: dict,
-  installed_package_id: str | None,
-) -> bool:
-  """Accept the installed package identity or its reviewed predecessor.
+def _update_candidate_rejection(
+  app_id: int,
+  manifest: dict,
+  manifest_url: str,
+  *,
+  package_id: str | None,
+  source_identity: str | None,
+) -> dict | None:
+  """Why install would not apply this candidate to ``app_id``, or None.
 
-  A permanent `package_id` binds the package across manifest id renames, as
-  it does for install, so a row that has one matches only that package.
+  Discovery applies install's one identity rule (``install.resolve_package_row``
+  with a Store update's inputs), so it never offers an update that install
+  would refuse, or apply to another row. The ``{code, message}`` is
+  update-check's ``candidate_rejected`` and the update preview's 409 detail.
+  Blocking (database reads, and a Git origin read for a legacy row): callers
+  run it in a worker thread, in its own short session.
   """
-  from app import install
+  from app import database, install
 
-  if installed_package_id:
-    return candidate_manifest.get("package_id") == installed_package_id
+  try:
+    install.validate_manifest_address(
+      manifest, manifest_url, package_id=package_id,
+    )
+    with database.SessionLocal() as db:
+      row = install.resolve_update_row(
+        db, manifest, manifest_url, source_identity,
+      ).row
+      row_id = row.id if row is not None else None
+  except HTTPException as exc:
+    return {"code": "identity_mismatch", "message": str(exc.detail)}
+  if row_id == app_id:
+    return None
+  return {
+    "code": "identity_mismatch",
+    "message": (
+      "This update source is a different app; installing it would add a "
+      "separate app."
+      if row_id is None else
+      "This update source belongs to another installed app."
+    ),
+  }
 
-  predecessor_source, _ = install._reviewed_predecessor_source(
-    candidate_manifest, candidate_manifest_url,
-  )
-  predecessor_matches = bool(
-    candidate_manifest.get("previous_id")
-    and install._catalog_identity_matches(
-      installed_manifest_url,
-      predecessor_source,
-      candidate_manifest["previous_id"],
-    )
-  )
-  return bool(
-    install._catalog_identity_matches(
-      installed_manifest_url,
-      candidate_manifest_url,
-      candidate_manifest["id"],
-    )
-    or predecessor_matches
-  )
+
+# Discovery reads a candidate only from the app's own Git origin, so a Store
+# listing at another repository is reported, not fetched. Install follows a
+# move whose new repository proves it is the same app (``resolve_package_row``).
+_REPOSITORY_MOVED = {
+  "code": "repository_moved",
+  "message": (
+    "The Store lists this app at a different repository than the one it was "
+    "installed from, so its update can't be checked here. If the app moved "
+    "there, reinstalling it from the Store updates this app when the new "
+    "repository proves it is the same app; otherwise it adds a separate app."
+  ),
+}
 
 
 def _update_manifest_source(
@@ -1454,9 +1451,10 @@ async def update_check(
   ``upstream``, or the App row, so it is safe to call on every Store open.
 
   ``manifest_url`` is an optional live catalog candidate. Installed provenance
-  remains immutable; when a candidate is supplied, its package identity must
-  match the installed package (or its reviewed predecessor) before its bytes
-  can influence availability.
+  remains immutable; the candidate must resolve to this row under install's
+  own identity rule (``install.resolve_package_row``) before its bytes can
+  influence availability. Otherwise `update_available` is null and
+  `candidate_rejected` says why.
 
   `update_available` is null (unknown) whenever the compare can't run — no
   `manifest_url`, no git repo, no recorded upstream branch, or the upstream
@@ -1495,17 +1493,19 @@ async def update_check(
   source_dir = app.source_dir
   installed_source_revision = app.upstream_commit
   installed_contract = app.capability_contract
+  installed_source_identity = app.source_identity
 
-  def _unknown() -> schemas.UpdateCheckOut:
+  def _unknown(rejection: dict | None = None) -> schemas.UpdateCheckOut:
     # Null is "we can't verify the source" — NOT an error. Do not manufacture
     # an update from a mutable version label. Shared by every precondition miss
-    # and fetch failure.
+    # and fetch failure; a candidate install would refuse says why.
     return schemas.UpdateCheckOut(
       update_available=None,
       upstream_version=None,
       local_version=local_version,
       installed_source_revision=installed_source_revision,
       checked_at=checked_at,
+      candidate_rejected=rejection,
     )
 
   if not installed_manifest_url:
@@ -1540,7 +1540,7 @@ async def update_check(
 
   async with fs_locks.source_dir_lock(str(repo)):
     try:
-      pending, pending_state = await asyncio.to_thread(
+      pending, pending_state = await settled.run_settled(
         _read_pending_update, repo, target_app_id,
       )
     except (OSError, subprocess.SubprocessError):
@@ -1561,6 +1561,8 @@ async def update_check(
   )
   try:
     commit = await _fetch_update_commit(repo, fetch_manifest_url)
+  except git_transfers.OriginMismatch:
+    return _unknown(dict(_REPOSITORY_MOVED))
   except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):
     return _unknown()
   # This lock is the response's linearization point. A concurrent install
@@ -1569,26 +1571,27 @@ async def update_check(
   async with fs_locks.source_dir_lock(str(repo)):
     try:
       # Discovery needs only the complete package identity, not its payload.
-      candidate = await asyncio.to_thread(
+      candidate = await settled.run_settled(
         install.read_git_package_summary, repo, commit,
       )
-      install.validate_manifest_address(
-        candidate.manifest, manifest_url or installed_manifest_url,
-        package_id=installed_package_id,
-      )
-      pending, pending_state = await asyncio.to_thread(
+      pending, pending_state = await settled.run_settled(
         _read_pending_update, repo, target_app_id,
       )
-      if manifest_url is not None and not _update_candidate_matches_installed(
-        installed_manifest_url, manifest_url, candidate.manifest,
-        installed_package_id,
-      ):
-        return _unknown()
+      # Install's own identity rule; database reads, no network.
+      rejection = await settled.run_settled(functools.partial(
+        _update_candidate_rejection,
+        target_app_id, candidate.manifest,
+        manifest_url or installed_manifest_url,
+        package_id=installed_package_id,
+        source_identity=installed_source_identity,
+      ))
+      if rejection is not None:
+        return _unknown(rejection)
       # The durable pending receipt wins before parsing/comparing a baseline.
       # This fence stays inside the source lock after the fetch/identity check.
       if pending is not None:
         return _pending_result(pending, pending_state)
-      recorded_package = await asyncio.to_thread(
+      recorded_package = await settled.run_settled(
         install.package_content_digest_from_git, repo, app_git.UPSTREAM_BRANCH,
       )
       # Real legacy owner data has no package manifest. Preserve its bridge /
@@ -1597,14 +1600,14 @@ async def update_check(
       if recorded_package is None:
         # Only real pre-manifest owner data needs source bytes. Re-read the
         # immutable candidate already fetched above, never another network ref.
-        legacy_candidate = await asyncio.to_thread(
+        legacy_candidate = await settled.run_settled(
           install.read_git_install_candidate,
           repo, candidate.commit, fetch_manifest_url, strict=False,
         )
-        recorded_tree = await asyncio.to_thread(
+        recorded_tree = await settled.run_settled(
           install.read_recorded_update_source, repo, legacy_candidate.runtime_tree,
         )
-        trusted_origin = await asyncio.to_thread(
+        trusted_origin = await settled.run_settled(
           install.trusted_catalog_checkout,
           installed_manifest_url, repo, fetch_manifest_url,
           candidate.manifest.get("id"),
@@ -1692,8 +1695,8 @@ async def update_candidate_preview(
   app = live_app_or_404(db, app_id)
   installed_manifest_url = app.manifest_url
   installed_package_id = app.package_id
+  installed_source_identity = app.source_identity
   source_dir = app.source_dir
-  upstream_commit = app.upstream_commit
   installed_contract = app.capability_contract
   if not installed_manifest_url:
     raise HTTPException(400, "App has no update source.")
@@ -1711,6 +1714,8 @@ async def update_candidate_preview(
   )
   try:
     commit = await _fetch_update_commit(repo, fetch_manifest_url)
+  except git_transfers.OriginMismatch:
+    raise HTTPException(409, detail=dict(_REPOSITORY_MOVED)) from None
   except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
     raise install.git_source_error(
       "The installed version was left unchanged.",
@@ -1719,25 +1724,22 @@ async def update_candidate_preview(
     ) from exc
   async with fs_locks.source_dir_lock(str(repo)):
     try:
-      candidate = await asyncio.to_thread(
+      candidate = await settled.run_settled(
         install.read_git_install_candidate, repo, commit, fetch_manifest_url,
       )
-      install.validate_manifest_address(
-        candidate.manifest, manifest_url or installed_manifest_url,
+      rejection = await settled.run_settled(functools.partial(
+        _update_candidate_rejection,
+        app_id, candidate.manifest, manifest_url or installed_manifest_url,
         package_id=installed_package_id,
-      )
-      if manifest_url is not None and not _update_candidate_matches_installed(
-        installed_manifest_url, manifest_url, candidate.manifest,
-        installed_package_id,
-      ):
-        raise HTTPException(
-          409, "Requested update source does not match the installed app.",
-        )
-      previous_source = await asyncio.to_thread(
+        source_identity=installed_source_identity,
+      ))
+      if rejection is not None:
+        raise HTTPException(409, detail=rejection)
+      previous_source = await settled.run_settled(
         install.read_recorded_update_source, repo, candidate.runtime_tree,
       )
       # Same source-lock snapshot as the candidate, as update-check reports it.
-      _, pending_state = await asyncio.to_thread(
+      _, pending_state = await settled.run_settled(
         _read_pending_update, repo, app_id,
       )
     except HTTPException:
@@ -1942,7 +1944,7 @@ async def _create_conflict_resolver_chat(
   db: Session, app_ids: list[int],
 ) -> schemas.AppConflictResolverChatOut:
   """Prepare the exact selected batch, then open its owner-visible resolver."""
-  from app import background_agents, install
+  from app import background_agents
 
   prepared = []
   sources = []
@@ -1996,8 +1998,8 @@ async def _create_conflict_resolver_chat(
     plans = []
     for app, repo, receipt in prepared:
       try:
-        plan = await install._to_completion(_validate_pending_update, repo, receipt)
-        upstream_version = await asyncio.to_thread(
+        plan = await settled.run_settled(_validate_pending_update, repo, receipt)
+        upstream_version = await settled.run_settled(
           _upstream_version, repo, app.upstream_commit,
         )
       except HTTPException as exc:
@@ -2021,7 +2023,7 @@ async def _create_conflict_resolver_chat(
     # Only idle retries may restore a checkout removed by an earlier abort.
     for app, repo, receipt, plan, _version in plans:
       try:
-        await install._to_completion(_park_pending_update, repo, receipt, plan)
+        await settled.run_settled(_park_pending_update, repo, receipt, plan)
       except HTTPException as exc:
         raise _resolver_app_error(exc, app.id) from exc
 
@@ -2124,39 +2126,16 @@ async def apply_app_source(
       },
     )
 
+  # Settled under the locks: a cancelled request must not release them while
+  # Apply's threads still write, nor cut Apply short before its rollback.
   async def _apply(app: models.App | None):
-    try:
-      return await app_apply.apply_source_revision(
-        db,
-        source_dir=source_dir,
-        app=app,
-        chat_id=body.chat_id,
-        accept_local_package=body.accept_local_package,
-      )
-    except app_apply.AppApplyError as exc:
-      raise HTTPException(
-        status_code=exc.status_code,
-        detail={"code": exc.code, "message": str(exc)},
-      ) from exc
-    except app_git.SourceTreeChanged as exc:
-      raise HTTPException(
-        status_code=409,
-        detail={"code": "source_changed", "message": str(exc)},
-      ) from exc
-    except CompileError as exc:
-      detail = {
-        "code": "compile_failed",
-        "message": str(exc),
-      }
-      # Strip colour before capping: escape codes inflate the text several
-      # times over, so a raw tail can lose the error line and its location.
-      stderr = readable_output(exc.stderr, limit=4000)
-      if stderr:
-        detail["stderr"] = stderr
-      raise HTTPException(status_code=422, detail=detail) from exc
-    except RolldownStalled as exc:
-      # Distinct from compile_failed: the source was not judged.
-      raise HTTPException(status_code=503, detail=exc.detail()) from exc
+    return await _apply_source_or_http(
+      db,
+      source_dir=source_dir,
+      app=app,
+      chat_id=body.chat_id,
+      accept_local_package=body.accept_local_package,
+    )
 
   async with fs_locks.install_uninstall_lock():
     matched = (
@@ -2176,26 +2155,8 @@ async def apply_app_source(
             ),
           },
         )
-      app_id = matched.id
-      async with (
-        fs_locks.app_storage_lock(app_id),
-        fs_locks.source_dir_lock(source_dir),
-      ):
-        app = (
-          db.query(models.App)
-          .populate_existing()
-          .filter(models.App.id == app_id, models.App.deleted_at.is_(None))
-          .first()
-        )
-        if app is None or app.source_dir != source_dir:
-          raise HTTPException(
-            status_code=409,
-            detail={
-              "code": "source_identity_changed",
-              "message": "The app source identity changed; retry the apply.",
-            },
-          )
-        result = await _apply(app)
+      async with _locked_app_source(db, matched.id, source_dir) as app:
+        result = await settled.settle(_apply(app), what="App apply")
     else:
       async with fs_locks.source_dir_lock(source_dir):
         _reject_if_source_dir_taken(db, source_dir, exclude_id=None)
@@ -2215,29 +2176,272 @@ async def apply_app_source(
               ),
             },
           )
-        result = await _apply(None)
+        result = await settled.settle(_apply(None), what="App apply")
 
-  event_type = "app_created" if result.mode == "created" else "app_updated"
-  if result.mode != "unchanged":
-    event = {"type": event_type, "appId": str(result.app.id)}
-    if result.mode == "created" and result.app.chat_id is not None:
-      event["chatId"] = str(result.app.chat_id)
-    get_system_broadcast().publish(event)
-    # Lifecycle refresh and workspace reveal are separate contracts. A preview
-    # action carries the REQUESTING chat (which may be modifying an app created
-    # elsewhere) and is emitted only after the coherent revision committed, so
-    # the shell never opens a half-written or failed build.
-    if body.chat_id:
-      get_system_broadcast().publish({
-        "type": "app_preview_ready",
-        "appId": str(result.app.id),
-        "chatId": str(body.chat_id),
-      })
+  _publish_apply_events(result, body.chat_id)
   return schemas.AppApplyOut(
     mode=result.mode,
     app=result.app,
     warnings=list(result.warnings),
   )
+
+
+@asynccontextmanager
+async def _locked_app_source(db: Session, app_id: int, source_dir: str):
+  """Hold one app's storage and source locks, yielding its row re-read under them.
+
+  Callers hold the install lock, which already rules out an uninstall or
+  reinstall; this catches only the app's source moving in the meantime.
+  """
+  async with (
+    fs_locks.app_storage_lock(app_id),
+    fs_locks.source_dir_lock(source_dir),
+  ):
+    app = (
+      db.query(models.App)
+      .populate_existing()
+      .filter(models.App.id == app_id, models.App.deleted_at.is_(None))
+      .first()
+    )
+    if app is None or app.source_dir != source_dir:
+      raise HTTPException(
+        status_code=409,
+        detail={
+          "code": "source_identity_changed",
+          "message": "The app source identity changed; try again.",
+        },
+      )
+    yield app
+
+
+async def _apply_source_or_http(
+  db: Session,
+  *,
+  source_dir: str,
+  app: models.App | None,
+  chat_id: str | None,
+  accept_local_package: bool = False,
+  expected_tree: app_git.WorktreeTree | None = None,
+):
+  """Accept one source revision, reporting failures as API errors."""
+  try:
+    return await app_apply.apply_source_revision(
+      db,
+      source_dir=source_dir,
+      app=app,
+      chat_id=chat_id,
+      accept_local_package=accept_local_package,
+      expected_tree=expected_tree,
+    )
+  except app_apply.AppApplyError as exc:
+    raise HTTPException(
+      status_code=exc.status_code,
+      detail={"code": exc.code, "message": str(exc)},
+    ) from exc
+  except app_git.SourceTreeChanged as exc:
+    raise HTTPException(
+      status_code=409,
+      detail={"code": "source_changed", "message": str(exc)},
+    ) from exc
+  except CompileError as exc:
+    detail = {
+      "code": "compile_failed",
+      "message": str(exc),
+    }
+    # Strip colour before capping: escape codes inflate the text several
+    # times over, so a raw tail can lose the error line and its location.
+    stderr = readable_output(exc.stderr, limit=4000)
+    if stderr:
+      detail["stderr"] = stderr
+    raise HTTPException(status_code=422, detail=detail) from exc
+  except RolldownStalled as exc:
+    # Distinct from compile_failed: the source was not judged.
+    raise HTTPException(status_code=503, detail=exc.detail()) from exc
+
+
+def _publish_apply_events(result, chat_id: str | None) -> None:
+  event_type = "app_created" if result.mode == "created" else "app_updated"
+  if result.mode == "unchanged":
+    return
+  event = {"type": event_type, "appId": str(result.app.id)}
+  if result.mode == "created" and result.app.chat_id is not None:
+    event["chatId"] = str(result.app.chat_id)
+  get_system_broadcast().publish(event)
+  # Lifecycle refresh and workspace reveal are separate contracts. A preview
+  # action carries the REQUESTING chat (which may be modifying an app created
+  # elsewhere) and is emitted only after the coherent revision committed, so
+  # the shell never opens a half-written or failed build.
+  if chat_id:
+    get_system_broadcast().publish({
+      "type": "app_preview_ready",
+      "appId": str(result.app.id),
+      "chatId": str(chat_id),
+    })
+
+
+def _listing_image(value: schemas.StoreListingImageIn | None, what: str):
+  if value is None:
+    return None
+  if value.data_base64 is not None:
+    try:
+      data = base64.b64decode(value.data_base64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+      raise HTTPException(
+        status_code=422,
+        detail={"code": "listing_image_invalid", "message": f"The {what} upload is damaged."},
+      ) from exc
+    return store_listing_source.ListingImage(data=data)
+  return store_listing_source.ListingImage(path=value.path or "")
+
+
+def _unapplied_changes() -> HTTPException:
+  return HTTPException(
+    status_code=409,
+    detail={
+      "code": "source_has_draft",
+      "message": (
+        "This app has changes that haven't been applied yet. Finish "
+        "them first, or ask an agent to."
+      ),
+    },
+  )
+
+
+@router.put(
+  "/{app_id}/store-listing",
+  response_model=schemas.AppApplyOut,
+  dependencies=[Depends(reject_cross_site)],
+)
+async def save_store_listing(
+  app_id: int,
+  body: schemas.StoreListingIn,
+  db: Session = Depends(get_db),
+  _: models.Owner = Depends(get_owner_or_app_with_manage_apps),
+):
+  """Write the owner's Store listing into the app source and accept it.
+
+  The save is one accepted revision containing only the listing: an app with
+  unaccepted edits in progress is refused rather than swept into it. A failed
+  accept restores edited bytes only before Git advances; afterward its clean
+  Git revision remains as the normal retry point.
+  """
+  edit = store_listing_source.ListingEdit(
+    tagline=body.tagline,
+    description=body.description,
+    icon=_listing_image(body.icon, "app icon"),
+    hero=_listing_image(body.hero, "banner image"),
+    screenshots=tuple(
+      store_listing_source.ListingScreenshot(
+        image=_listing_image(shot, f"screenshot {index}"),
+        alt=shot.alt,
+        label=shot.label or "",
+      )
+      for index, shot in enumerate(body.screenshots, start=1)
+    ),
+  )
+  async with fs_locks.install_uninstall_lock():
+    found = (
+      db.query(models.App)
+      .filter(models.App.id == app_id, models.App.deleted_at.is_(None))
+      .first()
+    )
+    if found is None or not found.source_dir:
+      raise HTTPException(
+        status_code=404,
+        detail={"code": "app_not_found", "message": "App not found."},
+      )
+    source_dir = str(found.source_dir)
+    if _validate_source_dir(source_dir, get_settings().data_dir) != source_dir:
+      raise HTTPException(
+        status_code=409,
+        detail={
+          "code": "source_identity_changed",
+          "message": "The app source directory changed while saving. Try again.",
+        },
+      )
+    async with _locked_app_source(db, app_id, source_dir) as app:
+      source = Path(source_dir)
+      if not await settled.run_settled(app_git.is_repo, source):
+        raise HTTPException(
+          status_code=409,
+          detail={
+            "code": "source_unavailable",
+            "message": "This app has no versioned source to hold a listing.",
+          },
+        )
+      head_before_apply = await settled.run_settled(app_git.head_sha, source, "HEAD")
+      accepted_before_apply = app.source_commit
+      # Unapplied edits, committed or not, are unreviewed; only listing files
+      # an interrupted or failed save left behind may ride along.
+      if await settled.run_settled(
+        store_listing_source.has_unapplied_changes, source, accepted_before_apply,
+      ):
+        raise _unapplied_changes()
+      async def write_and_accept():
+        try:
+          undo = await settled.run_settled(
+            store_listing_source.write_listing, source, app, edit,
+          )
+        except store_listing_source.ListingEditError as exc:
+          raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": str(exc)},
+          ) from exc
+        try:
+          # Check the exact tree apply will accept, then accept only that
+          # tree: hidden index flags or an edit landing after this check
+          # cannot slip unreviewed source in.
+          candidate = await settled.run_settled(app_git.snapshot_worktree, source)
+          if await settled.run_settled(
+            store_listing_source.changes_beyond_listing,
+            source, accepted_before_apply, candidate.tree_oid,
+          ):
+            raise _unapplied_changes()
+          return await _apply_source_or_http(
+            db, source_dir=source_dir, app=app, chat_id=None,
+            expected_tree=candidate,
+          )
+        except BaseException:
+          # Apply may have committed Git before a later build/publish step
+          # failed. That commit is its intentional retry point; restoring only
+          # worktree bytes would instead strand a dirty tree behind HEAD.
+          accepted_now = db.query(models.App.source_commit).filter_by(id=app_id).scalar()
+          if (
+            accepted_now == accepted_before_apply
+            and await settled.run_settled(app_git.head_sha, source, "HEAD") == head_before_apply
+          ):
+            await settled.run_settled(undo)
+          raise
+
+      what = f"Saving the Store listing of app {app_id}"
+
+      def saved_after_cancel(task: asyncio.Future) -> None:
+        # The revision is accepted even though nobody awaits the response, so
+        # the shell still hears about it.
+        if task.exception() is None:
+          _publish_apply_events(task.result(), None)
+        else:
+          settled.log_abandoned_failure(task, what)
+
+      # A cancelled request keeps the source lock until the write and accept
+      # settle; otherwise an undo could race the accept's Git ref move.
+      result = await settled.settle(
+        write_and_accept(), what=what, abandoned=saved_after_cancel,
+      )
+  _publish_apply_events(result, None)
+  warnings = list(result.warnings)
+  if app_apply.STORE_LOCAL_PACKAGE_DIVERGED in warnings:
+    # Addressed to agents applying by hand; say what it means for a listing.
+    warnings.remove(app_apply.STORE_LOCAL_PACKAGE_DIVERGED)
+    warnings.append(_STORE_APP_LISTING_SAVED)
+  return schemas.AppApplyOut(mode=result.mode, app=result.app, warnings=warnings)
+
+
+_STORE_APP_LISTING_SAVED = (
+  "This app was installed from the Store. The listing is saved in its source "
+  "and will be published from there, but the installed app keeps its current "
+  "icon and details until it is updated."
+)
 
 
 def _pending_store_update_app(
@@ -2270,7 +2474,7 @@ def _pending_store_update_app(
 def _pending_store_update_receipt(app: models.App, source_dir: str) -> dict:
   from app import install
 
-  receipt = install.read_pending_conflict_update_receipt(
+  receipt = pending_update.read_pending_conflict_update_receipt(
     source_dir,
     app_id=app.id,
     upstream_commit=app.upstream_commit,
@@ -2333,7 +2537,7 @@ async def resolve_app_update(
       fs_locks.source_dir_lock(source_dir),
     ):
       app = _pending_store_update_app(db, source_dir, app_id=app_id)
-      if not install.pending_update_receipt_file(source_dir).is_file() and (
+      if not pending_update.pending_update_receipt_file(source_dir).is_file() and (
         app.upstream_commit
         and app_git.ref_is_ancestor(
           source_dir, app.upstream_commit, app_git.LOCAL_BRANCH,
@@ -2341,7 +2545,7 @@ async def resolve_app_update(
       ):
         # Already installed: a retry after a lost response, or a finish that
         # stopped after removing its receipt. Clear any leftover checkout.
-        await install.clear_pending_conflict_update(db, app)
+        await pending_update.clear_pending_conflict_update(db, app)
         get_system_broadcast().publish(
           {"type": "app_updated", "appId": str(app.id)}
         )
@@ -2352,7 +2556,7 @@ async def resolve_app_update(
           ),
         )
       receipt = _pending_store_update_receipt(app, source_dir)
-      await install._to_completion(
+      await settled.run_settled(
         _require_pending_resolution, Path(source_dir),
         receipt["upstream_commit"],
       )
@@ -2387,7 +2591,7 @@ async def resolve_app_update(
           fs_locks.app_storage_lock(app_id),
           fs_locks.source_dir_lock(source_dir),
         ):
-          await install.clear_pending_conflict_update(db, app)
+          await pending_update.clear_pending_conflict_update(db, app)
       raise
 
   reapplied = result.app
@@ -2649,7 +2853,7 @@ async def update_app(
               "message": "Only a local app can attach a separate distribution manifest.",
             },
           )
-        accepted_id, accepted_digest = await asyncio.to_thread(
+        accepted_id, accepted_digest = await settled.run_settled(
           _accepted_local_distribution_package, app,
         )
         if distribution_candidate.manifest["id"] != accepted_id:
@@ -2664,10 +2868,7 @@ async def update_app(
               ),
             },
           )
-        published_digest = install.install_candidate_content_digest(
-          distribution_candidate,
-        )
-        if published_digest != accepted_digest:
+        if distribution_candidate.source_review_digest != accepted_digest:
           raise HTTPException(
             409,
             {
@@ -2794,7 +2995,7 @@ async def publish_hosted_app(
       )
     previous_bundle = app.public_bundle_path
     try:
-      new_bundle, bundle_digest = await asyncio.to_thread(
+      new_bundle, bundle_digest = await settled.run_settled(
         publish_public_bundle, app.id, app.compiled_path,
       )
       if bundle_digest != current_digest:
@@ -3157,13 +3358,13 @@ async def delete_app(
     # the tombstone is durable, terminate every verified group; a wrapper that
     # races in afterward observes the tombstone and exits before spawning work.
     try:
-      await asyncio.to_thread(app_jobs.terminate_app_jobs, app_id)
+      await settled.run_settled(app_jobs.terminate_app_jobs, app_id)
     except Exception:
       log.exception(
         "App %s was deleted but its supervised jobs could not be terminated",
         app_id,
       )
-    from app.install import deactivate_app_skills
+    from app.app_skills import deactivate_app_skills
     try:
       for warning in await deactivate_app_skills(app_id):
         log.warning("uninstall: %s", warning)
@@ -3190,7 +3391,7 @@ async def delete_app(
     try:
       resolved_source = _resolve_app_source_dir(app_source_dir)
       async with fs_locks.source_dir_lock(str(resolved_source)):
-        await app_cron.run_schedule_mutation(_drop_cron_only, resolved_source)
+        await settled.run_settled(_drop_cron_only, resolved_source)
     except Exception:
       log.exception(
         "App %s was deleted but its source cron could not be disabled",
@@ -3277,8 +3478,8 @@ async def delete_app_data(
     # failure would rotate the nonce and answer 204 while artifact values the
     # owner asked to erase are still on disk and readable by the still-live app.
     try:
-      await asyncio.to_thread(_rmtree_strict, storage_dir)
-      await asyncio.to_thread(_rmtree_strict, secrets_dir)
+      await settled.run_settled(_rmtree_strict, storage_dir)
+      await settled.run_settled(_rmtree_strict, secrets_dir)
     except OSError as exc:
       log.error("app %s data wipe failed: %s", app.id, exc)
       raise HTTPException(
@@ -3380,7 +3581,11 @@ async def recover_app(
           # recompile_app_bundle commits internally, but the row remains
           # tombstoned until the separate commit below. A crash or compile error
           # therefore cannot expose a stale or partially rebuilt app.
-          await recompile_app_bundle(db, app, app.jsx_source)
+          # Settled: it writes and publishes the bundle under these locks.
+          await settled.settle(
+            recompile_app_bundle(db, app, app.jsx_source),
+            what="App recovery rebuild",
+          )
         except RuntimeError as exc:
           db.rollback()
           raise HTTPException(
@@ -3418,7 +3623,7 @@ async def recover_app(
     try:
       resolved_source = _resolve_app_source_dir(app_source_dir)
       async with fs_locks.source_dir_lock(str(resolved_source)):
-        await app_cron.run_schedule_mutation(
+        await settled.run_settled(
           _reenable_init_cron_replay, resolved_source,
         )
     except Exception:
@@ -3437,7 +3642,7 @@ async def recover_app(
         cron_db.close()
 
     try:
-      _cron_count, _cron_warnings, _cron_infrastructure_ready = await app_cron.run_schedule_mutation(
+      _cron_count, _cron_warnings, _cron_infrastructure_ready = await settled.run_settled(
         _reconcile_recovered_cron,
       )
       if _cron_count:
@@ -3449,7 +3654,7 @@ async def recover_app(
         "App %s was recovered but cron supervision could not be reconciled",
         app_id,
       )
-    from app.install import restore_app_skills
+    from app.app_skills import restore_app_skills
     try:
       for warning in await restore_app_skills(app_id):
         log.warning("recover: %s", warning)

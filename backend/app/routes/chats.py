@@ -1618,7 +1618,7 @@ async def patch_chat(
       # problem at pick-time.
       from app.providers import get_provider
       candidate = get_provider(target_provider)
-      auth_error = await run_in_threadpool(
+      auth_error = await run_in_threadpool(  # unsettled: read-only (provider sign-in check)
         candidate.check_auth, get_app_settings().data_dir
       )
       if auth_error is not None:

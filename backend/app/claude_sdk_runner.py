@@ -81,7 +81,7 @@ from claude_agent_sdk.types import (
   UserMessage,
 )
 
-from app import activity, generated_files, tracing
+from app import activity, generated_files, settled, tracing
 from app.memory_observability import cgroup_oom_kill_count, process_was_oom_killed
 from app.claude_events import (
   NativeContinuationTracker,
@@ -859,22 +859,16 @@ class ActiveClaudeClient:
     ):
       return
     self._force_stop_started = True
-    reap_task = asyncio.create_task(asyncio.to_thread(
-      _terminate_claude_processes, self._process_group_id, self._run_marker,
-    ))
-    deferred_cancel: asyncio.CancelledError | None = None
-    while not reap_task.done():
+    process_group_id, run_marker = self._process_group_id, self._run_marker
+
+    def reap() -> None:
       try:
-        await asyncio.shield(reap_task)
-      except asyncio.CancelledError as exc:
-        deferred_cancel = deferred_cancel or exc
-    try:
-      reap_task.result()
-    except Exception:
-      log.warning("Claude process-group cleanup failed chat_id=%s", self.chat_id,
-                  exc_info=True)
-    if deferred_cancel is not None:
-      raise deferred_cancel
+        _terminate_claude_processes(process_group_id, run_marker)
+      except Exception:
+        log.warning("Claude process-group cleanup failed chat_id=%s", self.chat_id,
+                    exc_info=True)
+
+    await settled.run_settled(reap)
 
   def mark_finished(self) -> None:
     """Resolves the stop waiter once the runner is fully drained."""
@@ -1772,32 +1766,34 @@ async def run_claude_sdk_turn(
         "error": str(exc),
       }
     finally:
+      # Each awaited step below runs to its end: a cancellation landing in one
+      # is held until the unregister, disconnect and reap have all run.
+      teardown = settled.Teardown(log, f"chat_id={chat_id}")
       active_client.close_admission()
-      queue_cancel_failed = False
-      try:
-        await active_client.cancel_native_queue()
-      except Exception:
-        queue_cancel_failed = True
-        log.exception("Claude native queue cancellation failed chat_id=%s", chat_id)
+      queue_cancel_failed = not await teardown.step(
+        active_client.cancel_native_queue(), "Claude native queue cancellation",
+      )
       # A failed receipt seal ends the turn with an explicit error. Preserve
       # proven consumption before final file events so the pending row cannot
       # be blindly replayed, and later output stays on its correct side. Never
       # manufacture delivery for unacknowledged stdin writes.
       from app.chat_queue import get_lock
-      try:
+
+      async def seal_consumed_input() -> None:
         async with get_lock(chat_id):
           if registry.current_generation(chat_id) == active_client._run_generation:
             await _seal_steer_split(bc, active_client, chat_id)
-      except Exception:
-        log.exception("Claude consumed-input seal failed chat_id=%s", chat_id)
-      try:
-        await generated_files.publish_inbox_files(
+
+      await teardown.step(seal_consumed_input(), "Claude consumed-input seal")
+      await teardown.step(
+        generated_files.publish_inbox_files(
           bc,
           data_dir=generated_data_dir,
           chat_id=chat_id,
-        )
-      except Exception:
-        log.debug("generated-file turn capture failed", exc_info=True)
+        ),
+        "generated-file capture",
+        level=logging.DEBUG,
+      )
       current_handle = registry.get_handle(chat_id, RunnerKind.CLAUDE_SDK)
       if current_handle is active_client:
         registry.unregister(chat_id, RunnerKind.CLAUDE_SDK)
@@ -1818,6 +1814,9 @@ async def run_claude_sdk_turn(
           finally:
             active_client.mark_finished()
             from app.file_cache import reclaim_provider_cache
-            await reclaim_provider_cache("claude")
+            try:
+              await reclaim_provider_cache("claude")
+            finally:
+              teardown.finish()
 
   return await _run_once()
