@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -24,9 +25,6 @@ _vapid: Vapid | None = None
 _QUIET_PUSH_SOURCE_TYPES = frozenset({
   "platform_conflict",
   "platform_update",
-  # Native push relay problems: telling the owner by push about push failing
-  # would loop, so the notice stays in the bell.
-  "push_relay",
   "shell",
   "shell_rebuild",
   "shell_rebuilding",
@@ -145,6 +143,27 @@ class _PreparedPush:
   notification_id: str
   payload: dict
   subscriptions: tuple[dict, ...]
+  # Native push devices (Möbius mobile app): {"id", "token"} each.
+  devices: tuple[dict, ...] = ()
+
+
+# APNs caps a collapse id at 64 bytes; FCM accepts the same key.
+_COLLAPSE_KEY_MAX = 64
+_RELAY_BATCH = 100
+
+
+def _collapse_key(tag: str | None, notification_id: str) -> str:
+  key = tag or notification_id
+  if len(key) <= _COLLAPSE_KEY_MAX:
+    return key
+  return "c:" + hashlib.sha256(key.encode()).hexdigest()[:_COLLAPSE_KEY_MAX - 2]
+
+
+def _tap_url(target: str | None) -> str:
+  """The phone opens this on tap: always a page of this installation."""
+  if not isinstance(target, str) or not target.startswith("/") or target.startswith("//"):
+    target = "/shell/"
+  return get_settings().frontend_origin.rstrip("/") + target
 
 
 def _prepare_owner_notification(
@@ -295,22 +314,6 @@ def _prepare_owner_notification(
     "tag": f"{source_type}:{source_id or ''}:{tag}" if tag else None,
   }
 
-  # Native push to the mobile app passes the same gates as Web Push, is only
-  # queued here, and is sent by push_native's worker. Queueing is a separate
-  # transaction after the history row, so its failure must not cost the
-  # owner's Web Push.
-  from app import push_native
-  try:
-    push_native.queue_notification(
-      db, owner_id, notification_id,
-      collapse_key=push_native.collapse_key_for(payload["tag"], notification_id),
-    )
-  except Exception:
-    db.rollback()
-    logger.exception(
-      "native push queueing failed for notification %s", notification_id[:8],
-    )
-
   subscriptions = [
     {
       "id": sub.id,
@@ -324,6 +327,14 @@ def _prepare_owner_notification(
       .all()
     )
   ]
+  devices = [
+    {"id": device_id, "token": token}
+    for device_id, token in (
+      db.query(models.PushDevice.id, models.PushDevice.token)
+      .filter(models.PushDevice.owner_id == owner_id)
+      .all()
+    )
+  ]
   # Web Push is remote I/O and may wait on several endpoints. Copy the four
   # scalar fields we need, then release the checkout before delivery. If stale
   # subscriptions are found, delivery opens a fresh short cleanup transaction.
@@ -332,6 +343,7 @@ def _prepare_owner_notification(
     notification_id=notification_id,
     payload=payload,
     subscriptions=tuple(subscriptions),
+    devices=tuple(devices),
   )
 
 
@@ -350,13 +362,54 @@ def _deliver_prepared_push(prepared: _PreparedPush) -> None:
     except Exception:
       logger.exception("push delivery failed for sub %s", sub["id"][:8])
 
-  if stale_ids:
+  stale_devices = _deliver_native(prepared)
+
+  if stale_ids or stale_devices:
     from app.database import SessionLocal
     with SessionLocal() as cleanup_db:
       cleanup_db.query(models.PushSubscription).filter(
         models.PushSubscription.id.in_(stale_ids)
       ).delete(synchronize_session=False)
+      cleanup_db.query(models.PushDevice).filter(
+        models.PushDevice.id.in_(stale_devices)
+      ).delete(synchronize_session=False)
       cleanup_db.commit()
+
+
+def _deliver_native(prepared: _PreparedPush) -> list[str]:
+  """Send to the owner's phones through the relay; returns dead device ids.
+
+  Like Web Push there is no retry: a failed send leaves the notification in
+  the owner's history. Logs name device ids only, never tokens or content.
+  """
+  devices = prepared.devices
+  if not devices:
+    return []
+  from app import push_relay
+
+  payload = prepared.payload
+  stale = []
+  for start in range(0, len(devices), _RELAY_BATCH):
+    batch = devices[start:start + _RELAY_BATCH]
+    try:
+      statuses = push_relay.send(
+        [device["token"] for device in batch],
+        title=payload["title"],
+        body=payload["body"] or "",
+        data={"url": _tap_url(payload["target"]), "notificationId": prepared.notification_id},
+        collapse_key=_collapse_key(payload["tag"], prepared.notification_id),
+      )
+    except push_relay.RelayError as exc:
+      logger.warning(
+        "native push to %d device(s) failed: %s", len(batch), exc.code,
+      )
+      continue
+    for device, status in zip(batch, statuses):
+      if status == "invalid_token":
+        stale.append(device["id"])
+      elif status != "ok":
+        logger.warning("native push to device %s: %s", device["id"][:8], status)
+  return stale
 
 
 def notify_owner(

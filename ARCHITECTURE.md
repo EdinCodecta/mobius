@@ -277,8 +277,7 @@ FastAPI app. `main.py` is the factory (CORS, rate limiting, routers, static serv
 | `self_reminders.py` | Agent self-scheduling: append-only store of relational check-ins |
 | `theme.py` | Theme CSS management and HTML injection |
 | `push.py` | VAPID key management and Web Push delivery |
-| `push_native.py` | Native push to the mobile app: device registry, outbox, delivery worker |
-| `push_relay.py` | Wire contract for the mobius.you push relay (via the identity broker) |
+| `push_relay.py` | Native push to the mobile app via the mobius.you relay (through the identity broker) |
 
 ### Recovery boundary
 

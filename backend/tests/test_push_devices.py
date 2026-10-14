@@ -1,82 +1,100 @@
-"""Native push device registration: upsert, move, rotation and sign-out."""
+"""Native push devices: registration with the relay, delivery and cleanup."""
 
 from __future__ import annotations
 
 import pytest
 
-from app import models
+from app import models, push_relay
+from app.push import notify_owner
 
 FCM = "fcm:" + "a" * 140
 APNS = "ab" * 32
+
+
+class FakeRelay:
+  def __init__(self, monkeypatch):
+    self.binds, self.unbinds, self.sends = [], [], []
+    self.error = None
+    self.statuses = None
+
+    def bind_device(**kwargs):
+      self.binds.append(kwargs)
+      if self.error is not None:
+        raise self.error
+
+    def unbind_device(token):
+      self.unbinds.append(token)
+      if self.error is not None:
+        raise self.error
+
+    def send(tokens, **message):
+      self.sends.append((list(tokens), message))
+      if self.error is not None:
+        raise self.error
+      return self.statuses or ["ok"] * len(tokens)
+
+    monkeypatch.setattr(push_relay, "bind_device", bind_device)
+    monkeypatch.setattr(push_relay, "unbind_device", unbind_device)
+    monkeypatch.setattr(push_relay, "send", send)
+
+
+@pytest.fixture
+def relay(monkeypatch):
+  return FakeRelay(monkeypatch)
 
 
 def _put(client, auth, **body):
   return client.put("/api/push/devices", headers=auth, json={"platform": "android", **body})
 
 
-def _rows(db):
+def _tokens(db):
   db.expire_all()
-  return db.query(models.PushDevice).order_by(models.PushDevice.created_at).all()
+  return [row.token for row in db.query(models.PushDevice).order_by(models.PushDevice.created_at)]
 
 
-def test_registering_the_same_token_twice_updates_one_device(client, auth, db):
-  first = _put(client, auth, token=FCM)
-  second = _put(client, auth, token=FCM)
-
-  assert first.status_code == 200 and first.json()["status"] == "registered"
-  assert second.json() == {"id": first.json()["id"], "status": "updated"}
-  [device] = _rows(db)
-  assert device.provider == "fcm" and device.relay_state == "bind_pending"
+def _owner_id(db):
+  return db.query(models.Owner).filter_by(username="test").one().id
 
 
-def test_a_token_registered_under_another_owner_moves_to_the_caller(client, auth, db):
-  other = models.Owner(username="previous-owner", hashed_password="x")
-  db.add(other)
-  db.flush()
-  db.add(models.PushDevice(
-    id="dev-other", owner_id=other.id, token=FCM, platform="android",
-    relay_state="bound",
-  ))
-  db.commit()
+def test_registering_binds_at_the_relay_then_stores_one_device(client, auth, db, relay):
+  assert _put(client, auth, token=FCM).json() == {"status": "registered"}
+  assert _put(client, auth, token=FCM).status_code == 200
+
+  assert [b["token"] for b in relay.binds] == [FCM, FCM]
+  assert _tokens(db) == [FCM]
+
+
+def test_ios_apns_fields_are_stored_lower_case_and_passed_to_the_relay(client, auth, db, relay):
+  _put(client, auth, token=FCM, platform="ios", apnsToken=APNS.upper(), apnsEnvironment="sandbox")
+
+  assert relay.binds[0]["apns_token"] == APNS
+  device = db.query(models.PushDevice).one()
+  assert (device.apns_token, device.apns_environment) == (APNS, "sandbox")
+
+
+@pytest.mark.parametrize(("status", "code"), [(401, 409), (503, 502)])
+def test_a_refused_bind_stores_nothing_and_explains_why(client, auth, db, relay, status, code):
+  relay.error = push_relay.RelayError(f"http_{status}", status=status)
 
   response = _put(client, auth, token=FCM)
 
-  assert response.json() == {"id": "dev-other", "status": "moved"}
-  [device] = _rows(db)
-  caller = db.query(models.Owner).filter_by(username="test").one()
-  assert device.owner_id == caller.id
-  assert device.relay_state == "bind_pending", "the relay must learn the new owner"
+  assert response.status_code == code
+  if code == 409:
+    assert "mobius.you account" in response.json()["detail"]
+  assert _tokens(db) == []
 
 
-def test_rotation_retires_the_replaced_token(client, auth, db):
+def test_a_token_registered_under_another_owner_moves_to_the_caller(client, auth, db, relay):
+  other = models.Owner(username="previous-owner", hashed_password="x")
+  db.add(other)
+  db.flush()
+  db.add(models.PushDevice(id="dev-other", owner_id=other.id, token=FCM, platform="android"))
+  db.commit()
+
   _put(client, auth, token=FCM)
-  rotated = FCM[:-1] + "b"
 
-  _put(client, auth, token=rotated, replacesToken=FCM)
-
-  states = {row.token: row.relay_state for row in _rows(db)}
-  assert states == {FCM: "unbind_pending", rotated: "bind_pending"}
-  listed = client.get("/api/push/devices", headers=auth).json()["devices"]
-  assert [d["tokenTail"] for d in listed] == [rotated[-6:]]
-
-
-def test_the_same_apns_token_under_a_new_fcm_token_is_the_same_phone(client, auth, db):
-  ios = {"platform": "ios", "apnsToken": APNS.upper(), "apnsEnvironment": "sandbox"}
-  _put(client, auth, token=FCM, **ios)
-  _put(client, auth, token=FCM[:-1] + "c", **ios)
-
-  rows = _rows(db)
-  assert [r.relay_state for r in rows] == ["unbind_pending", "bind_pending"]
-  assert rows[1].apns_token == APNS, "APNs tokens are stored lower-case"
-
-
-def test_a_signed_out_token_that_registers_again_is_revived(client, auth, db):
-  _put(client, auth, token=FCM)
-  client.request("DELETE", "/api/push/devices", headers=auth, json={"token": FCM})
-
-  assert _put(client, auth, token=FCM).json()["status"] == "updated"
-  [device] = _rows(db)
-  assert device.disabled_at is None and device.relay_state == "bind_pending"
+  db.expire_all()
+  assert db.get(models.PushDevice, "dev-other").owner_id == _owner_id(db)
 
 
 @pytest.mark.parametrize("body", [
@@ -86,52 +104,76 @@ def test_a_signed_out_token_that_registers_again_is_revived(client, auth, db):
   {"token": FCM, "apnsToken": APNS, "apnsEnvironment": "sandbox"},
   {"token": FCM, "platform": "ios", "apnsToken": APNS},
   {"token": FCM, "platform": "ios", "apnsToken": "not-hex", "apnsEnvironment": "sandbox"},
-  {"token": FCM, "replacesToken": "two words"},
 ])
-def test_malformed_registrations_are_refused(client, auth, db, body):
+def test_malformed_registrations_are_refused_before_the_relay(client, auth, db, relay, body):
   assert _put(client, auth, **body).status_code == 422
-  assert _rows(db) == []
+  assert relay.binds == [] and _tokens(db) == []
 
 
-def test_sign_out_is_idempotent_and_hides_the_device(client, auth, db):
+def test_sign_out_removes_the_device_unbinds_it_and_is_idempotent(client, auth, db, relay):
   _put(client, auth, token=FCM)
 
   for _ in range(2):
     response = client.request("DELETE", "/api/push/devices", headers=auth, json={"token": FCM})
     assert response.status_code == 204
-  assert client.request(
-    "DELETE", "/api/push/devices", headers=auth, json={"token": "never-registered"},
-  ).status_code == 204
-  assert client.get("/api/push/devices", headers=auth).json() == {"devices": []}
+  assert _tokens(db) == [] and relay.unbinds == [FCM]
 
 
-def test_the_device_list_never_returns_a_full_token(client, auth):
-  _put(client, auth, token=FCM, platform="ios", apnsToken=APNS, apnsEnvironment="production")
-
-  response = client.get("/api/push/devices", headers=auth)
-
-  assert FCM not in response.text and APNS not in response.text
-  [device] = response.json()["devices"]
-  assert device["tokenTail"] == FCM[-6:] and device["hasApnsToken"] is True
-
-
-def test_test_notification_needs_an_active_phone_and_then_queues_one(client, auth, db):
-  assert client.post("/api/push/devices/test", headers=auth).status_code == 409
-  _put(client, auth, token="fcm:disabled-device")
-  disabled = db.query(models.PushDevice).one()
-  disabled.disabled_at = disabled.created_at
-  db.commit()
-  assert client.post("/api/push/devices/test", headers=auth).status_code == 409
-
+def test_sign_out_still_removes_the_device_when_the_relay_is_down(client, auth, db, relay):
   _put(client, auth, token=FCM)
-  response = client.post("/api/push/devices/test", headers=auth)
+  relay.error = push_relay.RelayError("unreachable:ConnectError")
 
-  assert response.status_code == 202
-  db.expire_all()
-  [delivery] = db.query(models.PushDelivery).all()
-  assert delivery.notification_id == response.json()["notificationId"]
+  response = client.request("DELETE", "/api/push/devices", headers=auth, json={"token": FCM})
+
+  assert response.status_code == 204 and _tokens(db) == []
+
+
+def test_an_owner_notification_reaches_every_phone_with_a_tap_url(client, auth, db, relay):
+  _put(client, auth, token=FCM)
+  _put(client, auth, token=FCM + "b")
+
+  notification_id = notify_owner(
+    db, _owner_id(db), title="Build finished", body="Open it when ready.",
+    source_type="agent", target="/shell/?chat=chat-1", tag="done",
+  )
+
+  [(tokens, message)] = relay.sends
+  assert sorted(tokens) == [FCM, FCM + "b"]
+  assert message["title"] == "Build finished"
+  assert message["data"]["notificationId"] == notification_id
+  assert message["data"]["url"].startswith("http")
+  assert message["data"]["url"].endswith("/shell/?chat=chat-1")
+  assert message["collapse_key"] == "agent::done"
+
+
+def test_an_invalid_token_is_deleted_and_others_are_kept(client, auth, db, relay):
+  _put(client, auth, token=FCM)
+  _put(client, auth, token=FCM + "b")
+  relay.statuses = ["invalid_token", "ok"]
+
+  notify_owner(db, _owner_id(db), title="Hi", body=None, source_type="agent")
+
+  survivors = _tokens(db)
+  assert len(survivors) == 1 and survivors[0] == relay.sends[0][0][1]
+
+
+def test_a_relay_outage_keeps_the_devices_and_the_history(client, auth, db, relay):
+  _put(client, auth, token=FCM)
+  relay.error = push_relay.RelayError("http_503", status=503)
+
+  notification_id = notify_owner(db, _owner_id(db), title="Hi", body=None, source_type="agent")
+
+  assert _tokens(db) == [FCM]
+  assert db.get(models.Notification, notification_id) is not None
+
+
+def test_quiet_maintenance_notices_never_reach_the_phone(client, auth, db, relay):
+  _put(client, auth, token=FCM)
+
+  notify_owner(db, _owner_id(db), title="Updated", body=None, source_type="platform_update")
+
+  assert relay.sends == []
 
 
 def test_device_routes_require_authentication(client):
-  assert client.get("/api/push/devices").status_code == 401
   assert client.put("/api/push/devices", json={"token": FCM, "platform": "android"}).status_code == 401

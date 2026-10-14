@@ -1786,7 +1786,6 @@ export const api = {
         // Sign-out reloads the page right after; let the request finish.
         keepalive: true,
       }),
-      sendTest: () => apiFetch('/push/devices/test', { method: 'POST' }),
     },
   },
 }

@@ -911,8 +911,8 @@ _PUSH_TOKEN = re.compile(r"^[\x21-\x7e]{1,4096}$")
 _APNS_TOKEN = re.compile(r"^[0-9a-fA-F]{64,200}$")
 
 
-def _push_token(value: str | None) -> str | None:
-  if value is not None and not _PUSH_TOKEN.fullmatch(value):
+def _push_token(value: str) -> str:
+  if not _PUSH_TOKEN.fullmatch(value):
     raise ValueError("Push token is not valid.")
   return value
 
@@ -921,8 +921,7 @@ class PushDeviceRegisterRequest(BaseModel):
   """What the mobile app's ``MobiusNative.registerPush()`` returned.
 
   ``apnsToken``/``apnsEnvironment`` arrive only from app versions that expose
-  the raw APNs token on iOS. ``replacesToken`` is the page's previous token
-  after a ``mobius:push-token`` rotation, so the stale row is retired at once.
+  the raw APNs token on iOS.
   """
 
   model_config = ConfigDict(populate_by_name=True)
@@ -933,11 +932,10 @@ class PushDeviceRegisterRequest(BaseModel):
   apns_environment: Literal["sandbox", "production"] | None = Field(
     default=None, alias="apnsEnvironment",
   )
-  replaces_token: str | None = Field(default=None, alias="replacesToken")
 
-  @field_validator("token", "replaces_token")
+  @field_validator("token")
   @classmethod
-  def _printable_tokens(cls, value: str | None) -> str | None:
+  def _printable_token(cls, value: str) -> str:
     return _push_token(value)
 
   @field_validator("apns_token")

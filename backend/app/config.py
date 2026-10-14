@@ -15,7 +15,6 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
 from urllib.parse import urlparse, urlunsplit
 
 from pydantic import Field, model_validator
@@ -129,13 +128,6 @@ class Settings(BaseSettings):
   # Public origin of this installation, bound into self-hosted account grants.
   # Empty derives from FRONTEND_ORIGIN when that is HTTPS or loopback HTTP.
   mobius_account_client_origin: str = ""
-  # Native push to the Möbius mobile app goes through the mobius.you push relay
-  # (see app/push_native.py); this installation holds no FCM or APNs secret.
-  # An iOS device that registered a raw APNs token is sent through APNs only
-  # when this is "apns"; otherwise FCM serves both platforms.
-  push_ios_transport: Literal["fcm", "apns"] = "fcm"
-  # Most device targets in one relay request; match the relay's batch limit.
-  push_relay_max_targets: int = Field(default=100, ge=1, le=1000)
 
   model_config = SettingsConfigDict(env_file=".env")
 

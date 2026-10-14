@@ -2,10 +2,10 @@
 
 Startup reconciliation is owned by ``startup.py``. This module owns only work
 that remains alive after readiness: watcher processes, periodic chat recovery,
-durable continuation wakeups, writer health, background compression,
-browser-profile quota enforcement, and native push delivery. Process-only and
-database-backed services have distinct start boundaries so a database-degraded
-boot can keep source diagnostics alive without starting database work. ``stop`` remains the single
+durable continuation wakeups, writer health, background compression, and
+browser-profile quota enforcement. Process-only and database-backed services
+have distinct start boundaries so a database-degraded boot can keep source
+diagnostics alive without starting database work. ``stop`` remains the single
 shutdown boundary.
 """
 
@@ -627,8 +627,6 @@ class RuntimeSupervisors:
     self._spawn("agent-scratch-retention", agent_scratch_loop())
     self._spawn("provider-session-retention", provider_session_retention_loop())
     self._spawn("capacity-monitor", capacity_monitor_loop())
-    from app.push_native import run_delivery_worker
-    self._spawn("native-push-delivery", run_delivery_worker())
 
   async def stop(self) -> None:
     """Cancel and observe every task, then stop external watcher resources."""

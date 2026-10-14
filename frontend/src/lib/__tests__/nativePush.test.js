@@ -4,7 +4,6 @@ import assert from 'node:assert/strict'
 import {
   disableNativePush,
   enableNativePush,
-  forgetNativePushForSignOut,
   getNativePushState,
   isNativePushAvailable,
   isNativePushEnabled,
@@ -111,6 +110,21 @@ test('a failed server registration is an error, not a silent success', async () 
   assert.equal(isNativePushEnabled(), false)
 })
 
+test('the server explains a refused registration', async () => {
+  const push = fakePush()
+  push.devices.register = async () => ({
+    ok: false,
+    status: 409,
+    json: async () => ({ detail: 'Link this Möbius to your mobius.you account.' }),
+  })
+
+  await enableNativePush({ win: app([{ token: 'fcm-1', platform: 'android' }]), push })
+
+  assert.deepEqual(getNativePushState(), {
+    status: 'error', error: 'Link this Möbius to your mobius.you account.',
+  })
+})
+
 test('a page load re-registers only after the owner turned push on', async () => {
   const push = fakePush()
   const win = app([{ token: 'fcm-1', platform: 'android' }])
@@ -124,7 +138,7 @@ test('a page load re-registers only after the owner turned push on', async () =>
   assert.equal(push.calls.length, 2)
 })
 
-test('a rotated token re-registers and retires the previous one', async () => {
+test('a rotated token re-registers', async () => {
   const push = fakePush()
   const win = app([{ token: 'fcm-1', platform: 'android' }])
   await enableNativePush({ win, push })
@@ -133,7 +147,7 @@ test('a rotated token re-registers and retires the previous one', async () => {
   await settle()
 
   assert.deepEqual(push.calls[1], [
-    'register', { token: 'fcm-2', platform: 'android', replacesToken: 'fcm-1' },
+    'register', { token: 'fcm-2', platform: 'android' },
   ])
 })
 
@@ -150,18 +164,8 @@ test('turning off forgets the token and ignores later rotations', async () => {
   assert.equal(isNativePushEnabled(), false)
 })
 
-test('sign-out forgets the registered token', async () => {
+test('turning off on a phone that never turned push on sends nothing', async () => {
   const push = fakePush()
-  await enableNativePush({ win: app([{ token: 'fcm-1', platform: 'android' }]), push })
-
-  await forgetNativePushForSignOut({ push })
-
-  assert.deepEqual(push.calls.at(-1), ['forget', { token: 'fcm-1' }])
-  assert.equal(isNativePushEnabled(), false)
-})
-
-test('sign-out on a phone that never turned push on sends nothing', async () => {
-  const push = fakePush()
-  await forgetNativePushForSignOut({ push })
+  await disableNativePush({ push })
   assert.deepEqual(push.calls, [])
 })

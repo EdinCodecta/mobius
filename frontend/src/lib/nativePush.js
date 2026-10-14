@@ -12,9 +12,9 @@
 //
 //   - feature-detect the bridge;
 //   - turn notifications on from a user action (the call can prompt);
-//   - re-register on every load once turned on, so rotation is re-armed and
-//     the server sees the phone is still in use;
-//   - re-register a rotated token, retiring the previous one;
+//   - re-register on every load once turned on, which re-arms rotation;
+//   - re-register a rotated token (the server drops the old one once the
+//     relay reports it invalid);
 //   - forget the token on sign-out or when the owner turns it off.
 //
 // A tiny subscribe/getState surface feeds the Settings row.
@@ -69,22 +69,29 @@ export function isNativePushEnabled() {
   return readStored().enabled
 }
 
+async function registrationError(response) {
+  // apiFetch resolves a non-2xx Response instead of throwing; the server's
+  // detail says why (for example, the account still needs linking).
+  try {
+    const { detail } = await response.json()
+    if (typeof detail === 'string' && detail) return new Error(detail)
+  } catch {
+    // Fall through to the generic message.
+  }
+  return new Error(`Phone registration failed (${response?.status ?? 'no response'}).`)
+}
+
 async function registerWithServer(result, push) {
   if (!result || typeof result.token !== 'string' || !result.token || !result.platform) {
     throw new Error('The app returned no push token.')
   }
-  const previous = readStored().token
   const body = { token: result.token, platform: result.platform }
   if (result.apnsToken) {
     body.apnsToken = result.apnsToken
     body.apnsEnvironment = result.apnsEnvironment
   }
-  if (previous && previous !== result.token) body.replacesToken = previous
   const response = await push.devices.register(body)
-  // apiFetch resolves a non-2xx Response instead of throwing.
-  if (!response || response.ok === false) {
-    throw new Error(`Phone registration failed (${response?.status ?? 'no response'}).`)
-  }
+  if (!response || response.ok === false) throw await registrationError(response)
   writeStored({ enabled: true, token: result.token })
 }
 
@@ -113,16 +120,20 @@ async function register(win, push) {
   return true
 }
 
-/** Turn notifications on for this phone. Call from a tap: it can prompt. */
-export async function enableNativePush({ win = globalThis.window, push = api.push } = {}) {
-  if (!isNativePushAvailable(win)) return false
-  setStatus('registering')
+async function registerReportingErrors(win, push) {
   try {
     return await register(win, push)
   } catch (error) {
     setStatus('error', error.message)
     return false
   }
+}
+
+/** Turn notifications on for this phone. Call from a tap: it can prompt. */
+export async function enableNativePush({ win = globalThis.window, push = api.push } = {}) {
+  if (!isNativePushAvailable(win)) return false
+  setStatus('registering')
+  return registerReportingErrors(win, push)
 }
 
 /**
@@ -132,26 +143,17 @@ export async function enableNativePush({ win = globalThis.window, push = api.pus
  */
 export async function resumeNativePush({ win = globalThis.window, push = api.push } = {}) {
   if (!isNativePushAvailable(win) || !readStored().enabled) return false
-  try {
-    return await register(win, push)
-  } catch (error) {
-    setStatus('error', error.message)
-    return false
-  }
+  return registerReportingErrors(win, push)
 }
 
-/** Stop notifications to this phone; the OS permission itself is untouched. */
+/**
+ * Stop notifications to this phone (Turn off, and sign-out while the owner
+ * credential still works). The OS permission itself is untouched.
+ */
 export async function disableNativePush({ push = api.push } = {}) {
   const { token } = readStored()
   writeStored({ enabled: false, token: null })
   setStatus('off')
-  if (token) await push.devices.forget({ token })
-}
-
-/** Sign-out step: forget this phone while the owner credential still works. */
-export async function forgetNativePushForSignOut({ push = api.push } = {}) {
-  const { token } = readStored()
-  writeStored({ enabled: false, token: null })
   if (token) await push.devices.forget({ token })
 }
 

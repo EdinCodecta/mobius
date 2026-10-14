@@ -6,16 +6,17 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app import models, push_native
+from app import models, push_relay
 from app.database import get_db
 from app.deps import get_current_owner_for_lifecycle_control, reject_cross_site
-from app.push import get_public_key_base64url, notify_owner
+from app.push import get_public_key_base64url
 from app.schemas import (
   PushDeviceForgetRequest,
   PushDeviceRegisterRequest,
   PushSubscribeRequest,
   PushUnsubscribeRequest,
 )
+from app.timeutil import now_naive_utc
 
 router = APIRouter(prefix="/api/push", tags=["push"])
 
@@ -88,17 +89,38 @@ def register_device(
   owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
   db: Session = Depends(get_db),
 ):
-  """Register or refresh this phone; a token another owner had moves here."""
-  device, outcome = push_native.register_device(
-    db, owner.id, push_native.DeviceRegistration(
-      token=body.token,
-      platform=body.platform,
-      apns_token=body.apns_token,
-      apns_environment=body.apns_environment,
-      replaces_token=body.replaces_token,
-    ),
-  )
-  return {"id": device.id, "status": outcome}
+  """Register this phone; a token another owner had moves to the caller.
+
+  The relay learns that this installation owns the token before it is
+  stored, so a device row always means the relay will accept sends to it.
+  The page re-registers on every load, which also re-claims a phone that
+  was bound to another installation in between.
+  """
+  try:
+    push_relay.bind_device(
+      token=body.token, platform=body.platform,
+      apns_token=body.apns_token, apns_environment=body.apns_environment,
+    )
+  except push_relay.RelayError as exc:
+    if exc.not_linked:
+      raise HTTPException(
+        409, "Link this Möbius to your mobius.you account to get phone notifications.",
+      )
+    raise HTTPException(502, "The notification service could not be reached.")
+  now = now_naive_utc()
+  device = db.query(models.PushDevice).filter(
+    models.PushDevice.token == body.token,
+  ).one_or_none()
+  if device is None:
+    device = models.PushDevice(id=str(uuid.uuid4()), token=body.token, created_at=now)
+    db.add(device)
+  device.owner_id = owner.id
+  device.platform = body.platform
+  device.apns_token = body.apns_token
+  device.apns_environment = body.apns_environment
+  device.last_seen_at = now
+  db.commit()
+  return {"status": "registered"}
 
 
 @router.delete(
@@ -110,33 +132,14 @@ def forget_device(
   db: Session = Depends(get_db),
 ):
   """Stop sending to this phone (sign-out); repeating it is harmless."""
-  push_native.forget_device(db, owner.id, body.token)
-
-
-@router.get("/devices")
-def list_devices(
-  owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
-  db: Session = Depends(get_db),
-):
-  """This owner's phones, with only the last characters of each token."""
-  return {"devices": push_native.list_devices(db, owner.id)}
-
-
-@router.post(
-  "/devices/test", status_code=202, dependencies=[Depends(reject_cross_site)],
-)
-def send_test_notification(
-  owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
-  db: Session = Depends(get_db),
-):
-  """Send a real notification through every channel to check delivery."""
-  if not push_native.has_active_device(db, owner.id):
-    raise HTTPException(409, "No phone is registered for notifications.")
-  notification_id = notify_owner(
-    db, owner.id,
-    title="Test notification",
-    body="Phone notifications from Möbius are working.",
-    source_type="system",
-    target="/shell/",
-  )
-  return {"notificationId": notification_id}
+  removed = db.query(models.PushDevice).filter(
+    models.PushDevice.token == body.token,
+    models.PushDevice.owner_id == owner.id,
+  ).delete(synchronize_session=False)
+  db.commit()
+  if removed:
+    try:
+      push_relay.unbind_device(body.token)
+    except push_relay.RelayError:
+      # Nothing is sent to a removed device; the relay keeps only a binding.
+      pass

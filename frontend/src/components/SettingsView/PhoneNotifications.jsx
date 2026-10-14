@@ -1,5 +1,4 @@
-import { useState, useSyncExternalStore } from 'react'
-import { api } from '../../api/client.js'
+import { useSyncExternalStore } from 'react'
 import {
   disableNativePush,
   enableNativePush,
@@ -14,7 +13,6 @@ const STATUS_TEXT = {
   registering: 'Turning on…',
   on: 'Notifications are on for this phone.',
   denied: "Notifications are turned off for Möbius in this phone's settings.",
-  error: "Couldn't turn on notifications for this phone. Try again.",
 }
 
 /** Settings row for native push; rendered only inside the Möbius mobile app. */
@@ -22,22 +20,13 @@ export default function PhoneNotifications() {
   const pushState = useSyncExternalStore(
     subscribeNativePush, getNativePushState, getNativePushState,
   )
-  const [testState, setTestState] = useState('idle')
   if (!isNativePushAvailable()) return null
 
   const enabled = isNativePushEnabled()
   const status = pushState.status === 'idle' ? (enabled ? 'on' : 'off') : pushState.status
-  const busy = status === 'registering'
-
-  async function sendTest() {
-    setTestState('sending')
-    try {
-      const response = await api.push.devices.sendTest()
-      setTestState(response?.ok ? 'sent' : 'failed')
-    } catch {
-      setTestState('failed')
-    }
-  }
+  const message = status === 'error'
+    ? pushState.error || "Couldn't turn on notifications for this phone. Try again."
+    : STATUS_TEXT[status] || STATUS_TEXT.off
 
   return (
     <section className="settings__section settings__section--compact">
@@ -55,32 +44,16 @@ export default function PhoneNotifications() {
           <button
             className="settings__btn settings__btn--sm"
             type="button"
-            disabled={busy}
+            disabled={status === 'registering'}
             onClick={() => { enableNativePush() }}
           >
-            {busy ? 'Turning on…' : 'Turn on'}
+            {status === 'registering' ? 'Turning on…' : 'Turn on'}
           </button>
         )}
       </div>
       <p className="settings__subtext settings__subtext--tight" role="status">
-        {STATUS_TEXT[status] || STATUS_TEXT.off}
+        {message}
       </p>
-      {enabled && (
-        <div className="settings__row">
-          <span className="settings__subtext settings__subtext--tight">
-            {testState === 'sent' && 'Test sent. It should arrive in a few seconds.'}
-            {testState === 'failed' && "Couldn't send a test notification."}
-          </span>
-          <button
-            className="settings__btn settings__btn--outline settings__btn--sm"
-            type="button"
-            disabled={testState === 'sending'}
-            onClick={sendTest}
-          >
-            Send test
-          </button>
-        </div>
-      )}
     </section>
   )
 }
