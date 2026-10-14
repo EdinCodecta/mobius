@@ -506,7 +506,7 @@ def _webp_chunks_kept(content: bytes) -> bytes:
     size = int.from_bytes(content[at + 4:at + 8], "little")
     end = at + 8 + size + (size & 1)
     chunk = content[at:end]
-    if kind == b"VP8X":
+    if kind == b"VP8X" and len(chunk) > 8:
       # Clear the EXIF and XMP presence flags along with their chunks.
       chunk = chunk[:8] + bytes([chunk[8] & ~0x0C]) + chunk[9:]
     if kind in _WEBP_KEPT_CHUNKS:
@@ -794,6 +794,18 @@ def _listing_draft(manifest: dict, store: dict, by_path: dict[str, dict]) -> dic
   }
 
 
+def _published_image_flagged(content: bytes) -> bool:
+  """Metadata check for one published file; an image it can't parse is flagged.
+
+  One malformed image anywhere in the source must name itself on the
+  checklist rather than take down the whole review.
+  """
+  try:
+    return listing_image_has_metadata(content)
+  except Exception:
+    return True
+
+
 def _published_images_with_metadata(
   by_path: dict[str, dict], listed: set[str],
 ) -> list[CommunityPublicationError]:
@@ -809,7 +821,7 @@ def _published_images_with_metadata(
   paths = [
     path for path in sorted(by_path)
     if path not in listed  # Listed art and the icon have their own items.
-    and listing_image_has_metadata(_file_bytes(by_path[path]))
+    and _published_image_flagged(_file_bytes(by_path[path]))
   ]
   if not paths:
     return []
@@ -817,8 +829,8 @@ def _published_images_with_metadata(
   return [CommunityPublicationError(
     f"{len(paths)} image{'s' if len(paths) > 1 else ''} in the source "
     f"carr{'y' if len(paths) > 1 else 'ies'} camera, location or other hidden "
-    f"metadata that publishing would make public: {named}. Ask an agent to "
-    "remove them or save them without the metadata.",
+    f"metadata that publishing would make public, or can't be read: {named}. "
+    "Ask an agent to remove them or save them without the metadata.",
     "listing_image_metadata",
   )]
 

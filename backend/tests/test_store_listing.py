@@ -1289,3 +1289,46 @@ def test_only_editor_art_and_the_declared_icon_ride_along_unreviewed(tmp_path):
 
   (root / "icon.png").write_bytes(b"png")
   assert store_listing_source.has_unapplied_changes(root, accepted) is True
+
+
+def test_a_malformed_image_anywhere_never_takes_down_the_review(monkeypatch):
+  """A truncated WebP chunk is read safely, and an image the scan can't parse
+  is named on the checklist rather than turning the review into a 500."""
+  from app import community_publish
+  from app.community_publish import _published_images_with_metadata
+
+  broken = b"RIFF" + (12).to_bytes(4, "little") + b"WEBP" + b"VP8X" + (0).to_bytes(4, "little")
+  files = {"assets/broken.webp": {
+    "path": "assets/broken.webp", "content_base64": base64.b64encode(broken).decode(),
+  }}
+  assert community_publish.listing_image_has_metadata(broken) is False
+  assert _published_images_with_metadata(files, set()) == []
+
+  def unparseable(content):
+    raise IndexError("truncated chunk")
+
+  monkeypatch.setattr(community_publish, "listing_image_has_metadata", unparseable)
+  problems = _published_images_with_metadata(files, set())
+  assert [p.code for p in problems] == ["listing_image_metadata"]
+  assert "assets/broken.webp" in problems[0].detail
+
+
+def test_a_declared_icon_rides_along_only_as_a_clean_image(tmp_path):
+  """A changed path named as the icon passes the guard only if it is a clean
+  listing image, so arbitrary bytes can't be accepted by pointing the icon at
+  them."""
+  root = tmp_path / "app"
+  root.mkdir()
+  subprocess.run(["git", "init", "-q", str(root)], check=True)
+  (root / "mobius.json").write_text(json.dumps({"id": "demo", "icon": "assets/logo.svg"}))
+  subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+  subprocess.run(
+    ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t",
+     "commit", "-q", "-m", "accepted"], check=True,
+  )
+  accepted = app_git.head_sha(root, "HEAD")
+  (root / "mobius.json").write_text(json.dumps({"id": "demo", "icon": "payload.png"}))
+  (root / "payload.png").write_text("<script>alert(1)</script>")
+  assert store_listing_source.has_unapplied_changes(root, accepted) is True
+  (root / "payload.png").write_bytes(_png((1, 2, 3)))
+  assert store_listing_source.has_unapplied_changes(root, accepted) is False

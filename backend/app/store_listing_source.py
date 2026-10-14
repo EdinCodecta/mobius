@@ -163,6 +163,19 @@ def _clean_editor_art(root: Path, rel: str) -> bool:
   return not listing_image_has_metadata(content)
 
 
+def _clean_icon(root: Path, rel: str) -> bool:
+  """Whether a declared PNG icon path is absent, or a clean listing image."""
+  target = root / rel
+  if not target.is_file():
+    return True
+  content = target.read_bytes()
+  try:
+    check_listing_image(content, "icon")
+  except CommunityPublicationError:
+    return False
+  return not listing_image_has_metadata(content)
+
+
 def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
   """Whether the source differs from its accepted revision beyond a listing.
 
@@ -195,7 +208,9 @@ def has_unapplied_changes(root: Path, accepted: str | None) -> bool:
     and str(manifest.get("icon") or "").lower().endswith(".png")
   }
   for path in changed:
-    if path in icons or (_EDITOR_ART.fullmatch(path) and _clean_editor_art(root, path)):
+    if (path in icons and _clean_icon(root, path)) or (
+      _EDITOR_ART.fullmatch(path) and _clean_editor_art(root, path)
+    ):
       continue
     if path == "mobius.json" and None not in manifests and (
       _listing_fields_removed(manifests[0]) == _listing_fields_removed(manifests[1])
