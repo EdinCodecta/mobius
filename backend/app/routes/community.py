@@ -35,7 +35,8 @@ from app.community_publish import (
   public_store_listing,
   store_listing_review,
   read_public_snapshot,
-  read_public_store_asset,
+  public_store_asset,
+  read_public_store_asset_bytes,
   read_publication_journal,
   write_publication_journal,
 )
@@ -963,9 +964,11 @@ async def preview_local_app_publication_asset(
     raise HTTPException(404, "Listing asset not found.")
   try:
     async with fs_locks.source_dir_lock(str(app.source_dir)):
-      content, media_type = await settled.run_settled(
-        read_public_store_asset, app, accepted_commit, asset_path,
+      raw = await settled.run_settled(
+        read_public_store_asset_bytes, app, accepted_commit, asset_path,
       )
+    # Decoding and stripping work on the bytes already read, off the lock.
+    content, media_type = await asyncio.to_thread(public_store_asset, raw)
   except CommunityPublicationError as exc:
     raise HTTPException(
       exc.status_code, {"code": exc.code, "message": exc.detail},

@@ -700,7 +700,8 @@ def ignore_migration_paths(
   every snapshot: a synthetic repo's ``.gitignore`` rewritten to the managed
   rules, a stale managed ``.gitignore`` dropped from a real-origin repo, and
   managed runtime paths untracked. ``tree`` is the candidate to compare, or
-  ``None`` for the worktree, where untracking leaves files in place.
+  ``None`` for the worktree, where untracking leaves files in place, so any
+  change to a managed runtime path there is part of the migration too.
   """
   repo = Path(source_dir)
   before = _ref_blob(repo, accepted, ".gitignore", read_only=True)
@@ -719,12 +720,26 @@ def ignore_migration_paths(
   ):
     paths.add(".gitignore")
   if tree is not None:
-    untracked = _run(
+    untracked = [_run(
       repo, "diff", "--name-only", "--no-renames", "-z", "--diff-filter=D",
       accepted, tree, "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
-    )
-    if untracked.returncode == 0:
-      paths.update(path for path in untracked.stdout.split("\0") if path)
+    )]
+  else:
+    # Apply untracks these runtime paths, so whatever they hold in the
+    # worktree (changed, or new under older ignore rules) never reaches it.
+    untracked = [
+      _run(
+        repo, "diff", "--name-only", "--no-renames", "-z", accepted,
+        "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+      ),
+      _run(
+        repo, "ls-files", "--others", "--exclude-standard", "-z",
+        "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+      ),
+    ]
+  for proc in untracked:
+    if proc.returncode == 0:
+      paths.update(path for path in proc.stdout.split("\0") if path)
   return paths
 
 

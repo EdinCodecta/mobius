@@ -73,17 +73,15 @@ class ListingEdit:
   icon: ListingImage | None = None
 
 
-def record_icon_for_save(root: Path, app: models.App) -> bytes | None:
+def record_icon_for_save(root: Path, app: models.App, manifest: dict) -> bytes | None:
   """The icon on the app's record that saving a listing copies into source.
 
   An app from before manifest icons keeps its icon on its record only;
   accepting a revision without one would clear the icon the owner sees.
+  ``manifest`` is the one the caller already parsed (BOM-aware), so a
+  declared icon is never mistaken for a missing one and overwritten.
   """
-  try:
-    declared = json.loads((root / "mobius.json").read_text(encoding="utf-8")).get("icon")
-  except (OSError, ValueError, AttributeError):
-    declared = None
-  if declared or (root / "icon.png").is_file():
+  if manifest.get("icon") or (root / "icon.png").is_file():
     return None
   return app.icon_override_png or app.icon_png or None
 
@@ -116,8 +114,7 @@ def note_what_saving_fixes(checklist: list[dict], root: Path, app: models.App) -
   icon = items["icon"]
   # Only a save that can go ahead keeps the icon; one refused for missing or
   # unreadable details, or unapplied source changes, fixes nothing.
-  manifest_path = root / "mobius.json"
-  manifest = _manifest_from(manifest_path.read_bytes() if manifest_path.is_file() else None)
+  manifest = _worktree_manifest(root)
   if icon["done"] or details.get("automatic") is False or manifest is None:
     return
   if icon.get("code") == "listing_image_metadata":
@@ -131,7 +128,7 @@ def note_what_saving_fixes(checklist: list[dict], root: Path, app: models.App) -
       )
       return
     message = "Saving the listing removes the icon's hidden metadata."
-  elif record_icon_for_save(root, app) is not None:
+  elif record_icon_for_save(root, app, manifest) is not None:
     message = "Saving the listing keeps the app's current icon."
   else:
     return
@@ -144,7 +141,16 @@ def _listing_fields_removed(manifest: dict) -> dict:
   return {key: value for key, value in manifest.items() if key not in {"icon", "store"}}
 
 
+def _worktree_manifest(root: Path) -> dict | None:
+  """The worktree's mobius.json, parsed the one way every reader here uses."""
+  path = root / "mobius.json"
+  if not path.is_file() or path.stat().st_size > MANIFEST_MAX_BYTES:
+    return None
+  return _manifest_from(path.read_bytes())
+
+
 def _manifest_from(raw: bytes | None) -> dict | None:
+  """Parse manifest bytes; json.loads honours a UTF-8 byte-order mark."""
   try:
     manifest = json.loads(raw) if raw is not None else None
   except ValueError:
@@ -607,7 +613,7 @@ def write_listing(root: Path, app: models.App, edit: ListingEdit) -> Callable[[]
         icon_rel = _content_named(clean, check_listing_image(clean, "app icon"))
       changes.write(icon_rel, clean)
     else:
-      icon_bytes = record_icon_for_save(root, app)
+      icon_bytes = record_icon_for_save(root, app, current)
     if icon_bytes is not None:
       try:
         normalized = icon_assets.normalize_icon(icon_bytes)

@@ -12,6 +12,7 @@ import logging
 import re
 import subprocess
 import unicodedata
+import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -500,9 +501,40 @@ def _png_chunk_draws(kind: bytes, data: bytes) -> bool:
 def _png_chunk_harmless(kind: bytes, data: bytes) -> bool:
   """Drawing chunks, a bare timestamp, or text naming only the producing tool."""
   return kind in _PNG_HARMLESS_CHUNKS or (
-    kind in _PNG_TEXT_CHUNKS and len(data) <= _PNG_SOFTWARE_TEXT_MAX_BYTES
-    and data.split(b"\0", 1)[0] == b"Software"
+    kind in _PNG_TEXT_CHUNKS and _png_short_software_text(kind, data)
   )
+
+
+def _png_short_software_text(kind: bytes, data: bytes) -> bool:
+  """Whether a text chunk is keyed "Software" with a short value, decompressed.
+
+  zTXt and iTXt may be compressed, so the cap applies to the inflated text,
+  inflating at most one byte past it; anything longer counts as metadata.
+  """
+  keyword, separator, rest = data.partition(b"\0")
+  if keyword != b"Software" or not separator:
+    return False
+  if kind == b"zTXt":
+    compressed, text = True, rest[1:]
+  elif kind == b"iTXt":
+    if len(rest) < 2:
+      return False
+    compressed = rest[0] == 1
+    # Language tag and translated keyword, each NUL-terminated, then text.
+    parts = rest[2:].split(b"\0", 2)
+    if len(parts) < 3:
+      return False
+    text = parts[2]
+  else:
+    compressed, text = False, rest
+  if not compressed:
+    return len(text) <= _PNG_SOFTWARE_TEXT_MAX_BYTES
+  try:
+    inflate = zlib.decompressobj()
+    value = inflate.decompress(text, _PNG_SOFTWARE_TEXT_MAX_BYTES + 1)
+  except zlib.error:
+    return False
+  return len(value) <= _PNG_SOFTWARE_TEXT_MAX_BYTES and not inflate.unconsumed_tail
 
 
 def _png_chunks_kept(
@@ -1113,11 +1145,40 @@ def read_accepted_file(app: models.App, path: str, *, max_bytes: int) -> bytes |
 def read_public_store_asset(
   app: models.App, accepted_commit: str, asset_path: str,
 ) -> tuple[bytes, str]:
-  """Read one listing asset from the exact accepted Git tree, with its media type.
+  """Read one listing asset and prepare it for serving, with its media type."""
+  return public_store_asset(read_public_store_asset_bytes(app, accepted_commit, asset_path))
 
+
+def public_store_asset(content: bytes) -> tuple[bytes, str]:
+  """Check and clean listing asset bytes already read; needs no source lock.
+
+  An incomplete listing's draft is served too, so the editor can show it;
+  its icon may name any tracked file, so only real listing images go out.
   The type comes from the image rule's verdict on the bytes, never the name,
   so a file that is also valid HTML cannot be served as a page.
   """
+  try:
+    suffix = check_listing_image(content, "listing image")
+  except CommunityPublicationError as exc:
+    raise CommunityPublicationError(
+      "That file is not a Store listing image.", "listing_asset_unavailable", 404,
+    ) from exc
+  if listing_image_has_metadata(content):
+    # Unauthenticated: an incomplete listing's draft art may still carry
+    # location or camera data, which the preview must never hand out.
+    try:
+      content = strip_listing_image_metadata(content)
+    except CommunityPublicationError as exc:
+      raise CommunityPublicationError(
+        "That file is not a Store listing image.", "listing_asset_unavailable", 404,
+      ) from exc
+  return content, LISTING_MEDIA_TYPES[suffix]
+
+
+def read_public_store_asset_bytes(
+  app: models.App, accepted_commit: str, asset_path: str,
+) -> bytes:
+  """Read one listing asset's raw bytes from the exact accepted Git tree."""
   repo = Path(app.source_dir)
   if not repo.is_dir() or not app_git.is_repo(repo):
     raise CommunityPublicationError(
@@ -1153,25 +1214,8 @@ def read_public_store_asset(
       404,
     )
   content = _blob(repo, entry)
-  # An incomplete listing's draft is served too, so the editor can show it;
-  # its icon may name any tracked file, so only real listing images go out.
-  try:
-    suffix = check_listing_image(content, "listing image")
-  except CommunityPublicationError as exc:
-    raise CommunityPublicationError(
-      "That file is not a Store listing image.", "listing_asset_unavailable", 404,
-    ) from exc
-  if listing_image_has_metadata(content):
-    # Unauthenticated: an incomplete listing's draft art may still carry
-    # location or camera data, which the preview must never hand out.
-    try:
-      content = strip_listing_image_metadata(content)
-    except CommunityPublicationError as exc:
-      raise CommunityPublicationError(
-        "That file is not a Store listing image.", "listing_asset_unavailable", 404,
-      ) from exc
   _scan_content(asset_path, content)
-  return content, LISTING_MEDIA_TYPES[suffix]
+  return content
 
 
 def _listing_paths(manifest: object) -> set[str]:

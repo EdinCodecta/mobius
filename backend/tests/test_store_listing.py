@@ -1000,6 +1000,63 @@ def test_a_clean_jpeg_upload_is_stored_byte_for_byte(client, auth):
   assert (source / src).read_bytes() == photo.getvalue()
 
 
+def test_a_byte_order_mark_never_hides_the_declared_icon(client, auth, db):
+  source = _source()
+  (source / "assets").mkdir()
+  logo = _png((70, 80, 90), (64, 64))
+  (source / "assets" / "logo.png").write_bytes(logo)
+  manifest = json.loads(_MANIFEST)
+  manifest["icon"] = "assets/logo.png"
+  (source / "mobius.json").write_bytes(
+    b"\xef\xbb\xbf" + json.dumps(manifest, indent=2).encode(),
+  )
+  (source / "icon.png").unlink()
+  app_id = _create(client, auth, source)
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  row.icon_override_png = _png((250, 0, 0), (32, 32))  # The owner's own override.
+  db.commit()
+
+  assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
+
+  assert (source / "assets" / "logo.png").read_bytes() == logo
+  assert not (source / "icon.png").exists()
+
+
+def test_a_tracked_runtime_file_changing_does_not_block_a_save(client, auth, db):
+  source = _source()
+  app_id = _create(client, auth, source)
+  (source / ".gitignore").write_text("# Older rules that did not ignore logs.\n")
+  (source / "run.log").write_text("first run\n")
+  _commit_accepted(db, source, app_id, "older rules tracking a log")
+  (source / "run.log").write_text("first run\nsecond run\n")  # Changes at runtime.
+  accepted = db.query(models.App).filter_by(id=app_id).one().source_commit
+
+  assert store_listing_source.has_unapplied_changes(source, accepted) is False
+  saved = _save(client, auth, app_id, **_complete_listing())
+
+  assert saved.status_code == 200, saved.text
+  # Apply untracked it, as its own snapshot always does.
+  assert "run.log" not in app_git._run(source, "ls-files").stdout.split()
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_the_software_text_cap_applies_after_decompression(compressed):
+  import zlib
+
+  from app.community_publish import listing_image_has_metadata
+
+  plain = io.BytesIO()
+  Image.new("RGB", (8, 8)).save(plain, format="PNG")
+  base = plain.getvalue()
+  end = base.rindex(b"IEND") - 4
+  for value, flagged in ((b"Editor 1.0", False), (b"x" * 5000, True)):
+    if compressed:
+      chunk = _png_chunk(b"zTXt", b"Software\0\0" + zlib.compress(value))
+    else:
+      chunk = _png_chunk(b"iTXt", b"Software\0\0\0\0\0" + value)
+    assert listing_image_has_metadata(base[:end] + chunk + base[end:]) is flagged
+
+
 def test_an_unexpected_image_error_is_a_checklist_item_not_a_crash(monkeypatch):
   from app import community_publish
 
