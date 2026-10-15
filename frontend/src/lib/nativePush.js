@@ -21,6 +21,11 @@ import { api } from '../api/client.js'
 const TOKEN_KEY = 'mobius.nativePush.token'
 // Set only by the owner's Turn on in Settings; cleared by Turn off and sign-out.
 const ENABLED_KEY = 'mobius.nativePush.enabled'
+// Earlier tokens of this phone that still have to be forgotten. Kept until the
+// server confirms, so a failed cleanup is retried instead of leaving a second
+// registration that duplicates every notification.
+const STALE_KEY = 'mobius.nativePush.staleTokens'
+const MAX_STALE = 10
 
 let listeningOn = null
 let pending = Promise.resolve()
@@ -44,6 +49,33 @@ function write(key, value) {
 }
 
 const storedToken = () => read(TOKEN_KEY)
+
+function staleTokens() {
+  try {
+    const list = JSON.parse(read(STALE_KEY) || '[]')
+    return Array.isArray(list) ? list.filter((token) => typeof token === 'string' && token) : []
+  } catch {
+    return []
+  }
+}
+
+function writeStale(list) {
+  write(STALE_KEY, list.length ? JSON.stringify(list.slice(-MAX_STALE)) : null)
+}
+
+// Forgets earlier tokens; any the server did not confirm stay for next time.
+async function forgetStale(push) {
+  const left = []
+  for (const token of staleTokens()) {
+    try {
+      const response = await push.devices.forget({ token })
+      if (!response?.ok) left.push(token)
+    } catch {
+      left.push(token)
+    }
+  }
+  writeStale(left)
+}
 
 export function isNativePushEnabled() {
   return read(ENABLED_KEY) === '1'
@@ -75,12 +107,9 @@ function save(result, push) {
       if (previous && previous !== token) {
         // The phone got a new push token; the old one may keep working for a
         // while, so stop sending to it or every notification arrives twice.
-        try {
-          await push.devices.forget({ token: previous })
-        } catch {
-          // The relay's invalid-token reply retires it later.
-        }
+        writeStale([...staleTokens().filter((stale) => stale !== token), previous])
       }
+      await forgetStale(push)
       return null
     }
     return failure(response, "Couldn't turn on notifications for this phone. Try again.")
@@ -120,16 +149,20 @@ export async function registerNativePush({ win = globalThis.window, push = api.p
 
 /**
  * Settings → Turn on. Call from a tap: it can show the OS prompt.
- * Resolves to `{ status: 'on' | 'denied' | 'error', message? }`.
+ * Resolves to `{ status: 'on' | 'denied' | 'error' | 'cancelled', message? }`;
+ * `cancelled` means the owner signed out meanwhile.
  */
 export async function enableNativePush({ win = globalThis.window, push = api.push } = {}) {
   if (!isNativePushAvailable(win)) return { status: 'error', message: 'Only available in the Möbius app.' }
   signedOut = false
   try {
     const result = await win.MobiusNative.registerPush()
+    if (signedOut) return { status: 'cancelled' }
     if (!result) return { status: 'denied' }
     listenForRotation(win, push)
     const error = await save(result, push)
+    // Signing out while this was in flight wins: the choice is not recorded.
+    if (signedOut) return { status: 'cancelled' }
     if (error) return { status: 'error', message: error }
     write(ENABLED_KEY, '1')
     return { status: 'on' }
@@ -146,6 +179,7 @@ export async function enableNativePush({ win = globalThis.window, push = api.pus
 export async function disableNativePush({ push = api.push } = {}) {
   write(ENABLED_KEY, null)
   await pending.catch(() => {})
+  await forgetStale(push)
   const token = storedToken()
   if (!token) return null
   try {

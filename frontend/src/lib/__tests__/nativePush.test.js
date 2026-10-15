@@ -206,3 +206,45 @@ test('a new token for this phone replaces the old one instead of adding a second
     ['register', { token: 'tok-2' }],
   ])
 })
+
+test('signing out while Turn on waits for permission keeps notifications off', async () => {
+  const push = fakePush()
+  let grant
+  const win = {
+    MobiusNative: { registerPush: () => new Promise((resolve) => { grant = resolve }) },
+    addEventListener() {},
+  }
+  const enabling = enableNativePush({ win, push })
+  await settle()
+
+  await forgetNativePush({ push })
+  grant({ token: 'tok-1' })
+
+  assert.deepEqual(await enabling, { status: 'cancelled' })
+  assert.equal(isNativePushEnabled(), false)
+  assert.deepEqual(push.calls, [])
+})
+
+test('an old token whose cleanup failed is retried until the server confirms', async () => {
+  let forgetOk = false
+  const calls = []
+  const push = {
+    devices: {
+      register: async (body) => { calls.push(['register', body.token]); return { ok: true } },
+      forget: async (body) => { calls.push(['forget', body.token]); return { ok: forgetOk } },
+    },
+  }
+  const win = app({ token: 'tok-1' })
+  await enableNativePush({ win, push })
+  win.emit('mobius:push-token', { token: 'tok-2' })
+  await settle()
+
+  forgetOk = true
+  assert.equal(await disableNativePush({ push }), null)
+
+  assert.deepEqual(calls, [
+    ['register', 'tok-1'], ['register', 'tok-2'], ['forget', 'tok-1'],
+    ['forget', 'tok-1'], ['forget', 'tok-2'],
+  ])
+  assert.equal(values.has('mobius.nativePush.staleTokens'), false)
+})

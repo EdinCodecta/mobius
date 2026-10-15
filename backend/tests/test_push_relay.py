@@ -59,6 +59,9 @@ def test_a_missing_or_malformed_result_is_an_error_never_a_silent_success(monkey
     {"index": 0, "status": "delivered"},
     {"index": 9, "status": "ok"},
     {"index": True, "status": "ok"},
+    {"index": 2, "status": ["ok"]},
+    {"index": 2, "status": {"ok": True}},
+    "not an object",
   ]}))
   assert _send(["a", "b", "c"]) == ["error", "ok", "error"]
 

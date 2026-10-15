@@ -252,6 +252,31 @@ def test_removing_a_phone_keeps_it_when_it_registered_again_meanwhile(client, au
   ).all()
   _put(client, auth, token=FCM)  # the phone re-registers while removal is paused
 
-  _remove_observed(db, _owner_id(db), observed)
+  assert _remove_observed(db, _owner_id(db), observed) == []
 
   assert _tokens(db) == [FCM] and relay.unbinds == []
+
+
+def test_a_phone_registered_again_before_the_unbind_is_bound_again(client, auth, db, relay):
+  from app.routes.push import _remove_observed, _unbind_removed
+
+  _put(client, auth, token=FCM)
+  observed = db.query(
+    models.PushDevice.id, models.PushDevice.token, models.PushDevice.registered_at,
+  ).all()
+  removed = _remove_observed(db, _owner_id(db), observed)
+  _put(client, auth, token=FCM)  # registers between the deletion and the unbind
+  binds_before = len(relay.binds)
+
+  _unbind_removed(removed)
+
+  assert relay.unbinds == [FCM]
+  assert len(relay.binds) == binds_before + 1 and _tokens(db) == [FCM]
+
+
+def test_a_removed_phone_that_stayed_removed_is_only_unbound(client, auth, db, relay):
+  from app.routes.push import _unbind_removed
+
+  _unbind_removed([FCM])
+
+  assert relay.unbinds == [FCM] and relay.binds == []

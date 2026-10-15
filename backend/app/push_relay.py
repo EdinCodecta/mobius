@@ -146,10 +146,13 @@ def send(
   except (ValueError, AttributeError):
     return statuses
   for item in results if isinstance(results, list) else ():
-    index = item.get("index") if isinstance(item, dict) else None
+    if not isinstance(item, dict):
+      continue
+    index, status = item.get("index"), item.get("status")
     if (
       isinstance(index, int) and not isinstance(index, bool)
-      and 0 <= index < len(tokens) and item.get("status") in _STATUSES
+      and 0 <= index < len(tokens)
+      and isinstance(status, str) and status in _STATUSES
     ):
-      statuses[index] = item["status"]
+      statuses[index] = status
   return statuses

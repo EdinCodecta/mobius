@@ -3,11 +3,11 @@
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app import models, push_relay
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.deps import get_current_owner_for_lifecycle_control, reject_cross_site
 from app.push import get_public_key_base64url
 from app.schemas import (
@@ -137,18 +137,25 @@ def list_devices(
   ]
 
 
-def _remove(db: Session, owner_id: int, *criteria) -> None:
+def _remove(
+  db: Session, background: BackgroundTasks, owner_id: int, *criteria,
+) -> None:
   observed = db.query(
     models.PushDevice.id, models.PushDevice.token, models.PushDevice.registered_at,
   ).filter(models.PushDevice.owner_id == owner_id, *criteria).all()
-  _remove_observed(db, owner_id, observed)
+  removed = _remove_observed(db, owner_id, observed)
+  if removed:
+    # The rows are gone, so nothing is sent to these phones any more. The
+    # relay unbind is best effort and can take a while; it must not hold up
+    # the response (sign-out waits for it).
+    background.add_task(_unbind_removed, removed)
 
 
-def _remove_observed(db: Session, owner_id: int, observed) -> None:
-  """Delete observed phones that are unchanged, then unbind only those.
+def _remove_observed(db: Session, owner_id: int, observed) -> list[str]:
+  """Delete observed phones that are unchanged; returns their tokens.
 
   A phone that registered again (or moved to another owner) since it was
-  observed keeps its row and its fresh relay binding.
+  observed keeps its row.
   """
   removed = []
   for device_id, token, registered_at in observed:
@@ -160,12 +167,31 @@ def _remove_observed(db: Session, owner_id: int, observed) -> None:
     if deleted:
       removed.append(token)
   db.commit()
-  for token in removed:
+  return removed
+
+
+def _unbind_removed(tokens: list[str]) -> None:
+  """Unbind removed phones at the relay, unless one registered again meanwhile.
+
+  A registration that lands between the deletion and this unbind has stored
+  its row; the unbind would leave that row unbound, so it is bound again.
+  """
+  for token in tokens:
     try:
       push_relay.unbind_device(token)
     except push_relay.RelayError:
       # Nothing is sent to a removed device; the relay keeps only a binding.
-      pass
+      continue
+    with SessionLocal() as db:
+      registered_again = db.query(models.PushDevice.id).filter(
+        models.PushDevice.token == token,
+      ).first()
+    if registered_again:
+      try:
+        push_relay.bind_device(token)
+      except push_relay.RelayError:
+        # Its next send reports invalid_token; the phone re-registers on open.
+        pass
 
 
 @router.delete(
@@ -173,11 +199,12 @@ def _remove_observed(db: Session, owner_id: int, observed) -> None:
 )
 def forget_device(
   body: PushDeviceRequest,
+  background: BackgroundTasks,
   owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
   db: Session = Depends(get_db),
 ):
   """Stop sending to this phone (sign-out); repeating it is harmless."""
-  _remove(db, owner.id, models.PushDevice.token == body.token)
+  _remove(db, background, owner.id, models.PushDevice.token == body.token)
 
 
 @router.delete(
@@ -186,8 +213,9 @@ def forget_device(
 )
 def remove_device(
   device_id: str,
+  background: BackgroundTasks,
   owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
   db: Session = Depends(get_db),
 ):
-  """Remove a phone from Settings; it registers again when Möbius next opens on it."""
-  _remove(db, owner.id, models.PushDevice.id == device_id)
+  """Remove one of the owner's phones (API; Settings switches phones off from the app)."""
+  _remove(db, background, owner.id, models.PushDevice.id == device_id)
