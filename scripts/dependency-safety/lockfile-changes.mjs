@@ -6,6 +6,12 @@ import { registryTarball } from './registry.mjs'
 
 const NODE_MODULES = 'node_modules/'
 
+// npm 7+ installs from `packages` (lockfile v2/v3). npm still installs a v1
+// lockfile from its `dependencies` tree, which this checker doesn't read, so a
+// lockfile in any other shape must fail the check rather than pass unread.
+export const isCheckableLockfile = lock =>
+  [2, 3].includes(lock?.lockfileVersion) && typeof lock.packages === 'object' && lock.packages !== null
+
 // What the lockfile says: aliased installs record the real package name,
 // others are named by their path.
 function claimedIdentity(installPath, entry) {

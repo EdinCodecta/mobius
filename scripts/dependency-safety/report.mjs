@@ -50,16 +50,23 @@ function flagLines(changes) {
   return [`**Worth a look** (${flagged.length}):`, ...truncated(flagged)]
 }
 
+const FOOTER = [
+  "<sub>Checks changed lockfile entries against npm's advisory database (including GitHub malware advisories)",
+  'and flags new packages, install scripts and unexpected downloads. Updated on every push.',
+  "It reads only the lockfile, which a pull request's author can write freely, so it catches bad releases in",
+  'honest npm and Dependabot updates and helps review, but it is no defense against a hostile author.</sub>',
+].join(' ')
+
+const reportText = sections => [REPORT_MARKER, '### Dependency safety check', '', ...sections, '', FOOTER, ''].join('\n')
+
 export function renderReport({ changes, advisories, advisoryError }) {
-  return [
-    REPORT_MARKER,
-    '### Dependency safety check',
-    '',
-    ...advisoryLines(advisories, advisoryError, changes.length),
-    '',
-    ...flagLines(changes),
-    '',
-    "<sub>Checks changed lockfile entries against npm's advisory database (including GitHub malware advisories) and flags new packages, install scripts and unexpected downloads. Updated on every push.</sub>",
-    '',
-  ].join('\n')
+  return reportText([...advisoryLines(advisories, advisoryError, changes.length), '', ...flagLines(changes)])
+}
+
+export function renderUnreadableReport(files) {
+  return reportText([
+    `❌ **Could not read ${files.length} changed lockfile(s), so no package in this pull request was checked.**`,
+    'npm can still install from them: regenerate them with npm 7 or later (lockfile version 2 or 3).',
+    ...truncated(files.map(file => `- ${code(file)}`)),
+  ])
 }
