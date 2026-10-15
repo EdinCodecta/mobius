@@ -469,23 +469,14 @@ async def _fork_codex_async(
       _codex_rollout(codex_home, source_session_id), after_call_id
     )
   )
-  from app.providers import CODEX_NATIVE_HELPERS_OFF, CODEX_TOOL_FEATURES
+  from app.providers import CODEX_NATIVE_HELPERS_OFF, CODEX_TOOLS_OFF
 
   # A fork answers from the conversation alone, like Claude's `--tools ""`.
-  # Codex's code runner still nests an image viewer (local file reads) and web
-  # access, so those go too. What cannot be switched off reaches nothing: the
-  # empty runner, a clock, a Plan-mode-only question tool, and apply_patch,
-  # which the read-only sandbox rejects.
-  tools_off = (
-    *(f"features.{name}=false"
-      for name in (*CODEX_TOOL_FEATURES, "view_image", "sleep_tool")),
-    'web_search="disabled"',
-  )
   config_overrides = (*_codex_mcp_isolation_overrides(
     cwd,
     env,
     runner=mcp_inventory_runner,
-  ), *CODEX_NATIVE_HELPERS_OFF, *tools_off)
+  ), *CODEX_NATIVE_HELPERS_OFF, *CODEX_TOOLS_OFF)
   config = CodexConfig(
     codex_bin=shutil.which("codex"),
     cwd=cwd,

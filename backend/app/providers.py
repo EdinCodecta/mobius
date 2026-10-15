@@ -874,19 +874,26 @@ CODEX_NATIVE_HELPERS_OFF = (
 )
 
 # Codex has no tool allow-list (no single `tools=[]` flag): a built-in tool
-# stays on until its feature is switched off. Tool-less runs (compaction, and
-# session forks for /btw and Agent Coaching) switch these off. If a tool-less
-# run hits an issue, or a Codex update adds a tool, adjust this list.
-CODEX_TOOL_FEATURES = (
-  "shell_tool",
-  "unified_exec",
-  "apps",
-  "browser_use",
-  "browser_use_external",
-  "browser_use_full_cdp_access",
-  "computer_use",
-  "image_generation",
-  "goals",
+# stays on until it is switched off. Tool-less runs (compaction, and session
+# forks for /btw and Agent Coaching) pass these config overrides last, so they
+# win over a provider's own settings (the Möbius subscription turns web search
+# on for chats). What Codex cannot switch off reaches no file or network: its
+# code runner, a clock, a Plan-mode-only question tool, and apply_patch, which
+# the read-only sandbox rejects. If a tool-less run hits an issue, or a Codex
+# update adds a tool, adjust this list.
+CODEX_TOOLS_OFF = (
+  "features.shell_tool=false",
+  "features.unified_exec=false",
+  "features.apps=false",
+  "features.browser_use=false",
+  "features.browser_use_external=false",
+  "features.browser_use_full_cdp_access=false",
+  "features.computer_use=false",
+  "features.image_generation=false",
+  "features.goals=false",
+  "features.view_image=false",
+  "features.sleep_tool=false",
+  'web_search="disabled"',
 )
 
 

@@ -585,7 +585,7 @@ async def _run_codex_summarize_turn(
   effort: str | None,
 ) -> str:
   """Run an ephemeral, read-only Codex turn and return its final message."""
-  from app.providers import CODEX_NATIVE_HELPERS_OFF, CODEX_TOOL_FEATURES, get_provider
+  from app.providers import CODEX_NATIVE_HELPERS_OFF, CODEX_TOOLS_OFF, get_provider
 
   provider = get_provider(provider_id)
 
@@ -608,9 +608,9 @@ async def _run_codex_summarize_turn(
   ]
   # The read-only sandbox remains defense in depth for any future built-in
   # that ignores a feature gate.
-  for feature in CODEX_TOOL_FEATURES:
-    cmd.extend(("--disable", feature))
-  for override in (*CODEX_NATIVE_HELPERS_OFF, *provider.codex_config_overrides()):
+  for override in (
+    *CODEX_NATIVE_HELPERS_OFF, *provider.codex_config_overrides(), *CODEX_TOOLS_OFF,
+  ):
     cmd.extend(("--config", override))
   if model:
     cmd.extend(("--model", model))
