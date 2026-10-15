@@ -9,8 +9,9 @@ function lastOpened(iso) {
   return date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
 }
 
-function phoneName(device) {
-  return isThisPhone(device.tokenTail) ? 'This phone' : `Phone ···${device.tokenTail}`
+function phoneName(device, { inSentence = false } = {}) {
+  const name = isThisPhone(device.tokenTail) ? 'This phone' : `Phone ···${device.tokenTail}`
+  return inSentence ? name.charAt(0).toLowerCase() + name.slice(1) : name
 }
 
 /**
@@ -97,7 +98,7 @@ export default function PhoneNotifications({ active = true }) {
         onCancel={(event) => { event.preventDefault(); if (!removing) setConfirming(null) }}
       >
         <h3 id="settings-phone-confirm-title" className="settings-phone-confirm__title">
-          Remove {confirming ? phoneName(confirming).replace(/^This phone$/, 'this phone') : 'phone'}?
+          Remove {confirming ? phoneName(confirming, { inSentence: true }) : 'phone'}?
         </h3>
         <p className="settings__subtext settings__subtext--tight">
           It stops getting notifications until Möbius opens on it again. To stop them for good,

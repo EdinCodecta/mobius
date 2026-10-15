@@ -604,6 +604,11 @@
 }
 
 .settings-phone-confirm {
+  /* The global reset zeroes dialog margins; centre it explicitly. */
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  height: fit-content;
   width: min(360px, calc(100vw - 32px));
   padding: 18px;
   border: 1px solid var(--border);
