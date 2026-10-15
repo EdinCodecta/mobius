@@ -425,6 +425,8 @@ jobs:
           npm run test:coverage
       - name: Run static app packager tests
         run: npm run test:packager
+      - name: Run dependency safety check tests
+        run: node --test 'scripts/dependency-safety/*.test.mjs'
       - name: Install browser harness deps
         # The harness imports Playwright helpers even though it does not launch
         # a browser. Install the root lockfile instead of relying on the

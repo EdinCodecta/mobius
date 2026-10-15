@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Compares every npm lockfile a pull request changes against its base and
-// writes the safety report. Exits 1 when a changed package has a known
-// advisory; writes no report when no lockfile installs anything new.
+// Compares the npm lockfiles of two commits and writes the safety report. It
+// only reads lockfile text from Git, so untrusted commits are safe inputs.
+// Exits 1 when a changed package has a known advisory or the lookup failed;
+// writes no report when no lockfile entry changed.
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
@@ -9,16 +10,10 @@ import { posix } from 'node:path'
 import { parseArgs } from 'node:util'
 
 import { changedPackages } from './lockfile-changes.mjs'
-import { findAdvisories, publishDates } from './registry.mjs'
+import { findAdvisories } from './registry.mjs'
 import { hasAdvisories, renderReport } from './report.mjs'
 
 const git = (...args) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 })
-
-function changedLockfiles(base) {
-  return git('diff', '--name-only', base, 'HEAD')
-    .split('\n')
-    .filter(file => posix.basename(file) === 'package-lock.json')
-}
 
 function readLock(ref, file) {
   const exists = spawnSync('git', ['cat-file', '-e', `${ref}:${file}`]).status === 0
@@ -34,27 +29,20 @@ async function lookUpAdvisories(changes) {
 }
 
 const { values: options } = parseArgs({
-  options: { base: { type: 'string', default: 'HEAD^1' }, out: { type: 'string' } },
+  options: { base: { type: 'string' }, head: { type: 'string' }, out: { type: 'string' } },
 })
-const sections = changedLockfiles(options.base)
-  .map(lockfile => ({
-    lockfile,
-    changes: changedPackages(readLock(options.base, lockfile), readLock('HEAD', lockfile)),
-  }))
-  .filter(section => section.changes.length > 0)
+const changes = git('diff', '--name-only', options.base, options.head)
+  .split('\n')
+  .filter(file => posix.basename(file) === 'package-lock.json')
+  .flatMap(file => changedPackages(readLock(options.base, file), readLock(options.head, file)))
 
-if (sections.length === 0) {
-  console.log('No lockfile installs a new package version.')
+if (changes.length === 0) {
+  console.log('No lockfile entry changed.')
   process.exit(0)
 }
 
-const changes = sections.flatMap(section => section.changes)
-const uniqueChanges = [...new Map(changes.map(change => [`${change.name}@${change.version}`, change])).values()]
-const { advisories, advisoryError } = await lookUpAdvisories(uniqueChanges)
-const dates = await publishDates(uniqueChanges)
-const report = renderReport({ sections, advisories, advisoryError, dates, now: new Date() })
-
+const { advisories, advisoryError } = await lookUpAdvisories(changes)
+const report = renderReport({ changes, advisories, advisoryError })
 if (options.out) writeFileSync(options.out, report)
 console.log(report)
-if (advisoryError) console.log(`::warning::Dependency safety check could not reach npm advisories: ${advisoryError}`)
-process.exitCode = hasAdvisories(advisories) ? 1 : 0
+process.exitCode = advisoryError || hasAdvisories(advisories) ? 1 : 0

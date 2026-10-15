@@ -1,20 +1,20 @@
 name: Dependency safety
 
-# Comments on pull requests that change an npm lockfile: known malware or
-# vulnerabilities in changed packages fail the check; releases younger than
-# Dependabot's cooldown, new packages, install scripts and downloads from
-# outside the npm registry are flagged for review. The changed packages are
-# only looked up, never installed or run.
+# Comments on pull requests that change an npm lockfile. Known malware or
+# vulnerabilities in changed packages fail the check; new packages, install
+# scripts and downloads from outside the npm registry are flagged for review.
+#
+# pull_request_target runs this workflow and the checker from main, so the
+# pull request's code never runs with the comment token. Its lockfiles are
+# fetched as Git objects and only parsed.
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
-    paths:
-      - '**/package-lock.json'
-      - 'scripts/dependency-safety/**'
-      - '.github/workflows/dependency-safety.yml'
+    paths: ['**/package-lock.json']
 
 permissions:
   contents: read
+  pull-requests: write
 
 concurrency:
   group: dependency-safety-${{ github.event.pull_request.number }}
@@ -23,41 +23,34 @@ concurrency:
 jobs:
   report:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      # Dependabot's token is read-only unless the workflow asks for this.
-      # Fork pull requests stay read-only and get the job summary only.
-      pull-requests: write
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      REPORT: dependency-safety.md
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          # The pull request's merge commit plus its first parent: the base.
-          fetch-depth: 2
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: 24
-      - name: Test the safety check
-        run: node --test 'scripts/dependency-safety/*.test.mjs'
       - name: Check changed packages
-        run: node scripts/dependency-safety/check.mjs --base HEAD^1 --out "$RUNNER_TEMP/dependency-safety.md"
-      - name: Publish the report
-        if: ${{ !cancelled() }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
-          report="$RUNNER_TEMP/dependency-safety.md"
-          [ -s "$report" ] || exit 0
-          cat "$report" >> "$GITHUB_STEP_SUMMARY"
-          [ "$SAME_REPO" = true ] || exit 0
-          marker="$(head -n 1 "$report")"
+          merge_base="$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" --jq .merge_base_commit.sha)"
+          git fetch --no-tags --depth=1 origin "$merge_base" "$HEAD_SHA"
+          node scripts/dependency-safety/check.mjs --base "$merge_base" --head "$HEAD_SHA" --out "$REPORT"
+      - name: Post or update the comment
+        if: ${{ !cancelled() }}
+        run: |
+          [ -s "$REPORT" ] || exit 0
+          marker="$(head -n 1 "$REPORT")"
           comment_id="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
             --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n 1)"
           if [ -n "$comment_id" ]; then
-            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@"$report" > /dev/null
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@"$REPORT" > /dev/null
           else
-            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F body=@"$report" > /dev/null
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F body=@"$REPORT" > /dev/null
           fi
