@@ -70,6 +70,12 @@ for (const scenario of SCENARIOS) {
     expect(chat?.id).toBeTruthy()
 
     const goalObjective = 'Keep the guarded service boundary stable'
+    // Runtime and detail reads own the Goal presentation: the rail follows
+    // `goal`, as the server sends it, not the /goal message text.
+    const goal = {
+      id: `${scenario.label}-goal`, revision: 1, objective: goalObjective,
+      status: 'active', resumable: false,
+    }
     const paragraphs = Array.from({ length: 42 }, (_, i) => ({
       type: 'text',
       content: `Attention history ${i + 1}. ${'Enough content to overflow the viewport. '.repeat(8)}`,
@@ -110,6 +116,7 @@ for (const scenario of SCENARIOS) {
           // its stream, so its active goal owns the same progress rail.
           ...runtimeSnapshot({ running: true, pending_question_id: pendingQuestionId }),
           active_goal_objective: goalObjective,
+          goal,
         }),
       })
     })
@@ -121,6 +128,7 @@ for (const scenario of SCENARIOS) {
         body: JSON.stringify({
           ...runtimeSnapshot({ running: true, pending_question_id: pendingQuestionId }),
           active_goal_objective: goalObjective,
+          goal,
         }),
       })
     })
@@ -186,10 +194,17 @@ for (const scenario of SCENARIOS) {
 
     await nudge.click()
 
+    // Measure the tail from fractional rects: the distance between the end of
+    // the scroller's content and its bottom edge. scrollHeight and clientHeight
+    // are whole numbers, so under the desktop shell's 90% root zoom their
+    // difference can sit more than 1px from the true maximum scrollTop even
+    // when the scroller is exactly at its tail.
     await page.waitForFunction(nudgeSelector => {
       const scroll = document.querySelector('[data-chat-surface="painted"] .chat__scroll')
-      if (!scroll || document.querySelector(nudgeSelector)) return false
-      return Math.abs(scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop) <= 1
+      if (!scroll?.lastElementChild || document.querySelector(nudgeSelector)) return false
+      const tailGap = scroll.getBoundingClientRect().bottom
+        - scroll.lastElementChild.getBoundingClientRect().bottom
+      return Math.abs(tailGap) <= 1
     }, scenario.nudgeSelector, { timeout: 5000 })
 
     const geometry = await page.evaluate(({ chatId, actionSelector }) => {
@@ -203,8 +218,9 @@ for (const scenario of SCENARIOS) {
       const actionRect = action?.getBoundingClientRect()
       const composerRect = composer?.getBoundingClientRect()
       return {
-        remaining: scroll
-          ? scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop
+        tailGap: scroll?.lastElementChild
+          ? scroll.getBoundingClientRect().bottom
+            - scroll.lastElementChild.getBoundingClientRect().bottom
           : null,
         actionBottom: actionRect?.bottom ?? null,
         composerTop: composerRect?.top ?? null,
@@ -212,7 +228,7 @@ for (const scenario of SCENARIOS) {
       }
     }, { chatId: chat.id, actionSelector: scenario.actionSelector })
 
-    expect(Math.abs(geometry.remaining)).toBeLessThanOrEqual(1)
+    expect(Math.abs(geometry.tailGap)).toBeLessThanOrEqual(1)
     expect(geometry.actionBottom).toBeLessThan(geometry.composerTop)
     expect(geometry.modeKind).toBe('ANCHOR_AT')
   })

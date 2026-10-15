@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from app import models
+from app import transcript_rows
 from app.chat_writer import (
   AppendPending, FinishRun, GoalPromotionRejected, PrepareChatStop,
   PromoteRunToGoal, StartTurn, StartTurnRecoveryChanged, get_writer,
@@ -104,7 +105,7 @@ def test_legacy_goal_resume_after_unrelated_turn_reuses_original_checklist(db, c
   assert goal.status == "open" and goal.hold_json is None and goal.revision == 5
   assert goal.plan_json["tasks"][0]["id"] == "verify"
   assert db.query(models.ChatGoal).count() == 1
-  update_goal_record(db, successor, goal, goal.revision, complete="Original outcome verified")
+  update_goal_record(db, successor, goal, goal.revision, complete=True)
   assert goal.status == "completed"
 
 
@@ -191,9 +192,9 @@ def test_reply_resume_does_not_borrow_a_retained_goal(db, chat):
 def test_saved_card_answer_carries_its_exact_goal_not_newest_goal(db, chat):
   goal, run = seed(db, chat, status="completed")
   db.add(models.ChatGoal(id="newer", chat_id=chat.id, objective="Separate outcome"))
-  chat.messages = [{"role":"assistant", "id": run.id, "blocks":[
+  transcript_rows.replace_all(db, chat, [{"role":"assistant", "id": run.id, "blocks":[
     {"type":"question", "question_id":"card", "questions":[], "response_mode":"continuation"},
-  ]}]
+  ]}])
   chat.pending_question_id = "card"; db.commit()
   queued = submit(AppendPending(chat_id=chat.id, question_id="card", answers={"q":"yes"},
     require_answer_match=True, user_msg={"role":"user", "content":"yes", "cid":"answer",
@@ -238,7 +239,7 @@ def test_goal_resume_http_retries_exact_target_and_preserves_followup_queue(clie
     successor = db.get(models.ChatRun,calls[0]["run_token"])
     assert successor.goal_id == goal.id and goal.status == "open"
     assert [row["cid"] for row in chat.pending_messages] == ["next"]
-    assert not any(row.get("cid") == "goal-resume" for row in chat.messages)
+    assert not any(row.get("cid") == "goal-resume" for row in transcript_rows.history(chat))
   finally:
     runtime.discard_starting(chat.id)
 
@@ -255,7 +256,7 @@ def test_agent_can_reconcile_named_legacy_goal_without_creating_a_replacement(cl
   headers = {"Authorization":"Bearer "+create_agent_token(chat.id, owner.username, owner.token_epoch, run_id="current")}
   path = f"/api/chats/{chat.id}/goal/update"
   assert client.post(path, headers=headers, json={"next_action":"Verify"}).status_code == 409
-  result = client.post(path, headers=headers, json={"goal_id":goal.id, "complete":"Original outcome independently verified"})
+  result = client.post(path, headers=headers, json={"goal_id":goal.id, "complete":True})
   assert result.status_code == 200, result.text
   db.expire_all()
   assert goal.status == "completed" and goal.objective == "The entire promised outcome"
@@ -352,7 +353,7 @@ def test_queued_owner_input_is_stamped_at_acceptance_not_promotion(db, chat):
   successor = db.get(models.ChatRun,"promoted")
   assert successor.owner_input_at.replace(tzinfo=UTC) == accepted
   assert not has_owner_input_after_hold(successor,goal)
-  assert all("_owner_input_at" not in row for row in chat.messages)
+  assert all("_owner_input_at" not in row for row in transcript_rows.history(chat))
 
 
 @pytest.mark.parametrize("hold_kind", ["explicit", "legacy", "invalid"])
@@ -442,7 +443,7 @@ def test_only_direct_owner_http_input_can_supply_later_reattachment_evidence(cli
     db.expire_all()
     run = db.get(models.ChatRun, calls[0]["run_token"])
     assert (run.owner_input_at is not None) == direct_owner
-    assert all("_owner_input_at" not in row for row in chat.messages)
+    assert all("_owner_input_at" not in row for row in transcript_rows.history(chat))
   finally:
     runtime.discard_starting(chat.id)
 

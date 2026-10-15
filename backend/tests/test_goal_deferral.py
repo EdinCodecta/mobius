@@ -1,9 +1,12 @@
 """Deferral is deliberate unfinished work, not abandonment or a false failure."""
+from datetime import UTC, datetime
 from copy import deepcopy
 
 import pytest
 
 from app import models
+from app.chat_writer import create_chat
+from app import transcript_rows
 from app.goals import goal_hold, update_goal_record
 from app.goal_plans import GoalPlanConflict, presented_goal
 from app.chat_writer import FinishRun, StartTurn, StartTurnRecoveryChanged
@@ -143,7 +146,8 @@ def test_deferral_does_not_drop_an_owed_helper_result_from_an_earlier_attempt(db
                        goal_id=goal.id, status="completed"))
   db.commit()
   monkeypatch.setattr(delegations, "_self_resuming_helper_rows", lambda *args: [
-    (SimpleNamespace(id="owed-result", parent_root_run_id="earlier-root"), "completed"),
+    (SimpleNamespace(id="owed-result", parent_root_run_id="earlier-root", goal_id=goal.id,
+                     app_id=None, parent_chat_id=chat.id), "completed"),
   ])
   with pytest.raises(GoalPlanError, match="helper:owed-result"):
     update_goal_record(db, run, goal, goal.revision, defer=REASON)
@@ -160,12 +164,12 @@ def test_settlement_cannot_hide_an_older_live_helper_behind_a_newer_finished_att
     root = "root-" + label
     db.add(models.ChatRun(id=root, root_run_id=root, chat_id=chat.id, goal_id=goal.id,
       goal_objective=goal.objective, status="completed", started_at=started))
-    child = models.Chat(id="child-" + label, title=label, messages=[])
+    child = create_chat(id="child-" + label, title=label, messages=[])
     db.add(child)
     db.flush()
     db.add(models.ChatRun(id="child-run-" + label, chat_id=child.id, status=status))
     db.add(models.Delegation(id="helper-" + label, parent_chat_id=chat.id,
-      parent_root_run_id=root, child_chat_id=child.id, task_key="verify", goal_task_id="verify",
+      parent_root_run_id=root, goal_id=goal.id, child_chat_id=child.id, task_key="verify", goal_task_id="verify",
       provider="codex", scope="read", cwd="/data", prompt_sha256="0" * 64,
       notify_parent_on_complete=False, created_at=started))
   db.commit()
@@ -224,7 +228,7 @@ async def test_normal_closeout_after_deferral_never_starts_settlement_or_invents
   assert db.get(models.ChatGoal, "goal-run").status == "stopped"
   saved = db.get(models.Chat, chat.id)
   assert saved.pending_question_id is None and not saved.pending_messages
-  assert not [b for m in saved.messages for b in m.get("blocks", []) if b.get("type") == "error"]
+  assert not [b for m in transcript_rows.history(saved) for b in m.get("blocks", []) if b.get("type") == "error"]
 
 
 def test_normal_not_now_card_answer_can_defer_without_a_second_question_or_recovery(
@@ -236,7 +240,8 @@ def test_normal_not_now_card_answer_can_defer_without_a_second_question_or_recov
   from app.routes import chats_stream
   from tests.test_owner_approvals import _ask, _answer, _finish
   original = approval_run[0].run_token
-  submit(PromoteRunToGoal(chat_id=chat.id, run_token=original, objective="Verify the paid test"))
+  promoted = submit(PromoteRunToGoal(chat_id=chat.id, run_token=original, objective="Verify the paid test"))
+  goal_id = promoted["goal_id"]
   qid = _ask(client, chat, approval_run).json()["question_id"]
   _finish(chat, approval_run[0])
   scheduled = []
@@ -245,10 +250,10 @@ def test_normal_not_now_card_answer_can_defer_without_a_second_question_or_recov
   assert response.status_code == 202, response.text
   db.expire_all()
   successor = db.query(models.ChatRun).filter_by(chat_id=chat.id, status="running").one()
-  assert successor.goal_id == original and len(scheduled) == 1
+  assert successor.goal_id == goal_id and len(scheduled) == 1
   # The normal card answer woke an agent. It can finish authorized independent
   # work, then record its reasoned deferral; the option label performs no hold.
-  assert db.get(models.ChatGoal, original).status == "open"
+  assert db.get(models.ChatGoal, goal_id).status == "open"
   deferred = _update(client, db, chat.id, {"defer": REASON}, run_id=successor.id)
   assert deferred.status_code == 200, deferred.text
   db.expire_all()
@@ -260,9 +265,9 @@ def test_normal_not_now_card_answer_can_defer_without_a_second_question_or_recov
   _finish(chat, sink)
   db.expire_all()
   assert successor.status == "completed" and len(scheduled) == 1
-  assert db.get(models.ChatGoal, original).status == "stopped"
+  assert db.get(models.ChatGoal, goal_id).status == "stopped"
   assert chat.pending_question_id is None
-  blocks = [b for m in chat.messages for b in m.get("blocks", [])]
+  blocks = [b for m in transcript_rows.history(chat) for b in m.get("blocks", [])]
   assert len([b for b in blocks if b.get("type") == "question"]) == 1
   assert not [b for b in blocks if b.get("type") == "error"]
 
@@ -282,3 +287,93 @@ def test_claim_settlement_refusal_rolls_back_hold_and_tasks_together(client, own
   goal = db.get(models.ChatGoal, "goal-1")
   assert goal.status == "open" and goal.hold_json is None
   assert goal.plan_json["tasks"][0]["status"] == "pending"
+
+
+def test_completion_waits_for_a_failed_helper_result_its_agent_has_not_received(db, chat):
+  """A helper failure that lands just before settlement stays the agent's to
+  handle: completion is refused until the agent reads it, so the failure can
+  never be stranded behind a closed Goal or turned into owner work."""
+  from app.delegations import record_result_read_by_parent
+  from app.goal_plans import GoalPlanError
+  goal, run = seed(db, chat)
+  child = create_chat(id="failed-helper-chat", title="Helper", messages=[])
+  db.add(child)
+  db.flush()
+  db.add(models.ChatRun(id="failed-helper-run", chat_id=child.id, status="failed",
+                       provider="claude", ended_at=datetime.now(UTC)))
+  db.add(models.Delegation(id="failed-helper", parent_chat_id=chat.id,
+    parent_root_run_id=run.id, goal_id=goal.id, child_chat_id=child.id,
+    task_key="cleanup", provider="claude", scope="write", cwd="/data",
+    prompt_sha256="0" * 64, notify_parent_on_complete=True))
+  db.commit()
+
+  with pytest.raises(GoalPlanError, match="helper:failed-helper") as refused:
+    update_goal_record(db, run, goal, goal.revision, complete=True)
+  assert "list_agents" in str(refused.value)
+  db.expire_all()
+  assert goal.status == "open"
+
+  assert record_result_read_by_parent(db, db.get(models.Delegation, "failed-helper"))
+  db.commit()
+  update_goal_record(db, run, goal, goal.revision, complete=True)
+  db.expire_all()
+  assert goal.status == "completed"
+
+
+def _helper(db, *, id, parent_chat_id, goal, run, status, app_id=None, delivered=False):
+  child = create_chat(id=id + "-chat", title=id, messages=[])
+  db.add(child)
+  db.flush()
+  db.add(models.ChatRun(id=id + "-run", chat_id=child.id, status=status,
+                       provider="claude", ended_at=datetime.now(UTC)))
+  db.add(models.Delegation(id=id, parent_chat_id=parent_chat_id, app_id=app_id,
+    parent_root_run_id=run.id, goal_id=goal.id, child_chat_id=child.id,
+    task_key=id, provider="claude", scope="write", cwd="/data",
+    prompt_sha256="0" * 64, notify_parent_on_complete=True,
+    delivered_run_id=id + "-run" if delivered else None))
+  db.flush()
+  return child
+
+
+def test_completion_waits_for_a_nested_failure_owed_to_a_finished_mid_level_helper(db, chat):
+  """A sub-helper that fails after its own parent helper finished still owes
+  that helper a wake; closing the Goal first would strand it."""
+  from app.goal_plans import GoalPlanError
+  goal, run = seed(db, chat)
+  middle = _helper(db, id="middle", parent_chat_id=chat.id, goal=goal, run=run,
+                   status="completed", delivered=True)
+  _helper(db, id="nested", parent_chat_id=middle.id, goal=goal, run=run, status="failed")
+  db.commit()
+  with pytest.raises(GoalPlanError, match="helper:nested"):
+    update_goal_record(db, run, goal, goal.revision, complete=True)
+  db.expire_all()
+  assert goal.status == "open"
+
+
+def test_app_owned_helper_results_never_hold_a_chat_goal_open(db, chat):
+  goal, run = seed(db, chat)
+  app = models.App(slug="owned-helper-app", source_dir="/tmp/mobius-tests/owned-helper-app",
+                   name="Owner app", description="", jsx_source="")
+  db.add(app)
+  db.flush()
+  _helper(db, id="app-helper", parent_chat_id=chat.id, goal=goal, run=run,
+          status="failed", app_id=app.id)
+  db.commit()
+  update_goal_record(db, run, goal, goal.revision, complete=True)
+  db.expire_all()
+  assert goal.status == "completed"
+
+
+def test_a_failed_mid_level_helper_does_not_trap_its_coordinator(db, chat):
+  """Only a helper may read its own children's results, and a failed helper
+  is never woken again. Its failure already reached the coordinator, so a
+  child result it can no longer receive must not block completion forever."""
+  goal, run = seed(db, chat)
+  middle = _helper(db, id="failed-middle", parent_chat_id=chat.id, goal=goal, run=run,
+                   status="failed", delivered=True)
+  _helper(db, id="orphaned-nested", parent_chat_id=middle.id, goal=goal, run=run,
+          status="failed")
+  db.commit()
+  update_goal_record(db, run, goal, goal.revision, complete=True)
+  db.expire_all()
+  assert goal.status == "completed"

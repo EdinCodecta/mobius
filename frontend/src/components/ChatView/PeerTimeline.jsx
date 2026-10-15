@@ -12,7 +12,9 @@ import {
   retryChatActivity,
 } from './chatActivityQueries.js'
 import { groupTimelineRows } from './timelineRowGrouping.js'
-import { peerRecordTool, peerTime, foldPeerActivity } from './peerTimeline.js'
+import { activityEventsFromPages, peerRecordTool, peerTime, foldPeerActivity } from './peerTimeline.js'
+
+const EMPTY_TIMELINE_MAP = new Map()
 
 export function usePeerTimeline(chatId, messages, enabled, activeTools) {
   const query = useInfiniteQuery({
@@ -23,7 +25,7 @@ export function usePeerTimeline(chatId, messages, enabled, activeTools) {
     enabled, staleTime: CHAT_ACTIVITY_STALE_TIME, retry: retryChatActivity,
   })
   const pages = query.data?.pages
-  const events = useMemo(() => [...new Map((pages || []).flatMap(p => p.events).map(event => [event.id, event])).values()], [pages])
+  const events = useMemo(() => activityEventsFromPages(pages), [pages])
   const oldestLoaded = events.length ? Math.min(...events.map(event => peerTime(event.created_at))) : Infinity
   const windowStart = messages[0]?.ts ?? Infinity
   const { hasNextPage, isFetching, isError, fetchNextPage } = query
@@ -32,16 +34,21 @@ export function usePeerTimeline(chatId, messages, enabled, activeTools) {
     if (enabled && hasNextPage && !isFetching && !isError && oldestLoaded >= windowStart) void fetchNextPage()
   }, [enabled, hasNextPage, isFetching, isError, oldestLoaded, windowStart, fetchNextPage])
   return useMemo(
-    () => ({
-      ...foldPeerActivity(
+    () => {
+      const timeline = foldPeerActivity(
         messages,
         projectChatActivity(messages, events, chatId, activeTools),
         chatId,
-      ),
-      // Source identity for the scroll handover; streaming projection alone
-      // must not schedule pre-paint geometry reads on every token.
-      activityEvents: events,
-    }),
+      )
+      return {
+        ...timeline,
+        tools: timeline.tools.size ? timeline.tools : EMPTY_TIMELINE_MAP,
+        positions: timeline.positions.size ? timeline.positions : EMPTY_TIMELINE_MAP,
+        // Source identity for the scroll handover; streaming projection alone
+        // must not schedule pre-paint geometry reads on every token.
+        activityEvents: events,
+      }
+    },
     [messages, events, chatId, activeTools],
   )
 }
