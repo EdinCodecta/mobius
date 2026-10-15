@@ -2715,7 +2715,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     if (activeViewRef.current !== 'settings') navToRef.current('settings')
   }, [activeViewRef])
 
-  const handleNotificationOpen = useCallback((target) => {
+  const openShellTarget = useCallback((target) => {
     if (target?.view === 'settings') {
       openSettingsSection(target.section)
     } else if (target?.view === 'canvas') {
@@ -3479,7 +3479,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
 
   // Installed-app launches and worker messages enter the same destination path
   // as the notification centre, including revealing a pending answer card.
-  useEffect(() => subscribeShellLaunchTargets(handleNotificationOpen), [handleNotificationOpen])
+  useEffect(() => subscribeShellLaunchTargets(openShellTarget), [openShellTarget])
 
   // Resolve a deferred candidate or allocate a fresh row. Ordinary Standard
   // New Chat never reaches this with the visible blank: that is a synchronous
@@ -4739,7 +4739,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           <NotificationCenter
             ref={notificationCenterActionsRef}
             commands={shellCommands}
-            onOpenTarget={handleNotificationOpen}
+            onOpenTarget={openShellTarget}
             onRecoveryAction={recoverNotificationAction}
             updateAvailable={shellUpdateAvailable}
             onUpdateNow={applyShellUpdate}

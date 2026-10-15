@@ -2,6 +2,10 @@
 // destination callback, leaving ordinary app-icon launches at the current view.
 import { parseNotificationTarget } from './notificationTarget.js'
 
+// Boot navigation already owns this document's target. Capture it before
+// history changes, and retire the overlap once per document, not per mount.
+let pendingBootLaunchURL = globalThis.location?.href
+
 export function subscribeShellLaunchTargets(onOpen, {
   launchQueue = globalThis.window?.launchQueue,
   serviceWorker = globalThis.navigator?.serviceWorker,
@@ -20,7 +24,12 @@ export function subscribeShellLaunchTargets(onOpen, {
   // The manifest's focus-existing mode does NOT navigate a warm app. The
   // browser queues its target until this consumer is ready, including launches
   // received while the shell was loading. A plain /shell/ launch is a no-op.
-  launchQueue?.setConsumer(({ targetURL }) => open(targetURL))
+  launchQueue?.setConsumer(({ targetURL }) => {
+    if (!active) return
+    const isBootLaunch = targetURL === pendingBootLaunchURL
+    pendingBootLaunchURL = undefined
+    if (!isBootLaunch) open(targetURL)
+  })
 
   return () => {
     active = false

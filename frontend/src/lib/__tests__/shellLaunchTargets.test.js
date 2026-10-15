@@ -5,7 +5,7 @@ import { subscribeShellLaunchTargets } from '../shellLaunchTargets.js'
 
 globalThis.location = { origin: 'https://mobius.test' }
 
-function harness(pending = []) {
+function harness(pending = [], subscribe = subscribeShellLaunchTargets) {
   let consumer = null
   const listeners = new Set()
   const opened = []
@@ -27,7 +27,7 @@ function harness(pending = []) {
   }
   return {
     opened,
-    subscribe: () => subscribeShellLaunchTargets(target => opened.push(target), { launchQueue, serviceWorker }),
+    subscribe: () => subscribe(target => opened.push(target), { launchQueue, serviceWorker }),
     launch(targetURL) { consumer({ targetURL }) },
     message(data) { for (const listener of listeners) listener({ data }) },
     listeners,
@@ -106,4 +106,60 @@ test('browsers without LaunchQueue retain warm push-message navigation', () => {
   assert.doesNotThrow(() => subscribeShellLaunchTargets(() => {}, {
     launchQueue: undefined, serviceWorker: undefined,
   })())
+})
+
+async function bootedHarness(bootURL, pending = []) {
+  // A fresh module models a new document; subscriptions can remount within it.
+  globalThis.location.href = bootURL
+  try {
+    const { subscribeShellLaunchTargets: subscribe } = await import(
+      `../shellLaunchTargets.js?document=${encodeURIComponent(bootURL)}`
+    )
+    return harness(pending, subscribe)
+  } finally {
+    delete globalThis.location.href
+  }
+}
+
+test('the cold app intent belongs to boot navigation, not the queued launch', async () => {
+  const bootURL = 'https://mobius.test/shell/?app=pages&intent=artifact:cold'
+  const h = await bootedHarness(bootURL, [bootURL])
+  h.subscribe()
+  assert.deepEqual(h.opened, [])
+  h.launch(bootURL)
+  assert.deepEqual(h.opened, [{ view: 'canvas', app: 'pages', intent: 'artifact:cold' }])
+})
+
+test('a different first launch is delivered and does not suppress a later boot URL', async () => {
+  const bootURL = 'https://mobius.test/shell/?app=pages&intent=artifact:later'
+  const h = await bootedHarness(bootURL, ['https://mobius.test/shell/?chat=queued'])
+  h.subscribe()
+  h.launch(bootURL)
+  assert.deepEqual(h.opened, [
+    { view: 'chat', chatId: 'queued', focusQuestion: false },
+    { view: 'canvas', app: 'pages', intent: 'artifact:later' },
+  ])
+})
+
+test('remounting does not suppress a warm launch matching the document boot URL', async () => {
+  const bootURL = 'https://mobius.test/shell/?app=pages&intent=artifact:remount'
+  const h = await bootedHarness(bootURL, [bootURL])
+  const stop = h.subscribe()
+  stop()
+  h.subscribe()
+  h.launch(bootURL)
+  assert.deepEqual(h.opened, [{ view: 'canvas', app: 'pages', intent: 'artifact:remount' }])
+})
+
+test('retired consumers cannot consume the document launch before the live subscription', async () => {
+  const bootURL = 'https://mobius.test/shell/?chat=cold-remount&focus=question'
+  const h = await bootedHarness(bootURL)
+  const stop = h.subscribe()
+  stop()
+  h.launch(bootURL)
+  h.subscribe()
+  h.launch(bootURL)
+  assert.deepEqual(h.opened, [])
+  h.message({ type: 'notification-click', target: bootURL })
+  assert.deepEqual(h.opened, [{ view: 'chat', chatId: 'cold-remount', focusQuestion: true }])
 })
