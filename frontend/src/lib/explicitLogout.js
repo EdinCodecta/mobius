@@ -1,3 +1,5 @@
+import { markExplicitSignOut } from './mobiusSignIn.js'
+
 /**
  * Revoke installation handoffs and stop this phone's native push while the
  * owner credential still exists, then remove every local owner-scoped trace.
@@ -29,5 +31,8 @@ export async function clearExplicitOwnerSession({
     // or by the next owner's registration of the same token.
   }
   dropCredential()
+  // Tell the sign-in screen this was deliberate, so a mobius.you instance
+  // does not redirect straight back into a fresh session.
+  markExplicitSignOut()
   await clearOwnerCache()
 }
