@@ -22,6 +22,7 @@ function install([installPath, entry]) {
   return {
     ...entry,
     ...identity,
+    claimed: `${claimed.name}@${claimed.version}`,
     outsideRegistry: Boolean(entry.resolved) && !tarball,
     misidentified: identity.name !== claimed.name || identity.version !== claimed.version,
   }
@@ -34,16 +35,19 @@ function installs(lock) {
     .map(install)
 }
 
-// Everything that decides which code npm downloads and whether it runs on install.
+// Everything that decides which code npm downloads and whether it runs on
+// install, plus what the lockfile calls it, so a changed claim is reported too.
 const fingerprint = entry =>
-  [entry.name, entry.version, entry.integrity, entry.resolved, Boolean(entry.hasInstallScript)].join(' ')
+  [entry.name, entry.version, entry.claimed, entry.integrity, entry.resolved, Boolean(entry.hasInstallScript)].join(' ')
+const download = entry => `${entry.integrity} ${entry.resolved}`
 
 function describeChange(entry, previousVersions) {
+  const sameVersion = previousVersions.filter(old => old.version === entry.version)
   return {
     name: entry.name,
     version: entry.version,
     newPackage: previousVersions.length === 0,
-    changedDownload: previousVersions.some(old => old.version === entry.version),
+    changedDownload: sameVersion.length > 0 && !sameVersion.some(old => download(old) === download(entry)),
     newInstallScript: Boolean(entry.hasInstallScript) && !previousVersions.some(old => old.hasInstallScript),
     outsideRegistry: entry.outsideRegistry,
     misidentified: entry.misidentified,

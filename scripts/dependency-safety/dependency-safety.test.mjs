@@ -36,6 +36,21 @@ test('a tampered copy cannot hide behind an unchanged duplicate of the same vers
   assert.equal(change.changedDownload, true)
 })
 
+test('renaming an entry without changing its download is reported as a mismatch, not a new download', () => {
+  const base = lock({ 'node_modules/chalk': install('chalk', '5.6.1') })
+  const head = lock({ 'node_modules/chalk': install('chalk', '5.6.1', { name: 'left-pad' }) })
+  const [change, ...rest] = changedPackages(base, head)
+  assert.deepEqual(rest, [])
+  assert.deepEqual([change.name, change.misidentified, change.changedDownload], ['chalk', true, false])
+})
+
+test('an install script added to the same download is not called a different download', () => {
+  const base = lock({ 'node_modules/chalk': install('chalk', '5.6.1') })
+  const head = lock({ 'node_modules/chalk': install('chalk', '5.6.1', { hasInstallScript: true }) })
+  const [change] = changedPackages(base, head)
+  assert.deepEqual([change.newInstallScript, change.changedDownload], [true, false])
+})
+
 test('flags new packages, new install scripts and downloads from outside the registry', () => {
   const base = lock({ 'node_modules/esbuild': install('esbuild', '0.1.0', { hasInstallScript: true }) })
   const head = lock({
