@@ -386,6 +386,12 @@ def _png_chunk(kind: bytes, data: bytes) -> bytes:
   return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
 
+def _with_png_chunk(png: bytes, kind: bytes, data: bytes) -> bytes:
+  """``png`` with one more chunk just before its IEND."""
+  end = png.rindex(b"IEND") - 4
+  return png[:end] + _png_chunk(kind, data) + png[end:]
+
+
 def test_uploaded_photos_lose_their_location_and_camera_data(client, auth):
   import hashlib
 
@@ -400,9 +406,8 @@ def test_uploaded_photos_lose_their_location_and_camera_data(client, auth):
   )
   assert Image.open(io.BytesIO(photo.getvalue())).getexif().get_ifd(0x8825)
   plain = _png((9, 90, 9))
-  end = plain.rindex(b"IEND") - 4
   # An unknown provenance chunk, and bytes hidden after the image ends.
-  png = plain[:end] + _png_chunk(b"caBX", b"C2PA manifest") + plain[end:] + b"TRAILING"
+  png = _with_png_chunk(plain, b"caBX", b"C2PA manifest") + b"TRAILING"
   assert Image.open(io.BytesIO(png)).size == (64, 40)
 
   saved = _save(client, auth, app_id, **_complete_listing(
@@ -756,8 +761,7 @@ def test_a_png_timestamp_alone_does_not_hold_the_listing_back(client, auth, db):
   source = _source()
   app_id = _create(client, auth, source)
   icon = (source / "icon.png").read_bytes()
-  end = icon.rindex(b"IEND") - 4
-  stamped = icon[:end] + _png_chunk(b"tIME", bytes([7, 234, 10, 14, 1, 2, 3])) + icon[end:]
+  stamped = _with_png_chunk(icon, b"tIME", bytes([7, 234, 10, 14, 1, 2, 3]))
   (source / "icon.png").write_bytes(stamped)
   _commit_accepted(db, source, app_id, "icon with a timestamp")
   assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
@@ -1045,16 +1049,12 @@ def test_the_software_text_cap_applies_after_decompression(compressed):
 
   from app.community_publish import listing_image_has_metadata
 
-  plain = io.BytesIO()
-  Image.new("RGB", (8, 8)).save(plain, format="PNG")
-  base = plain.getvalue()
-  end = base.rindex(b"IEND") - 4
   for value, flagged in ((b"Editor 1.0", False), (b"x" * 5000, True)):
     if compressed:
-      chunk = _png_chunk(b"zTXt", b"Software\0\0" + zlib.compress(value))
+      png = _with_png_chunk(_png(), b"zTXt", b"Software\0\0" + zlib.compress(value))
     else:
-      chunk = _png_chunk(b"iTXt", b"Software\0\0\0\0\0" + value)
-    assert listing_image_has_metadata(base[:end] + chunk + base[end:]) is flagged
+      png = _with_png_chunk(_png(), b"iTXt", b"Software\0\0\0\0\0" + value)
+    assert listing_image_has_metadata(png) is flagged
 
 
 def test_a_compressed_software_chunk_hides_nothing_past_its_tool_name():
@@ -1062,16 +1062,11 @@ def test_a_compressed_software_chunk_hides_nothing_past_its_tool_name():
 
   from app.community_publish import listing_image_has_metadata
 
-  plain = io.BytesIO()
-  Image.new("RGB", (8, 8)).save(plain, format="PNG")
-  base = plain.getvalue()
-  end = base.rindex(b"IEND") - 4
   name = zlib.compress(b"Editor 1.0")
   hidden = b"A name and a street address"
 
   def flagged(kind, data):
-    chunk = _png_chunk(kind, b"Software\0" + data)
-    return listing_image_has_metadata(base[:end] + chunk + base[end:])
+    return listing_image_has_metadata(_with_png_chunk(_png(), kind, b"Software\0" + data))
 
   assert flagged(b"zTXt", b"\0" + name) is False
   assert flagged(b"iTXt", b"\1\0\0\0" + name) is False
