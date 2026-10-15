@@ -48,7 +48,7 @@ def _put(client, auth, **body):
 
 def _tokens(db):
   db.expire_all()
-  return [row.token for row in db.query(models.PushDevice).order_by(models.PushDevice.created_at)]
+  return sorted(row.token for row in db.query(models.PushDevice))
 
 
 def _owner_id(db):
