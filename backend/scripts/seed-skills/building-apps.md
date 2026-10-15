@@ -186,9 +186,8 @@ of the app's source, so it is reviewed, versioned and published with the code:
   (turning it upright first, since the orientation tag goes with the rest,
   and keeping its colour profile;
   the same works for PNG and WebP without `quality`), or remove it if
-  nothing uses it. A bare PNG `tIME` timestamp and a PNG text chunk keyed
-  exactly `Software` (the tool that wrote it) are allowed; any other text key
-  (`Author`, `Comment`, `Description`, XMP...) is not.
+  nothing uses it. A bare PNG `tIME` timestamp is allowed; any PNG text
+  chunk is not, whatever its key (`Software`, `Author`, `Comment`, XMP...).
 - Screenshots must be truthful and private: capture the app's real UI in an
   empty, demo, or fixture state, never the owner's own records, names,
   accounts, chats, or machines. Build a small demo state if the app has none.

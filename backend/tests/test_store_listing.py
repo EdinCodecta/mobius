@@ -833,33 +833,6 @@ def test_an_app_accepted_with_older_ignore_rules_can_save_a_listing(client, auth
   assert app_git._run(source, "show", "HEAD:.gitignore").stdout == app_git._GITIGNORE
 
 
-def test_a_png_naming_only_its_software_does_not_hold_the_listing_back(client, auth, db):
-  from PIL import PngImagePlugin
-
-  source = _source()
-  app_id = _create(client, auth, source)
-  info = PngImagePlugin.PngInfo()
-  info.add_text("Software", "An image editor 3.2")
-  icon = io.BytesIO()
-  Image.new("RGB", (64, 64), (200, 40, 40)).save(icon, format="PNG", pnginfo=info)
-  (source / "icon.png").write_bytes(icon.getvalue())
-  (source / "assets").mkdir()
-  info = PngImagePlugin.PngInfo()
-  info.add_text("Author", "A person")
-  authored = io.BytesIO()
-  Image.new("RGB", (8, 8)).save(authored, format="PNG", pnginfo=info)
-  (source / "assets" / "authored.png").write_bytes(authored.getvalue())
-  _commit_accepted(db, source, app_id, "a tool name and an author name")
-  assert _save(client, auth, app_id, **_complete_listing()).status_code == 200
-
-  preview = _preview(client, auth, app_id)
-
-  assert _item(preview, "icon")["done"] is True
-  details = _item(preview, "details")
-  assert details["code"] == "listing_image_metadata"
-  assert "assets/authored.png" in details["message"] and "icon.png" not in details["message"]
-
-
 def test_undo_leaves_a_file_someone_edited_since_the_save(tmp_path):
   changes = store_listing_source._SourceChanges(tmp_path)
   (tmp_path / "mobius.json").write_text("original")
@@ -888,19 +861,6 @@ def test_an_unapplied_icon_redirect_cannot_replace_a_tracked_file(client, auth, 
   assert refused.json()["detail"]["code"] == "source_has_draft"
   row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
   assert app_git._run(source, "show", f"{row.source_commit}:notes.txt").stdout == "Plain notes.\n"
-
-
-def test_a_long_software_text_chunk_counts_as_metadata():
-  from PIL import PngImagePlugin
-
-  from app.community_publish import listing_image_has_metadata
-
-  for value, flagged in (("An image editor 3.2", False), ("x" * 300, True)):
-    info = PngImagePlugin.PngInfo()
-    info.add_text("Software", value)
-    image = io.BytesIO()
-    Image.new("RGB", (8, 8)).save(image, format="PNG", pnginfo=info)
-    assert listing_image_has_metadata(image.getvalue()) is flagged
 
 
 def test_the_public_preview_serves_draft_art_without_its_metadata(client, auth, db):
@@ -1043,41 +1003,29 @@ def test_a_tracked_runtime_file_changing_does_not_block_a_save(client, auth, db)
   assert "run.log" not in app_git._run(source, "ls-files").stdout.split()
 
 
-@pytest.mark.parametrize("compressed", [False, True])
-def test_the_software_text_cap_applies_after_decompression(compressed):
+@pytest.mark.parametrize("value", [
+  b"Editor 1.0",
+  b"A. Person, 12 Example Street, +1 555 0100",
+  b"a.person@example.com",
+])
+def test_png_software_text_counts_as_metadata_and_strips_away(value):
   import zlib
 
-  from app.community_publish import listing_image_has_metadata
+  from app.community_publish import (
+    listing_image_has_metadata, strip_listing_image_metadata,
+  )
 
-  for value, flagged in ((b"Editor 1.0", False), (b"x" * 5000, True)):
-    if compressed:
-      png = _with_png_chunk(_png(), b"zTXt", b"Software\0\0" + zlib.compress(value))
-    else:
-      png = _with_png_chunk(_png(), b"iTXt", b"Software\0\0\0\0\0" + value)
-    assert listing_image_has_metadata(png) is flagged
-
-
-def test_a_compressed_software_chunk_hides_nothing_past_its_tool_name():
-  import zlib
-
-  from app.community_publish import listing_image_has_metadata
-
-  name = zlib.compress(b"Editor 1.0")
-  hidden = b"A name and a street address"
-
-  def flagged(kind, data):
-    return listing_image_has_metadata(_with_png_chunk(_png(), kind, b"Software\0" + data))
-
-  assert flagged(b"zTXt", b"\0" + name) is False
-  assert flagged(b"iTXt", b"\1\0\0\0" + name) is False
-  # Bytes after the stream ends, a stream cut short, or a compression flag or
-  # method PNG does not define are not a short tool name.
-  assert flagged(b"zTXt", b"\0" + name + hidden) is True
-  assert flagged(b"iTXt", b"\1\0\0\0" + name + hidden) is True
-  assert flagged(b"zTXt", b"\0" + name[:-4]) is True
-  assert flagged(b"zTXt", b"\1" + name) is True
-  assert flagged(b"iTXt", b"\1\1\0\0" + name) is True
-  assert flagged(b"iTXt", b"\2\0\0\0Editor 1.0") is True
+  plain = _png()
+  # Every text form PNG has, with no carve-out for the Software key.
+  for kind, data in (
+    (b"tEXt", b"Software\0" + value),
+    (b"zTXt", b"Software\0\0" + zlib.compress(value)),
+    (b"iTXt", b"Software\0\0\0\0\0" + value),
+    (b"iTXt", b"Software\0\1\0\0\0" + zlib.compress(value)),
+  ):
+    png = _with_png_chunk(plain, kind, data)
+    assert listing_image_has_metadata(png) is True
+    assert strip_listing_image_metadata(png) == plain
 
 
 def test_an_unexpected_image_error_is_a_checklist_item_not_a_crash(monkeypatch):
