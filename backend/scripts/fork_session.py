@@ -469,13 +469,23 @@ async def _fork_codex_async(
       _codex_rollout(codex_home, source_session_id), after_call_id
     )
   )
-  from app.providers import CODEX_NATIVE_HELPERS_OFF
+  from app.providers import CODEX_NATIVE_HELPERS_OFF, CODEX_TOOL_FEATURES
 
+  # A fork answers from the conversation alone, like Claude's `--tools ""`.
+  # Codex's code runner still nests an image viewer (local file reads) and web
+  # access, so those go too. What cannot be switched off reaches nothing: the
+  # empty runner, a clock, a Plan-mode-only question tool, and apply_patch,
+  # which the read-only sandbox rejects.
+  tools_off = (
+    *(f"features.{name}=false"
+      for name in (*CODEX_TOOL_FEATURES, "view_image", "sleep_tool")),
+    'web_search="disabled"',
+  )
   config_overrides = (*_codex_mcp_isolation_overrides(
     cwd,
     env,
     runner=mcp_inventory_runner,
-  ), *CODEX_NATIVE_HELPERS_OFF)
+  ), *CODEX_NATIVE_HELPERS_OFF, *tools_off)
   config = CodexConfig(
     codex_bin=shutil.which("codex"),
     cwd=cwd,
@@ -495,7 +505,9 @@ async def _fork_codex_async(
           approval_mode=ApprovalMode.deny_all,
           cwd=cwd,
           sandbox=Sandbox.read_only,
-          **({"ephemeral": True} if ephemeral else {}),
+          # Codex refuses an ephemeral fork unless it leaves the turns out of
+          # its reply; the model still sees the whole conversation.
+          **({"ephemeral": True, "include_turns": False} if ephemeral else {}),
         )
       else:
         # The SDK's thread_fork does not take the app-server's lastTurnId yet;
@@ -505,7 +517,7 @@ async def _fork_codex_async(
           "cwd": cwd,
           "approvalPolicy": "never",
           "sandbox": "read-only",
-          **({"ephemeral": True} if ephemeral else {}),
+          **({"ephemeral": True, "excludeTurns": True} if ephemeral else {}),
         })
         thread = AsyncThread(codex, forked.thread.id)
       await _assert_codex_mcp_isolated(codex, str(thread.id or ""))

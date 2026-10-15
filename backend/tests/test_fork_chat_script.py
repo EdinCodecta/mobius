@@ -285,6 +285,20 @@ def test_codex_uses_sdk_thread_fork_and_read_only_turn(tmp_path, monkeypatch):
     "agents.enabled=false",
     "features.multi_agent=false",
     "features.multi_agent_v2.enabled=false",
+    # Built-in tools off, like a Claude fork's --tools "": no shell, file or
+    # image reads, browser, apps, or web.
+    "features.shell_tool=false",
+    "features.unified_exec=false",
+    "features.apps=false",
+    "features.browser_use=false",
+    "features.browser_use_external=false",
+    "features.browser_use_full_cdp_access=false",
+    "features.computer_use=false",
+    "features.image_generation=false",
+    "features.goals=false",
+    "features.view_image=false",
+    "features.sleep_tool=false",
+    'web_search="disabled"',
   )
   assert all(
     name not in calls["config"]["env"]
@@ -361,6 +375,8 @@ def test_codex_side_question_fork_is_ephemeral_and_uses_the_chats_model(
 
   assert result.answer == "side answer"
   assert calls["fork"]["ephemeral"] is True
+  # Codex refuses an ephemeral fork that would return its turns.
+  assert calls["fork"]["include_turns"] is False
   assert calls["fork"]["sandbox"] == "read-only"
   assert calls["run"]["model"] == "gpt-5.5"
 

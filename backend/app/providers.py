@@ -873,6 +873,22 @@ CODEX_NATIVE_HELPERS_OFF = (
   "features.multi_agent_v2.enabled=false",
 )
 
+# Codex has no tool allow-list (no single `tools=[]` flag): a built-in tool
+# stays on until its feature is switched off. Tool-less runs (compaction, and
+# session forks for /btw and Agent Coaching) switch these off. If a tool-less
+# run hits an issue, or a Codex update adds a tool, adjust this list.
+CODEX_TOOL_FEATURES = (
+  "shell_tool",
+  "unified_exec",
+  "apps",
+  "browser_use",
+  "browser_use_external",
+  "browser_use_full_cdp_access",
+  "computer_use",
+  "image_generation",
+  "goals",
+)
+
 
 class CodexProvider(BaseProvider):
   """OpenAI Codex provider.
