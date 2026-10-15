@@ -8,48 +8,93 @@
 // server sends through the mobius.you push relay; tapping a notification opens
 // its `url` in the app.
 //
-// The shell registers on every load: that keeps the relay binding fresh and
-// re-arms rotation. Sign-out forgets the phone while the credential still
-// works. To stop notifications otherwise, the owner turns them off for the
-// app in the phone's settings.
+// Nothing is registered until the owner turns phone notifications on in
+// Settings (a tap, since the first call can show the OS permission prompt).
+// After that, each load re-registers silently, which keeps the relay binding
+// fresh and re-arms rotation. Turning it off in Settings, or signing out,
+// forgets the phone while the credential still works.
 
 import { api } from '../api/client.js'
 
-// The last token the server accepted, so sign-out knows what to forget.
+// The last token the server accepted, so turning off or signing out knows
+// what to forget.
 const TOKEN_KEY = 'mobius.nativePush.token'
+// Set only by the owner's Turn on in Settings; cleared by Turn off and sign-out.
+const ENABLED_KEY = 'mobius.nativePush.enabled'
 
 let listeningOn = null
 let pending = Promise.resolve()
 let signedOut = false
 
-function storedToken() {
+function read(key) {
   try {
-    return localStorage.getItem(TOKEN_KEY)
+    return localStorage.getItem(key)
   } catch {
     return null
   }
 }
 
-function storeToken(token) {
+function write(key, value) {
   try {
-    if (token) localStorage.setItem(TOKEN_KEY, token)
-    else localStorage.removeItem(TOKEN_KEY)
+    if (value) localStorage.setItem(key, value)
+    else localStorage.removeItem(key)
   } catch {
-    // Without storage, sign-out cannot forget this phone; the next owner to
-    // sign in on it takes it over.
+    // Without storage the choice lasts only for this page.
   }
 }
 
+const storedToken = () => read(TOKEN_KEY)
+
+export function isNativePushEnabled() {
+  return read(ENABLED_KEY) === '1'
+}
+
+async function failure(response, fallback) {
+  // apiFetch resolves a non-2xx Response; the server's detail says why (for
+  // example, the account still needs linking).
+  try {
+    const { detail } = await response.json()
+    if (typeof detail === 'string' && detail) return detail
+  } catch {
+    // Fall through to the generic message.
+  }
+  return fallback
+}
+
+// Registers one token with the server; resolves to null or an error message.
 function save(result, push) {
   const token = result?.token
-  if (signedOut || typeof token !== 'string' || !token) return pending
-  // Serialized, so sign-out can wait for a registration already in flight.
-  pending = pending.catch(() => {}).then(async () => {
-    if (signedOut) return
+  if (signedOut || typeof token !== 'string' || !token) return Promise.resolve(null)
+  // Serialized, so turning off or signing out waits for a registration in flight.
+  const run = pending.catch(() => {}).then(async () => {
+    if (signedOut) return null
+    const previous = storedToken()
     const response = await push.devices.register({ token })
-    if (response?.ok) storeToken(token)
+    if (response?.ok) {
+      write(TOKEN_KEY, token)
+      if (previous && previous !== token) {
+        // The phone got a new push token; the old one may keep working for a
+        // while, so stop sending to it or every notification arrives twice.
+        try {
+          await push.devices.forget({ token: previous })
+        } catch {
+          // The relay's invalid-token reply retires it later.
+        }
+      }
+      return null
+    }
+    return failure(response, "Couldn't turn on notifications for this phone. Try again.")
   })
-  return pending
+  pending = run
+  return run
+}
+
+function listenForRotation(win, push) {
+  if (listeningOn === win) return
+  listeningOn = win
+  win.addEventListener('mobius:push-token', (event) => {
+    if (isNativePushEnabled()) save(event?.detail, push).catch(() => {})
+  })
 }
 
 export function isNativePushAvailable(win = globalThis.window) {
@@ -63,30 +108,60 @@ export function isThisPhone(tokenTail) {
 }
 
 /**
- * Register this phone for owner notifications; a no-op outside the app. The
- * shell calls it when it starts for a signed-in owner, which also ends an
- * earlier sign-out in the same page.
+ * Shell start: re-register silently, but only if the owner turned phone
+ * notifications on here. Also ends an earlier sign-out in the same page.
  */
 export async function registerNativePush({ win = globalThis.window, push = api.push } = {}) {
-  if (!isNativePushAvailable(win)) return
   signedOut = false
-  if (listeningOn !== win) {
-    listeningOn = win
-    win.addEventListener('mobius:push-token', (event) => {
-      save(event?.detail, push).catch(() => {})
-    })
-  }
+  if (!isNativePushAvailable(win) || !isNativePushEnabled()) return
+  listenForRotation(win, push)
   await save(await win.MobiusNative.registerPush(), push)
+}
+
+/**
+ * Settings → Turn on. Call from a tap: it can show the OS prompt.
+ * Resolves to `{ status: 'on' | 'denied' | 'error', message? }`.
+ */
+export async function enableNativePush({ win = globalThis.window, push = api.push } = {}) {
+  if (!isNativePushAvailable(win)) return { status: 'error', message: 'Only available in the Möbius app.' }
+  signedOut = false
+  try {
+    const result = await win.MobiusNative.registerPush()
+    if (!result) return { status: 'denied' }
+    listenForRotation(win, push)
+    const error = await save(result, push)
+    if (error) return { status: 'error', message: error }
+    write(ENABLED_KEY, '1')
+    return { status: 'on' }
+  } catch {
+    return { status: 'error', message: "Couldn't turn on notifications for this phone. Try again." }
+  }
+}
+
+/**
+ * Settings → Turn off. Stops notifications to this phone; the OS permission
+ * is untouched. Resolves to null or an error message (the token is kept so
+ * Turn off can be tried again).
+ */
+export async function disableNativePush({ push = api.push } = {}) {
+  write(ENABLED_KEY, null)
+  await pending.catch(() => {})
+  const token = storedToken()
+  if (!token) return null
+  try {
+    const response = await push.devices.forget({ token })
+    if (!response?.ok) return failure(response, "Couldn't turn off notifications for this phone. Try again.")
+  } catch {
+    return "Couldn't reach Möbius. Try again."
+  }
+  write(TOKEN_KEY, null)
+  return null
 }
 
 /** Sign-out: stop notifications to this phone while the credential works. */
 export async function forgetNativePush({ push = api.push } = {}) {
   signedOut = true
-  await pending.catch(() => {})
-  const token = storedToken()
-  if (!token) return
-  const response = await push.devices.forget({ token })
-  if (response?.ok) storeToken(null)
+  await disableNativePush({ push })
 }
 
 export function resetNativePushForTests() {

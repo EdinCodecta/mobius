@@ -1,7 +1,7 @@
 import { useEffect } from 'react'
 import { registerNativePush } from '../lib/nativePush.js'
 
-/** Registers this phone for native push inside the Möbius mobile app. */
+/** On shell start, re-registers this phone for native push if the owner turned it on in Settings. */
 export default function useNativePush() {
   useEffect(() => {
     registerNativePush().catch(() => {})

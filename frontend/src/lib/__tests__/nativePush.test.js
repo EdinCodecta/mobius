@@ -2,7 +2,10 @@ import { afterEach, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  disableNativePush,
+  enableNativePush,
   forgetNativePush,
+  isNativePushEnabled,
   isThisPhone,
   registerNativePush,
   resetNativePushForTests,
@@ -11,13 +14,19 @@ import {
 const originalLocalStorage = globalThis.localStorage
 const values = new Map()
 const TOKEN_KEY = 'mobius.nativePush.token'
+const ENABLED_KEY = 'mobius.nativePush.enabled'
 
 function fakePush({ ok = true, forgetOk = true } = {}) {
   const calls = []
   return {
     calls,
     devices: {
-      register: async (body) => { calls.push(['register', body]); return { ok, status: ok ? 200 : 409 } },
+      register: async (body) => {
+        calls.push(['register', body])
+        return ok
+          ? { ok: true, status: 200 }
+          : { ok: false, status: 409, json: async () => ({ detail: 'Link this Möbius first.' }) }
+      },
       forget: async (body) => { calls.push(['forget', body]); return { ok: forgetOk, status: forgetOk ? 204 : 500 } },
     },
   }
@@ -55,57 +64,95 @@ test('outside the mobile app nothing is registered', async () => {
   assert.deepEqual(push.calls, [])
 })
 
-test('inside the app the token is registered and remembered for sign-out', async () => {
+test('the shell never registers a phone the owner has not turned on', async () => {
   const push = fakePush()
-  await registerNativePush({ win: app({ token: 'tok-1', platform: 'android' }), push })
+  await registerNativePush({ win: app({ token: 'tok-1' }), push })
+  assert.deepEqual(push.calls, [])
+})
 
-  // Only the token leaves the page; the relay delivers through FCM.
+test('Turn on registers only the token and remembers the choice', async () => {
+  const push = fakePush()
+  const result = await enableNativePush({ win: app({ token: 'tok-1', platform: 'android' }), push })
+
+  assert.deepEqual(result, { status: 'on' })
   assert.deepEqual(push.calls, [['register', { token: 'tok-1' }]])
   assert.equal(values.get(TOKEN_KEY), 'tok-1')
+  assert.equal(isNativePushEnabled(), true)
 })
 
-test('denied permission registers nothing', async () => {
-  const push = fakePush()
-  await registerNativePush({ win: app(null), push })
-  assert.deepEqual(push.calls, [])
-  assert.equal(values.has(TOKEN_KEY), false)
-})
-
-test('a refused registration is not remembered', async () => {
-  const push = fakePush({ ok: false })
-  await registerNativePush({ win: app({ token: 'tok-1' }), push })
-  assert.equal(values.has(TOKEN_KEY), false)
-})
-
-test('a rotated token is registered', async () => {
+test('once turned on, each shell start re-registers silently', async () => {
   const push = fakePush()
   const win = app({ token: 'tok-1' })
+  await enableNativePush({ win, push })
+  resetNativePushForTests()
+
   await registerNativePush({ win, push })
+
+  assert.deepEqual(push.calls.map(([kind]) => kind), ['register', 'register'])
+})
+
+test('denied permission leaves notifications off', async () => {
+  const push = fakePush()
+  assert.deepEqual(await enableNativePush({ win: app(null), push }), { status: 'denied' })
+  assert.deepEqual(push.calls, [])
+  assert.equal(isNativePushEnabled(), false)
+})
+
+test('a refused registration explains why and stays off', async () => {
+  const push = fakePush({ ok: false })
+  const result = await enableNativePush({ win: app({ token: 'tok-1' }), push })
+
+  assert.deepEqual(result, { status: 'error', message: 'Link this Möbius first.' })
+  assert.equal(isNativePushEnabled(), false)
+  assert.equal(values.has(TOKEN_KEY), false)
+})
+
+test('a rotated token is registered only while turned on', async () => {
+  const push = fakePush()
+  const win = app({ token: 'tok-1' })
+  await enableNativePush({ win, push })
 
   win.emit('mobius:push-token', { token: 'tok-2' })
   await settle()
+  assert.deepEqual(push.calls.slice(-2), [['register', { token: 'tok-2' }], ['forget', { token: 'tok-1' }]])
 
-  assert.deepEqual(push.calls.at(-1), ['register', { token: 'tok-2' }])
-  assert.equal(values.get(TOKEN_KEY), 'tok-2')
+  await disableNativePush({ push })
+  win.emit('mobius:push-token', { token: 'tok-3' })
+  await settle()
+  assert.deepEqual(push.calls.at(-1), ['forget', { token: 'tok-2' }])
 })
 
-test('sign-out forgets the registered token', async () => {
+test('Turn off forgets this phone and the shell stops registering it', async () => {
   const push = fakePush()
-  await registerNativePush({ win: app({ token: 'tok-1' }), push })
+  const win = app({ token: 'tok-1' })
+  await enableNativePush({ win, push })
 
-  await forgetNativePush({ push })
+  assert.equal(await disableNativePush({ push }), null)
+  await registerNativePush({ win, push })
 
-  assert.deepEqual(push.calls.at(-1), ['forget', { token: 'tok-1' }])
+  assert.deepEqual(push.calls.map(([kind]) => kind), ['register', 'forget'])
   assert.equal(values.has(TOKEN_KEY), false)
+  assert.equal(values.has(ENABLED_KEY), false)
 })
 
-test('a failed forget keeps the token so it is not lost', async () => {
+test('a failed Turn off says so and keeps the token to try again', async () => {
   const push = fakePush({ forgetOk: false })
-  await registerNativePush({ win: app({ token: 'tok-1' }), push })
+  await enableNativePush({ win: app({ token: 'tok-1' }), push })
+
+  assert.equal(typeof await disableNativePush({ push }), 'string')
+  assert.equal(values.get(TOKEN_KEY), 'tok-1')
+  assert.equal(isNativePushEnabled(), false)
+})
+
+test('sign-out forgets the phone and signing in again does not re-register it', async () => {
+  const push = fakePush()
+  const win = app({ token: 'tok-1' })
+  await enableNativePush({ win, push })
 
   await forgetNativePush({ push })
+  await registerNativePush({ win, push })
 
-  assert.equal(values.get(TOKEN_KEY), 'tok-1')
+  assert.deepEqual(push.calls.map(([kind]) => kind), ['register', 'forget'])
 })
 
 test('sign-out waits for a registration in flight and blocks later ones', async () => {
@@ -121,6 +168,7 @@ test('sign-out waits for a registration in flight and blocks later ones', async 
     },
   }
   const win = app({ token: 'tok-1' })
+  values.set(ENABLED_KEY, '1')
   const registering = registerNativePush({ win, push })
   await settle()
 
@@ -135,24 +183,26 @@ test('sign-out waits for a registration in flight and blocks later ones', async 
 
 test('Settings recognizes this phone by the end of its registered token', async () => {
   assert.equal(isThisPhone('ab12cd'), false)
-  await registerNativePush({ win: app({ token: 'token-ab12cd' }), push: fakePush() })
+  await enableNativePush({ win: app({ token: 'token-ab12cd' }), push: fakePush() })
 
   assert.equal(isThisPhone('ab12cd'), true)
   assert.equal(isThisPhone('zz99zz'), false)
   assert.equal(isThisPhone(''), false)
 })
 
-test('signing in again without a reload registers the phone again', async () => {
+test('a new token for this phone replaces the old one instead of adding a second phone', async () => {
   const push = fakePush()
   const win = app({ token: 'tok-1' })
-  await registerNativePush({ win, push })
-  await forgetNativePush({ push })
+  await enableNativePush({ win, push })
 
-  await registerNativePush({ win, push })
   win.emit('mobius:push-token', { token: 'tok-2' })
   await settle()
+  await registerNativePush({ win: app({ token: 'tok-2' }), push })
 
-  assert.deepEqual(push.calls.map(([kind, body]) => [kind, body.token]), [
-    ['register', 'tok-1'], ['forget', 'tok-1'], ['register', 'tok-1'], ['register', 'tok-2'],
+  assert.deepEqual(push.calls, [
+    ['register', { token: 'tok-1' }],
+    ['register', { token: 'tok-2' }],
+    ['forget', { token: 'tok-1' }],
+    ['register', { token: 'tok-2' }],
   ])
 })
