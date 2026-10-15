@@ -16,6 +16,9 @@ name: Dependency safety
 on:
   pull_request_target:
     branches: [main]
+    # A push that undoes every lockfile change doesn't run this, so an earlier
+    # comment stays; it names the commit it checked so it reads as outdated.
+    # Clearing it would mean running on every push to every pull request.
     paths: ['**/package-lock.json']
 
 permissions:

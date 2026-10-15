@@ -7,6 +7,7 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import { changedPackages, isCheckableLockfile } from './lockfile-changes.mjs'
+import { findAdvisories } from './registry.mjs'
 import { hasAdvisories, renderReport, renderUnreadableReport, REPORT_MARKER } from './report.mjs'
 
 function install(name, version, extra = {}) {
@@ -109,10 +110,12 @@ test('only lockfiles with npm 7+ packages entries can be checked', () => {
 })
 
 const katex = { name: 'katex', version: '0.19.0' }
+const commit = 'c0ffee'.padEnd(40, '0')
 
-test('a clean report starts with its marker and says nothing stood out', () => {
-  const text = renderReport({ changes: [katex], advisories: {} })
+test('a clean report starts with its marker, names the checked commit and says nothing stood out', () => {
+  const text = renderReport({ commit, changes: [katex], advisories: {} })
   assert.equal(text.split('\n')[0], REPORT_MARKER)
+  assert.match(text, new RegExp(`^Checked at ${commit}\\.$`, 'm'))
   assert.match(text, /No known malware or vulnerabilities in the 1 changed package/)
   assert.match(text, /Nothing else stood out/)
 })
@@ -120,27 +123,41 @@ test('a clean report starts with its marker and says nothing stood out', () => {
 test('advisories for a changed package block the merge and link the advisory', () => {
   const advisories = { katex: [{ title: 'Malware in katex', url: 'https://github.com/advisories/GHSA-x', severity: 'critical', vulnerable_versions: '=0.19.0' }] }
   assert.equal(hasAdvisories(advisories), true)
-  assert.match(renderReport({ changes: [katex], advisories }), /Do not merge[\s\S]*\[`Malware in katex`\]\(https:\/\/github\.com\/advisories\/GHSA-x\) \(critical,/)
+  assert.match(renderReport({ commit, changes: [katex], advisories }), /Do not merge[\s\S]*\[`Malware in katex`\]\(https:\/\/github\.com\/advisories\/GHSA-x\) \(critical,/)
 })
 
 test('advisory text cannot inject Markdown, links or mentions into the comment', () => {
   const advisory = { title: 'x](https://evil.example)\n@someone', url: 'https://evil.example/)', severity: 'critical\n## Merge', vulnerable_versions: '*' }
-  const text = renderReport({ changes: [katex], advisories: { katex: [advisory] } })
+  const text = renderReport({ commit, changes: [katex], advisories: { katex: [advisory] } })
   assert.match(text, /^- `katex`: `x\]\(https:\/\/evil\.example\)@someone` \(unknown severity, affects `\*`\)$/m)
-  const failure = renderReport({ changes: [katex], advisories: null, advisoryError: 'Unexpected token, "\n## Merge" is not valid JSON' })
+  const failure = renderReport({ commit, changes: [katex], advisories: null, advisoryError: 'Unexpected token, "\n## Merge" is not valid JSON' })
   assert.doesNotMatch(failure, /^## Merge/m)
 })
 
 test('an unreachable advisory database is reported as a failure, not as clean', () => {
-  const text = renderReport({ changes: [katex], advisories: null, advisoryError: 'HTTP 503' })
+  const text = renderReport({ commit, changes: [katex], advisories: null, advisoryError: 'HTTP 503' })
   assert.match(text, /Could not check npm's advisory database/)
   assert.doesNotMatch(text, /No known malware/)
 })
 
+test('an advisory reply of any other shape fails the lookup instead of reading as clean', async t => {
+  let reply
+  t.mock.method(globalThis, 'fetch', async () => new Response(reply))
+  const lookUp = body => {
+    reply = body
+    return findAdvisories([katex])
+  }
+  for (const body of ['{"error":{}}', '[]', '{"katex":{"title":"x"}}', '{"katex":[null]}', '{"error":[]}']) {
+    await assert.rejects(lookUp(body), /unexpected response/, body)
+  }
+  assert.deepEqual(await lookUp('{}'), {})
+  assert.equal(hasAdvisories(await lookUp('{"katex":[{"title":"Malware in katex"}]}')), true)
+})
+
 test('lockfile text cannot break out of its code span', () => {
-  const text = renderReport({ changes: [{ name: 'x`\n@someone', version: '1.0.0', newPackage: true }], advisories: {} })
+  const text = renderReport({ commit, changes: [{ name: 'x`\n@someone', version: '1.0.0', newPackage: true }], advisories: {} })
   assert.match(text, /- `x@someone@1\.0\.0`: new package/)
-  const unreadable = renderUnreadableReport(['x`\n@someone/package-lock.json'])
+  const unreadable = renderUnreadableReport({ commit, files: ['x`\n@someone/package-lock.json'] })
   assert.equal(unreadable.split('\n')[0], REPORT_MARKER)
   assert.match(unreadable, /^- `x@someone\/package-lock\.json`$/m)
 })
@@ -170,6 +187,7 @@ test('a changed lockfile the checker cannot read fails the check, including unde
   const run = spawnSync(process.execPath, [CHECK, '--base', base, '--head', head, '--out', out], { cwd: repo, encoding: 'utf8' })
   assert.equal(run.status, 1, run.stdout + run.stderr)
   const report = readFileSync(out, 'utf8')
+  assert.match(report, new RegExp(`^Checked at ${head}\\.$`, 'm'))
   assert.match(report, /Could not read 2 changed lockfile/)
   assert.match(report, /^- `frontend\/package-lock\.json`$/m)
   assert.match(report, /^- `apps\/é\/package-lock\.json`$/m)

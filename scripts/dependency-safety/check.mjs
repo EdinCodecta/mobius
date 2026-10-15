@@ -37,22 +37,23 @@ async function lookUpAdvisories(changes) {
   }
 }
 
-async function buildReport(lockfiles) {
+async function buildReport(lockfiles, commit) {
   const unreadable = lockfiles.filter(({ head }) => head && !isCheckableLockfile(head)).map(({ file }) => file)
-  if (unreadable.length > 0) return { text: renderUnreadableReport(unreadable), failed: true }
+  if (unreadable.length > 0) return { text: renderUnreadableReport({ commit, files: unreadable }), failed: true }
 
   const changes = lockfiles.flatMap(({ base, head }) => changedPackages(base, head))
   if (changes.length === 0) return null
 
   const { advisories, advisoryError } = await lookUpAdvisories(changes)
   const failed = Boolean(advisoryError) || hasAdvisories(advisories)
-  return { text: renderReport({ changes, advisories, advisoryError }), failed }
+  return { text: renderReport({ commit, changes, advisories, advisoryError }), failed }
 }
 
 const { values: options } = parseArgs({
   options: { base: { type: 'string' }, head: { type: 'string' }, out: { type: 'string' } },
 })
-const report = await buildReport(changedLockfiles(options.base, options.head))
+const headCommit = git('rev-parse', '--verify', `${options.head}^{commit}`).trim()
+const report = await buildReport(changedLockfiles(options.base, options.head), headCommit)
 if (report) {
   if (options.out) writeFileSync(options.out, report.text)
   console.log(report.text)

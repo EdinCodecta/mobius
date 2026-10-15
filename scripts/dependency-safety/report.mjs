@@ -52,19 +52,22 @@ function flagLines(changes) {
 
 const FOOTER = [
   "<sub>Checks changed lockfile entries against npm's advisory database (including GitHub malware advisories)",
-  'and flags new packages, install scripts and unexpected downloads. Updated on every push.',
+  'and flags new packages, install scripts and unexpected downloads. Updated on every push while the pull request',
+  'still changes a lockfile; after a push that undoes those changes, it stays as it was.',
   "It reads only the lockfile, which a pull request's author can write freely, so it catches bad releases in",
   'honest npm and Dependabot updates and helps review, but it is no defense against a hostile author.</sub>',
 ].join(' ')
 
-const reportText = sections => [REPORT_MARKER, '### Dependency safety check', '', ...sections, '', FOOTER, ''].join('\n')
+// `commit` is the full SHA of the checked head, which GitHub links.
+const reportText = (commit, sections) =>
+  [REPORT_MARKER, '### Dependency safety check', '', `Checked at ${commit}.`, '', ...sections, '', FOOTER, ''].join('\n')
 
-export function renderReport({ changes, advisories, advisoryError }) {
-  return reportText([...advisoryLines(advisories, advisoryError, changes.length), '', ...flagLines(changes)])
+export function renderReport({ commit, changes, advisories, advisoryError }) {
+  return reportText(commit, [...advisoryLines(advisories, advisoryError, changes.length), '', ...flagLines(changes)])
 }
 
-export function renderUnreadableReport(files) {
-  return reportText([
+export function renderUnreadableReport({ commit, files }) {
+  return reportText(commit, [
     `❌ **Could not read ${files.length} changed lockfile(s), so no package in this pull request was checked.**`,
     'npm can still install from them: regenerate them with npm 7 or later (lockfile version 2 or 3).',
     ...truncated(files.map(file => `- ${code(file)}`)),

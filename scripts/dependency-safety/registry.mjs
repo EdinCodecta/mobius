@@ -16,6 +16,18 @@ export function registryTarball(resolved) {
   return match && { name: match[1], version: match[3] }
 }
 
+const isObject = value => typeof value === 'object' && value !== null && !Array.isArray(value)
+const isAdvisoryList = list => Array.isArray(list) && list.every(isObject)
+
+// A successful reply is a map from packages we asked about to advisory lists.
+// Anything else means the scan didn't happen, so it must fail like an
+// unreachable database rather than read as "no advisories".
+function checkedAdvisories(reply, query) {
+  const valid = isObject(reply) && Object.entries(reply).every(([name, list]) => Object.hasOwn(query, name) && isAdvisoryList(list))
+  if (!valid) throw new Error('npm advisory lookup returned an unexpected response')
+  return reply
+}
+
 export async function findAdvisories(changes) {
   const byName = Object.groupBy(changes, change => change.name)
   const query = Object.fromEntries(
@@ -28,5 +40,5 @@ export async function findAdvisories(changes) {
     signal: AbortSignal.timeout(30_000),
   })
   if (!response.ok) throw new Error(`npm advisory lookup returned HTTP ${response.status}`)
-  return response.json()
+  return checkedAdvisories(await response.json(), query)
 }
