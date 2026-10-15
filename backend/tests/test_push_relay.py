@@ -130,3 +130,15 @@ def test_notifications_are_shortened_to_fit_the_relay_limits(monkeypatch):
 def test_short_notifications_are_sent_unchanged():
   data = {"url": "https://mobius.example/shell/", "notificationId": "n1"}
   assert push_relay.fit_notification("Done", "Ready.", data) == ("Done", "Ready.")
+
+
+def test_the_title_is_shortened_too_when_the_link_leaves_little_room():
+  data = {"url": "https://mobius.example/" + "ü" * 1500, "notificationId": "n1"}
+
+  title, body = push_relay.fit_notification("Tïtle " * 60, "ü" * 2000, data)
+
+  assert body == "" and title and title.endswith("…")
+  assert len(json.dumps(
+    {"title": title, "body": body, "data": data},
+    separators=(",", ":"), ensure_ascii=False,
+  ).encode()) <= push_relay.MAX_PAYLOAD_BYTES

@@ -62,9 +62,14 @@ export function isThisPhone(tokenTail) {
   return !!token && !!tokenTail && token.endsWith(tokenTail)
 }
 
-/** Register this phone for owner notifications; a no-op outside the app. */
+/**
+ * Register this phone for owner notifications; a no-op outside the app. The
+ * shell calls it when it starts for a signed-in owner, which also ends an
+ * earlier sign-out in the same page.
+ */
 export async function registerNativePush({ win = globalThis.window, push = api.push } = {}) {
   if (!isNativePushAvailable(win)) return
+  signedOut = false
   if (listeningOn !== win) {
     listeningOn = win
     win.addEventListener('mobius:push-token', (event) => {

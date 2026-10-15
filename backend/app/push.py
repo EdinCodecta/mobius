@@ -163,8 +163,10 @@ def _collapse_key(tag: str | None, notification_id: str) -> str:
   return "c:" + hashlib.sha256(key.encode()).hexdigest()[:_COLLAPSE_KEY_MAX_BYTES - 2]
 
 
-# The relay accepts data values up to 2048 characters.
-_TAP_URL_MAX_CHARS = 2048
+# The relay accepts data values up to 2048 characters and the whole message up
+# to 4 KB. Measuring the URL as encoded JSON bytes keeps room for the title even
+# when the target is multibyte or needs escaping.
+_TAP_URL_MAX_BYTES = 2048
 
 
 def _tap_url(target: str | None) -> str:
@@ -172,7 +174,7 @@ def _tap_url(target: str | None) -> str:
   origin = get_settings().frontend_origin.rstrip("/")
   if (
     not isinstance(target, str) or not target.startswith("/") or target.startswith("//")
-    or len(origin) + len(target) > _TAP_URL_MAX_CHARS
+    or len(json.dumps(origin + target, ensure_ascii=False).encode()) > _TAP_URL_MAX_BYTES
   ):
     target = "/shell/"
   return origin + target

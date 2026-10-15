@@ -233,3 +233,25 @@ def test_settings_cannot_see_or_remove_another_owners_phone(client, auth, db, re
   assert client.get("/api/push/devices", headers=auth).json() == []
   assert client.delete("/api/push/devices/dev-other", headers=auth).status_code == 204
   assert _tokens(db) == [FCM] and relay.unbinds == []
+
+
+def test_a_tap_link_too_large_once_encoded_falls_back_to_the_shell():
+  from app.push import _tap_url
+
+  assert _tap_url("/shell/?chat=c1").endswith("/shell/?chat=c1")
+  # Under 2048 characters, but well over 2048 bytes once encoded.
+  assert _tap_url("/shell/?q=" + "ü" * 1500).endswith("/shell/")
+
+
+def test_removing_a_phone_keeps_it_when_it_registered_again_meanwhile(client, auth, db, relay):
+  from app.routes.push import _remove_observed
+
+  _put(client, auth, token=FCM)
+  observed = db.query(
+    models.PushDevice.id, models.PushDevice.token, models.PushDevice.registered_at,
+  ).all()
+  _put(client, auth, token=FCM)  # the phone re-registers while removal is paused
+
+  _remove_observed(db, _owner_id(db), observed)
+
+  assert _tokens(db) == [FCM] and relay.unbinds == []

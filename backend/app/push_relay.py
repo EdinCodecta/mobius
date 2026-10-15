@@ -71,20 +71,30 @@ def _payload_bytes(title: str, body: str, data: dict[str, str]) -> int:
   ).encode())
 
 
+def _shrink(text: str, excess: int, *, keep: int) -> str:
+  # Every character is at least one byte, so dropping ``excess`` characters
+  # (plus room for the three-byte ellipsis) removes at least that many bytes.
+  cut = text[:max(keep, len(text) - excess - len(_ELLIPSIS.encode()))]
+  return cut + _ELLIPSIS if cut else ""
+
+
 def fit_notification(
   title: str, body: str, data: dict[str, str],
 ) -> tuple[str, str]:
-  """Shorten title and body so the relay accepts the notification.
+  """Shorten body, then title, so the relay accepts the notification.
 
   ``data`` is sent unchanged; the caller keeps it small (a link and an id).
+  The relay requires a title, so at least its first character stays.
   """
   title = _clip(title, MAX_TITLE_CHARS)
   body = _clip(body, MAX_BODY_CHARS)
-  while body and (excess := _payload_bytes(title, body, data) - MAX_PAYLOAD_BYTES) > 0:
-    # Every character is at least one byte, so this always shrinks enough
-    # within a few rounds; the ellipsis costs three bytes.
-    body = body[:max(0, len(body) - excess - len(_ELLIPSIS.encode()))]
-    body = body + _ELLIPSIS if body else ""
+  while (excess := _payload_bytes(title, body, data) - MAX_PAYLOAD_BYTES) > 0:
+    if body:
+      body = _shrink(body, excess, keep=0)
+    elif len(title) > 2:
+      title = _shrink(title, excess, keep=1)
+    else:
+      break
   return title, body
 
 

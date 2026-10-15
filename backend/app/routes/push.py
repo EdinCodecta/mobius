@@ -137,12 +137,30 @@ def list_devices(
   ]
 
 
-def _remove(db: Session, devices) -> None:
-  tokens = [device.token for device in devices]
-  for device in devices:
-    db.delete(device)
+def _remove(db: Session, owner_id: int, *criteria) -> None:
+  observed = db.query(
+    models.PushDevice.id, models.PushDevice.token, models.PushDevice.registered_at,
+  ).filter(models.PushDevice.owner_id == owner_id, *criteria).all()
+  _remove_observed(db, owner_id, observed)
+
+
+def _remove_observed(db: Session, owner_id: int, observed) -> None:
+  """Delete observed phones that are unchanged, then unbind only those.
+
+  A phone that registered again (or moved to another owner) since it was
+  observed keeps its row and its fresh relay binding.
+  """
+  removed = []
+  for device_id, token, registered_at in observed:
+    deleted = db.query(models.PushDevice).filter(
+      models.PushDevice.id == device_id,
+      models.PushDevice.owner_id == owner_id,
+      models.PushDevice.registered_at == registered_at,
+    ).delete(synchronize_session=False)
+    if deleted:
+      removed.append(token)
   db.commit()
-  for token in tokens:
+  for token in removed:
     try:
       push_relay.unbind_device(token)
     except push_relay.RelayError:
@@ -159,10 +177,7 @@ def forget_device(
   db: Session = Depends(get_db),
 ):
   """Stop sending to this phone (sign-out); repeating it is harmless."""
-  _remove(db, db.query(models.PushDevice).filter(
-    models.PushDevice.token == body.token,
-    models.PushDevice.owner_id == owner.id,
-  ).all())
+  _remove(db, owner.id, models.PushDevice.token == body.token)
 
 
 @router.delete(
@@ -175,7 +190,4 @@ def remove_device(
   db: Session = Depends(get_db),
 ):
   """Remove a phone from Settings; it registers again when Möbius next opens on it."""
-  _remove(db, db.query(models.PushDevice).filter(
-    models.PushDevice.id == device_id,
-    models.PushDevice.owner_id == owner.id,
-  ).all())
+  _remove(db, owner.id, models.PushDevice.id == device_id)

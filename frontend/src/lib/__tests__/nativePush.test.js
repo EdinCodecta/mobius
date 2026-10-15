@@ -141,3 +141,18 @@ test('Settings recognizes this phone by the end of its registered token', async 
   assert.equal(isThisPhone('zz99zz'), false)
   assert.equal(isThisPhone(''), false)
 })
+
+test('signing in again without a reload registers the phone again', async () => {
+  const push = fakePush()
+  const win = app({ token: 'tok-1' })
+  await registerNativePush({ win, push })
+  await forgetNativePush({ push })
+
+  await registerNativePush({ win, push })
+  win.emit('mobius:push-token', { token: 'tok-2' })
+  await settle()
+
+  assert.deepEqual(push.calls.map(([kind, body]) => [kind, body.token]), [
+    ['register', 'tok-1'], ['forget', 'tok-1'], ['register', 'tok-1'], ['register', 'tok-2'],
+  ])
+})
