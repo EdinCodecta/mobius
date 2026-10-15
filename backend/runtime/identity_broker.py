@@ -113,7 +113,7 @@ INFERENCE_ROUTES = {
   ),
 }
 
-# Native push: the relay holds the FCM/APNs credentials for every installation,
+# Native push: the relay holds the FCM credentials for every installation,
 # so it authenticates each request by its capability (installation + linked
 # account) and keeps its own token-to-installation binding. Socket-only, like
 # contribution routes: no agent-facing surface may send push.
