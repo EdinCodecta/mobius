@@ -52,7 +52,30 @@ test('aliases use the real package name and workspace links are skipped', () => 
     'node_modules/string-width-cjs': install('string-width', '4.2.3', { name: 'string-width' }),
     'node_modules/local-app': { resolved: 'packages/local-app', link: true },
   })
-  assert.deepEqual(names(changedPackages(null, head)), ['string-width'])
+  const changes = changedPackages(null, head)
+  assert.deepEqual(names(changes), ['string-width'])
+  assert.equal(changes[0].misidentified, false)
+})
+
+test('a lockfile name or version cannot redirect the advisory lookup away from the downloaded package', () => {
+  const renamed = { 'node_modules/evil': install('evil', '1.0.0', { name: 'lodash', version: '4.17.21' }) }
+  const dotted = { 'node_modules/evil': install('evil', '1.0.0', { resolved: 'https://registry.npmjs.org/evil/../lodash/-/lodash-4.17.21.tgz' }) }
+  const identity = packages => changedPackages(null, lock(packages)).map(({ name, version, misidentified }) => [name, version, misidentified])
+  assert.deepEqual(identity(renamed), [['evil', '1.0.0', true]])
+  assert.deepEqual(identity(dotted), [['lodash', '4.17.21', true]])
+})
+
+test('a registry URL that is not a plain tarball path is not trusted as a registry download', () => {
+  for (const path of ['lodash/-/evil-1.0.0.tgz', '%65vil/-/%65vil-1.0.0.tgz', '@x%2Fevil/-/evil-1.0.0.tgz']) {
+    const head = lock({ 'node_modules/evil': install('evil', '1.0.0', { resolved: `https://registry.npmjs.org/${path}` }) })
+    assert.equal(changedPackages(null, head)[0].outsideRegistry, true, path)
+  }
+})
+
+test('an entry without a version still counts, identified by its download', () => {
+  const versionless = { resolved: 'https://registry.npmjs.org/evil/-/evil-1.0.0.tgz', integrity: 'sha512-evil' }
+  const [change] = changedPackages(null, lock({ 'node_modules/evil': versionless }))
+  assert.deepEqual([change.name, change.version, change.misidentified], ['evil', '1.0.0', true])
 })
 
 const katex = { name: 'katex', version: '0.19.0' }
@@ -67,7 +90,15 @@ test('a clean report starts with its marker and says nothing stood out', () => {
 test('advisories for a changed package block the merge and link the advisory', () => {
   const advisories = { katex: [{ title: 'Malware in katex', url: 'https://github.com/advisories/GHSA-x', severity: 'critical', vulnerable_versions: '=0.19.0' }] }
   assert.equal(hasAdvisories(advisories), true)
-  assert.match(renderReport({ changes: [katex], advisories }), /Do not merge[\s\S]*\[Malware in katex\]\(https:\/\/github\.com\/advisories\/GHSA-x\)/)
+  assert.match(renderReport({ changes: [katex], advisories }), /Do not merge[\s\S]*\[`Malware in katex`\]\(https:\/\/github\.com\/advisories\/GHSA-x\) \(critical,/)
+})
+
+test('advisory text cannot inject Markdown, links or mentions into the comment', () => {
+  const advisory = { title: 'x](https://evil.example)\n@someone', url: 'https://evil.example/)', severity: 'critical\n## Merge', vulnerable_versions: '*' }
+  const text = renderReport({ changes: [katex], advisories: { katex: [advisory] } })
+  assert.match(text, /^- `katex`: `x\]\(https:\/\/evil\.example\)@someone` \(unknown severity, affects `\*`\)$/m)
+  const failure = renderReport({ changes: [katex], advisories: null, advisoryError: 'Unexpected token, "\n## Merge" is not valid JSON' })
+  assert.doesNotMatch(failure, /^## Merge/m)
 })
 
 test('an unreachable advisory database is reported as a failure, not as clean', () => {

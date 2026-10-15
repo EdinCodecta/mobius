@@ -1,11 +1,14 @@
 // The pull-request comment. Its first line is the marker the workflow uses to
-// find and update its own comment. Lockfile text is untrusted, so package
-// names are shown as inline code that cannot break out or mention anyone.
+// find and update its own comment. Lockfile and advisory text is untrusted, so
+// it is shown as inline code that cannot break out or mention anyone.
 
 export const REPORT_MARKER = '<!-- dependency-safety -->'
 const MAX_LISTED = 50
+const SEVERITIES = new Set(['info', 'low', 'moderate', 'high', 'critical'])
+// Only a GitHub advisory page becomes a link; its URL has no room for Markdown.
+const ADVISORY_URL = /^https:\/\/github\.com\/advisories\/GHSA-[\w-]+$/
 
-const code = text => `\`${String(text).replace(/[`\r\n]/g, '')}\``
+const code = text => `\`${String(text).replace(/[`\p{Cc}\p{Cf}]/gu, '')}\``
 
 export const hasAdvisories = advisories => Object.values(advisories ?? {}).some(list => list.length > 0)
 
@@ -14,7 +17,8 @@ export function packageNotes(change) {
     change.newPackage && 'new package',
     change.newInstallScript && 'runs an install script',
     change.changedDownload && 'same version, different download',
-    change.outsideRegistry && 'downloaded from outside the npm registry',
+    change.outsideRegistry && 'not a standard npm registry download',
+    change.misidentified && 'lockfile name or version differs from its download',
   ].filter(Boolean)
 }
 
@@ -23,11 +27,17 @@ function truncated(lines) {
   return hidden > 0 ? [...lines.slice(0, MAX_LISTED), `- …and ${hidden} more`] : lines
 }
 
+function advisoryLine(name, advisory) {
+  const title = code(advisory.title)
+  const link = ADVISORY_URL.test(advisory.url) ? `[${title}](${advisory.url})` : title
+  const severity = SEVERITIES.has(advisory.severity) ? advisory.severity : 'unknown severity'
+  return `- ${code(name)}: ${link} (${severity}, affects ${code(advisory.vulnerable_versions)})`
+}
+
 function advisoryLines(advisories, advisoryError, packageCount) {
-  if (advisoryError) return [`❌ **Could not check npm's advisory database** (${advisoryError}). Re-run this check.`]
+  if (advisoryError) return [`❌ **Could not check npm's advisory database** (${code(advisoryError)}). Re-run this check.`]
   if (!hasAdvisories(advisories)) return [`✅ No known malware or vulnerabilities in the ${packageCount} changed package(s).`]
-  const found = Object.entries(advisories).flatMap(([name, list]) => list.map(advisory =>
-    `- ${code(name)}: [${advisory.title}](${advisory.url}) (${advisory.severity}, affects ${code(advisory.vulnerable_versions)})`))
+  const found = Object.entries(advisories).flatMap(([name, list]) => list.map(advisory => advisoryLine(name, advisory)))
   return ['❌ **Known malware or vulnerabilities in changed packages. Do not merge until resolved.**', ...truncated(found)]
 }
 
