@@ -523,7 +523,7 @@ The chat is large and self-contained; its hooks live beside it, not in `src/hook
 | `useOnlineStatus.js` | Connectivity verdict (page-side `/api/health` probe; feeds SW connectivity) |
 | `useProviderAuthStatus.js` | Provider auth status polling |
 | `usePushSubscription.js` | Web Push subscription after login |
-| `useNativePushResume.js` | Re-registers native push in the mobile app on load |
+| `useNativePush.js` | Registers native push in the Möbius mobile app on load |
 | `queries.js` | TanStack Query setup + query definitions |
 
 ### App runtime, service worker, libs

@@ -201,8 +201,8 @@ def test_native_push_devices_are_owner_controls_not_app_or_delegation(
   # Like a Web Push subscription, a registered phone receives every owner
   # notification, so neither an app nor a delegated helper may add or remove one.
   from app import push_relay
-  monkeypatch.setattr(push_relay, "bind_device", lambda **_kwargs: None)
-  body = {"token": "fcm:owner-controls-device", "platform": "android"}
+  monkeypatch.setattr(push_relay, "bind_device", lambda _token: None)
+  body = {"token": "fcm:owner-controls-device"}
   for denied in ("delegated", "app"):
     assert client.put(
       "/api/push/devices", headers=controls[denied], json=body,

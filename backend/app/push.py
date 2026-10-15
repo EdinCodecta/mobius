@@ -143,27 +143,35 @@ class _PreparedPush:
   notification_id: str
   payload: dict
   subscriptions: tuple[dict, ...]
-  # Native push devices (Möbius mobile app): {"id", "token"} each.
+  # Native push devices (Möbius mobile app): {"id", "token", "registered_at"}.
   devices: tuple[dict, ...] = ()
 
 
 # APNs caps a collapse id at 64 bytes; FCM accepts the same key.
-_COLLAPSE_KEY_MAX = 64
+_COLLAPSE_KEY_MAX_BYTES = 64
 _RELAY_BATCH = 100
 
 
 def _collapse_key(tag: str | None, notification_id: str) -> str:
   key = tag or notification_id
-  if len(key) <= _COLLAPSE_KEY_MAX:
+  if len(key.encode()) <= _COLLAPSE_KEY_MAX_BYTES:
     return key
-  return "c:" + hashlib.sha256(key.encode()).hexdigest()[:_COLLAPSE_KEY_MAX - 2]
+  return "c:" + hashlib.sha256(key.encode()).hexdigest()[:_COLLAPSE_KEY_MAX_BYTES - 2]
+
+
+# The relay accepts data values up to 2048 characters.
+_TAP_URL_MAX_CHARS = 2048
 
 
 def _tap_url(target: str | None) -> str:
   """The phone opens this on tap: always a page of this installation."""
-  if not isinstance(target, str) or not target.startswith("/") or target.startswith("//"):
+  origin = get_settings().frontend_origin.rstrip("/")
+  if (
+    not isinstance(target, str) or not target.startswith("/") or target.startswith("//")
+    or len(origin) + len(target) > _TAP_URL_MAX_CHARS
+  ):
     target = "/shell/"
-  return get_settings().frontend_origin.rstrip("/") + target
+  return origin + target
 
 
 def _prepare_owner_notification(
@@ -328,9 +336,12 @@ def _prepare_owner_notification(
     )
   ]
   devices = [
-    {"id": device_id, "token": token}
-    for device_id, token in (
-      db.query(models.PushDevice.id, models.PushDevice.token)
+    {"id": device_id, "token": token, "registered_at": registered_at}
+    for device_id, token, registered_at in (
+      db.query(
+        models.PushDevice.id, models.PushDevice.token,
+        models.PushDevice.registered_at,
+      )
       .filter(models.PushDevice.owner_id == owner_id)
       .all()
     )
@@ -370,14 +381,18 @@ def _deliver_prepared_push(prepared: _PreparedPush) -> None:
       cleanup_db.query(models.PushSubscription).filter(
         models.PushSubscription.id.in_(stale_ids)
       ).delete(synchronize_session=False)
-      cleanup_db.query(models.PushDevice).filter(
-        models.PushDevice.id.in_(stale_devices)
-      ).delete(synchronize_session=False)
+      for device in stale_devices:
+        # A phone that registered again while the send was in flight has a
+        # fresh relay binding; keep it.
+        cleanup_db.query(models.PushDevice).filter(
+          models.PushDevice.id == device["id"],
+          models.PushDevice.registered_at == device["registered_at"],
+        ).delete(synchronize_session=False)
       cleanup_db.commit()
 
 
-def _deliver_native(prepared: _PreparedPush) -> list[str]:
-  """Send to the owner's phones through the relay; returns dead device ids.
+def _deliver_native(prepared: _PreparedPush) -> list[dict]:
+  """Send to the owner's phones through the relay; returns the dead devices.
 
   Like Web Push there is no retry: a failed send leaves the notification in
   the owner's history. Logs name device ids only, never tokens or content.
@@ -406,7 +421,7 @@ def _deliver_native(prepared: _PreparedPush) -> list[str]:
       continue
     for device, status in zip(batch, statuses):
       if status == "invalid_token":
-        stale.append(device["id"])
+        stale.append(device)
       elif status != "ok":
         logger.warning("native push to device %s: %s", device["id"][:8], status)
   return stale

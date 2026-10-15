@@ -1,16 +1,17 @@
 """Client for the mobius.you native push relay — the whole wire contract.
 
-The relay holds the FCM and APNs credentials for every Möbius installation, so
-this installation keeps no push secret. Requests go over the root-owned
-identity broker's Unix socket; the broker mints a short-lived capability bound
-to this installation, its linked mobius.you account and the exact request, and
-forwards it to the relay (``PUSH_ROUTES`` in
-``backend/runtime/identity_broker.py``). Every route needs an
-``Idempotency-Key``; each call uses a fresh one because nothing here retries.
+The relay holds the FCM credentials for every Möbius installation, so this
+installation keeps no push secret. Requests go over the root-owned identity
+broker's Unix socket; the broker mints a short-lived capability bound to this
+installation, its linked mobius.you account and the exact request, and forwards
+it to the relay (``PUSH_ROUTES`` in ``backend/runtime/identity_broker.py``).
+Every route needs an ``Idempotency-Key``; each call uses a fresh one because
+nothing here retries.
 
-``POST /v1/push/devices/bind``   ``{provider, token, platform, apnsToken?, apnsEnvironment?}``
+``POST /v1/push/devices/bind``   ``{provider: "fcm", token}``
     This installation now owns the token; the last installation to bind it
-    wins, so a phone that moves to another Möbius stops getting this one's.
+    wins, and the relay refuses sends to a token this installation has not
+    bound.
 ``POST /v1/push/devices/unbind`` ``{token}``
 ``POST /v1/push/send``
     ``{targets: [{provider: "fcm", token}], notification: {title, body},
@@ -35,6 +36,13 @@ SEND_PATH = "/v1/push/send"
 # with its own 30 second ceiling; this bound covers both hops.
 _TIMEOUT = httpx.Timeout(35.0, connect=3.0)
 _STATUSES = frozenset({"ok", "invalid_token", "retry", "error"})
+# The relay refuses a notification past these limits (FCM allows 4 KB for the
+# notification and data together), and Möbius notifications may be longer, so
+# the text is shortened to fit instead.
+MAX_TITLE_CHARS = 256
+MAX_BODY_CHARS = 2000
+MAX_PAYLOAD_BYTES = 4096
+_ELLIPSIS = "…"
 
 
 class RelayError(Exception):
@@ -49,6 +57,35 @@ class RelayError(Exception):
   def not_linked(self) -> bool:
     # The broker cannot mint a capability until a mobius.you account is linked.
     return self.status == 401
+
+
+def _clip(text: str, limit: int) -> str:
+  return text if len(text) <= limit else text[:limit - 1] + _ELLIPSIS
+
+
+def _payload_bytes(title: str, body: str, data: dict[str, str]) -> int:
+  # Measured the way the relay measures it.
+  return len(json.dumps(
+    {"title": title, "body": body, "data": data},
+    separators=(",", ":"), ensure_ascii=False,
+  ).encode())
+
+
+def fit_notification(
+  title: str, body: str, data: dict[str, str],
+) -> tuple[str, str]:
+  """Shorten title and body so the relay accepts the notification.
+
+  ``data`` is sent unchanged; the caller keeps it small (a link and an id).
+  """
+  title = _clip(title, MAX_TITLE_CHARS)
+  body = _clip(body, MAX_BODY_CHARS)
+  while body and (excess := _payload_bytes(title, body, data) - MAX_PAYLOAD_BYTES) > 0:
+    # Every character is at least one byte, so this always shrinks enough
+    # within a few rounds; the ellipsis costs three bytes.
+    body = body[:max(0, len(body) - excess - len(_ELLIPSIS.encode()))]
+    body = body + _ELLIPSIS if body else ""
+  return title, body
 
 
 def _post(path: str, payload: dict) -> httpx.Response:
@@ -67,15 +104,8 @@ def _post(path: str, payload: dict) -> httpx.Response:
   return response
 
 
-def bind_device(
-  *, token: str, platform: str,
-  apns_token: str | None = None, apns_environment: str | None = None,
-) -> None:
-  payload = {"provider": "fcm", "token": token, "platform": platform}
-  if apns_token:
-    payload["apnsToken"] = apns_token
-    payload["apnsEnvironment"] = apns_environment or "production"
-  _post(BIND_PATH, payload)
+def bind_device(token: str) -> None:
+  _post(BIND_PATH, {"provider": "fcm", "token": token})
 
 
 def unbind_device(token: str) -> None:
@@ -90,10 +120,12 @@ def send(
 
   A missing or malformed result counts as ``error``, never ``ok``.
   """
+  data = {key: str(value) for key, value in data.items()}
+  title, body = fit_notification(title, body, data)
   response = _post(SEND_PATH, {
     "targets": [{"provider": "fcm", "token": token} for token in tokens],
     "notification": {"title": title, "body": body},
-    "data": {key: str(value) for key, value in data.items()},
+    "data": data,
     "options": {
       "collapseKey": collapse_key, "ttlSeconds": ttl_seconds, "priority": "high",
     },

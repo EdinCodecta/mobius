@@ -1803,11 +1803,11 @@ class PushSubscription(Base):
 class PushDevice(Base):
   """A phone running the Möbius mobile app that receives native push.
 
-  The app's web page registers the token from ``MobiusNative.registerPush()``
-  through ``PUT /api/push/devices``. Like a ``PushSubscription``, a device
-  receives every owner notification. Delivery goes through the mobius.you push
-  relay (``app.push_relay``), so this installation holds no FCM or APNs
-  credential. A token the relay reports invalid is deleted.
+  The shell registers the FCM token from ``MobiusNative.registerPush()``
+  through ``PUT /api/push/devices`` on every load. Like a ``PushSubscription``,
+  a device receives every owner notification. Delivery goes through the
+  mobius.you push relay (``app.push_relay``), so this installation holds no
+  FCM credential. A token the relay reports invalid is deleted.
 
   This is a new table, so ``create_all`` adds it to existing installations.
   """
@@ -1819,14 +1819,10 @@ class PushDevice(Base):
     Integer, ForeignKey("owner.id", ondelete="CASCADE"), nullable=False,
     index=True,
   )
-  # FCM registration token, on both platforms.
   token = Column(Text, nullable=False, unique=True)
-  platform = Column(String(16), nullable=False)
-  # Raw APNs token (hex) and environment, from app versions that expose them.
-  apns_token = Column(Text, nullable=True)
-  apns_environment = Column(String(16), nullable=True)
-  created_at = Column(DateTime, nullable=False, default=now_naive_utc)
-  last_seen_at = Column(DateTime, nullable=False, default=now_naive_utc)
+  # Changes on every registration, so cleanup after a send can tell whether
+  # the phone registered again while that send was in flight.
+  registered_at = Column(DateTime, nullable=False, default=now_naive_utc)
 
 
 class Notification(Base):

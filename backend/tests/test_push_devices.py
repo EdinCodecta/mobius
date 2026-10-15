@@ -8,7 +8,6 @@ from app import models, push_relay
 from app.push import notify_owner
 
 FCM = "fcm:" + "a" * 140
-APNS = "ab" * 32
 
 
 class FakeRelay:
@@ -17,8 +16,8 @@ class FakeRelay:
     self.error = None
     self.statuses = None
 
-    def bind_device(**kwargs):
-      self.binds.append(kwargs)
+    def bind_device(token):
+      self.binds.append(token)
       if self.error is not None:
         raise self.error
 
@@ -44,7 +43,7 @@ def relay(monkeypatch):
 
 
 def _put(client, auth, **body):
-  return client.put("/api/push/devices", headers=auth, json={"platform": "android", **body})
+  return client.put("/api/push/devices", headers=auth, json=body)
 
 
 def _tokens(db):
@@ -60,16 +59,17 @@ def test_registering_binds_at_the_relay_then_stores_one_device(client, auth, db,
   assert _put(client, auth, token=FCM).json() == {"status": "registered"}
   assert _put(client, auth, token=FCM).status_code == 200
 
-  assert [b["token"] for b in relay.binds] == [FCM, FCM]
+  assert relay.binds == [FCM, FCM]
   assert _tokens(db) == [FCM]
 
 
-def test_ios_apns_fields_are_stored_lower_case_and_passed_to_the_relay(client, auth, db, relay):
-  _put(client, auth, token=FCM, platform="ios", apnsToken=APNS.upper(), apnsEnvironment="sandbox")
+def test_platform_and_apns_fields_from_the_app_are_ignored(client, auth, db, relay):
+  response = _put(
+    client, auth, token=FCM, platform="ios", apnsToken="ab" * 32, apnsEnvironment="sandbox",
+  )
 
-  assert relay.binds[0]["apns_token"] == APNS
-  device = db.query(models.PushDevice).one()
-  assert (device.apns_token, device.apns_environment) == (APNS, "sandbox")
+  assert response.status_code == 200
+  assert relay.binds == [FCM] and _tokens(db) == [FCM]
 
 
 @pytest.mark.parametrize(("status", "code"), [(401, 409), (503, 502)])
@@ -88,7 +88,7 @@ def test_a_token_registered_under_another_owner_moves_to_the_caller(client, auth
   other = models.Owner(username="previous-owner", hashed_password="x")
   db.add(other)
   db.flush()
-  db.add(models.PushDevice(id="dev-other", owner_id=other.id, token=FCM, platform="android"))
+  db.add(models.PushDevice(id="dev-other", owner_id=other.id, token=FCM))
   db.commit()
 
   _put(client, auth, token=FCM)
@@ -100,10 +100,8 @@ def test_a_token_registered_under_another_owner_moves_to_the_caller(client, auth
 @pytest.mark.parametrize("body", [
   {"token": "has space"},
   {"token": ""},
-  {"token": FCM, "platform": "web"},
-  {"token": FCM, "apnsToken": APNS, "apnsEnvironment": "sandbox"},
-  {"token": FCM, "platform": "ios", "apnsToken": APNS},
-  {"token": FCM, "platform": "ios", "apnsToken": "not-hex", "apnsEnvironment": "sandbox"},
+  {"token": "x" * 4097},
+  {},
 ])
 def test_malformed_registrations_are_refused_before_the_relay(client, auth, db, relay, body):
   assert _put(client, auth, **body).status_code == 422
@@ -157,6 +155,32 @@ def test_an_invalid_token_is_deleted_and_others_are_kept(client, auth, db, relay
   assert len(survivors) == 1 and survivors[0] == relay.sends[0][0][1]
 
 
+def test_a_phone_that_registers_again_during_a_send_is_kept(client, auth, db, relay, monkeypatch):
+  _put(client, auth, token=FCM)
+  relay.statuses = ["invalid_token"]
+  real_send = push_relay.send
+
+  def send_while_the_phone_re_registers(tokens, **message):
+    statuses = real_send(tokens, **message)
+    _put(client, auth, token=FCM)
+    return statuses
+
+  monkeypatch.setattr(push_relay, "send", send_while_the_phone_re_registers)
+
+  notify_owner(db, _owner_id(db), title="Hi", body=None, source_type="agent")
+
+  assert _tokens(db) == [FCM]
+
+
+def test_a_collapse_key_over_64_bytes_is_hashed_to_fit():
+  from app.push import _collapse_key
+
+  short = "ü" * 32  # 32 characters, 64 bytes
+  assert _collapse_key(short, "n1") == short
+  hashed = _collapse_key("ü" * 33, "n1")
+  assert hashed.startswith("c:") and len(hashed.encode()) == 64
+
+
 def test_a_relay_outage_keeps_the_devices_and_the_history(client, auth, db, relay):
   _put(client, auth, token=FCM)
   relay.error = push_relay.RelayError("http_503", status=503)
@@ -176,4 +200,4 @@ def test_quiet_maintenance_notices_never_reach_the_phone(client, auth, db, relay
 
 
 def test_device_routes_require_authentication(client):
-  assert client.put("/api/push/devices", json={"token": FCM, "platform": "android"}).status_code == 401
+  assert client.put("/api/push/devices", json={"token": FCM}).status_code == 401

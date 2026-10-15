@@ -7,7 +7,7 @@ import { api, clearQueryCache, clearToken } from '../../api/client.js'
 import { authQueries, modelQueries, settingsQueries, themeQueries } from '../../hooks/queries.js'
 import { settleBackgroundAgentSave } from '../../lib/backgroundAgentSave.js'
 import { clearExplicitOwnerSession } from '../../lib/explicitLogout.js'
-import { disableNativePush } from '../../lib/nativePush.js'
+import { forgetNativePush } from '../../lib/nativePush.js'
 import { stopShellInstallPassPreparation } from '../../lib/shellInstallPass.js'
 import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.js'
 import {
@@ -27,7 +27,6 @@ import ManageModelsModal from '../ChatView/ManageModelsModal.jsx'
 import PlatformUpdates from './PlatformUpdates.jsx'
 import ProviderUsage from './ProviderUsage.jsx'
 import GithubConnection from './GithubConnection.jsx'
-import PhoneNotifications from './PhoneNotifications.jsx'
 import {
   formatPlanStatus,
   formatTrialTimeLeft,
@@ -917,7 +916,7 @@ export default function SettingsView({
       await clearExplicitOwnerSession({
         stopInstallHandoffPreparation: stopShellInstallPassPreparation,
         revokeInstallHandoffs: () => api.auth.shellInstallPass.revoke(),
-        forgetPushDevice: disableNativePush,
+        forgetPushDevice: forgetNativePush,
         dropCredential: clearToken,
         clearOwnerCache: clearQueryCache,
       })
@@ -1274,8 +1273,6 @@ export default function SettingsView({
             />
           )}
         </section>
-
-        <PhoneNotifications />
 
         <PlatformUpdates active={active} refreshToken={refreshToken} onOpenChat={onOpenChat} inertBoundaryRef={settingsBoundaryRef} />
 

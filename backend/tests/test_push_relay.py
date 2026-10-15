@@ -73,7 +73,7 @@ def test_a_refused_request_raises_and_says_whether_linking_is_missing(
   _use_relay(monkeypatch, lambda request: httpx.Response(status, json={"error": "no"}))
 
   with pytest.raises(push_relay.RelayError) as raised:
-    push_relay.bind_device(token="t", platform="android")
+    push_relay.bind_device("t")
   assert raised.value.not_linked is not_linked
 
 
@@ -94,17 +94,39 @@ def test_bind_and_unbind_payloads_use_a_fresh_key_each_call(monkeypatch):
     return httpx.Response(200, json={})
 
   _use_relay(monkeypatch, relay)
-  push_relay.bind_device(
-    token="t", platform="ios", apns_token="ab" * 32, apns_environment="sandbox",
-  )
-  push_relay.bind_device(token="t", platform="android")
+  push_relay.bind_device("t")
+  push_relay.bind_device("t")
   push_relay.unbind_device("t")
 
-  assert seen[0][:2] == ("/v1/push/devices/bind", {
-    "provider": "fcm", "token": "t", "platform": "ios",
-    "apnsToken": "ab" * 32, "apnsEnvironment": "sandbox",
-  })
-  assert seen[1][1] == {"provider": "fcm", "token": "t", "platform": "android"}
+  assert seen[0][:2] == ("/v1/push/devices/bind", {"provider": "fcm", "token": "t"})
+  assert seen[1][1] == {"provider": "fcm", "token": "t"}
   assert seen[2][:2] == ("/v1/push/devices/unbind", {"token": "t"})
   # A phone that moved away and back must be re-bound, not answered from cache.
   assert len({key for _, _, key in seen}) == 3
+
+
+def test_notifications_are_shortened_to_fit_the_relay_limits(monkeypatch):
+  seen = []
+
+  def relay(request):
+    seen.append(json.loads(request.content))
+    return httpx.Response(200, json={"results": [{"index": 0, "status": "ok"}]})
+
+  _use_relay(monkeypatch, relay)
+  data = {"url": "https://mobius.example/shell/", "notificationId": "n1"}
+  push_relay.send(["a"], title="T" * 500, body='ü"\n' * 4000, data=data, collapse_key="k")
+
+  sent = seen[0]
+  title, body = sent["notification"]["title"], sent["notification"]["body"]
+  assert len(title) == push_relay.MAX_TITLE_CHARS and title.endswith("…")
+  assert len(body) <= push_relay.MAX_BODY_CHARS and body.endswith("…")
+  assert sent["data"] == data
+  assert len(json.dumps(
+    {"title": title, "body": body, "data": data},
+    separators=(",", ":"), ensure_ascii=False,
+  ).encode()) <= push_relay.MAX_PAYLOAD_BYTES
+
+
+def test_short_notifications_are_sent_unchanged():
+  data = {"url": "https://mobius.example/shell/", "notificationId": "n1"}
+  assert push_relay.fit_notification("Done", "Ready.", data) == ("Done", "Ready.")

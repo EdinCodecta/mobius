@@ -11,8 +11,7 @@ from app.database import get_db
 from app.deps import get_current_owner_for_lifecycle_control, reject_cross_site
 from app.push import get_public_key_base64url
 from app.schemas import (
-  PushDeviceForgetRequest,
-  PushDeviceRegisterRequest,
+  PushDeviceRequest,
   PushSubscribeRequest,
   PushUnsubscribeRequest,
 )
@@ -77,15 +76,16 @@ def unsubscribe(
   db.commit()
 
 
-# Native push devices: the Möbius mobile app's web page registers the token
-# that ``MobiusNative.registerPush()`` returned. Like a Web Push subscription,
-# a device receives every owner notification, so only the owner may manage
-# one. Tokens travel in request bodies, never in URLs, to stay out of logs.
+# Native push devices: the shell inside the Möbius mobile app registers the
+# token that ``MobiusNative.registerPush()`` returned, on every load. Like a Web
+# Push subscription, a device receives every owner notification, so only the
+# owner may manage one. Tokens travel in request bodies, never in URLs, to stay
+# out of logs.
 
 
 @router.put("/devices", dependencies=[Depends(reject_cross_site)])
 def register_device(
-  body: PushDeviceRegisterRequest,
+  body: PushDeviceRequest,
   owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
   db: Session = Depends(get_db),
 ):
@@ -93,32 +93,25 @@ def register_device(
 
   The relay learns that this installation owns the token before it is
   stored, so a device row always means the relay will accept sends to it.
-  The page re-registers on every load, which also re-claims a phone that
-  was bound to another installation in between.
+  Re-registering on every load also re-claims a phone that was bound to
+  another installation in between.
   """
   try:
-    push_relay.bind_device(
-      token=body.token, platform=body.platform,
-      apns_token=body.apns_token, apns_environment=body.apns_environment,
-    )
+    push_relay.bind_device(body.token)
   except push_relay.RelayError as exc:
     if exc.not_linked:
       raise HTTPException(
         409, "Link this Möbius to your mobius.you account to get phone notifications.",
       )
     raise HTTPException(502, "The notification service could not be reached.")
-  now = now_naive_utc()
   device = db.query(models.PushDevice).filter(
     models.PushDevice.token == body.token,
   ).one_or_none()
   if device is None:
-    device = models.PushDevice(id=str(uuid.uuid4()), token=body.token, created_at=now)
+    device = models.PushDevice(id=str(uuid.uuid4()), token=body.token)
     db.add(device)
   device.owner_id = owner.id
-  device.platform = body.platform
-  device.apns_token = body.apns_token
-  device.apns_environment = body.apns_environment
-  device.last_seen_at = now
+  device.registered_at = now_naive_utc()
   db.commit()
   return {"status": "registered"}
 
@@ -127,7 +120,7 @@ def register_device(
   "/devices", status_code=204, dependencies=[Depends(reject_cross_site)],
 )
 def forget_device(
-  body: PushDeviceForgetRequest,
+  body: PushDeviceRequest,
   owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
   db: Session = Depends(get_db),
 ):

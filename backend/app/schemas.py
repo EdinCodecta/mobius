@@ -905,67 +905,15 @@ class PushUnsubscribeRequest(BaseModel):
   endpoint: str
 
 
-# FCM registration tokens are printable ASCII without spaces; this bounds what
-# the relay will be handed without encoding today's token format.
-_PUSH_TOKEN = re.compile(r"^[\x21-\x7e]{1,4096}$")
-_APNS_TOKEN = re.compile(r"^[0-9a-fA-F]{64,200}$")
+class PushDeviceRequest(BaseModel):
+  """The FCM token from the mobile app's ``MobiusNative.registerPush()``.
 
-
-def _push_token(value: str) -> str:
-  if not _PUSH_TOKEN.fullmatch(value):
-    raise ValueError("Push token is not valid.")
-  return value
-
-
-class PushDeviceRegisterRequest(BaseModel):
-  """What the mobile app's ``MobiusNative.registerPush()`` returned.
-
-  ``apnsToken``/``apnsEnvironment`` arrive only from app versions that expose
-  the raw APNs token on iOS.
+  FCM tokens are printable ASCII without spaces; this bounds what the relay is
+  handed without encoding today's token format. Other fields the app returns
+  (``platform``, APNs details) are ignored: the relay delivers through FCM.
   """
 
-  model_config = ConfigDict(populate_by_name=True)
-
-  token: str
-  platform: Literal["android", "ios"]
-  apns_token: str | None = Field(default=None, alias="apnsToken")
-  apns_environment: Literal["sandbox", "production"] | None = Field(
-    default=None, alias="apnsEnvironment",
-  )
-
-  @field_validator("token")
-  @classmethod
-  def _printable_token(cls, value: str) -> str:
-    return _push_token(value)
-
-  @field_validator("apns_token")
-  @classmethod
-  def _hex_apns_token(cls, value: str | None) -> str | None:
-    if value is None:
-      return None
-    if not _APNS_TOKEN.fullmatch(value):
-      raise ValueError("APNs token must be hexadecimal.")
-    return value.lower()
-
-  @model_validator(mode="after")
-  def _apns_belongs_to_ios(self) -> "PushDeviceRegisterRequest":
-    if self.apns_token is None:
-      self.apns_environment = None
-      return self
-    if self.platform != "ios":
-      raise ValueError("Only iOS devices have an APNs token.")
-    if self.apns_environment is None:
-      raise ValueError("apnsEnvironment is required with apnsToken.")
-    return self
-
-
-class PushDeviceForgetRequest(BaseModel):
-  token: str
-
-  @field_validator("token")
-  @classmethod
-  def _printable_token(cls, value: str) -> str:
-    return _push_token(value)
+  token: str = Field(pattern=r"^[\x21-\x7e]{1,4096}$")
 
 
 class NotificationAction(BaseModel):
