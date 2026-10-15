@@ -386,8 +386,10 @@ jobs:
         # @tanstack/react-query (via hooks/queries.js). Without
         # node_modules the loader can't resolve the bare specifier
         # and the whole test suite fails on ERR_MODULE_NOT_FOUND.
+        # Install scripts stay off: no dependency needs one on Linux, and a
+        # hijacked release would otherwise run code here on install.
         working-directory: frontend
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Audit frontend runtime dependencies
         working-directory: frontend
         run: |
@@ -675,7 +677,8 @@ jobs:
           cache-dependency-path: package-lock.json
 
       - name: Install test deps
-        run: npm ci
+        # Browsers come from the next step, so no package needs its install script.
+        run: npm ci --ignore-scripts
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
