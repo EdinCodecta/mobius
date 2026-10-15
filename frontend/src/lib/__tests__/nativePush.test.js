@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import {
   forgetNativePush,
+  isThisPhone,
   registerNativePush,
   resetNativePushForTests,
 } from '../nativePush.js'
@@ -130,4 +131,13 @@ test('sign-out waits for a registration in flight and blocks later ones', async 
   await settle()
 
   assert.deepEqual(calls, [['register', { token: 'tok-1' }], ['forget', { token: 'tok-1' }]])
+})
+
+test('Settings recognizes this phone by the end of its registered token', async () => {
+  assert.equal(isThisPhone('ab12cd'), false)
+  await registerNativePush({ win: app({ token: 'token-ab12cd' }), push: fakePush() })
+
+  assert.equal(isThisPhone('ab12cd'), true)
+  assert.equal(isThisPhone('zz99zz'), false)
+  assert.equal(isThisPhone(''), false)
 })

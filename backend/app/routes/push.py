@@ -18,6 +18,8 @@ from app.schemas import (
 from app.timeutil import now_naive_utc
 
 router = APIRouter(prefix="/api/push", tags=["push"])
+# Enough to tell phones apart in Settings without exposing a usable token.
+_TOKEN_TAIL = 6
 
 
 @router.get("/vapid-key")
@@ -116,6 +118,38 @@ def register_device(
   return {"status": "registered"}
 
 
+@router.get("/devices")
+def list_devices(
+  owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+  db: Session = Depends(get_db),
+):
+  """The owner's registered phones for Settings; never the full token."""
+  devices = db.query(models.PushDevice).filter(
+    models.PushDevice.owner_id == owner.id,
+  ).order_by(models.PushDevice.registered_at.desc()).all()
+  return [
+    {
+      "id": device.id,
+      "tokenTail": device.token[-_TOKEN_TAIL:],
+      "registeredAt": device.registered_at.replace(tzinfo=UTC).isoformat(),
+    }
+    for device in devices
+  ]
+
+
+def _remove(db: Session, devices) -> None:
+  tokens = [device.token for device in devices]
+  for device in devices:
+    db.delete(device)
+  db.commit()
+  for token in tokens:
+    try:
+      push_relay.unbind_device(token)
+    except push_relay.RelayError:
+      # Nothing is sent to a removed device; the relay keeps only a binding.
+      pass
+
+
 @router.delete(
   "/devices", status_code=204, dependencies=[Depends(reject_cross_site)],
 )
@@ -125,14 +159,23 @@ def forget_device(
   db: Session = Depends(get_db),
 ):
   """Stop sending to this phone (sign-out); repeating it is harmless."""
-  removed = db.query(models.PushDevice).filter(
+  _remove(db, db.query(models.PushDevice).filter(
     models.PushDevice.token == body.token,
     models.PushDevice.owner_id == owner.id,
-  ).delete(synchronize_session=False)
-  db.commit()
-  if removed:
-    try:
-      push_relay.unbind_device(body.token)
-    except push_relay.RelayError:
-      # Nothing is sent to a removed device; the relay keeps only a binding.
-      pass
+  ).all())
+
+
+@router.delete(
+  "/devices/{device_id}", status_code=204,
+  dependencies=[Depends(reject_cross_site)],
+)
+def remove_device(
+  device_id: str,
+  owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+  db: Session = Depends(get_db),
+):
+  """Remove a phone from Settings; it registers again when Möbius next opens on it."""
+  _remove(db, db.query(models.PushDevice).filter(
+    models.PushDevice.id == device_id,
+    models.PushDevice.owner_id == owner.id,
+  ).all())

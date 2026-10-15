@@ -211,6 +211,10 @@ def test_native_push_devices_are_owner_controls_not_app_or_delegation(
       "DELETE", "/api/push/devices", headers=controls[denied],
       json={"token": body["token"]},
     ).status_code == 403
+    assert client.get("/api/push/devices", headers=controls[denied]).status_code == 403
+    assert client.delete(
+      "/api/push/devices/some-device", headers=controls[denied],
+    ).status_code == 403
   assert client.put(
     "/api/push/devices", headers=controls["owner"], json=body,
   ).status_code == 200

@@ -27,6 +27,7 @@ import ManageModelsModal from '../ChatView/ManageModelsModal.jsx'
 import PlatformUpdates from './PlatformUpdates.jsx'
 import ProviderUsage from './ProviderUsage.jsx'
 import GithubConnection from './GithubConnection.jsx'
+import PhoneNotifications from './PhoneNotifications.jsx'
 import {
   formatPlanStatus,
   formatTrialTimeLeft,
@@ -1273,6 +1274,8 @@ export default function SettingsView({
             />
           )}
         </section>
+
+        <PhoneNotifications active={active} />
 
         <PlatformUpdates active={active} refreshToken={refreshToken} onOpenChat={onOpenChat} inertBoundaryRef={settingsBoundaryRef} />
 

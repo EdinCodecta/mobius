@@ -52,9 +52,19 @@ function save(result, push) {
   return pending
 }
 
+export function isNativePushAvailable(win = globalThis.window) {
+  return typeof win?.MobiusNative?.registerPush === 'function'
+}
+
+/** Whether a registered device (by its token's last characters) is this phone. */
+export function isThisPhone(tokenTail) {
+  const token = storedToken()
+  return !!token && !!tokenTail && token.endsWith(tokenTail)
+}
+
 /** Register this phone for owner notifications; a no-op outside the app. */
 export async function registerNativePush({ win = globalThis.window, push = api.push } = {}) {
-  if (typeof win?.MobiusNative?.registerPush !== 'function') return
+  if (!isNativePushAvailable(win)) return
   if (listeningOn !== win) {
     listeningOn = win
     win.addEventListener('mobius:push-token', (event) => {

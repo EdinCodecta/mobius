@@ -201,3 +201,35 @@ def test_quiet_maintenance_notices_never_reach_the_phone(client, auth, db, relay
 
 def test_device_routes_require_authentication(client):
   assert client.put("/api/push/devices", json={"token": FCM}).status_code == 401
+
+
+def test_settings_lists_phones_without_their_full_token(client, auth, db, relay):
+  _put(client, auth, token=FCM)
+
+  [device] = client.get("/api/push/devices", headers=auth).json()
+
+  assert device["tokenTail"] == FCM[-6:]
+  assert FCM not in str(device)
+  assert device["registeredAt"].endswith("+00:00")
+
+
+def test_settings_removes_a_phone_by_id_and_unbinds_it(client, auth, db, relay):
+  _put(client, auth, token=FCM)
+  [device] = client.get("/api/push/devices", headers=auth).json()
+
+  for _ in range(2):
+    response = client.delete(f"/api/push/devices/{device['id']}", headers=auth)
+    assert response.status_code == 204
+  assert _tokens(db) == [] and relay.unbinds == [FCM]
+
+
+def test_settings_cannot_see_or_remove_another_owners_phone(client, auth, db, relay):
+  other = models.Owner(username="other-owner", hashed_password="x")
+  db.add(other)
+  db.flush()
+  db.add(models.PushDevice(id="dev-other", owner_id=other.id, token=FCM))
+  db.commit()
+
+  assert client.get("/api/push/devices", headers=auth).json() == []
+  assert client.delete("/api/push/devices/dev-other", headers=auth).status_code == 204
+  assert _tokens(db) == [FCM] and relay.unbinds == []
