@@ -11,7 +11,8 @@ function clickEvent(extra = {}) {
 
 function withWindowLocation(href, fn) {
   const previous = globalThis.window
-  globalThis.window = { location: { href } }
+  const origin = URL.canParse(href) ? new URL(href).origin : 'null'
+  globalThis.window = { location: { href, origin } }
   try {
     return fn()
   } finally {
@@ -39,6 +40,24 @@ test('a plain click on an internal link opens it in the workspace instead of a n
   assert.equal(handled, true)
   assert.equal(event.prevented, true)
   assert.deepEqual(opened, ['https://mobius.test/shell?app=42'])
+})
+
+test('a plain click on a link to another origin is never taken over, even with shell parameters', () => {
+  const OTHER_ORIGINS = [
+    'https://elsewhere.example/shell?app=5&intent=open',
+    '//elsewhere.example/?chat=abc',
+    'http://mobius.test/shell?app=5',
+  ]
+  for (const href of OTHER_ORIGINS) {
+    const event = clickEvent()
+    const handled = withWindowLocation('https://mobius.test/shell?chat=current', () => (
+      openInternalLink(event, href, () => {
+        throw new Error('a link on another origin must not navigate in the workspace')
+      })
+    ))
+    assert.equal(handled, false, href)
+    assert.equal(event.prevented, false, href)
+  }
 })
 
 test('modified and secondary clicks keep the browser default for an internal link', () => {
