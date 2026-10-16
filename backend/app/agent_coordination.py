@@ -333,9 +333,19 @@ def scope_participants(
   current_chat_id: str | None = None,
   *,
   limit: int = MAX_PEERS,
+  alive_chat_ids: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
-  """Project a bounded affinity roster without exposing peer transcripts."""
-  from app.runner_registry import registry
+  """Project a bounded affinity roster without exposing peer transcripts.
+
+  A caller in a worker thread passes ``alive_chat_ids`` captured on the event
+  loop, so the thread never reads the loop-owned runner registry.
+  """
+  if alive_chat_ids is None:
+    from app.runner_registry import registry
+
+    is_alive = registry.is_alive
+  else:
+    is_alive = alive_chat_ids.__contains__
 
   chat_ids, delegation_by_chat = _scope_membership(db, scope, limit=limit)
   if not chat_ids:
@@ -376,7 +386,7 @@ def scope_participants(
       "provider": provider,
       "parent_chat_id": parent_chat_id,
       "status": status,
-      "online": registry.is_alive(chat_id),
+      "online": is_alive(chat_id),
       "is_current": chat_id == current_chat_id,
       "scope_member": True,
       "goal": run.goal_objective if run is not None else None,
@@ -926,6 +936,7 @@ def agent_context_snapshot(
   physical_run_id: str | None,
   *,
   chat: models.Chat | None = None,
+  alive_chat_ids: frozenset[str] | None = None,
 ) -> dict[str, Any] | None:
   """The small, event-oriented coordination payload injected into a turn."""
   scope = scope_for_chat(db, chat_id, physical_run_id)
@@ -935,6 +946,7 @@ def agent_context_snapshot(
   if scope.kind == "project" or _delegation_scope_has_children(db, scope):
     participants = scope_participants(
       db, scope, current_chat_id=chat_id, limit=MAX_CONTEXT_PEERS + 2,
+      alive_chat_ids=alive_chat_ids,
     )
   collaborators = [
     model_peer(peer, include_ended_at=True)
@@ -1510,8 +1522,6 @@ def send_owner_scope_message(
 
 
 def send_agent_message(
-  db: Session,
-  scope: CoordinationScope,
   *,
   owner_id: int,
   sender_chat_id: str,
@@ -1522,45 +1532,57 @@ def send_agent_message(
   body: str,
   delivery: str = DELIVERY_NEXT_TURN,
   send_id: str | None = None,
-) -> list[dict[str, Any]]:
-  """Send a scope broadcast or global direct note from one exact live run."""
-  if broadcast:
-    return send_scope_message(
+) -> list[dict[str, Any]] | None:
+  """Send a scope broadcast or global direct note from one exact live run.
+
+  Runs in a worker with its own session: validation, the write and the
+  recipient inbox prune froze the event loop on a busy disk. The live hint
+  goes through the thread-safe system broadcast. Returns None when the run
+  has no coordination scope.
+  """
+  from app.database import SessionLocal
+
+  with SessionLocal() as db:
+    scope = scope_for_chat(db, sender_chat_id, sender_run_id)
+    if scope is None:
+      return None
+    if broadcast:
+      return send_scope_message(
+        db,
+        scope,
+        sender_chat_id=sender_chat_id,
+        sender_run_id=sender_run_id,
+        recipients=recipients,
+        broadcast=True,
+        kind=kind,
+        delivery=delivery,
+        body=body,
+        send_id=send_id,
+      )
+
+    unique_recipients = list(dict.fromkeys(str(value) for value in recipients))
+    if not unique_recipients:
+      raise ValueError("Choose at least one recipient or broadcast to the scope.")
+    if sender_chat_id in unique_recipients:
+      raise ValueError("An agent cannot send a peer note to itself.")
+    addressable = _agent_chat_ids(db, set(unique_recipients))
+    if addressable != set(unique_recipients):
+      raise ValueError("A recipient is not an addressable Möbius peer.")
+    network = CoordinationScope(
+      kind="workspace", id=str(owner_id), root_chat_id=sender_chat_id,
+    )
+    return _persist_send(
       db,
-      scope,
+      network,
       sender_chat_id=sender_chat_id,
       sender_run_id=sender_run_id,
-      recipients=recipients,
-      broadcast=True,
+      recipients=unique_recipients,
+      broadcast=False,
       kind=kind,
       delivery=delivery,
       body=body,
       send_id=send_id,
     )
-
-  unique_recipients = list(dict.fromkeys(str(value) for value in recipients))
-  if not unique_recipients:
-    raise ValueError("Choose at least one recipient or broadcast to the scope.")
-  if sender_chat_id in unique_recipients:
-    raise ValueError("An agent cannot send a peer note to itself.")
-  addressable = _agent_chat_ids(db, set(unique_recipients))
-  if addressable != set(unique_recipients):
-    raise ValueError("A recipient is not an addressable Möbius peer.")
-  network = CoordinationScope(
-    kind="workspace", id=str(owner_id), root_chat_id=sender_chat_id,
-  )
-  return _persist_send(
-    db,
-    network,
-    sender_chat_id=sender_chat_id,
-    sender_run_id=sender_run_id,
-    recipients=unique_recipients,
-    broadcast=False,
-    kind=kind,
-    delivery=delivery,
-    body=body,
-    send_id=send_id,
-  )
 
 
 def send_work_claim_notice(
@@ -2064,10 +2086,11 @@ def build_coordination_context_delivery(
   physical_run_id: str | None,
   *,
   chat: models.Chat | None = None,
+  alive_chat_ids: frozenset[str] | None = None,
 ) -> CoordinationContextDelivery:
   """Build peer context and retain its boundary for provider admission."""
   snapshot = agent_context_snapshot(
-    db, chat_id, physical_run_id, chat=chat,
+    db, chat_id, physical_run_id, chat=chat, alive_chat_ids=alive_chat_ids,
   )
   if snapshot is None:
     return CoordinationContextDelivery(text="", delivered_through=None)
