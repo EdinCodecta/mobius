@@ -129,6 +129,38 @@ def test_withdrawal_vs_admission_invalidates_only_unentered_execution(db, chat, 
   assert not asyncio.run(deps.deliver_dependency(row.id))
 
 
+def test_chat_admission_reselects_after_selected_dependency_is_withdrawn(db, chat):
+  from app import chat as chat_mod
+  _setup(db, chat)
+  row = _follow(db, chat)
+  _answer()
+  db.expire_all()
+  run = db.get(models.ChatRun, "dependent-run")
+  run.status = "running"
+  run.provider_execution_admitted = False
+  db.commit()
+  selected, wait_ids, dependency_ids = chat_mod._selected_result_context(
+    db, chat.id, run.id, "Continue work",
+  )
+  assert dependency_ids == (row.id,) and row.id in selected
+  assert _withdraw(chat.id, row.id) == "withdrawn"
+  row_id, run_id = row.id, run.id
+  admitted, prompt, delivered_waits, delivered_dependencies = asyncio.run(
+    chat_mod._admit_with_selected_results(
+      db, chat.id, run.id, None, raw_message="Continue work",
+      user_message="before <results> Continue work", context_marker="<results>",
+      selected_context=selected, wait_results=wait_ids,
+      dependency_results=dependency_ids, has_peer_context_delivery=False,
+      activity_results=(),
+    )
+  )
+  assert admitted and "Continue work" in prompt
+  assert row_id not in prompt
+  assert delivered_waits == delivered_dependencies == ()
+  db.expire_all()
+  assert db.get(models.ChatRun, run_id).provider_execution_admitted
+
+
 @pytest.mark.parametrize('terminal', ['completed', 'cancelled', 'cannot_complete', 'dismissed'])
 def test_closed_goals_cannot_acquire_a_new_withdrawal_disposition(db, chat, client, auth, terminal):
   _setup(db, chat)

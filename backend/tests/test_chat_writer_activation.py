@@ -738,3 +738,25 @@ def test_append_steered_user_message_appends_when_no_assistant_yet():
   assert [m["content"] for m in chat["messages"]] == ["start", "steered"]
   assert "steered" not in chat["messages"][0]
   assert chat["messages"][1]["steered"] is True
+
+
+def test_recording_session_still_crosses_the_decision_graph_fence():
+  """Recording hooks must not bypass the production source-transition fence."""
+  from app.chat_writer import ChatWriterActor, Finalize
+  from tests.test_chat_writer import _RecordingSession
+
+  statements, snapshots = [], []
+  class RecordingSession(_RecordingSession):
+    def execute(self, statement, *args, **kwargs):
+      statements.append(str(statement))
+
+  actor = ChatWriterActor(session_factory=lambda: RecordingSession(snapshots))
+  actor.start()
+  try:
+    actor.submit(Finalize(chat_id="recording", run_token="run",
+      snapshot={"id": "run", "role": "assistant", "blocks": []})).result(5)
+  finally:
+    actor.stop(timeout=5)
+  assert len(snapshots) == 1
+  assert any(statement.startswith("UPDATE owner SET username=owner.username")
+    for statement in statements)

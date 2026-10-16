@@ -43,6 +43,86 @@ def _ack(chat, run, ids):
     run_token=run.id, dependency_results=ids)).result(timeout=5)
 
 
+def _source_claim(db, source, *, claim_id="source-claim", acquisition="source-acquisition"):
+  owner = db.query(models.Owner).first()
+  if owner is None:
+    owner = models.Owner(username="dependency-test-owner", hashed_password="unused")
+    db.add(owner)
+    db.flush()
+  claim = models.AgentWorkClaim(id=claim_id, acquisition_id=acquisition,
+    owner_id=owner.id, owner_chat_id=source.id, owner_run_id="source-run",
+    owner_goal_id="source-goal", work_key=claim_id, summary="Shared action")
+  db.add(claim)
+  db.commit()
+  return claim
+
+
+@pytest.mark.parametrize("state,expected", [
+  ("clean_gap", None),
+  ("failed", "owner_not_progressing"),
+  ("already_attempted", "owner_not_progressing"),
+  ("foreign_latest", "owner_not_progressing"),
+])
+def test_claim_source_clean_settlement_gap_is_exact_and_bounded(db, chat, state, expected):
+  from app.chat_writer import create_chat
+  from app.goal_dependency_sources import dependency_source_blocker, stage_reconcile_claim_sources
+  source = create_chat(id="source-chat", title="Source", messages=[])
+  db.add(source)
+  source_run = _run(db, source, "source-run", "source-goal")
+  claim = _source_claim(db, source)
+  follower = _run(db, chat, "follower-run", "follower-goal")
+  row = models.GoalDependency(id="follow-source", waiting_chat_id=chat.id,
+    waiting_goal_id=follower.goal_id, target_kind="claim_acquisition",
+    target_key="claim:source-acquisition", target_claim_id=claim.id,
+    target_acquisition_id=claim.acquisition_id, target_chat_id=source.id)
+  db.add(row)
+  if state == "failed":
+    source_run.status = "failed"
+  elif state == "already_attempted":
+    source_run.continuation_json = {"reason": "goal_settlement", "goal_id": "source-goal"}
+  elif state == "foreign_latest":
+    _run(db, source, "z-foreign-run", "foreign-goal")
+  db.commit()
+
+  assert dependency_source_blocker(db, row) == expected
+  assert stage_reconcile_claim_sources(db) == (0 if expected is None else 1)
+  db.refresh(row)
+  assert (row.resolved_at is None) is (expected is None)
+
+
+def test_claim_follow_cap_counts_owed_cards_and_excludes_inactive_rows(db, chat):
+  from app.chat_writer import create_chat
+  from app.goal_dependency_sources import outstanding_dependency_count, stage_follow_claim
+  source = create_chat(id="cap-source", title="Source", messages=[])
+  db.add(source)
+  _run(db, source, "source-run", "source-goal")
+  first = _source_claim(db, source)
+  follower = _run(db, chat, "follower-run", "follower-goal")
+  for index in range(65):
+    row = models.GoalDependency(id=f"card-{index}", waiting_chat_id=chat.id,
+      waiting_goal_id=follower.goal_id, target_kind="owner_card",
+      target_key=f"card:source:{index}", target_chat_id=source.id,
+      target_question_id=f"question-{index}")
+    if index == 0:
+      row.withdrawn_at = now_naive_utc()
+    elif index == 1:
+      row.owner_suppressed_at = now_naive_utc()
+    elif index == 2:
+      row.result_disposition = "delivered"
+    elif index == 3:
+      row.resolved_at = now_naive_utc()  # Owed results still consume capacity.
+    db.add(row)
+  db.commit()
+  assert outstanding_dependency_count(db, follower.goal_id) == 62
+  assert stage_follow_claim(db, first, chat_id=chat.id, run_id=follower.id) == "followed"
+  assert outstanding_dependency_count(db, follower.goal_id) == 63
+  second = _source_claim(db, source, claim_id="another-claim", acquisition="another-acquisition")
+  assert stage_follow_claim(db, second, chat_id=chat.id, run_id=follower.id) == "followed"
+  assert outstanding_dependency_count(db, follower.goal_id) == 64
+  third = _source_claim(db, source, claim_id="third-claim", acquisition="third-acquisition")
+  assert stage_follow_claim(db, third, chat_id=chat.id, run_id=follower.id) == "dependency_limit"
+
+
 def test_two_goals_following_one_acquisition_and_goalless_turn_have_exact_receipts(db, chat):
   a = _run(db, chat, "a", "goal-a")
   b = _run(db, chat, "b", "goal-b")
@@ -427,3 +507,30 @@ async def test_supervisor_wait_and_dependency_sweeps_survive_each_others_failure
     assert calls == ["wait", "dependency", "wait", "dependency"]
   finally:
     await supervisors.stop()
+
+
+def test_reconcile_after_clean_finish_preserves_unattempted_source_settlement(db, chat):
+  from app.chat_writer import create_chat, FinishRun, ReconcileClaimSources
+  from app.goal_dependency_sources import stage_follow_claim
+  source = create_chat(id="source", title="Claim owner", messages=[])
+  db.add(source)
+  db.add(models.ChatGoal(id="source-goal", chat_id=source.id, objective="Shared action"))
+  db.commit()
+  get_writer().submit(StartTurn(chat_id=source.id, run_token="source-run",
+    user_msg={"role": "user", "content": "Do shared action", "ts": 1})).result(5)
+  db.expire_all()
+  db.get(models.ChatRun, "source-run").goal_id = "source-goal"
+  db.commit()
+  claim = _source_claim(db, source)
+  follower = _run(db, chat, "follower-run", "follower-goal")
+  assert stage_follow_claim(db, claim, chat_id=chat.id, run_id=follower.id) == "followed"
+  db.commit()
+  get_writer().submit(AdmitProviderExecution(chat_id=source.id,
+    run_token="source-run")).result(5)
+  get_writer().submit(FinishRun(chat_id=source.id, run_token="source-run",
+    terminal_status="completed")).result(5)
+  assert get_writer().submit(ReconcileClaimSources()).result(5) == 0
+  db.expire_all()
+  row = db.query(models.GoalDependency).one()
+  assert row.resolved_at is None
+  assert db.get(models.ChatRun, "source-run").status == "completed"

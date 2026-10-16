@@ -730,7 +730,7 @@ def test_transfer_quota_failure_rolls_back_instead_of_losing_former_goal_follow(
   from app import goal_dependency_sources
   owner, first, second = _fixture(db)
   claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY, summary="Action")
-  monkeypatch.setattr(goal_dependency_sources, "MAX_CLAIM_DEPENDENCIES_PER_GOAL", 0)
+  monkeypatch.setattr(goal_dependency_sources, "MAX_OUTSTANDING_DEPENDENCIES_PER_GOAL", 0)
   with pytest.raises(ValueError, match="former Goal's follow: dependency_limit"):
     claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second", work_key=KEY,
       summary="Transfer", expected_owner_chat_id=first.id, takeover_reason="Accepted exact action from original executor")

@@ -2100,9 +2100,9 @@ class ChatWriterActor:
     real helpers.  The contention tests in `test_chat_writer_contention`
     drive a real `SessionLocal`, exercising the real dispatch below.
     """
-    if (not hasattr(db, "record_commit") and isinstance(cmd, (
+    if isinstance(cmd, (
         QuestionCommit, AnswerQuestion, AppendPending, Finalize, FinishRun,
-        ReplaceTranscript, ParkRun))):
+        ReplaceTranscript, ParkRun)):
       # Read source state only after the graph fence: subscriptions, answers,
       # Stop and replacement must agree on one side of the transition.
       from app.decision_cards import fence_decisions
@@ -2891,7 +2891,7 @@ class ChatWriterActor:
       models.ChatWait.id.in_(cmd.wait_results),
     ).all()} if cmd.wait_results else set()
     if eligible_waits != set(cmd.wait_results):
-      raise _PersistFailed("AdmitProviderExecution: Wait result is no longer receivable")
+      raise _SelectedResultUnavailable("AdmitProviderExecution: Wait result is no longer receivable")
     from app.goal_dependencies import receivable_dependency_results, dependency_delivery_blocker
     if run.id.startswith("dependency-resume-"):
       dependency = db.get(models.GoalDependency,
@@ -2903,7 +2903,7 @@ class ChatWriterActor:
       models.GoalDependency.id.in_(cmd.dependency_results),
     ).all()} if cmd.dependency_results else set()
     if eligible_dependencies != set(cmd.dependency_results):
-      raise _PersistFailed("AdmitProviderExecution: dependency result is no longer receivable")
+      raise _SelectedResultUnavailable("AdmitProviderExecution: dependency result is no longer receivable")
     activity_results = dict(cmd.activity_results)
     activity_ids = tuple(activity_results)
     if (
@@ -3034,7 +3034,10 @@ class ChatWriterActor:
     from app.chat_waits import stage_wait_results_delivered
     stage_wait_results_delivered(db, cmd.chat_id, cmd.wait_results, run_id=run.id)
     from app.goal_dependencies import stage_dependency_results_delivered
-    stage_dependency_results_delivered(db, cmd.chat_id, cmd.dependency_results, run_id=run.id)
+    # Includes settled cards returned by wait_for_decision during this turn,
+    # not only the result ids snapshotted before provider entry.
+    stage_dependency_results_delivered(db, cmd.chat_id,
+      run.admitted_dependency_results_json or (), run_id=run.id)
     self._stage_side_questions_delivered(db, cmd.chat_id, cmd.side_question_cids)
     if not _commit_or_rollback(db):
       raise _PersistFailed("AcknowledgeProviderSuccess did not persist")
@@ -6500,6 +6503,10 @@ class _PersistFailed(Exception):
   without poisoning the actor.  Distinct from `SQLAlchemyError`, so it
   does NOT trigger a session recreate (the session is fine; the write was
   legitimately impossible)."""
+
+
+class _SelectedResultUnavailable(_PersistFailed):
+  """A selected result changed before provider entry; reselect the prompt."""
 
 
 # -- chat-transcript persistence helpers ---------------------------------

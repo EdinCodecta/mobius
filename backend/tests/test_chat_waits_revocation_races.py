@@ -142,6 +142,35 @@ def test_changed_result_cannot_cross_provider_admission(db, chat, change):
   assert db.get(models.ChatWait, wait.id).received_run_id is None
 
 
+def test_chat_admission_reselects_after_selected_wait_is_withdrawn(db, chat):
+  run = _run(db, chat, "ordinary-turn", "goal-a", admitted=False)
+  wait = _wait(db, chat, run)
+  run.status = "running"
+  db.commit()
+  selected, wait_ids, dependency_ids = chat_mod._selected_result_context(
+    db, chat.id, run.id, "Continue work",
+  )
+  assert wait.id in wait_ids and wait.description in selected
+  wait.result_disposition = "withdrawn"
+  wait.result_disposed_at = now_naive_utc()
+  db.commit()
+  wait_id, description, run_id = wait.id, wait.description, run.id
+  admitted, prompt, delivered_waits, delivered_dependencies = asyncio.run(
+    chat_mod._admit_with_selected_results(
+      db, chat.id, run.id, None, raw_message="Continue work",
+      user_message="before <results> Continue work", context_marker="<results>",
+      selected_context=selected, wait_results=wait_ids,
+      dependency_results=dependency_ids, has_peer_context_delivery=False,
+      activity_results=(),
+    )
+  )
+  assert admitted and "Continue work" in prompt
+  assert description not in prompt and wait_id not in prompt
+  assert delivered_waits == delivered_dependencies == ()
+  db.expire_all()
+  assert db.get(models.ChatRun, run_id).provider_execution_admitted
+
+
 def test_held_wait_notice_cannot_start_or_promote_goalless_work(db, chat):
   a = _run(db, chat, "run-a", "goal-a")
   wait = _wait(db, chat, a)

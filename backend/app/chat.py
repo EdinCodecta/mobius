@@ -118,6 +118,7 @@ from app.chat_writer import (
   await_ack as _await_ack,
   cid_of,
   get_writer,
+  _SelectedResultUnavailable,
   next_message_ts as _next_message_ts,
   recover_start_continuation,
   update_last_assistant_message as _update_last_assistant_message,
@@ -2979,6 +2980,56 @@ async def _admit_provider_execution(
   return not _run_generation_superseded(chat_id, run_gen)
 
 
+def _selected_result_context(db, chat_id: str, run_token: str, raw_message: str):
+  """Rebuild only the result-bearing prompt segment for this exact run."""
+  from app.goal_dependencies import owed_dependency_results
+  from app.chat_waits import build_active_waits_context, owed_wait_results
+
+  dependency_text, dependency_ids = owed_dependency_results(
+    db, chat_id, raw_message, run_id=run_token,
+  )
+  wait_text, wait_ids = owed_wait_results(
+    db, chat_id, raw_message, run_id=run_token,
+  )
+  active_text = build_active_waits_context(db, chat_id)
+  return "\n\n".join(part for part in (active_text, wait_text, dependency_text) if part), wait_ids, dependency_ids
+
+
+async def _admit_with_selected_results(
+  db, chat_id: str, run_token: str, run_gen: int | None,
+  *, raw_message: str, user_message: str, context_marker: str | None,
+  selected_context: str, wait_results: tuple[str, ...],
+  dependency_results: tuple[str, ...], has_peer_context_delivery: bool,
+  activity_results: tuple[tuple[str, str], ...],
+):
+  """Retry stale selections, never a stale direct continuation or Stop."""
+  for attempt in range(3):
+    try:
+      admitted = await _admit_provider_execution(
+        chat_id, run_token, run_gen,
+        has_peer_context_delivery=has_peer_context_delivery,
+        activity_results=activity_results, wait_results=wait_results,
+        dependency_results=dependency_results,
+      )
+      if not admitted:
+        return False, user_message, (), ()
+      rendered = user_message.replace(
+        context_marker, f"{selected_context}\n\n" if selected_context else "", 1,
+      ) if context_marker else user_message
+      return True, rendered, wait_results, dependency_results
+    except _SelectedResultUnavailable:
+      if context_marker is None or attempt == 2 or _run_generation_superseded(chat_id, run_gen):
+        raise
+      # The writer rejected the old bytes atomically. Expire the request's
+      # read snapshot before choosing fresh, exact-Goal receivable results.
+      db.expire_all()
+      selected_context, wait_results, dependency_results = _selected_result_context(
+        db, chat_id, run_token, raw_message,
+      )
+      db.close()
+  raise AssertionError("unreachable result admission retry")
+
+
 def _log_superseded_run(chat_id: str, phase: str) -> None:
   _get_logger().info(
     "run_chat aborted: generation mismatch chat_id=%s phase=%s",
@@ -5812,22 +5863,14 @@ async def _run_chat_impl_with_db(
   # snapshot queues behind the live turn rather than mutating its request.
   wait_results: tuple[str, ...] = ()
   dependency_results: tuple[str, ...] = ()
+  result_context_marker = None
+  selected_result_context = ""
   if run_policy is None and chat_id:
-    from app.goal_dependencies import owed_dependency_results
-    dependency_text, dependency_results = owed_dependency_results(
-      db, chat_id, raw_user_message, run_id=run_token,
+    selected_result_context, wait_results, dependency_results = _selected_result_context(
+      db, chat_id, run_token, raw_user_message,
     )
-    if dependency_text:
-      user_message = f"{dependency_text}\n\n{user_message}"
-    from app.chat_waits import build_active_waits_context, owed_wait_results
-    owed_waits_text, wait_results = owed_wait_results(
-      db, chat_id, raw_user_message, run_id=run_token,
-    )
-    if owed_waits_text:
-      user_message = f"{owed_waits_text}\n\n{user_message}"
-    waits_context = build_active_waits_context(db, chat_id)
-    if waits_context:
-      user_message = f"{waits_context}\n\n{user_message}"
+    result_context_marker = f"<result-context-{uuid.uuid4().hex}>"
+    user_message = f"{result_context_marker}{user_message}"
 
   # Side questions the owner added to the chat ("/btw", then Add to chat)
   # reach the agent once: on this turn, recorded delivered only when the
@@ -6282,15 +6325,16 @@ async def _run_chat_impl_with_db(
     try:
       from app.codex_sdk_runner import run_codex_sdk_turn
 
-      if not await _admit_provider_execution(
-        chat_id,
-        run_token or "",
-        run_gen,
+      admitted, user_message, wait_results, dependency_results = await _admit_with_selected_results(
+        db, chat_id, run_token or "", run_gen,
+        raw_message=raw_user_message, user_message=user_message,
+        context_marker=result_context_marker,
+        selected_context=selected_result_context,
+        wait_results=wait_results, dependency_results=dependency_results,
         has_peer_context_delivery=coordination_message_through is not None,
         activity_results=activity_results,
-        wait_results=wait_results,
-        dependency_results=dependency_results,
-      ):
+      )
+      if not admitted:
         return await _complete_turn(
           bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,
           provider_id=provider_id, cost_usd=0, close_browser=False,
@@ -6478,15 +6522,16 @@ async def _run_chat_impl_with_db(
     try:
       from app.providers import skills_enabled as _skills_enabled
 
-      if not await _admit_provider_execution(
-        chat_id,
-        run_token or "",
-        run_gen,
+      admitted, user_message, wait_results, dependency_results = await _admit_with_selected_results(
+        db, chat_id, run_token or "", run_gen,
+        raw_message=raw_user_message, user_message=user_message,
+        context_marker=result_context_marker,
+        selected_context=selected_result_context,
+        wait_results=wait_results, dependency_results=dependency_results,
         has_peer_context_delivery=coordination_message_through is not None,
         activity_results=activity_results,
-        wait_results=wait_results,
-        dependency_results=dependency_results,
-      ):
+      )
+      if not admitted:
         return await _complete_turn(
           bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,
           provider_id=provider_id, cost_usd=0, close_browser=False,

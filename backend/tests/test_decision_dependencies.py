@@ -656,3 +656,90 @@ def test_foreign_not_now_can_defer_receipt_and_resume_without_redelivery(db, cha
   assert deps.owed_dependency_results(db, chat_id, "", run_id="owner-resumed") == ("", ())
   assert not asyncio.run(deps.deliver_dependency(row_id))
   assert len(scheduled) == 1
+
+
+@pytest.mark.parametrize("outcome", ["complete", "defer"])
+@pytest.mark.parametrize("already_following", [False, True])
+def test_already_answered_follow_can_finish_same_turn_without_redelivery(
+    db, chat, monkeypatch, outcome, already_following):
+  from app.goals import update_goal_record
+  from tests.test_goal_hold_lifecycle import resume
+
+  _setup(db, chat)
+  if already_following:
+    _follow(db, chat)
+  _answer()
+  run = db.get(models.ChatRun, "dependent-run")
+  run.status = "running"
+  db.commit()
+  get_writer().submit(AdmitProviderExecution(
+    chat_id=chat.id, run_token=run.id)).result(5)
+  # The result was not in the admission-time prompt. The explicit tool call
+  # now returns the settled decision to this already-entered exact-Goal run.
+  row = _follow(db, chat)
+  assert row.outcome_json["answers"] == {"q": "Not now"}
+  db.expire_all()
+  assert run.admitted_dependency_results_json == [row.id]
+  assert row.received_run_id is None
+  assert _follow(db, chat).id == row.id
+  assert run.admitted_dependency_results_json == [row.id]
+  goal = db.get(models.ChatGoal, "dependent-goal")
+  update_goal_record(db, run, goal, goal.revision, **(
+    {"complete": True} if outcome == "complete" else
+    {"defer": "The source owner chose Not now; no other authorized work remains."}))
+  # Runtime ACK still has the empty original prompt selection. It must also
+  # receipt evidence returned by tools during this physical run.
+  get_writer().submit(AcknowledgeProviderSuccess(
+    chat_id=chat.id, run_token=run.id)).result(5)
+  db.expire_all()
+  if outcome == "defer":
+    assert goal.status == "stopped"
+    assert row.result_disposition == "delivered"
+    assert row.received_run_id == run.id
+    run.status = "completed"
+    db.commit()
+    get_writer().submit(resume(chat, goal, token="owner-resumed")).result(5)
+    db.expire_all()
+    assert deps.owed_dependency_results(db, chat.id, "", run_id="owner-resumed") == ("", ())
+  else:
+    assert goal.status == "completed"
+    assert row.result_disposition == "retired_by_goal_outcome"
+  scheduled = []
+  monkeypatch.setattr(chat_mod, "_schedule_continuation", lambda **kw: scheduled.append(kw))
+  assert not asyncio.run(deps.deliver_dependency(row.id))
+  assert scheduled == []
+
+
+def test_settled_follow_does_not_acknowledge_before_provider_success(db, chat):
+  _setup(db, chat)
+  _answer()
+  run = db.get(models.ChatRun, "dependent-run")
+  run.status = "running"
+  db.commit()
+  get_writer().submit(AdmitProviderExecution(chat_id=chat.id, run_token=run.id)).result(5)
+  row = _follow(db, chat)
+  # A failed provider call must leave the returned evidence owed to the same
+  # Goal, rather than recording a delivery solely from the tool transaction.
+  run.status = "failed"
+  db.add(models.ChatRun(id="retry", chat_id=chat.id, goal_id=run.goal_id, status="running"))
+  db.commit()
+  assert deps.owed_dependency_results(db, chat.id, "", run_id="retry")[1] == (row.id,)
+  assert row.received_run_id is None and row.result_disposition is None
+
+
+def test_card_follow_cap_counts_claims_but_not_owner_suppressed_rows(db, chat):
+  from app.goal_dependency_sources import outstanding_dependency_count
+  _setup(db, chat)
+  for index in range(65):
+    db.add(models.GoalDependency(id=f"claim-{index}", waiting_chat_id=chat.id,
+      waiting_goal_id="dependent-goal", target_kind="claim_acquisition",
+      target_key=f"claim:acquisition-{index}", target_acquisition_id=f"acquisition-{index}",
+      owner_suppressed_at=now_naive_utc() if index == 0 else None))
+  db.commit()
+  assert outstanding_dependency_count(db, "dependent-goal") == 64
+  with pytest.raises(ValueError, match="64 outstanding"):
+    _follow(db, chat)
+  db.get(models.GoalDependency, "claim-1").result_disposition = "delivered"
+  db.commit()
+  assert _follow(db, chat).target_kind == "owner_card"
+  assert outstanding_dependency_count(db, "dependent-goal") == 64

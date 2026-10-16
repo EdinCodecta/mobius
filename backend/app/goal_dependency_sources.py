@@ -62,7 +62,17 @@ def _direct_cycle(db: Session, *, waiting_goal_id: str, source_goal_id: str | No
   return claims.first() is not None or cards.first() is not None
 
 
-MAX_CLAIM_DEPENDENCIES_PER_GOAL = 64
+MAX_OUTSTANDING_DEPENDENCIES_PER_GOAL = 64
+
+
+def outstanding_dependency_count(db: Session, waiting_goal_id: str) -> int:
+  """Count all live follows, including resolved results still owed to a Goal."""
+  return db.query(func.count(models.GoalDependency.id)).filter(
+    models.GoalDependency.waiting_goal_id == waiting_goal_id,
+    models.GoalDependency.withdrawn_at.is_(None),
+    models.GoalDependency.owner_suppressed_at.is_(None),
+    models.GoalDependency.result_disposition.is_(None),
+  ).scalar() or 0
 
 
 def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
@@ -132,14 +142,7 @@ def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
   if _direct_cycle(db, waiting_goal_id=goal.id,
                    source_goal_id=claim.owner_goal_id):
     return 'direct_cycle'
-  count = db.query(func.count(models.GoalDependency.id)).filter(
-    models.GoalDependency.waiting_goal_id == goal.id,
-    models.GoalDependency.target_kind == 'claim_acquisition',
-    models.GoalDependency.withdrawn_at.is_(None),
-    models.GoalDependency.owner_suppressed_at.is_(None),
-    models.GoalDependency.result_disposition.is_(None),
-  ).scalar() or 0
-  if count >= MAX_CLAIM_DEPENDENCIES_PER_GOAL:
+  if outstanding_dependency_count(db, goal.id) >= MAX_OUTSTANDING_DEPENDENCIES_PER_GOAL:
     return 'dependency_limit'
   if existing is not None:
     existing.owner_suppressed_at = None
@@ -211,6 +214,21 @@ def dependency_source_blocker(db: Session, row: models.GoalDependency, *, _seen=
     from app.chat_handoffs import native_goal_handoffs
     if native_goal_handoffs(db, goal).progress_owned:
       return None
+    # FinishRun commits before PromotePending admits the one bounded clean
+    # settlement. A reconciler in that gap must not declare the source dead.
+    # Only the chat's latest exact Goal attempt can own this allowance; an
+    # already-attempted settlement, failed run, or later foreign Goal cannot.
+    latest = db.query(models.ChatRun).filter(
+      models.ChatRun.chat_id == goal.chat_id,
+    ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).first()
+    if (latest is not None and latest.goal_id == goal.id
+        and latest.status == 'completed'
+        and latest.provider_execution_admitted is True
+        and latest.initiated_by_app_id is None
+        and chat.dismissed_goal_id != goal.id):
+      from app.continuations import recovery_attempted
+      if not recovery_attempted(db, latest, reason='goal_settlement'):
+        return None
     # Follow a finite chain of real sources, not the existence of a stale row.
     # Direct cycles are rejected on writes. Longer cycles remain representable,
     # but a detected chain of stalled executors is recovery, not automatic work.

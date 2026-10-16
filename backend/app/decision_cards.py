@@ -6,6 +6,8 @@ only latency. No transcript-position or process-local cancellation inference.
 """
 from __future__ import annotations
 
+from sqlalchemy import update
+
 from app import models
 from app.timeutil import now_naive_utc
 
@@ -13,8 +15,8 @@ from app.timeutil import now_naive_utc
 def fence_decisions(db):
   # The single-owner graph fence is shared with claim follows/transfers, so
   # mixed card/claim direct cycles cannot slip through concurrent registration.
-  db.query(models.Owner).update(
-    {models.Owner.username: models.Owner.username}, synchronize_session=False)
+  db.execute(update(models.Owner).values(username=models.Owner.username)
+    .execution_options(synchronize_session=False))
 
 
 def supported_family(card):
@@ -172,7 +174,8 @@ def stage_replace_decisions(db, chat, messages, pending_question_id):
 def stage_wait_for_decision(db, *, chat_id, run_id, source_chat_id, question_id):
   """Subscribe atomically to one readable saved foreign decision, or refuse."""
   from uuid import uuid4
-  from app.goal_dependency_sources import _eligible_goal, _direct_cycle
+  from app.goal_dependency_sources import (_eligible_goal, _direct_cycle,
+    outstanding_dependency_count, MAX_OUTSTANDING_DEPENDENCIES_PER_GOAL)
   from app.questions import saved_question
   from app.chat_writer import _question_owner_run
   fence_decisions(db)
@@ -206,13 +209,9 @@ def stage_wait_for_decision(db, *, chat_id, run_id, source_chat_id, question_id)
   existing = db.query(models.GoalDependency).filter_by(
     waiting_goal_id=goal.id, target_key=target_key).populate_existing().first()
   if existing is not None:
+    _stage_returned_decision_receipt(db, existing, run_id)
     return existing
-  count = db.query(models.GoalDependency).filter(
-    models.GoalDependency.waiting_goal_id == goal.id,
-    models.GoalDependency.result_disposition.is_(None),
-    models.GoalDependency.withdrawn_at.is_(None),
-  ).count()
-  if count >= 64:
+  if outstanding_dependency_count(db, goal.id) >= MAX_OUTSTANDING_DEPENDENCIES_PER_GOAL:
     raise ValueError("This Goal already has 64 outstanding dependencies.")
   dependency = models.GoalDependency(id=str(uuid4()), waiting_goal_id=goal.id,
     waiting_chat_id=chat_id, created_by_run_id=run_id,
@@ -221,4 +220,24 @@ def stage_wait_for_decision(db, *, chat_id, run_id, source_chat_id, question_id)
     outcome_json=row.outcome_json, resolved_at=row.resolved_at)
   db.add(dependency)
   db.flush()
+  _stage_returned_decision_receipt(db, dependency, run_id)
   return dependency
+
+
+def _stage_returned_decision_receipt(db, dependency, run_id):
+  """A settled follow returns its evidence in this exact run's tool response.
+
+  Keep it owed until provider success, just like admission-time context, but
+  let this run complete or defer without replaying that evidence next turn.
+  """
+  if (dependency.resolved_at is None or dependency.result_disposition is not None
+      or dependency.withdrawn_at is not None or dependency.owner_suppressed_at is not None):
+    return
+  run = db.get(models.ChatRun, run_id, populate_existing=True)
+  if (run is None or run.chat_id != dependency.waiting_chat_id
+      or run.goal_id != dependency.waiting_goal_id or run.status != "running"
+      or not run.provider_execution_admitted):
+    return
+  ids = list(run.admitted_dependency_results_json or ())
+  if dependency.id not in ids:
+    run.admitted_dependency_results_json = [*ids, dependency.id]
