@@ -455,7 +455,7 @@ info.write_text(json.dumps(data, sort_keys=True) + "\n")'; \
 RUN set -eux; \
     _lineage_sha="$(cat /app/platform-baked/.baked-sha)"; \
     if [ "${MOBIUS_USE_LOCAL_PLATFORM_SOURCE:-0}" = "1" ]; then \
-      _lineage_sha="${MOBIUS_LOCAL_PLATFORM_BASE_SHA}"; \
+      _lineage_sha="$(printf '%s' "${MOBIUS_LOCAL_PLATFORM_BASE_SHA}" | tr 'A-F' 'a-f')"; \
     fi; \
     : > /app/platform-lineage; \
     if printf '%s' "$_lineage_sha" | grep -Eq '^[0-9a-f]{40}$' \
