@@ -1115,26 +1115,16 @@ async def _deliver_resume(row_id: str) -> bool:
   return True
 
 
-async def sweep_due_waits(*, force_kind: str | None = None) -> int:
-  """One supervisor tick: check due armed waits, deliver met/expired resumes.
-
-  Single-process by design (the supervisor loop is the only caller), so plain
-  status guards are enough; the delivery latch still makes a crash redeliver
-  instead of losing a resume. ``force_kind`` rechecks one typed product wait
-  immediately after its owning event instead of waiting for the polling
-  interval. Returns the number of resumes delivered.
-
-  While edits made on the previous platform source are still being merged back
-  after an update, checks still run but resumes wait, like every other
-  automatic resume: a woken agent must not act on a checkout missing its own
-  recent edits. Undelivered results go out on the first sweep after that.
-  """
+def _select_wait_sweep(
+  now, force_kind: str | None,
+) -> tuple[list[str], list[str], bool]:
+  """Armed waits due for a check, closed waits owed a resume, and whether
+  resumes are held for unmerged late edits. Pure reads, for a worker."""
   from app.database import SessionLocal
   from app.platform_update import late_edits_pending
 
   hold_resumes = late_edits_pending()
 
-  now = now_naive_utc()
   due_ids: list[str] = []
   undelivered_ids: list[str] = []
   with SessionLocal() as db:
@@ -1165,6 +1155,29 @@ async def sweep_due_waits(*, force_kind: str | None = None) -> int:
         due_ids.append(row_id)
       else:
         undelivered_ids.append(row_id)
+  return due_ids, undelivered_ids, hold_resumes
+
+
+async def sweep_due_waits(*, force_kind: str | None = None) -> int:
+  """One supervisor tick: check due armed waits, deliver met/expired resumes.
+
+  Single-process by design (the supervisor loop is the only caller), so plain
+  status guards are enough; the delivery latch still makes a crash redeliver
+  instead of losing a resume. ``force_kind`` rechecks one typed product wait
+  immediately after its owning event instead of waiting for the polling
+  interval. Returns the number of resumes delivered.
+
+  While edits made on the previous platform source are still being merged back
+  after an update, checks still run but resumes wait, like every other
+  automatic resume: a woken agent must not act on a checkout missing its own
+  recent edits. Undelivered results go out on the first sweep after that.
+  """
+  # The selection scans every wait row and the hold check reads update state
+  # (and may run git); on a busy disk that froze the event loop each tick, so
+  # both run in a worker with its own session.
+  due_ids, undelivered_ids, hold_resumes = await asyncio.to_thread(
+    _select_wait_sweep, now_naive_utc(), force_kind,
+  )
 
   semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
