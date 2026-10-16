@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session, aliased, load_only
 from app import chat_writer
 from app import transcript_rows
 from app import auth, models
+from app.settled import run_settled
 from app.browser_access import BrowserLineage, require_live
 from app.continuations import HELPER_ANSWER_CID_PREFIX, HELPER_ANSWER_REASON
 from app.timeutil import now_naive_utc
@@ -2531,6 +2532,8 @@ def parent_wake_blocker(
   parent_helper = db.query(models.Delegation).filter(
     models.Delegation.child_chat_id == parent_chat_id,
   ).first()
+  if parent_helper is not None and parent_helper.cancelled_at is not None:
+    return "parent_cancelled", None
   if parent_helper is not None and (
     parent_helper.scope != "write"
     or parent_helper.interrupted_at is not None
@@ -3647,7 +3650,7 @@ async def _deliver_parent_wake_once(
     # Every read and repair here is synchronous SQLite work whose cost grows
     # with the parent's history; the periodic recovery sweep runs it for many
     # parents, so it must never hold the server event loop.
-    plan = await asyncio.to_thread(
+    plan = await run_settled(
       _plan_parent_wake, parent_chat_id, source_work_id,
     )
     if plan is None or is_chat_running(parent_chat_id):

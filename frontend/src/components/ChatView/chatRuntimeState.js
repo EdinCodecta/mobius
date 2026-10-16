@@ -12,6 +12,11 @@ export function isContinuationMessage(message) {
     || message?.kind === 'auto_continuation'
 }
 
+/** An added `/btw` answer: kept context for the agent, never an owner message. */
+export function isSideQuestionMessage(message) {
+  return message?.kind === 'side_question'
+}
+
 const ACTIVATION_RETRY_DELAYS_MS = [1000, 3000, 8000, 15000, 30000]
 
 /** Delay before quietly retrying a failed chat activation, or null to stop.
@@ -62,11 +67,9 @@ export function chatEntryFrame({
 }
 
 /**
- * Project a completed resume as one product event instead of leaving the old
- * actionable pause beside its continuation marker. The durable transcript is
- * untouched; only the render projection drops the resumable tail block that
- * the following continuation has superseded. Runtime and stream identity can
- * confirm the successor before its transcript row has been hydrated.
+ * A confirmed continuation replaces its actionable pause with one resume notice.
+ * The durable transcript is untouched. Runtime and stream identity can confirm
+ * the successor before its transcript row has been hydrated.
  */
 export function supersedeResumedPauseBlocks(messages, {
   running = false,
@@ -119,12 +122,16 @@ export function supersedeResumedPauseBlocks(messages, {
 }
 
 /** A visible transcript row authored by the owner, excluding product events
- * that retain role=user only because the provider receives `continue`. */
+ * that retain role=user only because the provider receives `continue`, and
+ * added side questions, which the agent receives as context, not a request.
+ * So neither is resent from ↑ history, copied as the owner's words, or read
+ * as the start of a turn. */
 export function isOwnerUserMessage(message) {
   return !!message
     && message.role === 'user'
     && !message.hidden
     && !isContinuationMessage(message)
+    && !isSideQuestionMessage(message)
 }
 
 /** The complete, contiguous batch of owner rows that reached the provider as

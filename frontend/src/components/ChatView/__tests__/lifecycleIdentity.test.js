@@ -3,11 +3,11 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement as h } from 'react'
 import { renderToStaticMarkup as render } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 const previousWindow = globalThis.window
 globalThis.window = { location: { href: 'http://localhost/' } }
 after(() => { globalThis.window = previousWindow })
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
+const vite = await createSsrRenderServer()
 after(() => vite.close())
 const load = async name => (await vite.ssrLoadModule('/src/components/ChatView/' + name + '.jsx')).default
 const Goal = await load('GoalHistoryCard')
@@ -117,4 +117,12 @@ test('decision history preserves quiet close and never invents an answer start',
  const html = render(h(Details, { dependencyHistory: [dependency] }))
  assert.match(html, /You chose Not now/)
  assert.doesNotMatch(html, /Continues automatically|Started|Waiting ·|resumed/)
+})
+
+// Manual and automatic recovery each leave one durable product notice.
+test('manual continuation records interrupted work without another pause card', () => {
+ const html = render(h(Resume, { msg: { continuation_reason: 'manual' } }))
+ assert.match(html, /Resumed manually/)
+ assert.match(html, /Interrupted work continued/)
+ assert.doesNotMatch(html, /Paused · Continued|automatically|>Resume</)
 })

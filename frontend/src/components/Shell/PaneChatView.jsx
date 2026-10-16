@@ -28,6 +28,7 @@ function PaneChatView({
   newChatSession = null,
   onNewChatSubmit,
   onNewChatRetry,
+  onNewChatCommand,
   artifactsAppId = null,
   runtimeActive = true,
   keepTranscriptPainted = false,
@@ -154,6 +155,7 @@ function PaneChatView({
         newChatSession={newChatSession}
         onNewChatSubmit={onNewChatSubmit}
         onNewChatRetry={onNewChatRetry}
+        onNewChatCommand={onNewChatCommand}
         hidden={!runtimeActive}
         keepTranscriptPainted={keepTranscriptPainted}
         paneContentHeight={paneContentHeight}

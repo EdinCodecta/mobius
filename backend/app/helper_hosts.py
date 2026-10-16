@@ -49,6 +49,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 
 from app.codex_sdk_contract import app_server_exit_code
 from app.memory_observability import ProcessExitEvidence, cgroup_oom_kill_count
+from app import settled
 
 log = logging.getLogger(__name__)
 
@@ -272,8 +273,9 @@ class HostManager:
       host = self._hosts.get(key)
       if host is None or not host.alive or host.expired:
         if host is not None:
+          # Settled: the lock must outlive the old host's process group.
           with contextlib.suppress(Exception):
-            await host.close()
+            await settled.settle(host.close(), what="Helper host close")
         await self._close_idle_siblings(key)
         host = factory()
         await host.start()
@@ -303,7 +305,7 @@ class HostManager:
         if other._idle_task is not None:
           other._idle_task.cancel()
         with contextlib.suppress(Exception):
-          await other.close()
+          await settled.settle(other.close(), what="Helper host close")
 
   async def discard(self, host: Host) -> None:
     """Replace a broken host on next use."""
@@ -444,10 +446,14 @@ class CodexHelperHost(Host):
     )
     client, cancel = await _enter_codex_context_owned(self._context)
     self.client = client
-    if cancel is not None:
-      await self.close()
-      raise cancel
+    # Captured before the cancel check, so close also ends the process group.
     self.process_group_id = _codex_process_group_id(client)
+    if cancel is not None:
+      # Settled: a second cancel must not release the lease lock while the
+      # process group is still being killed.
+      with contextlib.suppress(Exception):
+        await settled.settle(self.close(), what="Helper host close")
+      raise cancel
     lower_process_group_priority(
       self.process_group_id, logger=log, label="Codex helper host",
     )

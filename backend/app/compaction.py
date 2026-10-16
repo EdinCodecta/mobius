@@ -27,10 +27,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
 from app.chat_notes import extract_full_digest
-from app.continuations import (
-  continuation_actor_label,
-  is_continuation_message,
-)
+from app.continuations import not_owner_speech_label
 from app.peer_message import peer_message_compaction_lines
 from app.provider_errors import ProviderErrorKind, classify_provider_error
 
@@ -129,10 +126,7 @@ def build_transcript_text(
     # it back into a later synthesis recursively inflates the next handoff.
     if m.get("kind") == "compaction":
       continue
-    if is_continuation_message(m):
-      role = continuation_actor_label(m).upper()
-    else:
-      role = (m.get("role") or "user").upper()
+    role = (not_owner_speech_label(m) or m.get("role") or "user").upper()
     content = m.get("content") or ""
     if content.strip():
       lines.append(f"{role}: {content}")
