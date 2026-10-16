@@ -1,6 +1,9 @@
 """The default test entrypoint stays fast, hermetic, and checkout-owned."""
 
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "test.sh"
@@ -104,3 +107,65 @@ def test_image_runtime_reports_when_its_python_lock_differs():
   assert 'elif [ -r /app/requirements.lock ]' in source
   assert "checkout requirements.lock differs from the image runtime" in source
   assert "not dependency-authoritative" in source
+
+
+def _git(cwd, *args):
+  subprocess.run(
+    ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+    cwd=cwd, check=True, capture_output=True,
+  )
+
+
+def _checkout_with_fake_backend_node_tools(root):
+  """A primary checkout whose frontend tree holds just the verified surface."""
+  modules = root / "frontend" / "node_modules"
+  (modules / ".bin").mkdir(parents=True)
+  (modules / ".bin" / "rolldown").write_text("#!/bin/sh\n")
+  (modules / ".bin" / "rolldown").chmod(0o755)
+  for package in ("acorn", "eslint-scope"):
+    (modules / package).mkdir()
+    (modules / package / "package.json").write_text('{"name": "%s", "main": "index.js"}' % package)
+    (modules / package / "index.js").write_text("module.exports = {}\n")
+  (root / "frontend" / "package-lock.json").write_text("main lock\n")
+  (root / "backend").mkdir()
+  (root / "backend" / "test_probe.py").write_text("def test_probe():\n  assert True\n")
+  (root / ".gitignore").write_text("node_modules\n")
+  _git(root, "init", "-q", "-b", "main")
+  _git(root, "add", "-A")
+  _git(root, "commit", "-q", "-m", "base")
+
+
+def test_host_runner_still_runs_backend_tests_when_the_worktree_lockfile_diverges(tmp_path):
+  main = tmp_path / "main"
+  main.mkdir()
+  _checkout_with_fake_backend_node_tools(main)
+  worktree = tmp_path / "worktree"
+  _git(main, "worktree", "add", "-q", "-b", "bump", str(worktree))
+  (worktree / "frontend" / "package-lock.json").write_text("bumped lock\n")
+
+  result = subprocess.run(
+    [str(HOST_RUNNER), "test_probe.py", "-q"],
+    cwd=worktree, capture_output=True, text=True, timeout=60,
+  )
+  if result.returncode == 78:
+    pytest.skip("no pytest runtime available for the host runner here")
+  assert result.returncode == 0, result.stdout + result.stderr
+  assert "package-lock.json differs" in result.stderr
+  assert "not dependency-authoritative" in result.stderr
+
+
+def test_host_runner_still_refuses_when_no_tree_can_run_the_backend_node_tools(tmp_path):
+  main = tmp_path / "main"
+  main.mkdir()
+  _checkout_with_fake_backend_node_tools(main)
+  (main / "frontend" / "node_modules" / "acorn" / "package.json").unlink()
+  (main / "frontend" / "node_modules" / "acorn" / "index.js").unlink()
+  worktree = tmp_path / "worktree"
+  _git(main, "worktree", "add", "-q", "-b", "bump", str(worktree))
+
+  result = subprocess.run(
+    [str(HOST_RUNNER), "test_probe.py", "-q"],
+    cwd=worktree, capture_output=True, text=True, timeout=60,
+  )
+  assert result.returncode == 1
+  assert "no verified backend Node dependencies available" in result.stderr

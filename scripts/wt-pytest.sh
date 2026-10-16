@@ -88,6 +88,21 @@ matching_contrib_node_modules() {
   return 1
 }
 
+# Last resort when no installed tree has this checkout's exact lockfile: the
+# primary checkout, then reviewed contrib siblings, whichever still passes the
+# same verified-surface check. Nothing is borrowed unless it can run the tools.
+any_verified_node_modules() {
+  local frontend
+  for frontend in "$MAIN/frontend" "$CONTRIB_ROOT"/*/worktree/frontend; do
+    [ "$frontend" != "$ROOT/frontend" ] || continue
+    if backend_test_node_deps "$frontend"; then
+      printf '%s\n' "$frontend/node_modules"
+      return 0
+    fi
+  done
+  return 1
+}
+
 if backend_test_node_deps "$ROOT/frontend"; then
   NODE_MODULES="$WORKTREE_NODE_MODULES"
 elif [ "$ROOT" != "$MAIN" ] \
@@ -96,8 +111,15 @@ elif [ "$ROOT" != "$MAIN" ] \
   NODE_MODULES="$SHARED_NODE_MODULES"
 elif NODE_MODULES="$(matching_contrib_node_modules)"; then
   echo "wt-pytest: reusing exact-lock backend-test dependencies from $(dirname "$NODE_MODULES")" >&2
+elif NODE_MODULES="$(any_verified_node_modules)"; then
+  # A lockfile that differs from every installed tree (a dependency bump, or
+  # an upstream merge into the branch) must not block backend tests: they only
+  # execute the verified compiler surface checked above. Say so, as the
+  # requirements.lock mismatch below does, instead of refusing to run.
+  echo "wt-pytest: WARNING — frontend package-lock.json differs from $(dirname "$NODE_MODULES")" >&2
+  echo "wt-pytest: using its verified backend Node tools; results are not dependency-authoritative for a lockfile-changing PR" >&2
 else
-  echo "wt-pytest: no verified backend Node dependencies match this worktree" >&2
+  echo "wt-pytest: no verified backend Node dependencies available" >&2
   echo "  install them with: (cd \"$ROOT/frontend\" && npm ci)" >&2
   exit 1
 fi
