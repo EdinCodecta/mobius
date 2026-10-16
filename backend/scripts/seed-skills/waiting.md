@@ -42,7 +42,9 @@ When NOT to use it:
 
 Do independent work first. If your remaining next step is another chat's
 saved Q&A or approval, call `wait_for_decision(chat_id: "SOURCE_CHAT",
-question_id: "EXACT_CARD")`. Only an open top-level Goal can subscribe;
+question_id: "EXACT_CARD")`. The source chat's open card id is its
+`pending_question_id` (`mapi "/api/chats/SOURCE_CHAT?limit=1"`); a peer may
+also name it. Only an open top-level Goal can subscribe;
 helpers return the condition to their parent. Use the existing card: never
 copy it, poll its answer, or ask a peer to interrupt you later. Claim-owned
 work uses the confirmed claim dependency instead; approval is not completion.

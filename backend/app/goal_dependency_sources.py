@@ -120,9 +120,11 @@ def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
       return 'withdrawn'
     if existing.result_disposition is not None:
       # Recovery is a fact about the former attempt, not a terminal outcome
-      # of the acquisition. Once received, a later attempt may follow again.
-      # Do not rewrite the historical row or silently revive it on transfer.
-      if (not restore_owner_follow and existing.result_disposition == 'delivered'
+      # of the acquisition. Once received, a later attempt may follow again,
+      # including the former owner whose follow a transfer preserves (it may
+      # itself have taken over after that outcome). Never rewrite the
+      # historical row or silently revive it; a fresh row starts the follow.
+      if (existing.result_disposition == 'delivered'
           and isinstance(existing.outcome_json, dict)
           and existing.outcome_json.get('kind') == 'owner_not_progressing'):
         existing = None

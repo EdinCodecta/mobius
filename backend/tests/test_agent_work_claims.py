@@ -1022,11 +1022,40 @@ def test_round_trip_does_not_revive_a_deliberately_ended_follow(db, explicit_end
     assert dependency.result_disposition == "withdrawn"
     assert _claim_row(db).owner_chat_id == first.id
   else:
-    with pytest.raises(ValueError, match="cannot preserve the former Goal's follow"):
-      claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY,
-        summary="Return", expected_owner_chat_id=second.id, takeover_reason="Accepted exact action back")
-    assert _claim_row(db).owner_chat_id == second.id
+    from app.goal_dependencies import outstanding_dependencies
+    # A received owner_not_progressing outcome ended that follow, not the
+    # acquisition: handing the action on starts a fresh follow for the
+    # former owner and never revives the delivered row.
+    returned = claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY,
+      summary="Return", expected_owner_chat_id=second.id, takeover_reason="Accepted exact action back")
+    assert returned["previous_follow_status"] == "followed"
+    assert _claim_row(db).owner_chat_id == first.id
+    db.refresh(dependency)
+    assert dependency.result_disposition == "delivered"
+    assert dependency.outcome_json == {"kind": "owner_not_progressing"}
+    fresh = [row for row in outstanding_dependencies(db).all() if row.id != dependency.id]
+    assert [row.waiting_chat_id for row in fresh] == [second.id]
 
+
+def test_third_chat_can_take_over_from_stalled_successor(db):
+  # A stalls; B received owner_not_progressing and took over; B then stalls
+  # and a third Goal takes the same exact action over. B's earlier, received
+  # follow must not block the documented recovery.
+  owner, first, second = _owned_goal_claim(db)
+  dependency = db.query(models.GoalDependency).one()
+  dependency.resolved_at = now_naive_utc()
+  dependency.outcome_json = {"kind": "owner_not_progressing", "reason": "source_failed"}
+  dependency.result_disposition = "delivered"
+  db.commit()
+  claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second",
+    work_key=KEY, summary="Take over", expected_owner_chat_id=first.id,
+    takeover_reason="Former owner is not progressing")
+  assert _claim_row(db).owner_chat_id == second.id
+  third = _third_executor(db)
+  claim_work(db, owner_id=owner.id, chat_id=third.id, run_id="claim-run-third",
+    work_key=KEY, summary="Take over again", expected_owner_chat_id=second.id,
+    takeover_reason="Successor is not progressing")
+  assert _claim_row(db).owner_chat_id == third.id
 
 def test_received_owner_not_progressing_can_follow_same_live_acquisition_again(db):
   from app.goal_dependency_sources import stage_follow_claim
