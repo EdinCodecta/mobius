@@ -2834,7 +2834,6 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
         await newChatRef.current?.({
           draft: request.draft || undefined,
           forceNew: true,
-          autoSend: request.autoSend,
         })
         return
       }
