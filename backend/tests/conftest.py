@@ -80,6 +80,7 @@ os.environ["MOBIUS_FRONTEND_DIR"] = str(
 # point the override at the stub below (created before app.main imports).
 os.environ["MOBIUS_BAKED_STATIC_DIR"] = str(_static)
 os.environ["MOBIUS_BUILD_INFO_PATH"] = str(_Path(_tmp) / "missing-build-info.json")
+os.environ["MOBIUS_IMAGE_LINEAGE_PATH"] = str(_Path(_tmp) / "missing-platform-lineage")
 os.environ["MOBIUS_SERVING_SOURCE_FILE"] = str(_Path(_tmp) / "serving-source")
 os.environ["MOBIUS_SERVING_SHA_FILE"] = str(_Path(_tmp) / "serving-sha")
 if not (_static / "index.html").is_file():
