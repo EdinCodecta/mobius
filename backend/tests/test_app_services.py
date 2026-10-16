@@ -3063,7 +3063,9 @@ async def test_declared_control_routes_coexist_with_a_stalled_undeclared_public_
 
   held = 3 * received
   # Leave room for a control route's whole allowance, not a media grant's.
-  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", held + 4 * MIB)
+  monkeypatch.setattr(
+    app_services, "MAX_ADMITTED_EXCHANGE_COST", held + _execution_transfer(MIB) + MIB,
+  )
   async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as http:
     first = asyncio.create_task(http.post(f"/api/app-services/{app.slug}/echo", content=stalled()))
     try:
@@ -3234,7 +3236,7 @@ async def test_burst_of_tiny_responses_never_needs_a_second_transfer_allowance(
   app = _service_app(db, max_bytes=60 * MIB)
   # One execution allowance plus room for small envelopes and responses: a
   # finished or queued exchange must not keep a media-sized reservation.
-  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", 3 * 60 * MIB + MIB)
+  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", _execution_transfer(60 * MIB) + MIB)
   async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as http:
     replies = await asyncio.wait_for(asyncio.gather(*(
       http.get(f"/api/apps/{app.id}/service/thumb/{n}", headers=auth) for n in range(5)
@@ -3253,7 +3255,7 @@ async def test_finished_tiny_responses_release_their_transfer_allowance_before_h
   app = _service_app(db, max_bytes=cap)
   owner = db.query(models.Owner).first()
   monkeypatch.setattr(service_preload, "ready_host", lambda *_: None)
-  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", 3 * cap + MIB)
+  monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", _execution_transfer(cap) + MIB)
   executed = []
 
   async def reply(*_args):
@@ -3284,7 +3286,7 @@ async def test_finished_tiny_responses_release_their_transfer_allowance_before_h
     # Each later call ran while every earlier response was still awaiting
     # handoff, because those hold only their envelope and tiny response.
     assert len(handed_off) == 4 and all(cost < 64 * 1024 for cost in handed_off)
-    assert all(3 * cap <= cost < 3 * cap + MIB for cost in executed)
+    assert all(_execution_transfer(cap) <= cost < _execution_transfer(cap) + MIB for cost in executed)
     release.set()
     results = await asyncio.gather(*parked)
   finally:
