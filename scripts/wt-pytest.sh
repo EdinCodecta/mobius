@@ -88,13 +88,50 @@ matching_contrib_node_modules() {
   return 1
 }
 
-# Last resort when no installed tree has this checkout's exact lockfile: the
-# primary checkout, then reviewed contrib siblings, whichever still passes the
-# same verified-surface check. Nothing is borrowed unless it can run the tools.
-any_verified_node_modules() {
-  local frontend
+# The lockfile entries of the Node packages backend tests execute (the same
+# rolldown/acorn/eslint-scope surface as above) and their whole dependency
+# closure, one "path version integrity" line each, using npm's nested-then-
+# hoisted resolution. A dependency the lockfile cannot resolve prints as
+# missing, so it can never compare equal to a resolved one.
+backend_node_lock() {
+  node -e '
+    const pk = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).packages || {};
+    const find = (from, name) => {
+      for (let base = from; ; base = base.slice(0, Math.max(base.lastIndexOf("/node_modules/"), 0))) {
+        const key = (base ? base + "/" : "") + "node_modules/" + name;
+        if (pk[key]) return key;
+        if (!base) return null;
+      }
+    };
+    const lines = new Set();
+    const visit = (from, name) => {
+      const key = find(from, name);
+      if (!key) { lines.add(`missing ${name} from ${from || "."}`); return; }
+      const line = `${key} ${pk[key].version} ${pk[key].integrity}`;
+      if (lines.has(line)) return;
+      lines.add(line);
+      const entry = pk[key];
+      for (const dep of Object.keys({...entry.dependencies, ...entry.optionalDependencies})) visit(key, dep);
+    };
+    ["rolldown", "acorn", "eslint-scope"].forEach((name) => visit("", name));
+    console.log([...lines].sort().join("\n"));
+  ' "$1" 2>/dev/null
+}
+
+# Last resort when no installed tree has this checkout's exact lockfile (a
+# bump of an unrelated frontend package, or an upstream merge into the
+# branch): the primary checkout, then reviewed contrib siblings, whose lockfile
+# pins the backend-executed packages exactly as this checkout does and which
+# passes the same verified-surface check. A lockfile that changes those
+# packages never borrows another tree, so compiler tests always run the
+# versions this checkout locks.
+backend_lock_matching_node_modules() {
+  local frontend want
+  want="$(backend_node_lock "$ROOT/frontend/package-lock.json")" && [ -n "$want" ] \
+    || return 1
   for frontend in "$MAIN/frontend" "$CONTRIB_ROOT"/*/worktree/frontend; do
     [ "$frontend" != "$ROOT/frontend" ] || continue
+    [ "$(backend_node_lock "$frontend/package-lock.json")" = "$want" ] || continue
     if backend_test_node_deps "$frontend"; then
       printf '%s\n' "$frontend/node_modules"
       return 0
@@ -111,15 +148,10 @@ elif [ "$ROOT" != "$MAIN" ] \
   NODE_MODULES="$SHARED_NODE_MODULES"
 elif NODE_MODULES="$(matching_contrib_node_modules)"; then
   echo "wt-pytest: reusing exact-lock backend-test dependencies from $(dirname "$NODE_MODULES")" >&2
-elif NODE_MODULES="$(any_verified_node_modules)"; then
-  # A lockfile that differs from every installed tree (a dependency bump, or
-  # an upstream merge into the branch) must not block backend tests: they only
-  # execute the verified compiler surface checked above. Say so, as the
-  # requirements.lock mismatch below does, instead of refusing to run.
-  echo "wt-pytest: WARNING — frontend package-lock.json differs from $(dirname "$NODE_MODULES")" >&2
-  echo "wt-pytest: using its verified backend Node tools; results are not dependency-authoritative for a lockfile-changing PR" >&2
+elif NODE_MODULES="$(backend_lock_matching_node_modules)"; then
+  echo "wt-pytest: frontend package-lock.json differs from $(dirname "$NODE_MODULES"), but it locks the backend's Node tools (rolldown, acorn, eslint-scope) identically; reusing them" >&2
 else
-  echo "wt-pytest: no verified backend Node dependencies available" >&2
+  echo "wt-pytest: no verified backend Node dependencies match this worktree's locked rolldown, acorn, and eslint-scope" >&2
   echo "  install them with: (cd \"$ROOT/frontend\" && npm ci)" >&2
   exit 1
 fi

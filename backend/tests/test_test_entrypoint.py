@@ -1,5 +1,6 @@
 """The default test entrypoint stays fast, hermetic, and checkout-owned."""
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -116,6 +117,15 @@ def _git(cwd, *args):
   )
 
 
+_LOCKED = {"rolldown": "1.0.0", "acorn": "8.0.0", "eslint-scope": "9.0.0", "vite": "7.0.0"}
+
+
+def _lockfile(**bumps):
+  versions = {**_LOCKED, **bumps}
+  packages = {f"node_modules/{name}": {"version": version} for name, version in versions.items()}
+  return json.dumps({"lockfileVersion": 3, "packages": {"": {}, **packages}})
+
+
 def _checkout_with_fake_backend_node_tools(root):
   """A primary checkout whose frontend tree holds just the verified surface."""
   modules = root / "frontend" / "node_modules"
@@ -126,7 +136,7 @@ def _checkout_with_fake_backend_node_tools(root):
     (modules / package).mkdir()
     (modules / package / "package.json").write_text('{"name": "%s", "main": "index.js"}' % package)
     (modules / package / "index.js").write_text("module.exports = {}\n")
-  (root / "frontend" / "package-lock.json").write_text("main lock\n")
+  (root / "frontend" / "package-lock.json").write_text(_lockfile())
   (root / "backend").mkdir()
   (root / "backend" / "test_probe.py").write_text("def test_probe():\n  assert True\n")
   (root / ".gitignore").write_text("node_modules\n")
@@ -135,37 +145,39 @@ def _checkout_with_fake_backend_node_tools(root):
   _git(root, "commit", "-q", "-m", "base")
 
 
-def test_host_runner_still_runs_backend_tests_when_the_worktree_lockfile_diverges(tmp_path):
+def _run_host_runner_in_worktree(tmp_path, worktree_lock=None, break_acorn=False):
   main = tmp_path / "main"
   main.mkdir()
   _checkout_with_fake_backend_node_tools(main)
+  if break_acorn:
+    (main / "frontend" / "node_modules" / "acorn" / "package.json").unlink()
+    (main / "frontend" / "node_modules" / "acorn" / "index.js").unlink()
   worktree = tmp_path / "worktree"
   _git(main, "worktree", "add", "-q", "-b", "bump", str(worktree))
-  (worktree / "frontend" / "package-lock.json").write_text("bumped lock\n")
-
-  result = subprocess.run(
+  if worktree_lock is not None:
+    (worktree / "frontend" / "package-lock.json").write_text(worktree_lock)
+  return subprocess.run(
     [str(HOST_RUNNER), "test_probe.py", "-q"],
     cwd=worktree, capture_output=True, text=True, timeout=60,
   )
+
+
+def test_host_runner_reuses_backend_node_tools_when_only_other_frontend_packages_differ(tmp_path):
+  result = _run_host_runner_in_worktree(tmp_path, worktree_lock=_lockfile(vite="7.1.0"))
   if result.returncode == 78:
     pytest.skip("no pytest runtime available for the host runner here")
   assert result.returncode == 0, result.stdout + result.stderr
   assert "package-lock.json differs" in result.stderr
-  assert "not dependency-authoritative" in result.stderr
+  assert "locks the backend's Node tools (rolldown, acorn, eslint-scope) identically" in result.stderr
+
+
+def test_host_runner_refuses_a_lockfile_that_changes_the_backend_node_tools(tmp_path):
+  result = _run_host_runner_in_worktree(tmp_path, worktree_lock=_lockfile(rolldown="1.1.0"))
+  assert result.returncode == 1, result.stdout + result.stderr
+  assert "no verified backend Node dependencies match this worktree" in result.stderr
 
 
 def test_host_runner_still_refuses_when_no_tree_can_run_the_backend_node_tools(tmp_path):
-  main = tmp_path / "main"
-  main.mkdir()
-  _checkout_with_fake_backend_node_tools(main)
-  (main / "frontend" / "node_modules" / "acorn" / "package.json").unlink()
-  (main / "frontend" / "node_modules" / "acorn" / "index.js").unlink()
-  worktree = tmp_path / "worktree"
-  _git(main, "worktree", "add", "-q", "-b", "bump", str(worktree))
-
-  result = subprocess.run(
-    [str(HOST_RUNNER), "test_probe.py", "-q"],
-    cwd=worktree, capture_output=True, text=True, timeout=60,
-  )
-  assert result.returncode == 1
-  assert "no verified backend Node dependencies available" in result.stderr
+  result = _run_host_runner_in_worktree(tmp_path, break_acorn=True)
+  assert result.returncode == 1, result.stdout + result.stderr
+  assert "no verified backend Node dependencies match this worktree" in result.stderr
