@@ -408,6 +408,10 @@ def test_verified_completion_retires_its_fired_wait_without_provider_receipt(db,
   wait.status = outcome
   db.commit()
 
+  run = db.get(models.ChatRun, "goal-run")
+  run.provider_execution_admitted = True
+  run.admitted_wait_results_json = [wait.id]
+  db.commit()
   assert _complete(db)["status"] == "completed"
   db.expire_all()
   assert db.get(models.ChatWait, wait.id).resume_delivered_at is None
@@ -479,6 +483,10 @@ def test_completion_withdraws_the_queued_resume_of_its_fired_wait(db, chat):
   }, {"role": "user", "content": "Owner follow-up", "ts": 2, "cid": "owner-1"}]
   db.commit()
 
+  run = db.get(models.ChatRun, "goal-run")
+  run.provider_execution_admitted = True
+  run.admitted_wait_results_json = [wait.id]
+  db.commit()
   assert _complete(db)["status"] == "completed"
   asyncio.run(settle_after_goal_completion(chat.id))
 

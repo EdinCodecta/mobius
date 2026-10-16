@@ -311,3 +311,17 @@ def test_legacy_claim_carrier_cutover_never_retires_transfer_or_ordinary_interru
   assert db.query(models.AgentCoordinationMessage).count() == len(ids)
   # No peer cursor is falsely acknowledged and no durable note is erased.
   assert not db.query(models.ChatRun).filter(models.ChatRun.peer_message_through_id.is_not(None)).count()
+
+
+def test_provider_success_receipts_exact_dependency_and_kept_side_question_together(db, chat):
+  from app import transcript_rows
+  from app.chat_writer import AppendSideQuestion
+  run = _run(db, chat, "receiving", "goal")
+  row = _dependency(db, chat, run)
+  get_writer().submit(AppendSideQuestion(chat_id=chat.id, cid="side-1",
+    question="Which checks?", answer="The focused checks.", provider="claude")).result(timeout=5)
+  get_writer().submit(AcknowledgeProviderSuccess(chat_id=chat.id, run_token=run.id,
+    dependency_results=(row.id,), side_question_cids=("side-1",))).result(timeout=5)
+  db.expire_all()
+  assert row.result_disposition == "delivered" and row.received_run_id == run.id
+  assert transcript_rows.owed_side_questions(db, db.get(models.Chat, chat.id)) == []

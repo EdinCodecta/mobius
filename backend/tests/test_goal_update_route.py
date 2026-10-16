@@ -282,7 +282,7 @@ def test_completing_through_the_route_withdraws_its_fired_waits_resume(
   client, owner_token, db,
 ):
   """This route settles a completion exactly as patch_goal_record does: a
-  verified completion takes delivery of its fired Wait, so the queued resume
+  verified completion retires its admitted fired Wait, so the queued resume
   that would otherwise wake the finished Goal is withdrawn while the owner's
   own follow-up stays. (Mirrors PR #1450's patch_goal_record settlement.)"""
   from app import chat_waits
@@ -300,6 +300,11 @@ def test_completing_through_the_route_withdraws_its_fired_waits_resume(
     "ts": 1, "cid": f"wait-result-{wait.id}", "hidden": True,
     "kind": "wait_result", "source_work_id": "goal-root",
   }, {"role": "user", "content": "Owner follow-up", "ts": 2, "cid": "owner-1"}]
+  db.commit()
+
+  run = db.get(models.ChatRun, "goal-root")
+  run.provider_execution_admitted = True
+  run.admitted_wait_results_json = [wait.id]
   db.commit()
 
   completed = _update(client, db, chat_id, {
