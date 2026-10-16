@@ -91,6 +91,8 @@ class RuntimeSupervisors:
     self._frontend_handler = None
     self._database_services_started = False
     self._database_services_error: str | None = None
+    from app.app_update_batches import AppUpdateBatches
+    self.app_updates = AppUpdateBatches(settings.data_dir)
 
   def _spawn(self, name: str, coroutine) -> None:
     self._tasks[name] = asyncio.create_task(
@@ -244,6 +246,8 @@ class RuntimeSupervisors:
           "required runtime supervisors were not started: "
           + ", ".join(sorted(missing))
         )
+      # Settles any batch a stopped server left running, then admits new ones.
+      await self.app_updates.start()
       self._database_services_started = True
       self._database_services_error = None
     except Exception as exc:
@@ -528,7 +532,7 @@ class RuntimeSupervisors:
                 await push.notify_owner_async(
                   notification_db,
                   owner_row[0],
-                  title="Storage capacity alert",
+                  title="Möbius storage is running low",
                   body=result["body"],
                   source_type="capacity",
                   notification_id=notification_id,
@@ -626,6 +630,8 @@ class RuntimeSupervisors:
 
   async def stop(self) -> None:
     """Cancel and observe every task, then stop external watcher resources."""
+    # First, so each running update settles while the owners it uses still run.
+    await self.app_updates.stop()
     tasks = list(self._tasks.values())
     for task in tasks:
       task.cancel()

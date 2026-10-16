@@ -350,11 +350,13 @@ async def lifespan(app):
       setup_task.cancel()
       await asyncio.gather(setup_task, return_exceptions=True)
     record_memory_checkpoint("shutdown_begin")
-    try:
-      from app.public_app_transport import close_public_fetch_clients
-      await close_public_fetch_clients()
-    except Exception as exc:
-      _log.error("public fetch client shutdown failed: %s", exc, exc_info=True)
+    from app.public_app_transport import close_public_fetch_clients
+    from app.routes.proxy import close_proxy_clients
+    for close_clients in (close_public_fetch_clients, close_proxy_clients):
+      try:
+        await close_clients()
+      except Exception as exc:
+        _log.error("outbound fetch client shutdown failed: %s", exc, exc_info=True)
     # Preserve the final partial request-error windows across graceful restarts.
     # This is one bounded batch append, not one write per response.
     activity.flush_request_errors()
@@ -442,7 +444,7 @@ async def _parent_is_file_handler(_request: Request, exc: ParentIsFile):
 # but FastAPI buffers the WHOLE body for Pydantic-parsed endpoints (e.g. a
 # create with a huge jsx_source) before validation — an unbounded body there
 # could OOM the memory-tight host (Codex review round-9 #4, round-10 #5). The
-# cap sits ABOVE every legitimate route limit (storage 50 MB, uploads 20 MB) so
+# cap sits ABOVE legitimate route limits (including chat uploads at 50 MiB) so
 # it only ever stops abuse.
 _MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
 

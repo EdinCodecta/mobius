@@ -79,7 +79,10 @@ async def _open_device_asset_range(
   expected_end = offset + length - 1
   try:
     for hop in range(MAX_REDIRECTS + 1):
-      pinned_url, host_header, sni_host = validate_url_safe(current_url)
+      # getaddrinfo blocks; resolve off the event loop.
+      pinned_url, host_header, sni_host = await asyncio.to_thread(
+        validate_url_safe, current_url,
+      )
       request = client.build_request(
         "GET",
         pinned_url,
