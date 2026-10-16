@@ -934,6 +934,9 @@ def exchange_max_bytes(service: dict, method, path) -> int:
   return routes.get((method, service_route_key(path)), ceiling)
 
 
+_INVALID_REQUEST_DATA = "App service request contains invalid JSON data."
+
+
 async def _json_string_part(
   value: str, max_bytes: int, list_item: bool, reserve_sizing, pace,
 ) -> tuple[int, int]:
@@ -943,7 +946,8 @@ async def _json_string_part(
   quoted UTF-8 size. Six UTF-8 bytes per character is a safe upper bound for
   one JSON string character with ensure_ascii=False; a longer string is
   measured exactly in bounded slices, whose copies ``reserve_sizing`` admits
-  before the first is made, yielding through ``pace`` as slices add up.
+  before the first is made, yielding through ``pace`` as slices add up. A
+  string with no UTF-8 form is the 400 ``_serialize_request`` gives it.
   """
   if len(value) > max_bytes:
     raise HTTPException(413, "App service request is too large.")
@@ -967,8 +971,17 @@ async def _json_string_part(
     # same result for a string regardless of where it is split.
     part = json.encoder.encode_basestring(value[start:start + _JSON_SCAN_BYTES])
     chars += len(part) - 2
-    size += len(part.encode("utf-8")) - 2
+    try:
+      encoded = len(part.encode("utf-8"))
+    except UnicodeEncodeError:
+      # A lone surrogate has no UTF-8 form: the same invalid request
+      # serialization refuses for a short string. The error is not chained,
+      # since it would keep this slice alive after its reservation ends.
+      encoded = None
     del part
+    if encoded is None:
+      raise HTTPException(400, _INVALID_REQUEST_DATA)
+    size += encoded - 2
     if size > max_bytes:
       raise HTTPException(413, "App service request is too large.")
     await pace(_SIZING_SLICE_STEPS)
@@ -1018,7 +1031,7 @@ async def _serialize_request(request_envelope: dict, max_bytes: int) -> bytes:
       buffer.write(encoded)
     return buffer.getvalue()
   except (TypeError, ValueError, RecursionError) as exc:
-    raise HTTPException(400, "App service request contains invalid JSON data.") from exc
+    raise HTTPException(400, _INVALID_REQUEST_DATA) from exc
 
 
 def request_actor(db, principal, caller=None) -> dict:

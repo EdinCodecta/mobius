@@ -1141,6 +1141,83 @@ async def test_materialized_envelope_past_the_structural_bounds_rejects_before_s
   assert app_services._admitted_exchange_cost == 0
 
 
+# Lone surrogates parse from valid escaped JSON but have no UTF-8 form. Short
+# strings are sized without encoding; past one scan slice they are encoded in
+# slices, so the cut, the key position and either surrogate half are covered.
+_SLICE = app_services._JSON_SCAN_BYTES
+_LONE_SURROGATE_BODIES = {
+  "short": {"value": "x\ud800"},
+  "below-slice": {"value": "x" * (_SLICE - 1) + "\ud800"},
+  "at-slice": {"value": "x" * _SLICE + "\ud800"},
+  "past-slice-low": {"value": "x" * (_SLICE + 1) + "\udfff"},
+  "slice-end": {"value": "x" * (_SLICE - 1) + "\ud800" + "x" * _SLICE},
+  # Reversed halves stay two lone surrogates; JSON joins only a high-low pair.
+  "reversed-pair-at-cut": {"value": "x" * (_SLICE - 1) + "\ude00\ud83d"},
+  "dict-key": {"x" * (2 * _SLICE) + "\ud800": 1},
+  "list-item": {"value": ["ok", "x" * (3 * _SLICE) + "\udc00"]},
+}
+
+
+@pytest.mark.parametrize("body", sorted(_LONE_SURROGATE_BODIES))
+@pytest.mark.parametrize("access", ["private", "public"])
+def test_http_lone_surrogate_body_is_invalid_data_at_any_length(
+  client, auth, db, monkeypatch, access, body,
+):
+  app = _service_app(db, access="self" if access == "private" else "public")
+  value = _LONE_SURROGATE_BODIES[body]
+  monkeypatch.setattr(app_services, "service_entry", lambda *_: pytest.fail("service executed"))
+  raw = json.dumps(value).encode("ascii")
+  if access == "private":
+    response = client.post(f"/api/apps/{app.id}/service/echo", headers=auth, content=raw)
+  else:
+    response = client.post(f"/api/app-services/{app.slug}/echo", content=raw)
+  assert response.status_code == 400
+  assert response.json()["detail"] == "App service request contains invalid JSON data."
+  assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", sorted(_LONE_SURROGATE_BODIES))
+@pytest.mark.parametrize("caller", ["tool", "policy", "browser"])
+async def test_materialized_lone_surrogate_is_invalid_data_at_any_length(
+  db, auth, monkeypatch, caller, body,
+):
+  app = _service_app(db)
+  owner = db.query(models.Owner).first()
+  value = _LONE_SURROGATE_BODIES[body]
+  grant_id = "b" * 32
+  monkeypatch.setattr(app_services, "_validate_browser_call", lambda *_: None)
+  monkeypatch.setattr(app_services, "service_entry", lambda *_: pytest.fail("service executed"))
+  with pytest.raises(HTTPException) as caught:
+    if caller == "policy":
+      await app_services.invoke_policy(app, owner, "echo", value)
+    else:
+      actor = {"browser_grant_id": grant_id} if caller == "browser" else {}
+      await app_services.invoke_service(app, owner, {
+        "schema": 1, "method": "POST", "path": "/tools/echo", "query": {},
+        "headers": {}, "body": value, "public": False, "actor": actor,
+      }, lane="tools")
+  assert caught.value.status_code == 400
+  assert caught.value.detail == "App service request contains invalid JSON data."
+  assert grant_id not in app_services._browser_calls
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shift", [-1, 0, 1])
+async def test_valid_wide_unicode_near_the_sizing_slice_still_sizes_and_serializes(shift):
+  # Astral, BMP and escaped characters around the first slice cut are still
+  # sized within the bound and serialize unchanged.
+  for tail in ("😀", "雪", "\x00", "😀" * _SLICE):
+    value = {"value": "x" * (_SLICE + shift) + tail, "k" * _SLICE + "😀": ["é" * (_SLICE + shift)]}
+    with app_services.ServiceExchangeAdmission(MIB) as admission:
+      await admission.retain(value)
+      request = await app_services._serialize_request(value, MIB)
+      assert admission.encoded_bytes >= len(request)
+      assert json.loads(request) == value
+  assert app_services._admitted_exchange_cost == 0
+
+
 @pytest.mark.asyncio
 async def test_retained_depth_matches_the_lexical_scan_at_its_exact_bound():
   deepest = _nested(app_services.MAX_JSON_DEPTH)
