@@ -5839,7 +5839,7 @@ export default function ChatView({
     questionNudgeShown,
     resumeNudgeShown,
   })
-  const jumpToActualLatest = useCallback(async () => {
+  const followLatestIncludingUnloaded = useCallback(async () => {
     if (!hasUnloadedNewer) {
       followLatest()
       return
@@ -6544,7 +6544,7 @@ export default function ChatView({
                       className="chat__jump-latest"
                       aria-label="Jump to the latest message"
                       title="Jump to latest"
-                      {...composerAdjacentActionProps(jumpToActualLatest, {
+                      {...composerAdjacentActionProps(followLatestIncludingUnloaded, {
                         activateOnTouchEnd: true,
                       })}
                     >
