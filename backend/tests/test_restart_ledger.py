@@ -186,11 +186,19 @@ def _accept_managed_cutover(supervisor, *, source_boot, nonce, now) -> float:
   return now + 2
 
 
+@pytest.mark.parametrize("boot_delay", [
+  pytest.param(lambda s: 19 * 60, id="observed-first-download"),
+  pytest.param(
+    lambda s: s.MANAGED_REPLACEMENT_MAX_BOOT_SECONDS,
+    id="full-prepare-and-switch-budget",
+  ),
+])
 def test_managed_cutover_binds_a_replacement_booting_after_a_long_provider_download(
-  tmp_path, monkeypatch,
+  tmp_path, monkeypatch, boot_delay,
 ):
   """A managed provider can spend well over ten minutes downloading a new
-  image before it stops the drained container; its chats must still resume."""
+  image before it stops the drained container; its chats must still resume,
+  up to the account service's full prepare and switch budgets."""
   supervisor = _load_supervisor()
   _bind(supervisor, tmp_path, monkeypatch)
   nonce = "nonce-12345678"
@@ -198,7 +206,7 @@ def test_managed_cutover_binds_a_replacement_booting_after_a_long_provider_downl
     supervisor, source_boot="boot-source-1234", nonce=nonce, now=time.time(),
   )
 
-  late_boot = accepted_at + supervisor.MAX_ACCEPTED_AGE_SECONDS + 9 * 60
+  late_boot = accepted_at + boot_delay(supervisor)
   assert supervisor.begin_boot("boot-target-1234", now=late_boot) is True
   assert _authorized(tmp_path, "boot-target-1234") == nonce
 
