@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import Text, case, cast, func
+from sqlalchemy import JSON, Text, case, cast, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -537,7 +537,7 @@ def _chat_message_matches_key(
     return False
   target = str(key)
   if target.startswith("question:"):
-    return any(block.get("type") == "question" and block.get("question_id") == target[9:]
+    return any(isinstance(block, dict) and block.get("type") == "question" and block.get("question_id") == target[9:]
                for block in message.get("blocks") or [])
   message_id = message.get("id")
   if message_id is not None and str(message_id) == target:
@@ -552,6 +552,49 @@ def _chat_message_matches_key(
   return f"{role}-{index}" == target
 
 
+def _question_anchor_index(messages, anchor_key):
+  """Locate the nested card without hydrating every historical message.
+
+  Converted transcripts search nested JSON in storage and return one scalar
+  coordinate. Legacy bodies are already resident; live overlays stay dominant.
+  """
+  from app.chat_transcript import MaterializedHistory
+  if not isinstance(messages, MaterializedHistory) or messages.history.legacy is not None:
+    return next((index for index, message in enumerate(messages)
+      if _chat_message_matches_key(message, index, anchor_key)), None)
+  if messages.live is not None and _chat_message_matches_key(messages.live, 0, anchor_key):
+    return messages.live_index if messages.live_index >= 0 else len(messages.history)
+  db = messages.history.db
+  row = models.ChatMessage
+  question_id = anchor_key[len("question:"):]
+  if db.bind.dialect.name == "sqlite":
+    blocks = func.json_each(case(
+      (func.json_type(row.body, "$.blocks") == "array", func.json_extract(row.body, "$.blocks")),
+      else_="[]",
+    )).table_valued("value", "type")
+    body = case((blocks.c.type == "object", blocks.c.value), else_="{}")
+    match = select(1).select_from(blocks).where(
+      func.json_extract(body, "$.type") == "question",
+      func.json_extract(body, "$.question_id") == question_id,
+    ).exists()
+  else:
+    saved_blocks = cast(row.body, JSON)["blocks"]
+    blocks = func.json_array_elements(case(
+      (func.json_typeof(saved_blocks) == "array", saved_blocks),
+      else_=func.json_build_array(),
+    )).table_valued("value")
+    match = select(1).select_from(blocks).where(
+      blocks.c.value.op("->>")("type") == "question",
+      blocks.c.value.op("->>")("question_id") == question_id,
+    ).exists()
+  query = db.query(row.seq).filter(row.chat_id == messages.chat.id,
+    row.seq < len(messages.history), match)
+  if messages.live is not None and messages.live_index >= 0:
+    query = query.filter(row.seq != messages.live_index)
+  found = query.order_by(row.seq).first()
+  return found[0] if found is not None else None
+
+
 def _chat_detail_window(
   messages: list,
   *,
@@ -563,21 +606,22 @@ def _chat_detail_window(
   """Select one authoritative detail window and report anchor coverage."""
   total = len(messages)
   if anchor_key is not None:
-    anchor_index = next((
-      index for index, message in enumerate(metadata if metadata is not None and not anchor_key.startswith("question:") else messages)
+    is_question = anchor_key.startswith("question:")
+    anchor_index = (_question_anchor_index(messages, anchor_key) if is_question else next((
+      index for index, message in enumerate(metadata if metadata is not None else messages)
       if _chat_message_matches_key(message, index, anchor_key)
-    ), None)
+    ), None))
     if anchor_index is not None:
-      # Exact restoration is one atomic snapshot: keep one predecessor above
-      # the saved row, then carry the current tail. Without that small amount
+      # Keep one predecessor above the saved row. Without that small amount
       # of real scroll range, a row that becomes first in the cold window can
       # only sit at the list's 8px top padding; a saved positive viewport
       # offset is clamped even though the requested row was found. The reader
       # then returns to the right message at the wrong vertical position.
-      # A page ceiling here would still silently discard the exact address the
-      # caller asked us to preserve.
+      # A bounded following range is enough to expose the requested row without
+      # hydrating every later turn in a long-running chat.
       start = max(0, anchor_index - 1)
-      return messages[start:], start, True
+      end = min(total, anchor_index + limit) if is_question else total
+      return messages[start:end], start, True
     start = max(0, total - limit)
     return messages[start:], start, False
   if before is not None:
@@ -741,7 +785,9 @@ def _chat_detail_response(
     page = [{**message,
       **({"blocks": [{**block, "needed_by": backlinks[block["question_id"]]}
         if isinstance(block, dict) and block.get("type") == "question" and block.get("question_id") in backlinks
-        else block for block in (message.get("blocks") or [])]} if backlinks else {}),
+        else block for block in message["blocks"]]} if backlinks and isinstance(message.get("blocks"), list)
+        and any(isinstance(block, dict) and block.get("type") == "question"
+          and block.get("question_id") in backlinks for block in message["blocks"]) else {}),
       **({"wait_summaries": [*message.get("wait_summaries", []), *dependency_summaries[start + index]]}
         if start + index in dependency_summaries else {}),
     } for index, message in enumerate(page)]

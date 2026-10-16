@@ -52,9 +52,8 @@ function delegationMeta(node) {
 }
 
 const SOURCE_RECOVERY_BLOCKERS = new Set([
-  'source_missing', 'source_failed', 'source_deleted', 'source_held',
-  'source_goal_missing', 'owner_not_progressing', 'owner_deleted',
-  'owner_goal_not_open', 'acquisition_changed', 'source_settled_without_outcome',
+  'source_missing', 'source_failed', 'source_held',
+  'owner_not_progressing', 'owner_deleted',
 ])
 
 /* The exact saved question stays inspectable here, as a record addressed to

@@ -225,6 +225,14 @@ export function chatDetailCacheValue(data = {}) {
   }
 }
 
+/** A bounded historical reveal is not the conversation tail. */
+export function hasUnloadedNewerMessages(window) {
+  return Number.isInteger(window?.total)
+    && Number.isInteger(window?.offset)
+    && Array.isArray(window?.messages)
+    && window.total > window.offset + window.messages.length
+}
+
 export function compactPersistedChatDetailCacheValue(
   data,
   messageLimit = CHAT_DETAIL_PERSISTED_MESSAGE_LIMIT,

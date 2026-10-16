@@ -109,6 +109,11 @@ test('held and broken work use plain recovery copy without promising continuatio
     assert.doesNotMatch(html, /Source|eligible|Continues automatically/)
   }
   assert.match(render(h(Details, { dependencies: [{ ...dependency, resume_blocker: 'goal_held' }] })), /Saved until you continue this Goal/)
+  for (const obsolete of ['source_deleted', 'source_goal_missing',
+    'acquisition_changed', 'source_settled_without_outcome', 'owner_goal_not_open']) {
+    const html = render(h(Details, { dependencies: [{ ...dependency, resume_blocker: obsolete }] }))
+    assert.doesNotMatch(html, /This work needs recovery in Repair/)
+  }
 })
 
 

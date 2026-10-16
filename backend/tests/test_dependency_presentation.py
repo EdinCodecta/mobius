@@ -3,10 +3,50 @@ import pytest
 from app import models
 from app.chat_writer import create_chat
 from app.goal_dependencies import (source_dependency_backlinks,
-  terminal_dependency_summaries_by_message_index, goal_dependency_history)
+  terminal_dependency_summaries_by_message_index, goal_dependency_history,
+  goal_dependency_handoffs)
 from app.timeutil import now_naive_utc
 from tests.test_decision_dependencies import _setup, _follow
 from tests.test_goal_dependency_delivery import _run, _dependency
+
+
+def test_detail_without_dependencies_skips_receipt_index_and_keeps_blockless_rows(
+    db, chat, client, auth, monkeypatch):
+  from app import transcript_rows
+  transcript_rows.append(db, chat, {'role': 'user', 'id': 'plain', 'content': 'Hello'})
+  db.commit()
+  class UnreadableMessages:
+    def __iter__(self):
+      raise AssertionError('No dependency receipts should not index the transcript')
+  assert terminal_dependency_summaries_by_message_index(db, chat.id, UnreadableMessages()) == {}
+  response = client.get(f'/api/chats/{chat.id}', headers=auth)
+  assert response.status_code == 200, response.text
+  assert 'blocks' not in response.json()['messages'][0]
+
+
+def test_exact_anchor_window_is_bounded_without_losing_requested_row():
+  from app.routes.chats import _chat_detail_window
+  messages = [{'role': 'user', 'id': f'row-{i}'} for i in range(500)]
+  messages[10] = {'role': 'assistant', 'id': 'row-10', 'blocks': [
+    {'type': 'question', 'question_id': 'historical'}]}
+  page, start, found = _chat_detail_window(messages, limit=20, before=None,
+    anchor_key='question:historical')
+  assert found is True and start == 9
+  assert page[1]['id'] == 'row-10'
+  assert len(page) == 21
+
+
+def test_handoff_blocker_set_excludes_unproduced_names(db, chat, monkeypatch):
+  from app import goal_dependency_sources
+  run = _run(db, chat, 'declare', 'goal')
+  _dependency(db, chat, run, settled=False)
+  goal = db.get(models.ChatGoal, 'goal')
+  for obsolete in ('source_deleted', 'source_goal_missing',
+      'acquisition_changed', 'source_settled_without_outcome',
+      'owner_goal_not_open'):
+    monkeypatch.setattr(goal_dependency_sources, 'dependency_source_blocker',
+      lambda *args, **kwargs: obsolete)
+    assert goal_dependency_handoffs(db, goal)[0]['automatic']
 
 
 def test_card_backlinks_are_exact_deduplicated_and_read_only(db, chat, client, auth):
@@ -26,6 +66,7 @@ def test_card_backlinks_are_exact_deduplicated_and_read_only(db, chat, client, a
   expected = [{'chat_id': 'other', 'title': 'Another dependent'}, {'chat_id': chat.id, 'title': 'Finish blocked update'}]
   assert source_dependency_backlinks(db, source.id, question_ids=['choice', 'unrelated']) == {'choice': expected}
   detail = client.get('/api/chats/source', headers=auth).json()
+  assert 'blocks' not in detail['messages'][0]
   cards = [b for m in detail['messages'] for b in m.get('blocks', []) if b.get('type') == 'question']
   assert cards[0]['needed_by'] == expected
   assert source_dependency_backlinks(db, chat.id, question_ids=['choice']) == {}
@@ -209,3 +250,28 @@ def test_restricted_history_never_queries_foreign_metadata(db, chat, monkeypatch
     raise AssertionError('Restricted history must use only its already-saved facts')
   monkeypatch.setattr(db, 'get', forbidden)
   assert dependency_summary(db, row, include_foreign_context=False)['condition'] == 'Host repair'
+
+
+def test_question_anchor_search_does_not_hydrate_unrelated_history(db, chat, client, auth, monkeypatch):
+  from app import transcript_rows
+  from app.chat_transcript import MaterializedHistory
+  for index in range(500):
+    body = {'role': 'assistant', 'id': f'row-{index}', 'blocks': [{'type': 'text', 'text': 'Unrelated history'}]}
+    if index == 10:
+      body['blocks'] = [{'type': 'question', 'question_id': 'historical',
+        'questions': [{'question': 'A prior decision'}]}]
+    transcript_rows.append(db, chat, body)
+  db.commit()
+  def unexpected(self):
+    raise AssertionError('Question reveal must not hydrate the full transcript')
+  monkeypatch.setattr(MaterializedHistory, '__iter__', unexpected)
+  response = client.get(f'/api/chats/{chat.id}?anchor=question:historical&limit=20', headers=auth)
+  assert response.status_code == 200, response.text
+  data = response.json()
+  assert data['requested_anchor_found'] and data['offset'] == 9
+  assert data['messages'][1]['id'] == 'row-10'
+  assert len(data['messages']) == 21 and data['total'] == 500
+  missing = client.get(f'/api/chats/{chat.id}?anchor=question:missing&limit=20', headers=auth)
+  assert missing.status_code == 200, missing.text
+  assert missing.json()['requested_anchor_found'] is False
+  assert len(missing.json()['messages']) == 20

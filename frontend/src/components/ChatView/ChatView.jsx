@@ -161,6 +161,7 @@ import {
 import {
   chatCacheEntryState,
   chatDetailCacheValue,
+  hasUnloadedNewerMessages,
   chatSnapshotMatchesRuntime,
   shouldRefetchTranscriptForRuntime,
   mergeRecentMessagesIntoLoadedWindow,
@@ -523,6 +524,10 @@ export default function ChatView({
     applyMessagesToView,
     commitMessages,
   } = useTranscriptState({ cacheKey: transcriptCacheKey, cached, queryClient })
+  const [hasUnloadedNewer, setHasUnloadedNewer] = useState(
+    () => hasUnloadedNewerMessages(cached),
+  )
+  const loadingLatestRef = useRef(false)
   const messageHistory = useMemo(
     () => composerHistoryFromMessages(messages),
     [messages],
@@ -2728,6 +2733,7 @@ export default function ChatView({
         return
       }
       const msgs = detailCache.messages
+      setHasUnloadedNewer(hasUnloadedNewerMessages(detailCache))
       await reconcileFailedSendOutbox({
         visibleMessages: msgs,
         pendingMessages: runtime.pending_messages || [],
@@ -5823,7 +5829,7 @@ export default function ChatView({
     revealElement: revealPendingQuestion, contentVersion: messages,
   })
   const resumeNudgeShown = hasPendingResume && resumeCardOffscreen
-  const jumpToLatestVisible = jumpToLatestShown({
+  const jumpToLatestVisible = hasUnloadedNewer || jumpToLatestShown({
     // A send-owned PIN_USER_MSG is the expected latest-turn location, not a
     // reader escape. Its keyboard-close reachability floor can temporarily
     // extend the physical tail before the viewport grows, so suppress the
@@ -5833,6 +5839,34 @@ export default function ChatView({
     questionNudgeShown,
     resumeNudgeShown,
   })
+  const jumpToActualLatest = useCallback(async () => {
+    if (!hasUnloadedNewer) {
+      followLatest()
+      return
+    }
+    if (loadingLatestRef.current) return
+    loadingLatestRef.current = true
+    const generation = fetchGenRef.current
+    try {
+      const response = await apiFetch(`/chats/${chatId}?limit=20&compact=1`, {
+        timeoutMs: CHAT_FETCH_TIMEOUT_MS,
+      })
+      if (!response.ok) return
+      const latest = chatDetailCacheValue(await response.json())
+      if (chatIdStaleRef.current || fetchGenRef.current !== generation
+          || !latest.restorationWindowComplete) return
+      queryClient.setQueryData(chatMessagesQueryKey(chatId), latest)
+      flushSync(() => {
+        applyMessagesToView(latest.messages, latest.offset)
+        setHasUnloadedNewer(false)
+      })
+      followLatest()
+    } catch {
+      // Keep the control available for retry; never label the old window latest.
+    } finally {
+      loadingLatestRef.current = false
+    }
+  }, [hasUnloadedNewer, followLatest, chatId, queryClient, applyMessagesToView])
   const offscreenControlsVisible = questionNudgeShown
     || resumeNudgeShown
     || jumpToLatestVisible
@@ -6510,7 +6544,7 @@ export default function ChatView({
                       className="chat__jump-latest"
                       aria-label="Jump to the latest message"
                       title="Jump to latest"
-                      {...composerAdjacentActionProps(followLatest, {
+                      {...composerAdjacentActionProps(jumpToActualLatest, {
                         activateOnTouchEnd: true,
                       })}
                     >

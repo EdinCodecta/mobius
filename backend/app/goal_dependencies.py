@@ -249,9 +249,8 @@ def goal_dependency_handoffs(db, goal, *, include_foreign_context=True):
     # Temporary owner-input/provider/restart barriers retain a real result;
     # exhausted carriers and unavailable sources do not promise a future wake.
     automatic = blocker not in {"manual_resume", "source_missing", "owner_not_progressing",
-      "goal_held", "goal_closed", "chat_deleted", "disposed", "source_deleted",
-      "source_held", "source_failed", "source_goal_missing", "acquisition_changed",
-      "source_settled_without_outcome", "owner_deleted", "owner_goal_not_open"}
+      "goal_held", "goal_closed", "chat_deleted", "disposed",
+      "source_held", "source_failed", "owner_deleted"}
     result.append({key: context[key] for key in (
       "id", "target_kind", "condition", "source_chat_id", "source_chat_title",
       "source_question_id", "source_deleted", "outcome")})
@@ -309,17 +308,19 @@ def terminal_dependency_summaries_by_message_index(db, chat_id, messages, *, inc
   the newest answer. Paging uses the full coordinate index, like native Waits.
   """
   from app.goal_plans import assistant_message_run_id
+  rows = db.query(models.GoalDependency).filter(
+    models.GoalDependency.waiting_chat_id == chat_id,
+    (models.GoalDependency.resolved_at.is_not(None)
+     | models.GoalDependency.result_disposition.is_not(None)),
+  ).order_by(models.GoalDependency.created_at, models.GoalDependency.id).all()
+  if not rows:
+    return {}
   by_run = {}
   for index, message in enumerate(messages):
     if isinstance(message, dict) and message.get("role") == "assistant" and not message.get("hidden"):
       run_id = assistant_message_run_id(message.get("id"))
       if run_id:
         by_run.setdefault(run_id, index)
-  rows = db.query(models.GoalDependency).filter(
-    models.GoalDependency.waiting_chat_id == chat_id,
-    (models.GoalDependency.resolved_at.is_not(None)
-     | models.GoalDependency.result_disposition.is_not(None)),
-  ).order_by(models.GoalDependency.created_at, models.GoalDependency.id).all()
   result = {}
   for row in rows:
     index = by_run.get(row.received_run_id) if row.received_run_id else None
