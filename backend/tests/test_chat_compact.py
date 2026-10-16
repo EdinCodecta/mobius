@@ -1256,7 +1256,7 @@ async def test_codex_synthesis_disables_tools_and_isolates_cwd(
     "agents.enabled=false", "features.multi_agent_v2.enabled=false",
   } <= set(configured)
   assert {
-    "features.shell_tool=false", "features.unified_exec=false",
+    "features.shell_tool=false", "features.code_mode_host=false",
     "features.view_image=false",
   } <= set(configured)
   # Tools go off last, so a provider's own web search cannot come back on.
