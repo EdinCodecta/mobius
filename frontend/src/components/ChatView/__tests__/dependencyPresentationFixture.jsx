@@ -11,6 +11,7 @@ import GoalHistoryCard from '../GoalHistoryCard.jsx'
 import { Flag } from '@openai/apps-sdk-ui/components/Icon'
 import QuestionCard from '../QuestionCard.jsx'
 import WaitHistoryCard from '../WaitHistoryCard.jsx'
+import MsgContent from '../MsgContent.jsx'
 import ErrorCard from '../ErrorCard.jsx'
 import DrawerStatusMarker from '../../Drawer/DrawerStatusMarker.jsx'
 const chats = [{ chat_id: 'dependent', title: 'Finish the blocked update' }, { chat_id: 'launch', title: 'Prepare the launch' }]
@@ -50,6 +51,15 @@ function Fixture({ held = false, receiptCondition = dependency.condition, wrappe
       <WaitHistoryCard summary={{ ...dependency, condition: 'Release choice', disposition: 'delivered', outcome: { kind: 'closed_without_reply' } }} />
       <div className="chat__answer-cause"><WaitHistoryCard summary={{ id: 'native', description: 'Build finishes', status: 'met' }} /></div>
       <GoalHistoryCard summary={{ id: 'finished', status: 'completed', objective: 'Repair verified' }} />
+    </div>}
+    {comparisons && <div data-testid="message-history">
+      <MsgContent chatId="dependent" onInternalNav={navigate} msg={{ id: 'history', role: 'assistant', content: 'Done.',
+        goal_summaries: [{ id: 'finished-with-dependency', status: 'completed', objective: 'Repair verified',
+          plan: { tasks: [{ id: 'done', title: 'Repair verified', status: 'completed' }] },
+          dependency_history: [{ ...active, disposition: 'delivered' }] }],
+        wait_summaries: [{ ...active, id: 'woke', disposition: 'delivered', result_disposition: 'delivered', received_run_id: 'received',
+          outcome: { kind: 'closed_without_reply', answers: { release: 'Not now' } } },
+          { ...active, id: 'stopped', disposition: 'withdrawn' }] }} />
     </div>}
     <ErrorCard block={{ code: 'goal_settlement_unfinished', resumable: true }}>
       <button className="chat__resume chat__recovery-action" onClick={() => { window.resumes++ }}>Resume</button>

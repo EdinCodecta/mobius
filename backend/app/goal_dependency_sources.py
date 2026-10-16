@@ -104,17 +104,29 @@ def stage_follow_claim(db: Session, claim: models.AgentWorkClaim, *,
   target_key = f'claim:{claim.acquisition_id}'
   existing = db.query(models.GoalDependency).filter(
     models.GoalDependency.waiting_goal_id == goal.id,
-    models.GoalDependency.target_key == target_key,
-  ).first()
+    models.GoalDependency.target_kind == 'claim_acquisition',
+    models.GoalDependency.target_acquisition_id == claim.acquisition_id,
+  ).order_by(models.GoalDependency.created_at.desc(),
+             models.GoalDependency.id.desc()).first()
   if existing is not None:
     if existing.withdrawn_at is not None:
       return 'withdrawn'
     if existing.result_disposition is not None:
-      return existing.result_disposition
-    if existing.owner_suppressed_at is None:
-      return 'followed' if existing.resolved_at is None else 'result_owed'
-    if not restore_owner_follow or existing.resolved_at is not None:
-      return 'owner_suppressed'
+      # Recovery is a fact about the former attempt, not a terminal outcome
+      # of the acquisition. Once received, a later attempt may follow again.
+      # Do not rewrite the historical row or silently revive it on transfer.
+      if (not restore_owner_follow and existing.result_disposition == 'delivered'
+          and isinstance(existing.outcome_json, dict)
+          and existing.outcome_json.get('kind') == 'owner_not_progressing'):
+        existing = None
+        target_key = f'{target_key}:{uuid4().hex}'
+      else:
+        return existing.result_disposition
+    if existing is not None:
+      if existing.owner_suppressed_at is None:
+        return 'followed' if existing.resolved_at is None else 'result_owed'
+      if not restore_owner_follow or existing.resolved_at is not None:
+        return 'owner_suppressed'
   # Only adding or restoring an edge can create a cycle. In particular, an
   # explicitly withdrawn follow stays withdrawn across ownership changes.
   if _direct_cycle(db, waiting_goal_id=goal.id,

@@ -7420,19 +7420,22 @@ def _question_owner_run(db, chat, question_id):
 
 
 def _settle_ended_goal_claims(db, goal) -> None:
-  """End source acquisitions and exact dependencies in the lifecycle txn.
+  """Settle atomically when possible without making owner Stop/dismiss fail.
 
-  The outcome cannot be deferred to a post-commit notice: a crash followed by
-  reacquisition would overwrite the only source fact. Fail the transaction
-  rather than commit a Goal transition without its acquisition outcomes.
+  The savepoint rolls back partial claim/outcome changes together. Durable Goal
+  state lets the existing settlement-notice repair retry after this commit.
   """
   from app.agent_work_claims import stage_settle_goal_claims
   from app.goal_dependencies import stage_retire_goal_dependencies
 
-  stage_settle_goal_claims(
-    db, chat_id=goal.chat_id, goal_id=goal.id, status=goal.status,
-    result=goal.result,
-  )
+  try:
+    with db.begin_nested():
+      stage_settle_goal_claims(
+        db, chat_id=goal.chat_id, goal_id=goal.id, status=goal.status,
+        result=goal.result,
+      )
+  except Exception:
+    log.exception("Failed to settle ended Goal claims for %s; settlement notice will retry", goal.id)
   if goal.status not in {"open", "stopped"}:
     stage_retire_goal_dependencies(db, goal.chat_id, goal.id)
 

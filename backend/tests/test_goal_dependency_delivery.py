@@ -63,6 +63,69 @@ def test_two_goals_following_one_acquisition_and_goalless_turn_have_exact_receip
   assert deps.owed_dependency_results(db, chat.id, "", run_id=a.id) == ("", ())
 
 
+def test_delivery_sweep_skips_writer_without_pending_claim_sources(db, chat, monkeypatch):
+  from app import chat_writer
+  a = _run(db, chat, "a", "goal-a")
+  row = _dependency(db, chat, a)
+  visited = []
+  async def delivered(row_id):
+    visited.append(row_id)
+    return True
+  monkeypatch.setattr(deps, "deliver_dependency", delivered)
+  monkeypatch.setattr(deps, "withdraw_disposed_dependency_notices", delivered)
+  writer_requests = []
+  def unexpected_writer():
+    writer_requests.append(True)
+    raise AssertionError("no pending claim source should reach the writer")
+  monkeypatch.setattr(chat_writer, "get_writer", unexpected_writer)
+  assert asyncio.run(deps.deliver_pending_dependencies()) == 1
+  assert row.id in visited
+  assert writer_requests == []
+
+
+def test_claim_reconcile_failure_does_not_starve_owed_delivery(db, chat, monkeypatch):
+  from app import chat_writer
+  a = _run(db, chat, "a", "goal-a")
+  owed = _dependency(db, chat, a)
+  pending = models.GoalDependency(id="pending", waiting_chat_id=chat.id,
+    waiting_goal_id=a.goal_id, target_kind="claim_acquisition",
+    target_key="claim:pending", target_claim_id="pending-claim",
+    target_acquisition_id="pending-acquisition")
+  db.add(pending)
+  db.commit()
+  visited = []
+  async def delivered(row_id):
+    visited.append(row_id)
+    return True
+  async def cleanup(_chat_id):
+    return 0
+  monkeypatch.setattr(deps, "deliver_dependency", delivered)
+  monkeypatch.setattr(deps, "withdraw_disposed_dependency_notices", cleanup)
+  monkeypatch.setattr(chat_writer, "get_writer", lambda: (_ for _ in ()).throw(
+    RuntimeError("writer unavailable")))
+  assert asyncio.run(deps.deliver_pending_dependencies()) == 1
+  assert visited == [owed.id]
+
+
+def test_one_dependency_delivery_failure_does_not_starve_another(db, chat, monkeypatch):
+  a = _run(db, chat, "a", "goal-a")
+  b = _run(db, chat, "b", "goal-b")
+  first = _dependency(db, chat, a, "first")
+  second = _dependency(db, chat, b, "second")
+  seen = []
+  async def maybe_deliver(row_id):
+    seen.append(row_id)
+    if row_id == first.id:
+      raise RuntimeError("one provider continuation failed")
+    return True
+  async def cleanup(_chat_id):
+    return 0
+  monkeypatch.setattr(deps, "deliver_dependency", maybe_deliver)
+  monkeypatch.setattr(deps, "withdraw_disposed_dependency_notices", cleanup)
+  assert asyncio.run(deps.deliver_pending_dependencies()) == 1
+  assert set(seen) == {first.id, second.id}
+
+
 def test_unrelated_latest_goal_cannot_steal_continuation(db, chat, monkeypatch):
   a = _run(db, chat, "a", "goal-a")
   row = _dependency(db, chat, a)
@@ -325,3 +388,42 @@ def test_provider_success_receipts_exact_dependency_and_kept_side_question_toget
   db.expire_all()
   assert row.result_disposition == "delivered" and row.received_run_id == run.id
   assert transcript_rows.owed_side_questions(db, db.get(models.Chat, chat.id)) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_sweep", ["wait", "dependency"])
+async def test_supervisor_wait_and_dependency_sweeps_survive_each_others_failure(monkeypatch, failed_sweep):
+  from app import broadcast as broadcasts, chat_waits
+  from tests.test_runtime_supervisors import _supervisors
+  broadcast = broadcasts.SystemBroadcast()
+  monkeypatch.setattr(broadcasts, "get_system_broadcast", lambda: broadcast)
+  calls, tick = [], asyncio.Event()
+  async def waits(**_kwargs):
+    calls.append("wait")
+    if failed_sweep == "wait":
+      raise RuntimeError("wait sweep broke")
+  async def dependencies():
+    calls.append("dependency")
+    tick.set()
+    if failed_sweep == "dependency":
+      raise RuntimeError("dependency sweep broke")
+  monkeypatch.setattr(chat_waits, "sweep_due_waits", waits)
+  monkeypatch.setattr(deps, "deliver_pending_dependencies", dependencies)
+  supervisors = _supervisors()
+  spawn = supervisors._spawn
+  def only_wait_loop(name, coroutine):
+    if name == "chat-wait-sweep":
+      spawn(name, coroutine)
+    else:
+      coroutine.close()
+  monkeypatch.setattr(supervisors, "_spawn", only_wait_loop)
+  await supervisors._start_chat_supervisors()
+  try:
+    await asyncio.sleep(0)
+    for _ in range(2):
+      tick.clear()
+      broadcast.publish({"type": "platform_boot_ready"})
+      await asyncio.wait_for(tick.wait(), timeout=1)
+    assert calls == ["wait", "dependency", "wait", "dependency"]
+  finally:
+    await supervisors.stop()

@@ -18,6 +18,8 @@ from app.continuations import DEPENDENCY_RESULT_MESSAGE_KIND
 from app.timeutil import now_naive_utc
 
 _LOG = logging.getLogger("moebius.goal_dependencies")
+_legacy_cutover_done = False
+_legacy_cutover_chats = set()
 
 
 def undisposed_dependencies(db: Session):
@@ -65,12 +67,11 @@ def dependency_result_message_blocker(db, chat_id, message):
   return dependency_delivery_blocker(db, row) if row is not None else "dependency_missing"
 
 
-def receivable_dependency_results(db, chat_id, run_id):
+def receivable_dependency_results(db, chat_id, run_id, *, receipt=False):
   run = db.get(models.ChatRun, run_id) if run_id else None
   goal_id = run.goal_id if run is not None and run.chat_id == chat_id else None
-  open_goals = db.query(models.ChatGoal.id).filter(
-    models.ChatGoal.chat_id == chat_id, models.ChatGoal.status == "open",
-  )
+  from app.goals import result_receiving_goals
+  open_goals = result_receiving_goals(db, chat_id, run_id, receipt=receipt)
   active_chats = db.query(models.Chat.id).filter(models.Chat.deleted_at.is_(None))
   return outstanding_dependencies(db).filter(
     models.GoalDependency.waiting_chat_id == chat_id,
@@ -106,7 +107,7 @@ def stage_dependency_results_delivered(db, chat_id, dependency_ids, *, run_id):
   ids = set(dependency_ids) & set(run.admitted_dependency_results_json or ())
   if not ids:
     return 0
-  return receivable_dependency_results(db, chat_id, run_id).filter(
+  return receivable_dependency_results(db, chat_id, run_id, receipt=True).filter(
     models.GoalDependency.id.in_(ids),
   ).update({models.GoalDependency.result_disposition: "delivered",
     models.GoalDependency.result_disposed_at: now_naive_utc(),
@@ -463,26 +464,49 @@ async def deliver_pending_dependencies():
   """Existing supervisor reconciliation, never a polling agent or new runner."""
   from app.database import SessionLocal
   from app.chat_writer import ReconcileClaimSources, await_ack, get_writer
-  await await_ack(get_writer().submit(ReconcileClaimSources()))
+  global _legacy_cutover_done
+  # This historic carrier scan is a startup cutover, not recurring work on
+  # the shared writer. Retry it only if its transaction failed.
+  if not _legacy_cutover_done:
+    try:
+      with SessionLocal() as db:
+        old_notices = db.query(models.AgentCoordinationMessage, models.AgentWorkClaim).join(
+          models.AgentWorkClaim,
+          models.AgentCoordinationMessage.from_run_id == ("work-claim:" + models.AgentWorkClaim.id),
+        ).filter(
+          models.AgentCoordinationMessage.delivery.in_(("interrupt", "next_turn")),
+          (models.AgentWorkClaim.completed_at.is_not(None) | models.AgentWorkClaim.released_at.is_not(None)),
+        ).all()
+        for notice, claim in old_notices:
+          if notice.send_id == f"revision:{claim.revision}":
+            notice.delivery = "next_turn"
+            if notice.to_chat_id:
+              _legacy_cutover_chats.add(notice.to_chat_id)
+        db.commit()
+      _legacy_cutover_done = True
+    except Exception:
+      _LOG.warning("legacy claim notice cutover failed", exc_info=True)
+  # Only genuinely unresolved claim follows warrant the serialized source
+  # reconciliation. The partial index added at cutover makes this a seek.
+  try:
+    with SessionLocal() as db:
+      has_pending_claims = db.query(models.GoalDependency.id).filter(
+        models.GoalDependency.target_kind == "claim_acquisition",
+        models.GoalDependency.resolved_at.is_(None),
+        models.GoalDependency.result_disposition.is_(None),
+        models.GoalDependency.withdrawn_at.is_(None),
+        models.GoalDependency.owner_suppressed_at.is_(None),
+      ).first() is not None
+    if has_pending_claims:
+      await await_ack(get_writer().submit(ReconcileClaimSources()))
+  except Exception:
+    _LOG.warning("claim source reconciliation failed", exc_info=True)
   with SessionLocal() as db:
-    rows = outstanding_dependencies(db).all()
-    ids = [row.id for row in rows if row.resolved_at is not None]
-    chats = {row.waiting_chat_id for row in rows}
-    # Include old carrier-only chats at cutover, without acknowledging or
-    # deleting their durable mail or touching general peer interrupts.
-    old_notices = db.query(models.AgentCoordinationMessage, models.AgentWorkClaim).join(
-      models.AgentWorkClaim,
-      models.AgentCoordinationMessage.from_run_id == ("work-claim:" + models.AgentWorkClaim.id),
-    ).filter(
-      models.AgentCoordinationMessage.delivery == "interrupt",
-      (models.AgentWorkClaim.completed_at.is_not(None) | models.AgentWorkClaim.released_at.is_not(None)),
-    ).all()
-    for notice, claim in old_notices:
-      if notice.send_id == f"revision:{claim.revision}":
-        notice.delivery = "next_turn"
-        if notice.to_chat_id:
-          chats.add(notice.to_chat_id)
-    db.commit()
+    rows = outstanding_dependencies(db).filter(
+      models.GoalDependency.resolved_at.is_not(None),
+    ).with_entities(models.GoalDependency.id, models.GoalDependency.waiting_chat_id).all()
+    ids = [row.id for row in rows]
+    chats = {row.waiting_chat_id for row in rows} | _legacy_cutover_chats
   started = 0
   for row_id in ids:
     try:
@@ -490,5 +514,9 @@ async def deliver_pending_dependencies():
     except Exception:
       _LOG.warning("dependency continuation failed dependency=%s", row_id, exc_info=True)
   for chat_id in chats:
-    await withdraw_disposed_dependency_notices(chat_id)
+    try:
+      await withdraw_disposed_dependency_notices(chat_id)
+      _legacy_cutover_chats.discard(chat_id)
+    except Exception:
+      _LOG.warning("dependency notice cleanup failed chat=%s", chat_id, exc_info=True)
   return started

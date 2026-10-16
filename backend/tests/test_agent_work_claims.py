@@ -832,17 +832,16 @@ def test_ineligible_follower_and_approval_never_claim_a_follow(db, ineligible):
   assert "will receive its result" not in approval["next_action"]
 
 
-def test_stop_cannot_commit_without_atomic_dependency_outcome(db, monkeypatch):
+def test_stop_commits_but_rolls_back_failed_atomic_dependency_outcome(db, monkeypatch):
   from app import agent_work_claims
   from app.chat_writer import PrepareChatStop, get_writer
   owner, first, second = _owned_goal_claim(db, task_status="running")
   def fail_stamp(*args, **kwargs):
     raise RuntimeError("Injected outcome storage failure")
   monkeypatch.setattr(agent_work_claims, "stage_stamp_claim_outcome", fail_stamp)
-  with pytest.raises(RuntimeError, match="Injected outcome storage failure"):
-    get_writer().submit(PrepareChatStop(chat_id=first.id, actor="owner")).result(timeout=5)
+  get_writer().submit(PrepareChatStop(chat_id=first.id, actor="owner")).result(timeout=5)
   db.expire_all()
-  assert db.get(models.ChatGoal, "claim-goal-first").status == "open"
+  assert db.get(models.ChatGoal, "claim-goal-first").status == "stopped"
   assert _claim_row(db).released_at is None
   assert db.query(models.GoalDependency).one().outcome_json is None
 
@@ -1027,6 +1026,34 @@ def test_round_trip_does_not_revive_a_deliberately_ended_follow(db, explicit_end
       claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first", work_key=KEY,
         summary="Return", expected_owner_chat_id=second.id, takeover_reason="Accepted exact action back")
     assert _claim_row(db).owner_chat_id == second.id
+
+
+def test_received_owner_not_progressing_can_follow_same_live_acquisition_again(db):
+  from app.goal_dependency_sources import stage_follow_claim
+  owner, first, second = _owned_goal_claim(db)
+  old = db.query(models.GoalDependency).one()
+  old.resolved_at = now_naive_utc()
+  old.outcome_json = {"kind": "owner_not_progressing", "reason": "source_failed"}
+  db.commit()
+  claim = _claim_row(db)
+  # Until the factual outcome is received, retries remain idempotent.
+  assert stage_follow_claim(db, claim, chat_id=second.id,
+    run_id="claim-run-second") == "result_owed"
+  old.result_disposition = "delivered"
+  db.commit()
+  assert stage_follow_claim(db, claim, chat_id=second.id,
+    run_id="claim-run-second") == "followed"
+  db.commit()
+  rows = db.query(models.GoalDependency).order_by(models.GoalDependency.created_at).all()
+  assert len(rows) == 2
+  fresh = next(row for row in rows if row.id != old.id)
+  assert fresh.target_acquisition_id == old.target_acquisition_id
+  assert fresh.target_key != old.target_key
+  assert old.outcome_json["kind"] == "owner_not_progressing"
+  assert old.result_disposition == "delivered"
+  assert stage_follow_claim(db, claim, chat_id=second.id,
+    run_id="claim-run-second") == "followed"
+  assert db.query(models.GoalDependency).count() == 2
 
 
 @pytest.mark.parametrize("goal_less", [False, True])
@@ -1274,3 +1301,31 @@ def test_legacy_interest_model_has_no_runtime_consumers():
       or (isinstance(node, ast.Name) and node.id == "AgentWorkInterest")
       or (isinstance(node, ast.ImportFrom) and any(name.name == "AgentWorkInterest" for name in node.names))
       for node in ast.walk(tree)), path
+
+
+@pytest.mark.parametrize("blocker", ["direct_cycle", "dependency_limit"])
+def test_refollow_after_stalled_source_still_enforces_cycle_and_64_cap(db, blocker):
+  from app.goal_dependency_sources import stage_follow_claim
+  owner, first, second = _owned_goal_claim(db)
+  old = db.query(models.GoalDependency).one()
+  old.resolved_at = now_naive_utc()
+  old.outcome_json = {"kind": "owner_not_progressing", "reason": "source_failed"}
+  old.result_disposition = "delivered"
+  db.commit()
+  claim = _claim_row(db)
+  if blocker == "direct_cycle":
+    claim_work(db, owner_id=owner.id, chat_id=second.id, run_id="claim-run-second",
+      work_key="cycle-backedge", summary="Other action")
+    followed = claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first",
+      work_key="cycle-backedge", summary="Follow other action")
+    assert followed["follow_status"] == "followed"
+  else:
+    for index in range(64):
+      db.add(models.GoalDependency(id=f"pending-{index}", waiting_goal_id=old.waiting_goal_id,
+        waiting_chat_id=second.id, target_kind="claim_acquisition", target_key=f"claim:other-{index}",
+        target_claim_id=f"other-{index}", target_acquisition_id=f"other-{index}"))
+    db.commit()
+  before = db.query(models.GoalDependency).count()
+  assert stage_follow_claim(db, claim, chat_id=second.id, run_id="claim-run-second") == blocker
+  assert db.query(models.GoalDependency).count() == before
+  assert old.result_disposition == "delivered"

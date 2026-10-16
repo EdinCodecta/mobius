@@ -423,7 +423,8 @@ def test_preobserved_orm_state_cannot_hide_an_answer_committed_before_subscribe(
 
 
 @pytest.mark.parametrize("target", ["source", "dependent"])
-def test_project_delete_and_restore_do_not_lose_or_revive_card_dependencies(db, chat, client, auth, target):
+def test_project_delete_and_restore_do_not_lose_or_revive_card_dependencies(db, chat, client, auth, target, monkeypatch):
+  monkeypatch.setattr(chat_mod, "_schedule_continuation", lambda **_kwargs: None)
   source, _ = _setup(db, chat)
   row = _follow(db, chat)
   project = client.post("/api/projects", headers=auth,
@@ -441,12 +442,31 @@ def test_project_delete_and_restore_do_not_lose_or_revive_card_dependencies(db, 
   # dependent subscription that deletion already retired.
   from app import transcript_rows
   before = dict(row.outcome_json or {})
+  if target == "source":
+    # Deleting the source legitimately owes source_deleted to its follower.
+    # Receive that first delivery; restoration must not revive it. An
+    # unadmitted carrier is correctly retryable and is not a receipt.
+    asyncio.run(deps.deliver_dependency(row.id))
+    db.expire_all()
+    receiver = db.get(models.ChatRun, "dependency-resume-" + row.id)
+    get_writer().submit(AdmitProviderExecution(chat_id=chat.id, run_token=receiver.id,
+      dependency_results=(row.id,))).result(5)
+    get_writer().submit(AcknowledgeProviderSuccess(chat_id=chat.id, run_token=receiver.id,
+      dependency_results=(row.id,))).result(5)
+    db.expire_all()
+    assert row.result_disposition == "delivered"
+  delivered_before = [m.get("cid") for m in transcript_rows.history(chat)
+    if m.get("kind") == "dependency_result"]
+  assert len(delivered_before) == (1 if target == "source" else 0)
   receipt = response.headers["X-Recovery-Notification-Id"]
   recovered = client.post(f"/api/projects/{project['id']}/recover", headers=auth,
     json={"notification_id": receipt})
   assert recovered.status_code == 200, recovered.text
   db.expire_all()
-  assert not any("dependency-result" in str(message) for message in transcript_rows.history(chat))
+  assert not asyncio.run(deps.deliver_dependency(row.id))
+  db.expire_all()
+  assert [m.get("cid") for m in transcript_rows.history(chat)
+    if m.get("kind") == "dependency_result"] == delivered_before
   assert row.outcome_json == before if target == "source" else row.withdrawn_at is not None
 
 
@@ -586,3 +606,53 @@ def test_replacing_a_legacy_open_card_preserves_its_exact_goal_owner(db, chat, c
     {"id": "source-run", "role": "assistant", "blocks": [card], "ts": 2}]})
   assert result.status_code == 200
   assert saved_decision(db, "source", "choice").source_goal_id == "source-goal"
+
+
+def test_foreign_not_now_can_defer_receipt_and_resume_without_redelivery(db, chat, monkeypatch):
+  from app import transcript_rows
+  from app.broadcast import create_broadcast, remove_broadcast
+  from app.chat_event_sink import ChatEventSink
+  from app.goals import update_goal_record
+  from tests.test_goal_hold_lifecycle import resume
+
+  _setup(db, chat)
+  row = _follow(db, chat)
+  _answer()
+  scheduled = []
+  monkeypatch.setattr(chat_mod, "_schedule_continuation", lambda **kw: scheduled.append(kw))
+  monkeypatch.setattr(chat_mod, "_publish_chat_run_finished", lambda *_: None)
+  assert asyncio.run(deps.deliver_dependency(row.id))
+  db.expire_all()
+  goal = db.get(models.ChatGoal, "dependent-goal")
+  receiver = db.get(models.ChatRun, "dependency-resume-" + row.id)
+  assert row.outcome_json["answers"] == {"q": "Not now"}
+  assert deps.owed_dependency_results(db, chat.id, "", run_id=receiver.id)[1] == (row.id,)
+  get_writer().submit(AdmitProviderExecution(chat_id=chat.id, run_token=receiver.id,
+    dependency_results=(row.id,))).result(5)
+  db.expire_all()
+  update_goal_record(db, receiver, goal, goal.revision,
+    defer="The owner chose Not now in the source decision; remaining work is on hold.")
+  get_writer().submit(AcknowledgeProviderSuccess(chat_id=chat.id, run_token=receiver.id,
+    dependency_results=(row.id,))).result(5)
+  receiver_id, row_id, chat_id = receiver.id, row.id, chat.id
+  bc = create_broadcast(chat_id)
+  sink = ChatEventSink(bc, chat_id, run_token=receiver_id)
+  sink.publish({"type": "text", "content": "Work is on hold as requested."})
+  try:
+    asyncio.run(chat_mod._complete_turn(bc=bc, sink=sink, db=db, chat_id=chat_id,
+      run_gen=None, provider_id="claude", cost_usd=0, close_browser=False))
+  finally:
+    remove_broadcast(chat_id)
+  db.expire_all()
+  goal, row = db.get(models.ChatGoal, "dependent-goal"), db.get(models.GoalDependency, row_id)
+  saved = db.get(models.Chat, chat_id)
+  assert goal.status == "stopped" and row.received_run_id == receiver_id
+  assert row.result_disposition == "delivered"
+  assert len(scheduled) == 1
+  assert not any(b.get("type") == "error" for m in transcript_rows.history(saved) for b in m.get("blocks", []))
+  get_writer().submit(resume(saved, goal, token="owner-resumed")).result(5)
+  db.expire_all()
+  assert goal.status == "open"
+  assert deps.owed_dependency_results(db, chat_id, "", run_id="owner-resumed") == ("", ())
+  assert not asyncio.run(deps.deliver_dependency(row_id))
+  assert len(scheduled) == 1

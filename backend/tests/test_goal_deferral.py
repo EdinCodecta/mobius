@@ -515,3 +515,88 @@ def test_result_resolving_between_blocker_read_and_completion_cas_wins(db, chat,
   assert goal.status == "open" and goal.revision == 4
   assert row.result_disposition is None
   assert (row.status == "met") if kind == "wait" else row.resolved_at is not None
+
+
+@pytest.mark.parametrize("kind", ["wait", "dependency"])
+def test_deferral_receipts_admitted_results_only_after_success(db, chat, kind):
+  from app.chat_waits import owed_wait_results, stage_wait_results_delivered
+  from app.goal_dependencies import owed_dependency_results, stage_dependency_results_delivered
+  goal, run = seed(db, chat)
+  row = _goal_result(db, chat, run, kind)
+  run.provider_execution_admitted = True
+  setattr(run, f"admitted_{kind}_results_json", [row.id])
+  db.commit()
+  update_goal_record(db, run, goal, goal.revision, defer=REASON)
+  db.refresh(row)
+  assert row.result_disposition is None  # Tools do not promise provider success.
+  owed = owed_wait_results if kind == "wait" else owed_dependency_results
+  receipt = stage_wait_results_delivered if kind == "wait" else stage_dependency_results_delivered
+  assert owed(db, chat.id, "", run_id=run.id) == ("", ())  # Never admit held work.
+  assert receipt(db, chat.id, (row.id,), run_id=run.id) == 1
+  db.commit(); db.refresh(row)
+  assert row.result_disposition == "delivered" and row.received_run_id == run.id
+
+
+@pytest.mark.parametrize("kind", ["wait", "dependency"])
+@pytest.mark.parametrize("hold", ["owner_stop", "other_run", "legacy"])
+def test_success_receipt_cannot_bypass_a_different_hold(db, chat, kind, hold):
+  from app.chat_waits import stage_wait_results_delivered
+  from app.goal_dependencies import stage_dependency_results_delivered
+  from app.goals import _new_hold
+  goal, run = seed(db, chat)
+  row = _goal_result(db, chat, run, kind)
+  run.provider_execution_admitted = True
+  setattr(run, f"admitted_{kind}_results_json", [row.id])
+  goal.status = "stopped"
+  goal.hold_json = None if hold == "legacy" else _new_hold(
+    cause="stop" if hold == "owner_stop" else "deferred",
+    actor="owner" if hold == "owner_stop" else "agent",
+    run_id=run.id if hold == "owner_stop" else "other-run", source_id="hold", reason=REASON)
+  db.commit()
+  receipt = stage_wait_results_delivered if kind == "wait" else stage_dependency_results_delivered
+  assert receipt(db, chat.id, (row.id,), run_id=run.id) == 0
+  db.refresh(row)
+  assert row.result_disposition is None
+
+
+@pytest.mark.parametrize("kind", ["wait", "dependency"])
+@pytest.mark.parametrize("admitted", [False, True])
+def test_deferral_blocks_results_not_in_the_admitted_prompt(db, chat, kind, admitted):
+  from app.goal_plans import GoalPlanError
+  goal, run = seed(db, chat)
+  row = _goal_result(db, chat, run, kind)
+  run.provider_execution_admitted = admitted
+  setattr(run, f"admitted_{kind}_results_json", [] if admitted else [row.id])
+  db.commit()
+  with pytest.raises(GoalPlanError, match=f"{kind}:" + row.id):
+    update_goal_record(db, run, goal, goal.revision, defer=REASON)
+  assert goal.status == "open" and row.result_disposition is None
+
+
+@pytest.mark.parametrize("action", ["stop", "dismiss"])
+def test_owner_end_survives_partial_claim_settlement_failure_and_retries(db, chat, monkeypatch, caplog, action):
+  import asyncio
+  from app import agent_work_claims, agent_coordination
+  from app.chat_writer import PrepareChatStop, ClearPresentedGoal
+  goal, run = seed(db, chat)
+  owner = models.Owner(username="claim-owner", hashed_password="unused")
+  db.add(owner); db.commit()
+  agent_work_claims.claim_work(db, owner_id=owner.id, chat_id=chat.id,
+    run_id=run.id, work_key="repair-stop", summary="Repair stop")
+  claim = db.query(models.AgentWorkClaim).one()
+  original = agent_work_claims.stage_settle_goal_claims
+  def fail_after_changes(*args, **kwargs):
+    original(*args, **kwargs)
+    raise RuntimeError("Injected partial claim settlement failure")
+  monkeypatch.setattr(agent_work_claims, "stage_settle_goal_claims", fail_after_changes)
+  command = (PrepareChatStop(chat_id=chat.id, actor="owner") if action == "stop" else
+    ClearPresentedGoal(chat_id=chat.id, expected_goal_id=goal.id))
+  submit(command)
+  db.expire_all()
+  assert goal.status == ("stopped" if action == "stop" else "dismissed")
+  assert claim.released_at is None and claim.completed_at is None
+  assert "settlement notice will retry" in caplog.text
+  monkeypatch.setattr(agent_work_claims, "stage_settle_goal_claims", original)
+  asyncio.run(agent_coordination.settle_claims_with_owner(chat.id))
+  db.expire_all()
+  assert claim.released_at is not None and claim.completed_at is None

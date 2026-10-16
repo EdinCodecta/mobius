@@ -92,13 +92,12 @@ def claim_scheduled_wait_result(chat_id: str, message: object) -> bool:
   return claimed == 1
 
 
-def _receivable_wait_results(db: Session, chat_id: str, run_id: str | None):
+def _receivable_wait_results(db: Session, chat_id: str, run_id: str | None, *, receipt=False):
   """Only this receiving run's Goal (plus unowned results) may ride along."""
   run = db.get(models.ChatRun, run_id) if run_id else None
   goal_id = run.goal_id if run is not None and run.chat_id == chat_id else None
-  open_goals = db.query(models.ChatGoal.id).filter(
-    models.ChatGoal.chat_id == chat_id, models.ChatGoal.status == "open",
-  )
+  from app.goals import result_receiving_goals
+  open_goals = result_receiving_goals(db, chat_id, run_id, receipt=receipt)
   return db.query(models.ChatWait).filter(
     models.ChatWait.chat_id == chat_id,
     models.ChatWait.kind != "platform_activation",
@@ -134,8 +133,9 @@ def stage_wait_results_delivered(
 ) -> int:
   """Receipt only what this admitted, successful exact-Goal run may receive.
 
-  Rechecking the Goal here preserves a hold/withdrawal that won after context
-  selection. Retirement is a different disposition, never provider receipt.
+  Rechecking the Goal preserves an owner/other-run hold or withdrawal that
+  won after selection. This run's own deferral may receipt its admitted result;
+  retirement remains a different disposition, never provider receipt.
   """
   run = db.get(models.ChatRun, run_id)
   if not wait_ids or run is None or run.chat_id != chat_id or not run.provider_execution_admitted:
@@ -145,7 +145,7 @@ def stage_wait_results_delivered(
   if not wait_ids:
     return 0
   now = now_naive_utc()
-  return _receivable_wait_results(db, chat_id, run_id).filter(
+  return _receivable_wait_results(db, chat_id, run_id, receipt=True).filter(
     models.ChatWait.id.in_(wait_ids),
   ).update({
     models.ChatWait.resume_delivered_at: now,

@@ -386,12 +386,17 @@ class RuntimeSupervisors:
             pass
           try:
             await sweep_due_waits(force_kind=force_kind)
+          except asyncio.CancelledError:
+            raise
+          except Exception as exc:
+            self.log.error("chat-wait sweep failed: %s", exc, exc_info=True)
+          try:
             from app.goal_dependencies import deliver_pending_dependencies
             await deliver_pending_dependencies()
           except asyncio.CancelledError:
             raise
           except Exception as exc:
-            self.log.error("chat-wait sweep failed: %s", exc, exc_info=True)
+            self.log.error("dependency delivery sweep failed: %s", exc, exc_info=True)
       finally:
         system_broadcast.unsubscribe(events)
 

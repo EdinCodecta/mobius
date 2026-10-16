@@ -95,6 +95,17 @@ test('missing exact card never redirects focus to another question', async ({ pa
   await expect(page.locator('#visible [data-question-id="choice"]')).toBeFocused()
 })
 
+test('authoritative missing decision retires its intent without clearing a prior search', async ({ page }) => {
+  await open(page)
+  const search = await page.evaluate(() => window.requestSearch())
+  await page.evaluate(() => window.requestDecision('choice'))
+  await mount(page, [{ ...visible, ready: false }])
+  expect(await page.evaluate(() => window.pendingDecision()?.questionId)).toBe('choice')
+  await page.evaluate(() => window.reportMissingDecision())
+  expect(await page.evaluate(() => window.pendingDecision())).toBeNull()
+  expect(await page.evaluate(() => window.pendingSearch()?.id)).toBe(search.id)
+})
+
 test('new search retires an unconsumed card intent even while every view is hidden', async ({ page }) => {
   await open(page)
   await page.evaluate(() => window.requestDecision('choice'))

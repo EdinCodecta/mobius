@@ -37,3 +37,21 @@ test('exact-card focus never jumps to newer owner input if the target disappeare
   assert.equal(questionRevealElement(root, 'missing', pending), null)
   assert.equal(questionRevealElement(root, null, pending), pending)
 })
+
+
+test('authoritative missing-anchor cleanup consumes only the matching navigation intent', async () => {
+  const { requestChatSearchReveal, chatSearchRevealFor, retireMissingChatReveal, clearChatSearchReveal } =
+    await import('../chatSearchReveal.js')
+  const chatId = 'missing-decision'
+  const search = requestChatSearchReveal(chatId, { anchorKey: 'older-search' })
+  const decision = requestChatQuestionReveal(chatId, 'gone-card')
+  assert.equal(retireMissingChatReveal(chatId, { decisionRevealId: decision.id, searchRevealId: search.id }), true)
+  assert.equal(chatQuestionRevealFor(chatId), null)
+  assert.equal(chatSearchRevealFor(chatId)?.id, search.id)
+  const newer = requestChatQuestionReveal(chatId, 'another-card')
+  assert.equal(retireMissingChatReveal(chatId, { decisionRevealId: decision.id, searchRevealId: search.id }), false)
+  assert.equal(chatQuestionRevealFor(chatId)?.id, newer.id)
+  assert.equal(chatSearchRevealFor(chatId)?.id, search.id)
+  consumeChatQuestionReveal(chatId, newer.id)
+  clearChatSearchReveal(chatId, search.id)
+})

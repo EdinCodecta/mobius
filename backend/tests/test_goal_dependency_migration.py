@@ -81,6 +81,36 @@ def test_fresh_upgrade_and_repeat_preserve_legacy_rows_without_dependencies(tmp_
   }
 
 
+def test_pending_dependency_indexes_are_append_only_and_idempotent(tmp_path):
+  eng = create_engine(f"sqlite:///{tmp_path / 'pending-indexes.db'}")
+  models.Base.metadata.create_all(eng)
+  schema_migrations._index_pending_goal_dependencies(eng)
+  schema_migrations._index_pending_goal_dependencies(eng)
+  indexes = {item["name"] for item in inspect(eng).get_indexes("goal_dependencies")}
+  assert {"ix_goal_dependencies_pending_claims",
+    "ix_goal_dependencies_pending_delivery"} <= indexes
+
+
+def test_legacy_notice_cutover_scans_once_per_startup(db, monkeypatch):
+  from app import goal_dependencies as deps
+  monkeypatch.setattr(deps, "_legacy_cutover_done", False)
+  monkeypatch.setattr(deps, "_legacy_cutover_chats", set())
+  seen = []
+  def observe(_conn, _cursor, statement, _parameters, _context, _executemany):
+    if "agent_coordination_messages" in statement.lower():
+      seen.append(statement)
+  eng = db.get_bind()
+  event.listen(eng, "before_cursor_execute", observe)
+  try:
+    assert asyncio.run(deps.deliver_pending_dependencies()) == 0
+    first = len(seen)
+    assert first >= 1
+    assert asyncio.run(deps.deliver_pending_dependencies()) == 0
+    assert len(seen) == first
+  finally:
+    event.remove(eng, "before_cursor_execute", observe)
+
+
 @pytest.mark.parametrize("missing", ["table", "suppression_field"])
 def test_partial_dependency_migration_reuses_acquisition_and_repairs_field(tmp_path, missing):
   eng = create_engine(f"sqlite:///{tmp_path / 'partial.db'}")

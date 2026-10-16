@@ -362,6 +362,41 @@ def _helper_blockers(db, run, goal) -> list[str]:
   ]
 
 
+def result_receiving_goals(db, chat_id, run_id, *, receipt=False):
+  """Admission requires an open Goal; success may receipt its own deferral.
+
+  A different run or owner Stop still keeps results owed. This predicate stays
+  in the receipt UPDATE so a concurrent hold cannot be bypassed by a stale read.
+  """
+  eligible = models.ChatGoal.status == "open"
+  if receipt:
+    hold = models.ChatGoal.hold_json
+    eligible |= ((models.ChatGoal.status == "stopped")
+      & (hold["cause"].as_string() == "deferred")
+      & (hold["actor"].as_string() == "agent")
+      & (hold["run_id"].as_string() == run_id))
+  return db.query(models.ChatGoal.id).filter(
+    models.ChatGoal.chat_id == chat_id, eligible,
+  )
+
+
+def _deferral_handoff_queries(db, run, goal):
+  from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED
+  from app.goal_dependencies import outstanding_dependencies
+
+  admitted_waits = run.admitted_wait_results_json if run.provider_execution_admitted else ()
+  admitted_dependencies = run.admitted_dependency_results_json if run.provider_execution_admitted else ()
+  return (("wait:", _goal_waits(db, goal.chat_id, goal.id).filter(
+    (models.ChatWait.status == "armed") | (_FIRED_UNDELIVERED
+      & models.ChatWait.id.notin_(admitted_waits or ())),
+  )), ("dependency:", outstanding_dependencies(db).filter(
+    models.GoalDependency.waiting_chat_id == goal.chat_id,
+    models.GoalDependency.waiting_goal_id == goal.id,
+    models.GoalDependency.resolved_at.is_(None)
+      | models.GoalDependency.id.notin_(admitted_dependencies or ()),
+  )))
+
+
 def _unseen_goal_result_queries(db, run, goal):
   """Do not finish past results that arrived after this turn's admission.
 
@@ -471,16 +506,9 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
   if defer_reason is not None:
     # A deliberate hold must not silently abandon a real handoff. Resolve its
     # owner first; this operation never cancels helpers, cards, or Waits.
-    from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED
     blockers = _helper_blockers(db, run, goal)
-    blockers += ["wait:" + row.id for row in _goal_waits(db, goal.chat_id, goal.id).filter(
-      (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
-    ).all()]
-    from app.goal_dependencies import outstanding_dependencies
-    blockers += ["dependency:" + row.id for row in outstanding_dependencies(db).filter(
-      models.GoalDependency.waiting_chat_id == goal.chat_id,
-      models.GoalDependency.waiting_goal_id == goal.id,
-    ).all()]
+    blockers += [prefix + row.id
+      for prefix, query in _deferral_handoff_queries(db, run, goal) for row in query.all()]
     if db.query(models.Chat.pending_question_id).filter(models.Chat.id == goal.chat_id).scalar():
       blockers.append("owner_question")
     if blockers:
@@ -541,6 +569,8 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
   # Retire only after the guarded terminal transition, never before its check.
   result_guards = [~query.exists() for _, query in _unseen_goal_result_queries(db, run, goal)] \
     if status == "completed" else []
+  if defer_reason is not None:
+    result_guards = [~query.exists() for _, query in _deferral_handoff_queries(db, run, goal)]
   changed = db.execute(update(models.ChatGoal).where(
     *result_guards,
     models.ChatGoal.id == goal.id, models.ChatGoal.revision == expected_revision,

@@ -175,6 +175,7 @@ import {
   consumeChatSearchActivation,
   reconcileChatSearchActivation,
   subscribeChatSearchReveal,
+  retireMissingChatReveal,
 } from '../../lib/chatSearchReveal.js'
 import { useChatQuestionActivation, useChatQuestionReveal } from './hooks/useChatQuestionReveal.js'
 import {
@@ -481,6 +482,7 @@ export default function ChatView({
     chatId, hidden, searchRevealId: searchReveal?.id,
   })
   const decisionQuestionId = questionActivation.reveal?.questionId
+  const decisionRevealId = questionActivation.reveal?.id
   const decisionAnchorKey = decisionQuestionId ? `question:${decisionQuestionId}` : null
   const inputRef = useRef(null)
   const handleInternalNav = useCallback((url) => {
@@ -2707,7 +2709,10 @@ export default function ChatView({
             retireSavedReadingPosition(chatId)
             anchorRetired = true
           } else {
-            clearChatSearchReveal(chatId, searchReveal?.id)
+            retireMissingChatReveal(chatId, {
+              decisionRevealId: decisionAnchorKey ? decisionRevealId : null,
+              searchRevealId: searchReveal?.id,
+            })
           }
         } else {
           // Rolling servers may omit the coverage bit. A row that is present
@@ -2973,6 +2978,7 @@ export default function ChatView({
     searchReveal?.anchorKey,
     searchReveal?.id,
     decisionAnchorKey,
+    decisionRevealId,
     commitRuntimeSnapshot,
     inspectRuntimeSnapshot,
     onRuntimeSettledIdle,

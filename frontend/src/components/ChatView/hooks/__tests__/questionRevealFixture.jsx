@@ -3,7 +3,7 @@ import React, { useLayoutEffect, useRef } from 'react'
 import { createRoot } from 'react-dom/client'
 import '../../../../hooks/useNavigation.js'
 import { useChatQuestionActivation, useChatQuestionReveal } from '../useChatQuestionReveal.js'
-import { requestChatSearchReveal } from '../../../../lib/chatSearchReveal.js'
+import { requestChatSearchReveal, chatSearchRevealFor, retireMissingChatReveal } from '../../../../lib/chatSearchReveal.js'
 import { requestChatQuestionReveal, chatQuestionRevealFor } from '../../../../lib/chatQuestionReveal.js'
 
 window.activations = []
@@ -11,6 +11,11 @@ window.reveals = []
 window.requestDecision = id => requestChatQuestionReveal('source', id)
 window.pendingDecision = () => chatQuestionRevealFor('source')
 window.requestSearch = () => requestChatSearchReveal('source', { anchorKey: 'older-search-window' })
+window.pendingSearch = () => chatSearchRevealFor('source')
+window.reportMissingDecision = () => retireMissingChatReveal('source', {
+  decisionRevealId: chatQuestionRevealFor('source')?.id,
+  searchRevealId: chatSearchRevealFor('source')?.id,
+})
 function View({ id, hidden = false, ready = true, saved = 'saved:initial', search = null, card = 'choice' }) {
   const rootRef = useRef(null)
   const activation = useChatQuestionActivation({ chatId: 'source', hidden, searchRevealId: search?.id })

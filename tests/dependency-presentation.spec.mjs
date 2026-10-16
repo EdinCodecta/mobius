@@ -144,6 +144,10 @@ test('stop following confirms, cancels and retries without touching the source c
   await open(page)
   const details = page.getByRole('region', { name: 'Dependent Goal' })
   const stop = details.getByRole('button', { name: /^Stop following:/ })
+  await stop.dblclick()
+  expect(await page.evaluate(() => window.withdrawals)).toEqual([])
+  await expect(details.getByRole('button', { name: /^Confirm stop following:/ })).toBeVisible()
+  await details.getByRole('button', { name: 'Keep following' }).click()
   await stop.focus(); await page.keyboard.press('Enter')
   await expect(details).toContainText('Your Goal stays unfinished')
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
@@ -164,4 +168,17 @@ test('stop following confirms, cancels and retries without touching the source c
   expect(await page.evaluate(() => window.withdrawals)).toEqual(['d', 'd'])
   await expect(page.locator('.qcard')).not.toHaveClass(/qcard--answered/)
   await expect(details.getByRole('link', { name: /^Open decision/ })).toBeVisible()
+})
+
+test('saved message history links use internal navigation in goal and wait cards', async ({ page }) => {
+  await open(page)
+  await page.evaluate(() => window.mountFixture({ comparisons: true }))
+  const history = page.getByTestId('message-history')
+  const cards = history.locator('.chat__goal-history')
+  await expect(cards).toHaveCount(3)
+  for (const card of await cards.all()) {
+    await card.locator('summary').click()
+    await card.getByRole('link', { name: /^Open decision/ }).click()
+  }
+  expect(await page.evaluate(() => window.navigations)).toEqual(Array(3).fill(base + '/shell/?chat=source&focus=question&question=choice'))
 })

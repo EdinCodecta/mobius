@@ -101,3 +101,9 @@ export function subscribeChatSearchReveal(chatId, listener) {
     if (set.size === 0) listeners.delete(id)
   }
 }
+
+/** An authoritative missing anchor retires only the activation that requested it. */
+export function retireMissingChatReveal(chatId, { decisionRevealId, searchRevealId } = {}) {
+  if (decisionRevealId != null) return consumeChatQuestionReveal(chatId, decisionRevealId)
+  return clearChatSearchReveal(chatId, searchRevealId)
+}

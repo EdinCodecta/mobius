@@ -6693,6 +6693,24 @@ def _add_transfer_notice_revision(eng) -> None:
     ))
 
 
+def _index_pending_goal_dependencies(eng) -> None:
+  """Seek live claim sources and owed results without scanning follow history."""
+  from sqlalchemy import text
+  with eng.begin() as conn:
+    conn.execute(text(
+      "CREATE INDEX IF NOT EXISTS ix_goal_dependencies_pending_claims "
+      "ON goal_dependencies (id) WHERE target_kind='claim_acquisition' "
+      "AND resolved_at IS NULL AND result_disposition IS NULL "
+      "AND withdrawn_at IS NULL AND owner_suppressed_at IS NULL"
+    ))
+    conn.execute(text(
+      "CREATE INDEX IF NOT EXISTS ix_goal_dependencies_pending_delivery "
+      "ON goal_dependencies (waiting_chat_id, id) WHERE resolved_at IS NOT NULL "
+      "AND result_disposition IS NULL AND withdrawn_at IS NULL "
+      "AND owner_suppressed_at IS NULL"
+    ))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -6807,6 +6825,7 @@ _SCHEMA_MIGRATIONS = (
   ("0090_goal_dependencies", _add_goal_dependencies),
   ("0091_saved_decision_cards", _add_saved_decision_cards),
   ("0092_transfer_notice_revision", _add_transfer_notice_revision),
+  ("0093_pending_goal_dependency_indexes", _index_pending_goal_dependencies),
 )
 
 

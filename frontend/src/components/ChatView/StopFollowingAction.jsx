@@ -25,11 +25,15 @@ export default function StopFollowingAction({ dependency, onStopFollowing }) {
     </span>}
     <span className="chat__dependency-actions">
       <button type="button" className="chat__dependency-link" disabled={pending}
-        aria-label={`${confirming ? 'Confirm stop following' : 'Stop following'}: ${dependency.condition}`}
+        aria-label={`Stop following: ${dependency.condition}`}
         aria-describedby={confirming ? descriptionId : undefined}
-        onClick={() => confirming ? void stop() : setConfirming(true)}>
-        {pending ? 'Stopping…' : confirming ? 'Confirm stop following' : 'Stop following'}
+        onClick={() => setConfirming(true)}>
+        Stop following
       </button>
+      {confirming && <button type="button" className="chat__dependency-link" disabled={pending}
+        aria-label={`Confirm stop following: ${dependency.condition}`}
+        aria-describedby={descriptionId}
+        onClick={() => void stop()}>{pending ? 'Stopping…' : 'Confirm stop following'}</button>}
       {confirming && <button type="button" className="chat__dependency-link" disabled={pending}
         onClick={() => { setConfirming(false); setError('') }}>Keep following</button>}
     </span>
