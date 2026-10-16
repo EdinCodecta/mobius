@@ -117,12 +117,33 @@ def _git(cwd, *args):
   )
 
 
-_LOCKED = {"rolldown": "1.0.0", "acorn": "8.0.0", "eslint-scope": "9.0.0", "vite": "7.0.0"}
+# A lockfile shaped like the real one around the backend's Node tools: rolldown
+# has a hoisted dependency and an optional platform binding, and esrecurse uses
+# a nested estraverse that shadows a different hoisted copy only vite uses.
+_LOCKED = {
+  "node_modules/rolldown": {
+    "version": "1.0.0",
+    "dependencies": {"@oxc-project/types": "^0.1.0"},
+    "optionalDependencies": {"@rolldown/binding-linux-x64-gnu": "1.0.0"},
+  },
+  "node_modules/@oxc-project/types": {"version": "0.1.0"},
+  "node_modules/@rolldown/binding-linux-x64-gnu": {"version": "1.0.0", "optional": True},
+  "node_modules/acorn": {"version": "8.0.0"},
+  "node_modules/eslint-scope": {"version": "9.0.0", "dependencies": {"esrecurse": "^4.3.0"}},
+  "node_modules/esrecurse": {"version": "4.3.0", "dependencies": {"estraverse": "^5.2.0"}},
+  "node_modules/esrecurse/node_modules/estraverse": {"version": "5.3.0"},
+  "node_modules/estraverse": {"version": "4.3.0"},
+  "node_modules/vite": {"version": "7.0.0", "dependencies": {"estraverse": "^4.0.0"}},
+}
 
 
-def _lockfile(**bumps):
-  versions = {**_LOCKED, **bumps}
-  packages = {f"node_modules/{name}": {"version": version} for name, version in versions.items()}
+def _lockfile(**changes):
+  """The fixture lockfile, with ``changes`` (path → fields) applied on top."""
+  packages = {}
+  for path, entry in _LOCKED.items():
+    entry = {**entry, **changes.get(path, {})}
+    entry.setdefault("integrity", f"sha512-{path}@{entry['version']}")
+    packages[path] = entry
   return json.dumps({"lockfileVersion": 3, "packages": {"": {}, **packages}})
 
 
@@ -162,8 +183,15 @@ def _run_host_runner_in_worktree(tmp_path, worktree_lock=None, break_acorn=False
   )
 
 
-def test_host_runner_reuses_backend_node_tools_when_only_other_frontend_packages_differ(tmp_path):
-  result = _run_host_runner_in_worktree(tmp_path, worktree_lock=_lockfile(vite="7.1.0"))
+@pytest.mark.parametrize("changes", [
+  pytest.param({"node_modules/vite": {"version": "7.1.0"}}, id="unrelated-package"),
+  # Only vite uses the hoisted estraverse; esrecurse resolves its nested copy.
+  pytest.param({"node_modules/estraverse": {"version": "4.4.0"}}, id="shadowed-hoisted-copy"),
+])
+def test_host_runner_reuses_backend_node_tools_when_only_other_frontend_packages_differ(
+  tmp_path, changes,
+):
+  result = _run_host_runner_in_worktree(tmp_path, worktree_lock=_lockfile(**changes))
   if result.returncode == 78:
     pytest.skip("no pytest runtime available for the host runner here")
   assert result.returncode == 0, result.stdout + result.stderr
@@ -171,8 +199,20 @@ def test_host_runner_reuses_backend_node_tools_when_only_other_frontend_packages
   assert "locks the backend's Node tools (rolldown, acorn, eslint-scope) identically" in result.stderr
 
 
-def test_host_runner_refuses_a_lockfile_that_changes_the_backend_node_tools(tmp_path):
-  result = _run_host_runner_in_worktree(tmp_path, worktree_lock=_lockfile(rolldown="1.1.0"))
+@pytest.mark.parametrize("changes", [
+  pytest.param({"node_modules/rolldown": {"version": "1.1.0"}}, id="direct-tool"),
+  pytest.param({"node_modules/@oxc-project/types": {"version": "0.2.0"}}, id="hoisted-dependency"),
+  pytest.param(
+    {"node_modules/@rolldown/binding-linux-x64-gnu": {"integrity": "sha512-rebuilt"}},
+    id="optional-platform-binding-integrity",
+  ),
+  pytest.param(
+    {"node_modules/esrecurse/node_modules/estraverse": {"version": "5.4.0"}},
+    id="nested-dependency",
+  ),
+])
+def test_host_runner_refuses_a_lockfile_that_changes_the_backend_node_tools(tmp_path, changes):
+  result = _run_host_runner_in_worktree(tmp_path, worktree_lock=_lockfile(**changes))
   assert result.returncode == 1, result.stdout + result.stderr
   assert "no verified backend Node dependencies match this worktree" in result.stderr
 
