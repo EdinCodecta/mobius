@@ -137,17 +137,20 @@ _LOCKED = {
 }
 
 
-def _lockfile(**changes):
-  """The fixture lockfile, with ``changes`` (path → fields) applied on top."""
+def _lockfile(changes=None, omit=()):
+  """The fixture lockfile, with ``changes`` (path → fields) applied on top and
+  the ``omit`` entries left out."""
   packages = {}
   for path, entry in _LOCKED.items():
-    entry = {**entry, **changes.get(path, {})}
+    if path in omit:
+      continue
+    entry = {**entry, **(changes or {}).get(path, {})}
     entry.setdefault("integrity", f"sha512-{path}@{entry['version']}")
     packages[path] = entry
   return json.dumps({"lockfileVersion": 3, "packages": {"": {}, **packages}})
 
 
-def _checkout_with_fake_backend_node_tools(root):
+def _checkout_with_fake_backend_node_tools(root, lock):
   """A primary checkout whose frontend tree holds just the verified surface."""
   modules = root / "frontend" / "node_modules"
   (modules / ".bin").mkdir(parents=True)
@@ -157,7 +160,7 @@ def _checkout_with_fake_backend_node_tools(root):
     (modules / package).mkdir()
     (modules / package / "package.json").write_text('{"name": "%s", "main": "index.js"}' % package)
     (modules / package / "index.js").write_text("module.exports = {}\n")
-  (root / "frontend" / "package-lock.json").write_text(_lockfile())
+  (root / "frontend" / "package-lock.json").write_text(lock)
   (root / "backend").mkdir()
   (root / "backend" / "test_probe.py").write_text("def test_probe():\n  assert True\n")
   (root / ".gitignore").write_text("node_modules\n")
@@ -166,10 +169,10 @@ def _checkout_with_fake_backend_node_tools(root):
   _git(root, "commit", "-q", "-m", "base")
 
 
-def _run_host_runner_in_worktree(tmp_path, worktree_lock=None, break_acorn=False):
+def _run_host_runner_in_worktree(tmp_path, worktree_lock=None, break_acorn=False, main_lock=None):
   main = tmp_path / "main"
   main.mkdir()
-  _checkout_with_fake_backend_node_tools(main)
+  _checkout_with_fake_backend_node_tools(main, main_lock or _lockfile())
   if break_acorn:
     (main / "frontend" / "node_modules" / "acorn" / "package.json").unlink()
     (main / "frontend" / "node_modules" / "acorn" / "index.js").unlink()
@@ -191,7 +194,7 @@ def _run_host_runner_in_worktree(tmp_path, worktree_lock=None, break_acorn=False
 def test_host_runner_reuses_backend_node_tools_when_only_other_frontend_packages_differ(
   tmp_path, changes,
 ):
-  result = _run_host_runner_in_worktree(tmp_path, worktree_lock=_lockfile(**changes))
+  result = _run_host_runner_in_worktree(tmp_path, worktree_lock=_lockfile(changes))
   if result.returncode == 78:
     pytest.skip("no pytest runtime available for the host runner here")
   assert result.returncode == 0, result.stdout + result.stderr
@@ -212,7 +215,30 @@ def test_host_runner_reuses_backend_node_tools_when_only_other_frontend_packages
   ),
 ])
 def test_host_runner_refuses_a_lockfile_that_changes_the_backend_node_tools(tmp_path, changes):
-  result = _run_host_runner_in_worktree(tmp_path, worktree_lock=_lockfile(**changes))
+  result = _run_host_runner_in_worktree(tmp_path, worktree_lock=_lockfile(changes))
+  assert result.returncode == 1, result.stdout + result.stderr
+  assert "no verified backend Node dependencies match this worktree" in result.stderr
+
+
+@pytest.mark.parametrize("missing", [
+  pytest.param(("node_modules/@oxc-project/types",), id="hoisted-dependency"),
+  pytest.param(("node_modules/@rolldown/binding-linux-x64-gnu",), id="optional-platform-binding"),
+  # Without its nested copy esrecurse would resolve the hoisted one, so drop both.
+  pytest.param(
+    ("node_modules/esrecurse/node_modules/estraverse", "node_modules/estraverse"),
+    id="nested-dependency",
+  ),
+])
+def test_host_runner_refuses_lockfiles_that_both_leave_a_backend_dependency_unresolved(
+  tmp_path, missing,
+):
+  # Both lockfiles omit the same required package and differ elsewhere: the
+  # missing package is pinned by neither, so equal gaps must not count as a match.
+  result = _run_host_runner_in_worktree(
+    tmp_path,
+    main_lock=_lockfile(omit=missing),
+    worktree_lock=_lockfile({"node_modules/vite": {"version": "7.1.0"}}, omit=missing),
+  )
   assert result.returncode == 1, result.stdout + result.stderr
   assert "no verified backend Node dependencies match this worktree" in result.stderr
 

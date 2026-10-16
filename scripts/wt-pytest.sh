@@ -91,8 +91,9 @@ matching_contrib_node_modules() {
 # The lockfile entries of the Node packages backend tests execute (the same
 # rolldown/acorn/eslint-scope surface as above) and their whole dependency
 # closure, one "path version integrity" line each, using npm's nested-then-
-# hoisted resolution. A dependency the lockfile cannot resolve prints as
-# missing, so it can never compare equal to a resolved one.
+# hoisted resolution. A dependency the lockfile cannot resolve makes the
+# whole signature invalid (no output, nonzero exit): such a lockfile does not
+# pin what would run, so it can never justify borrowing a tree.
 backend_node_lock() {
   node -e '
     const pk = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).packages || {};
@@ -106,7 +107,7 @@ backend_node_lock() {
     const lines = new Set();
     const visit = (from, name) => {
       const key = find(from, name);
-      if (!key) { lines.add(`missing ${name} from ${from || "."}`); return; }
+      if (!key) process.exit(1);
       const line = `${key} ${pk[key].version} ${pk[key].integrity}`;
       if (lines.has(line)) return;
       lines.add(line);
@@ -126,12 +127,13 @@ backend_node_lock() {
 # packages never borrows another tree, so compiler tests always run the
 # versions this checkout locks.
 backend_lock_matching_node_modules() {
-  local frontend want
+  local frontend want have
   want="$(backend_node_lock "$ROOT/frontend/package-lock.json")" && [ -n "$want" ] \
     || return 1
   for frontend in "$MAIN/frontend" "$CONTRIB_ROOT"/*/worktree/frontend; do
     [ "$frontend" != "$ROOT/frontend" ] || continue
-    [ "$(backend_node_lock "$frontend/package-lock.json")" = "$want" ] || continue
+    have="$(backend_node_lock "$frontend/package-lock.json")" || continue
+    [ "$have" = "$want" ] || continue
     if backend_test_node_deps "$frontend"; then
       printf '%s\n' "$frontend/node_modules"
       return 0
