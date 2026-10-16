@@ -98,9 +98,21 @@ def test_only_the_chats_live_run_can_save(client, auth, chat, db):
 
   response = _save(client, {"Authorization": f"Bearer {stale}"}, chat_summary="Must not land.")
   assert response.status_code == 409
+  assert "no longer holds this run as the chat's owner" in response.json()["detail"]
   assert not note_path(get_settings().data_dir, chat.id).exists()
   # An owner browser session is not a run and cannot impersonate one.
   assert _save(client, auth, chat_summary="Nope.").status_code in {401, 403}
+
+
+def test_the_writer_names_why_a_run_is_not_the_chats_live_owner(chat, db):
+  _start(chat, "live-run")
+  writer = get_writer()
+  assert writer._live_run_refusal(db, chat.id, "live-run") is None
+  assert writer._live_run_refusal(db, chat.id, "never-recorded") == "run_unknown"
+  assert writer._live_run_refusal(db, "other-chat", "live-run") == "chat_inactive"
+  db.get(models.ChatRun, "live-run").status = "completed"
+  db.commit()
+  assert writer._live_run_refusal(db, chat.id, "live-run") == "run_not_running"
 
 
 def test_existing_notes_keep_their_history_and_other_sections():
