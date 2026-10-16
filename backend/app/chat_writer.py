@@ -4882,13 +4882,15 @@ class ChatWriterActor:
     """Why ``run_token`` is not the chat's live owner run, or ``None``.
 
     The reason is a stable code a caller can show an agent; ``_owned_live_run``
-    is the same check for callers that only need the run.
+    is the same check for callers that only need the run. The run is bound to
+    ``chat_id`` before anything about the chat is consulted, so a run asking
+    about another chat learns only ``run_unknown``, never that chat's state.
     """
     run = db.get(models.ChatRun, run_token) if run_token else None
-    if _active_chat(db, chat_id) is None:
-      return "chat_inactive"
     if run is None or run.chat_id != chat_id:
       return "run_unknown"
+    if _active_chat(db, chat_id) is None:
+      return "chat_inactive"
     if run.status != "running":
       return "run_not_running"
     if self._run_token_owner.get(chat_id) != run_token:
