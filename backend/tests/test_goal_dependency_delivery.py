@@ -419,7 +419,7 @@ def test_success_receipt_withdraws_only_its_stale_queue_not_owner_work(db, chat)
 @pytest.mark.parametrize("event", ["completion", "transfer", "ambiguous_old_revision", "ordinary_interrupt", "quiet_backlog"])
 def test_legacy_claim_carrier_cutover_never_retires_transfer_or_ordinary_interrupt(db, chat, event):
   import json
-  from app.goal_dependency_sources import obsolete_claim_notice_carrier
+  from app.schema_migrations import _retire_legacy_claim_notice_carriers
   owner = models.Owner(username="legacy-owner", hashed_password="unused")
   db.add(owner)
   db.flush()
@@ -446,9 +446,9 @@ def test_legacy_claim_carrier_cutover_never_retires_transfer_or_ordinary_interru
     "content": "<agent_coordination>" + json.dumps({"self_chat_id": chat.id,
       "messages": [{"id": identity} for identity in ids]}) + "</agent_coordination>", "ts": 1}
   should_retire = event in {"completion", "quiet_backlog"}
-  assert obsolete_claim_notice_carrier(db, chat.id, message) is should_retire
   get_writer().submit(AppendPending(chat_id=chat.id, run_token="", user_msg=message)).result(timeout=5)
-  assert asyncio.run(deps.withdraw_disposed_dependency_notices(chat.id)) == int(should_retire)
+  _retire_legacy_claim_notice_carriers(db.get_bind())
+  _retire_legacy_claim_notice_carriers(db.get_bind())  # interrupted ledger write is safe
   db.refresh(chat)
   assert bool(chat.pending_messages) is not should_retire
   assert db.query(models.AgentCoordinationMessage).count() == len(ids)
@@ -534,3 +534,37 @@ def test_reconcile_after_clean_finish_preserves_unattempted_source_settlement(db
   row = db.query(models.GoalDependency).one()
   assert row.resolved_at is None
   assert db.get(models.ChatRun, "source-run").status == "completed"
+
+
+def test_source_reconciliation_shares_visited_edges_across_diamond_branches(db, chat, monkeypatch):
+  from collections import Counter
+  from types import SimpleNamespace
+  from app import chat_handoffs
+  from app.chat_writer import create_chat
+  from app.goal_dependency_sources import dependency_source_blocker
+  claims = {}
+  for name in ('a', 'b', 'c', 'd', 'e'):
+    source = create_chat(id=f'source-{name}', messages=[])
+    db.add(source)
+    run = _run(db, source, f'run-{name}', f'goal-{name}')
+    run.status = 'failed'
+    claim = _source_claim(db, source, claim_id=f'claim-{name}', acquisition=f'acquisition-{name}')
+    claim.owner_goal_id, claim.owner_run_id = run.goal_id, run.id
+    claims[name] = claim
+  follower = _run(db, chat, 'follower', 'follower-goal')
+  edges = [(follower.goal_id, 'a'), ('goal-a', 'b'), ('goal-a', 'c'),
+    ('goal-b', 'd'), ('goal-c', 'd'), ('goal-d', 'e')]
+  for index, (waiting_goal, source) in enumerate(edges):
+    claim = claims[source]
+    db.add(models.GoalDependency(id=f'edge-{index}', waiting_goal_id=waiting_goal,
+      waiting_chat_id=chat.id if index == 0 else f'source-{waiting_goal[-1]}',
+      target_kind='claim_acquisition', target_key=f'claim:{claim.acquisition_id}',
+      target_claim_id=claim.id, target_acquisition_id=claim.acquisition_id))
+  db.commit()
+  visits = Counter()
+  def native(_db, goal):
+    visits[goal.id] += 1
+    return SimpleNamespace(progress_owned=False)
+  monkeypatch.setattr(chat_handoffs, 'native_goal_handoffs', native)
+  assert dependency_source_blocker(db, db.get(models.GoalDependency, 'edge-0')) == 'owner_not_progressing'
+  assert visits['goal-e'] == 1  # Shared leaf edge, not a fresh traversal per branch.

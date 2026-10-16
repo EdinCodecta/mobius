@@ -275,3 +275,49 @@ def test_question_anchor_search_does_not_hydrate_unrelated_history(db, chat, cli
   assert missing.status_code == 200, missing.text
   assert missing.json()['requested_anchor_found'] is False
   assert len(missing.json()['messages']) == 20
+
+
+def test_dependency_receipt_paging_hydrates_only_exact_on_page_anchors(db, chat, monkeypatch):
+  from app import goal_dependencies
+  run = _run(db, chat, 'declare', 'goal')
+  row = _dependency(db, chat, run)
+  row.result_disposition, row.received_run_id = 'delivered', 'receive'
+  other_run = _run(db, chat, 'off-page', 'other-goal')
+  other = _dependency(db, chat, other_run, 'other')
+  other.created_by_run_id, other.received_run_id = 'off-page', None
+  db.commit()
+  messages = [{'role': 'assistant', 'id': identity} for identity in
+    ['declare', 'off-page', 'receive', 'receive:assistant:1']]
+  summaries = []
+  original = goal_dependencies.dependency_summary
+  def summarize(db, dependency, **kwargs):
+    summaries.append(dependency.id)
+    return original(db, dependency, **kwargs)
+  monkeypatch.setattr(goal_dependencies, 'dependency_summary', summarize)
+  # A receipt present outside the window must not fall back to its declaration.
+  assert terminal_dependency_summaries_by_message_index(db, chat.id, messages,
+    message_start=0, message_end=1) == {}
+  assert summaries == []
+  history = terminal_dependency_summaries_by_message_index(db, chat.id, messages,
+    message_start=2, message_end=4)
+  assert list(history) == [2] and summaries == [row.id]
+  summaries.clear()
+  assert terminal_dependency_summaries_by_message_index(db, chat.id, messages,
+    message_start=3, message_end=4) == {}
+  assert summaries == []
+
+
+def test_chat_detail_passes_its_page_window_to_dependency_receipts(db, chat, client, auth, monkeypatch):
+  from app import goal_dependencies, transcript_rows
+  for index in range(5):
+    transcript_rows.append(db, chat, {'role': 'user', 'id': f'row-{index}', 'content': 'Hello'})
+  db.commit()
+  windows = []
+  def summaries(_db, chat_id, messages, *, message_start, message_end, **kwargs):
+    assert chat_id == chat.id and len(messages) == 5
+    windows.append((message_start, message_end))
+    return {}
+  monkeypatch.setattr(goal_dependencies, 'terminal_dependency_summaries_by_message_index', summaries)
+  response = client.get(f'/api/chats/{chat.id}?limit=2&before=3', headers=auth)
+  assert response.status_code == 200, response.text
+  assert windows == [(1, 3)]

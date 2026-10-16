@@ -12,11 +12,23 @@ from app import models
 from app.timeutil import now_naive_utc
 
 
-def fence_decisions(db):
-  # The single-owner graph fence is shared with claim follows/transfers, so
-  # mixed card/claim direct cycles cannot slip through concurrent registration.
-  db.execute(update(models.Owner).values(username=models.Owner.username)
+def fence_owner(db, owner_id=None):
+  """Serialize graph reads/writes on the owning account in this transaction.
+
+  A no-op UPDATE, rather than SELECT FOR UPDATE, also fences SQLite writers.
+  The installation has one owner, but callers with a known owner id can avoid
+  touching any other account if that ever changes.
+  """
+  stmt = update(models.Owner)
+  if owner_id is not None:
+    stmt = stmt.where(models.Owner.id == owner_id)
+  db.execute(stmt.values(username=models.Owner.username)
     .execution_options(synchronize_session=False))
+
+
+def fence_decisions(db):
+  """Compatibility name for the shared owner graph fence."""
+  fence_owner(db)
 
 
 def supported_family(card):

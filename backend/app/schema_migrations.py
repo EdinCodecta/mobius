@@ -6711,6 +6711,102 @@ def _index_pending_goal_dependencies(eng) -> None:
     ))
 
 
+def _retire_legacy_claim_notice_carriers(eng) -> None:
+  """One-time retirement of proven terminal claim wakes, not peer receipts.
+
+  A transfer can share the claim-notice kind, so only the current terminal
+  revision is authoritative. Repeated execution is safe if ledger recording
+  was interrupted after this transaction committed.
+  """
+  from sqlalchemy import JSON, bindparam, inspect, text
+
+  # Partial historical schemas without these sources cannot hold old carriers.
+  if not {"agent_work_claims", "agent_coordination_messages", "chats"} <= set(
+      inspect(eng).get_table_names()):
+    return
+
+  with eng.begin() as conn:
+    terminal = conn.execute(text(
+      "SELECT n.id, n.to_chat_id, n.send_id, n.delivery, c.revision "
+      "FROM agent_coordination_messages n JOIN agent_work_claims c "
+      "ON n.from_run_id = ('work-claim:' || c.id) "
+      "WHERE c.completed_at IS NOT NULL OR c.released_at IS NOT NULL"
+    )).mappings().all()
+    terminal_ids = set()
+    chat_ids = set()
+    for notice in terminal:
+      if notice["send_id"] != f"revision:{notice['revision']}":
+        continue
+      terminal_ids.add(notice["id"])
+      if notice["to_chat_id"]:
+        chat_ids.add(notice["to_chat_id"])
+      if notice["delivery"] == "interrupt":
+        conn.execute(text(
+          "UPDATE agent_coordination_messages SET delivery='next_turn' "
+          "WHERE id=:id AND delivery='interrupt'"
+        ), {"id": notice["id"]})
+
+    # The saved note stays readable on the next authorized turn. Only its
+    # stale wake reservation is removed; peer cursors are never advanced.
+    update_pending = text(
+      "UPDATE chats SET pending_messages=:pending WHERE id=:chat_id"
+    ).bindparams(bindparam("pending", type_=JSON))
+    for chat_id in chat_ids:
+      pending = conn.execute(text(
+        "SELECT pending_messages FROM chats WHERE id=:chat_id"
+      ), {"chat_id": chat_id}).scalar_one_or_none()
+      if isinstance(pending, str):
+        pending = json.loads(pending)
+      if not isinstance(pending, list) or not pending:
+        continue
+      saved = {row["id"]: row for row in conn.execute(text(
+        "SELECT id, to_chat_id, delivery FROM agent_coordination_messages "
+        "WHERE to_chat_id=:chat_id"
+      ), {"chat_id": chat_id}).mappings()}
+
+      def obsolete(message):
+        if not isinstance(message, dict) or not (
+          message.get("kind") == "peer_message" and message.get("hidden") is True
+          and isinstance(message.get("peer_message_through"), dict)
+        ):
+          return False
+        content = message.get("content")
+        if not isinstance(content, str):
+          return False
+        _, marker, tail = content.partition("<agent_coordination>")
+        if not marker:
+          return False
+        encoded, close, _ = tail.partition("</agent_coordination>")
+        if not close:
+          return False
+        try:
+          data = json.loads(encoded)
+          entries = data["messages"]
+        except (ValueError, TypeError, KeyError):
+          return False
+        if not isinstance(entries, list) or not entries or data.get("self_chat_id") != chat_id:
+          return False
+        ids = [item.get("id") for item in entries if isinstance(item, dict)]
+        if len(ids) != len(entries) or any(not isinstance(value, str) for value in ids):
+          return False
+        if ids[-1] != message["peer_message_through"].get("id"):
+          return False
+        retired = False
+        for identity in ids:
+          note = saved.get(identity)
+          if note is None or note["to_chat_id"] != chat_id:
+            return False
+          if identity in terminal_ids:
+            retired = True
+          elif note["delivery"] == "interrupt":
+            return False
+        return retired
+
+      kept = [message for message in pending if not obsolete(message)]
+      if len(kept) != len(pending):
+        conn.execute(update_pending, {"chat_id": chat_id, "pending": kept})
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -6826,6 +6922,7 @@ _SCHEMA_MIGRATIONS = (
   ("0091_saved_decision_cards", _add_saved_decision_cards),
   ("0092_transfer_notice_revision", _add_transfer_notice_revision),
   ("0093_pending_goal_dependency_indexes", _index_pending_goal_dependencies),
+  ("0094_retire_legacy_claim_notice_carriers", _retire_legacy_claim_notice_carriers),
 )
 
 

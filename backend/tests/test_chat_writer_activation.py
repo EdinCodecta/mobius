@@ -760,3 +760,29 @@ def test_recording_session_still_crosses_the_decision_graph_fence():
   assert len(snapshots) == 1
   assert any(statement.startswith("UPDATE owner SET username=owner.username")
     for statement in statements)
+
+
+def test_writer_fences_graph_mutations_and_dependency_result_admission(monkeypatch):
+  """A plain queue/park/title write must not contend on the owner graph row."""
+  from app import decision_cards
+  from app.chat_writer import (
+    ChatWriterActor, AppendPending, FinishRun, ParkRun, ReplaceTranscript,
+  )
+  from app.continuations import DEPENDENCY_RESULT_MESSAGE_KIND
+
+  actor = object.__new__(ChatWriterActor)
+  db = object()
+  fenced = []
+  monkeypatch.setattr(decision_cards, "fence_decisions", lambda session: fenced.append(session))
+  for name in ("_append_pending", "_finish_run", "_park_run", "_replace_transcript"):
+    monkeypatch.setattr(ChatWriterActor, name, lambda self, session, cmd: None)
+
+  for cmd in (AppendPending(), ParkRun(), ReplaceTranscript(title="renamed")):
+    actor._dispatch(db, cmd)
+  assert fenced == []
+
+  for cmd in (AppendPending(answers={"q": "yes"}),
+              AppendPending(user_msg={"kind": DEPENDENCY_RESULT_MESSAGE_KIND}), FinishRun(),
+              ReplaceTranscript(messages=[])):
+    actor._dispatch(db, cmd)
+  assert fenced == [db, db, db, db]

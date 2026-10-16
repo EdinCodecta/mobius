@@ -1,6 +1,7 @@
 """Legacy work interests remain readable, non-waking history on upgrade."""
 
 import asyncio
+import json
 
 import pytest
 from datetime import UTC, datetime, timedelta
@@ -91,24 +92,78 @@ def test_pending_dependency_indexes_are_append_only_and_idempotent(tmp_path):
     "ix_goal_dependencies_pending_delivery"} <= indexes
 
 
-def test_legacy_notice_cutover_scans_once_per_startup(db, monkeypatch):
-  from app import goal_dependencies as deps
-  monkeypatch.setattr(deps, "_legacy_cutover_done", False)
-  monkeypatch.setattr(deps, "_legacy_cutover_chats", set())
-  seen = []
-  def observe(_conn, _cursor, statement, _parameters, _context, _executemany):
-    if "agent_coordination_messages" in statement.lower():
-      seen.append(statement)
-  eng = db.get_bind()
-  event.listen(eng, "before_cursor_execute", observe)
-  try:
-    assert asyncio.run(deps.deliver_pending_dependencies()) == 0
-    first = len(seen)
-    assert first >= 1
-    assert asyncio.run(deps.deliver_pending_dependencies()) == 0
-    assert len(seen) == first
-  finally:
-    event.remove(eng, "before_cursor_execute", observe)
+@pytest.mark.parametrize("missing", ["agent_work_claims", "agent_coordination_messages", "chats"])
+def test_legacy_claim_notice_cutover_accepts_partial_historical_schema(tmp_path, missing):
+  eng = create_engine(f"sqlite:///{tmp_path / 'partial-notices.db'}")
+  models.Base.metadata.create_all(eng)
+  with eng.begin() as conn:
+    conn.execute(text(f"DROP TABLE {missing}"))
+  schema_migrations._retire_legacy_claim_notice_carriers(eng)
+  eng.dispose()
+
+
+def test_legacy_claim_notice_cutover_is_ledgered_and_preserves_transfers(tmp_path,
+                                                                        monkeypatch):
+  eng = create_engine(f"sqlite:///{tmp_path / 'claim-notices.db'}")
+  models.Base.metadata.create_all(eng)
+  now = datetime(2026, 10, 12, 12)
+  with Session(eng) as db:
+    db.add(models.Owner(id=1, username="owner", hashed_password="unused"))
+    db.add_all([create_chat(id=chat_id, messages=[]) for chat_id in
+      ("source", "waiting")])
+    db.flush()
+    db.add_all([
+      models.AgentWorkClaim(id="finished", owner_id=1, work_key="finished",
+        summary="Finished", owner_chat_id="source", owner_run_id="run",
+        revision=2, completed_at=now),
+      models.AgentWorkClaim(id="transferred", owner_id=1, work_key="transferred",
+        summary="Transferred", owner_chat_id="source", owner_run_id="run",
+        revision=2, previous_owner_chat_id="waiting"),
+    ])
+    db.flush()
+    for identity, claim_id, revision in (
+      ("terminal", "finished", 2), ("old-revision", "finished", 1),
+      ("transfer", "transferred", 2),
+    ):
+      db.add(models.AgentCoordinationMessage(id=identity, room_kind="workspace",
+        room_id="owner:1", from_chat_id="source", to_chat_id="waiting",
+        from_run_id=f"work-claim:{claim_id}", send_id=f"revision:{revision}",
+        kind="claim_notice", delivery="interrupt", body=identity))
+    def carrier(cid, ids):
+      return {"role": "user", "kind": "peer_message", "hidden": True,
+        "cid": cid, "peer_message_through": {"id": ids[-1]},
+        "content": "<agent_coordination>" + json.dumps({
+          "self_chat_id": "waiting", "messages": [{"id": item} for item in ids],
+        }) + "</agent_coordination>"}
+    waiting = db.get(models.Chat, "waiting")
+    waiting.pending_messages = [carrier("terminal-only", ["terminal"]),
+      carrier("transfer-only", ["transfer"]),
+      carrier("mixed", ["terminal", "transfer"]),
+      {"role": "user", "cid": "owner", "content": "Keep me"}]
+    db.add(models.ChatRun(id="receipt-run", chat_id="waiting",
+      root_run_id="receipt-run", status="completed", provider="codex",
+      peer_message_through_created_at=now, peer_message_through_id="receipt"))
+    db.commit()
+
+  version = "0094_retire_legacy_claim_notice_carriers"
+  monkeypatch.setattr(schema_migrations, "_SCHEMA_MIGRATIONS", (
+    (version, schema_migrations._retire_legacy_claim_notice_carriers),
+  ))
+  schema_migrations.run_migrations(eng)
+  schema_migrations.run_migrations(eng)
+  with Session(eng) as db:
+    notices = {row.id: row.delivery for row in
+      db.query(models.AgentCoordinationMessage).all()}
+    assert notices == {"terminal": "next_turn", "old-revision": "interrupt",
+      "transfer": "interrupt"}
+    waiting = db.get(models.Chat, "waiting")
+    assert [item["cid"] for item in waiting.pending_messages] == [
+      "transfer-only", "mixed", "owner"]
+    receipt = db.get(models.ChatRun, "receipt-run")
+    assert receipt.peer_message_through_created_at == now
+    assert receipt.peer_message_through_id == "receipt"
+    assert schema_migrations._applied_migrations(eng) == {version}
+  eng.dispose()
 
 
 @pytest.mark.parametrize("missing", ["table", "suppression_field"])

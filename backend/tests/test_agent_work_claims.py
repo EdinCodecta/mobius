@@ -1329,3 +1329,58 @@ def test_refollow_after_stalled_source_still_enforces_cycle_and_64_cap(db, block
   assert stage_follow_claim(db, claim, chat_id=second.id, run_id="claim-run-second") == blocker
   assert db.query(models.GoalDependency).count() == before
   assert old.result_disposition == "delivered"
+
+
+@pytest.mark.parametrize("status", ["armed", "met"])
+@pytest.mark.parametrize("affinity", ["exact", "other-root", "other-goal", "disposed"])
+def test_goalless_claim_source_keeps_exact_armed_or_owed_wait(db, status, affinity):
+  from app.chat_writer import ReconcileClaimSources, get_writer
+  from app.chat_waits import declare_wait
+  owner, first, _ = _owned_goal_claim(db)
+  source = db.get(models.ChatRun, "claim-run-first")
+  _claim_row(db).owner_goal_id = None
+  source.goal_id = None
+  source.status = "completed"
+  db.commit()
+  wait = declare_wait(db, chat_id=first.id, description="External work",
+    kind="timer", delay_secs=60, created_by_run_id=source.id)
+  wait.status = status
+  if affinity == "other-root":
+    wait.root_run_id = "unrelated-root"
+  elif affinity == "other-goal":
+    wait.goal_id = "claim-goal-first"
+  elif affinity == "disposed":
+    wait.status, wait.result_disposition = "met", "delivered"
+  db.commit()
+  expected_pending = affinity == "exact"
+  assert get_writer().submit(ReconcileClaimSources()).result(timeout=5) == (0 if expected_pending else 1)
+  db.expire_all()
+  row = db.query(models.GoalDependency).one()
+  assert (row.resolved_at is None) == expected_pending
+  if not expected_pending:
+    assert row.outcome_json["kind"] == "owner_not_progressing"
+
+
+@pytest.mark.parametrize("affinity", ["exact", "other-root", "other-goal", "not-waking"])
+def test_goalless_claim_source_keeps_exact_self_resuming_helper(db, affinity):
+  from app.chat_writer import ReconcileClaimSources, get_writer
+  owner, first, _ = _owned_goal_claim(db)
+  source = db.get(models.ChatRun, "claim-run-first")
+  _claim_row(db).owner_goal_id = None
+  source.goal_id = None
+  source.status = "completed"
+  child = create_chat(id="source-helper", title="Helper", messages=[])
+  db.add(child)
+  db.flush()
+  db.add(models.ChatRun(id="helper-run", root_run_id="helper-run", chat_id=child.id,
+    status="running", provider="codex"))
+  db.add(models.Delegation(id="source-delegation", parent_chat_id=first.id,
+    parent_root_run_id=source.root_run_id if affinity != "other-root" else "unrelated-root",
+    goal_id="claim-goal-first" if affinity == "other-goal" else None,
+    child_chat_id=child.id, task_key="source-help", provider="codex", scope="write",
+    cwd="/tmp", prompt_sha256="test", notify_parent_on_complete=affinity != "not-waking"))
+  db.commit()
+  expected_pending = affinity == "exact"
+  assert get_writer().submit(ReconcileClaimSources()).result(timeout=5) == (0 if expected_pending else 1)
+  db.expire_all()
+  assert (db.query(models.GoalDependency).one().resolved_at is None) == expected_pending

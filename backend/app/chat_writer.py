@@ -63,7 +63,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app import chat_archive, models, schemas, transcript_rows
 from app.goals import admit_goal
 from app.chat_titles import apply_generated_title, first_message_title
-from app.continuations import SIDE_QUESTION_MESSAGE_KIND
+from app.continuations import DEPENDENCY_RESULT_MESSAGE_KIND, SIDE_QUESTION_MESSAGE_KIND
 from app.json_safety import json_safe
 from app.upload_lifecycle import claim_uploads, release_uploads
 from app.events import (
@@ -2100,11 +2100,16 @@ class ChatWriterActor:
     real helpers.  The contention tests in `test_chat_writer_contention`
     drive a real `SessionLocal`, exercising the real dispatch below.
     """
-    if isinstance(cmd, (
-        QuestionCommit, AnswerQuestion, AppendPending, Finalize, FinishRun,
-        ReplaceTranscript, ParkRun)):
-      # Read source state only after the graph fence: subscriptions, answers,
-      # Stop and replacement must agree on one side of the transition.
+    if (isinstance(cmd, (QuestionCommit, AnswerQuestion, Finalize, FinishRun))
+        or isinstance(cmd, AppendPending) and (
+          bool(cmd.answers) or cmd.user_msg.get("kind") == DEPENDENCY_RESULT_MESSAGE_KIND)
+        or isinstance(cmd, ReplaceTranscript) and cmd.messages is not None):
+      # These commands may publish/settle a saved card or its dependents.
+      # Fence BEFORE reading the chat/card: a later stage_* lock alone would
+      # not protect a source marker read before a concurrent subscription.
+      # A dependency-result append also fences withdrawal's receivability
+      # check. Plain queue appends, title-only updates and ParkRun touch no
+      # graph edge or decision disposition, so need no owner-wide lock.
       from app.decision_cards import fence_decisions
       fence_decisions(db)
     if isinstance(cmd, WithdrawGoalDependency):
@@ -5296,13 +5301,11 @@ class ChatWriterActor:
     rejected = [row for row in pending if row.get("delivery_status") == "rejected"]
     from app.chat_waits import wait_result_message_blocker
     from app.goal_dependencies import dependency_result_message_blocker
-    from app.goal_dependency_sources import obsolete_claim_notice_carrier
     runnable = [
       row for row in pending
       if row.get("delivery_status") != "rejected"
       if not wait_result_message_blocker(db, cmd.chat_id, row)
       if not dependency_result_message_blocker(db, cmd.chat_id, row)
-      if not obsolete_claim_notice_carrier(db, cmd.chat_id, row)
       if not goal_clear_requested(str(row.get("content") or ""))
       and not is_retired_goal_handoff(row)
     ]

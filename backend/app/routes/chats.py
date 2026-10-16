@@ -780,7 +780,8 @@ def _chat_detail_response(
     for block in (message.get("blocks") or []) if isinstance(block, dict) and block.get("type") == "question"}
   backlinks = source_dependency_backlinks(db, chat.id, question_ids=question_ids) if expose_session else {}
   dependency_summaries = terminal_dependency_summaries_by_message_index(
-    db, chat.id, coordinates, include_foreign_context=expose_session)
+    db, chat.id, coordinates, message_start=start, message_end=start + len(page),
+    include_foreign_context=expose_session)
   if backlinks or dependency_summaries:
     page = [{**message,
       **({"blocks": [{**block, "needed_by": backlinks[block["question_id"]]}
@@ -1860,10 +1861,11 @@ def get_chat(
   of the first message in this page) and `total` (total message count).
 
   `anchor` is a durable rendered-row key used when restoring an older reading
-  position. If found, the response contains that row through the current tail
-  from one authoritative snapshot and reports `requested_anchor_found=true`;
-  `limit` is intentionally ignored. If it is absent, the ordinary latest page
-  is returned with `requested_anchor_found=false`.
+  position. If found, the response includes a predecessor when available and reports
+  `requested_anchor_found=true`. A `question:` anchor returns at most `limit`
+  messages starting at the matched row; other anchors extend through the tail,
+  ignoring `limit`. Both use one authoritative snapshot. If no row matches the
+  anchor, the ordinary latest page returns `requested_anchor_found=false`.
   """
   if principal.scope == "app":
     raise HTTPException(status_code=403, detail="App token is not valid here.")

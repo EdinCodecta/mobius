@@ -11,6 +11,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import models
+from app.decision_cards import fence_owner
+from app.goal_dependencies import pending_follow_predicate
 from app.timeutil import now_naive_utc
 from app.goal_dependency_sources import stage_follow_claim, stage_stamp_claim_outcome
 
@@ -97,10 +99,7 @@ def _stage_goal_owner_change(db: Session, row: models.AgentWorkClaim, *,
     follower_goals = db.query(models.GoalDependency.waiting_goal_id).filter(
       models.GoalDependency.target_acquisition_id == row.acquisition_id,
       models.GoalDependency.waiting_goal_id != goal_id,
-      models.GoalDependency.resolved_at.is_(None),
-      models.GoalDependency.result_disposition.is_(None),
-      models.GoalDependency.withdrawn_at.is_(None),
-      models.GoalDependency.owner_suppressed_at.is_(None),
+      pending_follow_predicate(),
     ).all()
     if any(_direct_cycle(db, waiting_goal_id=follower_goal, source_goal_id=goal_id)
            for (follower_goal,) in follower_goals):
@@ -108,20 +107,14 @@ def _stage_goal_owner_change(db: Session, row: models.AgentWorkClaim, *,
       raise ValueError("Transfer would create a direct Goal dependency cycle.")
   db.query(models.GoalDependency).filter(
     models.GoalDependency.target_acquisition_id == row.acquisition_id,
-    models.GoalDependency.resolved_at.is_(None),
-    models.GoalDependency.result_disposition.is_(None),
-    models.GoalDependency.withdrawn_at.is_(None),
-    models.GoalDependency.owner_suppressed_at.is_(None),
+    pending_follow_predicate(),
   ).update({models.GoalDependency.target_chat_id: chat_id}, synchronize_session=False)
   # Only the acquiring Goal becomes executor. Other Goals in the same chat
   # remain subscribed, even when the acquisition completes before transfer out.
   db.query(models.GoalDependency).filter(
     models.GoalDependency.target_acquisition_id == row.acquisition_id,
     models.GoalDependency.waiting_goal_id == goal_id,
-    models.GoalDependency.resolved_at.is_(None),
-    models.GoalDependency.result_disposition.is_(None),
-    models.GoalDependency.withdrawn_at.is_(None),
-    models.GoalDependency.owner_suppressed_at.is_(None),
+    pending_follow_predicate(),
   ).update({models.GoalDependency.owner_suppressed_at: now}, synchronize_session=False)
   previous_follow_status = "no_open_top_level_goal"
   if previous_goal_id and previous_goal_id != goal_id:
@@ -216,9 +209,7 @@ def claim_work(
   if row.owner_chat_id == chat_id:
     # Refreshing ownership from a different Goal in the same chat also changes
     # graph edges. Serialize it with follows/transfers and reject reverse edges.
-    db.query(models.Owner).filter(models.Owner.id == owner_id).update(
-      {models.Owner.username: models.Owner.username}, synchronize_session=False,
-    )
+    fence_owner(db, owner_id)
     db.refresh(row)
     if row.owner_chat_id != chat_id:
       db.rollback()
@@ -282,9 +273,7 @@ def claim_work(
 
   # Transfer may create a reverse Goal edge, so share the tenant-scoped graph
   # fence with ordinary follow registration before checking direct cycles.
-  db.query(models.Owner).filter(models.Owner.id == owner_id).update(
-    {models.Owner.username: models.Owner.username}, synchronize_session=False,
-  )
+  fence_owner(db, owner_id)
   db.expire(row)
   db.refresh(row)
   if row.owner_chat_id != expected_owner_chat_id:

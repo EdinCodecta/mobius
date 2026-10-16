@@ -109,18 +109,27 @@ def native_goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
   A NULL-owned historical helper is included only when its immutable root is
   the Goal id; a mutable physical run link is not evidence of ownership.
   """
+  return native_handoffs(db, goal.chat_id, goal_id=goal.id)
+
+
+def native_handoffs(db: Session, chat_id: str, *, goal_id: str | None,
+                    root_run_id: str | None = None) -> GoalHandoffs:
+  """Native progress owned by an exact Goal or a Goal-less causal root."""
+  if goal_id is None and root_run_id is None:
+    raise ValueError("Goal-less handoffs require an exact causal root")
   from app import models, questions
   from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED, serialize_wait
   from app.delegations import _self_resuming_helper_rows
   from app.chat import continuation_handoff_for_chat
 
-  latest = db.query(models.ChatRun.id, models.ChatRun.goal_id, models.ChatRun.status).filter(
-    models.ChatRun.chat_id == goal.chat_id,
+  latest = db.query(models.ChatRun.id, models.ChatRun.root_run_id, models.ChatRun.goal_id, models.ChatRun.status).filter(
+    models.ChatRun.chat_id == chat_id,
   ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).first()
-  owns_chat_attempt = latest is not None and latest.goal_id == goal.id
-  pending = questions.get(goal.chat_id)
+  owns_chat_attempt = (latest is not None and latest.goal_id == goal_id
+    and (goal_id is not None or (latest.root_run_id or latest.id) == root_run_id))
+  pending = questions.get(chat_id)
   pending_id = db.query(models.Chat.pending_question_id).filter(
-    models.Chat.id == goal.chat_id,
+    models.Chat.id == chat_id,
   ).scalar()
   # Saved-card admission prevents a successor until this marker is answered
   # or cancelled; native in-turn questions carry their explicit run identity.
@@ -130,9 +139,12 @@ def native_goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
       card = GoalCardHandoff(question_id=pending_id, kind="saved")
     elif pending is not None and pending.run_token == latest.id:
       card = GoalCardHandoff(question_id=pending.question_id, kind="in_turn")
-  wait_rows = _goal_waits(db, goal.chat_id, goal.id).filter(
+  wait_query = _goal_waits(db, chat_id, goal_id).filter(
     (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
-  ).all()
+  )
+  if goal_id is None:
+    wait_query = wait_query.filter(models.ChatWait.root_run_id == root_run_id)
+  wait_rows = wait_query.all()
   waits = tuple(GoalWaitHandoff(
     wait_id=saved["id"], kind=saved["kind"],
     delivery_pending=saved["delivery_pending"],
@@ -140,14 +152,15 @@ def native_goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
   ) for saved in (serialize_wait(row, db=db) for row in wait_rows))
   helpers = tuple(
     GoalHelperHandoff(delegation_id=row.id, kind="self_resuming")
-    for row, _status in _self_resuming_helper_rows(db, {goal.chat_id})
-    if row.goal_id == goal.id or (
-      row.goal_id is None and row.parent_root_run_id == goal.id
-    )
+    for row, _status in _self_resuming_helper_rows(db, {chat_id})
+    if (goal_id is not None and (row.goal_id == goal_id or (
+      row.goal_id is None and row.parent_root_run_id == goal_id
+    ))) or (goal_id is None and row.goal_id is None
+      and row.parent_root_run_id == root_run_id)
   )
   park = None
   if owns_chat_attempt and latest.status in models.CONTINUATION_RUN_STATUSES:
-    projected = continuation_handoff_for_chat(db, goal.chat_id)
+    projected = continuation_handoff_for_chat(db, chat_id)
     if projected["kind"] != "none":
       park = GoalParkHandoff(
         run_id=latest.id, kind=projected["kind"], reason=projected.get("reason"),
@@ -158,7 +171,7 @@ def native_goal_handoffs(db: Session, goal: models.ChatGoal) -> GoalHandoffs:
     waits=waits,
     helpers=helpers,
     dependencies=(),
-    queued=queued_goal_continuations(db, goal.chat_id, goal.id),
+    queued=queued_goal_continuations(db, chat_id, goal_id, root_run_id=root_run_id),
     park=park,
     failed_attempt=bool(owns_chat_attempt and latest.status in {"failed", "interrupted"}),
   )
