@@ -3927,13 +3927,13 @@ async def test_stdio_headroom_keeps_two_full_media_calls_and_a_control_admissibl
 def test_stdio_execution_overhead_includes_fixed_and_size_scaled_costs():
   # Independent pins complement peak-allocation tests and callers that derive
   # their expected execution charge from the production formula.
-  assert app_services._stdio_overhead(4096) == 299208
-  assert app_services._stdio_overhead(60 * MIB) == 495304
+  assert app_services._stdio_overhead(4096) == 1085752
+  assert app_services._stdio_overhead(60 * MIB) == 1281848
 
 
 @pytest.mark.asyncio
 async def test_execution_reserves_the_larger_encoding_peak_instead_of_stdio():
-  cap = MIB
+  cap = 2 * MIB
   with app_services.ServiceExchangeAdmission(cap) as admission:
     await admission.retain({"body": "x" * (cap - 1024)})
     encoding = app_services._json_encoding_peak(
@@ -3942,4 +3942,50 @@ async def test_execution_reserves_the_larger_encoding_peak_instead_of_stdio():
     assert encoding > _execution_transfer(cap)
     admission.admit_execution(cap)
     assert admission.transfer_cost == encoding
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_child_drains_paused_output_before_wait_can_finish(monkeypatch):
+  drained = asyncio.Event()
+  events = []
+
+  class Reader:
+    async def read(self, size):
+      assert size == app_services._STDIO_SLICE
+      events.append("drained")
+      drained.set()
+      return b""
+
+  class Process:
+    pid = 42
+    stdout = Reader()
+    stderr = Reader()
+
+    async def wait(self):
+      # A real subprocess transport with paused unread pipes behaves this
+      # way even after SIGKILL: reaping alone cannot complete its waiters.
+      await drained.wait()
+      events.append("reaped")
+
+  monkeypatch.setattr(app_services.os, "killpg", lambda *_: events.append("killed"))
+  pending_read = asyncio.create_task(asyncio.Event().wait())
+  try:
+    await asyncio.wait_for(app_services._stop_process(Process(), pending_read), timeout=1)
+  finally:
+    pending_read.cancel()
+    await asyncio.gather(pending_read, return_exceptions=True)
+  assert events[0] == "killed" and "reaped" in events
+
+
+@pytest.mark.asyncio
+async def test_bounded_diagnostics_stay_reserved_through_response_decode():
+  raw = b'{"status":500,"body":{}}'
+  diagnostic = "x" * 999 + "😀"
+  with app_services.ServiceExchangeAdmission(4096) as admission:
+    admission.admit_output(raw, diagnostic)
+    expected = 3 * len(raw) + app_services._JSON_STRING_COST + 4 * len(diagnostic)
+    assert admission.transfer_cost == expected
+    await admission.decode_response(raw)
+    assert admission.transfer_cost == expected
   assert app_services._admitted_exchange_cost == 0

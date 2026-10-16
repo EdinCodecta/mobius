@@ -339,7 +339,7 @@ async def run(
   tasks: list[asyncio.Task] = []
 
   async def wrap(sock: socket.socket):
-    reader, writer = await asyncio.open_connection(sock=sock)
+    reader, writer = await asyncio.open_connection(sock=sock, limit=STDIO_CHUNK_BYTES)
     unwrapped.discard(sock)
     writers.append(writer)
     return reader, writer

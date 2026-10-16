@@ -186,10 +186,13 @@ _EXHAUSTED = object()
 _STDIO_SLICE = service_preload.STDIO_CHUNK_BYTES
 # A bytes header, block waste and a (growing) list slot per collected chunk.
 _STDIO_CHUNK_COST = 33 + _RETAINED_BLOCK_SLACK + 16
-# CPython's selector pipe/socket read callback can allocate max_size (256 KiB)
-# even for a tiny reply. Charge it to each executing exchange, conservatively:
-# callbacks are serialized, but this avoids a separate process-wide owner.
+# One selector callback may allocate 256 KiB. Each of the two StreamReaders
+# can retain twice its 64 KiB flow-control limit plus that final callback's
+# data before pausing, including when an oversized output is rejected.
+# Charge all buffers and one callback to each exchange, conservatively, rather
+# than introducing a separate process-wide owner. uvloop needs less.
 _STDIO_READ_TRANSIENT = 256 * 1024 + 33 + _RETAINED_BLOCK_SLACK
+_STDIO_RECEIVE_COST = 3 * _STDIO_READ_TRANSIENT + 4 * _STDIO_SLICE
 
 
 def _stdio_overhead(max_bytes: int) -> int:
@@ -199,10 +202,10 @@ def _stdio_overhead(max_bytes: int) -> int:
   stdout and stderr chunks carry their headers; stderr is collected and joined
   like stdout. Reader buffers hold output not yet collected, so they fit the
   joined copy, which does not exist until reading ends. The callback transient
-  is additional, including for routes much smaller than one read.
+  and receive-buffer overshoot are additional, including for tiny routes.
   """
   return (
-    _STDIO_READ_TRANSIENT
+    _STDIO_RECEIVE_COST
     + min(max_bytes, 2 * _STDIO_SLICE)
     + (max_bytes // _STDIO_SLICE + 2) * _STDIO_CHUNK_COST
     + 2 * MAX_ERROR_BYTES
@@ -348,16 +351,20 @@ class ServiceExchangeAdmission:
     )
     self._hold("execution", transfer=max(3 * max_bytes + _stdio_overhead(max_bytes), encoding))
 
-  def admit_output(self, stdout: bytes):
+  def admit_output(self, stdout: bytes, diagnostic: str = ""):
     """Replace the transfer allowance by the stdout the process produced.
 
     The serialized request is gone; the response's raw, decoded and rendered
     copies are bounded by three copies of its actual stdout plus what the
-    response estimate adds for rendering. A finished exchange awaiting
-    response handoff therefore no longer holds a ceiling sized for output it
+    response estimate adds for rendering, plus the bounded diagnostic text.
+    A finished exchange awaiting response handoff no longer holds a ceiling
+    sized for output it
     did not produce.
     """
-    self._hold("response", transfer=3 * len(stdout))
+    diagnostic_cost = (
+      _JSON_STRING_COST + len(diagnostic) * _json_text_width(diagnostic) if diagnostic else 0
+    )
+    self._hold("response", transfer=3 * len(stdout) + diagnostic_cost)
 
   def _decoded_cost(self, cost: int, *, direction: str = "request"):
     if cost > MAX_JSON_DECODE_COST:
@@ -1123,16 +1130,21 @@ async def _stop_process(process, *tasks) -> None:
     os.killpg(process.pid, signal.SIGKILL)
   except ProcessLookupError:
     pass
-  if not tasks:
-    # Admission cancellation has not installed pipe readers yet. Drain the
-    # now-stopped child as well as reaping it; wait() alone can block on a full
-    # asyncio pipe buffer even after SIGKILL.
-    await process.communicate()
-    return
-  await process.wait()
   for task in tasks:
     task.cancel()
   await asyncio.gather(*tasks, return_exceptions=True)
+
+  async def discard(reader):
+    if reader is not None:
+      while await reader.read(_STDIO_SLICE):
+        pass
+
+  # A rejected output can leave a paused pipe with unread bytes. wait() alone
+  # cannot reap its transport until those bytes drain, even after SIGKILL.
+  # Discard instead of communicate(), which retains another output copy.
+  await asyncio.gather(
+    process.wait(), discard(process.stdout), discard(process.stderr),
+  )
 
 
 async def _settled_stop(process, *tasks) -> None:
@@ -1195,6 +1207,7 @@ async def _run_spawned(
       cwd=str(entry.parent),
       env=environment,
       start_new_session=True,
+      limit=_STDIO_SLICE,
     ))
     try:
       process = await asyncio.shield(spawn)
@@ -1403,9 +1416,11 @@ async def _invoke_admitted_service(
         detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
         log.warning("App service %s failed: %s", app.slug, detail or "no diagnostics")
         raise ServiceBoundaryError("process_failed", 502, "App service failed.")
-      # The output phase no longer reserves stderr or the serialized request.
+      # Retain only the bounded text needed if the JSON reports a handled
+      # failure; decode its raw stderr while execution headroom is still held.
+      diagnostic = stderr.decode("utf-8", errors="replace").strip()[-1000:]
       del stderr, outcome
-      admission.admit_output(stdout)
+      admission.admit_output(stdout, diagnostic)
   finally:
     pin.close()
   try:
@@ -1420,12 +1435,10 @@ async def _invoke_admitted_service(
   status = response.get("status", 200)
   if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status <= 599:
     raise ServiceBoundaryError("invalid_status", 502, "App service returned an invalid status.")
-  if status >= 500 and stderr:
-    detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
-    if detail:
-      # A handled app failure still exits its adapter successfully, so preserve
-      # its bounded diagnostics without exposing them in the HTTP response.
-      log.warning("App service %s returned %d: %s", app.slug, status, detail)
+  if status >= 500 and diagnostic:
+    # A handled app failure still exits its adapter successfully, so preserve
+    # its bounded diagnostics without exposing them in the HTTP response.
+    log.warning("App service %s returned %d: %s", app.slug, status, diagnostic)
   try:
     headers = _response_headers(
       response.get("headers"), public=bool(request_envelope.get("public")),

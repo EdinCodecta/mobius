@@ -213,7 +213,8 @@ by decoding again is not matched. An unmatched route or method keeps the
 whole `max_bytes` grant. A matched route's ceiling bounds the request body
 read (before buffering), the serialized request, the service's stdout and a
 decoded binary response, and execution admission reserves three times that
-smaller ceiling plus bounded stdio overhead (described below). The ceiling governs admission accounting only; it promises no
+smaller ceiling plus bounded stdio overhead (described below). The ceiling
+governs admission accounting only; it promises no
 execution priority, queue position, availability under load or process RSS.
 Adding or lowering a route ceiling narrows the service in update review;
 removing, renaming or raising one widens it.
@@ -301,17 +302,22 @@ waiting for its execution slot holds only its retained envelope estimate.
 Inside the slot, before the request is serialized or any process starts, the
 exchange reserves three times its accepted serialized ceiling for the input
 and two stdout copies, plus bounded stdio overhead: at most two 64 KiB pending
-input slices, chunk headers, bounded stderr and a 256 KiB selector-read
-transient (including its object overhead). That transient is conservatively
-charged per executing exchange inside the same total budget, even though
-callbacks run one at a time. Input writes yield under backpressure, and both
+input slices, chunk headers and bounded stderr. Each executing exchange also
+reserves the two readers' bounded receive-buffer overshoot and one 256 KiB
+selector-read transient (including object overhead), even for oversized
+responses on tiny routes. These conservatively charged costs stay inside the
+same total budget, even though callbacks run one at a time. Input writes yield
+under backpressure, and both
 execution paths collect whole 64 KiB output chunks regardless of service write
 sizes; neither unsent-input copies nor fragment headers grow unaccounted.
 The reservation is larger instead when encoding its largest string part needs
 more. When the budget cannot hold
 that allowance, the call answers a retryable HTTP **503** with `Retry-After`
-and no service runs. Once the service answers, the allowance is replaced by
-three copies of its actual stdout, so finished responses awaiting handoff do
+and no service runs. Rejected processes are killed and their remaining pipes
+drained without retaining their output before the runtime pin is released.
+Once the service answers, the allowance is replaced by three copies of its
+actual stdout plus any bounded diagnostic text, so finished responses awaiting
+handoff do
 not hold a media-sized allowance. Decoded cost is charged before
 materialization. Once request decoding is complete, its freed
 transient Unicode copy is replaced by the retained envelope estimate; the
