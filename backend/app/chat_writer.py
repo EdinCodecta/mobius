@@ -1183,7 +1183,8 @@ class AuthorizeCheckpoint(_Command):
   """Admit a continuity save from the chat's live run; apply its name.
 
   Returns ``{"status": "ok", "title_applied": bool}`` or
-  ``{"status": "stale_run"}``. The note file itself is written by the caller
+  ``{"status": "stale_run", "reason": <code>}``, where the code names which
+  live-run condition failed. The note file itself is written by the caller
   under the chat's transition lock.
   """
 
@@ -5042,22 +5043,38 @@ class ChatWriterActor:
       "agent_settings_json": chat.agent_settings_json,
     }
 
-  def _owned_live_run(self, db, chat_id: str, run_token: str):
+  def _live_run_refusal(self, db, chat_id: str, run_token: str):
+    """Why ``run_token`` is not the chat's live owner run, or ``None``.
+
+    The reason is a stable code a caller can show an agent; ``_owned_live_run``
+    is the same check for callers that only need the run. The run is bound to
+    ``chat_id`` before anything about the chat is consulted, so a run asking
+    about another chat learns only ``run_unknown``, never that chat's state.
+    """
     run = db.get(models.ChatRun, run_token) if run_token else None
-    if (
-      _active_chat(db, chat_id) is None or run is None or run.chat_id != chat_id
-      or run.status != "running"
-      or self._run_token_owner.get(chat_id) != run_token
-      or not self._run_is_latest(db, run)
-    ):
+    if run is None or run.chat_id != chat_id:
+      return "run_unknown"
+    if _active_chat(db, chat_id) is None:
+      return "chat_inactive"
+    if run.status != "running":
+      return "run_not_running"
+    if self._run_token_owner.get(chat_id) != run_token:
+      return "run_not_owner"
+    if not self._run_is_latest(db, run):
+      return "run_not_latest"
+    return None
+
+  def _owned_live_run(self, db, chat_id: str, run_token: str):
+    if self._live_run_refusal(db, chat_id, run_token) is not None:
       return None
-    return run
+    return db.get(models.ChatRun, run_token)
 
   def _authorize_checkpoint(self, db, cmd: AuthorizeCheckpoint) -> dict:
     chat = _active_chat(db, cmd.chat_id)
-    if self._owned_live_run(db, cmd.chat_id, cmd.run_token) is None:
+    reason = self._live_run_refusal(db, cmd.chat_id, cmd.run_token)
+    if reason is not None:
       db.rollback()
-      return {"status": "stale_run"}
+      return {"status": "stale_run", "reason": reason}
     title_applied = bool(cmd.title and apply_generated_title(chat, cmd.title))
     if title_applied and not _commit_or_rollback(db):
       raise _PersistFailed("AuthorizeCheckpoint title did not persist")

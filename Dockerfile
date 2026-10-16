@@ -111,6 +111,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && [ "$(printf '%s\n' "2.38" "$git_version" | sort -V | head -n1)" = "2.38" ] \
     && rm -rf /root/.npm /var/lib/apt/lists/*
 
+# Only Liberation fonts are installed, and fontconfig then resolves the generic
+# serif and sans-serif families (and system-ui, which falls back to sans-serif)
+# to Liberation Mono. Pages and app screenshots would render monospace, unlike
+# an owner's device. Pin the generics to the matching proportional faces, and
+# fail the build if they ever stop resolving that way.
+RUN printf '%s\n' \
+      '<?xml version="1.0"?>' \
+      '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">' \
+      '<fontconfig>' \
+      '  <alias binding="same"><family>sans-serif</family><prefer><family>Liberation Sans</family></prefer></alias>' \
+      '  <alias binding="same"><family>serif</family><prefer><family>Liberation Serif</family></prefer></alias>' \
+      '</fontconfig>' > /etc/fonts/conf.d/61-mobius-fonts.conf \
+    && fc-cache -f \
+    && [ "$(fc-match --format '%{family}' sans-serif)" = "Liberation Sans" ] \
+    && [ "$(fc-match --format '%{family}' system-ui)" = "Liberation Sans" ] \
+    && [ "$(fc-match --format '%{family}' serif)" = "Liberation Serif" ]
+
 # Use the pinned library for Python and other dynamically linked consumers,
 # not just the CLI. Keep Debian's package for its dependency metadata.
 COPY --from=sqlite-runtime /sqlite-runtime/usr/local/lib/libsqlite3.so* /usr/local/lib/
