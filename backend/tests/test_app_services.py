@@ -8,6 +8,7 @@ import os
 import random
 from pathlib import Path
 import signal
+import sys
 import time
 import tracemalloc
 from types import SimpleNamespace
@@ -2156,8 +2157,8 @@ async def test_response_budget_adds_retained_request_before_parsing(db, auth, mo
 
   async def reply(*_args):
     request_reserved = app_services._admitted_exchange_cost
-    assert request_reserved > 3 * 4096
-    retained_request = request_reserved - 3 * 4096
+    assert request_reserved > _execution_transfer(4096)
+    retained_request = request_reserved - _execution_transfer(4096)
     # Either direction fits alone; their simultaneously retained costs do not.
     monkeypatch.setattr(
       app_services, "MAX_ADMITTED_EXCHANGE_COST", retained_request + response_alone - 1,
@@ -2654,6 +2655,10 @@ sys.stdout.write('{"body":"' + '\\\\n' * 100_000 + '"}')
 MIB = 1024 * 1024
 
 
+def _execution_transfer(max_bytes):
+  return 3 * max_bytes + app_services._stdio_overhead(max_bytes)
+
+
 def _route_limit(method, path, max_bytes):
   return {
     "method": method, "path": path,
@@ -2863,7 +2868,7 @@ async def test_http_route_ceiling_is_reserved_and_enforced_before_body_decode(
   # Three copies of the ceiling; encoding a ceiling-sized string part also
   # holds the part, its bytes and encoder state (measured 13.2 KB at 4 KiB).
   assert [size for size, _transfer in executions] == [cap, cap]
-  assert executions[0][1] > 13_210 and executions[1] == (cap, 3 * cap), "admission did not reserve the route ceiling"
+  assert executions[0][1] > 13_210 and executions[1] == (cap, _execution_transfer(cap)), "admission did not reserve the route ceiling"
   if framing == "understated-length":
     assert [read[3] for read in reads[:2]] == ["2", "2"]
   assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
@@ -2911,8 +2916,9 @@ async def test_tool_and_policy_requests_use_their_route_ceiling_before_execution
     ("/tools/log", cap), ("reviewer/validate-comment", cap), ("/tools/other", 60 * MIB),
   ]
   for _path, limit, cost in executed:
-    # Three serialized copies of the selected ceiling plus the small envelope.
-    assert 3 * limit <= cost < 3 * limit + 64 * 1024
+    # Three serialized copies of the selected ceiling, the running process's
+    # stdio overhead and the small envelope.
+    assert _execution_transfer(limit) <= cost < _execution_transfer(limit) + 64 * 1024
   assert app_services._admitted_exchange_cost == 0
 
 
@@ -3493,7 +3499,7 @@ async def test_queued_tool_and_policy_requests_serialize_only_after_execution_ad
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
   assert (result if caller == "policy" else result[1]) == {"ok": True}
-  assert serialized == [(cap, 3 * cap + retained)]
+  assert serialized == [(cap, _execution_transfer(cap) + retained)]
   assert app_services._admitted_exchange_cost == 0
 
 
@@ -3764,3 +3770,160 @@ async def test_service_traces_categorize_exchange_failures_without_changing_resp
     {"mobius.app.slug": "service-test"}, {"mobius.service.error_type": category},
   ]
   assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answers_first", [False, True])
+@pytest.mark.parametrize("lane", ["spawn", "preload"])
+@pytest.mark.parametrize("stderr_bytes", [0, app_services.MAX_ERROR_BYTES])
+@pytest.mark.parametrize("cap", [4096, 64 * 1024, MIB, 8 * MIB])
+async def test_stdio_fits_its_execution_reservation_in_either_order(
+  tmp_path, monkeypatch, answers_first, lane, stderr_bytes, cap,
+):
+  # A service may answer and close stdout before reading stdin; the unsent
+  # request then waits in the pipe transport while stdout is collected.
+  collected = tmp_path / "collected"
+  entry = tmp_path / "service.py"
+  answer = (
+    f"view = memoryview(b'{{\"body\":\"' + b'x' * ({cap} - 11) + b'\"}}')\n"
+    "while view: view = view[os.write(1, view):]\n"
+  )
+  close_stdout = (
+    "socket.socket(fileno=os.dup(1)).shutdown(socket.SHUT_WR)\n"
+    if lane == "preload" else "os.close(1)\n"
+  )
+  action = (
+    answer + close_stdout
+    + f"while not os.path.exists({str(collected)!r}): time.sleep(0.001)\n"
+    + "sys.stdin.buffer.read()\n"
+    if answers_first else "sys.stdin.buffer.read()\n" + answer
+  )
+  entry.write_text(
+    "import os, sys, time, socket\nMOBIUS_PRELOAD = True\n"
+    + 'if __name__ == "__main__":\n'
+    + f"  os.write(2, b\"e\" * {stderr_bytes})\n"
+    + "".join("  " + line + "\n" for line in action.splitlines())
+  )
+  preload = app_services.service_preload
+  environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+  host = None
+  if lane == "preload":
+    host = await preload.start((990, "stdio-budget"), "service-test", sys.executable, entry, environment)
+    assert host is not None
+  real_read = preload.read_bounded
+
+  async def read_then_release(reader, limit):
+    data = await real_read(reader, limit)
+    if limit == cap:
+      collected.touch()
+    return data
+
+  monkeypatch.setattr(app_services, "_read_bounded", read_then_release)
+  monkeypatch.setattr(preload, "read_bounded", read_then_release)
+  tracemalloc.start()
+  try:
+    with app_services.ServiceExchangeAdmission(cap) as admission:
+      part = min(16384, cap // 8)
+      envelope = {"body": [str(i).ljust(part, "x") for i in range(cap // part - 2)], "actor": {}}
+      await admission.retain(envelope)
+      admission.admit_execution(cap)
+      request = await app_services._serialize_request(envelope, cap)
+      tracemalloc.reset_peak()
+      if lane == "spawn":
+        stdout, _stderr, code = await app_services._run_spawned(
+          sys.executable, entry, environment, request, 30, cap,
+        )
+      else:
+        stdout, _stderr, code = await preload.run(
+          host, environment, request, timeout_seconds=30,
+          max_stdout=cap, max_stderr=app_services.MAX_ERROR_BYTES,
+        )
+      peak = tracemalloc.get_traced_memory()[1]
+      assert code == 0 and len(stdout) == cap
+      assert _stderr == b"e" * stderr_bytes
+      assert peak <= admission.cost, (peak, admission.cost)
+  finally:
+    tracemalloc.stop()
+    if host is not None:
+      await preload.shutdown()
+  assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_bounded_output_reads_keep_whole_chunks_however_the_writer_splits_it():
+  size = 16 * 1024
+  reader = asyncio.StreamReader()
+
+  async def drip():
+    for _ in range(size):
+      reader.feed_data(b"x")
+      await asyncio.sleep(0)
+    reader.feed_eof()
+
+  tracemalloc.start()
+  try:
+    producer = asyncio.create_task(drip())
+    data = await app_services._read_bounded(reader, size)
+    await producer
+    peak = tracemalloc.get_traced_memory()[1]
+  finally:
+    tracemalloc.stop()
+  assert data == b"x" * size
+  # One object per write would hold dozens of bytes of headers per byte.
+  assert peak < 4 * size, peak
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [0, 1, 65535, 65536, 65537])
+async def test_bounded_output_preserves_bytes_through_chunk_and_eof_boundaries(size):
+  reader = asyncio.StreamReader()
+  expected = b"x" * size
+  reader.feed_data(expected)
+  reader.feed_eof()
+  assert await app_services._read_bounded(reader, size) == expected
+
+
+@pytest.mark.asyncio
+async def test_bounded_output_rejects_the_first_excess_byte_without_waiting_for_eof():
+  reader = asyncio.StreamReader()
+  reader.feed_data(b"x" * 65537)
+  with pytest.raises(ValueError, match="output limit exceeded"):
+    await asyncio.wait_for(app_services._read_bounded(reader, 65536), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_full_sized_output_still_waits_for_eof_and_is_cancellable():
+  reader = asyncio.StreamReader()
+  reader.feed_data(b"x" * 65536)
+  task = asyncio.create_task(app_services._read_bounded(reader, 65536))
+  await asyncio.sleep(0)
+  assert not task.done()
+  task.cancel()
+  with pytest.raises(asyncio.CancelledError):
+    await task
+
+
+@pytest.mark.asyncio
+async def test_stdio_headroom_keeps_two_full_media_calls_and_a_control_admissible():
+  cap = 60 * MIB
+  envelope = {"body": [str(i).ljust(16384, "x") for i in range(cap // 16384 - 2)], "actor": {}}
+  with (
+    app_services.ServiceExchangeAdmission(cap) as first,
+    app_services.ServiceExchangeAdmission(cap) as second,
+    app_services.ServiceExchangeAdmission(8 * MIB) as control,
+  ):
+    for admission in (first, second):
+      await admission.retain(envelope)
+      admission.admit_execution(cap)
+    await control.retain({"body": {"ok": 1}, "actor": {}})
+    control.admit_execution(8 * MIB)
+    assert app_services._admitted_exchange_cost <= app_services.MAX_ADMITTED_EXCHANGE_COST
+    assert all(a.transfer_cost >= 3 * a.max_bytes + 256 * 1024 for a in (first, second, control))
+  assert app_services._admitted_exchange_cost == 0
+
+
+def test_stdio_execution_overhead_includes_fixed_and_size_scaled_costs():
+  # Independent pins complement peak-allocation tests and callers that derive
+  # their expected execution charge from the production formula.
+  assert app_services._stdio_overhead(4096) == 299208
+  assert app_services._stdio_overhead(60 * MIB) == 495304

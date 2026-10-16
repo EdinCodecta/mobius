@@ -179,6 +179,34 @@ _COOPERATIVE_STEP = 4 * 1024
 # about as much CPU as this many visited values (measured near 100 us).
 _SIZING_SLICE_STEPS = 256
 _EXHAUSTED = object()
+# Request stdin is written in slices of this size, and stdout is collected in
+# whole chunks of it (service_preload.read_bounded), so neither the pipe
+# transport's copy of unsent input nor per-chunk object overhead grows with
+# how a transfer is split.
+_STDIO_SLICE = service_preload.STDIO_CHUNK_BYTES
+# A bytes header, block waste and a (growing) list slot per collected chunk.
+_STDIO_CHUNK_COST = 33 + _RETAINED_BLOCK_SLACK + 16
+# CPython's selector pipe/socket read callback can allocate max_size (256 KiB)
+# even for a tiny reply. Charge it to each executing exchange, conservatively:
+# callbacks are serialized, but this avoids a separate process-wide owner.
+_STDIO_READ_TRANSIENT = 256 * 1024 + 33 + _RETAINED_BLOCK_SLACK
+
+
+def _stdio_overhead(max_bytes: int) -> int:
+  """What a running process adds beside its request and two stdout copies.
+
+  The write transport copies the unsent part of at most two input slices;
+  stdout and stderr chunks carry their headers; stderr is collected and joined
+  like stdout. Reader buffers hold output not yet collected, so they fit the
+  joined copy, which does not exist until reading ends. The callback transient
+  is additional, including for routes much smaller than one read.
+  """
+  return (
+    _STDIO_READ_TRANSIENT
+    + min(max_bytes, 2 * _STDIO_SLICE)
+    + (max_bytes // _STDIO_SLICE + 2) * _STDIO_CHUNK_COST
+    + 2 * MAX_ERROR_BYTES
+  )
 
 
 def _json_text_width(text: str, start: int = 0, end: int | None = None) -> int:
@@ -199,12 +227,12 @@ class ServiceExchangeAdmission:
 
   The reservation is the sum of three parts, each charged by the phase that
   owns it and never substituted for another: transfer, request and response.
-  Transfer charges three copies of serialized bytes (raw, pipe/buffer and
-  encoder): of the bytes actually received while a body is read
+  Transfer charges three copies of the bytes actually received during a read
   (``admit_received``), nothing while the decoded envelope waits for an
   execution slot (``retain``), the whole transfer ceiling from inside that slot
-  before serialization or any process starts (``admit_execution``), and the
-  actual stdout once the process has answered (``admit_output``). Request and
+  before serialization or any process starts, including bounded stdio overhead
+  (``admit_execution``), and actual stdout once the process has answered
+  (``admit_output``). Request and
   response decoded costs are added, never substituted. After request
   materialization its transient Unicode decode copy is gone; retain() charges
   the surviving envelope. The response's decode/encode estimate stays held
@@ -310,13 +338,15 @@ class ServiceExchangeAdmission:
 
     Runs before the request is serialized or a process is started, so an
     exhausted budget answers a retryable 503 with no side effect. Beyond
-    three serialized copies, it reserves what encoding the largest retained
-    string part can briefly hold besides the growing buffer (``retain``).
+    the serialized input and two stdout copies, it charges bounded pending
+    input, chunk headers, stderr and a selector-read transient. Encoding the
+    largest retained string part is charged instead when its peak is higher
+    (``retain``).
     """
     encoding = _json_encoding_peak(
       min(max_bytes, self.encoded_bytes), self.largest_part, self.encoded_depth,
     )
-    self._hold("execution", transfer=max(3 * max_bytes, encoding))
+    self._hold("execution", transfer=max(3 * max_bytes + _stdio_overhead(max_bytes), encoding))
 
   def admit_output(self, stdout: bytes):
     """Replace the transfer allowance by the stdout the process produced.
@@ -1077,8 +1107,13 @@ _read_bounded = service_preload.read_bounded
 
 
 async def _write_request(stream, body: bytes) -> None:
-  stream.write(body)
-  await stream.drain()
+  # A pipe transport copies whatever one write leaves unsent; a single write of
+  # the whole body would duplicate it while a service answers before reading.
+  view = memoryview(body)
+  for start in range(0, len(view), _STDIO_SLICE):
+    stream.write(view[start:start + _STDIO_SLICE])
+    await stream.drain()
+  del view
   stream.close()
   await stream.wait_closed()
 
@@ -1364,11 +1399,13 @@ async def _invoke_admitted_service(
         )
       del request_bytes
       stdout, stderr, returncode = outcome
-      admission.admit_output(stdout)
       if returncode != 0:
         detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
         log.warning("App service %s failed: %s", app.slug, detail or "no diagnostics")
         raise ServiceBoundaryError("process_failed", 502, "App service failed.")
+      # The output phase no longer reserves stderr or the serialized request.
+      del stderr, outcome
+      admission.admit_output(stdout)
   finally:
     pin.close()
   try:
