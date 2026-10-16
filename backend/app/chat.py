@@ -38,6 +38,7 @@ from app import (
   questions,
   run_state,
   schemas,
+  settled,
   skills as skills_platform,
 )
 from app.broadcast import (
@@ -48,7 +49,11 @@ from app.broadcast import (
   has_running_chat_broadcast,
   set_active_broadcast,
 )
-from app.agent_admission import AgentTurnDeferred, require_agent_turn_admission
+from app.agent_admission import (
+  AgentTurnDeferred,
+  agent_turn_deferral,
+  require_agent_turn_admission,
+)
 from app.chat_event_sink import (
   ChatEventSink as _ChatEventSink,
   _pause_note,
@@ -104,6 +109,7 @@ from app.chat_writer import (
   RecordRunMetrics,
   ReconcileStartupChat,
   RecoverWedgedRun,
+  PostponeResourcePark,
   ResolvePark,
   StartContinuation,
   StartContinuationAttached,
@@ -1874,6 +1880,7 @@ async def prepare_restart_intents(
 LIMIT_RETRY_NOTIFY_TITLE = "Your paused chat is ready to retry"
 LIMIT_RETRY_NOTIFY_BODY = "The retry check is due. The provider may still be limited."
 CONTINUATION_SWEEP_BATCH_SIZE = 100
+_RESOURCE_HOLD_UNCHECKED = object()
 # Start due provider-limit continuations gradually. Unrelated live work must
 # not delay an opted-in chat after its retry check, but a bad/early timestamp
 # also must not launch a whole parked batch in one burst.
@@ -2603,11 +2610,41 @@ async def sweep_reset_parks(
   def wants_auto_resume(chat, run) -> bool:
     return auto_resume_rejection(chat, run) is None
 
+  # Measured at most once per pass: every resource park asks the same question.
+  resource_hold: AgentTurnDeferred | None | object = _RESOURCE_HOLD_UNCHECKED
+
   for run in due:
     chat_id = run.chat_id
     chat = chats.get(chat_id)
     chat_gone = chat is None or chat.deleted_at is not None
     auto_resume = wants_auto_resume(chat, run)
+    if auto_resume and run.park_reason in RESOURCE_PARK_REASONS:
+      # A continuation started while memory or storage is still short only
+      # re-parks and saves another identical waiting card (dozens per chat
+      # during one low-disk episode). Keep the one parked run and its one card,
+      # and check again later; the turn resumes once admission would succeed.
+      if resource_hold is _RESOURCE_HOLD_UNCHECKED:
+        try:
+          resource_hold = await agent_turn_deferral(get_settings().data_dir)
+        except Exception:
+          log.warning(
+            "sweep_reset_parks: resource check failed; resuming normally",
+            exc_info=True,
+          )
+          resource_hold = None
+      if resource_hold is not None:
+        try:
+          await _await_ack(get_writer().submit(PostponeResourcePark(
+            chat_id=chat_id,
+            run_token=run.id,
+            parked_until=now + _PARK_MIN_DELAY,
+          )))
+        except Exception:
+          log.warning(
+            "sweep_reset_parks: resource postpone failed chat_id=%s",
+            chat_id, exc_info=True,
+          )
+        continue
     restart_auto_resume = auto_resume and run.park_reason == "restart"
     if run.park_reason == "restart" and not auto_resume:
       log.info(
@@ -3631,20 +3668,12 @@ async def _close_turn_browser(chat_id: str, run_gen: int | None) -> None:
 async def _join_browser_close(chat_id: str) -> bool:
   """Run browser teardown to completion; call only under the lifecycle lock.
 
-  Shield and JOIN cleanup on cancellation: releasing the gate while a worker
+  A cancelled caller waits for the teardown: releasing the gate while a worker
   thread still sends signals would endanger the successor.
   """
-  task = asyncio.create_task(_close_browser_session(chat_id))
-  try:
-    return await asyncio.shield(task)
-  except asyncio.CancelledError:
-    while not task.done():
-      try:
-        await asyncio.shield(task)
-      except asyncio.CancelledError:
-        continue
-    task.result()
-    raise
+  return await settled.settle(
+    _close_browser_session(chat_id), what=f"Browser close for chat {chat_id}",
+  )
 
 
 async def reap_unowned_browsers(*, memory_budget_bytes: int | None) -> dict:
@@ -3954,7 +3983,7 @@ def _parse_reset_text(text: str, now: datetime) -> datetime | None:
 # `chat_run_finished` wake-ups. These parks always continue: the platform
 # interrupted the turn, not a provider quota, so the paid-retry opt-in for
 # limits does not apply.
-RESOURCE_PARK_REASONS = frozenset({"memory", "storage"})
+RESOURCE_PARK_REASONS = models.RESOURCE_PARK_REASONS
 # These recoveries belong to the interrupted turn rather than the paid-limit
 # preference. Compaction is admitted only after one bounded synthesis succeeds;
 # the saved attempt flag prevents repeated synthesis/retry on the same root.
@@ -4030,6 +4059,40 @@ def _limit_park_fields(
       "limit-park reset parse failed; using fallback", exc_info=True,
     )
     return LimitParkTiming(now + PARK_FALLBACK_DELAY, "rate_limit")
+
+
+TURN_STOPPED_MESSAGE = (
+  "The agent stopped before finishing this turn. Your work so far is saved; "
+  "tap Resume to continue."
+)
+PROCESS_DIED_MESSAGE = (
+  "The agent's process was shut down unexpectedly, usually because it ran out "
+  "of memory or time. Your work so far is saved; tap Resume to try again."
+)
+# A provider CLI killed by a signal reports a negative exit status, and the SDK
+# adds this placeholder when the process died before writing any output.
+_PROCESS_DIED_RE = re.compile(
+  r"exit code:? -\d+|no stderr captured", re.IGNORECASE,
+)
+
+
+def turn_failure_block(error_text: str) -> dict:
+  """The transcript card for a provider turn that ended with an error.
+
+  Provider failure text is written for developers. Known process-level
+  failures get a plain sentence and a Resume affordance; their raw text goes
+  to the server log, as for setup failures, so the error block keeps its
+  two-key passthrough (events.ERROR_PASSTHROUGH_FIELDS). Any other provider
+  message is shown as-is: it is often the only useful explanation (an auth
+  problem, a refused request), and guessing would hide it.
+  """
+  text = error_text.strip()
+  if text == "Execution interrupted.":
+    return {"type": "error", "message": TURN_STOPPED_MESSAGE, "resumable": True}
+  if _PROCESS_DIED_RE.search(text):
+    _get_logger().warning("agent process ended unexpectedly: %s", text[-2000:])
+    return {"type": "error", "message": PROCESS_DIED_MESSAGE, "resumable": True}
+  return {"type": "error", "message": error_text}
 
 
 def _park_event(
@@ -4224,7 +4287,7 @@ def _park_exit(
       ))
       return {"parked": False}
     if error_text:
-      sink.publish({"type": "error", "message": error_text})
+      sink.publish(turn_failure_block(error_text))
     elif runner_result is None:
       # An EXCEPTION exit must always persist an error block. A bare
       # exception (e.g. `TimeoutError()`) stringifies to "" — publishing
@@ -5117,13 +5180,14 @@ _MEMORY_RECLAIM_DISPOSITIONS = frozenset({
 async def _acknowledge_provider_success(
   *, chat_id: str, run_token: str, delivered_through,
   wait_results: tuple[str, ...] = (),
+  side_question_cids: tuple[str, ...] = (),
 ) -> None:
   """Best-effort provider-success and delivery acknowledgement.
 
   A failed acknowledgement conservatively leaves provider availability limited
-  and repeats an already-seen peer note or Wait result on a later turn; it
-  never records success before the provider call has actually returned
-  successfully.
+  and repeats an already-seen peer note, Wait result or added side question
+  on a later turn; it never records success before the provider call has
+  actually returned successfully.
   """
   if not chat_id or not run_token:
     return
@@ -5138,6 +5202,7 @@ async def _acknowledge_provider_success(
         delivered_through.message_id if delivered_through is not None else None
       ),
       wait_results=wait_results,
+      side_question_cids=side_question_cids,
     )))
     if wait_results:
       from app.chat_waits import (
@@ -5564,6 +5629,23 @@ async def _run_chat_impl_with_db(
   user_message = raw_user_message
   historical_goal_mode = _chat_has_goal_intent(messages)
 
+  # Sync before reading the chat row: the read-to-snapshot-commit span below
+  # must stay await-free so a concurrent picker PATCH cannot be overwritten.
+  codex_native_skills_ready = False
+  if provider.name == "Codex":
+    try:
+      from app.codex_skills import codex_native_skills_ready as _skills_ready
+      from app.providers import skills_enabled as _skills_enabled
+      codex_native_skills_ready = await _skills_ready(
+        settings.data_dir,
+        _skills_enabled(settings.data_dir),
+      )
+    except Exception:
+      log.exception("codex skills sync failed chat_id=%s", chat_id)
+    if _run_generation_superseded(chat_id, run_gen):
+      _log_superseded_run(chat_id, "codex-skill-sync")
+      return chat_queue.TerminalDisposition.STALE_NO_ACTION
+
   app_context_block = ""
   app_context_env: dict[str, str] = {}
   chat_row = None
@@ -5591,17 +5673,6 @@ async def _run_chat_impl_with_db(
   )
   # The provider sees this turn as its first: it gets the first-turn context.
   starts_fresh = not session_id or session_retired
-  codex_native_skills_ready = False
-  if provider.name == "Codex":
-    try:
-      from app.codex_skills import sync_codex_skills_for_prompt
-      from app.providers import skills_enabled as _skills_enabled
-      codex_native_skills_ready = sync_codex_skills_for_prompt(
-        settings.data_dir,
-        _skills_enabled(settings.data_dir),
-      )
-    except Exception:
-      log.exception("codex skills sync failed chat_id=%s", chat_id)
   if run_policy is None:
     # Möbius owns an owner's `/goal`: the command already created the Goal, so
     # the agent's copy is a plain request. Claude's CLI has its own `/goal`,
@@ -5801,6 +5872,28 @@ async def _run_chat_impl_with_db(
     if waits_context:
       user_message = f"{waits_context}\n\n{user_message}"
 
+  # Side questions the owner added to the chat ("/btw", then Add to chat)
+  # reach the agent once: on this turn, recorded delivered only when the
+  # provider call succeeds (AcknowledgeProviderSuccess), like Wait results.
+  side_question_cids: tuple[str, ...] = ()
+  if run_policy is None and chat_row is not None:
+    from app.side_questions import owed_side_questions_context
+    try:
+      owed_side_rows = [
+        body for _seq, body in transcript_rows.owed_side_questions(db, chat_row)
+        if isinstance(body, dict) and isinstance(body.get("cid"), str)
+      ]
+    except Exception:
+      # Advisory context: an unreadable row must not cost the owner's turn.
+      # The answers stay owed and ride the next turn instead.
+      log.exception("owed side questions unreadable chat_id=%s", chat_id)
+      owed_side_rows = []
+    if owed_side_rows:
+      user_message = (
+        f"{owed_side_questions_context(owed_side_rows)}\n\n{user_message}"
+      )
+      side_question_cids = tuple(body["cid"] for body in owed_side_rows)
+
   goal_brief_refresh = None
   if chat_id:
     from app.goals import compaction_brief_refresh, turn_goal_brief
@@ -5997,20 +6090,25 @@ async def _run_chat_impl_with_db(
   # request; live app state is never recomposed for an established chat.
   runner_agent_settings = agent_settings
   custom_prompt = _custom_system_prompt(chat_overrides)
-  from app.system_prompts import exact_prompt_for_chat, prompt_for_chat
+  from app.system_prompts import (
+    compose_system_prompt_off_loop, exact_prompt_for_chat, prompt_for_chat,
+  )
   try:
-    system_prompt = (
-      exact_prompt_for_chat(
+    if run_policy is not None:
+      system_prompt = exact_prompt_for_chat(
         chat_row, run_policy.system_prompt, db, persist=True,
       )
-      if run_policy is not None
-      else prompt_for_chat(
-        chat_row,
-        custom_prompt if custom_prompt else _read_skill_text(),
-        db,
-        persist=True,
+    else:
+      base_prompt = custom_prompt if custom_prompt else _read_skill_text()
+      # Composing reads each app's fragment from Git, so a chat that has no
+      # snapshot yet composes off the event loop.
+      composed = (
+        None if chat_row.system_prompt_snapshot_id
+        else await compose_system_prompt_off_loop(base_prompt, db)
       )
-    )
+      system_prompt = prompt_for_chat(
+        chat_row, base_prompt, db, persist=True, composed=composed,
+      )
     db.commit()
   except Exception:
     log.exception("failed to snapshot system prompt chat_id=%s", chat_id)
@@ -6271,6 +6369,7 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
+          side_question_cids=side_question_cids,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(
@@ -6466,6 +6565,7 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
+          side_question_cids=side_question_cids,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(

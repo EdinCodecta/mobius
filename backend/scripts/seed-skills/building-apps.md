@@ -150,6 +150,57 @@ When the partner asks to share a local-first app as a repo, make the existing so
 4. Run `python3 /data/platform/backend/scripts/validate-app.py /data/apps/<name>` before push. It checks the declared source/import closure and bundles the real entry with the installer’s exact Rolldown contract, catching missing files, missing default exports, and production-only compile failures locally. Exit 3 (`INCONCLUSIVE`, or `build_stalled` from apply) means the machine was too busy to finish the build, not that the source is wrong: retry later instead of editing.
 5. Smoke-install from the raw GitHub `mobius.json` URL on a clean instance or under a test slug before calling it shareable.
 
+### Store listing — what the App Store shows before anyone installs
+
+Publishing from the App Store's **Publish** tab makes the app's last applied
+source public, and the Store refuses it without a listing. The listing is part
+of the app's source, so it is reviewed, versioned and published with the code:
+
+```json
+"icon": "icon.png",
+"store": {
+  "tagline": "One line on what it does for the owner (at most 120 bytes).",
+  "description": "Plain text: what it does, who it is for, what stays private (at most 4000 bytes).",
+  "hero": "static/store/hero.png",
+  "screenshots": [
+    {"src": "static/store/main.png", "alt": "What the image shows, concretely.", "label": "Optional short caption"}
+  ]
+}
+```
+
+- `icon` and every listing image must be committed files; listing images live
+  under `static/store/`. `hero` is optional; 1–5 screenshots are required,
+  each with concrete `alt` text (at most 300 bytes) and an optional `label`
+  (at most 120 bytes).
+- Every listing image, the icon included, must be a real PNG, JPEG or WebP
+  file of at most 6 MB, 8192 px on its longest side, and 32 million pixels in
+  all (so 8192x8192 is too large; 5000x5000 fits). The file extension alone
+  does not count. Images saved through the Store editor lose their EXIF,
+  location and text metadata.
+- Publishing makes the whole source public, so before it does, every
+  committed PNG, JPEG and WebP (not only listing art) is checked for hidden
+  metadata: EXIF and GPS, XMP, PNG text chunks, C2PA provenance, JPEG
+  comments and thumbnails, and bytes after the image ends. The preview's
+  `details` item names every such file. Clean one by re-saving its pixels,
+  e.g. `python3 -c "from PIL import Image, ImageOps; im = ImageOps.exif_transpose(Image.open('f.jpg')); icc = im.info.get('icc_profile'); im.info.clear(); im.save('f.jpg', quality=95, icc_profile=icc)"`
+  (turning it upright first, since the orientation tag goes with the rest,
+  and keeping its colour profile;
+  the same works for PNG and WebP without `quality`), or remove it if
+  nothing uses it. A bare PNG `tIME` timestamp is allowed; any PNG text
+  chunk is not, whatever its key (`Software`, `Author`, `Comment`, XMP...).
+- Screenshots must be truthful and private: capture the app's real UI in an
+  empty, demo, or fixture state, never the owner's own records, names,
+  accounts, chats, or machines. Build a small demo state if the app has none.
+- Apply the app so the listing is in its accepted source, then check it with
+  `mapi "/api/community/publications/github/preview?app_id=<id>"`. Its
+  `checklist` names every unmet item at once, and `ready` is true only when
+  `listing` is exactly what the Store will publish.
+- The owner can also write the listing by hand in the Store's Publish tab,
+  which saves it into this same source. An older app with no `mobius.json`
+  needs an agent to create one first, preserving its existing permissions,
+  capabilities, and any schedule; a listing save will not guess that contract.
+- Publishing itself stays the owner's action in the Store.
+
 **Don't hand-bump a version constant in app source.** If an app carries its released version inline (e.g. `const APP_VERSION = '1.2.0'`), leave that line alone — the catalog/installer sets it per release, not your edits. Bumping it locally guarantees a merge conflict on the *next* update: your bump and the new release's bump land on the same line, so every update stops to ask the owner to reconcile a version number. Git already tracks your edits — you never need a version bump to record them. (This is the single most common avoidable update conflict.)
 
 ### Verify your own output — don't make the owner the test loop
@@ -884,12 +935,12 @@ const { chatId } = await window.mobius.chat.start({
 window.parent.postMessage({ type: 'moebius:open-chat', chatId }, '*')
 ```
 
-Use `moebius:new-chat` only for an editable draft. Do not add an `autoSend`
-field to that shell message: retained panes and navigation make a
-create-then-send handoff inherently timing-sensitive. `window.mobius.chat.start`
-is the shared first-turn primitive. It creates a visible app-owned chat, waits
-for the first message to be accepted, then returns its id for navigation. Catch
-errors and preserve the source UI so the owner can retry without losing work.
+`moebius:new-chat` always opens an editable draft; the owner's own Send is
+what approves app-chosen text, so the shell ignores any `autoSend` field.
+`window.mobius.chat.start` is the shared first-turn primitive. It creates a
+visible app-owned chat, waits for the first message to be accepted, then
+returns its id for navigation. Catch errors and preserve the source UI so the
+owner can retry without losing work.
 
 The opaque app document cannot name the shell as a target origin, so raw
 app-to-shell messages use `'*'`. For reply protocols, require

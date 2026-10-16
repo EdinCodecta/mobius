@@ -63,6 +63,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app import chat_archive, models, schemas, transcript_rows
 from app.goals import admit_goal
 from app.chat_titles import apply_generated_title, first_message_title
+from app.continuations import SIDE_QUESTION_MESSAGE_KIND
 from app.json_safety import json_safe
 from app.upload_lifecycle import claim_uploads, release_uploads
 from app.events import (
@@ -443,8 +444,9 @@ class AcknowledgeProviderSuccess(_Command):
   Provider admission is intentionally earlier: it prevents ambiguous replay
   of an execution attempt. It is not proof that the provider accepted the
   prompt. This later acknowledgement both heals an older provider-limit signal
-  and records what the provider received — the peer-note cursor and the Wait
-  results the turn carried — in the same writer-owned transaction.
+  and records what the provider received — the peer-note cursor, the Wait
+  results and the added side questions the turn carried — in the same
+  writer-owned transaction.
   """
 
   chat_id: str = ""
@@ -452,6 +454,8 @@ class AcknowledgeProviderSuccess(_Command):
   peer_message_through_created_at: datetime | None = None
   peer_message_through_id: str | None = None
   wait_results: tuple[str, ...] = ()
+  # cids of the added /btw side questions this turn's prompt carried.
+  side_question_cids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -996,6 +1000,27 @@ class AppendSteeredUserMessage(_Command):
 
 
 @dataclass
+class AppendSideQuestion(_Command):
+  """Add an owner-kept ``/btw`` answer to the transcript without a turn.
+
+  The row is context for the agent, not a request: it never enters the
+  pending queue, so it cannot start a turn or join a queued batch, and it may
+  land while a turn runs (above that turn's reply). It is refused while an
+  owner question card is open, because that card must stay the transcript's
+  tail to remain answerable. ``cid`` makes a retried add return the stored
+  row. The agent receives the row once, on its next successful turn
+  (``transcript_rows.owed_side_questions`` and AcknowledgeProviderSuccess).
+  Returns ``{"status": "stored", "stored": row}`` or a ``conflict``.
+  """
+
+  chat_id: str = ""
+  cid: str = ""
+  question: str = ""
+  answer: str = ""
+  provider: str = ""
+
+
+@dataclass
 class PromotePending(_Command):
   """Move pending follow-ups into the transcript and mark the run.
 
@@ -1155,7 +1180,8 @@ class AuthorizeCheckpoint(_Command):
   """Admit a continuity save from the chat's live run; apply its name.
 
   Returns ``{"status": "ok", "title_applied": bool}`` or
-  ``{"status": "stale_run"}``. The note file itself is written by the caller
+  ``{"status": "stale_run", "reason": <code>}``, where the code names which
+  live-run condition failed. The note file itself is written by the caller
   under the chat's transition lock.
   """
 
@@ -1312,6 +1338,21 @@ class ResolvePark(_Command):
 
 
 @dataclass
+class PostponeResourcePark(_Command):
+  """Move a still-short memory/storage park's next check to ``parked_until``.
+
+  The reset sweep checks admission before resuming a resource park. While the
+  resource is still short, the same parked run simply waits longer: starting a
+  continuation would only re-park and append another identical waiting card.
+  Idempotent; a run no longer parked for a resource is left alone.
+  """
+
+  chat_id: str = ""
+  run_token: str = ""
+  parked_until: object = None
+
+
+@dataclass
 class PrepareAutoResume(_Command):
   """Durably mark a due park as notified but still awaiting auto-resume.
 
@@ -1407,6 +1448,7 @@ _FENCE_COMMANDS = (
   RecoverWedgedRun,
   ParkRun,
   ResolvePark,
+  PostponeResourcePark,
   PrepareAutoResume,
 )
 
@@ -2208,6 +2250,8 @@ class ChatWriterActor:
       return self._append_pending(db, cmd)
     if isinstance(cmd, AppendSteeredUserMessage):
       return self._append_steered_user_message(db, cmd)
+    if isinstance(cmd, AppendSideQuestion):
+      return self._append_side_question(db, cmd)
     if isinstance(cmd, BeginNoteRecovery):
       return self._begin_note_recovery(db, cmd)
     if isinstance(cmd, PersistCompaction):
@@ -2246,6 +2290,8 @@ class ChatWriterActor:
       return self._prepare_restart_intents(db, cmd)
     if isinstance(cmd, ResolvePark):
       return self._resolve_park(db, cmd)
+    if isinstance(cmd, PostponeResourcePark):
+      return self._postpone_resource_park(db, cmd)
     if isinstance(cmd, PrepareAutoResume):
       return self._prepare_auto_resume(db, cmd)
     raise NotImplementedError(type(cmd).__name__)
@@ -2873,8 +2919,68 @@ class ChatWriterActor:
     )
     from app.chat_waits import stage_wait_results_delivered
     stage_wait_results_delivered(db, cmd.chat_id, cmd.wait_results)
+    self._stage_side_questions_delivered(db, cmd.chat_id, cmd.side_question_cids)
     if not _commit_or_rollback(db):
       raise _PersistFailed("AcknowledgeProviderSuccess did not persist")
+
+  def _stage_side_questions_delivered(
+    self, db, chat_id: str, cids: tuple[str, ...],
+  ) -> None:
+    """Record, in the ack's transaction, that the agent got these answers."""
+    if not cids:
+      return
+    chat = _active_chat(db, chat_id)
+    if chat is None:
+      return
+    for cid in cids:
+      seq = transcript_rows.client_message_seq(db, chat, cid)
+      if seq is None:
+        continue
+      body = transcript_rows.at(db, chat, seq)
+      if (
+        isinstance(body, dict)
+        and body.get("kind") == SIDE_QUESTION_MESSAGE_KIND
+        and body.get("delivered_to_agent") is not True
+      ):
+        transcript_rows.update_at(
+          db, chat, seq, {**body, "delivered_to_agent": True},
+        )
+
+  def _append_side_question(self, db, cmd: AppendSideQuestion) -> dict:
+    """Append one kept side question; see AppendSideQuestion."""
+    from datetime import UTC, datetime
+
+    if not cmd.cid or not cmd.question.strip() or not cmd.answer.strip():
+      raise _PersistFailed("AppendSideQuestion needs a cid, question and answer")
+    chat = _active_chat(db, cmd.chat_id)
+    if chat is None:
+      raise _PersistFailed("AppendSideQuestion: chat not found or deleted")
+    existing = transcript_rows.client_message_seq(db, chat, cmd.cid)
+    if existing is not None:
+      db.rollback()
+      return {"status": "stored", "stored": transcript_rows.at(db, chat, existing)}
+    if chat.pending_question_id is not None:
+      db.rollback()
+      return {"status": "conflict", "reason": "question_open"}
+    from app.side_questions import side_question_row_content
+    row = {
+      "role": "user",
+      "kind": SIDE_QUESTION_MESSAGE_KIND,
+      "content": side_question_row_content(cmd.question, cmd.answer),
+      "side_question": {
+        "question": cmd.question,
+        "answer": cmd.answer,
+        "provider": cmd.provider,
+      },
+      "delivered_to_agent": False,
+      "cid": cmd.cid,
+      "ts": _next_row_ts(db, chat, list(chat.pending_messages or [])),
+    }
+    transcript_rows.append(db, chat, row)
+    chat.updated_at = datetime.now(UTC)
+    if not _commit_or_rollback(db):
+      raise _PersistFailed("AppendSideQuestion did not persist")
+    return {"status": "stored", "stored": row}
 
   def _stage_activity_delivery_consumption(
     self, db, *, chat_id: str, run_token: str,
@@ -4158,10 +4264,12 @@ class ChatWriterActor:
     if blocker is not None:
       db.rollback()
       return StartContinuationBlocked(blocker)
+    goal_id = delegation_goal_id(db, trigger)
+    # A nested helper works in its coordinator's Goal, but this physical run
+    # belongs to the helper chat: bind only an open Goal this chat owns. The
+    # shared Goal stays in the activity source and the assignment chain.
     from app.run_state import open_goal_identity_for_chat
-    goal_objective, goal_id = open_goal_identity_for_chat(
-      db, cmd.chat_id, delegation_goal_id(db, trigger),
-    )
+    goal_objective, goal_id = open_goal_identity_for_chat(db, cmd.chat_id, goal_id)
 
     existing = transcript_rows.read_all(db, chat)
     try:
@@ -4770,22 +4878,38 @@ class ChatWriterActor:
       "agent_settings_json": chat.agent_settings_json,
     }
 
-  def _owned_live_run(self, db, chat_id: str, run_token: str):
+  def _live_run_refusal(self, db, chat_id: str, run_token: str):
+    """Why ``run_token`` is not the chat's live owner run, or ``None``.
+
+    The reason is a stable code a caller can show an agent; ``_owned_live_run``
+    is the same check for callers that only need the run. The run is bound to
+    ``chat_id`` before anything about the chat is consulted, so a run asking
+    about another chat learns only ``run_unknown``, never that chat's state.
+    """
     run = db.get(models.ChatRun, run_token) if run_token else None
-    if (
-      _active_chat(db, chat_id) is None or run is None or run.chat_id != chat_id
-      or run.status != "running"
-      or self._run_token_owner.get(chat_id) != run_token
-      or not self._run_is_latest(db, run)
-    ):
+    if run is None or run.chat_id != chat_id:
+      return "run_unknown"
+    if _active_chat(db, chat_id) is None:
+      return "chat_inactive"
+    if run.status != "running":
+      return "run_not_running"
+    if self._run_token_owner.get(chat_id) != run_token:
+      return "run_not_owner"
+    if not self._run_is_latest(db, run):
+      return "run_not_latest"
+    return None
+
+  def _owned_live_run(self, db, chat_id: str, run_token: str):
+    if self._live_run_refusal(db, chat_id, run_token) is not None:
       return None
-    return run
+    return db.get(models.ChatRun, run_token)
 
   def _authorize_checkpoint(self, db, cmd: AuthorizeCheckpoint) -> dict:
     chat = _active_chat(db, cmd.chat_id)
-    if self._owned_live_run(db, cmd.chat_id, cmd.run_token) is None:
+    reason = self._live_run_refusal(db, cmd.chat_id, cmd.run_token)
+    if reason is not None:
       db.rollback()
-      return {"status": "stale_run"}
+      return {"status": "stale_run", "reason": reason}
     title_applied = bool(cmd.title and apply_generated_title(chat, cmd.title))
     if title_applied and not _commit_or_rollback(db):
       raise _PersistFailed("AuthorizeCheckpoint title did not persist")
@@ -6036,6 +6160,26 @@ class ChatWriterActor:
       run.ended_at = datetime.now(UTC)
     if not _commit_or_rollback(db):
       raise _PersistFailed("ResolvePark did not persist")
+    return True
+
+  def _postpone_resource_park(self, db, cmd: PostponeResourcePark):
+    """Push a resource park's due time later; True when it moved."""
+    from app.models import RESOURCE_PARK_REASONS, ChatRun
+
+    run = db.query(ChatRun).filter(
+      ChatRun.id == cmd.run_token,
+      ChatRun.chat_id == cmd.chat_id,
+    ).first()
+    if (
+      run is None
+      or run.status not in ("parked", "resume_pending")
+      or run.park_reason not in RESOURCE_PARK_REASONS
+      or not self._run_is_latest(db, run)
+    ):
+      return False
+    run.parked_until = cmd.parked_until
+    if not _commit_or_rollback(db):
+      raise _PersistFailed("PostponeResourcePark did not persist")
     return True
 
   def _prepare_auto_resume(self, db, cmd: PrepareAutoResume):

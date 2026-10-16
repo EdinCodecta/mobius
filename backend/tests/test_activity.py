@@ -785,7 +785,7 @@ async def test_bootstrap_install_emits_with_source_bootstrap(db, monkeypatch):
   captured = []
 
   async def _fake_install(
-    db, manifest_url, manifest, raw_base, source="url", staged_clone=None,
+    db, manifest_url, manifest, raw_base, source="url", prepared=None,
   ):
     from app import app_git
     from app.install import InstallResult
@@ -814,7 +814,7 @@ async def test_bootstrap_install_emits_with_source_bootstrap(db, monkeypatch):
   expected_count = len(bootstrap._CORE_BOOTSTRAP_APPS)
   from unittest.mock import AsyncMock
   with patch("app.bootstrap.install_from_manifest", _fake_install), patch(
-    "app.bootstrap.stage_package_clone", AsyncMock(return_value=None),
+    "app.bootstrap.prepare_package", AsyncMock(return_value=None),
   ):
     await ensure_bootstrap_apps_installed(db)
 

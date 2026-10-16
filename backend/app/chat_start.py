@@ -426,7 +426,7 @@ async def start_programmatic_activity_continuation(
           orphaned = None
           # The common fresh start needs only these durable reads; do them
           # in a worker. The locks held above order them against any start.
-          exists, blocked = await asyncio.to_thread(
+          exists, blocked = await asyncio.to_thread(  # unsettled: read-only (run existence and start blockers)
             _activity_start_precheck, chat_id, run_token,
           )
           # A drain may have begun during that read; its runs stay its own.

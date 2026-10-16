@@ -1269,9 +1269,8 @@ async def refresh_app_model_providers(data_dir: str) -> None:
   """
   async with _app_provider_refresh_lock:
     if not _app_providers_fresh():
-      _apply_app_model_declarations(
-        await asyncio.to_thread(_read_app_model_declarations),
-      )
+      declarations = await asyncio.to_thread(_read_app_model_declarations)  # unsettled: read-only (app declarations)
+      _apply_app_model_declarations(declarations)
 
 
 def _read_app_model_declarations() -> list[tuple[Any, dict]] | None:

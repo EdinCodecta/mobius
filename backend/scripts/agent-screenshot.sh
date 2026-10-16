@@ -454,12 +454,15 @@ clear_stale_browser_profile_lock() {
     # not establish profile ownership: verify the exact browser root and its
     # user-data-dir before retaining the lock. Unreadable process state is
     # uncertain, so leave the lock untouched rather than risk a live profile.
-    if python3 - "$owner_pid" "$AGENT_BROWSER_PROFILE" <<'PYOWNER'
+    if python3 - "$owner_pid" "$AGENT_BROWSER_PROFILE" \
+      "$(dirname "${BASH_SOURCE[0]}")/.." <<'PYOWNER'
 import os
 from pathlib import Path
 import sys
 
-pid, profile = sys.argv[1:]
+pid, profile, backend = sys.argv[1:]
+sys.path.insert(0, backend)
+from app.browser_processes import BROWSER_EXECUTABLES
 try:
   args = (Path('/proc') / pid / 'cmdline').read_bytes().split(b'\0')
 except FileNotFoundError:
@@ -469,7 +472,7 @@ except OSError:
 args = [a.decode('utf-8', errors='surrogateescape') for a in args if a]
 if not args:
   raise SystemExit(1)
-browser = Path(args[0]).name in {'chrome', 'chromium', 'chromium-browser'}
+browser = Path(args[0]).name in BROWSER_EXECUTABLES
 directory = next((arg.split('=', 1)[1] for arg in args
                   if arg.startswith('--user-data-dir=')), None)
 if directory is None and '--user-data-dir' in args:
@@ -781,12 +784,31 @@ sleep 0.3
 # at the FINAL capture boundary, after the initial paint above. The token is
 # read inside the page and never appears in argv or output.
 BROWSER_PHASE="authentication verification"
-AUTH_OK="$(browser_eval_retry \
-  "(async () => { const token = localStorage.getItem('token'); const login = () => document.querySelector('[data-auth-surface=login]'); if (!token || login()) return false; try { const res = await fetch('/api/chats?agent-screenshot-auth=' + Date.now(), { cache: 'no-store', headers: { Authorization: 'Bearer ' + token } }); return res.status === 200 && !!localStorage.getItem('token') && !login(); } catch { return false; } })()" \
+AUTH_RESULT_RAW="$(browser_eval_retry \
+  "(async () => { const token = localStorage.getItem('token'); const login = () => document.querySelector('[data-auth-surface=login]'); if (!token || login()) return 'rejected'; try { const res = await fetch('/api/owner/timezone?agent-screenshot-auth=' + Date.now(), { cache: 'no-store', headers: { Authorization: 'Bearer ' + token } }); if (res.status === 401 || res.status === 403) return 'rejected'; if (!res.ok) return 'unavailable'; return !!localStorage.getItem('token') && !login() ? 'ok' : 'rejected'; } catch { return 'unavailable'; } })()" \
   || true)"
-if [ "$AUTH_OK" != "true" ]; then
-  die "authentication failed; the token was rejected or the login page remained visible"
+if [ -s "$BROWSER_TIMEOUT_FILE" ]; then
+  AUTH_OK="unavailable"
+else
+  # agent-browser eval prints JSON, including quotes around JavaScript strings.
+  # Only the three probe outcomes are valid; malformed/non-string output is
+  # an unavailable probe, never an authentication denial or a successful check.
+  AUTH_OK="$(printf '%s' "$AUTH_RESULT_RAW" | python3 -c '
+import json
+import sys
+
+try:
+    result = json.load(sys.stdin)
+except json.JSONDecodeError:
+    result = None
+print(result if isinstance(result, str) and result in ("ok", "rejected", "unavailable") else "unavailable")
+')"
 fi
+case "$AUTH_OK" in
+  ok) ;;
+  rejected) die "authentication failed; the token was rejected or the login page remained visible" ;;
+  *) die "authentication probe unavailable; the server or browser did not answer" ;;
+esac
 
 # For shell routes, prove the browser loaded the same hashed entry asset that
 # exists in the currently-built dist. This turns stale screenshots into a clear

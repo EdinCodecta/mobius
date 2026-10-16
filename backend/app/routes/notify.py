@@ -16,13 +16,12 @@ import logging
 import time
 from typing import Annotated
 
-import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
 
 from app import models
+from app.streaming import ClosingStreamingResponse
 from app.broadcast import (
   get_active_broadcast,
   get_all_active_broadcasts,
@@ -44,21 +43,6 @@ log = logging.getLogger(__name__)
 # Keepalive cadence for the shell-level SSE — same value used in
 # chats_stream so proxies behave consistently.
 _KEEPALIVE_INTERVAL = 30
-
-
-class _SystemEventStreamingResponse(StreamingResponse):
-  """Close the event iterator when ASGI abandons an in-flight body send."""
-
-  async def __call__(self, scope, receive, send):
-    try:
-      await super().__call__(scope, receive, send)
-    finally:
-      close = getattr(self.body_iterator, "aclose", None)
-      if close is not None:
-        # A server can cancel the outer ASGI task as well as Starlette's body
-        # task. Re-enter the suspended async generator even in that state.
-        with anyio.CancelScope(shield=True):
-          await close()
 
 
 # Characters kept from a build_phase label. The label is the one free-text
@@ -455,7 +439,7 @@ async def stream_system_events(
     finally:
       broadcast.unsubscribe(queue)
 
-  return _SystemEventStreamingResponse(
+  return ClosingStreamingResponse(
     revocable_browser_stream(generate(), principal),
     media_type="text/event-stream",
     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
