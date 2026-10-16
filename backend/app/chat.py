@@ -5556,6 +5556,24 @@ async def _run_chat_impl_with_db(
   if run_token is None:
     run_token = alloc_run_token()
 
+  provider = get_provider(provider_id)
+  # Sync before reading the chat row: the read-to-snapshot-commit span below
+  # must stay await-free so a concurrent picker PATCH cannot be overwritten.
+  codex_native_skills_ready = False
+  if provider.name == "Codex":
+    try:
+      from app.codex_skills import codex_native_skills_ready as _skills_ready
+      from app.providers import skills_enabled as _skills_enabled
+      codex_native_skills_ready = await _skills_ready(
+        settings.data_dir,
+        _skills_enabled(settings.data_dir),
+      )
+    except Exception:
+      log.exception("codex skills sync failed chat_id=%s", chat_id)
+    if _run_generation_superseded(chat_id, run_gen):
+      _log_superseded_run(chat_id, "codex-skill-sync")
+      return chat_queue.TerminalDisposition.STALE_NO_ACTION
+
   app_context_block = ""
   app_context_env: dict[str, str] = {}
   chat_row = None
@@ -5572,7 +5590,6 @@ async def _run_chat_impl_with_db(
       )
   from app.delegations import policy_for_chat
   run_policy = policy_for_chat(db, chat_id) if chat_row is not None else None
-  provider = get_provider(provider_id)
   # A retired session is not resumed: its own history would keep the model
   # following a withdrawn instruction. A top-level chat starts fresh and is
   # reseeded from its transcript, exactly as for a lost session. (A retired
@@ -5584,17 +5601,6 @@ async def _run_chat_impl_with_db(
   )
   # The provider sees this turn as its first: it gets the first-turn context.
   starts_fresh = not session_id or session_retired
-  codex_native_skills_ready = False
-  if provider.name == "Codex":
-    try:
-      from app.codex_skills import sync_codex_skills_for_prompt
-      from app.providers import skills_enabled as _skills_enabled
-      codex_native_skills_ready = sync_codex_skills_for_prompt(
-        settings.data_dir,
-        _skills_enabled(settings.data_dir),
-      )
-    except Exception:
-      log.exception("codex skills sync failed chat_id=%s", chat_id)
   if run_policy is None:
     # Möbius owns an owner's `/goal`: the command already created the Goal, so
     # the agent's copy is a plain request. Claude's CLI has its own `/goal`,
