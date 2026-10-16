@@ -124,9 +124,9 @@ RUN printf '%s\n' \
       '  <alias binding="same"><family>serif</family><prefer><family>Liberation Serif</family></prefer></alias>' \
       '</fontconfig>' > /etc/fonts/conf.d/61-mobius-fonts.conf \
     && fc-cache -f \
-    && [ "$(fc-match sans-serif family)" = "Liberation Sans" ] \
-    && [ "$(fc-match system-ui family)" = "Liberation Sans" ] \
-    && [ "$(fc-match serif family)" = "Liberation Serif" ]
+    && [ "$(fc-match --format '%{family}' sans-serif)" = "Liberation Sans" ] \
+    && [ "$(fc-match --format '%{family}' system-ui)" = "Liberation Sans" ] \
+    && [ "$(fc-match --format '%{family}' serif)" = "Liberation Serif" ]
 
 # Use the pinned library for Python and other dynamically linked consumers,
 # not just the CLI. Keep Debian's package for its dependency metadata.
