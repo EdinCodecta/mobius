@@ -447,6 +447,27 @@ data["image_inputs"] = json.loads(subprocess.run(["python3", "/app/platform-bake
 info.write_text(json.dumps(data, sort_keys=True) + "\n")'; \
     chmod a+r /app/build-info.json
 
+# Every official commit the baked source descends from (`image_lineage`), so a
+# boot can prove the release its checkout records is older than this image
+# without that checkout holding the image's own history. A commits-only fetch
+# of the whole history is a few megabytes. A local-overlay build records its
+# public base; a build with no exact commit records nothing.
+RUN set -eux; \
+    _lineage_sha="$(cat /app/platform-baked/.baked-sha)"; \
+    if [ "${MOBIUS_USE_LOCAL_PLATFORM_SOURCE:-0}" = "1" ]; then \
+      _lineage_sha="${MOBIUS_LOCAL_PLATFORM_BASE_SHA}"; \
+    fi; \
+    : > /app/platform-lineage; \
+    if printf '%s' "$_lineage_sha" | grep -Eq '^[0-9a-f]{40}$' \
+       && [ "$(python3 -c 'import json; print(json.load(open("/app/build-info.json"))["sha"])')" != unknown ]; then \
+      _lineage_repo="$(mktemp -d)"; \
+      git -C "$_lineage_repo" init -q; \
+      git -C "$_lineage_repo" fetch -q --filter=tree:0 "$MOBIUS_PLATFORM_ORIGIN" "$_lineage_sha"; \
+      git -C "$_lineage_repo" rev-list "$_lineage_sha" > /app/platform-lineage; \
+      rm -rf "$_lineage_repo"; \
+    fi; \
+    chmod a+r /app/platform-lineage
+
 # Initialize the runtime volume paths for the non-root agent user.
 RUN mkdir -p /data/db /data/apps /data/compiled /data/shared \
     && chown -R mobius:mobius /data
