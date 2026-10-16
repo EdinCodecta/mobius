@@ -2865,10 +2865,9 @@ async def test_http_route_ceiling_is_reserved_and_enforced_before_body_decode(
   assert all(read[1] == read[2] == 0 for read in reads)
   assert max(size for size, _public in grown) == cap
   assert all(public == (3 * size if route == "public" else 0) for size, public in grown)
-  # Three copies of the ceiling; encoding a ceiling-sized string part also
-  # holds the part, its bytes and encoder state (measured 13.2 KB at 4 KiB).
-  assert [size for size, _transfer in executions] == [cap, cap]
-  assert executions[0][1] > 13_210 and executions[1] == (cap, _execution_transfer(cap)), "admission did not reserve the route ceiling"
+  # Stdio headroom dominates encoding these small envelopes, but the route's
+  # ceiling, not the service's 60 MiB maximum, must still govern both calls.
+  assert executions == [(cap, _execution_transfer(cap))] * 2
   if framing == "understated-length":
     assert [read[3] for read in reads[:2]] == ["2", "2"]
   assert app_services._admitted_exchange_cost == app_services._public_ingress_cost == 0
@@ -3788,9 +3787,12 @@ async def test_stdio_fits_its_execution_reservation_in_either_order(
     f"view = memoryview(b'{{\"body\":\"' + b'x' * ({cap} - 11) + b'\"}}')\n"
     "while view: view = view[os.write(1, view):]\n"
   )
+  # uvloop subprocess stdio and preload stdio use sockets; shutdown signals
+  # EOF even when the child has another descriptor for that socket.
   close_stdout = (
-    "socket.socket(fileno=os.dup(1)).shutdown(socket.SHUT_WR)\n"
-    if lane == "preload" else "os.close(1)\n"
+    "if stat.S_ISSOCK(os.fstat(1).st_mode):\n"
+    "  socket.socket(fileno=os.dup(1)).shutdown(socket.SHUT_WR)\n"
+    "else: os.close(1)\n"
   )
   action = (
     answer + close_stdout
@@ -3799,7 +3801,7 @@ async def test_stdio_fits_its_execution_reservation_in_either_order(
     if answers_first else "sys.stdin.buffer.read()\n" + answer
   )
   entry.write_text(
-    "import os, sys, time, socket\nMOBIUS_PRELOAD = True\n"
+    "import os, sys, time, socket, stat\nMOBIUS_PRELOAD = True\n"
     + 'if __name__ == "__main__":\n'
     + f"  os.write(2, b\"e\" * {stderr_bytes})\n"
     + "".join("  " + line + "\n" for line in action.splitlines())
@@ -3927,3 +3929,17 @@ def test_stdio_execution_overhead_includes_fixed_and_size_scaled_costs():
   # their expected execution charge from the production formula.
   assert app_services._stdio_overhead(4096) == 299208
   assert app_services._stdio_overhead(60 * MIB) == 495304
+
+
+@pytest.mark.asyncio
+async def test_execution_reserves_the_larger_encoding_peak_instead_of_stdio():
+  cap = MIB
+  with app_services.ServiceExchangeAdmission(cap) as admission:
+    await admission.retain({"body": "x" * (cap - 1024)})
+    encoding = app_services._json_encoding_peak(
+      min(cap, admission.encoded_bytes), admission.largest_part, admission.encoded_depth,
+    )
+    assert encoding > _execution_transfer(cap)
+    admission.admit_execution(cap)
+    assert admission.transfer_cost == encoding
+  assert app_services._admitted_exchange_cost == 0
