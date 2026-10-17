@@ -1709,7 +1709,7 @@ def _claim_and_notices(db):
   return claim, notices
 
 
-def test_goal_completion_wakes_claim_followers_without_a_finish_call(
+def test_goal_completion_stamps_exact_goal_dependency_without_peer_notice(
   client, auth, db, monkeypatch,
 ):
   _claim_owner_and_follower(db)
@@ -1721,21 +1721,17 @@ def test_goal_completion_wakes_claim_followers_without_a_finish_call(
     json={"complete": "Merged as 0b44dc9d; CI green",
           "finished_claims": [CLAIM_KEY]},
   )
-
   assert completed.status_code == 200, completed.text
-  claim, [notice] = _claim_and_notices(db)
+  claim, notices = _claim_and_notices(db)
   assert claim.completed_at is not None
-  assert claim.notification_revision == claim.revision
-  assert notice.to_chat_id == "claim-follower"
-  assert "completed: Owning Goal completed: Merged as 0b44dc9d" in notice.body
-  assert delivered == [(["claim-follower"], "interrupt")]
+  assert notices == [] and delivered == []
+  dependency = db.query(models.GoalDependency).one()
+  assert dependency.outcome_json["kind"] == "completed"
+  assert dependency.outcome_json["outcome"].startswith("Owning Goal completed")
 
 
-def test_stop_wakes_followers_of_released_claims_off_the_lifecycle_path(
-  client, auth, db, monkeypatch,
-):
+def test_stop_stamps_release_without_generic_peer_wake(client, auth, db, monkeypatch):
   import asyncio
-
   import app.agent_coordination as coordination
   from app import chat as chat_mod
 
@@ -1747,11 +1743,10 @@ def test_stop_wakes_followers_of_released_claims_off_the_lifecycle_path(
     await asyncio.gather(*list(coordination._SETTLEMENT_TASKS))
 
   asyncio.run(stop_then_drain_settlement())
-
-  claim, [notice] = _claim_and_notices(db)
+  claim, notices = _claim_and_notices(db)
   assert claim.released_at is not None
-  assert "You may claim it now" in notice.body
-  assert delivered == [(["claim-follower"], "interrupt")]
+  assert notices == [] and delivered == []
+  assert db.query(models.GoalDependency).one().outcome_json["kind"] == "released"
 
 
 @pytest.mark.parametrize("terminal_status", ["stopped", "interrupted", "failed"])
@@ -1778,33 +1773,25 @@ def test_process_termination_does_not_release_goal_claims_without_stop_intent(
   assert db.get(models.ChatGoal, "claim-owner-goal").status == "open"
 
 
-def test_settlement_notice_lost_to_a_crash_is_delivered_by_the_next_seam(
+def test_settlement_outcome_survives_lost_postcommit_nudge(
   client, auth, db, monkeypatch,
 ):
-  """The settle commit survives a restart; only the wake is retried."""
+  """A crash after the source commit cannot erase the follower's fact."""
   import asyncio
-
   from app.agent_coordination import settle_claims_with_owner
   from app.goals import update_goal_record
 
   _claim_owner_and_follower(db)
-  # Completion commits, then the process "dies" before any notice is sent.
   update_goal_record(
     db, db.get(models.ChatRun, "claim-owner-run"),
     db.get(models.ChatGoal, "claim-owner-goal"), 0, complete="Merged",
   )
-  claim, notices = _claim_and_notices(db)
-  assert claim.notification_revision < claim.revision and notices == []
-  delivered = _record_deliveries(monkeypatch)
-
-  assert asyncio.run(settle_claims_with_owner("claim-owner")) == [
-    "claim-follower",
-  ]
-  assert asyncio.run(settle_claims_with_owner("claim-owner")) == []
-  claim, notices = _claim_and_notices(db)
-  assert claim.notification_revision == claim.revision
-  assert len(notices) == 1
-  assert delivered == [(["claim-follower"], "interrupt")]
+  before = db.query(models.GoalDependency).one()
+  assert before.resolved_at is not None
+  assert before.outcome_json["kind"] == "released"
+  asyncio.run(settle_claims_with_owner("claim-owner"))
+  after = db.query(models.GoalDependency).one()
+  assert after.outcome_json == before.outcome_json
 
 
 def test_goal_parent_and_its_helper_share_one_coordination_scope(db):

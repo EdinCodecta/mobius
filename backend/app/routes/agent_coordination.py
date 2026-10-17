@@ -21,14 +21,13 @@ from app.agent_coordination import (
   owner_chat_snapshot,
   owner_project_snapshot,
   send_agent_message,
-  send_work_claim_notice,
+  send_work_claim_transfer_notice,
   visible_peer_messages,
 )
 from app.agent_work_claims import (
-  acknowledge_notice,
+  acknowledge_transfer_notice,
   claim_work,
   finish_work,
-  work_claim_notice_body,
 )
 from app.database import get_db
 from app.deps import (
@@ -116,11 +115,11 @@ async def claim_current_work(
     raise HTTPException(409, str(exc)) from exc
   previous = result.get("previous_owner_chat_id")
   if previous and result.get("notification_pending"):
-    send_work_claim_notice(
+    send_work_claim_transfer_notice(
       db,
       owner_id=principal.owner.id,
       claim_id=result["id"],
-      revision=result["revision"],
+      revision=result["transfer_notice_revision"],
       sender_chat_id=principal.chat_id,
       recipients=[previous],
       body=(
@@ -136,9 +135,8 @@ async def claim_current_work(
     # its requested live/wake/queue delivery path. A crash or delivery error
     # before this point leaves notification_pending true, so the exact same
     # transfer request retries idempotently instead of losing the wake.
-    acknowledge_notice(
-      db, claim_id=result["id"], revision=result["revision"],
-      resolve_interests=False,
+    acknowledge_transfer_notice(
+      db, claim_id=result["id"], revision=result["transfer_notice_revision"],
     )
     result["notification_pending"] = False
     result["steered"] = delivery.steered
@@ -165,36 +163,13 @@ async def finish_current_work(
     )
   except ValueError as exc:
     raise HTTPException(409, str(exc)) from exc
-  recipients = finished.interested_chat_ids
-  delivery = None
-  woken: list[str] = []
-  if recipients:
-    send_work_claim_notice(
-      db,
-      owner_id=principal.owner.id,
-      claim_id=finished.claim["id"],
-      revision=finished.claim["revision"],
-      sender_chat_id=principal.chat_id,
-      recipients=recipients,
-      body=work_claim_notice_body(
-        finished.claim["work_key"], finished.claim["state"],
-        finished.claim.get("outcome") or "",
-      ),
-    )
-    delivery = await deliver_peer_recipients(
-      recipients=recipients, delivery=DELIVERY_INTERRUPT, kind="handoff",
-      sender_chat_id=principal.chat_id,
-    )
-    woken = delivery.woken
-  acknowledge_notice(
-    db, claim_id=finished.claim["id"], revision=finished.claim["revision"],
-    resolve_interests=True,
-  )
+  # Source outcome was stamped in the finish transaction. The delivery pass
+  # only reduces latency; it never makes the result durable.
+  from app.goal_dependencies import deliver_pending_dependencies
+  delivery = await deliver_pending_dependencies()
   return {
-    **finished.claim, "notification_pending": False,
-    "notified": recipients, "steered": delivery.steered if recipients else [],
-    "woken": woken, "queued": delivery.queued if recipients else [],
-    "unreachable": delivery.unreachable if recipients else [],
+    **finished,
+    "dependency_delivery": delivery,
   }
 
 

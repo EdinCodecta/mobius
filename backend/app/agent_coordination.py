@@ -1585,7 +1585,7 @@ def send_agent_message(
     )
 
 
-def send_work_claim_notice(
+def send_work_claim_transfer_notice(
   db: Session,
   *,
   owner_id: int,
@@ -1595,7 +1595,7 @@ def send_work_claim_notice(
   recipients: list[str],
   body: str,
 ) -> list[dict[str, Any]]:
-  """Persist a retry-safe claim notice across physical agent turns."""
+  """Persist a retry-safe ownership-revocation interrupt for the former executor."""
   unique_recipients = list(dict.fromkeys(str(value) for value in recipients))
   if not unique_recipients:
     return []
@@ -1968,74 +1968,15 @@ async def deliver_peer_recipients(
   )
 
 
-async def notify_settled_claims(
-  db: Session, *, owner_id: int, sender_chat_id: str, settled: list[Any],
-) -> list[str]:
-  """Notify and wake followers of claims settled with their owner.
+async def settle_claims_with_owner(chat_id: str) -> None:
+  """Post-commit claim repair and exact-Goal result delivery nudge.
 
-  Each notice is persisted idempotently (``send_id`` is the claim revision),
-  then one interrupting delivery wakes every follower, and only then is each
-  retry latch acknowledged. A crash before acknowledgement leaves the claim's
-  notice pending for the next lifecycle seam; one failing claim cannot
-  suppress fanout for the others. Returns the notified follower ids.
-  """
-  from app.agent_work_claims import acknowledge_notice, work_claim_notice_body
-
-  recipients: list[str] = []
-  noticed = []
-  for item in settled:
-    try:
-      if item.interested_chat_ids:
-        send_work_claim_notice(
-          db,
-          owner_id=owner_id,
-          claim_id=item.claim_id,
-          revision=item.revision,
-          sender_chat_id=sender_chat_id,
-          recipients=item.interested_chat_ids,
-          body=work_claim_notice_body(item.work_key, item.state, item.outcome),
-        )
-        recipients.extend(item.interested_chat_ids)
-      noticed.append(item)
-    except Exception:
-      db.rollback()
-      log.exception(
-        "claim %s settled with chat %s but followers were not notified",
-        item.claim_id, sender_chat_id,
-      )
-  recipients = list(dict.fromkeys(recipients))
-  if recipients:
-    await deliver_peer_recipients(
-      recipients=recipients, delivery=DELIVERY_INTERRUPT, kind="handoff",
-      sender_chat_id=sender_chat_id,
-    )
-  for item in noticed:
-    try:
-      acknowledge_notice(
-        db, claim_id=item.claim_id, revision=item.revision,
-        resolve_interests=True,
-      )
-    except Exception:
-      db.rollback()
-      log.warning(
-        "claim %s notice delivered but not acknowledged", item.claim_id,
-        exc_info=True,
-      )
-  return recipients
-
-
-async def settle_claims_with_owner(chat_id: str) -> list[str]:
-  """Post-commit seam: settle and announce claims whose owner has ended.
-
-  Lifecycle writes (Goal completion, Stop, dismissal, chat deletion) settle
-  claims atomically with the Goal or tombstone. This seam re-derives any
-  claim those writes could not settle, then delivers every notice this chat
-  still owes its followers. Returns the notified follower ids. It never
-  raises: a failure leaves durable state for the next seam, never a false
-  completion.
+  Lifecycle writes settle claims atomically with their Goal or tombstone.
+  This seam repairs source rows ended by older paths, then nudges dependency
+  reconciliation. No follower chat-wide interrupt is sent. Failure leaves
+  durable outcomes for the next supervisor pass, never a false receipt.
   """
   from app.agent_work_claims import (
-    pending_settlement_notices,
     stage_settle_claims_with_owner,
   )
   from app.database import SessionLocal
@@ -2046,19 +1987,10 @@ async def settle_claims_with_owner(chat_id: str) -> list[str]:
         db.commit()
       else:
         db.rollback()
-      pending = pending_settlement_notices(db, chat_id)
-      by_owner: dict[int, list[Any]] = {}
-      for item in pending:
-        by_owner.setdefault(item.owner_id, []).append(item)
-      notified: list[str] = []
-      for owner_id, items in by_owner.items():
-        notified.extend(await notify_settled_claims(
-          db, owner_id=owner_id, sender_chat_id=chat_id, settled=items,
-        ))
-      return notified
+      from app.goal_dependencies import deliver_pending_dependencies
+      await deliver_pending_dependencies()
   except Exception:
     log.warning("claim settlement failed chat=%s", chat_id, exc_info=True)
-    return []
 
 
 _SETTLEMENT_TASKS: set[asyncio.Task] = set()
