@@ -1,6 +1,8 @@
 import mmap
 import os
 
+import pytest
+
 from app import file_cache
 
 
@@ -207,3 +209,27 @@ def test_background_work_cleanup_covers_every_repository_pack_but_no_chat_profil
     )
   }
   assert all("agent-browser-profiles" not in str(path) for path in source_paths)
+
+
+@pytest.mark.parametrize("cached", [None, file_cache.ACCUMULATED_CACHE_FLOOR_BYTES - 1])
+def test_periodic_release_waits_for_the_floor(tmp_path, monkeypatch, cached):
+  """A quiet instance, or one without a readable cgroup, is left alone."""
+  calls = []
+  monkeypatch.setattr(file_cache, "_cached_file_bytes", lambda: cached)
+  monkeypatch.setattr(file_cache, "reclaim_background_work_cache", calls.append)
+
+  assert file_cache.reclaim_accumulated_cache(tmp_path) is False
+  assert calls == []
+
+
+def test_periodic_release_frees_what_a_long_turn_keeps_hot(tmp_path, monkeypatch):
+  """Over the floor, the tick reuses the background-work cleanup unchanged."""
+  calls = []
+  monkeypatch.setattr(
+    file_cache, "_cached_file_bytes",
+    lambda: file_cache.ACCUMULATED_CACHE_FLOOR_BYTES,
+  )
+  monkeypatch.setattr(file_cache, "reclaim_background_work_cache", calls.append)
+
+  assert file_cache.reclaim_accumulated_cache(tmp_path) is True
+  assert calls == [tmp_path]

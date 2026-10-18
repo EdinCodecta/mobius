@@ -246,3 +246,23 @@ def reclaim_background_work_cache(data_dir: str | Path) -> None:
   """
   reclaim_file_cache(settled_tool_paths(), skip_mapped=False)
   reclaim_file_cache(repository_pack_paths(data_dir))
+
+
+# Below this much file cache the periodic pass has too little to release to be
+# worth running; in-use executable pages alone hold roughly half of it.
+ACCUMULATED_CACHE_FLOOR_BYTES = 256 * 1024 * 1024
+
+
+def reclaim_accumulated_cache(data_dir: str | Path) -> bool:
+  """Release tool and git-history pages that a long turn keeps hot.
+
+  The settled-turn, app-job and boot boundaries run only after work ends, so
+  one long turn, or several overlapping ones, leaves these pages billable for
+  hours. The capacity monitor's existing tick calls this; it does nothing
+  while the container's file cache is under the floor or unreadable.
+  """
+  cached = _cached_file_bytes()
+  if cached is None or cached < ACCUMULATED_CACHE_FLOOR_BYTES:
+    return False
+  reclaim_background_work_cache(data_dir)
+  return True

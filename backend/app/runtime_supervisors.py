@@ -521,6 +521,7 @@ class RuntimeSupervisors:
         run_capacity_tick,
       )
       from app.config import get_settings
+      from app.file_cache import reclaim_accumulated_cache
 
       data_dir = get_settings().data_dir
       tick = 0
@@ -570,6 +571,12 @@ class RuntimeSupervisors:
           raise
         except Exception as exc:
           self.log.error("capacity monitor failed: %s", exc, exc_info=True)
+        # Railway meters page cache as memory, and turn-end cleanup waits for
+        # the turn to end; release what long turns keep hot in the meantime.
+        try:
+          await asyncio.to_thread(reclaim_accumulated_cache, data_dir)
+        except Exception:
+          self.log.debug("periodic file cache advice failed", exc_info=True)
         tick += 1
         await asyncio.sleep(CAPACITY_MONITOR_INTERVAL_SECS)
 
