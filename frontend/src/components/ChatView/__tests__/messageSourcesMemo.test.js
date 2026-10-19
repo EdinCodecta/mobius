@@ -18,3 +18,10 @@ test('older-history prepend reuses references work for unchanged historical bloc
   assert.equal(sameMessageSourcesProps(before, { ...before, disclosureKey: 'next:references' }), false)
   assert.equal(sameMessageSourcesProps(before, { ...before, chatId: 'other' }), false)
 })
+
+test('references comparison reads an omitted source input as none', () => {
+  const bare = { chatId: 'chat', disclosureKey: 'reply:references' }
+  assert.equal(sameMessageSourcesProps(bare, { ...bare }), true)
+  assert.equal(sameMessageSourcesProps(bare, { ...bare, groups: [], refs: [] }), true)
+  assert.equal(sameMessageSourcesProps(bare, { ...bare, groups: [[{ type: 'tool' }]] }), false)
+})
