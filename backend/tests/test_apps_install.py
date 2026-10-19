@@ -11258,6 +11258,96 @@ def test_install_preview_resolves_its_row_off_the_event_loop(
   assert on_loop == [False]
 
 
+# MANIFEST_NEWS minus its icon, job and seed files, so a test names every file.
+_MANIFEST_WITHOUT_FILES = {
+  key: value for key, value in MANIFEST_NEWS.items()
+  if key not in ("icon", "schedule", "storage_seeds")
+}
+
+
+def _recording_client(responses: dict, requests: list):
+  """`_fake_async_client`, also recording each request's method, url and headers."""
+  make = _fake_async_client(responses)
+
+  def factory(*args, **kwargs):
+    client = make()
+    stream = client.stream
+
+    def recording_stream(method, url, **kw):
+      requests.append((method, url, dict(kw.get("headers") or {})))
+      return stream(method, url, **kw)
+
+    client.stream = recording_stream
+    return client
+
+  return factory
+
+
+def test_install_preview_reports_download_size_without_fetching_app_code(
+  client, auth, bypass_url_validation,
+):
+  """The Store shows this before install, so only headers are read."""
+  base = "https://preview-size.test/repo/"
+  manifest = {
+    **_MANIFEST_WITHOUT_FILES, "id": "preview-size", "entry": "index.jsx",
+    "source_files": ["lib.js"], "static_assets": {"a.png": "static/a.png"},
+  }
+  sized = lambda size: (200, b"", {"Content-Length": str(size)})
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": sized(1000),
+    base + "lib.js": sized(200),
+    base + "static/a.png": sized(30),
+  }
+  requests: list = []
+  with patch("app.install.httpx.AsyncClient", side_effect=_recording_client(responses, requests)):
+    preview = client.post("/api/apps/preview", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert preview.status_code == 200, preview.text
+  assert preview.json()["download_bytes"] == 1230
+  file_requests = [r for r in requests if not r[1].endswith("mobius.json")]
+  assert {method for method, _url, _h in file_requests} == {"HEAD"}
+  assert all(h["Accept-Encoding"] == "identity" for _m, _u, h in file_requests)
+
+
+def test_install_preview_omits_download_size_when_a_file_size_is_unknown(
+  client, auth, bypass_url_validation,
+):
+  """A missing size hides the number instead of showing a wrong one."""
+  base = "https://preview-size-unknown.test/repo/"
+  manifest = {
+    **_MANIFEST_WITHOUT_FILES, "id": "preview-size-unknown", "entry": "index.jsx",
+    "source_files": ["lib.js"],
+  }
+  responses = {
+    base + "mobius.json": (200, json.dumps(manifest).encode()),
+    base + "index.jsx": (200, b"", {"Content-Length": "1000"}),
+    # lib.js is absent: the fake answers 404.
+  }
+  with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
+    preview = client.post("/api/apps/preview", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+  assert preview.status_code == 200, preview.text
+  assert preview.json()["download_bytes"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [
+  {"Content-Length": "40", "Content-Encoding": "gzip"},
+  {},
+])
+async def test_remote_file_size_never_reports_a_compressed_or_missing_length(
+  headers, bypass_url_validation,
+):
+  class _Client:
+    def stream(self, method, url, **kwargs):
+      return _StreamCtx(200, b"", headers=headers)
+
+  assert await install._remote_file_size(_Client(), "https://x.test/a.js") is None
+
+
 def test_staged_clone_binds_identity_before_its_one_package_read(
   db, tmp_path, monkeypatch,
 ):

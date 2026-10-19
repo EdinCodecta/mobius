@@ -36,9 +36,10 @@ import socket
 import subprocess
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import AsyncIterator, Callable, Mapping, Sequence
 from urllib.parse import quote, urljoin, urlparse
 
 import httpx
@@ -232,6 +233,7 @@ _SYSTEM_PROMPT_MAX_BYTES = _CONTRACT_SYSTEM_PROMPT_MAX_BYTES
 _MERGED_NON_SOURCE = managed_paths.MERGED_NON_SOURCE
 
 _HTTP_TIMEOUT = 15.0
+_SIZE_LOOKUP_CONCURRENCY = 16
 
 # Tests override this module attribute to prevent production cron mutation.
 CRON_SCAFFOLD = app_cron.BAKED_CRON_SCAFFOLD
@@ -651,10 +653,34 @@ def pending_conflict_update_matches_app(
   )
 
 
-async def _http_get(
-  client: httpx.AsyncClient, url: str, max_bytes: int, _hops: int = 0,
-) -> bytes:
-  """GETs a URL with SSRF validation + manual redirect handling.
+def _redirect_target(url: str, r: httpx.Response) -> str | None:
+  """The next hop of a redirect, or None for a usable response.
+
+  Error statuses raise here, so every caller refuses them the same way.
+  """
+  if r.status_code in (301, 302, 303, 307, 308):
+    loc = r.headers.get("Location")
+    if not loc:
+      raise HTTPException(502, f"Redirect from {url} missing Location header.")
+    return urljoin(url, loc)
+  if r.status_code == 404:
+    raise HTTPException(404, f"Not found: {url}")
+  if _is_rate_limited(url, r.status_code, r.headers):
+    raise _rate_limit_error(url, r.headers)
+  if r.status_code >= 400:
+    raise HTTPException(502, f"Upstream {r.status_code} fetching {url}")
+  return None
+
+
+@asynccontextmanager
+async def _validated_response(
+  client: httpx.AsyncClient,
+  url: str,
+  method: str = "GET",
+  headers: Mapping[str, str] | None = None,
+  _hops: int = 0,
+) -> AsyncIterator[httpx.Response]:
+  """Open one request with SSRF validation + manual redirect handling.
 
   Each hop is re-validated through `_validate_url_safe` so a 302 to
   a private IP gets rejected just like a direct request to one — and the
@@ -664,11 +690,7 @@ async def _http_get(
   closing the DNS-rebinding gap where httpx would re-resolve at connect time.
   `follow_redirects` is False on the client; we walk the chain ourselves with a
   hop count cap, resolving each Location against the original (hostname) URL.
-
-  Reads the body as a stream and aborts as soon as the running byte
-  total crosses `max_bytes` — `r.content` would buffer the full
-  response before the cap fires, so a hostile upstream could force
-  us to allocate `max_bytes` × N pending requests in memory.
+  Yields the final response with its body still unread.
   """
   if _hops > _MAX_REDIRECTS:
     raise HTTPException(
@@ -676,52 +698,94 @@ async def _http_get(
     )
   # getaddrinfo blocks; resolve off the event loop.
   pinned_url, host_header, sni_host = await asyncio.to_thread(_validate_url_safe, url)
+  next_url = None
   try:
     async with client.stream(
-      "GET", pinned_url,
-      headers={"Host": host_header},
+      method, pinned_url,
+      headers={**(headers or {}), "Host": host_header},
       # httpcore/anyio expect a hostname string here. Passing bytes worked with
       # older httpx but now reaches idna2008_resolve(), which calls `.encode()`
       # and crashes every real HTTPS install/update before the request is sent.
       extensions={"sni_hostname": sni_host},
     ) as r:
-      # Handle redirects + error statuses with the stream closed
-      # quickly so we don't hold a connection while recursing.
-      if r.status_code in (301, 302, 303, 307, 308):
-        loc = r.headers.get("Location")
-        if not loc:
-          raise HTTPException(
-            502, f"Redirect from {url} missing Location header.",
-          )
-        next_url = urljoin(url, loc)
-      else:
-        next_url = None
-        if r.status_code == 404:
-          raise HTTPException(404, f"Not found: {url}")
-        if _is_rate_limited(url, r.status_code, r.headers):
-          raise _rate_limit_error(url, r.headers)
-        if r.status_code >= 400:
-          raise HTTPException(
-            502, f"Upstream {r.status_code} fetching {url}",
-          )
-        chunks: list[bytes] = []
-        total = 0
-        async for chunk in r.aiter_bytes():
-          total += len(chunk)
-          if total > max_bytes:
-            raise HTTPException(
-              413,
-              f"{url} exceeds {max_bytes} byte cap ({total}+ received).",
-            )
-          chunks.append(chunk)
-        return b"".join(chunks)
+      next_url = _redirect_target(url, r)
+      if next_url is None:
+        yield r
   except httpx.TimeoutException:
     raise HTTPException(504, f"Timeout fetching {url}")
   except httpx.RequestError as exc:
     raise HTTPException(502, f"Failed to fetch {url}: {exc}")
-  # Recurse outside the stream context so the previous connection is
+  if next_url is None:
+    return
+  # Follow outside the stream context so the previous connection is
   # already released by the time we open the next one.
-  return await _http_get(client, next_url, max_bytes, _hops + 1)
+  async with _validated_response(
+    client, next_url, method, headers, _hops + 1,
+  ) as r:
+    yield r
+
+
+async def _http_get(client: httpx.AsyncClient, url: str, max_bytes: int) -> bytes:
+  """GETs a URL through `_validated_response`.
+
+  Reads the body as a stream and aborts as soon as the running byte
+  total crosses `max_bytes` — `r.content` would buffer the full
+  response before the cap fires, so a hostile upstream could force
+  us to allocate `max_bytes` × N pending requests in memory.
+  """
+  async with _validated_response(client, url) as r:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in r.aiter_bytes():
+      total += len(chunk)
+      if total > max_bytes:
+        raise HTTPException(
+          413,
+          f"{url} exceeds {max_bytes} byte cap ({total}+ received).",
+        )
+      chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _remote_file_size(client: httpx.AsyncClient, url: str) -> int | None:
+  """A remote file's size from its response headers, or None when unknown.
+
+  Asks for `identity` encoding: httpx advertises gzip by default, and a
+  compressed length is not the number of bytes install writes.
+  """
+  try:
+    async with _validated_response(
+      client, url, "HEAD", {"Accept-Encoding": "identity"},
+    ) as r:
+      length = r.headers.get("Content-Length", "")
+      encoding = r.headers.get("Content-Encoding", "identity")
+  except HTTPException:
+    return None
+  if encoding != "identity" or not length.isdigit():
+    return None
+  return int(length)
+
+
+async def package_download_bytes(manifest: Mapping, raw_base: str) -> int | None:
+  """Bytes install would download for `manifest`, or None if any is unknown.
+
+  The pre-install review shows this, so it reads response headers only and
+  never fetches app code; install still fetches and binds the bytes itself.
+  The sum is `package_bytes`, the same count the package limit uses.
+  """
+  paths = sorted(set(package_input_paths(manifest)))
+  # A manifest may declare many files; keep the burst on one host small.
+  gate = asyncio.Semaphore(_SIZE_LOOKUP_CONCURRENCY)
+
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as client:
+    async def size_of(rel: str) -> int | None:
+      async with gate:
+        return await _remote_file_size(client, raw_base + quote(rel))
+
+    sizes = dict(zip(paths, await asyncio.gather(*map(size_of, paths))))
+  if None in sizes.values():
+    return None
+  return package_bytes(manifest, sizes.__getitem__)
 
 
 class _PackageDownload:

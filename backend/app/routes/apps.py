@@ -777,7 +777,8 @@ async def preview_app_install(
 ):
   """Validate and normalize the capabilities an install would apply.
 
-  This intentionally fetches only the manifest.  The install endpoint repeats
+  This intentionally fetches only the manifest (plus the response headers that
+  size its declared files, never their contents).  The install endpoint repeats
   the fetch and binds it to ``reviewed_capability_digest`` before fetching app
   code or mutating durable state, closing the catalog-preview/install race.
   """
@@ -803,6 +804,7 @@ async def preview_app_install(
     capability_digest=digest,
     installed_contract=installed_contract,
     capability_diff=diff_contracts(installed_contract, contract),
+    download_bytes=await install.package_download_bytes(manifest, raw_base),
   )
 
 
