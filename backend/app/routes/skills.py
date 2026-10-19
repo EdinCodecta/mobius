@@ -53,7 +53,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
-from app import activity, catalog_index, data_git, install, models, skills
+from app import (
+  activity, app_skills, catalog_index, data_git, install, models, skills,
+)
 from app.config import get_settings
 from app.database import get_db
 from app.deps import (
@@ -867,6 +869,13 @@ async def install_skill(
           f"(provenance: {_provenance_of(skills_dir, name)}). Remove or "
           "rename it first, or install under a different `name`.",
         )
+    if app_skills.holds_restorable_skill(skills_dir, name):
+      raise HTTPException(
+        409,
+        f"A skill named {name!r} belongs to an app skill that is set aside "
+        "and can still be restored (for example, a deleted app in its "
+        "recovery window). Install under a different `name`.",
+      )
 
     # One crash-recoverable transition, in four durable steps:
     #   1. stage the complete bounded tree in a fresh dot-prefixed dir
