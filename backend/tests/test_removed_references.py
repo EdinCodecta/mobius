@@ -100,6 +100,29 @@ def test_references_that_did_not_break_with_this_release_are_not_reported(repo, 
   assert _find(repo, baseline=_MOVED_BEFORE, release=_MOVED_AFTER, local=local) == []
 
 
+@pytest.mark.parametrize("source", [
+  # An old-name import with a fallback to the new home works across the move.
+  "try:\n  from app.install import read_receipt\n"
+  "except ImportError:\n  from app.pending_update import read_receipt\n",
+  "from app import install, pending_update\n\ndef read():\n"
+  "  try:\n    return install.read_receipt()\n"
+  "  except AttributeError:\n    return pending_update.read_receipt()\n",
+  "try:\n  from app.install import read_receipt\nexcept (ModuleNotFoundError, ImportError):\n  read_receipt = None\n",
+])
+def test_references_guarded_by_a_lookup_fallback_are_left_to_the_tests(repo, source):
+  local = {"backend/app/voice.py": source}
+  assert _find(repo, baseline=_MOVED_BEFORE, release=_MOVED_AFTER, local=local) == []
+
+
+def test_a_handler_for_an_unrelated_error_does_not_guard_a_moved_name(repo):
+  local = {"backend/app/voice.py": (
+    "try:\n  from app.install import read_receipt\nexcept ValueError:\n  pass\n"
+  )}
+  assert _find(repo, baseline=_MOVED_BEFORE, release=_MOVED_AFTER, local=local) == [
+    "backend/app/voice.py:2 uses app.install.read_receipt",
+  ]
+
+
 @pytest.mark.parametrize("release_install", [
   "def __getattr__(name):\n  return name\n",
   "from app.pending_update import *\n",

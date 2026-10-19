@@ -11,7 +11,9 @@ does not on the candidate: the same pass-before/fail-after rule as the local
 tests, so names that were already dynamic or unresolvable never block an
 update. Resolution is static and deliberately conservative. A module with a
 module-level ``__getattr__`` or a star import is treated as defining every
-name, and a module alias that the referring file rebinds anywhere is ignored.
+name, a module alias that the referring file rebinds anywhere is ignored, and a
+reference inside a ``try`` whose handler catches a failed lookup is left to the
+tests: an old-name import with a fallback to the new one works across a move.
 """
 
 from __future__ import annotations
@@ -25,6 +27,12 @@ from app import app_git
 PACKAGE = "app"
 SOURCE_ROOT = "backend/app"
 _DYNAMIC = object()
+# Handlers that can absorb a missing module or name. A broad handler counts
+# too: the static check cannot tell what the fallback does, so it abstains.
+_LOOKUP_FAILURES = frozenset({
+  "ImportError", "ModuleNotFoundError", "AttributeError", "NameError",
+  "Exception", "BaseException",
+})
 
 
 def _module_name(path: str) -> str:
@@ -119,9 +127,37 @@ def _absolute(module: str, node: ast.ImportFrom, path: str) -> str | None:
   return ".".join([*base, *([node.module] if node.module else [])])
 
 
+def _handles_lookup_failure(handler: ast.ExceptHandler) -> bool:
+  if handler.type is None:
+    return True
+  kinds = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+  return any(
+    (isinstance(kind, ast.Name) and kind.id in _LOOKUP_FAILURES)
+    or (isinstance(kind, ast.Attribute) and kind.attr in _LOOKUP_FAILURES)
+    for kind in kinds
+  )
+
+
+def _guarded_nodes(tree: ast.Module) -> set[int]:
+  """Nodes inside a ``try`` body whose handlers can absorb a failed lookup."""
+  guarded: set[int] = set()
+  for node in ast.walk(tree):
+    if isinstance(node, (ast.Try, ast.TryStar)) and any(
+      _handles_lookup_failure(handler) for handler in node.handlers
+    ):
+      for statement in node.body:
+        guarded.update(id(child) for child in ast.walk(statement))
+  return guarded
+
+
 def _references(tree: ast.Module, path: str, is_module) -> list[tuple[int, str, str]]:
-  """(line, module, name) pairs this file takes from the backend package."""
+  """(line, module, name) pairs this file takes from the backend package.
+
+  References a lookup-failure handler guards are omitted: they are not
+  evidence that the edit breaks.
+  """
   module = _module_name(path)
+  guarded = _guarded_nodes(tree)
   found: list[tuple[int, str, str]] = []
   # Every binding of a name: the backend module an import binds it to, or
   # None for any other binding. Repeating one import inside each function is
@@ -141,7 +177,8 @@ def _references(tree: ast.Module, path: str, is_module) -> list[tuple[int, str, 
       for alias in node.names:
         if alias.name == "*":
           continue
-        found.append((node.lineno, source, alias.name))
+        if id(node) not in guarded:
+          found.append((node.lineno, source, alias.name))
         target = f"{source}.{alias.name}"
         bind(alias.asname or alias.name, target if is_module(target) else None)
     elif isinstance(node, ast.Import):
@@ -172,7 +209,8 @@ def _references(tree: ast.Module, path: str, is_module) -> list[tuple[int, str, 
   }
   for node in ast.walk(tree):
     if (isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
-        and isinstance(node.value, ast.Name) and node.value.id in stable):
+        and isinstance(node.value, ast.Name) and node.value.id in stable
+        and id(node) not in guarded):
       found.append((node.lineno, stable[node.value.id], node.attr))
   return found
 
