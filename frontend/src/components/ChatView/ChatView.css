@@ -4831,6 +4831,35 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
   text-overflow: ellipsis;
 }
 
+/* Files attached to a queued message. A message that is only a picture has no
+   text, so this is the whole row; with text it sits after it. */
+.queued__files {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 50%;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted); /* CONTRACT: low-contrast text on opaque fill */
+}
+
+.queued__files--only {
+  flex: 1;
+  max-width: none;
+}
+
+.queued__files svg {
+  flex-shrink: 0;
+}
+
+.queued__files-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* The queued message open in the chat box (ChatInputBar's history strip says
    "Editing queued message N of M"). The row stays in place, tinted, and its
    pencil becomes a quiet label so the owner can see where the edit will land. */
