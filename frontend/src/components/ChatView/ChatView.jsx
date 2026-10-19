@@ -4166,9 +4166,9 @@ export default function ChatView({
   })
 
   // Chat commands (slashCommands.mobiusChatCommand) run here and are never
-  // sent. Nothing typed is lost to a failure: /compact and /new leave the chat
-  // box only once their action has happened, and /btw moves its question into
-  // the side-question card, which offers Try again.
+  // sent. Nothing typed is lost to a failure: /compact leaves the chat box once
+  // the server starts compacting and /new once the new chat exists, and /btw
+  // moves its question into the side-question card, which offers Try again.
   function dispatchMobiusChatCommand(composed) {
     const command = mobiusChatCommand(composed)
     if (!command) return false
