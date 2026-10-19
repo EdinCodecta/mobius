@@ -365,21 +365,31 @@ async def deactivate_app_skills(app_id: int) -> list[str]:
   return warnings
 
 
-def holds_restorable_skill(skills_dir: Path, skill_id: str) -> bool:
-  """Whether a set-aside app skill still reserves ``skill_id``.
+def holds_restorable_skill(db: Session, skills_dir: Path, skill_id: str) -> bool:
+  """Whether a set-aside app skill could still come back under ``skill_id``.
 
-  An inactive record exists while its app is deleted but recoverable (purge
-  drops it), or after a restore left the skill aside because another skill
-  had taken the name. Either way the app can still bring it back, so a direct
-  install must not take the name in the meantime.
+  An inactive record exists while its app is deleted but recoverable, or after
+  a restore left the skill aside because another skill had taken the name.
+  It reserves the name only while restore could still use it: the preserved
+  bytes exist and the app row does (soft-deleted rows stay until purge). A
+  record a failed purge left behind must not block the name forever, the same
+  rule the sync phase applies to a hard-purged owner.
   """
   _, records = _read_app_skill_records(skills_dir)
-  return any(
-    isinstance(rec, dict)
-    and rec.get("active", True) is False
-    and _app_skill_id(rel) == skill_id
-    for rel, rec in records.items()
-  )
+  for rel, rec in records.items():
+    if (
+      not isinstance(rec, dict)
+      or rec.get("active", True) is not False
+      or _app_skill_id(rel) != skill_id
+    ):
+      continue
+    app_id = rec.get("app_id")
+    preserved = skills_dir / ".inactive" / str(app_id) / rel
+    if not preserved.is_file():
+      continue
+    if db.query(models.App.id).filter(models.App.id == app_id).first():
+      return True
+  return False
 
 
 def _restore_blocker(skills_dir: Path, rel: str, installed: dict) -> str | None:

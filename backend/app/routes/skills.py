@@ -833,6 +833,7 @@ def list_skills(principal=Depends(get_principal)) -> dict:
 )
 async def install_skill(
   body: SkillInstall,
+  db: Session = Depends(get_db),
   _: models.Owner = Depends(get_owner_or_app_with_manage_skills),
 ) -> dict:
   """Fetch a skill (SKILL.md dir or single markdown) from GitHub into the tree.
@@ -869,7 +870,7 @@ async def install_skill(
           f"(provenance: {_provenance_of(skills_dir, name)}). Remove or "
           "rename it first, or install under a different `name`.",
         )
-    if app_skills.holds_restorable_skill(skills_dir, name):
+    if app_skills.holds_restorable_skill(db, skills_dir, name):
       raise HTTPException(
         409,
         f"A skill named {name!r} belongs to an app skill that is set aside "

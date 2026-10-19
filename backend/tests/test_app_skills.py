@@ -409,6 +409,44 @@ def test_direct_install_cannot_take_a_deleted_apps_restorable_skill_name(
     shutil.rmtree(_skills_dir(), ignore_errors=True)
 
 
+@pytest.mark.parametrize("leftover", ["app_gone", "bytes_gone"])
+def test_leftover_inactive_record_does_not_block_a_skill_install(
+  client, auth, bypass_url_validation, monkeypatch, leftover,
+):
+  """A record a failed purge left behind cannot be restored, so it must not
+  reserve the name forever."""
+  from app.routes import skills as skills_routes
+
+  shutil.rmtree(_skills_dir(), ignore_errors=True)
+  owner = _install(client, auth, _skill_manifest(), {
+    "index.jsx": JSX, "contributing.md": SKILL_V1,
+  })
+  assert owner.status_code == 201, owner.text
+  app_id = owner.json()["id"]
+  assert client.delete(f"/api/apps/{app_id}", headers=auth).status_code == 204
+  if leftover == "app_gone":
+    records = _sidecar()
+    records["contributing.md"]["app_id"] = 987654
+    (_skills_dir() / ".app-skills.json").write_text(json.dumps(records))
+    preserved = _skills_dir() / ".inactive" / "987654" / "contributing.md"
+    preserved.parent.mkdir(parents=True)
+    preserved.write_text(SKILL_V1)
+  else:
+    (_skills_dir() / ".inactive" / str(app_id) / "contributing.md").unlink()
+
+  url = "https://raw.githubusercontent.com/o/r/main/contributing.md"
+  monkeypatch.setattr(
+    skills_routes.install, "_http_get",
+    _fake_fetch({url: b"# public contributing skill\n"}),
+  )
+  try:
+    r = client.post("/api/skills/install", headers=auth, json={"url": url})
+    assert r.status_code == 201, r.text
+    assert (_skills_dir() / "contributing" / "SKILL.md").is_file()
+  finally:
+    shutil.rmtree(_skills_dir(), ignore_errors=True)
+
+
 def _place_installed_dir_skill(name: str, body: str) -> Path:
   """An install-provenance directory skill that reached disk some other way."""
   folder = _skills_dir() / name
