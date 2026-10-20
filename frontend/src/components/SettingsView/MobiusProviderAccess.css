@@ -6,7 +6,9 @@
 .settings-mobius-access__visibility small, .settings-mobius-access__row > span, .settings-mobius-access__note { color: var(--muted); }
 .settings-mobius-access__visibility input { flex: 0 0 18px; width: 18px; height: 18px; appearance: auto; -webkit-appearance: checkbox; accent-color: var(--accent); }
 .settings-mobius-access__note { margin: 0; line-height: 1.45; }
-.settings-mobius-access__action { justify-self: start; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text); cursor: pointer; }
+.settings-mobius-access__action { justify-self: start; min-height: 44px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text); cursor: pointer; }
+.settings-mobius-access__confirm { display: grid; gap: 8px; }
+.settings-mobius-access__actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .settings-mobius-access__prices { border-top: 1px solid var(--border); padding-top: 9px; }
 .settings-mobius-access__prices summary { cursor: pointer; }
 .settings-mobius-access__prices > div { display: grid; gap: 8px; padding-top: 10px; }

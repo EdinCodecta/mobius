@@ -12,77 +12,73 @@ export class MobiusAccessError extends Error {
   }
 }
 
-function exactKeys(value, required, optional = []) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-  const allowed = new Set([...required, ...optional])
-  const keys = Object.keys(value)
-  return required.every(key => keys.includes(key))
-    && keys.every(key => allowed.has(key))
+const ACCESS_STATES = ['signed_out', 'unavailable', 'available']
+
+function isObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
 
-/** Validate GET /api/identity/agent; signed-out or unavailable access exposes no model data. */
+function boundedText(value, min, max) {
+  return typeof value === 'string' && value.length >= min && value.length <= max
+}
+
+function parsePricing(pricing) {
+  if (!isObject(pricing)) return null
+  const kinds = ['input', 'cached_input', 'output']
+  if (!kinds.every(kind => Number.isFinite(pricing[kind]) && pricing[kind] >= 0)) return null
+  return { input: pricing.input, cached_input: pricing.cached_input, output: pricing.output }
+}
+
+/**
+ * Read GET /api/identity/agent into exactly the fields this page renders.
+ *
+ * Unknown keys are ignored at every level so a field the identity service adds
+ * later cannot blank the page. The one structural rule kept strictly is that
+ * signed-out or unavailable access exposes no models, balance or trial.
+ */
 export function parseAgentAccess(value) {
-  const accessStates = ['signed_out', 'unavailable', 'available']
-  if (
-    !exactKeys(value, ['agent_access', 'models', 'balance', 'trial', 'retention'])
-    || !accessStates.includes(value.agent_access)
-    || !Array.isArray(value.models)
-    || value.models.length > 50
-    || !value.balance || typeof value.balance !== 'object' || Array.isArray(value.balance)
-    || !value.trial || typeof value.trial !== 'object' || Array.isArray(value.trial)
-    || !value.retention || typeof value.retention !== 'object' || Array.isArray(value.retention)
-  ) throw new Error('Möbius returned invalid model access.')
+  if (!isObject(value) || !ACCESS_STATES.includes(value.agent_access)) {
+    throw new Error('Möbius returned invalid model access.')
+  }
+  const models = value.models ?? []
+  const balance = value.balance ?? {}
+  const trial = value.trial ?? {}
+  const retention = value.retention ?? {}
+  if (!Array.isArray(models) || ![balance, trial, retention].every(isObject)) {
+    throw new Error('Möbius returned invalid model access.')
+  }
   if (value.agent_access !== 'available') {
-    if (
-      value.models.length
-      || [value.balance, value.trial, value.retention]
-        .some(section => Object.keys(section).length)
-    ) throw new Error('Möbius exposed model data without account access.')
-    return value
+    if (models.length || 'available_units' in balance || 'available_usd' in balance || 'state' in trial) {
+      throw new Error('Möbius exposed model data without account access.')
+    }
+    return { agent_access: value.agent_access, models: [], balance: {}, trial: {}, retention: {} }
   }
-  const modelIds = new Set()
-  for (const model of value.models) {
-    const pricing = model?.pricing
-    if (
-      !exactKeys(model, ['id', 'name', 'pricing'], ['context_window'])
-      || typeof model?.id !== 'string'
-      || !/^[a-z0-9][a-z0-9_-]{0,79}$/.test(model.id)
-      || typeof model?.name !== 'string'
-      || !model.name
-      || model.name.length > 80
-      || !pricing || typeof pricing !== 'object' || Array.isArray(pricing)
-      || !exactKeys(pricing, ['input', 'cached_input', 'output'])
-      || !['input', 'cached_input', 'output'].every(kind => (
-        Number.isFinite(pricing[kind]) && pricing[kind] >= 0
-      ))
-      || (model.context_window !== undefined && (
-        !Number.isSafeInteger(model.context_window) || model.context_window < 1
-      ))
-    ) throw new Error('Möbius returned invalid model prices.')
-    if (modelIds.has(model.id)) throw new Error('Möbius returned duplicate model aliases.')
-    modelIds.add(model.id)
+
+  if (models.length > 50) throw new Error('Möbius returned invalid model prices.')
+  const seen = new Set()
+  const parsedModels = models.map(model => {
+    const pricing = isObject(model) ? parsePricing(model.pricing) : null
+    if (!pricing || !boundedText(model.id, 1, 80) || !boundedText(model.name, 1, 80)) {
+      throw new Error('Möbius returned invalid model prices.')
+    }
+    if (seen.has(model.id)) throw new Error('Möbius returned duplicate model aliases.')
+    seen.add(model.id)
+    return { id: model.id, name: model.name, pricing }
+  })
+  if (!boundedText(trial.state, 1, 40)) throw new Error('Möbius returned invalid trial state.')
+  if (!Number.isSafeInteger(balance.available_units) || balance.available_units < 0) {
+    throw new Error('Möbius returned an invalid model balance.')
   }
-  if (
-    !exactKeys(value.trial, ['state'])
-    || !['ready', 'active', 'expired', 'ineligible'].includes(value.trial.state)
-  ) throw new Error('Möbius returned invalid trial state.')
-  if (
-    !exactKeys(value.balance, ['available_units'], ['available_usd'])
-    || !Number.isSafeInteger(value.balance.available_units)
-    || value.balance.available_units < 0
-    || (value.balance.available_usd !== undefined && (
-      typeof value.balance.available_usd !== 'string'
-      || !/^\d+(?:\.\d{1,6})?$/.test(value.balance.available_usd)
-    ))
-  ) throw new Error('Möbius returned an invalid model balance.')
-  if (
-    !exactKeys(value.retention, ['policy', 'notice'])
-    || value.retention.policy !== 'local-testing-v1'
-    || typeof value.retention.notice !== 'string'
-    || value.retention.notice.length < 20
-    || value.retention.notice.length > 500
-  ) throw new Error('Möbius returned invalid model retention state.')
-  return value
+  if (!boundedText(retention.notice, 1, 500)) {
+    throw new Error('Möbius returned invalid model retention state.')
+  }
+  return {
+    agent_access: 'available',
+    models: parsedModels,
+    balance: { available_units: balance.available_units },
+    trial: { state: trial.state },
+    retention: { notice: retention.notice },
+  }
 }
 
 /** One owner-authenticated request; agent-access responses are validated before use. */

@@ -22,6 +22,9 @@ export default function MobiusProviderAccess({ active = true, onVisibilityChange
   const [access, setAccess] = useState(null)
   const [accessError, setAccessError] = useState('')
   const [accessBusy, setAccessBusy] = useState(false)
+  // Trial activation changes the Möbius account, so it confirms inline first,
+  // like GitHub's Disconnect…. Leaving Settings drops the pending confirmation.
+  const [confirmTrial, setConfirmTrial] = useState(false)
   const [visible, setVisible] = useState(null)
   const [visibilityError, setVisibilityError] = useState('')
   const [visibilityBusy, setVisibilityBusy] = useState(false)
@@ -48,7 +51,10 @@ export default function MobiusProviderAccess({ active = true, onVisibilityChange
   useEffect(() => { void loadVisibility() }, [loadVisibility])
   // Signing in happens in Möbius · You, so re-read access whenever the owner
   // comes back to a visible Settings page.
-  useEffect(() => { if (active) void loadAccess() }, [active, loadAccess])
+  useEffect(() => {
+    if (active) void loadAccess()
+    else setConfirmTrial(false)
+  }, [active, loadAccess])
 
   const setVisibility = async next => {
     if (visibilityBusy) return
@@ -81,6 +87,7 @@ export default function MobiusProviderAccess({ active = true, onVisibilityChange
         : error.message)
     } finally {
       setAccessBusy(false)
+      setConfirmTrial(false)
     }
   }
 
@@ -103,7 +110,14 @@ export default function MobiusProviderAccess({ active = true, onVisibilityChange
       <button type="button" className="settings-mobius-access__action" onClick={onOpenAccount}>Sign in from Möbius · You</button>
     </>}
     {access?.agent_access === 'available' && <>
-      {access.trial.state === 'ready' && <button type="button" className="settings-mobius-access__action" disabled={accessBusy} onClick={activate}>{accessBusy ? 'Activating…' : 'Activate trial credit'}</button>}
+      {access.trial.state === 'ready' && !confirmTrial && <button type="button" className="settings-mobius-access__action" onClick={() => setConfirmTrial(true)}>Activate trial credit…</button>}
+      {access.trial.state === 'ready' && confirmTrial && <div className="settings-mobius-access__confirm">
+        <p className="settings-mobius-access__note">Activate your Möbius trial credit now? The trial starts when you activate it.</p>
+        <div className="settings-mobius-access__actions">
+          <button type="button" className="settings-mobius-access__action" disabled={accessBusy} onClick={() => setConfirmTrial(false)}>Cancel</button>
+          <button type="button" className="settings-mobius-access__action" disabled={accessBusy} onClick={activate}>{accessBusy ? 'Activating…' : 'Activate'}</button>
+        </div>
+      </div>}
       <details className="settings-mobius-access__prices">
         <summary>Access details and token rates</summary>
         <div>
