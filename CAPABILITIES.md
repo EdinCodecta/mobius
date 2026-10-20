@@ -633,6 +633,37 @@ access, the provider stops the newly returned tracks without starting a
 recorder. Finish before readiness fails rather than manufacturing an empty or
 invalid video. Finish after readiness returns the useful partial recording.
 
+## First-open consent for Store apps
+
+A Store-installed app is dormant until the owner accepts what it asks for, once,
+in one all-or-nothing request shown the first time it is opened. Install only
+stages the app. Source: `backend/app/app_consent.py`.
+
+- **Declared vs accepted.** The declared side is the reviewed capability
+  contract. The accepted side is `App.accepted_consent`: the rows the owner
+  accepted (id and rank), a row-vocabulary `version`, and who, when and how
+  (`owner`, `platform` for first-boot apps, `migration` for apps that existed
+  before this shipped). Saving rows, not the contract, means rewording or
+  re-deriving rows can never turn an old answer into a new question.
+- **When it asks.** The app token mint answers `409 consent_required` until the
+  app was never accepted or its contract now asks for a row, or a higher level
+  of a row, that the accepted answer does not cover. A narrower or equal request
+  never asks. Job tokens are refused until an app was accepted at least once.
+- **Who can answer.** `POST /api/apps/{id}/consent` takes the digest of the
+  request that was shown and accepts only a human owner session
+  (`get_current_owner_for_owner_input`): agent runs, delegated helpers, apps and
+  shared-browser guests are refused. `DELETE` makes the app dormant again.
+- **Rows come from one place.** `rows_from_contract` turns a contract into
+  rows with their wording and a platform-defined `critical` flag (an app cannot
+  mark itself harmless). The install preview returns the same `access_rows`, so
+  the install dialog and the first-open request never keep separate wording.
+  `HANDLED_DATA_KEYS` plus a test fail the build when a new contract permission
+  has no row.
+- **Not yet covered** (next steps): install-time effects (setup, schedules,
+  skills, the first-run job) still start at install; a Store update's new
+  grants still apply before the owner answers; local and agent-built apps are
+  not gated; there is no Settings screen for revoking.
+
 ## Stable error codes
 
 Providers may use DOM-style names for familiar browser handling, but app logic

@@ -31,9 +31,9 @@ export default function WalkthroughAccessConfirm({ confirmation, app, icon, onAp
         {rows.length === 0
           ? <p className="wt-confirm__empty">No special permissions requested.</p>
           : <ul className="wt-confirm__list" tabIndex={0} aria-labelledby="wt-confirm-section">
-            {rows.map(row => <li className="wt-confirm__row" key={row.label}>
-              <div><strong>{row.label}</strong><span>{row.summary}</span></div>
-              <em className={row.tone === 'read' || row.tone === 'muted' ? 'is-read' : ''}>{row.tag}</em>
+            {rows.map(row => <li className="wt-confirm__row" key={row.id}>
+              <div><strong>{row.title}{row.level ? ` (${row.level})` : ''}</strong><span>{row.text}</span></div>
+              {row.critical && <i className="wt-confirm__dot" role="img" aria-label="Critical: can change your Möbius" title="Critical: can change your Möbius" />}
             </li>)}
           </ul>}
         {libraries.length > 0 && <p className="wt-confirm__meta">Loads {libraries.length === 1 ? 'one library' : `${libraries.length} libraries`} from esm.sh on first open: {libraries.join(', ')}.</p>}

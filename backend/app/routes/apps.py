@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session, defer
 
 from app import chat_writer
 from app import (
-  activity, app_activity, app_apply, app_badge, app_capability_acceptance,
+  activity, app_activity, app_apply, app_badge, app_capability_acceptance, app_consent,
   app_git, app_jobs, app_recency, chat_app_artifacts, chat_queue, drawer_pins, fs_locks,
   git_transfers, icon_cache, models, pending_update, project_git, providers, schemas,
   settled, source_dirs, store_listing_source, workspace_files,
@@ -806,6 +806,7 @@ async def preview_app_install(
     installed_contract=installed_contract,
     capability_diff=diff_contracts(installed_contract, contract),
     download_bytes=download_bytes,
+    access_rows=app_consent.rows_for_manifest(manifest, contract),
   )
 
 

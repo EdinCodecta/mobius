@@ -29,7 +29,7 @@ from slowapi.util import get_remote_address
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app import auth, models, runtime_identity, schemas
+from app import app_consent, auth, models, runtime_identity, schemas
 from app.broadcast import get_system_broadcast
 from app.config import get_settings
 from app.database import get_db
@@ -546,6 +546,13 @@ def create_app_token_endpoint(
   )
   if not app:
     raise HTTPException(status_code=404, detail="App not found.")
+  # A Store-installed app is dormant until the owner accepts what it asks for
+  # (app_consent.py). The shell answers this with its first-open popup.
+  if app_consent.status(app) == "required":
+    raise HTTPException(status_code=409, detail={
+      "code": "consent_required",
+      "message": "This app requires your approval before it opens.",
+    })
   owner = principal.owner
   # Preserve the delegation lineage on the down-scoped token. create_agent_token
   # keeps agent_chat == delegation_chat, so principal.chat_id is the child chat
@@ -580,6 +587,12 @@ def create_app_job_token_endpoint(
   )
   if not app:
     raise HTTPException(status_code=404, detail="App not found.")
+  # Nothing of a Store app runs before the owner accepts what it asks for.
+  if app_consent.never_accepted(app):
+    raise HTTPException(status_code=409, detail={
+      "code": "consent_required",
+      "message": "This app has not been accepted yet.",
+    })
   return {
     "token": auth.create_app_token(
       body.app_id,
