@@ -5,13 +5,14 @@ from app.chat_writer import create_chat
 
 from tests.goal_fixtures import goal_run as make_goal_run, persist_goal_fixture
 
+import asyncio
 import json
 from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 
-from app import auth as auth_mod, models
+from app import agent_coordination, auth as auth_mod, models
 from app.agent_coordination import (
   MAX_CONTEXT_MESSAGES,
   PeerDeliveryResult,
@@ -286,10 +287,29 @@ def test_nested_claude_helper_can_message_nested_codex_peer_across_scopes(
 
 
 def test_mixed_scope_direct_send_is_atomic_grouped_and_idempotent(
-  client, auth, db,
+  client, auth, db, monkeypatch,
 ):
   chats, _ = _network_fixture(db)
   scout_auth = _delegated_auth(db, chats["scout"].id, "scout-run")
+  # Validation, the write, the inbox prune and the thread-safe live hint all
+  # run in the send's worker, never on the event loop.
+  on_loop = []
+
+  def record(name):
+    real = getattr(agent_coordination, name)
+
+    def wrapper(*args, **kwargs):
+      try:
+        asyncio.get_running_loop()
+        on_loop.append((name, True))
+      except RuntimeError:
+        on_loop.append((name, False))
+      return real(*args, **kwargs)
+
+    monkeypatch.setattr(agent_coordination, name, wrapper)
+
+  record("_prune_direct_inboxes")
+  record("_publish_message_hint")
   payload = {
     "recipients": [chats["builder"].id, chats["outsider"].id],
     "kind": "handoff",
@@ -320,6 +340,9 @@ def test_mixed_scope_direct_send_is_atomic_grouped_and_idempotent(
   assert {row.send_target_key for row in stored} == {
     chats["builder"].id, chats["outsider"].id,
   }
+  assert ("_prune_direct_inboxes", False) in on_loop
+  assert ("_publish_message_hint", False) in on_loop
+  assert not any(loop for _, loop in on_loop)
 
   conflict = client.post(
     "/api/agent-coordination/messages",
@@ -1468,7 +1491,8 @@ def test_interrupt_delivery_wakes_an_idle_unfinished_goal_for_every_kind(
   monkeypatch.setattr(
     coordination, "paused_goal_run",
     lambda _db, chat_id: (
-      SimpleNamespace(id="builder-goal-run") if chat_id == builder.id else None
+      SimpleNamespace(id="builder-goal-run", goal_id=runs["builder"].goal_id)
+      if chat_id == builder.id else None
     ),
   )
   started = []
@@ -1498,6 +1522,9 @@ def test_interrupt_delivery_wakes_an_idle_unfinished_goal_for_every_kind(
   )
   assert interrupted.status_code == 200, interrupted.text
   assert interrupted.json()["woken"] == [builder.id]
+  # The wake resumes under the paused Goal, not as Goal-less work.
+  assert started[-1]["goal_id"] == runs["builder"].goal_id
+  assert started[-1]["source_work_id"] == "builder-goal-run"
   assert len(started) == 1
   wake = started[0]
   assert wake["chat_id"] == builder.id
@@ -1682,7 +1709,7 @@ def _claim_and_notices(db):
   return claim, notices
 
 
-def test_goal_completion_wakes_claim_followers_without_a_finish_call(
+def test_goal_completion_stamps_exact_goal_dependency_without_peer_notice(
   client, auth, db, monkeypatch,
 ):
   _claim_owner_and_follower(db)
@@ -1694,21 +1721,17 @@ def test_goal_completion_wakes_claim_followers_without_a_finish_call(
     json={"complete": "Merged as 0b44dc9d; CI green",
           "finished_claims": [CLAIM_KEY]},
   )
-
   assert completed.status_code == 200, completed.text
-  claim, [notice] = _claim_and_notices(db)
+  claim, notices = _claim_and_notices(db)
   assert claim.completed_at is not None
-  assert claim.notification_revision == claim.revision
-  assert notice.to_chat_id == "claim-follower"
-  assert "completed: Owning Goal completed: Merged as 0b44dc9d" in notice.body
-  assert delivered == [(["claim-follower"], "interrupt")]
+  assert notices == [] and delivered == []
+  dependency = db.query(models.GoalDependency).one()
+  assert dependency.outcome_json["kind"] == "completed"
+  assert dependency.outcome_json["outcome"].startswith("Owning Goal completed")
 
 
-def test_stop_wakes_followers_of_released_claims_off_the_lifecycle_path(
-  client, auth, db, monkeypatch,
-):
+def test_stop_stamps_release_without_generic_peer_wake(client, auth, db, monkeypatch):
   import asyncio
-
   import app.agent_coordination as coordination
   from app import chat as chat_mod
 
@@ -1720,11 +1743,10 @@ def test_stop_wakes_followers_of_released_claims_off_the_lifecycle_path(
     await asyncio.gather(*list(coordination._SETTLEMENT_TASKS))
 
   asyncio.run(stop_then_drain_settlement())
-
-  claim, [notice] = _claim_and_notices(db)
+  claim, notices = _claim_and_notices(db)
   assert claim.released_at is not None
-  assert "You may claim it now" in notice.body
-  assert delivered == [(["claim-follower"], "interrupt")]
+  assert notices == [] and delivered == []
+  assert db.query(models.GoalDependency).one().outcome_json["kind"] == "released"
 
 
 @pytest.mark.parametrize("terminal_status", ["stopped", "interrupted", "failed"])
@@ -1751,30 +1773,58 @@ def test_process_termination_does_not_release_goal_claims_without_stop_intent(
   assert db.get(models.ChatGoal, "claim-owner-goal").status == "open"
 
 
-def test_settlement_notice_lost_to_a_crash_is_delivered_by_the_next_seam(
+def test_settlement_outcome_survives_lost_postcommit_nudge(
   client, auth, db, monkeypatch,
 ):
-  """The settle commit survives a restart; only the wake is retried."""
+  """A crash after the source commit cannot erase the follower's fact."""
   import asyncio
-
   from app.agent_coordination import settle_claims_with_owner
   from app.goals import update_goal_record
 
   _claim_owner_and_follower(db)
-  # Completion commits, then the process "dies" before any notice is sent.
   update_goal_record(
     db, db.get(models.ChatRun, "claim-owner-run"),
     db.get(models.ChatGoal, "claim-owner-goal"), 0, complete="Merged",
   )
-  claim, notices = _claim_and_notices(db)
-  assert claim.notification_revision < claim.revision and notices == []
-  delivered = _record_deliveries(monkeypatch)
+  before = db.query(models.GoalDependency).one()
+  assert before.resolved_at is not None
+  assert before.outcome_json["kind"] == "released"
+  asyncio.run(settle_claims_with_owner("claim-owner"))
+  after = db.query(models.GoalDependency).one()
+  assert after.outcome_json == before.outcome_json
 
-  assert asyncio.run(settle_claims_with_owner("claim-owner")) == [
-    "claim-follower",
-  ]
-  assert asyncio.run(settle_claims_with_owner("claim-owner")) == []
-  claim, notices = _claim_and_notices(db)
-  assert claim.notification_revision == claim.revision
-  assert len(notices) == 1
-  assert delivered == [(["claim-follower"], "interrupt")]
+
+def test_goal_parent_and_its_helper_share_one_coordination_scope(db):
+  """A Goal helper is keyed by its physical spawning root but owned by the
+  Goal. Coordination must use the same ownership, or the parent cannot see or
+  message its own live helpers."""
+  from app.agent_coordination import _scope_membership, send_scope_message
+
+  parent = create_chat(id="goal-scope-parent", title="Coordinator", messages=[])
+  helper = create_chat(id="goal-scope-helper", title="Helper", messages=[])
+  db.add_all([parent, helper])
+  db.flush()
+  db.add(models.ChatGoal(id="goal-scope-g", chat_id=parent.id, objective="Ship it",
+                         status="open"))
+  db.add(models.ChatRun(id="goal-scope-attempt", root_run_id="goal-scope-attempt",
+                        chat_id=parent.id, goal_id="goal-scope-g", status="running",
+                        provider="claude"))
+  db.add(models.Delegation(
+    id="goal-scope-delegation", parent_chat_id=parent.id,
+    parent_root_run_id="goal-scope-attempt", goal_id="goal-scope-g",
+    child_chat_id=helper.id, task_key="scout", provider="codex", scope="write",
+    cwd="/data", prompt_sha256="0" * 64,
+  ))
+  db.commit()
+
+  parent_scope = scope_for_chat(db, parent.id, "goal-scope-attempt")
+  helper_scope = scope_for_chat(db, helper.id)
+
+  assert parent_scope.id == helper_scope.id == "goal-scope-g"
+  members, _ = _scope_membership(db, parent_scope, limit=None)
+  assert helper.id in members
+  sent = send_scope_message(
+    db, parent_scope, sender_chat_id=parent.id, sender_run_id="goal-scope-attempt",
+    recipients=[helper.id], broadcast=False, kind="note", body="Check the logs first.",
+  )
+  assert [row["recipient_chat_id"] for row in sent] == [helper.id]

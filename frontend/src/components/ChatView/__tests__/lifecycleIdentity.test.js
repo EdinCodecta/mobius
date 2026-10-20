@@ -3,11 +3,11 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement as h } from 'react'
 import { renderToStaticMarkup as render } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 const previousWindow = globalThis.window
 globalThis.window = { location: { href: 'http://localhost/' } }
 after(() => { globalThis.window = previousWindow })
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
+const vite = await createSsrRenderServer()
 after(() => vite.close())
 const load = async name => (await vite.ssrLoadModule('/src/components/ChatView/' + name + '.jsx')).default
 const Goal = await load('GoalHistoryCard')
@@ -44,7 +44,7 @@ test('automatic resume markers explain what caused the continuation', () => {
 
  assert.match(restarted, /Server restarted — continuing automatically/)
  assert.match(goalHandoff, /Continuing Goal/)
- assert.match(goalHandoff, /The agent turn ended, but the Goal is still unfinished/)
+ assert.match(goalHandoff, /Continuing toward the Goal/)
  assert.match(recovered, /Interrupted work recovered — continuing automatically/)
 })
 
@@ -96,4 +96,33 @@ test('provider-limit continuation reports a retry without promising availability
  assert.match(html, /Resumed automatically/)
  assert.match(html, /Retry check due — trying the provider again/)
  assert.doesNotMatch(html, /[Uu]sage available|[Ll]imit (has )?reset|[Qq]uota restored/)
+})
+
+test('foreign decision has one exact Open decision link and no answer control', async () => {
+ const Details = await load('GoalPlanDetails')
+ const dependency = { id: 'decision', target_kind: 'owner_card', condition: 'Release choice', source_chat_id: 'source', source_question_id: 'card-1', source_chat_title: 'Repair', automatic: true }
+ const html = render(h(Details, { dependencies: [dependency] }))
+ assert.match(html, /Release choice/); assert.match(html, /Open decision/)
+ assert.match(html, /href="\/shell\/\?chat=source&amp;focus=question&amp;question=card-1"/)
+ assert.match(html, />Open decision · Repair<\/a>/)
+ assert.doesNotMatch(html, /<input|<button|deadline|next check|Waiting for you/)
+ const deleted = render(h(Details, { dependencies: [{ ...dependency, source_deleted: true }] }))
+ assert.doesNotMatch(deleted, /<a /)
+ assert.match(deleted, /The chat was deleted/)
+})
+
+test('decision history preserves quiet close and never invents an answer start', async () => {
+ const Details = await load('GoalPlanDetails')
+ const dependency = { id: 'decision', target_kind: 'owner_card', condition: 'Release choice', source_chat_title: 'Repair', disposition: 'retired_by_goal_outcome', received_run_id: null, outcome: { kind: 'closed_without_reply', answers: { release: 'Not now' } } }
+ const html = render(h(Details, { dependencyHistory: [dependency] }))
+ assert.match(html, /You chose Not now/)
+ assert.doesNotMatch(html, /Continues automatically|Started|Waiting ·|resumed/)
+})
+
+// Manual and automatic recovery each leave one durable product notice.
+test('manual continuation records interrupted work without another pause card', () => {
+ const html = render(h(Resume, { msg: { continuation_reason: 'manual' } }))
+ assert.match(html, /Resumed manually/)
+ assert.match(html, /Interrupted work continued/)
+ assert.doesNotMatch(html, /Paused · Continued|automatically|>Resume</)
 })

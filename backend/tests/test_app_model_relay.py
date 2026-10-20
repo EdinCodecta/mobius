@@ -640,6 +640,26 @@ def test_relay_rejects_invalid_backend_listener_ports(monkeypatch, env_port):
     adapter._relay_base_url()
 
 
+@pytest.mark.parametrize("protocol", ["anthropic_messages", "responses"])
+def test_relay_sdk_env_bypasses_ambient_proxies_without_losing_exclusions(
+  monkeypatch, tmp_path, protocol,
+):
+  import os
+
+  monkeypatch.setattr(os, "environ", {
+    "HTTP_PROXY": "http://synthetic-proxy.invalid",
+    "ALL_PROXY": "http://synthetic-proxy.invalid",
+    "NO_PROXY": "existing.example",
+    "no_proxy": "other.example",
+  })
+  adapter = providers.AppModelProvider(4242, _manifest(protocol=protocol)["model_provider"])
+  env = adapter.build_env({}, str(tmp_path))
+  for name in ("NO_PROXY", "no_proxy"):
+    assert {"existing.example", "other.example", "127.0.0.1", "localhost"} <= set(
+      env[name].split(",")
+    )
+
+
 def test_responses_sdk_child_scrubs_inherited_credentials_but_preserves_control_env(
   monkeypatch, tmp_path,
 ):
@@ -677,7 +697,7 @@ def test_responses_sdk_child_scrubs_inherited_credentials_but_preserves_control_
   assert captured["MOBIUS_RUN_TOKEN"] == "synthetic-run"
 
 
-@pytest.mark.parametrize("effort", ["none", "minimal", "ultra"])
+@pytest.mark.parametrize("effort", ["none", "minimal", "xhigh", "ultra"])
 def test_messages_effort_protocol_rejects_responses_only_values(effort):
   manifest = _manifest(models=[{
     "id": "example/flash", "label": "Flash", "effort_levels": [effort],
@@ -714,7 +734,7 @@ def test_effort_protocol_keeps_nonempty_unique_string_list_guard(protocol, effor
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
 async def test_messages_declared_effort_survives_switch_turn_helper_and_compaction(
   monkeypatch, tmp_path, effort,
 ):

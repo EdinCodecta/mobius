@@ -111,6 +111,6 @@ new turns without deleting saved chats.
 - The relay repairs request shapes only. It does not rewrite streamed
   responses: a provider whose stream is malformed (for example, reused content
   block indices) is incompatible until the provider fixes it.
-- Test the exact provider protocol against a mock streamed Responses server
+- Test the exact provider protocol against a matching mock streamed server
   before claiming compatibility with any particular remote vendor. Live paid
   inference should be tested only after the owner explicitly authorizes it.
