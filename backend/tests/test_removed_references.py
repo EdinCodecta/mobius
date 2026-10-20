@@ -114,6 +114,45 @@ def test_references_guarded_by_a_lookup_fallback_are_left_to_the_tests(repo, sou
   assert _find(repo, baseline=_MOVED_BEFORE, release=_MOVED_AFTER, local=local) == []
 
 
+@pytest.mark.parametrize("source", [
+  # A default value is read when the function is defined, inside the try.
+  "from app import install\ntry:\n  def read(receipt=install.read_receipt):\n    return receipt\n"
+  "except AttributeError:\n  read = None\n",
+  # A removed module raises ModuleNotFoundError, which this handler catches.
+  "try:\n  from app.gone import thing\nexcept ModuleNotFoundError:\n  thing = None\n",
+])
+def test_lookups_that_run_inside_a_matching_handler_are_left_to_the_tests(repo, source):
+  baseline = {**_MOVED_BEFORE, "backend/app/gone.py": "thing = 1\n"}
+  local = {"backend/app/voice.py": source}
+  assert _find(repo, baseline=baseline, release=_MOVED_AFTER, local=local) == []
+
+
+@pytest.mark.parametrize("source", [
+  "from app import install\ntry:\n  def read():\n    return install.read_receipt()\n"
+  "except Exception:\n  read = None\nVALUE = read()\n",
+  "from app import install\ntry:\n  read = lambda: install.read_receipt()\n"
+  "except AttributeError:\n  read = None\n",
+])
+def test_a_function_body_is_not_guarded_by_the_try_that_defines_it(repo, source):
+  # The body runs when called, after the try has finished.
+  local = {"backend/app/voice.py": source}
+  found = _find(repo, baseline=_MOVED_BEFORE, release=_MOVED_AFTER, local=local)
+  assert [entry.split(" uses ")[1] for entry in found] == ["app.install.read_receipt"]
+
+
+@pytest.mark.parametrize("source", [
+  # A moved name in a module that still exists raises ImportError.
+  "try:\n  from app.install import read_receipt\nexcept AttributeError:\n  pass\n",
+  "try:\n  from app.install import read_receipt\nexcept ModuleNotFoundError:\n  pass\n",
+  # A missing module attribute raises AttributeError.
+  "from app import install\ntry:\n  VALUE = install.read_receipt\nexcept ImportError:\n  pass\n",
+])
+def test_a_handler_for_another_lookup_error_does_not_guard_a_moved_name(repo, source):
+  local = {"backend/app/voice.py": source}
+  found = _find(repo, baseline=_MOVED_BEFORE, release=_MOVED_AFTER, local=local)
+  assert [entry.split(" uses ")[1] for entry in found] == ["app.install.read_receipt"]
+
+
 def test_a_handler_for_an_unrelated_error_does_not_guard_a_moved_name(repo):
   local = {"backend/app/voice.py": (
     "try:\n  from app.install import read_receipt\nexcept ValueError:\n  pass\n"

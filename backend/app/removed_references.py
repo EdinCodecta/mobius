@@ -12,7 +12,7 @@ tests, so names that were already dynamic or unresolvable never block an
 update. Resolution is static and deliberately conservative. A module with a
 module-level ``__getattr__`` or a star import is treated as defining every
 name, a module alias that the referring file rebinds anywhere is ignored, and a
-reference inside a ``try`` whose handler catches a failed lookup is left to the
+reference whose failed lookup an enclosing ``try`` catches is left to the
 tests: an old-name import with a fallback to the new one works across a move.
 """
 
@@ -21,18 +21,23 @@ from __future__ import annotations
 import ast
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
 from app import app_git
 
 PACKAGE = "app"
 SOURCE_ROOT = "backend/app"
 _DYNAMIC = object()
-# Handlers that can absorb a missing module or name. A broad handler counts
-# too: the static check cannot tell what the fallback does, so it abstains.
-_LOOKUP_FAILURES = frozenset({
-  "ImportError", "ModuleNotFoundError", "AttributeError", "NameError",
-  "Exception", "BaseException",
-})
+# The handler names that catch each failed lookup: the error itself and its
+# built-in bases. A broad handler counts: the static check cannot tell what
+# the fallback does, so it abstains.
+_CATCHERS = {
+  "AttributeError": frozenset({"AttributeError", "Exception", "BaseException"}),
+  "ImportError": frozenset({"ImportError", "Exception", "BaseException"}),
+  "ModuleNotFoundError": frozenset({
+    "ModuleNotFoundError", "ImportError", "Exception", "BaseException",
+  }),
+}
 
 
 def _module_name(path: str) -> str:
@@ -127,38 +132,75 @@ def _absolute(module: str, node: ast.ImportFrom, path: str) -> str | None:
   return ".".join([*base, *([node.module] if node.module else [])])
 
 
-def _handles_lookup_failure(handler: ast.ExceptHandler) -> bool:
+def _caught(handler: ast.ExceptHandler) -> set[str]:
+  """Exception class names one handler names; a bare ``except`` catches all."""
   if handler.type is None:
-    return True
+    return {"BaseException"}
   kinds = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
-  return any(
-    (isinstance(kind, ast.Name) and kind.id in _LOOKUP_FAILURES)
-    or (isinstance(kind, ast.Attribute) and kind.attr in _LOOKUP_FAILURES)
-    for kind in kinds
-  )
+  return {
+    kind.id if isinstance(kind, ast.Name) else kind.attr
+    for kind in kinds if isinstance(kind, (ast.Name, ast.Attribute))
+  }
 
 
-def _guarded_nodes(tree: ast.Module) -> set[int]:
-  """Nodes inside a ``try`` body whose handlers can absorb a failed lookup."""
-  guarded: set[int] = set()
-  for node in ast.walk(tree):
-    if isinstance(node, (ast.Try, ast.TryStar)) and any(
-      _handles_lookup_failure(handler) for handler in node.handlers
-    ):
-      for statement in node.body:
-        guarded.update(id(child) for child in ast.walk(statement))
-  return guarded
+def _guards(tree: ast.Module) -> dict[int, frozenset[str]]:
+  """Exception names the enclosing ``try`` handlers catch when each node runs.
 
-
-def _references(tree: ast.Module, path: str, is_module) -> list[tuple[int, str, str]]:
-  """(line, module, name) pairs this file takes from the backend package.
-
-  References a lookup-failure handler guards are omitted: they are not
-  evidence that the edit breaks.
+  A function or lambda body runs only when called, after the ``try`` that
+  defines it has finished, so it starts unguarded; ``try`` statements inside
+  it still count. Handlers, ``else`` and ``finally`` are outside their own
+  ``try``'s protection.
   """
+  guards: dict[int, frozenset[str]] = {}
+  pending: list[tuple[ast.AST, frozenset[str]]] = [(tree, frozenset())]
+  while pending:
+    node, caught = pending.pop()
+    if caught:
+      guards[id(node)] = caught
+    if isinstance(node, (ast.Try, ast.TryStar)):
+      inner = caught.union(*(_caught(handler) for handler in node.handlers))
+      pending.extend((statement, inner) for statement in node.body)
+      pending.extend(
+        (part, caught) for part in (*node.handlers, *node.orelse, *node.finalbody)
+      )
+      continue
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+      deferred = {id(statement) for statement in node.body}
+    elif isinstance(node, ast.Lambda):
+      deferred = {id(node.body)}
+    else:
+      deferred = set()
+    pending.extend(
+      (child, frozenset() if id(child) in deferred else caught)
+      for child in ast.iter_child_nodes(node)
+    )
+  return guards
+
+
+class _Reference(NamedTuple):
+  line: int
+  module: str
+  name: str
+  imported: bool  # ``from module import name``, not ``module.name``
+  caught: frozenset[str]  # what enclosing handlers catch when it runs
+
+
+def _absorbs(reference: _Reference, candidate: _Tree) -> bool:
+  """Whether a handler around ``reference`` catches the error its lookup raises."""
+  if not reference.imported:
+    raised = "AttributeError"
+  elif candidate.is_module(reference.module):
+    raised = "ImportError"
+  else:
+    raised = "ModuleNotFoundError"
+  return not reference.caught.isdisjoint(_CATCHERS[raised])
+
+
+def _references(tree: ast.Module, path: str, is_module) -> list[_Reference]:
+  """Every name this file takes from the backend package."""
   module = _module_name(path)
-  guarded = _guarded_nodes(tree)
-  found: list[tuple[int, str, str]] = []
+  guards = _guards(tree)
+  found: list[_Reference] = []
   # Every binding of a name: the backend module an import binds it to, or
   # None for any other binding. Repeating one import inside each function is
   # common and keeps the name an alias; any other binding makes it unknowable.
@@ -177,8 +219,9 @@ def _references(tree: ast.Module, path: str, is_module) -> list[tuple[int, str, 
       for alias in node.names:
         if alias.name == "*":
           continue
-        if id(node) not in guarded:
-          found.append((node.lineno, source, alias.name))
+        found.append(_Reference(
+          node.lineno, source, alias.name, True, guards.get(id(node), frozenset()),
+        ))
         target = f"{source}.{alias.name}"
         bind(alias.asname or alias.name, target if is_module(target) else None)
     elif isinstance(node, ast.Import):
@@ -209,9 +252,11 @@ def _references(tree: ast.Module, path: str, is_module) -> list[tuple[int, str, 
   }
   for node in ast.walk(tree):
     if (isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
-        and isinstance(node.value, ast.Name) and node.value.id in stable
-        and id(node) not in guarded):
-      found.append((node.lineno, stable[node.value.id], node.attr))
+        and isinstance(node.value, ast.Name) and node.value.id in stable):
+      found.append(_Reference(
+        node.lineno, stable[node.value.id], node.attr, False,
+        guards.get(id(node), frozenset()),
+      ))
   return found
 
 
@@ -242,9 +287,10 @@ def find(repo: Path, release: str, candidate: str, baseline: str) -> list[str]:
       tree = ast.parse(after.source(path) or "")
     except SyntaxError:
       continue  # The import probe owns syntax errors.
-    for line, module, name in _references(tree, path, is_module):
-      if before.defines(module, name) and not after.defines(module, name):
-        removed.add((path, line, f"{module}.{name}"))
+    for ref in _references(tree, path, is_module):
+      if (before.defines(ref.module, ref.name) and not after.defines(ref.module, ref.name)
+          and not _absorbs(ref, after)):
+        removed.add((path, ref.line, f"{ref.module}.{ref.name}"))
   return [f"{path}:{line} uses {name}" for path, line, name in sorted(removed)]
 
 
