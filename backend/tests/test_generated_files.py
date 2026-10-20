@@ -779,7 +779,7 @@ def test_generated_file_timeout_removes_frozen_copy_after_confirmed_rejection(
       return ack
 
   monkeypatch.setattr(chat_event_sink, "get_writer", lambda: Writer())
-  asyncio.run(sink._resolve_uncertain_generated_files())
+  asyncio.run(sink.settle_uncertain_generated_files())
 
   assert (inbox / "report.pdf").read_bytes() == b"report"
   assert list(gf.stored_dir(settings.data_dir, chat.id).iterdir()) == []
@@ -855,3 +855,18 @@ def test_non_ascii_filename_downloads_instead_of_500(client, db, auth, chat):
   assert res.status_code == 200
   assert res.content == b"%PDF-1.4 cjk"
   assert "filename*=utf-8''" in res.headers["content-disposition"]
+
+
+def test_discarding_a_staged_capture_touches_only_that_inbox_file(tmp_path):
+  data_dir = str(tmp_path)
+  gf.add_inbox_file(data_dir, "chat", "image.png", b"capture")
+  gf.add_inbox_file(data_dir, "chat", "report.pdf", b"agent file")
+  outside = tmp_path / "outside.png"
+  outside.write_bytes(b"keep")
+
+  assert gf.discard_inbox_file(data_dir, "chat", "image.png") is True
+  assert gf.discard_inbox_file(data_dir, "chat", "image.png") is False
+  assert gf.discard_inbox_file(data_dir, "chat", "../../../outside.png") is False
+  assert gf.discard_inbox_file(data_dir, "missing-chat", "image.png") is False
+  assert gf._inbox_names(data_dir, "chat") == ["report.pdf"]
+  assert outside.read_bytes() == b"keep"

@@ -181,15 +181,17 @@ class ImageDelivery(enum.Enum):
   """What the tool step can truthfully say once a native image completes."""
 
   SHOWN = "shown"
-  # Staged but not yet published: a commit is unresolved, failed, or lost its
-  # capacity race. The capture stays queued in the inbox (or in the sink's
-  # unresolved commit), and the turn-end publication retries it.
+  # Staged but not yet published, and an attempt can still succeed: a commit
+  # timed out and may yet land, or the chat still has room. The turn-end
+  # settlement retries it and rewrites the step with the final outcome.
   PENDING = "pending"
-  # Nothing was staged: the chat is full or the result is not a usable PNG.
+  # Nothing to show and nothing queued: the result is not a usable PNG, or
+  # the chat has no room, in which case any staged copy is discarded.
   NOT_ATTACHED = "not_attached"
 
 
 _IMAGE_DELIVERY_OUTPUT = {
+  ImageDelivery.SHOWN: ("Image generated.", 0),
   ImageDelivery.PENDING: (
     "Image generated. Attaching it has not finished yet; Möbius tries again "
     "when this turn ends.",
@@ -202,6 +204,11 @@ _IMAGE_DELIVERY_OUTPUT = {
 }
 
 
+async def _image_can_still_attach(sink) -> bool:
+  """Whether an unpublished capture has a real chance before the turn ends."""
+  return sink.generated_file_commit_unresolved() or await sink.generated_file_capacity() > 0
+
+
 async def _deliver_codex_generated_image(
   sink, data_dir: str, chat_id: str, result: str,
   *, tool_use_id: str, staged: dict[str, dict[str, object]],
@@ -210,13 +217,16 @@ async def _deliver_codex_generated_image(
 
   Use the typed result bytes, never the provider's saved path inside the
   protected credentials tree. Each staged name is recorded in ``staged`` with
-  its tool step and size, so a capture that the turn-end publication recovers
+  its tool step and size, so a capture that the turn-end settlement recovers
   still lands beside that step in a correctly sized frame.
   """
   name = None
+  published: set[str] = set()
   try:
-    # Never stage bytes that cannot become an attachment.
-    if await sink.generated_file_capacity() <= 0:
+    # Never stage bytes that cannot become an attachment. A full reading
+    # behind a timed-out commit is not final: that commit may free nothing,
+    # but it may also be the only thing in the way.
+    if not await _image_can_still_attach(sink):
       return ImageDelivery.NOT_ATTACHED
     name, size = await asyncio.to_thread(
       _stage_codex_generated_image, data_dir, chat_id, result,
@@ -228,8 +238,65 @@ async def _deliver_codex_generated_image(
     )
   except (OSError, ValueError):
     log.warning("Codex generated-image capture failed chat_id=%s", chat_id, exc_info=True)
-    return ImageDelivery.NOT_ATTACHED if name is None else ImageDelivery.PENDING
-  return ImageDelivery.SHOWN if name in published else ImageDelivery.PENDING
+    if name is None:
+      return ImageDelivery.NOT_ATTACHED
+  if name in published:
+    return ImageDelivery.SHOWN
+  if await _image_can_still_attach(sink):
+    return ImageDelivery.PENDING
+  # A full chat cannot take it this turn or the next: never leave it queued.
+  await asyncio.to_thread(generated_files.discard_inbox_file, data_dir, chat_id, name)
+  staged.pop(name, None)
+  return ImageDelivery.NOT_ATTACHED
+
+
+async def _settle_pending_codex_images(
+  sink, data_dir: str, chat_id: str,
+  *, staged: dict[str, dict[str, object]], pending_steps: set[str],
+) -> None:
+  """Give every step that promised a turn-end retry its final outcome.
+
+  Settle timed-out commits, retry only the pending captures, then rewrite
+  each such step: shown if its picture is now attached, otherwise discard the
+  capture and say it could not be attached. A capture whose commit is still
+  unresolved (the writer is unavailable) keeps its pending step; Finalize
+  settles that commit.
+  """
+  pending = {
+    name: attributes["source_tool_use_id"] for name, attributes in staged.items()
+    if attributes.get("source_tool_use_id") in pending_steps
+  }
+  if not pending:
+    return
+  try:
+    await sink.settle_uncertain_generated_files()
+  except Exception:
+    log.warning("generated-image commit settlement failed chat_id=%s", chat_id, exc_info=True)
+  try:
+    published = await generated_files.publish_inbox_files(
+      sink, data_dir=data_dir, chat_id=chat_id, names=list(pending),
+      known_attributes=staged,
+    )
+  except (OSError, ValueError):
+    log.warning("generated-image retry failed chat_id=%s", chat_id, exc_info=True)
+    published = set()
+  unresolved = sink.generated_file_commit_unresolved()
+  for name, tool_use_id in pending.items():
+    if name in published:
+      outcome = ImageDelivery.SHOWN
+    elif unresolved:
+      continue
+    elif await asyncio.to_thread(generated_files.discard_inbox_file, data_dir, chat_id, name):
+      outcome = ImageDelivery.NOT_ATTACHED
+    else:
+      # Only a committed publication consumes the inbox copy.
+      outcome = ImageDelivery.SHOWN
+    staged.pop(name, None)
+    content, exit_code = _IMAGE_DELIVERY_OUTPUT[outcome]
+    sink.publish({
+      "type": "tool_output", "tool_use_id": tool_use_id, "content": content,
+      "output_complete": True, "output_exit_code": exit_code,
+    })
 
 
 def _process_group_capture_delay(elapsed: float) -> float:
@@ -1854,6 +1921,8 @@ async def _run_codex_sdk_turn(
   completed_image_ids: set[str] = set()
   # Inbox name -> its ImageGen step and size, for the turn-end publication.
   staged_images: dict[str, dict[str, object]] = {}
+  # ImageGen steps that promised a turn-end retry; settlement rewrites them.
+  pending_image_steps: set[str] = set()
   helper_host = None
   codex_context = (
     sdk["AsyncCodex"](config=config) if helper_host_key is None else None
@@ -2386,12 +2455,14 @@ async def _run_codex_sdk_turn(
               continue  # A repeated completion must not attach a second image.
             completed_image_ids.add(item.id)
             if item.status == "completed" and item.failure is None:
-              image_delivery_output = _IMAGE_DELIVERY_OUTPUT.get(
-                await _deliver_codex_generated_image(
-                  bc, runtime_data_dir, chat_id, item.result,
-                  tool_use_id=item.id, staged=staged_images,
-                ),
+              delivery = await _deliver_codex_generated_image(
+                bc, runtime_data_dir, chat_id, item.result,
+                tool_use_id=item.id, staged=staged_images,
               )
+              if delivery is ImageDelivery.PENDING:
+                pending_image_steps.add(item.id)
+              if delivery is not ImageDelivery.SHOWN:
+                image_delivery_output = _IMAGE_DELIVERY_OUTPUT[delivery]
           if isinstance(item, sdk["ContextCompactionThreadItem"]):
             _publish_codex_context_compaction(bc, chat_id)
             continue
@@ -2646,6 +2717,14 @@ async def _run_codex_sdk_turn(
     teardown = settled.Teardown(log, f"chat_id={chat_id}")
     # A cancellation landing in any step below is deferred, so it cannot skip
     # the reap, unregister and executor close that follow.
+    await teardown.step(
+      _settle_pending_codex_images(
+        bc, runtime_data_dir, chat_id,
+        staged=staged_images, pending_steps=pending_image_steps,
+      ),
+      "generated-image settlement",
+      level=logging.DEBUG,
+    )
     await teardown.step(
       generated_files.publish_inbox_files(
         bc,

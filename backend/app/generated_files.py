@@ -362,6 +362,27 @@ def _open_deliverable_file(
     os.close(directory_fd)
 
 
+def discard_inbox_file(data_dir: str, chat_id: str, name: str) -> bool:
+  """Remove one staged inbox file; return whether it was still there.
+
+  For a capture its producer has proven can never be published, so the turn's
+  final publication cannot leave it queued behind a full chat.
+  """
+  if Path(name).name != name or name in {".", ".."}:
+    return False
+  try:
+    inbox_fd = _open_directory(_chat_root(data_dir, chat_id) / "inbox", create=False)
+  except OSError:
+    return False
+  try:
+    os.unlink(name, dir_fd=inbox_fd)
+    return True
+  except FileNotFoundError:
+    return False
+  finally:
+    os.close(inbox_fd)
+
+
 def add_inbox_file(data_dir: str, chat_id: str, name: str, content: bytes) -> None:
   """Offer runtime-produced bytes as a finished deliverable.
 

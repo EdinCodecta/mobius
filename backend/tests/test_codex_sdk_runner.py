@@ -5630,6 +5630,9 @@ class _ImagePublicationSink:
     self.events.append(event)
     return event['name']
 
+  def generated_file_commit_unresolved(self):
+    return False
+
 
 def test_native_image_capture_does_not_publish_unfinished_inbox_files(tmp_path):
   from app import generated_files
@@ -5649,6 +5652,65 @@ def test_native_image_capture_does_not_publish_unfinished_inbox_files(tmp_path):
   }
   assert list(staged.values()) == [{'source_tool_use_id': 'ig_1', 'width': 1, 'height': 1}]
   assert (inbox / 'report.pdf').read_bytes() == b'%PDF-partial'
+
+
+class _UnresolvedCommitSink:
+  """A sink whose only file commit timed out and may still land."""
+
+  def __init__(self, data_dir):
+    self.data_dir = data_dir
+    self.unresolved = True
+    self.events = []
+    self.commit_lands = True
+
+  async def generated_file_capacity(self):
+    return 0  # The real sink reports no room while a commit is unresolved.
+
+  def generated_file_commit_unresolved(self):
+    return self.unresolved
+
+  async def publish_generated_file(self, event):
+    raise AssertionError('no publication is admitted behind an unresolved commit')
+
+  async def settle_uncertain_generated_files(self):
+    from app import generated_files
+    if self.commit_lands:
+      for name in generated_files._inbox_names(self.data_dir, 'chat'):
+        generated_files.discard_inbox_file(self.data_dir, 'chat', name)  # consumed
+      self.unresolved = False
+
+  def publish(self, event):
+    self.events.append(event)
+
+
+@pytest.mark.parametrize('commit_lands', [True, False])
+def test_image_behind_a_timed_out_commit_stays_pending_until_that_commit_settles(
+  tmp_path, commit_lands,
+):
+  from app import generated_files
+
+  sink = _UnresolvedCommitSink(str(tmp_path))
+  sink.commit_lands = commit_lands
+  staged = {}
+  delivery = asyncio.run(codex_sdk_runner._deliver_codex_generated_image(
+    sink, str(tmp_path), 'chat', _IMAGE_RESULT, tool_use_id='ig_1', staged=staged,
+  ))
+  # A "full" reading behind a timed-out commit is not final: stage and wait.
+  assert delivery is codex_sdk_runner.ImageDelivery.PENDING
+  assert len(generated_files._inbox_names(str(tmp_path), 'chat')) == 1
+
+  asyncio.run(codex_sdk_runner._settle_pending_codex_images(
+    sink, str(tmp_path), 'chat', staged=staged, pending_steps={'ig_1'},
+  ))
+  if commit_lands:
+    assert sink.events == [{
+      'type': 'tool_output', 'tool_use_id': 'ig_1', 'content': 'Image generated.',
+      'output_complete': True, 'output_exit_code': 0,
+    }]
+  else:
+    # The writer is still unavailable: Finalize settles it, so no rewrite yet.
+    assert sink.events == []
+    assert len(generated_files._inbox_names(str(tmp_path), 'chat')) == 1
 
 
 def test_generated_image_cancelled_capture_never_publishes_partial_bytes(tmp_path, monkeypatch):
@@ -5728,6 +5790,7 @@ def test_generated_image_cancelled_capture_never_publishes_partial_bytes(tmp_pat
   ('completed', _IMAGE_RESULT, 0, 499, 'capacity_race'),
   ('completed', _IMAGE_RESULT, 0, 500, 'capacity_after_staging'),
   ('completed', _IMAGE_RESULT, 0, 500, 'raises'),
+  ('completed', _IMAGE_RESULT, 1, 500, 'raises_once'),
   ('completed', _IMAGE_RESULT, 0, 500, 'uncertain'),
   ('completed', _IMAGE_RESULT, 1, 500, 'committed_uncertain'),
 ])
@@ -5750,9 +5813,11 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
   started = v.ImageGenerationThreadItem(
     id='image-call', type='imageGeneration', status='in_progress', result='',
   )
+  # The provider may name the revised prompt only on completion.
   completed = v.ImageGenerationThreadItem(
     id='image-call', type='imageGeneration', status=status, result=result,
     savedPath=str(private_path), transparentBackground=True,
+    revisedPrompt='A red fox in snow',
   )
   notifications = [
     SimpleNamespace(method='item/started', payload=v.ItemStartedNotification(
@@ -5803,7 +5868,6 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
     ChatBroadcast(chat.id), chat.id, run_token='rt-image',
     agent_activity_binding=EMPTY_AGENT_ACTIVITY_BINDING,
   )
-  generated_file_capacity = sink.generated_file_capacity
   if capacity in (0, 499):
     db.add_all([models.GeneratedFile(
       chat_id=chat.id, name=f'existing-{index}.png', path=f'existing-{index}',
@@ -5822,9 +5886,15 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
 
     monkeypatch.setattr(sink, 'generated_file_capacity', capacity_lost_after_staging)
   if publication != 'accepted':
+    publication_attempts = 0
+
     async def uncertain_publication(event):
+      nonlocal publication_attempts
+      publication_attempts += 1
       assert publication != 'capacity_after_staging', 'a full chat admits no commit'
-      if publication == 'raises':
+      if publication == 'raises_once' and publication_attempts > 1:
+        return await publish_generated_file(event)
+      if publication in ('raises', 'raises_once'):
         raise OSError('simulated post-stage settlement failure')
       if publication == 'capacity_race':
         db.add(models.GeneratedFile(
@@ -5849,15 +5919,11 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
   tools = [block for block in sink.assistant_blocks if block.get('tool') == 'ImageGen']
   assert len(tools) == (9 if capacity == 0 else 1)
   assert tools[0]['tool_use_id'] == 'image-call'
-  # The step tells the truth about the picture: shown now, still queued for
-  # the turn-end publication, or never staged at all.
+  assert tools[0]['input'] == 'A red fox in snow'
+  # The step ends with the truth about its picture. A pending promise is
+  # always kept: the turn-end settlement rewrites it as shown or not attached.
   if status == 'failed':
     step = ('Image generation failed.', 1)
-  elif publication != 'accepted':
-    step = (
-      'Image generated. Attaching it has not finished yet; Möbius tries again '
-      'when this turn ends.', 0,
-    )
   elif expected_files:
     step = ('Image generated.', 0)
   else:
@@ -5869,21 +5935,8 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
   serialized = json.dumps(sink.assistant_blocks)
   assert str(private_path) not in serialized
   assert _IMAGE_RESULT not in serialized
-  pending = generated_files._inbox_names(get_settings().data_dir, chat.id)
-  # Full capacity stages nothing; a lost race leaves at most this one capture.
-  retained = publication in ('uncertain', 'raises', 'capacity_race', 'capacity_after_staging')
-  assert len(pending) == (1 if retained else 0)
-  if publication in ('uncertain', 'raises', 'capacity_after_staging'):
-    # Ordinary inbox recovery must deliver the one retained capture, not lose
-    # it or turn the replay into a second attachment.
-    monkeypatch.setattr(sink, 'publish_generated_file', publish_generated_file)
-    monkeypatch.setattr(sink, 'generated_file_capacity', generated_file_capacity)
-    receipt = asyncio.run(generated_files.publish_inbox_files(
-      sink, data_dir=get_settings().data_dir, chat_id=chat.id,
-    ))
-    assert list(receipt) == pending
-    assert db.query(models.GeneratedFile).filter_by(chat_id=chat.id).count() == 1
-    assert generated_files._inbox_names(get_settings().data_dir, chat.id) == []
+  # Nothing is left queued that this chat could never attach.
+  assert generated_files._inbox_names(get_settings().data_dir, chat.id) == []
   if expected_files:
     row = rows[0]
     res = client.get(
