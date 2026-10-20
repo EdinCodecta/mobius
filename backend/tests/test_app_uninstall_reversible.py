@@ -101,6 +101,17 @@ MANIFEST = {
 BASE = "https://raw.githubusercontent.com/x/app-revtest/main/"
 
 
+def _app_token(client, auth, app_id):
+  """Mint the app's token, first accepting what it asks for (Store apps wait)."""
+  consent = client.get(f"/api/apps/{app_id}/consent", headers=auth).json()
+  if consent["status"] == "required":
+    accepted = client.post(
+      f"/api/apps/{app_id}/consent", json={"digest": consent["digest"]}, headers=auth,
+    )
+    assert accepted.status_code == 200, accepted.text
+  return _app_token(client, auth, app_id)
+
+
 def _install(client, auth, manifest=MANIFEST, base=BASE):
   responses = {
     base + "mobius.json": (200, json.dumps(manifest).encode()),
@@ -161,9 +172,7 @@ def test_reinstall_reattaches_same_id_and_data(
 ):
   app = _install(client, auth)
   app_id = app["id"]
-  old_token = client.post(
-    "/api/auth/app-token", headers=auth, json={"app_id": app_id},
-  ).json()["token"]
+  old_token = _app_token(client, auth, app_id)
   old_nonce = db.query(models.App).filter(models.App.id == app_id).one().token_nonce
   data_file = _seed_data(app_id, body="kept")
 
@@ -254,9 +263,7 @@ def test_recover_never_reactivates_pre_uninstall_app_token(
 ):
   app = _install(client, auth)
   app_id = app["id"]
-  token = client.post(
-    "/api/auth/app-token", headers=auth, json={"app_id": app_id},
-  ).json()["token"]
+  token = _app_token(client, auth, app_id)
   app_auth = {"Authorization": f"Bearer {token}"}
 
   assert client.put(
@@ -514,9 +521,7 @@ def test_delete_app_data_wipes_storage_and_keeps_app(
   the app is still listed, and only the runtime data is gone."""
   app = _install(client, auth)
   app_id = app["id"]
-  old_token = client.post(
-    "/api/auth/app-token", json={"app_id": app_id}, headers=auth,
-  ).json()["token"]
+  old_token = _app_token(client, auth, app_id)
   old_nonce = db.query(models.App).filter(models.App.id == app_id).one().token_nonce
   data_file = _seed_data(app_id, body="wipe-me")
   storage_dir = Path(get_settings().data_dir) / "apps" / str(app_id)
