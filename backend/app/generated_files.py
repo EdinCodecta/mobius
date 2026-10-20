@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import stat
 import uuid
+from collections.abc import Mapping
 from urllib.parse import quote
 
 log = logging.getLogger(__name__)
@@ -389,11 +390,15 @@ def add_inbox_file(data_dir: str, chat_id: str, name: str, content: bytes) -> No
 
 async def publish_inbox_files(
   sink, *, data_dir: str, chat_id: str, names: list[str] | None = None,
+  known_attributes: Mapping[str, Mapping[str, object]] | None = None,
 ) -> set[str]:
   """Freeze, persist, and consume a batch; return the published inbox names.
 
   Every inbox file is a finished candidate only once the turn has ended. A
   mid-turn caller passes ``names`` to publish just the files it wrote whole.
+  ``known_attributes`` carries transcript facts the producer already proved
+  for a staged name (its tool step, its pixel size); the event reducer keeps
+  only the fields it recognizes.
   """
   published: set[str] = set()
   capacity = await sink.generated_file_capacity()
@@ -406,6 +411,7 @@ async def publish_inbox_files(
     if captured is None:
       continue
     event = {
+      **((known_attributes or {}).get(name) or {}),
       "type": "generated_file",
       **{key: value for key, value in captured.items() if not key.startswith("_")},
       "previewable": previewable_mime_type(captured["mime_type"]),

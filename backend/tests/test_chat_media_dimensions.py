@@ -243,3 +243,20 @@ def test_generated_reference_projection_exceeds_sqlite_bind_limit(tmp_path, db, 
     assert "media_dimensions" not in messages[0]
   finally:
     connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, native_limit)
+
+
+def test_native_picture_sized_at_capture_needs_no_row_lookup_or_file_read(tmp_path):
+  class NoQueries:
+    def query(self, *_args):
+      raise AssertionError('a capture-sized picture must not query generated rows')
+
+  messages = [{'role': 'assistant', 'blocks': [{'type': 'generated_files', 'files': [{
+    'name': 'generated-image-1.png', 'mime_type': 'image/png', 'previewable': True,
+    'width': 1536, 'height': 1024,
+  }]}]}]
+  with patch('app.image_previews.Image.open', side_effect=AssertionError('decoded on read')):
+    projected = project_message_image_dimensions(
+      messages, chat_id='chat', data_dir=str(tmp_path), db=NoQueries(),
+    )
+  # The renderer sizes the frame from the transcript entry itself.
+  assert projected == messages

@@ -5607,9 +5607,12 @@ def test_generated_image_preserves_bytes_and_uses_unique_names(tmp_path):
   import base64
   from app import generated_files
 
-  names = [codex_sdk_runner._stage_codex_generated_image(
+  staged = [codex_sdk_runner._stage_codex_generated_image(
     str(tmp_path), 'chat', _IMAGE_RESULT,
   ) for _ in range(2)]
+  names = [name for name, _size in staged]
+  # The size proven while decoding travels with the capture.
+  assert staged[0][1] == staged[1][1] == {'width': 1, 'height': 1}
   inbox = generated_files.output_dir(str(tmp_path), 'chat')
   assert names[0] != names[1]
   assert all((inbox / name).read_bytes() == base64.b64decode(_IMAGE_RESULT) for name in names)
@@ -5635,10 +5638,16 @@ def test_native_image_capture_does_not_publish_unfinished_inbox_files(tmp_path):
   # The agent may still be writing its own deliverable when an image completes.
   (inbox / 'report.pdf').write_bytes(b'%PDF-partial')
   sink = _ImagePublicationSink()
+  staged = {}
   assert asyncio.run(codex_sdk_runner._deliver_codex_generated_image(
-    sink, str(tmp_path), 'chat', _IMAGE_RESULT,
-  ))
+    sink, str(tmp_path), 'chat', _IMAGE_RESULT, tool_use_id='ig_1', staged=staged,
+  )) is codex_sdk_runner.ImageDelivery.SHOWN
   assert [event['mime_type'] for event in sink.events] == ['image/png']
+  # The published picture names its step and size; nothing private leaks.
+  assert {key: sink.events[0][key] for key in ('source_tool_use_id', 'width', 'height')} == {
+    'source_tool_use_id': 'ig_1', 'width': 1, 'height': 1,
+  }
+  assert list(staged.values()) == [{'source_tool_use_id': 'ig_1', 'width': 1, 'height': 1}]
   assert (inbox / 'report.pdf').read_bytes() == b'%PDF-partial'
 
 
@@ -5717,6 +5726,7 @@ def test_generated_image_cancelled_capture_never_publishes_partial_bytes(tmp_pat
   ('failed', _IMAGE_RESULT, 0, 500, 'accepted'),
   ('completed', _IMAGE_RESULT, 0, 0, 'accepted'),
   ('completed', _IMAGE_RESULT, 0, 499, 'capacity_race'),
+  ('completed', _IMAGE_RESULT, 0, 500, 'capacity_after_staging'),
   ('completed', _IMAGE_RESULT, 0, 500, 'raises'),
   ('completed', _IMAGE_RESULT, 0, 500, 'uncertain'),
   ('completed', _IMAGE_RESULT, 1, 500, 'committed_uncertain'),
@@ -5801,8 +5811,19 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
     ) for index in range(500 if capacity == 0 else 499)])
     db.commit()
   publish_generated_file = sink.publish_generated_file
+  if publication == 'capacity_after_staging':
+    capacity_reads = 0
+
+    async def capacity_lost_after_staging():
+      # The pre-staging check passes; every later read finds the chat full.
+      nonlocal capacity_reads
+      capacity_reads += 1
+      return 1 if capacity_reads == 1 else 0
+
+    monkeypatch.setattr(sink, 'generated_file_capacity', capacity_lost_after_staging)
   if publication != 'accepted':
     async def uncertain_publication(event):
+      assert publication != 'capacity_after_staging', 'a full chat admits no commit'
       if publication == 'raises':
         raise OSError('simulated post-stage settlement failure')
       if publication == 'capacity_race':
@@ -5828,8 +5849,20 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
   tools = [block for block in sink.assistant_blocks if block.get('tool') == 'ImageGen']
   assert len(tools) == (9 if capacity == 0 else 1)
   assert tools[0]['tool_use_id'] == 'image-call'
-  attached = expected_files and publication == 'accepted'
-  assert all(tool['output_exit_code'] == (0 if attached else 1) for tool in tools)
+  # The step tells the truth about the picture: shown now, still queued for
+  # the turn-end publication, or never staged at all.
+  if status == 'failed':
+    step = ('Image generation failed.', 1)
+  elif publication != 'accepted':
+    step = (
+      'Image generated. Attaching it has not finished yet; Möbius tries again '
+      'when this turn ends.', 0,
+    )
+  elif expected_files:
+    step = ('Image generated.', 0)
+  else:
+    step = ('The image was generated, but Möbius could not attach it.', 1)
+  assert all((tool['output'], tool['output_exit_code']) == step for tool in tools)
   assert private_path.read_bytes() == b'do not read this'
   rows = db.query(models.GeneratedFile).filter_by(chat_id=chat.id).all()
   assert len(rows) == expected_files + (500 if capacity in (0, 499) else 0)
@@ -5838,11 +5871,9 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
   assert _IMAGE_RESULT not in serialized
   pending = generated_files._inbox_names(get_settings().data_dir, chat.id)
   # Full capacity stages nothing; a lost race leaves at most this one capture.
-  retained = publication in ('uncertain', 'raises', 'capacity_race')
+  retained = publication in ('uncertain', 'raises', 'capacity_race', 'capacity_after_staging')
   assert len(pending) == (1 if retained else 0)
-  if retained:
-    assert 'could not attach' in tools[0]['output']
-  if publication in ('uncertain', 'raises'):
+  if publication in ('uncertain', 'raises', 'capacity_after_staging'):
     # Ordinary inbox recovery must deliver the one retained capture, not lose
     # it or turn the replay into a second attachment.
     monkeypatch.setattr(sink, 'publish_generated_file', publish_generated_file)
@@ -5869,3 +5900,7 @@ def test_native_generated_image_reaches_durable_chat_and_authenticated_preview(
       if b.get('type') == 'generated_files'
     ]
     assert attachment_blocks[0]['files'][0]['name'] == row.name
+    # A late-resolved commit still lands beside its step, sized up front.
+    assert {key: attachment_blocks[0]['files'][0].get(key) for key in (
+      'source_tool_use_id', 'width', 'height',
+    )} == {'source_tool_use_id': 'image-call', 'width': 1, 'height': 1}

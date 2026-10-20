@@ -12,8 +12,8 @@ Codex includes a built-in image generator covered by the plan, with no separate 
 
 Call the injected `imagegen` tool according to its current contract. Return the
 tool's generated-image result directly: Möbius captures it automatically as a
-durable image attachment, shown in the conversation as soon as it is saved, so
-do not repeat it as a Markdown image.
+durable image attachment, shown in the conversation right after the generation
+step as soon as it is saved, so do not repeat it as a Markdown image.
 Do not inspect, locate, or republish a backing file: provider storage is an
 implementation detail inside the protected credentials tree, and normal
 delivery needs no credential access or recovery approval. If the tool reports

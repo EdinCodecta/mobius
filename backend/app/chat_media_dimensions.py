@@ -54,14 +54,16 @@ def _message_image_references(message: dict, pattern, chat_id: str):
       references.setdefault(match.group("path"),
         (match.group("kind"), unquote(match.group("filename"))))
   # Generated images are attachments, not Markdown; key them by the same URL
-  # the renderer builds with encodeURIComponent.
+  # the renderer builds with encodeURIComponent. A native picture recorded its
+  # size at capture, so it needs neither the row lookup nor a file read.
   for block in message.get("blocks") or []:
     if not isinstance(block, dict) or block.get("type") != "generated_files":
       continue
     for file in block.get("files") or []:
       if (isinstance(file, dict) and isinstance(file.get("name"), str)
           and str(file.get("mime_type", "")).startswith("image/")
-          and file.get("previewable") is True):
+          and file.get("previewable") is True
+          and not ("width" in file and "height" in file)):
         encoded_name = quote(file["name"], safe="~!*'()")
         references.setdefault(f"/api/chats/{chat_id}/generated-files/{encoded_name}",
           ("generated-files", file["name"]))
@@ -90,6 +92,7 @@ def project_message_image_dimensions(
     for kind, filename in references.values() if kind == "generated-files"}
   # Stored rows are bounded per chat; Markdown references are not. Intersect
   # in Python so hostile text cannot exhaust the database bind-parameter limit.
+  generated_base: Path | None = None
   generated_paths = {}
   if generated_names and db is not None:
     try:
@@ -117,7 +120,7 @@ def project_message_image_dimensions(
     for url_path, (kind, filename) in references.items():
       if kind != "generated-files":
         dimensions[url_path] = _stored_dimensions(chat_root / kind, filename)
-      elif filename in generated_paths:
+      elif generated_base is not None and filename in generated_paths:
         dimensions[url_path] = _stored_dimensions(generated_base, generated_paths[filename])
       else:
         dimensions[url_path] = None

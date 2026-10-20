@@ -488,6 +488,54 @@ def test_full_chat_does_not_recopy_queued_files_on_later_turns(
   assert freeze_calls == 0
 
 
+def test_known_attributes_describe_a_file_but_never_replace_its_capture(tmp_path):
+  from app.events import process_event
+
+  data_dir = str(tmp_path)
+  gf.add_inbox_file(data_dir, "chat", "image.png", b"finished image")
+  events = []
+
+  class Sink:
+    async def generated_file_capacity(self):
+      return 1
+
+    async def publish_generated_file(self, event):
+      events.append(event)
+      return event["name"]
+
+  attributes = {"image.png": {
+    "source_tool_use_id": "ig_1", "width": 3, "height": 2,
+    "name": "other.png", "path": "../escape", "type": "tool_start",
+  }}
+  assert asyncio.run(gf.publish_inbox_files(
+    Sink(), data_dir=data_dir, chat_id="chat", known_attributes=attributes,
+  )) == {"image.png"}
+  event = events[0]
+  assert (event["type"], event["name"]) == ("generated_file", "image.png")
+  assert event["path"] != "../escape"
+
+  blocks = []
+  assert process_event({k: v for k, v in event.items() if not k.startswith("_")}, blocks)
+  assert blocks[0]["files"][0] == {
+    "name": "image.png", "size": len(b"finished image"), "mime_type": "image/png",
+    "previewable": True, "sha256": event["sha256"],
+    "source_tool_use_id": "ig_1", "width": 3, "height": 2,
+  }
+
+
+@pytest.mark.parametrize("width,height", [(True, 2), (0, 2), (3, -1), (3.0, 2), ("3", 2), (3, None)])
+def test_generated_file_entry_drops_an_unproven_size(width, height):
+  from app.events import process_event
+
+  blocks = []
+  assert process_event({
+    "type": "generated_file", "name": "image.png", "mime_type": "image/png",
+    "previewable": True, "width": width, "height": height,
+  }, blocks)
+  assert "width" not in blocks[0]["files"][0]
+  assert "height" not in blocks[0]["files"][0]
+
+
 def test_publish_failure_keeps_inbox_and_frozen_copy(chat):
   class FailingSink:
     async def generated_file_capacity(self):

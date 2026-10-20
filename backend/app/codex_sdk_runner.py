@@ -29,6 +29,7 @@ import asyncio
 import base64
 import contextlib
 import concurrent.futures as _cf
+import enum
 import functools
 import io
 import logging
@@ -134,8 +135,14 @@ def _ensure_codex_home(env: dict[str, str], data_dir: str) -> None:
   env.setdefault("CODEX_HOME", str(Path(data_dir) / "cli-auth" / "codex"))
 
 
-def _generated_png_bytes(result: str) -> bytes:
-  """Decode a native image result, proving it is one bounded, decodable PNG."""
+def _generated_png_bytes(result: str) -> tuple[bytes, dict[str, int]]:
+  """Decode a native image result, proving it is one bounded, decodable PNG.
+
+  PNG is the provider's format: Codex's image-generation extension saves each
+  result as ``.png`` and shows it as ``data:image/png;base64`` (codex-cli
+  0.162). Anything else is refused rather than stored under a wrong type.
+  Returns the bytes and their pixel size.
+  """
   limit = generated_files.MAX_RECORDED_BYTES
   try:
     if len(result) > ((limit + 2) // 3) * 4:
@@ -154,35 +161,75 @@ def _generated_png_bytes(result: str) -> bytes:
       image.verify()  # Chunk checksums and a complete file, without pixels.
     with Image.open(io.BytesIO(content), formats=["PNG"]) as image:
       image.load()
+      size = {"width": image.width, "height": image.height}
   except (TypeError, ValueError, OSError, SyntaxError, EOFError, Image.DecompressionBombError) as exc:
     raise ValueError(f"generated image result is not a valid bounded PNG: {exc}") from exc
-  return content
+  return content, size
 
 
-def _stage_codex_generated_image(data_dir: str, chat_id: str, result: str) -> str:
+def _stage_codex_generated_image(
+  data_dir: str, chat_id: str, result: str,
+) -> tuple[str, dict[str, int]]:
+  """Write a proven PNG into the inbox; return its name and pixel size."""
+  content, size = _generated_png_bytes(result)
   name = f"generated-image-{uuid.uuid4().hex}.png"
-  generated_files.add_inbox_file(data_dir, chat_id, name, _generated_png_bytes(result))
-  return name
+  generated_files.add_inbox_file(data_dir, chat_id, name, content)
+  return name, size
 
 
-async def _deliver_codex_generated_image(sink, data_dir: str, chat_id: str, result: str) -> bool:
-  """Attach a native image through the deliverable inbox; return whether it shows.
+class ImageDelivery(enum.Enum):
+  """What the tool step can truthfully say once a native image completes."""
+
+  SHOWN = "shown"
+  # Staged but not yet published: a commit is unresolved, failed, or lost its
+  # capacity race. The capture stays queued in the inbox (or in the sink's
+  # unresolved commit), and the turn-end publication retries it.
+  PENDING = "pending"
+  # Nothing was staged: the chat is full or the result is not a usable PNG.
+  NOT_ATTACHED = "not_attached"
+
+
+_IMAGE_DELIVERY_OUTPUT = {
+  ImageDelivery.PENDING: (
+    "Image generated. Attaching it has not finished yet; Möbius tries again "
+    "when this turn ends.",
+    0,
+  ),
+  ImageDelivery.NOT_ATTACHED: (
+    "The image was generated, but Möbius could not attach it.",
+    1,
+  ),
+}
+
+
+async def _deliver_codex_generated_image(
+  sink, data_dir: str, chat_id: str, result: str,
+  *, tool_use_id: str, staged: dict[str, dict[str, object]],
+) -> ImageDelivery:
+  """Attach a native image through the deliverable inbox.
 
   Use the typed result bytes, never the provider's saved path inside the
-  protected credentials tree. A capture interrupted after staging stays in the
-  inbox, where the turn's final publication or the next turn recovers it.
+  protected credentials tree. Each staged name is recorded in ``staged`` with
+  its tool step and size, so a capture that the turn-end publication recovers
+  still lands beside that step in a correctly sized frame.
   """
+  name = None
   try:
     # Never stage bytes that cannot become an attachment.
     if await sink.generated_file_capacity() <= 0:
-      return False
-    name = await asyncio.to_thread(_stage_codex_generated_image, data_dir, chat_id, result)
-    return name in await generated_files.publish_inbox_files(
+      return ImageDelivery.NOT_ATTACHED
+    name, size = await asyncio.to_thread(
+      _stage_codex_generated_image, data_dir, chat_id, result,
+    )
+    staged[name] = {"source_tool_use_id": tool_use_id, **size}
+    published = await generated_files.publish_inbox_files(
       sink, data_dir=data_dir, chat_id=chat_id, names=[name],
+      known_attributes=staged,
     )
   except (OSError, ValueError):
     log.warning("Codex generated-image capture failed chat_id=%s", chat_id, exc_info=True)
-    return False
+    return ImageDelivery.NOT_ATTACHED if name is None else ImageDelivery.PENDING
+  return ImageDelivery.SHOWN if name in published else ImageDelivery.PENDING
 
 
 def _process_group_capture_delay(elapsed: float) -> float:
@@ -1805,6 +1852,8 @@ async def _run_codex_sdk_turn(
   # path that omits that aggregate can still publish one authoritative result.
   command_output_deltas: dict[str, list[str]] = {}
   completed_image_ids: set[str] = set()
+  # Inbox name -> its ImageGen step and size, for the turn-end publication.
+  staged_images: dict[str, dict[str, object]] = {}
   helper_host = None
   codex_context = (
     sdk["AsyncCodex"](config=config) if helper_host_key is None else None
@@ -2330,19 +2379,19 @@ async def _run_codex_sdk_turn(
 
         if isinstance(payload, sdk["ItemCompletedNotification"]):
           item = payload.item.root if hasattr(payload.item, "root") else payload.item
-          image_delivery_error = None
+          image_delivery_output = None
           image_generation_cls = sdk.get("ImageGenerationThreadItem")
           if image_generation_cls is not None and isinstance(item, image_generation_cls):
             if item.id in completed_image_ids:
               continue  # A repeated completion must not attach a second image.
             completed_image_ids.add(item.id)
-            if (
-              item.status == "completed" and item.failure is None
-              and not await _deliver_codex_generated_image(
-                bc, runtime_data_dir, chat_id, item.result,
+            if item.status == "completed" and item.failure is None:
+              image_delivery_output = _IMAGE_DELIVERY_OUTPUT.get(
+                await _deliver_codex_generated_image(
+                  bc, runtime_data_dir, chat_id, item.result,
+                  tool_use_id=item.id, staged=staged_images,
+                ),
               )
-            ):
-              image_delivery_error = "The image was generated, but Möbius could not attach it."
           if isinstance(item, sdk["ContextCompactionThreadItem"]):
             _publish_codex_context_compaction(bc, chat_id)
             continue
@@ -2364,9 +2413,8 @@ async def _run_codex_sdk_turn(
             for event in _tool_completed_events(
               item, sdk, streamed_command_output=streamed_command_output,
             ):
-              if image_delivery_error and event["type"] == "tool_output":
-                event["content"] = image_delivery_error
-                event["output_exit_code"] = 1
+              if image_delivery_output and event["type"] == "tool_output":
+                event["content"], event["output_exit_code"] = image_delivery_output
               image_view_cls = sdk.get("ImageViewThreadItem")
               if image_view_cls is not None and isinstance(item, image_view_cls):
                 if event.get("type") == "tool_end" and getattr(item, "id", None):
@@ -2603,6 +2651,7 @@ async def _run_codex_sdk_turn(
         bc,
         data_dir=runtime_data_dir,
         chat_id=chat_id,
+        known_attributes=staged_images,
       ),
       "generated-file capture",
       level=logging.DEBUG,
