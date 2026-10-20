@@ -908,6 +908,31 @@ def _mark_superseded_draft(
     return None
 
 
+def _record_merged_contribution(
+  record: dict, repo: Path, upstream_sha: str | None,
+) -> str | None:
+  """Hand the updater the local bytes a merged contribution started from.
+
+  ``plan.source_sha`` is the live commit whose bytes were staged. The update
+  that brings this merge retires each reviewed file the live source still
+  holds unchanged, whatever form review gave the merged version.
+  """
+  plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+  number = record.get("number")
+  files = plan.get("files")
+  if not isinstance(number, int) or not isinstance(files, list):
+    return None
+  try:
+    return app_git.record_merged_contribution(
+      repo, number=number, source_sha=str(plan.get("source_sha") or ""),
+      paths=files, merge_sha=upstream_sha,
+      contribution_id=str(record.get("id") or ""),
+    )
+  except (OSError, subprocess.SubprocessError, RuntimeError):
+    log.warning("could not record a merged contribution", exc_info=True)
+    return None
+
+
 def _settle_equivalence(record: dict, upstream_sha: str | None = None) -> str | None:
   """Promote or discard the pending witness when GitHub settles the PR."""
   plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
@@ -918,6 +943,7 @@ def _settle_equivalence(record: dict, upstream_sha: str | None = None) -> str | 
   digest = str(plan.get("diff_sha256") or "")
   if record.get("status") == "merged":
     _mark_superseded_draft(record, repo, upstream_sha)
+    _record_merged_contribution(record, repo, upstream_sha)
     equivalent = app_git.mark_equivalent_change_landed(
       repo, digest, upstream_sha=upstream_sha,
     )

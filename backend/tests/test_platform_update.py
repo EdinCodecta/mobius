@@ -305,11 +305,11 @@ def test_local_edit_preserved_across_update(clone_env):
   served = (platform / "backend/app/main.py").read_text()
   assert "LINE_A = 111" in served  # local edit
   assert "LINE_C = 333" in served  # upstream edit
-  # One commit carries the final local tree on the exact target, regardless of
-  # how many historical local commits produced it.
+  # Each local unit lands as one commit carrying its final bytes on the exact
+  # target, regardless of how many historical local commits produced it.
   assert _parents(platform, res.new_sha) == [target]
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "keep line A local",
   ]
   assert pu.recorded_upstream_sha(platform) == target
   assert res.overlay["mode"] == "net"
@@ -332,7 +332,7 @@ def test_net_merge_omits_local_change_already_present_upstream(clone_env):
 
   assert res.status == "updated"
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "local keep",
   ]
   assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'keep'\n"
 
@@ -470,7 +470,7 @@ def test_contributed_squash_uses_provenance_for_both_histories(clone_env):
   assert "LINE_A = 'LOCAL FOLLOWUP'" in served
   assert "LINE_C = 9001" in served
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "local followup",
   ]
   assert res.overlay["mode"] == "net"
   assert pre not in _git(platform, "rev-list", "HEAD").stdout.split()
@@ -564,9 +564,13 @@ def test_partial_provenance_parks_only_the_genuine_conflict(clone_env):
   assert pu.continue_platform_overlay_update(platform) == "prepared"
   assert _finish_prepared(platform) == "replayed"
 
-  assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
-  ]
+  # main.py, which the reviewed change also shaped, is committed apart from
+  # foo.py and names that unit, so it still guards the file next update.
+  assert _overlay_subjects(platform, target) == ["later local edits"] * 2
+  assert "Mobius-Overlay-Also: " in _git(
+    platform, "log", "-1", "--format=%B", f"{target}..HEAD",
+    "--", "backend/app/main.py",
+  ).stdout
   served = (platform / "backend/app/main.py").read_text()
   assert "LINE_A = 'LOCAL FOLLOWUP'" in served and "LINE_C = 9001" in served
   assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'RESOLVED'\n"
@@ -843,6 +847,7 @@ def test_resolver_refuses_unstaged_final_bytes_without_losing_them(clone_env):
   assert "LINE_A = 'FINAL'" in (platform / "backend/app/main.py").read_text()
   assert (platform / "notes.txt").read_text() == "resolved with context\n"
   assert _overlay_subjects(platform, target) == [
+    "local edit",
     "Reconcile local platform source with reviewed upstream",
   ]
 
@@ -1822,7 +1827,7 @@ def test_original_dirty_edit_conflicting_with_resolution_parks_again(clone_env):
   _git(replay, "add", "backend/app/foo.py")
   assert pu.continue_platform_overlay_update(platform) == "updated"
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "local edit",
   ]
   assert "LINE_A = 'BOTH'" in (platform / "backend/app/main.py").read_text()
   assert (platform / "backend/app/foo.py").read_text() == (
@@ -1895,7 +1900,7 @@ def test_uncommitted_edits_stay_uncommitted_across_a_parked_conflict(clone_env):
 
   target = _git(platform, "rev-parse", "origin/main").stdout.strip()
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "local edit",
   ]
   assert "LINE_A = 'BOTH'" in (platform / "backend/app/main.py").read_text()
   assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'DIRTY AGAIN'\n"
@@ -1968,7 +1973,7 @@ def test_dirty_resolution_merges_with_a_late_commit(clone_env):
 
   assert pu.continue_platform_overlay_update(platform) == "updated"
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "late commit",
   ]
   assert _git(platform, "show", "HEAD:backend/app/late.py").stdout == "LATE = True\n"
   assert "LINE_A = 'RESOLVED'" in (platform / "backend/app/main.py").read_text()
@@ -2121,7 +2126,7 @@ def test_a_multi_commit_unit_that_landed_as_one_review_is_dropped(clone_env):
   assert res.status == "updated", res
   assert res.overlay["mode"] == "net"
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "keep",
   ]
   assert (platform / "backend/app/bar.py").read_text() == "VALUE = 'keep'\n"
   assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'release'\n"
@@ -2149,7 +2154,7 @@ def test_a_whitespace_different_change_is_not_mistaken_for_the_review(clone_env)
   assert res.status == "updated", res
   assert res.overlay["mode"] == "net"
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "respaced",
   ]
   assert "LINE_A =  'X'" in (platform / "backend/app/main.py").read_text()
 
@@ -8175,3 +8180,193 @@ def test_image_activation_preserves_late_nested_repository_without_false_incoher
   assert _git(nested, "rev-parse", "HEAD").stdout == nested_head
   assert (nested / "owner.txt").read_text() == "independent owner work\n"
   assert (nested / "uncommitted.txt").read_text() == "do not discard\n"
+
+
+# --- Overlay units: identity across updates and retirement of merged PRs ----
+
+_FOO_DRAFT = "VALUE = 'draft'\n"
+_FOO_MERGED = "VALUE = 'merged'\n"
+
+
+def _unit_message(subject: str, unit: str, disposition: str = "local-only") -> str:
+  return app_git.overlay_message(subject, unit=unit, disposition=disposition)
+
+
+def _draft_pr_unit(platform: Path, origin: Path) -> str:
+  """A local draft marked for PR #77, unrelated local work, and a release that
+  merged a rewritten #77."""
+  _local_commit(platform, edits={"backend/app/foo.py": _FOO_DRAFT},
+                msg=_unit_message("Draft foo", "foo-draft", "pending-pr:#77"))
+  _local_commit(platform, edits={"backend/app/local.py": "LOCAL = 1\n"},
+                msg="local feature")
+  return _advance_origin(origin, edits={"backend/app/foo.py": _FOO_MERGED},
+                         msg="Rewrite foo (#77)")
+
+
+def test_diverged_update_emits_one_commit_per_unit_and_retires_a_merged_pr(clone_env):
+  origin, platform = clone_env
+  target = _draft_pr_unit(platform, origin)
+  pu._fetch(platform)
+  assert app_git.merge_refs(platform, "main", target).status == "conflict"
+  preview = pu.platform_update_preview(platform)
+  assert preview["conflict_paths"] == []
+  assert preview["retired_paths"] == [{
+    "path": "backend/app/foo.py", "pr": 77, "unit": "foo-draft", "proof": "pending-pr",
+  }]
+
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "updated", res
+  assert (platform / "backend/app/foo.py").read_text() == _FOO_MERGED
+  assert (platform / "backend/app/local.py").read_text() == "LOCAL = 1\n"
+  # The retired unit emits nothing; the other unit keeps its own commit.
+  assert _overlay_subjects(platform, target) == ["local feature"]
+  assert [item.path for item in res.reconciliation.retired_paths] == ["backend/app/foo.py"]
+  pinned = f"{pu._SET_ASIDE_PREFIX}/retired-{target[:8]}"
+  assert _git(platform, "show", f"{pinned}:backend/app/foo.py").stdout == _FOO_DRAFT
+  assert pinned in pu.platform_status(platform)["recovery_refs"]
+
+
+def test_owner_choice_local_unit_is_never_retired_and_the_resolver_keeps_it(clone_env):
+  origin, platform = clone_env
+  _draft_pr_unit(platform, origin)
+  draft = _git(platform, "rev-parse", "main~1").stdout.strip()
+  app_git.mark_overlay_disposition(platform, draft, "owner-choice:local")
+
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "conflict" and res.conflict_paths == ["backend/app/foo.py"]
+  parked = pu._read_conflict_flag()["overlay"]
+  assert parked["units"] == {"backend/app/foo.py": "foo-draft"}
+  assert parked["unit_intent"]["foo-draft"]["disposition"] == "owner-choice:local"
+  assert "left" not in parked
+  message = pu._platform_conflict_resolver_message(res.target_sha, res.conflict_paths, parked)
+  assert (
+    "- `foo-draft` (Draft foo): backend/app/foo.py. "
+    "The owner chose to keep this local: preserve it."
+  ) in message
+
+
+def test_retired_copies_leave_only_the_residual_conflict_for_the_resolver(clone_env):
+  origin, platform = clone_env
+  _local_commit(platform, edits={"backend/app/foo.py": _FOO_DRAFT},
+                msg=_unit_message("Draft foo", "foo-draft", "pending-pr:#77"))
+  served = _local_commit(platform, edits={
+    "backend/app/main.py": _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'LOCAL'"),
+  }, msg="local line A")
+  target = _advance_origin(origin, edits={
+    "backend/app/foo.py": _FOO_MERGED,
+    "backend/app/main.py": _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'UPSTREAM'"),
+  }, msg="Rewrite foo (#77)")
+  pu._fetch(platform)
+  assert sorted(app_git.merge_refs(platform, served, target).conflict_paths) == [
+    "backend/app/foo.py", "backend/app/main.py",
+  ]
+  # Review predicts exactly what Apply parks.
+  assert pu.platform_update_preview(platform)["conflict_paths"] == ["backend/app/main.py"]
+
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "conflict" and res.conflict_paths == ["backend/app/main.py"]
+  parked = pu._read_conflict_flag()["overlay"]
+  assert parked["served"] == served
+  assert _git(platform, "rev-parse", f"{parked['left']}^").stdout.strip() == served
+  assert parked["units"] == {"backend/app/main.py": "c-" + served[:8] + "-local-line-a"}
+  worktree = Path(parked["worktree"])
+  assert (worktree / "backend/app/foo.py").read_text() == _FOO_MERGED
+  (worktree / "backend/app/main.py").write_text(
+    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'BOTH'"),
+  )
+  _git(worktree, "add", "backend/app/main.py")
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "replayed"
+  assert (platform / "backend/app/foo.py").read_text() == _FOO_MERGED
+  assert "LINE_A = 'BOTH'" in (platform / "backend/app/main.py").read_text()
+  assert _overlay_subjects(platform, target) == ["local line A"]
+
+
+def test_old_image_late_edit_squash_is_split_back_into_units_on_next_update(
+  clone_env, monkeypatch,
+):
+  """A unit chain prepared by new code boots on an older image, which squashes
+  late edits into one commit; the next update recovers their unit."""
+  origin, platform = clone_env
+  _local_commit(platform, edits={"backend/app/alpha.py": "A = 1\n"},
+                msg=_unit_message("Add alpha", "alpha"))
+  target = _advance_origin(origin, edits={
+    "backend/app/main.py": _MAIN_PY.replace("LINE_C = 3", "LINE_C = 33"),
+  })
+  pu._fetch(platform)
+  plan = _apply_plan(_served_sha(platform), target, platform)
+  plan.pop("repo")
+  assert pu.prepare_reviewed_update(**plan, repo=platform)["state"] == "prepared"
+  _local_commit(platform, edits={"backend/app/late.py": "LATE = 1\n"},
+                msg=_unit_message("Late beta", "late-beta"))
+  with monkeypatch.context() as old_image:
+    old_image.setattr(pu, "_net_overlay_commit", pu._single_overlay_commit)
+    assert _finish_prepared(platform) == "replayed"
+  assert _overlay_subjects(platform, target) == [
+    "Add alpha", "Reconcile local platform source with reviewed upstream",
+  ]
+
+  newer = _advance_origin(origin, edits={
+    "backend/app/main.py": _MAIN_PY.replace("LINE_C = 3", "LINE_C = 333"),
+  })
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "updated", res
+  assert _overlay_subjects(platform, newer) == ["Add alpha", "Late beta"]
+  assert "Mobius-Overlay-Unit: late-beta" in _git(
+    platform, "log", "-1", "--format=%B",
+  ).stdout
+  assert (platform / "backend/app/late.py").read_text() == "LATE = 1\n"
+
+
+def test_status_reports_local_overlay_size_and_what_the_next_update_retires(clone_env):
+  origin, platform = clone_env
+  _draft_pr_unit(platform, origin)
+  pu._fetch(platform)
+
+  overlay = pu.platform_status(platform)["local_overlay"]
+
+  assert overlay["release_sha"] == pu.recorded_upstream_sha(platform)
+  assert (overlay["files"], overlay["unit_count"], overlay["large"]) == (2, 2, False)
+  assert {unit["slug"] for unit in overlay["units"]} >= {"foo-draft"}
+  assert overlay["retirable"] == {"files": 1, "prs": [77]}
+  assert overlay["computed_for"][0] == _served_sha(platform)
+
+
+def test_status_overlay_follows_a_disposition_mark_without_a_new_commit(clone_env):
+  origin, platform = clone_env
+  _draft_pr_unit(platform, origin)
+  pu._fetch(platform)
+  assert pu.platform_status(platform)["local_overlay"]["retirable"]["files"] == 1
+
+  draft = _git(platform, "rev-parse", "HEAD^").stdout.strip()
+  app_git.mark_overlay_disposition(platform, draft, "owner-choice:local")
+  overlay = pu.platform_status(platform)["local_overlay"]
+
+  assert overlay["retirable"] == {"files": 0, "prs": []}
+  assert {u["slug"]: u["disposition"] for u in overlay["units"]}["foo-draft"] == (
+    "owner-choice:local"
+  )
+
+
+def test_status_overlay_follows_a_newly_recorded_merge_witness(clone_env):
+  origin, platform = clone_env
+  draft = _local_commit(platform, edits={"backend/app/foo.py": _FOO_DRAFT},
+                        msg="Draft foo")
+  _local_commit(platform, edits={"backend/app/local.py": "LOCAL = 1\n"},
+                msg="local feature")
+  _advance_origin(origin, edits={"backend/app/foo.py": _FOO_MERGED},
+                  msg="Rewrite foo (#77)")
+  pu._fetch(platform)
+  assert pu.platform_status(platform)["local_overlay"]["retirable"]["files"] == 0
+
+  app_git.record_merged_contribution(
+    platform, number=77, source_sha=draft, paths=["backend/app/foo.py"],
+  )
+
+  assert pu.platform_status(platform)["local_overlay"]["retirable"] == {
+    "files": 1, "prs": [77],
+  }

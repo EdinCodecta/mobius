@@ -30,6 +30,13 @@ owns activation and restarts, and `contributing` owns public GitHub actions.
   rows: never read or write it directly; `transcript_rows` readers serve an
   unconverted chat from it themselves. Read `TRANSCRIPT_STORAGE_DESIGN.md`
   before changing chat persistence.
+- **Local platform commits.** Updates carry local commits as labelled units
+  and retire a unit's unchanged files once the release merges its pull
+  request. Contribute records that itself; when you open a pull request for a
+  local platform commit any other way, run
+  `python3 backend/scripts/platform_overlay.py mark <commit> pending-pr:#<N>`.
+  Mark work the owner wants kept even after upstream merges a version of it
+  `owner-choice:local`.
 - **Owner-input cards.** Card access is deliberately uniform: any authenticated
   participant that can read a Q&A, Restart, or sealed-input card may answer it
   through that card's ordinary endpoint. The chat access check and exact card
