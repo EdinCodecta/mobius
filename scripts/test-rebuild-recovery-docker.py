@@ -47,6 +47,14 @@ def command(*args, timeout=60, **kwargs):
                           timeout=timeout, **kwargs)
 
 
+def mounted(path):
+    """Kernel mount table, not os.path.ismount: Docker's bind-option volume
+    mount shares the root filesystem with its Mountpoint on hosted runners."""
+    target = os.path.realpath(path)
+    with open("/proc/self/mountinfo", encoding="utf-8") as table:
+        return any(line.split()[4].replace("\\040", " ") == target for line in table)
+
+
 def load(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader
@@ -417,6 +425,8 @@ def main():
                                capture_output=True, timeout=30)
             subprocess.run(["docker", "network", "rm", f"{project}_default"],
                            capture_output=True, timeout=15)
+            subprocess.run(["docker", "volume", "rm", "-f", f"{project}_data"],
+                           capture_output=True, timeout=15)
         for role in ("source", "target"):
             subprocess.run(["docker", "image", "rm", "-f", f"{image_base}:{role}"],
                            capture_output=True, timeout=15)
@@ -445,13 +455,13 @@ HEALTHCHECK --interval=1s --timeout=1s --retries=2 CMD test -f /data/ready
             gate_code.write_bytes((ROOT / "scripts/mobius-boot-admission.py").read_bytes())
             gate_code.chmod(0o644)
 
-            def scenario(name, kind):
+            def scenario(name, kind, *, bind_option_volume=False):
                 # Proxies opened by a schedule close (and re-raise their relay
                 # errors) at the end of the scenario that owns them.
                 with contextlib.ExitStack() as stack:
-                    run_scenario(name, kind, stack)
+                    run_scenario(name, kind, stack, bind_option_volume)
 
-            def run_scenario(name, kind, stack):
+            def run_scenario(name, kind, stack, bind_option_volume):
                 print(f"recovery Docker scenario: {name}", flush=True)
                 project = f"recovery-{token}-{name}"
                 scenarios.append(project)
@@ -464,7 +474,24 @@ HEALTHCHECK --interval=1s --timeout=1s --retries=2 CMD test -f /data/ready
                 admission_root = state / "admission"
                 admission_root.mkdir(mode=0o700)
                 compose_file, override = base / "compose.yml", base / "override.json"
-                compose_file.write_text('''services:
+                if bind_option_volume:
+                    # Production's layout (2026-10-09/12): a named local
+                    # volume bound to a separate disk. Docker mounts it at its
+                    # Mountpoint only while a container uses it.
+                    compose_file.write_text(f'''services:
+  app:
+    image: ${{MOBIUS_IMAGE}}
+    restart: unless-stopped
+    volumes:
+      - app_data:/data
+volumes:
+  app_data:
+    name: {project}_data
+    driver: local
+    driver_opts: {{type: none, o: bind, device: {data}}}
+''')
+                else:
+                    compose_file.write_text('''services:
   app:
     image: ${MOBIUS_IMAGE}
     restart: unless-stopped
@@ -506,6 +533,13 @@ HEALTHCHECK --interval=1s --timeout=1s --retries=2 CMD test -f /data/ready
                 assert source_image == source
                 config["deployment_name"] = command("docker", "inspect", "-f", "{{.Name}}",
                                                     source_cid).stdout.strip().removeprefix("/")
+                mountpoint = None
+                if bind_option_volume:
+                    mountpoint = command("docker", "volume", "inspect", "-f", "{{.Mountpoint}}",
+                                         f"{project}_data").stdout.strip()
+                    assert mounted(mountpoint) and mountpoint != str(data)
+                    # The installer's resolver names the stable device.
+                    assert host.persistent_data_dir("volume", f"{project}_data") == os.path.realpath(data)
                 ledger = _load_supervisor()
                 _bind(ledger, data, patch)
                 eventually(lambda: ledger.BOOT_PATH.exists())
@@ -564,6 +598,11 @@ HEALTHCHECK --interval=1s --timeout=1s --retries=2 CMD test -f /data/ready
                     assert subprocess.run(["docker", "inspect", source_cid],
                                           capture_output=True, timeout=10).returncode != 0
                     assert ledger.ACCEPTED_PATH.read_bytes() == accepted
+                    if mountpoint:
+                        # With no container, the old installer's data_dir is a
+                        # hidden directory that does not hold the live ledger.
+                        assert not mounted(mountpoint)
+                        assert not Path(mountpoint, ".restart-ledger/cutover-receipt.json").exists()
                 elif kind in {"start-timeout", "delayed-entry"}:
                     gate = host.prepare_admission(config, tx)
                     target_cid, start_accepted = None, False
@@ -755,6 +794,11 @@ HEALTHCHECK --interval=1s --timeout=1s --retries=2 CMD test -f /data/ready
                     assert status["state"] == "rolled_back", status
                     assert ledger.ACK_PATH.exists()
                 assert not host.TRANSACTION.exists()
+                if mountpoint:
+                    # Recovery read the live ledger through the stable path
+                    # after the source was gone, so the exact chat handoff
+                    # survived (the 2026-10-12 incident lost it here).
+                    assert host.admission_store(config, tx).observe()["source_handoff_valid"] is True
                 first_boot = ledger.BOOT_PATH.read_bytes()
                 host.reconcile()
                 assert ledger.BOOT_PATH.read_bytes() == first_boot, "reconcile replayed a boot"
@@ -785,6 +829,7 @@ HEALTHCHECK --interval=1s --timeout=1s --retries=2 CMD test -f /data/ready
             try:
                 scenario("legacy-incident", "legacy")
                 scenario("remove-ambiguity", "remove-timeout")
+                scenario("bind-option-volume", "remove-timeout", bind_option_volume=True)
                 scenario("accepted-start", "start-timeout")
                 scenario("delayed-entry", "delayed-entry")
                 scenario("delayed-create", "delayed-create")

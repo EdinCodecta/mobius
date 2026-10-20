@@ -67,8 +67,10 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -122,7 +124,16 @@ FETCHED_REF = "refs/mobius/fetched"
 
 
 class GitTransferFailed(RuntimeError):
-  """A Git network transfer failed: the host, the network or the repository."""
+  """A Git network transfer failed: the host, the network or the repository.
+
+  ``transient`` says whether the same transfer may later succeed unchanged: a
+  timeout or a dropped connection may, a missing ref or repository, refused
+  credentials, a name that does not exist or a full disk will not.
+  """
+
+  def __init__(self, message: str, *, transient: bool = True) -> None:
+    super().__init__(message)
+    self.transient = transient
 
 
 class GitTransferTimeout(GitTransferFailed):
@@ -417,6 +428,17 @@ def _git_env(
   return env
 
 
+def ref_file_size(source_dir: str | Path, ref: str, path: str) -> int | None:
+  """One file's size at ``ref`` without reading it, or None when it has none."""
+  proc = _run(Path(source_dir), "cat-file", "-s", f"{ref}:{path}", check=False, read_only=True)
+  return int(proc.stdout.strip()) if proc.returncode == 0 else None
+
+
+def ref_file(source_dir: str | Path, ref: str, path: str) -> bytes | None:
+  """One file's bytes at ``ref``, or None when ``ref`` has no file there."""
+  return _ref_blob(Path(source_dir), ref, path, read_only=True)
+
+
 def _run(
   repo: Path,
   *args: str,
@@ -667,6 +689,79 @@ def _refresh_ignore_rules(
       "rm", "-r", "--cached", "--ignore-unmatch", "--",
       *_MANAGED_RUNTIME_PATHS, check=False,
     )
+
+
+def ignore_migration_paths(
+  source_dir: str | Path, accepted: str, tree: str | None = None,
+) -> set[str]:
+  """Paths that differ from ``accepted`` only through managed-ignore migration.
+
+  The read-only mirror of ``_refresh_ignore_rules``, which apply runs before
+  every snapshot: a synthetic repo's ``.gitignore`` rewritten to the managed
+  rules, a stale managed ``.gitignore`` dropped from a real-origin repo, and
+  managed runtime paths untracked. ``tree`` is the candidate to compare, or
+  ``None`` for the worktree, where untracking leaves files in place, so any
+  change to a managed runtime path there is part of the migration too.
+  """
+  repo = Path(source_dir)
+  before = _ref_blob(repo, accepted, ".gitignore", read_only=True)
+  if tree is None:
+    gitignore = repo / ".gitignore"
+    after = gitignore.read_bytes() if gitignore.is_file() else None
+  else:
+    after = _ref_blob(repo, tree, ".gitignore", read_only=True)
+  paths: set[str] = set()
+  if before != after and (
+    after == _GITIGNORE.encode("utf-8")
+    or (
+      after is None and before is not None
+      and _looks_like_managed_gitignore(before.decode("utf-8", "replace"))
+    )
+  ):
+    paths.add(".gitignore")
+  if tree is not None:
+    untracked = [_run(
+      repo, "diff", "--name-only", "--no-renames", "-z", "--diff-filter=D",
+      accepted, tree, "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+    )]
+  else:
+    # Apply untracks these runtime paths, so whatever they hold in the
+    # worktree (changed, or new under older ignore rules) never reaches it.
+    untracked = [
+      _run(
+        repo, "diff", "--name-only", "--no-renames", "-z", accepted,
+        "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+      ),
+      _run(
+        repo, "ls-files", "--others", "--exclude-standard", "-z",
+        "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+      ),
+    ]
+  for proc in untracked:
+    if proc.returncode == 0:
+      paths.update(path for path in proc.stdout.split("\0") if path)
+  return paths
+
+
+def worktree_diff_paths(source_dir: str | Path, ref: str) -> set[str] | None:
+  """Paths whose worktree differs from ``ref``, untracked included, read-only.
+
+  Ignored files are left out, as apply never commits them. ``None`` when Git
+  cannot answer. Unlike a snapshot, this never touches ignore rules or any
+  index, so read-only views can use it.
+  """
+  repo = Path(source_dir)
+  diff = _run(
+    repo, "diff", "--name-only", "--no-renames", "-z", ref, "--",
+    check=False, read_only=True,
+  )
+  untracked = _run(
+    repo, "ls-files", "--others", "--exclude-standard", "-z",
+    check=False, read_only=True,
+  )
+  if diff.returncode or untracked.returncode:
+    return None
+  return {path for path in (diff.stdout + untracked.stdout).split("\0") if path}
 
 
 def is_repo(source_dir: str | Path) -> bool:
@@ -2641,6 +2736,47 @@ def _is_shallow(repo: Path) -> bool:
   ).stdout.strip() == "true"
 
 
+# Failures, in Git's untranslated text, that a later identical fetch repeats.
+_PERMANENT_FETCH_ERROR = re.compile(
+  r"couldn't find remote ref|not our ref|repository\b.*\bnot found"
+  r"|does not appear to be a git repository|authentication failed"
+  r"|could not read (?:username|password)|returned error: 40[134]\b"
+  r"|no space left on device|disk quota exceeded",
+  re.IGNORECASE,
+)
+_DNS_RECHECK_TIMEOUT = 5  # seconds
+_UNRESOLVED_HOST = re.compile(r"could not resolve host: ([^\s']+)", re.IGNORECASE)
+
+
+def _transient_fetch_error(stderr: str) -> bool:
+  """Whether a failed fetch may succeed unchanged later; anything unknown may.
+
+  Git reports every resolver failure alike, so the host is looked up again:
+  as for connectors, only a resolver that could not answer (``EAI_AGAIN``) is
+  temporary, while a name that does not exist stays missing.
+  """
+  if _PERMANENT_FETCH_ERROR.search(stderr):
+    return False
+  unresolved = _UNRESOLVED_HOST.search(stderr)
+  if unresolved is None:
+    return True
+  answers: list[bool] = []
+
+  def lookup() -> None:
+    try:
+      socket.getaddrinfo(unresolved.group(1), None)
+    except socket.gaierror as exc:
+      answers.append(exc.errno == socket.EAI_AGAIN)
+    except (OSError, UnicodeError):
+      pass
+
+  # A resolver too slow to answer is itself a temporary failure.
+  lookup_thread = threading.Thread(target=lookup, daemon=True)
+  lookup_thread.start()
+  lookup_thread.join(_DNS_RECHECK_TIMEOUT)
+  return answers[0] if answers else True
+
+
 def _transfer(
   stage: Path, url: str, ref: str, *, unshallow: bool,
 ) -> tuple[str, str | None]:
@@ -2676,7 +2812,8 @@ def _transfer(
         "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
         *(["--unshallow"] if unshallow else []),
         "--end-of-options", url, f"+{source}:{FETCHED_REF}",
-        # The tag fallback below reads Git's untranslated error text.
+        # The tag fallback and the failure's classification read Git's
+        # untranslated error text.
         timeout=_GIT_TRANSFER_TIMEOUT, env={"LC_ALL": "C"},
       )
       break
@@ -2688,7 +2825,8 @@ def _transfer(
       if source == sources[-1] or "couldn't find remote ref" not in exc.stderr:
         lines = (exc.stderr or "").strip().splitlines()
         raise GitTransferFailed(
-          lines[-1] if lines else f"git exited with status {exc.returncode}"
+          lines[-1] if lines else f"git exited with status {exc.returncode}",
+          transient=_transient_fetch_error(exc.stderr or ""),
         ) from exc
   fetched = _resolve_commit(stage, FETCHED_REF)
   if fetched is None:
@@ -3856,6 +3994,59 @@ def read_blob(source_dir: str | Path, ref: str, rel: str) -> bytes | None:
     capture_output=True, timeout=_GIT_TIMEOUT, check=False, env=_git_env(repo),
   )
   return proc.stdout if proc.returncode == 0 else None
+
+
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_REGULAR_FILE_MODES = frozenset({b"100644", b"100755"})
+
+
+def read_committed_file(
+  source_dir: str | Path,
+  commit: str,
+  rel: str,
+  *,
+  max_bytes: int,
+  timeout: float = 5,
+) -> bytes | None:
+  """Bytes of one regular file in an exact accepted commit, or None.
+
+  Reads only Git's object database, so uncommitted worktree edits, symlinks,
+  and other non-regular tree entries can never reach the caller. ``commit``
+  must be a full object id (an accepted ``source_commit``), not a moving ref.
+  """
+  if not isinstance(commit, str) or not _COMMIT_SHA_RE.fullmatch(commit):
+    return None
+  repo = Path(source_dir)
+  env = _git_env(repo, read_only=True)
+  try:
+    listing = subprocess.run(
+      ["git", "--literal-pathspecs", "-C", str(repo),
+       "ls-tree", "-l", "-z", commit, "--", rel],
+      capture_output=True, timeout=timeout, check=False, env=env,
+    )
+    if listing.returncode != 0:
+      return None
+    meta, tab, name = listing.stdout.removesuffix(b"\0").partition(b"\t")
+    fields = meta.split()
+    if (
+      not tab
+      or name != rel.encode()
+      or len(fields) != 4
+      or fields[0] not in _REGULAR_FILE_MODES
+      or fields[1] != b"blob"
+      or not fields[3].isdigit()
+      or int(fields[3]) > max_bytes
+    ):
+      return None
+    blob = subprocess.run(
+      ["git", "-C", str(repo), "cat-file", "blob", fields[2].decode("ascii")],
+      capture_output=True, timeout=timeout, check=False, env=env,
+    )
+  except (OSError, subprocess.SubprocessError, UnicodeError):
+    return None
+  if blob.returncode != 0 or len(blob.stdout) > max_bytes:
+    return None
+  return blob.stdout
 
 
 # Sentinels for the structural JSON merge: a key that is absent on a side, and

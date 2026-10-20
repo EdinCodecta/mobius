@@ -53,7 +53,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
-from app import activity, catalog_index, data_git, install, models, skills
+from app import (
+  activity, app_skills, catalog_index, data_git, install, models, skills,
+)
 from app.config import get_settings
 from app.database import get_db
 from app.deps import (
@@ -65,6 +67,7 @@ from app.deps import (
 from app import fs_locks
 from app.manifest_contract import SKILL_MAX_BYTES
 from app.net_utils import pinned_client
+from app.settled import run_settled
 from app.storage_io import atomic_write
 
 router = APIRouter(prefix="/api/skills", tags=["skills"])
@@ -830,6 +833,7 @@ def list_skills(principal=Depends(get_principal)) -> dict:
 )
 async def install_skill(
   body: SkillInstall,
+  db: Session = Depends(get_db),
   _: models.Owner = Depends(get_owner_or_app_with_manage_skills),
 ) -> dict:
   """Fetch a skill (SKILL.md dir or single markdown) from GitHub into the tree.
@@ -866,6 +870,13 @@ async def install_skill(
           f"(provenance: {_provenance_of(skills_dir, name)}). Remove or "
           "rename it first, or install under a different `name`.",
         )
+    if app_skills.holds_restorable_skill(db, skills_dir, name):
+      raise HTTPException(
+        409,
+        f"A skill named {name!r} belongs to an app skill that is set aside "
+        "and can still be restored (for example, a deleted app in its "
+        "recovery window). Install under a different `name`.",
+      )
 
     # One crash-recoverable transition, in four durable steps:
     #   1. stage the complete bounded tree in a fresh dot-prefixed dir
@@ -1140,7 +1151,7 @@ async def update_skill(
 
     if (data_dir / ".git").is_dir():
       try:
-        ok, detail = await asyncio.to_thread(
+        ok, detail = await run_settled(
           data_git.snapshot_path,
           data_dir,
           f"shared/skills/{name}",
@@ -1419,7 +1430,7 @@ async def uninstall_skill(
 
     if target_kind == "dir" and (data_dir / ".git").is_dir():
       try:
-        ok, detail = await asyncio.to_thread(
+        ok, detail = await run_settled(
           data_git.snapshot_path,
           data_dir,
           f"shared/skills/{name}",

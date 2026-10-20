@@ -2,16 +2,13 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 
 globalThis.location = { origin: 'http://localhost' }
 globalThis.window = { location: globalThis.location, innerHeight: 800 }
 
-const vite = await createServer({
-  appType: 'custom',
-  logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui', 'dompurify'] },
+const vite = await createSsrRenderServer({
+  noExternal: ['dompurify'],
   plugins: [{
     name: 'dompurify-ssr-stub', enforce: 'pre',
     resolveId: id => id === 'dompurify' ? '\0dompurify-stub' : null,

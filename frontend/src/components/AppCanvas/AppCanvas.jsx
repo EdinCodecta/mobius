@@ -13,6 +13,7 @@ import {
   liveAppToken, resolveLatchedToken,
 } from '../../lib/appToken.js'
 import { createAppStorageHost } from '../../lib/appStorageHost.js'
+import { acquireAudioSession } from '../../lib/audioSession.js'
 import { validNavLocationText } from '../../lib/appNavLocation.js'
 import { readAppNavLocation, writeValidatedAppNavLocation } from '../../lib/appNavLocationStore.js'
 import {
@@ -219,7 +220,8 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //
 // Host-level messages (attributed and narrowed here, outcomes owned by the
 // `onHostRequest` callback):
-//   - {type: 'moebius:new-chat', draft?, autoSend?}          frame → host
+//   - {type: 'moebius:new-chat', draft?}                     frame → host
+//     (always an editable draft; see appHostRequest)
 //   - {type: 'moebius:open-chat', chatId, draft?}            frame → host
 //   - {type: 'moebius:open-app', appId, intent?}             frame → host
 //   - {type: 'moebius:open-settings', section?}              frame → host
@@ -371,6 +373,9 @@ const AppCanvas = forwardRef(function AppCanvas({
   onAppFocus, onImmersive, onIntentDelivered, onAppError, onHostRequest,
   onMediaSession, onShellShortcut,
 }, hostRef) {
+  // Before app code can play: app frames cannot set the page's audio session.
+  useLayoutEffect(() => acquireAudioSession('playback'), [])
+
   const queryClient = useQueryClient()
   const [serviceSurface, setServiceSurface] = useState(null)
   const [cameraPreview, setCameraPreview] = useState(null)

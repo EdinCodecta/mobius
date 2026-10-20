@@ -54,7 +54,7 @@ def test_every_package_input_changes_the_same_incoming_identity(repo, field):
   assert summary.source_digest == _full(repo, commit).source_digest
 
 
-@pytest.mark.parametrize('missing', ['mobius.json', 'index.jsx', 'cards.js', 'large.bin', 'seed.json', 'fetch.sh', 'icon.png'])
+@pytest.mark.parametrize('missing', ['mobius.json', 'index.jsx', 'cards.js', 'large.bin', 'seed.json', 'fetch.sh'])
 def test_missing_incoming_inputs_have_identical_closed_failure(repo, missing):
   tree = _tree(); tree.pop(missing); commit = _commit(repo, tree)
   with pytest.raises(ValueError) as full:
@@ -72,6 +72,17 @@ def test_invalid_incoming_manifest_has_same_failure(repo, body):
   with pytest.raises(type(full.value)) as summary:
     install.read_git_package_summary(repo, commit)
   assert str(summary.value) == str(full.value)
+
+
+def test_missing_icon_is_nonfatal_like_an_http_404_and_identity_exact(repo):
+  tree = _tree(); tree.pop('icon.png'); commit = _commit(repo, tree)
+  full = _full(repo, commit); summary = install.read_git_package_summary(repo, commit)
+  assert full.candidate.icon_processed is None
+  assert summary.icon_warning == full.candidate.icon_warning == (
+    'icon: candidate Git tree is missing icon icon.png'
+  )
+  assert summary.source_digest == full.source_digest
+  assert install.read_git_install_candidate(repo, commit, URL).candidate.icon_warning
 
 
 def test_invalid_icon_remains_nonfatal_and_identity_exact(repo):

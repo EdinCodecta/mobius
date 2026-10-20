@@ -33,6 +33,7 @@ import {
   enrichMessageSource,
 } from './messageSources.js'
 import { toolBlockFailed } from './toolResultFormat.js'
+import { VIEWED_SNAPSHOT_NAME } from './toolImageResult.js'
 
 // Tool names whose tool events describe an AskUserQuestion-style
 // call: Claude's AskUserQuestion and Codex's request_user_input.
@@ -578,6 +579,11 @@ export function attachToolOutput(prev, content, event = null) {
   if (typeof event?.owner_card_question_id === 'string') {
     block.owner_card_question_id = event.owner_card_question_id
   }
+  // A screenshot step names the chat-media picture it saved, so opening it
+  // live never downloads the full stored result.
+  if (typeof event?.saved_image === 'string') {
+    block.saved_image = event.saved_image
+  }
   if (event?.output_exit_code != null) {
     block.output_exit_code = event.output_exit_code
   }
@@ -611,6 +617,26 @@ export function attachGeneratedFile(prev, event) {
   if (existing.some(f => f.name === name)) return prev  // idempotent
   const updated = [...prev]
   updated[i] = { ...block, files: [...existing, entry] }
+  return updated
+}
+
+/**
+ * Applies a `viewed_image` event: the chat snapshot of exactly the image a
+ * finished ViewImage sent to the model. Codex records that image only after
+ * the view completes, so the runner binds it when the turn ends. Exact id
+ * only, so a snapshot can never land on a different view; idempotent under
+ * catch-up replay.
+ */
+export function attachViewedImage(prev, event) {
+  const name = event?.viewed_image_media
+  const toolUseId = event?.tool_use_id
+  if (!toolUseId || typeof name !== 'string' || !VIEWED_SNAPSHOT_NAME.test(name)) return prev
+  const i = prev.findLastIndex(
+    it => it.type === 'tool' && it.tool === 'ViewImage' && it.tool_use_id === toolUseId,
+  )
+  if (i < 0 || prev[i].viewed_image_media === name) return prev
+  const updated = [...prev]
+  updated[i] = { ...prev[i], viewed_image_media: name }
   return updated
 }
 
