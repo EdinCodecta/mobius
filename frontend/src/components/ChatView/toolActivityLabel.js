@@ -38,6 +38,7 @@ const ACTIVITY_LABELS = new Map([
   ['ViewImage', 'Viewing images'],
   // Codex's built-in image generator; each picture shows after its step.
   ['ImageGen', 'Generating images'],
+  ['ImageGenFailed', 'Generating images'],
   // Consulting the Memory app. A Bash call to its search script, classified by
   // the `recall` marker the backend stamps from the command — see
   // effectiveToolName. Uncountable, so it has no singular twin.
@@ -87,6 +88,8 @@ const PAST_LABELS = new Map([
   ['Skill', 'Used skills'],
   ['ViewImage', 'Viewed images'],
   ['ImageGen', 'Generated images'],
+  // Generation failed, or the picture could not be attached: never claim it.
+  ['ImageGenFailed', 'Tried to generate images'],
   ['MemoryRecall', 'Recalled from Memory'],
   ['PeerMessage', 'Exchanged messages'],
   ['HelperSpawn', 'Started helpers'],
@@ -131,6 +134,7 @@ const PAST_SINGULAR = new Map([
   ['Read files', 'Read a file'],
   ['Viewed images', 'Viewed an image'],
   ['Generated images', 'Generated an image'],
+  ['Tried to generate images', 'Tried to generate an image'],
   ['Used skills', 'Used a skill'],
 ])
 
@@ -156,6 +160,7 @@ const ACTIVITY_ICONS = new Map([
   ['Skill', 'skill'],
   ['ViewImage', 'image'],
   ['ImageGen', 'image'],
+  ['ImageGenFailed', 'image'],
   ['MemoryRecall', 'search'],
   ['AppActivity', 'sparkle'],
   ['PeerMessage', 'agents'],
@@ -211,7 +216,7 @@ const CATEGORY_ONLY = new Set([
   'HelperList', 'GoalControl', 'WaitControl', 'AskControl', 'WorkClaim', 'PeerControl',
   'NotifyControl', 'OpenControl', 'AppControl', 'NoteControl', 'ScreenControl',
   // The input is the image prompt; the step reads as the activity alone.
-  'ImageGen',
+  'ImageGen', 'ImageGenFailed',
 ])
 
 // The bare control name (`update_goal`) for either provider's spelling.
@@ -444,6 +449,10 @@ export function effectiveToolName(tool) {
       && peerMessageCardModel(tool.peer_message)) return 'PeerMessage'
   if (Array.isArray(tool?.skills) && tool.skills.length > 0) return 'Skill'
   if (IMAGE_TOOL_NAMES.has(name)) return 'ViewImage'
+  // A nonzero exit is the only failure signal a step carries (see
+  // toolBlockFailed); a failed generation must not read "Generated".
+  if (name === 'ImageGen' && Number.isInteger(tool?.output_exit_code)
+      && tool.output_exit_code !== 0) return 'ImageGenFailed'
   const control = controlToolName(name)
   if (control) return control
   if (name === 'Read') {
@@ -467,7 +476,7 @@ export function effectiveToolName(tool) {
 // effectiveToolName still gives them an honest label and expandable details,
 // while the ordinary activity stretch folds them beside reads and commands.
 const DISTINCTIVE_ACTIVITIES = new Set([
-  'ViewImage', 'ImageGen', 'MemoryRecall', 'AppActivity',
+  'ViewImage', 'ImageGen', 'ImageGenFailed', 'MemoryRecall', 'AppActivity',
 ])
 
 // The one-line story of a peer-network exchange: who the agent messaged or
