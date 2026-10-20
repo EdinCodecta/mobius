@@ -11,16 +11,6 @@ const css = readFileSync(
   'utf8',
 )
 
-const accountView = readFileSync(
-  new URL('../../components/SettingsView/identity/IdentityAccount.jsx', import.meta.url),
-  'utf8',
-)
-
-test('hidden Settings unmounts the deletion modal while retaining the account page', () => {
-  assert.match(view, /<IdentityAccount active=\{active\}/)
-  assert.match(accountView, /\{deletingDeployment && active && \(\s*<DeleteDeploymentModal/)
-})
-
 const updates = readFileSync(
   new URL('../../components/SettingsView/PlatformUpdates.jsx', import.meta.url), 'utf8',
 )
@@ -35,7 +25,6 @@ test('appearance keeps one icon switch in the header without making the section 
   assert.match(view, /<header className="settings__header">/)
   assert.doesNotMatch(view, /settings__section--appearance/)
   assert.match(view, /className="settings__appearance-toggle"[\s\S]*role="switch"[\s\S]*onClick=\{toggleTheme\}/)
-  assert.match(view, /!detailPage && <button[\s\S]*className="settings__appearance-toggle"/)
   assert.match(view, /settings__appearance-option/)
   assert.doesNotMatch(view, /settings__appearance-thumb/)
   assert.match(view, /<Sun[\s\S]*<Moon/)
@@ -47,14 +36,6 @@ test('appearance keeps one icon switch in the header without making the section 
 test('provider priority does not override the last-picked new-chat model', () => {
   assert.match(view, /New chats still use your last-picked chat model/)
   assert.doesNotMatch(view, /settings__priority-summary|firstBackgroundLabel|lastModelLabel/)
-})
-
-test('provider detail shows its usage without another disclosure', () => {
-  assert.match(view, /selectedProvider === 'codex'/)
-  assert.match(view, /selectedProvider === 'claude'/)
-  assert.match(view, /detailNode=\{codexAuthenticated \? \(\s*<ProviderUsage/)
-  assert.match(view, /detailNode=\{claudeAuthenticated \? \(\s*<ProviderUsage/)
-  assert.doesNotMatch(view, /PlanUsageToggle|expandedUsage/)
 })
 
 test('version details distinguish served Möbius from its container identity', () => {
@@ -112,71 +93,36 @@ test('status failures project unknown rather than retaining an unchecked current
   assert.match(requests, /results\[0\]\.status === 'rejected'[\s\S]*platformStatusUnavailable\(current\)/)
 })
 
-test('provider rows keep six-dot background priority and provider-scoped controls', () => {
+test('provider rows keep six-dot background priority without reorder chrome', () => {
   assert.match(view, /settings-bg-row__effort-visual[\s\S]*settings-bg-row__effort-dot/)
   assert.match(view, /efforts=\{efforts\}[\s\S]*onEffortChange=\{onEffortChange\}/)
   assert.doesNotMatch(view, /settings-bg-row__effort-picker|<EffortStepper/)
   assert.doesNotMatch(view, /\{effortLabel\} effort<\/span>/)
-  assert.match(view, /reorderMode=\{!selectedProvider\}/)
   assert.match(view, /<GripVertical size=\{18\} strokeWidth=\{2\}/)
   assert.doesNotMatch(view, /settings-agent-group__reorder|>Reorder<|model-trigger__caret/)
   assert.match(view, /background-task priority/)
-  assert.match(view, /settings-provider-summary/)
-  assert.match(view, /detailMode=\{selectedProvider === row\.provider\}/)
-  assert.match(view, /onClick=\{\(\) => setDetailPage\(null\)\}/)
-  assert.match(view, /!detailMode && <button[\s\S]*onClick=\{onOpen\}/)
-  assert.match(view, /detailMode && <div className="settings-provider-details">/)
-  assert.match(view, /selectedProvider && selectedProvider !== row\.provider \? null/)
-  assert.match(view, /onlyProvider=\{manageModelsProvider === 'all' \? null : manageModelsProvider\}/)
   assert.match(css, /\.settings-bg-row\s*\{[^}]*border:\s*1px solid var\(--border\);[^}]*background:\s*var\(--surface\);/s)
   assert.match(css, /\.settings-bg-row__effort-visual\s*\{[^}]*min-width:\s*68px;/s)
-  assert.match(css, /\.settings-bg-row__drag-handle\s*\{[^}]*align-self:\s*start;[^}]*height:\s*62px;/s)
   assert.doesNotMatch(view, /dropPosition|settings-bg-row--drop-before|settings-bg-row--drop-after/)
   assert.doesNotMatch(css, /settings-bg-row--drop-before|settings-bg-row--drop-after/)
 })
 
-test('disconnected provider rows are grey and fixed beneath connected providers', () => {
-  assert.match(view, /connectedProvidersFirst\(backgroundDraft \|\|/)
-  assert.match(view, /moveConnectedProvider\(current, fromIndex, toIndex, configuredProvidersRef\.current\)/)
-  assert.match(view, /backgroundRowRefs\.current\.slice\(0, connectedCount\)/)
-  assert.match(view, /reorderMode && configured && \(/)
-  assert.match(view, /reorderMode && !configured && <span className="settings-bg-row__drag-spacer"/)
-  assert.match(view, /configured && <span className="settings-provider-summary__rank"/)
-  assert.match(css, /\.settings-bg-row--disconnected:not\(\.settings-bg-row--detail\) \{ opacity: 0\.7; \}/)
+test('provider usage is fetched only for the open provider page', () => {
+  assert.match(view, /&& selectedProvider === 'codex'/)
+  assert.match(view, /&& selectedProvider === 'claude'/)
+  assert.doesNotMatch(view, /PlanUsageToggle|expandedUsage/)
+})
+
+test('the Möbius account and Möbius sign-in hand off to Möbius · You', () => {
+  assert.match(view, /onOpenApp\?\.\('identity'\)/)
+  assert.match(view, /onOpenAccount=\{openMobiusYou\}/)
+  assert.doesNotMatch(view, /IdentityAccount|SettingsView\/identity\/|useIdentityQuery/)
 })
 
 test('provider-dependent model controls stay unavailable until connected', () => {
   assert.match(view, /disabled=\{!configuredProviders\.has\(row\.provider\)\}/)
   assert.match(view, /disabled=\{!configured\}/)
   assert.match(view, /configuredProviders=\{configuredProviders\}/)
-})
-
-test('Möbius account opens its Settings page while GitHub expands inline', () => {
-  const github = readFileSync(new URL('../../components/SettingsView/GithubConnection.jsx', import.meta.url), 'utf8')
-  assert.match(view, /onClick=\{\(\) => openDetailPage\('account'\)\}/)
-  assert.match(view, /accountOpen && <div className="settings__account-page">[\s\S]*<IdentityAccount/)
-  assert.match(view, /!accountOpen && <section[\s\S]*settings__section--ai/)
-  assert.match(view, /<GithubConnection[\s\S]*expanded=\{githubAccountOpen\}/)
-  assert.match(github, /aria-expanded=\{expanded\}[\s\S]*settings-github-detail/)
-  assert.doesNotMatch(view, /onOpenApp\?\.\('identity'\)/)
-})
-
-test('Möbius account row uses the shared profile photo or handle', () => {
-  assert.match(view, /useIdentityQuery\(\{ enabled: active \}\)\.data\?\.profile/)
-  assert.match(view, /<ProfileAvatar profile=\{mobiusProfile\} \/>/)
-  assert.match(view, /@\$\{mobiusProfile\.handle\}/)
-})
-
-test('live usage is a collapsed dropdown that only fetches while open', () => {
-  const identity = readFileSync(new URL('../../components/SettingsView/identity/IdentityAccount.jsx', import.meta.url), 'utf8')
-  assert.match(identity, /<UsageDisclosure instance=\{managed\} \/>/)
-  assert.match(identity, /onToggle=\{event => setOpen\(event\.currentTarget\.open\)\}/)
-  assert.match(identity, /\{open && \(\s*<div className="id-disclosure-body">\s*<DeploymentMetrics/)
-})
-
-test('ID card shows the Railway account email when Möbius has no sign-in email', () => {
-  const identity = readFileSync(new URL('../../components/SettingsView/identity/IdentityAccount.jsx', import.meta.url), 'utf8')
-  assert.match(identity, /<span>\{profile\?\.email \|\| railway\.connection\.account\}<\/span>/)
 })
 
 test('Settings detail back button has a 44px touch target and keeps the shared 18px icon', () => {
@@ -186,12 +132,6 @@ test('Settings detail back button has a 44px touch target and keeps the shared 1
   assert.match(backStyle, /width:\s*44px;/)
   assert.match(backStyle, /height:\s*44px;/)
   assert.doesNotMatch(view, />←<\/button>/)
-})
-
-test('profile photo edit keeps a named native button around its decorative badge', () => {
-  const account = readFileSync(new URL('../../components/SettingsView/identity/IdentityAccount.jsx', import.meta.url), 'utf8')
-  assert.match(account, /<button\s+type="button"\s+className="id-avatar-edit"\s+disabled=\{uploading\}\s+aria-label=\{uploading \? 'Uploading profile picture' : 'Change profile picture'\}\s+onClick=\{\(\) => fileRef\.current\?\.click\(\)\}/)
-  assert.match(account, /<span className="id-avatar-edit-badge" aria-hidden="true">/)
 })
 
 test('new provider connections use the curated unattended defaults', () => {

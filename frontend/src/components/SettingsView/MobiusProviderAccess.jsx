@@ -1,6 +1,6 @@
-/* Möbius model access and picker visibility inside the Settings provider row. */
+/* Möbius model access and picker visibility on the Möbius provider page. */
 import { useCallback, useEffect, useState } from 'react'
-import { identityRequest } from './identity-client.js'
+import { mobiusAccessRequest } from './mobiusAgentAccess.js'
 import './MobiusProviderAccess.css'
 
 const dollars = units => new Intl.NumberFormat(undefined, {
@@ -18,7 +18,7 @@ function accessStatus(access, error) {
   return access.balance.available_units > 0 || access.trial.state === 'ready' ? 'Available' : 'No credit'
 }
 
-export default function MobiusProviderAccess({ onVisibilityChange }) {
+export default function MobiusProviderAccess({ active = true, onVisibilityChange, onOpenAccount }) {
   const [access, setAccess] = useState(null)
   const [accessError, setAccessError] = useState('')
   const [accessBusy, setAccessBusy] = useState(false)
@@ -29,7 +29,7 @@ export default function MobiusProviderAccess({ onVisibilityChange }) {
   const loadAccess = useCallback(async () => {
     setAccessError('')
     try {
-      setAccess(await identityRequest('/agent'))
+      setAccess(await mobiusAccessRequest('/api/identity/agent'))
     } catch (error) {
       setAccessError(error.message)
     }
@@ -38,21 +38,24 @@ export default function MobiusProviderAccess({ onVisibilityChange }) {
   const loadVisibility = useCallback(async () => {
     setVisibilityError('')
     try {
-      const result = await identityRequest('/api/auth/providers/mobius/enabled')
+      const result = await mobiusAccessRequest('/api/auth/providers/mobius/enabled')
       setVisible(result.enabled)
     } catch (error) {
       setVisibilityError(error.message)
     }
   }, [])
 
-  useEffect(() => { void loadAccess(); void loadVisibility() }, [loadAccess, loadVisibility])
+  useEffect(() => { void loadVisibility() }, [loadVisibility])
+  // Signing in happens in Möbius · You, so re-read access whenever the owner
+  // comes back to a visible Settings page.
+  useEffect(() => { if (active) void loadAccess() }, [active, loadAccess])
 
   const setVisibility = async next => {
     if (visibilityBusy) return
     setVisibilityBusy(true)
     setVisibilityError('')
     try {
-      const result = await identityRequest('/api/auth/providers/mobius/enabled', {
+      const result = await mobiusAccessRequest('/api/auth/providers/mobius/enabled', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled: next }),
@@ -71,7 +74,7 @@ export default function MobiusProviderAccess({ onVisibilityChange }) {
     setAccessBusy(true)
     setAccessError('')
     try {
-      setAccess(await identityRequest('/agent/trial', { method: 'POST' }))
+      setAccess(await mobiusAccessRequest('/api/identity/agent/trial', { method: 'POST' }))
     } catch (error) {
       setAccessError(error.code === 'trial_fund_exhausted'
         ? 'Trial capacity is unavailable right now. Your account is still ready.'
@@ -95,6 +98,10 @@ export default function MobiusProviderAccess({ onVisibilityChange }) {
       <span>Model access</span>
       <strong>{accessStatus(access, accessError)}</strong>
     </div>
+    {access?.agent_access === 'signed_out' && <>
+      <p className="settings-mobius-access__note">Sign in to your Möbius account in Möbius · You to use Möbius models here.</p>
+      <button type="button" className="settings-mobius-access__action" onClick={onOpenAccount}>Sign in from Möbius · You</button>
+    </>}
     {access?.agent_access === 'available' && <>
       {access.trial.state === 'ready' && <button type="button" className="settings-mobius-access__action" disabled={accessBusy} onClick={activate}>{accessBusy ? 'Activating…' : 'Activate trial credit'}</button>}
       <details className="settings-mobius-access__prices">
