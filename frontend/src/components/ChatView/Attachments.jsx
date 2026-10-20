@@ -28,6 +28,14 @@ export function generatedImageHref(chatId, name) {
   return `/api/chats/${encodeURIComponent(chatId)}/generated-files/${encodeURIComponent(name)}`
 }
 
+/** A native picture's size recorded at capture, keyed like the server's
+ * media-dimension map, so its frame is final before any byte loads. */
+function generatedImageDimensions(file, chatId) {
+  const { width, height } = file
+  if (![width, height].every(side => Number.isInteger(side) && side > 0)) return null
+  return { [generatedImageHref(chatId, file.name)]: { width, height } }
+}
+
 export function documentAttachmentIdentity(file, chatId) {
   return `${chatId}:${file.name}:${file.sha256 || ''}`
 }
@@ -62,8 +70,8 @@ export default function Attachments({ attachments, chatId, mediaDimensions }) {
             <span key={img.name} className="chat__generated-image">
               <ExpandableImage
                 href={generatedImageHref(chatId, img.name)}
-                alt={img.name}
-                mediaDimensions={mediaDimensions}
+                alt={img.alt || 'Generated image'}
+                mediaDimensions={generatedImageDimensions(img, chatId) || mediaDimensions}
               />
             </span>
           ) : (

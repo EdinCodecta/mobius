@@ -368,3 +368,62 @@ test('reopened generated gallery images reserve every frame before authorization
   assert.equal((html.match(/class="md-image-frame"/g) || []).length, names.length)
   assert.equal((html.match(/--md-image-ratio:120 \/ 300/g) || []).length, names.length)
 })
+
+const imageStep = (id, prompt, extra = {}) => ({
+  type: 'tool', tool: 'ImageGen', tool_use_id: id, input: prompt,
+  status: 'done', output: 'Image generated.', output_exit_code: 0, ...extra,
+})
+const nativePicture = (name, step, extra = {}) => ({
+  name, size: 900, mime_type: 'image/png', previewable: true,
+  source_tool_use_id: step, width: 1536, height: 1024, ...extra,
+})
+
+for (const isStreaming of [true, false]) {
+  test(`each generated picture follows the step that made it (${isStreaming})`, () => {
+    const html = renderToStaticMarkup(createElement(MsgContent, {
+      msg: { role: 'assistant', blocks: [
+        { type: 'text', content: 'First a fox.' },
+        imageStep('ig_1', 'A red fox in snow'),
+        { type: 'text', content: 'Now a heron.' },
+        imageStep('ig_2', 'A grey heron at dawn'),
+        { type: 'text', content: 'Both are done.' },
+        { type: 'generated_files', files: [
+          nativePicture('generated-image-1.png', 'ig_1'),
+          nativePicture('generated-image-2.png', 'ig_2'),
+        ] },
+      ] },
+      chatId: 'chat-generated-file', isStreaming, isActiveAnswer: isStreaming,
+    }))
+    // Before its media token resolves, a frame is named by its alt text.
+    const order = ['First a fox.', 'Open A red fox in snow preview', 'Now a heron.',
+      'Open A grey heron at dawn preview', 'Both are done.'].map(text => html.indexOf(text))
+    assert.ok(order.every(index => index >= 0), `missing in ${order}`)
+    assert.deepEqual([...order].sort((a, b) => a - b), order)
+    // The recorded capture size fixes each frame before any byte loads.
+    assert.equal((html.match(/--md-image-ratio:1536 \/ 1024/g) || []).length, 2)
+  })
+}
+
+test('a picture whose step is not on screen falls back after the answer', () => {
+  const html = renderToStaticMarkup(createElement(MsgContent, {
+    msg: { role: 'assistant', blocks: [
+      { type: 'text', content: 'Here it is.' },
+      { type: 'generated_files', files: [nativePicture('generated-image-1.png', 'ig_gone')] },
+    ] },
+    chatId: 'chat-generated-file', isStreaming: false,
+  }))
+  assert.ok(html.indexOf('Here it is.') < html.indexOf('chat__generated-image'))
+  assert.match(html, /aria-label="Open Generated image preview"/)
+  assert.doesNotMatch(html, /generated-image-1\.png preview/)
+})
+
+test('a picture still pending at the step reads as pending, not as a failure', () => {
+  const html = renderToStaticMarkup(createElement(MsgContent, {
+    msg: { role: 'assistant', blocks: [imageStep('ig_1', 'A red fox in snow', {
+      output: 'Image generated. Attaching it has not finished yet; Möbius tries again when this turn ends.',
+    })] },
+    chatId: 'chat-generated-file', isStreaming: true, isActiveAnswer: true,
+  }))
+  assert.match(html, /Generat(ed|ing) an image/)
+  assert.doesNotMatch(html, /chat__generated-image/)
+})

@@ -388,6 +388,18 @@ test('a distinctive tool (image view) breaks out into its own line', () => {
   assert.equal(nodes[3].group.length, 1)            // the trailing image view, alone
 })
 
+test('an image generation step stands alone and reads as the activity', () => {
+  const gen = tool({ tool: 'ImageGen', input: 'A red fox in snow', status: 'done' })
+  const nodes = groupActivityRuns([e(tool({ tool: 'Bash' })), e(gen), e(tool({ tool: 'Bash' }))])
+  assert.equal(nodes.length, 3)
+  assert.equal(nodes[1].group[0].item, gen)
+  assert.ok(isDistinctiveActivityTool(gen))
+  // The prompt is the picture's alt text, not the row's label.
+  assert.equal(toolCallLabel(gen), 'Generated an image')
+  assert.equal(toolCallLabel({ ...gen, status: 'running' }), 'Generating an image')
+  assert.equal(toolActivityLabel('ImageGen'), 'Generating images')
+})
+
 test('consecutive image views each get their own line — they do not accumulate', () => {
   const img = '/a.png'
   const nodes = groupActivityRuns([

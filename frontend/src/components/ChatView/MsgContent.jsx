@@ -1,4 +1,5 @@
 import { Fragment, memo, useMemo } from 'react'
+import { useGeneratedFiles } from './hooks/useGeneratedFiles.js'
 import { usePositionedPeerNotes } from './peerTimelineContext.js'
 import {
   insertPositionedActivity,
@@ -182,6 +183,27 @@ function markdownImagePaths(block) {
   return paths
 }
 
+/** Where each published file shows. A picture appears as soon as it is
+ * published, right after the step that produced it when the server named one,
+ * unless the prose already embeds it. Every other file, and any document only
+ * once the turn has finished, sits after the answer. */
+function generatedFileLayout(files, { chatId, isStreaming, embeddedImageKey }) {
+  const embedded = new Set(embeddedImageKey.split('\n'))
+  const visible = files.filter(file => attachmentIsGalleryImage(file)
+    ? !embedded.has(generatedImageHref(chatId, file.name))
+    : !isStreaming)
+  const byStep = new Map()
+  for (const file of visible) {
+    const step = attachmentIsGalleryImage(file) ? file.source_tool_use_id : null
+    if (step) byStep.set(step, [...(byStep.get(step) || []), file])
+  }
+  return {
+    visible,
+    byStep,
+    afterAnswer: visible.filter(file => !byStep.has(file.source_tool_use_id)),
+  }
+}
+
 /** One string naming every image path the message's prose embeds, so a memo
  * can depend on the set's content rather than on a per-render Set. */
 function embeddedImagePathKey(blocks) {
@@ -245,29 +267,17 @@ function MsgContentInner({
   activitySourceBlocks,
 }) {
   const positionedNotes = usePositionedPeerNotes(activityMessageId || msg.id)
-  // Memoized once per message: open image previews derive from this list.
-  // It holds every published file; only the attachment area below hides
-  // documents until the final answer.
-  const generatedFiles = useMemo(() => (
-    msg.role === 'assistant'
-      ? (msg.blocks || []).flatMap(block =>
-          block.type === 'generated_files' && Array.isArray(block.files)
-            ? block.files.map(file => ({ ...file, kind: 'generated' }))
-            : [],
-        )
-      : []
-  ), [msg.role, msg.blocks])
-  // Pictures show as soon as they are published; documents wait for the final
-  // answer. A picture the prose already embeds is not repeated.
+  // One identity per message while its files are unchanged: open image
+  // previews and document cards derive from this list. It holds every
+  // published file; the layout below decides where each one shows.
+  const generatedFiles = useGeneratedFiles(msg)
   const embeddedImageKey = generatedFiles.some(attachmentIsGalleryImage)
     ? embeddedImagePathKey(msg.blocks)
     : ''
-  const visibleFiles = useMemo(() => {
-    const embedded = new Set(embeddedImageKey.split('\n'))
-    return generatedFiles.filter(file => attachmentIsGalleryImage(file)
-      ? !embedded.has(generatedImageHref(chatId, file.name))
-      : !isStreaming)
-  }, [generatedFiles, embeddedImageKey, chatId, isStreaming])
+  const fileLayout = useMemo(
+    () => generatedFileLayout(generatedFiles, { chatId, isStreaming, embeddedImageKey }),
+    [generatedFiles, chatId, isStreaming, embeddedImageKey],
+  )
   // Build a stable per-render answerable predicate that closes over the
   // scalar props (no function prop needed from ChatView).
   const isQuestionAnswerable = (block) =>
@@ -677,16 +687,38 @@ function MsgContentInner({
     // arrive here after conversion to the same block shape, so the transcript
     // doesn't reshuffle on promote.
     const nodes = groupActivityRuns(foldAppActivityOperations(finalEntries))
-    // Both kinds sit after the agent's last prose and before any terminal
+    // A picture follows the step that made it. If that step is not on screen
+    // (an older or reduced transcript), it joins the files after the answer.
+    const shownSteps = new Set(nodes.flatMap(node => (
+      node.group ? node.group.map(entry => entry.item?.tool_use_id).filter(Boolean) : []
+    )))
+    const followsShownStep = file => fileLayout.byStep.has(file.source_tool_use_id)
+      && shownSteps.has(file.source_tool_use_id)
+    const afterAnswerFiles = [...fileLayout.byStep.keys()].every(step => shownSteps.has(step))
+      ? fileLayout.afterAnswer
+      : fileLayout.visible.filter(file => !followsShownStep(file))
+    const stepAttachments = node => {
+      const steps = (node.group || []).map(entry => entry.item?.tool_use_id)
+        .filter(step => fileLayout.byStep.has(step))
+      return steps.map(step => (
+        <Attachments
+          key={`generated-files-${step}`}
+          attachments={fileLayout.byStep.get(step)}
+          chatId={chatId}
+          mediaDimensions={msg.media_dimensions}
+        />
+      ))
+    }
+    // The rest sit after the agent's last prose and before any terminal
     // question card, including in already-saved transcripts.
     const lastTextNode = nodes.findLastIndex(node => node.single?.item?.type === 'text')
-    const beforeQuestionNode = visibleFiles.length
+    const beforeQuestionNode = afterAnswerFiles.length
       ? nodes.findIndex((node, index) =>
           index > lastTextNode && node.single?.item?.type === 'question',
         )
       : -1
-    const fileAttachments = visibleFiles.length
-      ? <Attachments key="generated-files" attachments={visibleFiles} chatId={chatId} mediaDimensions={msg.media_dimensions} />
+    const fileAttachments = afterAnswerFiles.length
+      ? <Attachments key="generated-files" attachments={afterAnswerFiles} chatId={chatId} mediaDimensions={msg.media_dimensions} />
       : null
 
     return (
@@ -727,7 +759,7 @@ function MsgContentInner({
                   onInternalNav={onInternalNav}
                 />
               </div>
-            )]
+            ), ...stepAttachments(node)]
           }
           return [...before, renderBlock(node.single.item, node.single.idx)]
         })}
