@@ -161,24 +161,40 @@ def _called_within(body: list[ast.stmt]) -> set[int]:
   Their bodies may run while the block is still executing, so a guard around
   the block may cover them; the check abstains as it does for the block's own
   statements. A lambda counts when it is called on the spot or bound to a
-  name the block calls. Calling an ``async def`` only creates a coroutine, so
-  it counts only when the block awaits that call; calling a generator
-  function runs nothing, so it never counts.
+  name the block calls. Calling an ``async def`` or a generator function
+  only creates a coroutine or generator, so those count only when the block
+  also runs it: awaits the coroutine (directly or as an argument of an
+  awaited call such as ``asyncio.gather``), or consumes the generator (loops
+  over it, passes it to a call such as ``list``, or delegates with
+  ``yield from``).
   """
   nodes = [node for statement in body for node in ast.walk(statement)]
   calls = [node for node in nodes if isinstance(node, ast.Call)]
-  called = {call.func.id for call in calls if isinstance(call.func, ast.Name)}
-  awaited = {
-    node.value.func.id for node in nodes
-    if isinstance(node, ast.Await) and isinstance(node.value, ast.Call)
-    and isinstance(node.value.func, ast.Name)
-  }
+
+  def names(candidates) -> set[str]:
+    return {
+      call.func.id for call in candidates
+      if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
+
+  def arguments(call: ast.Call) -> list[ast.expr]:
+    return [*call.args, *(keyword.value for keyword in call.keywords)]
+
+  called = names(calls)
+  awaited_calls = [node.value for node in nodes
+                   if isinstance(node, ast.Await) and isinstance(node.value, ast.Call)]
+  awaited = names(awaited_calls) | names(
+    argument for call in awaited_calls for argument in arguments(call)
+  )
+  consumed = names(argument for call in calls for argument in arguments(call)) | names(
+    node.iter for node in nodes if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension))
+  ) | names(node.value for node in nodes if isinstance(node, ast.YieldFrom))
   found = {id(call.func) for call in calls if isinstance(call.func, ast.Lambda)}
   for node in nodes:
     if isinstance(node, ast.AsyncFunctionDef) and node.name in awaited:
       found.add(id(node))
-    elif (isinstance(node, ast.FunctionDef) and node.name in called
-          and not _is_generator(node)):
+    elif (isinstance(node, ast.FunctionDef)
+          and node.name in (consumed if _is_generator(node) else called)):
       found.add(id(node))
     elif (isinstance(node, ast.Assign) and isinstance(node.value, ast.Lambda)
           and any(isinstance(target, ast.Name) and target.id in called

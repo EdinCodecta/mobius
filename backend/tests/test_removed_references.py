@@ -131,6 +131,14 @@ def test_references_guarded_by_a_lookup_fallback_are_left_to_the_tests(repo, sou
   "from app import install\n\nasync def main():\n  try:\n    async def read():\n"
   "      return install.read_receipt()\n    return await read()\n"
   "  except AttributeError:\n    return None\n",
+  "import asyncio\nfrom app import install\n\nasync def main():\n  try:\n    async def read():\n"
+  "      return install.read_receipt()\n    return await asyncio.gather(read())\n"
+  "  except AttributeError:\n    return None\n",
+  # A generator consumed inside the try runs under its handler.
+  "from app import install\ntry:\n  def items():\n    yield install.read_receipt()\n"
+  "  VALUE = list(items())\nexcept AttributeError:\n  VALUE = []\n",
+  "from app import install\ntry:\n  def items():\n    yield install.read_receipt()\n"
+  "  for item in items():\n    pass\nexcept AttributeError:\n  pass\n",
 ])
 def test_lookups_that_run_inside_a_matching_handler_are_left_to_the_tests(repo, source):
   baseline = {**_MOVED_BEFORE, "backend/app/gone.py": "thing = 1\n"}
