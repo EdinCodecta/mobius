@@ -6,6 +6,7 @@ import {
   platformActivationLabel,
   platformStatusFromApply,
   platformStatusUnavailable,
+  platformUpdateStall,
   platformUpdateStatusLabel,
   reviewedUpdateUsesContainerRebuild,
 } from '../platformUpdateState.js'
@@ -226,4 +227,25 @@ test('routine image replacement requires complete action evidence without extern
   }
   assert.equal(reviewedUpdateUsesContainerRebuild({ activation: { level: 'image_rebuild' } }), false)
   assert.equal(reviewedUpdateUsesContainerRebuild({ activation: { level: 'image_rebuild', required_actions: ['server_restart', 'image_rebuild'] } }), true)
+})
+
+test('a stalled update names how long and why, with the backend\'s actions', () => {
+  assert.equal(platformUpdateStall({ unfinished_update: { stage: 'resolve' } }), null)
+
+  const idle = platformUpdateStall({
+    unfinished_update: { stage: 'resolve', stalled: {
+      reason: 'resolver_idle', idle_hours: 31.6, actions: ['resume', 'retry', 'cancel'],
+    } },
+  })
+  assert.deepEqual(idle, {
+    message: 'Update paused for 32 h: resolver idle.', canResume: true, canRetry: true,
+  })
+
+  const blocked = platformUpdateStall({
+    restart_blocker: { packages: [{ name: 'claude-agent-sdk' }], blocking: true },
+    unfinished_update: { stage: 'finish', stalled: { reason: 'restart_blocked', idle_hours: 0, actions: [] } },
+  })
+  assert.match(blocked.message, /cannot restart into it \(needs claude-agent-sdk\)/)
+  assert.equal(blocked.canResume, false)
+  assert.equal(blocked.canRetry, false)
 })

@@ -30,6 +30,7 @@ import subprocess
 import stat
 import textwrap
 import threading
+import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -6394,6 +6395,130 @@ def test_a_local_requirements_edit_does_not_hide_a_newer_release_lock(clone_env)
     pu.settle_prepared_update_for_this_image(platform)
 
 
+def _image_behind_a_release_pin(platform: Path, origin: Path, monkeypatch, installed):
+  """The source took an official release's newer agent SDK pin, and the
+  running image installs an older one (or none)."""
+  _with_python_inputs(platform, origin)
+  old_image = _served_sha(platform)
+  old_lock = (platform / "backend/requirements.lock").read_bytes()
+  newer = _advance_origin(origin, edits={
+    "backend/requirements.lock": "fastapi==1\nclaude-agent-sdk==0.2.165\n",
+  })
+  pu._fetch(platform)
+  _git(platform, "merge", "-q", "--ff-only", newer)
+  pu._set_upstream(platform, newer)
+  _boot_image(old_image)
+  _record_image_inputs(platform, old_lock)
+  monkeypatch.setattr(pu, "_installed_version", {"fastapi": "1", **installed}.get)
+  return newer
+
+
+def test_package_gap_names_package_versions_and_fix_release(clone_env, monkeypatch):
+  origin, platform = clone_env
+  newer = _image_behind_a_release_pin(
+    platform, origin, monkeypatch, {"claude-agent-sdk": "0.2.161"},
+  )
+
+  gap = pu.python_package_gap(platform)
+
+  assert gap["packages"] == [{
+    "name": "claude-agent-sdk", "declared": "==0.2.165",
+    "installed": "0.2.161", "kind": "version", "origin": "official_newer",
+  }]
+  assert gap["origin"] == "official_newer" and gap["declared_by"] == newer
+  assert gap["fix"] == {"action": "replace_container", "target_sha": newer}
+  assert gap["blocking"] is False
+  reason = pu.release_packages_missing_from_image(platform)
+  assert "newer release" in reason
+  assert "claude-agent-sdk: source declares ==0.2.165, this image has 0.2.161" in reason
+  assert f"Replace the container with release {newer[:12]}" in reason
+
+
+def test_version_only_gap_warns_but_does_not_refuse_restart(clone_env, monkeypatch):
+  """The same source already runs on this image; refusing its boot would
+  leave the instance unable to restart even to load a fix."""
+  origin, platform = clone_env
+  _image_behind_a_release_pin(platform, origin, monkeypatch, {"claude-agent-sdk": "0.2.161"})
+
+  assert pu.settle_prepared_update_for_this_image(platform) == "none"
+
+
+def test_missing_distribution_still_refuses(clone_env, monkeypatch):
+  origin, platform = clone_env
+  _image_behind_a_release_pin(platform, origin, monkeypatch, {})
+
+  assert pu.python_package_gap(platform)["blocking"] is True
+  with pytest.raises(
+    pu.BootTransactionError, match="claude-agent-sdk: source declares ==0.2.165, this image does not have it",
+  ):
+    pu.settle_prepared_update_for_this_image(platform)
+
+
+def test_a_local_missing_package_beside_an_official_version_bump_does_not_block(
+  clone_env, monkeypatch,
+):
+  """Each shortfall keeps its input's provenance: a distribution only a local
+  declaration adds never blocks, nor is it blamed on the official release."""
+  origin, platform = clone_env
+  newer = _image_behind_a_release_pin(
+    platform, origin, monkeypatch, {"claude-agent-sdk": "0.2.161"},
+  )
+  local = _local_commit(platform, edits={
+    "backend/requirements.txt": "fastapi\nlocally-added\n",
+  })
+
+  gap = pu.python_package_gap(platform)
+
+  assert {item["name"]: (item["kind"], item["origin"]) for item in gap["packages"]} == {
+    "claude-agent-sdk": ("version", "official_newer"),
+    "locally-added": ("missing", "local"),
+  }
+  assert gap["blocking"] is False
+  assert gap["fix"] == {"action": "replace_container", "target_sha": newer, "commit": local}
+  reason = pu.describe_package_gap(gap)
+  release_part, local_part = reason.split(" A local change ")
+  assert "claude-agent-sdk" in release_part and "locally-added" not in release_part
+  assert "locally-added" in local_part and f"Revert local commit {local[:12]}" in local_part
+  assert pu.settle_prepared_update_for_this_image(platform) == "none"
+
+
+def test_a_local_package_gap_names_the_local_commit_and_never_refuses(clone_env, monkeypatch):
+  origin, platform = clone_env
+  _with_python_inputs(platform, origin)
+  image = _served_sha(platform)
+  image_lock = (platform / "backend/requirements.lock").read_bytes()
+  local = _local_commit(platform, edits={
+    "backend/requirements.lock": "fastapi==1\nlocally-added==1\n",
+  })
+  _boot_image(image)
+  _record_image_inputs(platform, image_lock)
+  monkeypatch.setattr(pu, "_installed_version", {"fastapi": "1"}.get)
+
+  gap = pu.python_package_gap(platform)
+
+  assert gap["origin"] == "local" and gap["blocking"] is False
+  assert gap["fix"] == {"action": "revert_local_declaration", "commit": local}
+  assert [item["kind"] for item in gap["packages"]] == ["missing"]
+  assert pu.settle_prepared_update_for_this_image(platform) == "none"
+
+
+def test_status_reports_restart_blocker(clone_env, monkeypatch):
+  """Status carries the gap with the running image's verdict: an image
+  without ``check-packages`` refuses any official-newer gap at boot."""
+  from app import restart_util
+
+  origin, platform = clone_env
+  _image_behind_a_release_pin(platform, origin, monkeypatch, {"claude-agent-sdk": "0.2.161"})
+
+  monkeypatch.setattr(restart_util, "image_boot_checks_packages", lambda: False)
+  blocker = pu.platform_status(platform)["restart_blocker"]
+  assert blocker["packages"][0]["name"] == "claude-agent-sdk"
+  assert blocker["blocking"] is True
+
+  monkeypatch.setattr(restart_util, "image_boot_checks_packages", lambda: True)
+  assert pu.platform_status(platform)["restart_blocker"]["blocking"] is False
+
+
 def test_the_boot_protocol_can_only_advance_with_a_new_image():
   path = Path(pu.__file__).resolve().parents[1] / "runtime" / "boot-protocol"
   assert int(path.read_text().strip()) == pu.BOOT_PROTOCOL
@@ -8175,3 +8300,254 @@ def test_image_activation_preserves_late_nested_repository_without_false_incoher
   assert _git(nested, "rev-parse", "HEAD").stdout == nested_head
   assert (nested / "owner.txt").read_text() == "independent owner work\n"
   assert (nested / "uncommitted.txt").read_text() == "do not discard\n"
+
+
+# --- A stalled update is surfaced and resumable ------------------------------
+
+_HOURS = 3600
+
+
+def _parked_update(platform: Path, *, chat_id: str | None = None, hours_ago: float = 10):
+  """An update parked for its resolver ``hours_ago``, with nothing touched since."""
+  worktree = platform.parent / "candidate"
+  _git(platform, "worktree", "add", "--detach", "-q", str(worktree), "HEAD")
+  blob = _git(worktree, "rev-parse", "HEAD:backend/app/main.py").stdout.strip()
+  subprocess.run(  # leave the file unmerged, as a parked conflict does
+    ["git", "-C", str(worktree), "update-index", "--index-info"], check=True, text=True,
+    input="".join(f"100644 {blob} {stage}\tbackend/app/main.py\n" for stage in (1, 2, 3)),
+  )
+  target = _served_sha(platform)
+  then = time.time() - hours_ago * _HOURS
+  pu._write_conflict_flag(target, ["backend/app/main.py"], chat_id, overlay={
+    "mode": "net", "worktree": str(worktree), "target": target,
+    "parked_at": pu.datetime.fromtimestamp(then, pu.timezone.utc).isoformat(),
+  })
+  index = worktree / _git(worktree, "rev-parse", "--git-path", "index").stdout.strip()
+  for path in (pu.CONFLICT_FLAG, index):
+    os.utime(path, (then, then))
+  return worktree, index, then
+
+
+def test_parked_at_is_written_once_and_preserved(clone_env):
+  """A re-park of the same update (another conflict on continue, a restart
+  under the resolver) keeps when it first waited; another target starts over."""
+  _origin, platform = clone_env
+  target = "a" * 40
+  pu._write_conflict_flag(target, ["x"], overlay={"mode": "net", "parked_at": "2026-01-01T09:00:00+00:00"})
+
+  assert pu._parked_at(target) == "2026-01-01T09:00:00+00:00"
+  assert pu._parked_at("b" * 40) != "2026-01-01T09:00:00+00:00"
+
+  local = _local_commit(platform, edits={"backend/app/main.py":
+    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'LOCAL'")})
+  assert local
+  pu.CONFLICT_FLAG.unlink()
+  _advance_origin(_origin, edits={"backend/app/main.py":
+    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'UPSTREAM'")})
+  first = pu.reconcile_clone(platform).overlay["parked_at"]
+  assert pu._read_conflict_flag()["overlay"]["parked_at"] == first
+  assert pu.reconcile_clone(platform).overlay["parked_at"] == first
+
+
+def test_stall_detected_after_threshold_without_progress(clone_env, db):
+  _origin, platform = clone_env
+  _worktree, _index, then = _parked_update(platform)
+  pending = pu.unfinished_update(platform)
+
+  assert pu.detect_update_stall(db, pending, repo=platform, now=then + 5 * _HOURS) is None
+  stalled = pu.detect_update_stall(db, pending, repo=platform, now=then + 7 * _HOURS)
+
+  assert stalled["reason"] == "resolver_missing"
+  assert stalled["idle_hours"] == 7.0
+  assert stalled["remaining_paths"] == ["backend/app/main.py"]
+  assert stalled["actions"] == ["resume", "retry", "cancel"]
+
+
+def test_worktree_change_resets_stall(clone_env, db):
+  _origin, platform = clone_env
+  _worktree, index, then = _parked_update(platform)
+  pending = pu.unfinished_update(platform)
+  before = pu.detect_update_stall(db, pending, repo=platform, now=then + 7 * _HOURS)
+
+  later = then + 3 * _HOURS
+  os.utime(index, (later, later))  # the resolver staged part of an answer
+
+  assert pu.detect_update_stall(db, pending, repo=platform, now=then + 7 * _HOURS) is None
+  after = pu.detect_update_stall(db, pending, repo=platform, now=later + 7 * _HOURS)
+  assert after["episode"] != before["episode"]
+
+
+def test_an_idle_resolver_stalls_but_one_waiting_on_the_owner_does_not(clone_env, db):
+  from app import models
+  from app.chat_writer import create_chat
+
+  _origin, platform = clone_env
+  _worktree, _index, then = _parked_update(platform, chat_id="resolver-1")
+  db.add(create_chat(id="resolver-1", title="Resolve platform update conflict",
+                     messages=[], pending_messages=[], provider="claude"))
+  db.commit()
+  db.query(models.Chat).filter(models.Chat.id == "resolver-1").update({
+    models.Chat.updated_at: pu.datetime.fromtimestamp(then, pu.timezone.utc).replace(tzinfo=None),
+  })
+  db.commit()
+  pending = pu.unfinished_update(platform)
+
+  stalled = pu.detect_update_stall(db, pending, repo=platform, now=then + 7 * _HOURS)
+  assert stalled["reason"] == "resolver_idle"
+  assert stalled["resolver_chat_id"] == "resolver-1"
+
+  db.query(models.Chat).filter(models.Chat.id == "resolver-1").update({
+    models.Chat.pending_question_id: "q-1",
+  })
+  db.commit()
+  assert pu.detect_update_stall(db, pending, repo=platform, now=then + 7 * _HOURS) is None
+
+
+def test_a_finish_whose_restart_is_refused_stalls_at_once(clone_env, db):
+  pending = {"target_sha": "a" * 40, "stage": "finish", "action": "restart", "cancellable": True}
+  blocker = {"blocking": True}
+
+  stalled = pu.detect_update_stall(db, pending, blocker=blocker, now=time.time())
+
+  assert stalled["reason"] == "restart_blocked"
+  assert stalled["actions"] == ["cancel"]
+  assert pu.detect_update_stall(db, pending, blocker={"blocking": False}) is None
+
+
+def test_status_names_a_stalled_update(clone_env, db):
+  _origin, platform = clone_env
+  _parked_update(platform)
+  status = {"unfinished_update": pu.unfinished_update(platform), "restart_blocker": None}
+
+  enriched = pu.with_update_stall(db, status)
+
+  assert enriched["unfinished_update"]["stalled"]["reason"] == "resolver_missing"
+
+
+@pytest.mark.asyncio
+async def test_stall_notification_fires_once_per_episode(
+  clone_env, db, owner_token, monkeypatch, tmp_path,
+):
+  """One bell row per stall; new progress that stalls again notifies again."""
+  from app import models, push
+  from app.database import SessionLocal
+
+  _origin, platform = clone_env
+  monkeypatch.setattr(pu, "STALL_NOTIFIED_PATH", tmp_path / ".stall-notified")
+  _worktree, index, then = _parked_update(platform)
+  sent = []
+
+  async def record(session, owner_id, **kwargs):
+    # Stands in for delivery: the durable bell row only, never a push.
+    sent.append(kwargs)
+    session.add(models.Notification(
+      id=kwargs["notification_id"], owner_id=owner_id,
+      source_type=kwargs["source_type"], title=kwargs["title"], body=kwargs["body"],
+    ))
+    session.commit()
+
+  monkeypatch.setattr(push, "notify_owner_async", record)
+
+  first = await pu.notify_update_stall_once(SessionLocal, platform)
+  assert first and first.startswith("platform-stall-")
+  assert await pu.notify_update_stall_once(SessionLocal, platform) is None
+  assert len(sent) == 1 and sent[0]["source_type"] == "platform_stall"
+  assert len(sent[0]["source_type"]) <= 16
+
+  later = then + _HOURS  # progress, then idle past the threshold again
+  os.utime(index, (later, later))
+  second = await pu.notify_update_stall_once(SessionLocal, platform)
+  assert second and second != first
+  assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_marker_only_finish_notifies_once_across_passes(
+  clone_env, db, owner_token, monkeypatch, tmp_path,
+):
+  """Without a prepared record the finish comes from the activation marker;
+  its stall episode must not change as supervisor passes go by."""
+  from app import models, push
+  from app.database import SessionLocal
+
+  _origin, platform = clone_env
+  monkeypatch.setattr(pu, "STALL_NOTIFIED_PATH", tmp_path / ".stall-notified")
+  monkeypatch.setattr(pu, "restart_blocker", lambda repo: {"blocking": True})
+  official = _git(platform, "rev-parse", "HEAD").stdout.strip()
+  pu.RESTART_NEEDED_FLAG.write_text(json.dumps({
+    "version": 2, "target_sha": official, "upstream_sha": official,
+    "paths": ["Dockerfile"], "image_paths": ["Dockerfile"],
+  }), encoding="utf-8")
+  pending = pu.unfinished_update(platform)
+  assert pending["stage"] == "finish" and pu.read_prepared_update() is None
+  sent = []
+
+  async def record(session, owner_id, **kwargs):
+    sent.append(kwargs)
+    session.add(models.Notification(
+      id=kwargs["notification_id"], owner_id=owner_id,
+      source_type=kwargs["source_type"], title=kwargs["title"], body=kwargs["body"],
+    ))
+    session.commit()
+
+  monkeypatch.setattr(push, "notify_owner_async", record)
+
+  now = time.time()
+  episodes = [
+    pu.detect_update_stall(db, pending, blocker={"blocking": True}, repo=platform,
+                           now=now + offset)["episode"]
+    for offset in (0, _HOURS)
+  ]
+  assert episodes[0] == episodes[1]
+
+  first = await pu.notify_update_stall_once(SessionLocal, platform)
+  monkeypatch.setattr(pu.time, "time", lambda: now + 2 * _HOURS)
+  assert first and await pu.notify_update_stall_once(SessionLocal, platform) is None
+  assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_restarts_the_idle_bound_resolver(clone_env, db, monkeypatch):
+  from app.chat_writer import create_chat
+
+  _origin, platform = clone_env
+  worktree, _index, _then = _parked_update(platform, chat_id="resolver-1")
+  db.add(create_chat(id="resolver-1", title="Resolve platform update conflict",
+                     messages=[], pending_messages=[], provider="claude"))
+  db.commit()
+  started = []
+
+  async def fake_start(**kwargs):
+    started.append(kwargs)
+    return True
+
+  monkeypatch.setattr("app.chat_start.start_programmatic_chat_turn", fake_start)
+
+  result = await pu.resume_platform_conflict_resolver(db, platform)
+
+  assert result == {"chat_id": "resolver-1", "created": False, "started": True}
+  assert started[0]["chat_id"] == "resolver-1"
+  assert "backend/app/main.py" in started[0]["content"]
+  assert str(worktree) in started[0]["content"]
+  assert "continue_platform_overlay_update" in started[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_resume_recreates_a_missing_resolver_and_rebinds_the_update(
+  clone_env, db, monkeypatch,
+):
+  _origin, platform = clone_env
+  _parked_update(platform, chat_id="deleted-resolver")
+  calls = []
+
+  async def fake_spawn(session, paths, target_sha, overlay=None):
+    calls.append((paths, target_sha, overlay["mode"]))
+    return {"chat_id": "new-resolver", "created": True, "started": True}
+
+  monkeypatch.setattr(pu, "spawn_platform_conflict_chat", fake_spawn)
+
+  result = await pu.resume_platform_conflict_resolver(db, platform)
+
+  assert result["chat_id"] == "new-resolver" and result["created"] is True
+  assert calls == [(["backend/app/main.py"], _served_sha(platform), "net")]
+  assert pu._read_conflict_flag()["chat_id"] == "new-resolver"

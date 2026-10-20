@@ -49,6 +49,7 @@ import asyncio
 import contextlib
 import fcntl
 import hashlib
+import importlib.metadata
 import json
 import logging
 import os
@@ -258,6 +259,24 @@ class UnfinishedUpdate(TypedDict):
   action: Literal["replace", "restart", "none"]
   # Prepared but not yet in place: dropping it changes nothing live.
   cancellable: bool
+  # Set by ``with_update_stall`` when nothing has moved it for a while.
+  stalled: NotRequired[StalledUpdate]
+
+
+class StalledUpdate(TypedDict):
+  """An unfinished update that nothing is moving forward (``detect_update_stall``).
+
+  ``episode`` identifies this stall: new progress starts another one, which
+  is notified again.
+  """
+
+  since: str
+  idle_hours: float
+  reason: Literal["resolver_idle", "resolver_missing", "restart_blocked"]
+  resolver_chat_id: str | None
+  remaining_paths: list[str]
+  actions: list[Literal["resume", "retry", "cancel"]]
+  episode: str
 
 
 _UPDATE_PROGRESS = PlatformUpdateProgress(
@@ -337,6 +356,10 @@ class PlatformStatus(TypedDict):
   # While set, Settings offers only Finish update for this exact release and
   # no newer release is offered or accepted.
   unfinished_update: UnfinishedUpdate | None
+  # Python packages the served source declares that this image lacks. When
+  # ``blocking`` restarts are refused (``restart_util.validate_restart_source``);
+  # otherwise it is a warning that a container replacement closes.
+  restart_blocker: NotRequired[PackageGap | None]
 
 
 class PlatformApplyResult(TypedDict):
@@ -1295,6 +1318,16 @@ def _write_conflict_flag(
     body.append("overlay:" + json.dumps(overlay, separators=(",", ":")))
   body.extend(paths)
   _atomic_write_text(CONFLICT_FLAG, "\n".join(body))
+
+
+def _parked_at(target: str) -> str:
+  """When this target's update first parked: kept across re-parks and
+  rewrites of the same update, so stall detection measures the whole wait."""
+  previous = _read_conflict_flag() or {}
+  kept = (previous.get("overlay") or {}).get("parked_at")
+  if kept and previous.get("upstream") == target:
+    return str(kept)
+  return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _read_conflict_flag() -> dict | None:
@@ -3048,7 +3081,7 @@ def _park_net_conflict(
   parked = {
     "mode": "net", "worktree": str(worktree), "served": carried.served,
     "pre": carried.pre, "target": target, "paths": paths,
-    "stage": stage, "base": base, "right": right,
+    "stage": stage, "base": base, "right": right, "parked_at": _parked_at(target),
   }
   _write_conflict_flag(target, paths, overlay=parked)
   ROLLED_BACK_FLAG.unlink(missing_ok=True)
@@ -3099,7 +3132,7 @@ def _park_for_repair(
   parked = {
     "mode": "net", "worktree": str(worktree), "served": source, "pre": source,
     "target": target, "paths": paths, "stage": "committed", "base": base,
-    "right": target, "image_digest": image_digest,
+    "right": target, "image_digest": image_digest, "parked_at": _parked_at(target),
   }
   _write_conflict_flag(target, paths, overlay=parked)
 
@@ -3649,15 +3682,75 @@ def _settle_update_record(repo: Path, image: str | None) -> str:
   return _settle_swap(repo, record)
 
 
-def release_packages_missing_from_image(
-  repo: Path = PLATFORM_REPO, image: str | None = None,
-) -> str | None:
-  """Why this image must not serve the checkout, or None.
+class PackageShortfall(TypedDict):
+  """One declared distribution this image does not install as declared.
 
-  Running an older image under source from a newer release (historical
-  image-only rollback) is unsupported: that source declares Python packages
-  the image does not have. Each package input this image does not install
-  (``image_installs_python_input``) is judged on its own:
+  ``origin`` is the declaring input's (``PackageGap``); a gap may mix both.
+  """
+
+  name: str
+  declared: str
+  installed: str | None
+  kind: Literal["missing", "version"]
+  origin: Literal["official_newer", "local"]
+
+
+class PackageGap(TypedDict):
+  """What the served source declares that this image does not install.
+
+  ``origin`` is ``official_newer`` when an input comes from an official
+  release newer than the image, otherwise ``local``. Only ``blocking`` gaps
+  refuse a boot: a distribution an official-newer input declares and this
+  image lacks entirely. A version-only gap, or one only a local input
+  declares, is a warning; the import-level startup check stays the hard
+  gate, and ``fix`` names what closes the gap (with the local ``commit`` to
+  revert when a local input also falls short).
+  """
+
+  packages: list[PackageShortfall]
+  inputs: list[str]
+  origin: Literal["official_newer", "local"]
+  declared_by: str | None
+  fix: dict[str, str | None]
+  blocking: bool
+
+
+_REQUIREMENT_NAME = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?")
+
+
+def declared_python_packages(data: bytes) -> dict[str, str]:
+  """Package name (normalized) to version spec, for requirements or a lock.
+
+  ``scripts/request-container-upgrade.py`` keeps a copy (it runs from fetched
+  upstream on older installations and cannot import this module).
+  """
+  packages: dict[str, str] = {}
+  text = re.sub(r"\\\r?\n", " ", data.decode("utf-8", "replace"))
+  for logical in text.splitlines():
+    line = re.sub(r"(^|\s)#.*$", "", logical).strip()
+    match = _REQUIREMENT_NAME.match(line)
+    if not line or line.startswith("-") or not match:
+      continue
+    rest = line[match.end():].split(";", 1)[0].split()
+    spec = "".join(token for token in rest if not token.startswith("--"))
+    packages[re.sub(r"[-_.]+", "-", match.group(1)).lower()] = spec
+  return packages
+
+
+def _installed_version(name: str) -> str | None:
+  """This interpreter's installed version of ``name``: the image's truth,
+  which a lock diff alone cannot show (for example a lost live install)."""
+  try:
+    return importlib.metadata.version(name)
+  except importlib.metadata.PackageNotFoundError:
+    return None
+
+
+def _unmet_python_inputs(repo: Path, image: str | None) -> list[tuple[str, bytes, bool]]:
+  """Package inputs this image does not install: ``(path, served, newer)``.
+
+  Each input this image does not install (``image_installs_python_input``) is
+  judged on its own:
 
   - declared somewhere in this image's own history: not newer than the image,
     so a newer image under older source (a container-only upgrade) is fine.
@@ -3666,23 +3759,23 @@ def release_packages_missing_from_image(
     build-recorded lineage (``image_lineage``) also proves the recorded
     release's own declarations are not newer;
   - declared in the official history (``origin/main``) but never in the
-    image's: a newer official release, so the checkout is refused;
-  - declared in neither: a local package declaration, which stays allowed.
+    image's: a newer official release (``newer``);
+  - declared in neither: a local package declaration.
 
   Official history is the proof, not the recorded release marker, which older
   updaters could set to a local commit. Without complete fetched official
   history (a shallow clone, or none fetched) the recorded release stands in
-  for it, so an unproven input is refused rather than trusted. A live update record is settled before this runs.
+  for it, so an unproven input counts as newer rather than trusted.
   """
   baked = _build_info().get("image_inputs")
   if not isinstance(baked, dict) or not baked:
-    return None
-  image = image or frozen_image_sha()
+    return []
   # Absence from history proves nothing in a shallow clone (images seed one),
   # so only a complete clone may call an input local by its absence.
   official = "" if _is_shallow(repo) else _rev(repo, "refs/remotes/origin/main")
   release = recorded_upstream_sha(repo)
   release_in_image = bool(release) and release in image_lineage()
+  unmet = []
   for path in _PYTHON_DEPENDENCY_INPUTS:
     served = _served_bytes(repo, path)
     if served is None or image_installs_python_input(repo, path, served):
@@ -3695,13 +3788,165 @@ def release_packages_missing_from_image(
       newer = _declared_in_history(repo, official, path, served)
     else:
       newer = bool(release) and _git_blob(repo, release, path) == served
-    if newer:
-      return (
-        "the platform source declares Python packages from a newer release "
-        "than this container image; starting an older image under newer "
-        "source is not supported. Replace the container with the release's "
-        "image."
+    unmet.append((path, served, newer))
+  return unmet
+
+
+def python_package_gap(
+  repo: Path = PLATFORM_REPO, image: str | None = None,
+) -> PackageGap | None:
+  """The packages this image lacks for the served source, or None.
+
+  A live update record is settled before the boot transaction asks.
+  """
+  image = image or frozen_image_sha()
+  unmet = _unmet_python_inputs(repo, image)
+  if not unmet:
+    return None
+  newer = [(path, served) for path, served, is_newer in unmet if is_newer]
+  local = [path for path, _served, is_newer in unmet if not is_newer]
+  shortfalls: dict[str, PackageShortfall] = {}
+  # Official-newer inputs first: a distribution both declare is the release's.
+  for _path, served, is_newer in sorted(unmet, key=lambda item: not item[2]):
+    for name, spec in declared_python_packages(served).items():
+      installed = _installed_version(name)
+      pinned = spec[2:] if spec.startswith("==") and "," not in spec else None
+      if name in shortfalls or (installed is not None and pinned in {None, installed}):
+        continue
+      shortfalls[name] = PackageShortfall(
+        name=name, declared=spec, installed=installed,
+        kind="missing" if installed is None else "version",
+        origin="official_newer" if is_newer else "local",
       )
+  official = _rev(repo, "refs/remotes/origin/main")
+  excluded = ["--not", official] if official else []
+  local_commit = None
+  if local:
+    local_commit = _git(
+      "log", "-1", "--format=%H", "HEAD", *excluded, "--", *local,
+      repo=repo, check=False,
+    ).stdout.strip() or None
+  if newer:
+    path, served = newer[0]
+    declared_by = _commit_declaring(repo, official or "HEAD", path, served)
+    release = _latest_known_release(repo)
+    if not (release and all(_git_blob(repo, release, p) == b for p, b in newer)):
+      release = declared_by
+    fix: dict[str, str | None] = {"action": "replace_container", "target_sha": release}
+    if local:
+      fix["commit"] = local_commit
+  else:
+    declared_by = local_commit
+    fix = {"action": "revert_local_declaration", "commit": declared_by}
+  packages = sorted(shortfalls.values(), key=lambda item: item["name"])
+  return PackageGap(
+    packages=packages, inputs=[path for path, _served, _newer in unmet],
+    origin="official_newer" if newer else "local", declared_by=declared_by,
+    fix=fix,
+    blocking=any(
+      item["kind"] == "missing" and item["origin"] == "official_newer"
+      for item in packages
+    ),
+  )
+
+
+def describe_package_gap(gap: PackageGap) -> str:
+  """Owner-facing sentences naming each package and what closes its part.
+
+  A gap from an image that predates per-package ``origin`` takes the gap's.
+  """
+  def detail(origin: str) -> str:
+    listed = "; ".join(
+      f"{item['name']}: source declares {item['declared'] or 'it'}, this image "
+      + (f"has {item['installed']}" if item["installed"] else "does not have it")
+      for item in gap["packages"] if item.get("origin", gap["origin"]) == origin
+    )
+    return f" ({listed})" if listed else ""
+
+  fix = gap["fix"]
+  sentences = []
+  if gap["origin"] == "official_newer":
+    target = (fix.get("target_sha") or "")[:12]
+    sentences.append(
+      "the platform source declares Python packages from a newer release than "
+      f"this container image{detail('official_newer')}. Replace the container "
+      f"with release {target or 'that release'} (Settings, Finish update)."
+    )
+  local = detail("local")
+  if gap["origin"] == "local" or local:
+    commit = (fix.get("commit") or "")[:12]
+    sentences.append(
+      f"{'A' if sentences else 'a'} local change declares Python packages this "
+      f"container image does not install{local}. Revert local commit "
+      f"{commit or 'the uncommitted edit'} or wait for its release."
+    )
+  return " ".join(sentences)
+
+
+def release_packages_missing_from_image(
+  repo: Path = PLATFORM_REPO, image: str | None = None,
+) -> str | None:
+  """Why an image without ``platform_boot check-packages`` refuses the
+  checkout, or None.
+
+  Those older images refuse every input from a newer official release,
+  including a version-only one, so restart admission on them predicts this
+  strict rule (``restart_util.validate_restart_source``). Running an older
+  image under newer source (historical image-only rollback) is unsupported.
+  """
+  gap = python_package_gap(repo, image)
+  if gap is None or gap["origin"] != "official_newer":
+    return None
+  return describe_package_gap(gap)
+
+
+_RESTART_BLOCKER_CACHE: dict[tuple, PackageGap | None] = {}
+
+
+def restart_blocker(repo: Path = PLATFORM_REPO) -> PackageGap | None:
+  """The package gap restart admission acts on, with the running image's
+  verdict as ``blocking``: an image without ``check-packages`` refuses every
+  official-newer gap. Cached per image, served inputs and fetched release,
+  because the history scan is too slow for every status poll."""
+  from app.restart_util import image_boot_checks_packages
+
+  inputs = tuple(
+    hashlib.sha256(_served_bytes(repo, path) or b"").hexdigest()
+    for path in _PYTHON_DEPENDENCY_INPUTS
+  )
+  key = (
+    str(repo), frozen_image_sha(), inputs, _rev(repo, "refs/remotes/origin/main"),
+    recorded_upstream_sha(repo), image_boot_checks_packages(),
+  )
+  if key not in _RESTART_BLOCKER_CACHE:
+    gap = python_package_gap(repo)
+    if gap and not key[-1]:
+      gap["blocking"] = gap["origin"] == "official_newer"
+    _RESTART_BLOCKER_CACHE.clear()
+    _RESTART_BLOCKER_CACHE[key] = gap
+  return _RESTART_BLOCKER_CACHE[key]
+
+
+def _commit_declaring(repo: Path, commit: str, path: str, data: bytes) -> str | None:
+  """The newest commit in ``commit`` whose ``path`` became exactly ``data``."""
+  try:
+    blob = subprocess.run(
+      ["git", "-C", str(repo), "hash-object", "--stdin"],
+      input=data, capture_output=True, check=True, timeout=_GIT_TIMEOUT,
+      env=_scrubbed_git_env(repo),
+    ).stdout.decode().strip()
+  except (OSError, subprocess.SubprocessError):
+    return None
+  history = _git(
+    "log", "-m", "--format=commit %H", "--raw", "--no-abbrev", "--no-renames",
+    commit, "--", path, repo=repo, check=False,
+  )
+  current = None
+  for line in history.stdout.splitlines() if history.returncode == 0 else []:
+    if line.startswith("commit "):
+      current = line.split()[1]
+    elif len(fields := line.split("\t", 1)[0].split()) >= 4 and fields[3] == blob:
+      return current
   return None
 
 
@@ -3733,9 +3978,12 @@ def _declared_in_history(repo: Path, commit: str, path: str, data: bytes) -> boo
 
 
 def _refuse_source_newer_than_image_packages(repo: Path, image: str | None) -> None:
-  reason = release_packages_missing_from_image(repo, image)
-  if reason:
-    raise BootTransactionError(reason)
+  """Boot refuses only a blocking gap. A version-only one serves: the same
+  source already ran on this image, and refusing would leave the instance
+  unable to restart even to load a fix."""
+  gap = python_package_gap(repo, image)
+  if gap and gap["blocking"]:
+    raise BootTransactionError(describe_package_gap(gap))
 
 
 def _refresh_trusted_hooks(repo: Path) -> str | None:
@@ -4582,6 +4830,200 @@ def unfinished_update(repo: Path = PLATFORM_REPO) -> UnfinishedUpdate | None:
   return None
 
 
+_UPDATE_STALL_HOURS = 6.0
+STALL_NOTIFIED_PATH = Path("/data/.platform-stall-notified")
+
+
+def _update_stall_hours() -> float:
+  try:
+    hours = float(os.environ.get("MOBIUS_UPDATE_STALL_HOURS", _UPDATE_STALL_HOURS))
+  except ValueError:
+    return _UPDATE_STALL_HOURS
+  return hours if hours > 0 else _UPDATE_STALL_HOURS
+
+
+def _mtime(path: Path) -> float | None:
+  try:
+    return path.stat().st_mtime
+  except OSError:
+    return None
+
+
+def update_progress_signals(repo: Path = PLATFORM_REPO) -> dict[str, float | None]:
+  """When the unfinished update last moved, from files alone (epoch seconds).
+
+  ``parked_at``: the first park for this target (the flag's own time for a
+  flag written before that was recorded). ``worktree_changed_at``: the
+  newest of the candidate worktree's index (the resolver staged an answer)
+  and the flag (the updater re-parked or rebound it). ``prepared_at``: the
+  prepared update record, and ``activation_marked_at``: the activation
+  marker, for ``finish``.
+  """
+  flag_mtime = _mtime(CONFLICT_FLAG)
+  overlay = ((_read_conflict_flag() or {}).get("overlay") or {}) if flag_mtime else {}
+  parked_at = flag_mtime
+  try:
+    parked_at = datetime.fromisoformat(str(overlay["parked_at"])).timestamp()
+  except (KeyError, ValueError):
+    pass
+  changed = [flag_mtime]
+  worktree = overlay.get("worktree")
+  if worktree and Path(worktree).is_dir():
+    index = _git("rev-parse", "--git-path", "index", repo=Path(worktree), check=False).stdout.strip()
+    if index:
+      changed.append(_mtime(Path(worktree) / index))
+  known = [value for value in changed if value is not None]
+  return {
+    "parked_at": parked_at,
+    "worktree_changed_at": max(known) if known else None,
+    "prepared_at": _mtime(PREPARED_UPDATE_PATH),
+    "activation_marked_at": _mtime(RESTART_NEEDED_FLAG),
+  }
+
+
+def _naive_utc_timestamp(value: datetime | None) -> float | None:
+  if value is None:
+    return None
+  return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def detect_update_stall(
+  db: Session,
+  pending: UnfinishedUpdate | None,
+  *,
+  blocker: PackageGap | None = None,
+  repo: Path = PLATFORM_REPO,
+  now: float | None = None,
+) -> StalledUpdate | None:
+  """Whether nothing is moving ``pending`` forward.
+
+  A parked update stalls once its resolver chat is idle (not running and not
+  waiting on an owner answer), or missing, and neither the candidate, the
+  flag nor that chat has changed for ``MOBIUS_UPDATE_STALL_HOURS`` (6).
+  A finish stalls at once when its restart is refused (``restart_blocker``),
+  since the time its record was written: the prepared update, or the
+  activation marker a marker-only finish comes from.
+  """
+  from app import models, questions
+  from app.run_state import running_chat_ids
+
+  if not pending:
+    return None
+  now = time.time() if now is None else now
+  signals = update_progress_signals(repo)
+  cancel = ["cancel"] if pending["cancellable"] else []
+  if pending["stage"] == "finish" and blocker and blocker["blocking"]:
+    # The episode must not depend on ``now``: each supervisor pass would then
+    # start, and notify, a new one.
+    recorded = signals["prepared_at"] or signals["activation_marked_at"]
+    since = recorded or now
+    return StalledUpdate(
+      since=datetime.fromtimestamp(since, timezone.utc).isoformat(timespec="seconds"),
+      idle_hours=round((now - since) / 3600, 1), reason="restart_blocked",
+      resolver_chat_id=None, remaining_paths=[], actions=cancel,
+      episode=hashlib.sha256(
+        f"{pending['target_sha']}|restart_blocked|{recorded or ''}".encode(),
+      ).hexdigest()[:16],
+    )
+  if pending["stage"] != "resolve":
+    return None
+  flag = _read_conflict_flag() or {}
+  chat_id = flag.get("chat_id")
+  chat = (
+    db.query(models.Chat.id, models.Chat.updated_at, models.Chat.pending_question_id)
+    .filter(models.Chat.id == chat_id, models.Chat.deleted_at.is_(None))
+    .first()
+  ) if chat_id else None
+  if chat is not None and (
+    chat.pending_question_id or questions.is_waiting(chat.id)
+    or chat.id in running_chat_ids(db, [chat.id])
+  ):
+    return None
+  moved = [
+    signals["parked_at"], signals["worktree_changed_at"],
+    _naive_utc_timestamp(chat.updated_at) if chat is not None else None,
+  ]
+  last = max((value for value in moved if value is not None), default=now)
+  if now - last < _update_stall_hours() * 3600:
+    return None
+  worktree = (flag.get("overlay") or {}).get("worktree")
+  remaining = (
+    _unmerged_paths(Path(worktree)) if worktree and Path(worktree).is_dir()
+    else list(flag.get("paths") or [])
+  )
+  return StalledUpdate(
+    since=datetime.fromtimestamp(last, timezone.utc).isoformat(timespec="seconds"),
+    idle_hours=round((now - last) / 3600, 1),
+    reason="resolver_idle" if chat is not None else "resolver_missing",
+    resolver_chat_id=chat.id if chat is not None else None,
+    remaining_paths=remaining,
+    actions=["resume", *(["retry"] if cancel else []), *cancel],
+    episode=hashlib.sha256(
+      f"{pending['target_sha']}|{signals['parked_at']}|{last}".encode(),
+    ).hexdigest()[:16],
+  )
+
+
+def with_update_stall(db: Session, status: PlatformStatus) -> PlatformStatus:
+  """``status`` with ``unfinished_update.stalled`` set when it has stalled."""
+  pending = status.get("unfinished_update")
+  stalled = detect_update_stall(db, pending, blocker=status.get("restart_blocker"))
+  if pending and stalled:
+    status["unfinished_update"] = {**pending, "stalled": stalled}
+  return status
+
+
+async def notify_update_stall_once(session_factory, repo: Path = PLATFORM_REPO) -> str | None:
+  """Tell the owner once per stall episode; returns the notification id sent.
+
+  The id is derived from the episode, so a retry after a lost write cannot
+  duplicate it. The episode is recorded only after its bell row exists, so a
+  failed push is retried next pass, and a dismissed one is not repeated.
+  """
+  from app import models, push
+
+  def detect() -> StalledUpdate | None:
+    with session_factory() as db:
+      pending = unfinished_update(repo)
+      blocker = restart_blocker(repo) if pending and pending["stage"] == "finish" else None
+      return detect_update_stall(db, pending, blocker=blocker, repo=repo)
+
+  stalled = await asyncio.to_thread(detect)
+  if stalled is None or _read_text(STALL_NOTIFIED_PATH) == stalled["episode"]:
+    return None
+  notification_id = f"platform-stall-{stalled['episode']}"
+  chat_id = stalled["resolver_chat_id"]
+  body = {
+    "resolver_idle": "Its resolver chat stopped before finishing. Open Settings to resume, retry or cancel it.",
+    "resolver_missing": "No chat is resolving it. Open Settings to resume, retry or cancel it.",
+    "restart_blocked": "Möbius cannot restart to finish it. Open Settings to see what is missing.",
+  }[stalled["reason"]]
+  with session_factory() as db:
+    owner = db.query(models.Owner.id).first()
+    if owner is None:
+      return None
+    await push.notify_owner_async(
+      db, owner[0], title="Platform update paused", body=body,
+      source_type="platform_stall", notification_id=notification_id,
+      target=f"/shell/?chat={chat_id}" if chat_id else None,
+    )
+  with session_factory() as db:
+    delivered = db.query(models.Notification.id).filter(
+      models.Notification.id == notification_id,
+    ).first() is not None
+  if not delivered:
+    return None
+  _atomic_write_text(STALL_NOTIFIED_PATH, stalled["episode"])
+  return notification_id
+
+
+def _read_text(path: Path) -> str | None:
+  try:
+    return path.read_text(encoding="utf-8").strip()
+  except OSError:
+    return None
+
+
 def park_update_for_agent(
   *,
   plan_id: str,
@@ -4664,6 +5106,7 @@ def platform_status(
   )
   current_build_committed_at = _commit_timestamp(repo, image_sha)
   upstream_checked_at = _last_fetch_timestamp(repo)
+  blocker = restart_blocker(repo)
 
   if conflict:
     flag = _read_conflict_flag() or {}
@@ -4693,6 +5136,7 @@ def platform_status(
       rollback_target_sha=None, rollback_error=None,
       recovery_refs=recovery_refs,
       unfinished_update=unfinished_update(repo),
+      restart_blocker=blocker,
       )
 
   # A freshly published GHCR revision may not yet be in this clone's object
@@ -4730,6 +5174,7 @@ def platform_status(
     rollback_error=(rollback or {}).get("error"),
     recovery_refs=recovery_refs,
     unfinished_update=unfinished_update(repo),
+    restart_blocker=blocker,
   )
 
 
@@ -5286,6 +5731,64 @@ async def create_platform_conflict_resolver_chat(
     overlay=parked,
   )
   return result
+
+
+async def resume_platform_conflict_resolver(
+  db: Session, repo: Path = PLATFORM_REPO,
+) -> PlatformConflictResolverChatOut:
+  """Start the stalled resolver again: a new turn in its bound chat when it
+  exists and is idle, otherwise a new resolver chat bound to the update."""
+  from app import models, questions
+  from app.chat_start import start_programmatic_chat_turn
+  from app.run_state import running_chat_ids
+
+  flag = _read_conflict_flag() or {}
+  if not flag.get("upstream"):
+    raise PlatformUpdateError("No unresolved platform update conflict.")
+  chat = (
+    db.query(models.Chat)
+    .filter(models.Chat.id == flag["chat_id"])
+    .filter(models.Chat.deleted_at.is_(None))
+    .filter(models.Chat.created_by_app_id.is_(None))
+    .first()
+  ) if flag.get("chat_id") else None
+  if chat is None:
+    # Opens a new resolver and rebinds the update to it.
+    return await create_platform_conflict_resolver_chat(db, repo)
+  if (
+    chat.pending_question_id or questions.is_waiting(chat.id)
+    or chat.id in running_chat_ids(db, [chat.id])
+  ):
+    return PlatformConflictResolverChatOut(chat_id=chat.id, created=False, started=False)
+  started = await start_programmatic_chat_turn(
+    chat_id=chat.id, title=chat.title, provider=chat.provider,
+    content=_platform_conflict_resolver_resume_message(flag),
+  )
+  return PlatformConflictResolverChatOut(chat_id=chat.id, created=False, started=started)
+
+
+def _platform_conflict_resolver_resume_message(flag: dict) -> str:
+  """Where the stopped resolution stands, and how to finish it."""
+  overlay = flag.get("overlay") or {}
+  worktree = overlay.get("worktree")
+  remaining = (
+    _unmerged_paths(Path(worktree)) if worktree and Path(worktree).is_dir()
+    else list(flag.get("paths") or [])
+  )
+  state = (
+    "These files still have conflict markers: " + ", ".join(remaining) + "."
+    if remaining else
+    "Every file is resolved and staged, so an answer is waiting to be continued."
+  )
+  return (
+    "The owner asked you to resume this platform update; it stopped before "
+    f"finishing. {state} Re-read the original instructions above, finish "
+    f"resolving in `{worktree or 'the isolated candidate'}`, stage the files, "
+    "run their tests, then run `cd /data/platform/backend && python3 -c "
+    "\"from app.platform_update import continue_platform_overlay_update as c; "
+    "print(c())\"`. If you cannot finish, say exactly why, so the owner can "
+    "retry or cancel the update in Settings."
+  )
 
 
 # Shared by every agent the owner asks to unblock an update: the owner's request

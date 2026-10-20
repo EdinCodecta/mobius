@@ -25,11 +25,13 @@ def _git(repo: Path, *args: str) -> str:
 
 def _commit(
   repo: Path, name: str, lock: str | None = None, *, bridge: bool = False,
+  requirements: str | None = None,
 ) -> str:
   (repo / name).write_text(name + "\n")
-  if lock is not None:
-    (repo / "backend").mkdir(exist_ok=True)
-    (repo / "backend/requirements.lock").write_text(lock)
+  for path, content in (("requirements.lock", lock), ("requirements.txt", requirements)):
+    if content is not None:
+      (repo / "backend").mkdir(exist_ok=True)
+      (repo / "backend" / path).write_text(content)
   if bridge:
     for required in upgrade.BRIDGE_FILES:
       (repo / required).parent.mkdir(parents=True, exist_ok=True)
@@ -185,19 +187,120 @@ def test_a_release_marker_on_a_local_commit_does_not_block_the_upgrade(install):
   assert upgrade.main(["--check"]) == 0
 
 
-def test_a_local_package_declaration_does_not_block_the_upgrade(install):
-  (install["platform"] / "backend/requirements.lock").write_text("pkg==1\nlocal==1\n")
+def test_check_refuses_when_target_would_drop_a_local_package_pin(install, capsys):
+  """A local commit pins a package the target image does not install; the
+  upgrade would lose the live install."""
+  local = _commit(install["platform"], "local-pin", lock="pkg==1\nlocal==1\n")
+
+  assert upgrade.main(["--check"]) == 1
+
+  err = capsys.readouterr().err
+  assert "local: source declares ==1, target image does not install it" in err
+  assert f"revert local commit {local[:7]}" in err
+  assert not _request(install).exists()
+
+
+def test_check_names_the_lost_version_of_a_locally_bumped_pin(install, capsys):
+  _commit(install["platform"], "local-bump", lock="pkg==3\n")
+
+  assert upgrade.main(["--check"]) == 1
+  assert "pkg: source declares ==3, target image installs ==2" in capsys.readouterr().err
+
+
+def test_allow_package_loss_overrides(install):
+  _commit(install["platform"], "local-pin", lock="pkg==1\nlocal==1\n")
+
+  assert upgrade.main(["--allow-package-loss"]) == 0
+  assert _request(install).exists()
+
+
+def test_check_allows_target_whose_history_declares_served_packages(install):
+  """A source on an older release's packages is covered by the newer image."""
+  (install["platform"] / "unrelated.txt").write_text("local\n")
 
   assert upgrade.main(["--check"]) == 0
 
 
-def test_a_committed_local_package_edit_under_a_local_release_marker_is_allowed(install):
+def test_target_that_drops_a_distribution_the_source_release_declares_is_refused(
+  install, capsys,
+):
+  """History proves the source's release is older than the target, not that
+  the target still installs its packages. The unchanged source would boot on
+  an image without ``needed``, so not even the override allows it."""
+  platform = install["platform"]
+  release = _commit(platform, "release-with-needed", lock="pkg==1\nneeded==1\n")
+  target = _commit(platform, "release-drops-needed", lock="pkg==2\n", bridge=True)
+  _git(platform, "update-ref", "refs/remotes/origin/main", target)
+  _git(platform, "reset", "-q", "--hard", release)
+  _git(platform, "branch", "-f", "upstream", release)
+  upgrade.BUILD_INFO.write_text(json.dumps({"sha": release}))
+
+  assert upgrade.main(["--check"]) == 1
+  assert "no longer installs Python packages" in capsys.readouterr().err
+  assert upgrade.main(["--allow-package-loss"]) == 1
+  assert "(needed)" in capsys.readouterr().err
+
+  assert not _request(install).exists()
+  assert _git(platform, "rev-parse", "HEAD") == release
+  assert "needed==1" in (platform / "backend/requirements.lock").read_text()
+
+
+def test_a_direct_requirement_the_target_keeps_as_a_dependency_is_allowed(install):
+  """The image installs the lock, not requirements.txt: a package the target
+  stops listing directly but still locks as a dependency is not lost."""
+  platform = install["platform"]
+  release = _commit(
+    platform, "release-lists-needed", lock="pkg==1\nneeded==1\n",
+    requirements="pkg\nneeded\n",
+  )
+  target = _commit(
+    platform, "release-locks-needed", lock="pkg==2\nneeded==1\n",
+    requirements="pkg\n", bridge=True,
+  )
+  _git(platform, "update-ref", "refs/remotes/origin/main", target)
+  _git(platform, "reset", "-q", "--hard", release)
+  _git(platform, "branch", "-f", "upstream", release)
+  upgrade.BUILD_INFO.write_text(json.dumps({"sha": release}))
+
+  assert upgrade.main(["--check"]) == 0
+
+
+def test_check_allows_a_lock_change_that_drops_no_package(install):
+  # Only an artifact hash differs; every declared version is installed.
+  (install["platform"] / "backend/requirements.lock").write_text(
+    "pkg==2 \\\n    --hash=sha256:" + "a" * 64 + "\n"
+  )
+
+  assert upgrade.main(["--check"]) == 0
+
+
+def test_check_names_release_that_declares_served_packages(install, capsys):
+  """Source on packages only a later official release declared needs that
+  release, which the refusal names; the loss is not overridable."""
+  _git(install["platform"], "reset", "-q", "--hard", install["new"])
+  later = _commit(install["platform"], "later-release", lock="pkg==3\n", bridge=True)
+  latest = _commit(install["platform"], "latest-release", lock="pkg==2\n", bridge=True)
+  _git(install["platform"], "update-ref", "refs/remotes/origin/main", latest)
+  _git(install["platform"], "reset", "-q", "--hard", later)
+  _git(install["platform"], "branch", "-f", "upstream", later)
+
+  assert upgrade.main(["--check", "--allow-package-loss", "--target", install["new"]]) == 1
+
+  err = capsys.readouterr().err
+  assert f"use release {later[:12]}" in err
+  assert "pkg: source declares ==3, target image installs ==2" in err
+
+
+def test_a_committed_local_package_edit_under_a_local_release_marker_is_local(install, capsys):
   """The marker can name a local commit that also carries a local package
-  declaration; neither makes the declaration an official newer release."""
+  declaration; neither makes the declaration an official newer release, so
+  only the owner's acceptance of the loss is needed."""
   local = _commit(install["platform"], "local-packages", lock="pkg==1\nlocal==1\n")
   _git(install["platform"], "branch", "-f", "upstream", local)
 
-  assert upgrade.main(["--check"]) == 0
+  assert upgrade.main(["--check"]) == 1
+  assert "--allow-package-loss" in capsys.readouterr().err
+  assert upgrade.main(["--check", "--allow-package-loss"]) == 0
 
 
 def test_checks_and_request_hold_the_updater_lock(install, monkeypatch):

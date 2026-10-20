@@ -1,7 +1,7 @@
 /** One next action for updating Möbius, with visible versions and a direct restart control. */
 import { useEffect, useRef, useState } from 'react'
 import { Alert } from '@openai/apps-sdk-ui/components/Alert'
-import { platformUpdateStatusLabel, platformActivationLevel, reviewedUpdateUsesContainerRebuild } from '../../lib/platformUpdateState.js'
+import { platformUpdateStatusLabel, platformActivationLevel, platformUpdateStall, reviewedUpdateUsesContainerRebuild } from '../../lib/platformUpdateState.js'
 import { rebuildIsActive, rebuildAwaitingHostHelper, rebuildStatusLine } from '../../lib/containerRebuild.js'
 import { containerVersionIdentity, platformVersionIdentity } from '../../lib/platformVersionIdentity.js'
 import { formatUpstreamCommitDate } from '../../lib/platformProvenance.js'
@@ -37,6 +37,7 @@ export function PlatformUpdatesView({ update, onOpenChat, inertBoundaryRef }) {
   // A new container is running the update and its replacement is not yet
   // confirmed; nothing else may start until it is.
   const settling = platform?.unfinished_update?.stage === 'settling'
+  const stall = platformUpdateStall(platform)
   const available = platform?.available || platform?.newer_updates_available
   const unavailable = !platform || platform.status_unavailable
   const activeRebuild = rebuildIsActive(rebuild)
@@ -71,6 +72,10 @@ export function PlatformUpdatesView({ update, onOpenChat, inertBoundaryRef }) {
     setReview(intent)
   }
   function closeReview() { restoreFocus.current = true; setReview(null) }
+  // Retry drops the stalled update, then reviews the release again from scratch.
+  async function retry() {
+    if (await update.cancel()) openReview()
+  }
   async function check() {
     await update.check()
     restoreFocus.current = true
@@ -135,6 +140,17 @@ export function PlatformUpdatesView({ update, onOpenChat, inertBoundaryRef }) {
           <button type="button" className="settings__btn settings__btn--sm settings__btn--outline" onClick={update.cancel}>Cancel update</button>
         )}
       </div>
+      {stall && !repairReason && !busy && (
+        <div className="platform-updates__description">
+          <p role="status">{stall.message}</p>
+          {stall.canResume && onOpenChat && (
+            <button type="button" className="settings__btn settings__btn--sm settings__btn--outline" onClick={update.resume}>Resume</button>
+          )}
+          {stall.canRetry && (
+            <button type="button" className="settings__btn settings__btn--sm settings__btn--outline" onClick={retry}>Retry</button>
+          )}
+        </div>
+      )}
       {repairReason && !review && !update.reconnecting && (
         <div className="platform-updates__description">
           <p>{repairReason}</p>

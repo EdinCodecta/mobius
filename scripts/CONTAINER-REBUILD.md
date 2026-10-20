@@ -261,8 +261,12 @@ The script queues the helper for the latest official image (`--target` names an
 exact release instead; `--check` only reports whether it would) after checking,
 under the updater's lock, that the target is an official release that ships this
 bridge and is newer than the running image and the source's official package
-declarations, that no update is prepared or parked, and that the helper is
-idle. The helper drains chats, replaces only
+declarations, that the target image still installs every package the source's
+release declares (one the target's lock dropped is refused outright) and every
+locally declared version (a local pin it would drop is named with the
+local commit to revert; `--allow-package-loss` accepts the loss knowingly),
+that no update is prepared
+or parked, and that the helper is idle. The helper drains chats, replaces only
 the container, and attempts to restore the previous container if the new one is
 unhealthy. If exact restoration cannot be confirmed, the host retains the
 transaction and reports `needs_recovery`; the request is not safely retryable.

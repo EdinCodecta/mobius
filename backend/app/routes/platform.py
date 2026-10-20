@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
 from app import auth, deployment_control, models, platform_activation, platform_update
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.deps import (
   get_current_owner, get_current_owner_for_lifecycle_control,
   reject_cross_site,
@@ -114,6 +114,13 @@ class PlatformApplyIn(BaseModel):
   )
 
 
+def _with_stall(read_status, **kwargs) -> PlatformStatus:
+  """Status plus whether its unfinished update has stalled (resolver chat state)."""
+  status = read_status(**kwargs)
+  with SessionLocal() as db:
+    return platform_update.with_update_stall(db, status)
+
+
 @router.get("/status")
 async def get_platform_status(
   _: models.Owner = Depends(get_current_owner),
@@ -131,10 +138,10 @@ async def get_platform_status(
     if platform_activation.deployment_kind() == "railway":
       release = await deployment_control.latest_official_release()
       return await asyncio.to_thread(
-        platform_update.platform_status,
+        _with_stall, platform_update.platform_status,
         target_sha=release["build_sha"],
       )
-    return await asyncio.to_thread(platform_update.platform_status)
+    return await asyncio.to_thread(_with_stall, platform_update.platform_status)
   except deployment_control.DeploymentControlError as exc:
     raise HTTPException(
       status_code=exc.status_code,
@@ -374,13 +381,21 @@ async def keep_settling_platform_update(
     ) from exc
 
 
+class ConflictResolverChatIn(BaseModel):
+  # Resume a stalled resolver: start its bound chat again, or open a new one.
+  resume: bool = False
+
+
 @router.post("/conflict-resolver-chat", dependencies=[Depends(reject_cross_site)])
 async def create_platform_conflict_resolver_chat(
+  request: ConflictResolverChatIn | None = None,
   db: Session = Depends(get_db),
   _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
 ) -> PlatformConflictResolverChatOut:
   """Create or return the resolver chat for a recorded platform update conflict."""
   try:
+    if request is not None and request.resume:
+      return await platform_update.resume_platform_conflict_resolver(db)
     return await platform_update.create_platform_conflict_resolver_chat(db)
   except PlatformUpdateError as exc:
     raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -397,7 +412,7 @@ def restart_platform(
   except RestartSourceInvalid as exc:
     raise HTTPException(
       status_code=409,
-      detail={"code": "platform_source_invalid", "message": str(exc)},
+      detail={"code": "platform_source_invalid", **exc.detail, "message": str(exc)},
     ) from exc
   return JSONResponse(
     {"status": "restarting"},

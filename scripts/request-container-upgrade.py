@@ -22,7 +22,10 @@ upstream so an older installation needs nothing new installed::
 It changes nothing but the helper's inbox, and only after these checks pass:
 the target is a fetched official release that ships this bridge, descends
 from the running image, and is not older than any official Python package
-declaration of the installed source; no update is prepared or parked; and the
+declaration of the installed source; the target image installs every package
+the installed source's release declares and every locally declared version
+(``--allow-package-loss`` accepts losing a local declaration
+knowingly); no update is prepared or parked; and the
 helper is installed and idle. They hold the updater's lock while checking and
 requesting. The helper must also have certified the target's
 ``deployment/self-hosted-helper.required`` protocol, so an outdated helper is
@@ -49,6 +52,9 @@ CONTROL = DATA / "mobius-rebuild"
 BUILD_INFO = Path(os.environ.get("MOBIUS_BUILD_INFO_PATH", "/app/build-info.json"))
 ACTIVE_STATES = {"queued", "preparing", "replacing", "verifying"}
 PYTHON_INPUTS = ("backend/requirements.txt", "backend/requirements.lock")
+# What an image installs: the Dockerfile installs only the lock, so a package
+# requirements.txt no longer lists can still be installed as a dependency.
+INSTALLED_INVENTORY = "backend/requirements.lock"
 BRIDGE_FILES = ("backend/runtime/boot-protocol", "scripts/request-container-upgrade.py")
 RECONCILE_LOCK = DATA / ".platform-reconcile.lock"
 # Served code from this release on discounts package inputs the running image
@@ -93,8 +99,9 @@ def running_image() -> str:
     return sha
 
 
-def declared_in_history(commit: str, path: str, data: bytes) -> bool:
-    """Whether ``path`` held exactly ``data`` at some commit ``commit`` contains.
+def declaring_commits(commit: str, path: str, data: bytes) -> list[str]:
+    """Commits ``commit`` contains whose ``path`` held exactly ``data``, oldest
+    first, merge results included.
 
     Mirrors the boot transaction's own judgment
     (``platform_update._declared_in_history``), which the target image applies
@@ -106,17 +113,70 @@ def declared_in_history(commit: str, path: str, data: bytes) -> bool:
         input=data, capture_output=True, check=True, env=env, timeout=120,
     ).stdout.decode().strip()
     history = subprocess.run(
-        ["git", "-C", str(PLATFORM), "log", "-m", "--format=", "--raw", "--no-abbrev",
-         "--no-renames", commit, "--", path],
+        ["git", "-C", str(PLATFORM), "log", "-m", "--reverse", "--format=commit %H",
+         "--raw", "--no-abbrev", "--no-renames", commit, "--", path],
         capture_output=True, text=True, check=False, env=env, timeout=120,
     )
     if history.returncode != 0:
-        return False
+        return []
+    found: list[str] = []
+    current = ""
     for line in history.stdout.splitlines():
+        if line.startswith("commit "):
+            current = line.split()[1]
+            continue
         fields = line.split("\t", 1)[0].split()
-        if len(fields) >= 4 and blob in fields[2:4]:
-            return True
-    return False
+        if len(fields) >= 4 and blob in fields[2:4] and current not in found:
+            found.append(current)
+    return found
+
+
+def declared_in_history(commit: str, path: str, data: bytes) -> bool:
+    """Whether ``path`` held exactly ``data`` at some commit ``commit`` contains."""
+    return bool(declaring_commits(commit, path, data))
+
+
+# Mirrors ``platform_update.declared_python_packages``; this script runs from
+# fetched upstream on older installations, so it cannot import it.
+_REQUIREMENT = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?")
+
+
+def parse_requirements(data: bytes) -> dict[str, str]:
+    """Package name to version spec for a requirements file or pip lock."""
+    packages: dict[str, str] = {}
+    text = re.sub(r"\\\r?\n", " ", data.decode("utf-8", "replace"))
+    for logical in text.splitlines():
+        line = re.sub(r"(^|\s)#.*$", "", logical).strip()
+        match = _REQUIREMENT.match(line)
+        if not line or line.startswith("-") or not match:
+            continue
+        rest = line[match.end():].split(";", 1)[0].split()
+        spec = "".join(token for token in rest if not token.startswith("--"))
+        packages[re.sub(r"[-_.]+", "-", match.group(1)).lower()] = spec
+    return packages
+
+
+def package_loss(served: bytes, installed: dict[str, str]) -> list[str]:
+    """What the target image (its ``INSTALLED_INVENTORY``) would not install
+    of what the source declares: a missing distribution, or another version
+    than an exact pin."""
+    lost = []
+    for name, spec in parse_requirements(served).items():
+        pinned = spec.startswith("==") and "," not in spec
+        if name not in installed:
+            lost.append(f"{name}: source declares {spec or 'it'}, target image does not install it")
+        elif pinned and installed[name] != spec:
+            lost.append(f"{name}: source declares {spec}, target image installs {installed[name]}")
+    return lost
+
+
+def show(commit: str, path: str) -> bytes | None:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    out = subprocess.run(
+        ["git", "-C", str(PLATFORM), "show", f"{commit}:{path}"],
+        capture_output=True, check=False, env=env, timeout=120,
+    )
+    return out.stdout if out.returncode == 0 else None
 
 
 def check_target(target: str) -> str:
@@ -157,23 +217,61 @@ def check_target(target: str) -> str:
     for required in BRIDGE_FILES:
         if git("cat-file", "-e", f"{target}:{required}").returncode != 0:
             raise Refused("the target release predates the container-only upgrade")
-    # The target image's boot serves the unchanged source only if none of its
-    # package inputs comes from an official release newer than the target:
-    # an input declared in the target's history is older or equal, and one
-    # never declared officially is a local declaration.
+    return image
+
+
+def check_served_packages_survive(
+    target: str, official: str, *, allow_package_loss: bool = False,
+) -> None:
+    """Refuse a target image that would not install what the source declares.
+
+    An input declared in the target's history is an older or equal release,
+    so the newer image covers its versions, but history orders releases and
+    does not prove the target still installs each one: a distribution the
+    target's lock (what its image installs) dropped is refused outright,
+    because the unchanged source would boot without it. One declared only in newer official history needs that
+    release instead. Anything else is a local declaration, which the target
+    image would not install, losing the live install. That loss is refused
+    unless the owner accepts it, naming each package and the local commit to
+    revert.
+    """
+    installed = parse_requirements(show(target, INSTALLED_INVENTORY) or b"")
     for path in PYTHON_INPUTS:
         try:
             served = (PLATFORM / path).read_bytes()
         except OSError:
             continue
         if declared_in_history(target, path, served):
+            dropped = sorted(parse_requirements(served).keys() - installed.keys())
+            if dropped:
+                raise Refused(
+                    f"the target image no longer installs Python packages the "
+                    f"installed source's release declares in {path} "
+                    f"({', '.join(dropped)}); install the platform update from "
+                    "Settings instead of replacing only the container"
+                )
             continue
-        if declared_in_history(official, path, served):
+        lost = package_loss(served, installed)
+        detail = f" ({'; '.join(lost)})" if lost else ""
+        releases = declaring_commits(official, path, served)
+        if releases:
             raise Refused(
-                "the installed source declares newer Python packages than the "
-                "target; use the latest official release"
+                f"the installed source declares newer Python packages than the "
+                f"target{detail}; use release {releases[0][:12]} or newer"
             )
-    return image
+        if not lost or allow_package_loss:
+            continue
+        local = git("log", "-1", "--format=%h", "HEAD", "--not", official, "--", path)
+        commit = local.stdout.strip()
+        fix = (
+            f"revert local commit {commit} or wait for its release"
+            if commit else "revert the uncommitted edit or wait for its release"
+        )
+        raise Refused(
+            f"the target image would drop Python packages the installed source "
+            f"declares in {path} ({'; '.join(lost)}); {fix}, or pass "
+            "--allow-package-loss to accept losing them"
+        )
 
 
 def check_no_pending_update() -> None:
@@ -260,6 +358,10 @@ def main(argv: list[str] | None = None) -> int:
         "--check", action="store_true",
         help="run every check and report, but request nothing",
     )
+    parser.add_argument(
+        "--allow-package-loss", action="store_true",
+        help="accept that the target image lacks a locally declared Python package",
+    )
     args = parser.parse_args(argv)
     try:
         target = resolve(args.target) if args.target else resolve("refs/remotes/origin/main")
@@ -271,6 +373,10 @@ def main(argv: list[str] | None = None) -> int:
         with open(RECONCILE_LOCK, "a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             image = check_target(target)
+            check_served_packages_survive(
+                target, resolve("refs/remotes/origin/main"),
+                allow_package_loss=args.allow_package_loss,
+            )
             check_no_pending_update()
             inbox = check_helper_idle(target)
             if args.check:

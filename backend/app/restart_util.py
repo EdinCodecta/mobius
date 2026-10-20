@@ -18,6 +18,7 @@ manually.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -41,7 +42,19 @@ _RESTART_ADMITTED = False
 
 
 class RestartSourceInvalid(RuntimeError):
-  """The editable platform would not survive the next startup probe."""
+  """The editable platform would not survive the next startup probe.
+
+  ``detail`` carries a structured reason when one exists: ``{"code":
+  "image_packages_behind_source", "gap": PackageGap}``.
+  """
+
+  def __init__(self, message: str, detail: dict | None = None) -> None:
+    super().__init__(message)
+    self.detail = detail or {}
+
+
+# The image's own checkout, whose boot transaction decides what may serve.
+BAKED_BACKEND = Path(os.environ.get("MOBIUS_BAKED_BACKEND", "/app/platform-baked/backend"))
 
 
 # A module-level infinite loop or blocking call in agent-edited source would
@@ -142,12 +155,7 @@ def validate_restart_source(platform_root: Path | None = None) -> None:
 
   failure = run_candidate_startup_check(backend)
   if failure is None:
-    # The next boot also refuses source that needs a newer image's packages.
-    from app.platform_update import release_packages_missing_from_image
-
-    reason = release_packages_missing_from_image(platform_root)
-    if reason:
-      raise RestartSourceInvalid(f"Restart stopped: {reason}")
+    _refuse_what_the_image_boot_refuses(platform_root)
     return
   if len(failure) > 1200:
     failure = failure[-1200:]
@@ -155,6 +163,79 @@ def validate_restart_source(platform_root: Path | None = None) -> None:
     "Restart stopped: the current platform source failed its startup check. "
     "Ask Möbius to repair it before restarting. "
     f"Details: {failure}"
+  )
+
+
+def image_boot_checks_packages() -> bool:
+  """Whether this image's boot has ``check-packages`` and its relaxed rule:
+  only a missing official-newer distribution refuses a boot."""
+  try:
+    source = (BAKED_BACKEND / "app" / "platform_boot.py").read_text(encoding="utf-8")
+  except (OSError, UnicodeDecodeError):
+    return False
+  return '"check-packages"' in source
+
+
+def _baked_package_verdict(platform_root: Path) -> tuple[bool, dict | None] | None:
+  """The image's own ``platform_boot check-packages`` verdict, or None when
+  this image predates that command (or it could not answer)."""
+  if not image_boot_checks_packages():
+    return None
+  # The entrypoint's own scrub for the boot transaction, plus the import-only
+  # signing key placeholder (the served worker withholds the real one).
+  env = {
+    key: value for key, value in os.environ.items()
+    if not key.startswith("GIT_") and key not in {
+      "PYTHONPATH", "MOBIUS_SSO_CLIENT_SECRET", "MOBIUS_COMPUTE_INSTANCE_TOKEN",
+      "MOBIUS_IDENTITY_BOOTSTRAP",
+    }
+  }
+  env["PYTHONDONTWRITEBYTECODE"] = "1"
+  import_probe_env(env)
+  try:
+    completed = subprocess.run(
+      [sys.executable or "python3", "-m", "app.platform_boot", "check-packages",
+       str(platform_root)],
+      cwd=BAKED_BACKEND, env=env, capture_output=True, text=True,
+      timeout=STARTUP_CHECK_TIMEOUT_SECONDS, check=False,
+    )
+  except (OSError, subprocess.SubprocessError):
+    return None
+  if completed.returncode not in (0, 1):
+    return None  # an older image's usage error: it has no such command
+  try:
+    gap = json.loads(completed.stdout.strip().splitlines()[-1])
+  except (IndexError, ValueError):
+    return None
+  return completed.returncode == 0, gap if isinstance(gap, dict) else None
+
+
+def _refuse_what_the_image_boot_refuses(platform_root: Path) -> None:
+  """Admission predicts the image's boot guard, not the served one.
+
+  An image with ``check-packages`` serves a version-only package gap, so its
+  verdict decides. An older image refuses any input from a newer official
+  release, so the served strict rule stands in for it; relaxing that here
+  would admit a restart the old image's boot then refuses.
+  """
+  from app import platform_update
+
+  verdict = _baked_package_verdict(platform_root)
+  if verdict is not None:
+    allowed, gap = verdict
+    if allowed:
+      return
+    reason = platform_update.describe_package_gap(gap) if gap else (
+      "this container image refuses the platform source's Python packages"
+    )
+  else:
+    reason = platform_update.release_packages_missing_from_image(platform_root)
+    if not reason:
+      return
+    gap = platform_update.python_package_gap(platform_root)
+  raise RestartSourceInvalid(
+    f"Restart stopped: {reason}",
+    {"code": "image_packages_behind_source", "gap": gap},
   )
 
 

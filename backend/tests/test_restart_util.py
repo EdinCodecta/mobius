@@ -113,6 +113,84 @@ def test_restart_source_without_selftest_gets_import_only_validation(
   ru.validate_restart_source()
 
 
+_GAP = {
+  "packages": [{
+    "name": "claude-agent-sdk", "declared": "==0.2.165",
+    "installed": "0.2.161", "kind": "version",
+  }],
+  "inputs": ["backend/requirements.lock"], "origin": "official_newer",
+  "declared_by": "c" * 40, "fix": {"action": "replace_container", "target_sha": "c" * 40},
+  "blocking": False,
+}
+
+
+def _baked_image(root: Path, monkeypatch, *, exit_code: int | None, gap=None) -> None:
+  """An image checkout whose boot answers ``check-packages`` (``exit_code``),
+  or an older one that only knows activate|revert|guard (None)."""
+  app = root / "app"
+  app.mkdir(parents=True)
+  (app / "__init__.py").write_text("", encoding="utf-8")
+  if exit_code is None:
+    body = "import sys\nprint('usage: activate|revert|guard', file=sys.stderr)\nraise SystemExit(2)\n"
+  else:
+    body = (
+      "import json, sys\n"
+      "assert sys.argv[1] == \"check-packages\"\n"
+      f"print(json.dumps({gap!r}))\n"
+      f"raise SystemExit({exit_code})\n"
+    )
+  (app / "platform_boot.py").write_text(body, encoding="utf-8")
+  monkeypatch.setattr(ru, "BAKED_BACKEND", root)
+
+
+def test_admission_uses_baked_check_packages_when_available(monkeypatch, tmp_path):
+  """A new image serves a version-only gap, so admission follows its verdict
+  even where the served strict rule would refuse."""
+  from app import platform_update
+
+  monkeypatch.setenv("MOBIUS_PLATFORM_DIR", str(tmp_path / "platform"))
+  _write_probe_fixture(tmp_path / "platform", broken=False)
+  monkeypatch.setattr(
+    platform_update, "release_packages_missing_from_image", lambda *_: "strict refusal",
+  )
+  _baked_image(tmp_path / "baked-ok", monkeypatch, exit_code=0, gap=_GAP)
+
+  ru.validate_restart_source()
+
+  blocking = {**_GAP, "packages": [{**_GAP["packages"][0], "kind": "missing", "installed": None}],
+              "blocking": True}
+  _baked_image(tmp_path / "baked-refuses", monkeypatch, exit_code=1, gap=blocking)
+  try:
+    ru.validate_restart_source()
+  except ru.RestartSourceInvalid as exc:
+    assert exc.detail == {"code": "image_packages_behind_source", "gap": blocking}
+    assert "claude-agent-sdk: source declares ==0.2.165, this image does not have it" in str(exc)
+  else:
+    raise AssertionError("a missing distribution was admitted")
+
+
+def test_admission_falls_back_to_served_strict_check_on_old_image(monkeypatch, tmp_path):
+  """An older image refuses every official-newer gap at boot, so admission
+  must too, and names the gap."""
+  from app import platform_update
+
+  monkeypatch.setenv("MOBIUS_PLATFORM_DIR", str(tmp_path / "platform"))
+  _write_probe_fixture(tmp_path / "platform", broken=False)
+  monkeypatch.setattr(
+    platform_update, "release_packages_missing_from_image", lambda *_: "strict refusal",
+  )
+  monkeypatch.setattr(platform_update, "python_package_gap", lambda *_: _GAP)
+  _baked_image(tmp_path / "baked-old", monkeypatch, exit_code=None)
+
+  try:
+    ru.validate_restart_source()
+  except ru.RestartSourceInvalid as exc:
+    assert str(exc) == "Restart stopped: strict refusal"
+    assert exc.detail["gap"] == _GAP
+  else:
+    raise AssertionError("the old image's strict rule was not predicted")
+
+
 def test_last_chance_restart_preflight_does_not_drain_invalid_source(
   monkeypatch,
 ):

@@ -54,3 +54,28 @@ test('the recovery status control is disabled while checking', () => {
   assert.match(html, /<button[^>]*disabled=""[^>]*>Checking recovery status…<\/button>/)
   assert.doesNotMatch(html, />(?:Review update|Cancel update|Keep this version|Withdraw request|Updating…)</)
 })
+
+test('a stalled update offers Resume and Retry beside Cancel', () => {
+  const platform = {
+    state: 'conflict', contained_upstream_sha: target, conflict_chat_id: 'resolver',
+    unfinished_update: { stage: 'resolve', action: 'replace', cancellable: true, stalled: {
+      reason: 'resolver_idle', idle_hours: 7, actions: ['resume', 'retry', 'cancel'],
+      resolver_chat_id: 'resolver', remaining_paths: ['backend/app/main.py'],
+    } },
+  }
+  const update = {
+    platform, cachedPlatform: null, rebuild: null, version: null, phase: 'idle',
+    busy: false, reconnecting: false, error: '', errorCode: '', checkResult: '',
+  }
+  const html = renderToStaticMarkup(createElement(PlatformUpdatesView, { update, onOpenChat: () => {} }))
+  assert.match(html, /Update paused for 7 h: resolver idle\./)
+  assert.match(html, /<button[^>]*>Resume<\/button>/)
+  assert.match(html, /<button[^>]*>Retry<\/button>/)
+  assert.match(html, /<button[^>]*>Cancel update<\/button>/)
+
+  const moving = { ...platform, unfinished_update: { ...platform.unfinished_update, stalled: undefined } }
+  const quiet = renderToStaticMarkup(createElement(PlatformUpdatesView, {
+    update: { ...update, platform: moving }, onOpenChat: () => {},
+  }))
+  assert.doesNotMatch(quiet, /Update paused|>Resume<|>Retry</)
+})

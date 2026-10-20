@@ -123,3 +123,23 @@ export function platformActivationLabel(activation) {
 export function platformActivationLevel(platform) {
   return platform?.activation?.level || (platform?.needs_restart ? 'server_restart' : 'live')
 }
+
+const STALL_REASONS = {
+  resolver_idle: 'resolver idle',
+  resolver_missing: 'no resolver chat',
+}
+
+/**
+ * The stalled view of an unfinished update, or null. The backend decides
+ * whether it stalled and which actions apply; this only words it.
+ */
+export function platformUpdateStall(platform) {
+  const stalled = platform?.unfinished_update?.stalled
+  if (!stalled) return null
+  const actions = new Set(stalled.actions || [])
+  const packages = (platform?.restart_blocker?.packages || []).map(item => item.name)
+  const message = stalled.reason === 'restart_blocked'
+    ? `Update paused: this container cannot restart into it${packages.length ? ` (needs ${packages.join(', ')})` : ''}.`
+    : `Update paused for ${Math.max(1, Math.round(stalled.idle_hours || 0))} h: ${STALL_REASONS[stalled.reason] || 'no progress'}.`
+  return { message, canResume: actions.has('resume'), canRetry: actions.has('retry') }
+}
