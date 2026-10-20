@@ -129,13 +129,16 @@ test('manual continuation records interrupted work without another pause card', 
 })
 
 test('a settled pause names its cause and offers no recovery action', () => {
- const update = render(h(PauseRecord, { block: { type: 'pause_record', pause: { kind: 'restart' } } }))
- const storage = render(h(PauseRecord, { block: { type: 'pause_record', pause: { kind: 'storage' } } }))
- const legacy = render(h(PauseRecord, { block: { type: 'pause_record' } }))
+ const record = source => render(h(PauseRecord, { block: { type: 'pause_record', source } }))
+ const update = record({ type: 'error', resumable: true, pause: { kind: 'restart' } })
+ const storage = record({ type: 'error', resumable: true, pause: { kind: 'storage' } })
+ const legacyLimit = record({ type: 'error', resumable: true, pause: { kind: 'limit' } })
+ const crash = record({ type: 'error', resumable: true, message: 'Interrupted.' })
  assert.match(update, /Paused for a platform update/)
  assert.match(storage, /Paused while storage was low/)
- assert.match(legacy, />Paused</)
- for (const html of [update, storage, legacy]) {
+ assert.match(legacyLimit, /Paused at a usage limit/, 'legacy notes keep the live card classification')
+ assert.match(crash, /Work interrupted/)
+ for (const html of [update, storage, legacyLimit, crash]) {
   assert.doesNotMatch(html, /<button|role="alert"|automatically/)
  }
 })

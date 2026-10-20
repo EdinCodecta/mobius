@@ -77,6 +77,12 @@ test('accepted resume settles the old credit pause only in the render projection
   assert.notEqual(projected[0].hidden, true)
   assert.deepEqual(projected[0].blocks.map(block => block.type), ['pause_record'],
     'the actionable credit card becomes a settled history record')
+  const html = renderToStaticMarkup(createElement(MsgContent, {
+    msg: projected[0], isLastMsg: true, onResume() {},
+  }))
+  assert.match(html, /Paused while out of credits/)
+  assert.doesNotMatch(html, /<button|chat__resume|chat__text--error|role="alert"/,
+    'the settled record renders without recovery chrome even at the tail')
   assert.deepEqual(messages[0].blocks, [creditBlock])
   assert.equal(supersedeResumedPauseBlocks([message])[0], message)
 })
