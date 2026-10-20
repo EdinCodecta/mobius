@@ -127,7 +127,10 @@ test('a continuation supersedes the resumable pause it completed', () => {
   const displayed = supersedeResumedPauseBlocks(messages)
 
   assert.notEqual(displayed, messages)
-  assert.deepEqual(displayed[0].blocks, [pause.blocks[0]])
+  assert.deepEqual(displayed[0].blocks, [
+    pause.blocks[0],
+    { type: 'pause_record' },
+  ], 'the pause stays in history as a settled record, not an actionable card')
   assert.equal(displayed[1], hiddenControlRow)
   assert.equal(displayed[2], continuation)
   assert.equal(messages[0], pause, 'the durable transcript is not mutated')
@@ -151,23 +154,55 @@ test('a recovery answer supersedes the pause it resumed without a transcript mar
 
   const displayed = supersedeResumedPauseBlocks([pause, recovered])
 
-  assert.deepEqual(displayed[0].blocks, [pause.blocks[0]])
+  assert.deepEqual(displayed[0].blocks, [
+    pause.blocks[0],
+    { type: 'pause_record' },
+  ])
   assert.equal(displayed[1], recovered)
 })
 
-test('a pause-only row disappears once its continuation marker replaces it', () => {
+test('a pause-only row stays visible as the record of why work paused', () => {
   const messages = [
     {
       role: 'assistant',
-      blocks: [{ type: 'error', resumable: true, message: 'Paused.' }],
+      blocks: [{ type: 'error', resumable: true, message: 'Paused.', pause: { kind: 'restart' } }],
     },
     { role: 'user', kind: 'continuation', continuation_reason: 'manual' },
   ]
 
   const displayed = supersedeResumedPauseBlocks(messages)
 
-  assert.equal(displayed[0].hidden, true)
-  assert.deepEqual(displayed[0].blocks, [])
+  assert.notEqual(displayed[0].hidden, true)
+  assert.deepEqual(displayed[0].blocks, [
+    { type: 'pause_record', pause: { kind: 'restart' } },
+  ])
+})
+
+test('a recovery that only paused again collapses into one pause and one resume', () => {
+  const firstPause = {
+    role: 'assistant', id: 'rt-a',
+    blocks: [
+      { type: 'text', content: 'Working.' },
+      { type: 'error', resumable: true, pause: { kind: 'storage' } },
+    ],
+  }
+  const retryPausedAgain = {
+    role: 'assistant', id: 'auto-retry-1', continuation_reason: 'storage',
+    blocks: [{ type: 'error', resumable: true, pause: { kind: 'storage' } }],
+  }
+  const resumed = {
+    role: 'assistant', id: 'auto-retry-2', continuation_reason: 'storage',
+    blocks: [{ type: 'text', content: 'Continuing.' }],
+  }
+
+  const displayed = supersedeResumedPauseBlocks([firstPause, retryPausedAgain, resumed])
+
+  assert.deepEqual(displayed[0].blocks, [
+    firstPause.blocks[0],
+    { type: 'pause_record', pause: { kind: 'storage' } },
+  ], 'the first pause keeps its record')
+  assert.equal(displayed[1].hidden, true, 'the intermediate retry adds no second pause/resume pair')
+  assert.equal(displayed[2], resumed, 'the final resume notice remains')
 })
 
 test('a later continuation does not erase an unrelated historical pause', () => {
@@ -203,19 +238,22 @@ test('confirmed live successor retires the pause before its transcript row is hy
   const hidden = { role: 'user', hidden: true, content: 'continue' }
   const messages = [pause, hidden]
   const displayed = supersedeResumedPauseBlocks(messages, liveSuccessor)
-  assert.deepEqual(displayed[0].blocks, [pause.blocks[0]])
+  assert.deepEqual(displayed[0].blocks, [
+    pause.blocks[0],
+    { type: 'pause_record', pause: { kind: 'restart' } },
+  ])
   assert.equal(displayed[1], hidden)
   assert.equal(displayed.length, messages.length, 'live output is not inserted into the durable transcript')
   assert.equal(messages[0], pause)
   assert.equal(messages[0].blocks.length, 2, 'saved recovery history is never rewritten')
 })
 
-test('a live successor hides a pause-only anchor without hiding its following output', () => {
+test('a live successor settles a pause-only anchor into its record', () => {
   const pause = restartPause()
   pause.blocks = [pause.blocks.at(-1)]
   const displayed = supersedeResumedPauseBlocks([pause], liveSuccessor)
-  assert.equal(displayed[0].hidden, true)
-  assert.deepEqual(displayed[0].blocks, [])
+  assert.notEqual(displayed[0].hidden, true)
+  assert.deepEqual(displayed[0].blocks, [{ type: 'pause_record', pause: { kind: 'restart' } }])
 })
 
 test('live recovery supersession requires a running server and matching stream identity', () => {

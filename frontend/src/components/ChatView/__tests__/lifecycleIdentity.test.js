@@ -14,6 +14,7 @@ const Goal = await load('GoalHistoryCard')
 const Wait = await load('WaitHistoryCard')
 const Resume = await load('ContinuationCard')
 const ErrorCard = await load('ErrorCard')
+const PauseRecord = await load('PauseRecordCard')
 const icon = html => html.match(/<span class="chat__lifecycle-icon"[\s\S]*?<\/span>/)?.[0]
 
 test('Goal and Wait keep different identity icons even when both complete', () => {
@@ -125,4 +126,26 @@ test('manual continuation records interrupted work without another pause card', 
  assert.match(html, /Resumed manually/)
  assert.match(html, /Interrupted work continued/)
  assert.doesNotMatch(html, /Paused · Continued|automatically|>Resume</)
+})
+
+test('a settled pause names its cause and offers no recovery action', () => {
+ const update = render(h(PauseRecord, { block: { type: 'pause_record', pause: { kind: 'restart' } } }))
+ const storage = render(h(PauseRecord, { block: { type: 'pause_record', pause: { kind: 'storage' } } }))
+ const legacy = render(h(PauseRecord, { block: { type: 'pause_record' } }))
+ assert.match(update, /Paused for a platform update/)
+ assert.match(storage, /Paused while storage was low/)
+ assert.match(legacy, />Paused</)
+ for (const html of [update, storage, legacy]) {
+  assert.doesNotMatch(html, /<button|role="alert"|automatically/)
+ }
+})
+
+test('a resume marker shows when the work continued', () => {
+ const today = new Date(); today.setHours(9, 5, 0, 0)
+ const earlier = new Date(2026, 0, 3, 14, 30)
+ const html = render(h(Resume, { msg: { continuation_reason: 'restart', ts: today.getTime() } }))
+ assert.match(html, /Resumed automatically · <time dateTime="[^"]+"[^>]*>09:05<\/time>/)
+ const older = render(h(Resume, { msg: { continuation_reason: 'restart', ts: earlier.getTime() } }))
+ assert.match(older, /3rd Jan 2026, 14:30<\/time>/, 'an earlier day keeps its date')
+ assert.doesNotMatch(render(h(Resume, { msg: { continuation_reason: 'restart' } })), /<time/)
 })

@@ -66,8 +66,25 @@ export function chatEntryFrame({
   return { showEmpty, showLoadError, displayReady }
 }
 
+/** Display-only history of a pause that a later continuation resolved. A
+ * distinct block type, so no Resume, tail-recovery or nudge logic treats it
+ * as actionable. */
+export const PAUSE_RECORD_BLOCK = 'pause_record'
+
+function settledPauseRecord(pauseBlock) {
+  return {
+    type: PAUSE_RECORD_BLOCK,
+    ...(pauseBlock.code ? { code: pauseBlock.code } : {}),
+    ...(pauseBlock.pause ? { pause: pauseBlock.pause } : {}),
+  }
+}
+
 /**
- * A confirmed continuation replaces its actionable pause with one resume notice.
+ * A confirmed continuation settles its actionable pause into a history record:
+ * the chat keeps showing that work paused (a platform update, low storage, a
+ * limit) beside the resume notice, without a stale Resume control or "will
+ * continue" copy. A recovery attempt that only paused again is an intermediate
+ * step and is hidden, so repeated retries read as one pause and one resume.
  * The durable transcript is untouched. Runtime and stream identity can confirm
  * the successor before its transcript row has been hydrated.
  */
@@ -89,10 +106,13 @@ export function supersedeResumedPauseBlocks(messages, {
         || tail.resumable !== true) return
     if (projected === messages) projected = [...messages]
     const remainingBlocks = blocks.slice(0, -1)
+    if (previous.continuation_reason && remainingBlocks.length === 0) {
+      projected[index] = { ...previous, blocks: [], hidden: true }
+      return
+    }
     projected[index] = {
       ...previous,
-      blocks: remainingBlocks,
-      ...(remainingBlocks.length === 0 ? { hidden: true } : {}),
+      blocks: [...remainingBlocks, settledPauseRecord(tail)],
     }
   }
   for (let index = 0; index < messages.length; index += 1) {
