@@ -250,3 +250,168 @@ test('the frame keeps an early visibility verdict for the app runtime', () => {
   host.deliver({ type: 'moebius:frame-visibility', visible: true })
   assert.equal(config.frameVisible, true)
 })
+
+// A closed app stays loaded but hidden in the shell's warm-frame cache, and a
+// hidden ancestor never changes the frame's native Page Visibility. These
+// tests pin that the app frame itself turns the shell's verdict into silence.
+
+function bootFrame() {
+  const source = frame.match(/<script data-mobius-background-pause>([\s\S]*?)<\/script>/)?.[1]
+  assert.ok(source, 'app-frame.html has the background pause script')
+
+  let nativeVisibility = 'visible'
+  class FakeDocument {
+    get visibilityState() { return nativeVisibility }
+    get hidden() { return nativeVisibility === 'hidden' }
+  }
+  const visibilityEvents = []
+  const attached = []
+  const document = new FakeDocument()
+  document.dispatchEvent = (event) => { visibilityEvents.push(event.type) }
+  document.querySelectorAll = () => attached
+
+  class FakeAudioContext {
+    constructor() { this.state = 'running' }
+    resume() { this.state = 'running'; return Promise.resolve() }
+    suspend() { this.state = 'suspended'; return Promise.resolve() }
+    close() { this.state = 'closed'; return Promise.resolve() }
+  }
+  class FakeMediaElement {
+    constructor() { this.paused = true }
+    play() { this.paused = false; return Promise.resolve() }
+    pause() { this.paused = true }
+  }
+
+  let messageListener = null
+  const parent = {}
+  const window = {
+    parent,
+    location: { origin: SHELL_ORIGIN },
+    AudioContext: FakeAudioContext,
+    webkitAudioContext: FakeAudioContext,
+    HTMLMediaElement: FakeMediaElement,
+    addEventListener(type, callback) { if (type === 'message') messageListener = callback },
+  }
+  runInNewContext(source, {
+    window, document, Document: FakeDocument, HTMLMediaElement: FakeMediaElement, Event,
+  })
+
+  return {
+    window,
+    document,
+    attached,
+    visibilityEvents,
+    Media: FakeMediaElement,
+    setNativeVisibility(value) { nativeVisibility = value },
+    shell(data, origin = SHELL_ORIGIN, eventSource = parent) {
+      messageListener({ source: eventSource, origin, data: { type: 'moebius:frame-visibility', ...data } })
+    },
+  }
+}
+
+const settle = () => new Promise(resolve => setImmediate(resolve))
+
+test('a hidden app reads as a hidden page and hears visibilitychange both ways', () => {
+  const app = bootFrame()
+  assert.equal(app.document.hidden, false)
+  app.shell({ visible: false })
+  assert.equal(app.document.hidden, true)
+  assert.equal(app.document.visibilityState, 'hidden')
+  app.shell({ visible: false })
+  app.shell({ visible: true })
+  assert.equal(app.document.visibilityState, 'visible')
+  assert.deepEqual(app.visibilityEvents, ['visibilitychange', 'visibilitychange'])
+
+  // The browser's own tab-hide still counts while the shell shows the app.
+  app.setNativeVisibility('hidden')
+  assert.equal(app.document.hidden, true)
+})
+
+test('running audio stops while hidden and resumes on return; app-paused audio stays paused', async () => {
+  const app = bootFrame()
+  const music = new app.window.AudioContext()
+  const muted = new app.window.webkitAudioContext()
+  await muted.suspend()
+
+  app.shell({ visible: false })
+  await settle()
+  assert.equal(music.state, 'suspended')
+
+  app.shell({ visible: true })
+  await settle()
+  assert.equal(music.state, 'running')
+  assert.equal(muted.state, 'suspended', 'never resumes what the app paused itself')
+})
+
+test('resume() while hidden is held until return, and an app suspend() cancels it', async () => {
+  const app = bootFrame()
+  const sfx = new app.window.AudioContext()
+  const ambience = new app.window.AudioContext()
+  app.shell({ visible: false })
+  await settle()
+
+  await sfx.resume()
+  assert.equal(sfx.state, 'suspended', 'a game loop cannot restart sound in the background')
+  await ambience.suspend()
+
+  app.shell({ visible: true })
+  await settle()
+  assert.equal(sfx.state, 'running')
+  assert.equal(ambience.state, 'suspended')
+})
+
+test('a context created while hidden waits silently for the foreground', async () => {
+  const app = bootFrame()
+  app.shell({ visible: false })
+  const booted = new app.window.AudioContext()
+  assert.ok(booted instanceof app.window.AudioContext)
+  await settle()
+  assert.equal(booted.state, 'suspended')
+  app.shell({ visible: true })
+  await settle()
+  assert.equal(booted.state, 'running')
+})
+
+test('playing media pauses while hidden, play() is held, and app pauses are respected', async () => {
+  const app = bootFrame()
+  const detached = new app.Media()
+  await detached.play()
+  const inPage = new app.Media()
+  inPage.paused = false // e.g. an autoplay element the app never called play() on
+  app.attached.push(inPage)
+  const stopped = new app.Media()
+  app.attached.push(stopped)
+
+  app.shell({ visible: false })
+  assert.equal(detached.paused, true)
+  assert.equal(inPage.paused, true)
+
+  await stopped.play()
+  assert.equal(stopped.paused, true, 'play() is held while hidden')
+  inPage.pause()
+
+  app.shell({ visible: true })
+  await settle()
+  assert.equal(detached.paused, false)
+  assert.equal(stopped.paused, false)
+  assert.equal(inPage.paused, true, 'the app paused it while hidden')
+})
+
+test('deliberate background playback keeps playing but still reads as hidden', async () => {
+  const app = bootFrame()
+  const reader = new app.window.AudioContext()
+  app.shell({ visible: false, backgroundPlayback: true })
+  await settle()
+  assert.equal(reader.state, 'running')
+  assert.equal(app.document.hidden, true)
+})
+
+test('only the shell parent can background the app', async () => {
+  const app = bootFrame()
+  const music = new app.window.AudioContext()
+  app.shell({ visible: false }, 'https://evil.test')
+  app.shell({ visible: false }, SHELL_ORIGIN, {})
+  await settle()
+  assert.equal(music.state, 'running')
+  assert.equal(app.document.hidden, false)
+})

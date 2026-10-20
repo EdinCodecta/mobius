@@ -136,9 +136,13 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //      scrim but synchronously cancels any Android compositor scroll already in
 //      flight. Hidden/incoming frames receive false too.
 //
-//   3c. {type: 'moebius:frame-visibility', visible, navigationReady} parent → frame
+//   3c. {type: 'moebius:frame-visibility', visible, navigationReady,
+//        backgroundPlayback} parent → frame
 //      visible keeps painted frames foreground during shell handoffs;
 //      navigationReady requires a mounted, promoted, logically visible frame.
+//      app-frame.html turns visible:false into a hidden page and pauses the
+//      frame's sound unless backgroundPlayback says the document owns an open
+//      media session (deliberate playback the drawer still controls).
 //
 // Intra-app nav (`moebius:nav-push` / `nav-pop` / `nav-push-deferred` / `nav-push-ack` /
 // `nav-push-rejected` / `nav-back`) is handled below — see the
@@ -1420,11 +1424,14 @@ const AppCanvas = forwardRef(function AppCanvas({
   // shell ancestor — which does NOT change the nested iframe's
   // document.visibilityState (no visibilitychange/blur/pagehide fires). So an
   // app that plays audio or animates keeps running after you navigate away
-  // (the reported "music keeps playing after exiting" bug). Posting the verdict
-  // lets an app pause on `visible:false` and resume on `visible:true`. The
-  // native Page Visibility API still covers real tab-hide (it propagates to
-  // same-origin child frames), so the two compose: an app is foreground only
-  // when it's the active canvas AND the tab is visible.
+  // (the reported "music keeps playing after exiting" bug). app-frame.html
+  // turns this verdict into the standard Page Visibility state and pauses the
+  // document's Web Audio and media elements, so its sound stops without
+  // Möbius-specific app code. `backgroundPlayback` exempts a document with an open media
+  // session from that forced pause: its playback is deliberate and stays
+  // controllable from the drawer. The native Page Visibility API still covers
+  // real tab-hide, so the two compose: an app is foreground only when it's
+  // the active canvas AND the tab is visible.
   //
   // Double-buffer routing: only the LIVE frame ever receives the real verdict.
   // A buffered incoming frame is invisible by construction, so it gets an
@@ -1443,6 +1450,7 @@ const AppCanvas = forwardRef(function AppCanvas({
       navigationReady: visible && visibleRef.current
         && v === liveVersionRef.current && swap.liveLoaded
         && frameNavRef.current.get(v)?.mounted === true,
+      backgroundPlayback: frameMediaSessionRef.current.has(v),
     })
   }
 
