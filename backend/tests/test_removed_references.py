@@ -139,6 +139,8 @@ def test_references_guarded_by_a_lookup_fallback_are_left_to_the_tests(repo, sou
   "  VALUE = list(items())\nexcept AttributeError:\n  VALUE = []\n",
   "from app import install\ntry:\n  def items():\n    yield install.read_receipt()\n"
   "  for item in items():\n    pass\nexcept AttributeError:\n  pass\n",
+  "from app import install\ntry:\n  def items():\n    yield install.read_receipt()\n"
+  "  VALUE = ', '.join(items())\nexcept AttributeError:\n  VALUE = ''\n",
 ])
 def test_lookups_that_run_inside_a_matching_handler_are_left_to_the_tests(repo, source):
   baseline = {**_MOVED_BEFORE, "backend/app/gone.py": "thing = 1\n"}
@@ -158,6 +160,9 @@ def test_lookups_that_run_inside_a_matching_handler_are_left_to_the_tests(repo, 
   # Calling a generator function runs nothing until it is iterated.
   "from app import install\ntry:\n  def items():\n    yield install.read_receipt()\n"
   "  values = items()\nexcept AttributeError:\n  values = ()\nVALUE = list(values)\n",
+  # Passing it to a call that only stores it does not run it either.
+  "from app import install\nHELD = []\ntry:\n  def items():\n    yield install.read_receipt()\n"
+  "  HELD.append(items())\nexcept AttributeError:\n  pass\nVALUE = list(HELD[0])\n",
 ])
 def test_a_function_body_is_not_guarded_by_the_try_that_defines_it(repo, source):
   # The body runs when called, after the try has finished.

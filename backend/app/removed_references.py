@@ -155,6 +155,20 @@ def _is_generator(function: ast.FunctionDef) -> bool:
   return False
 
 
+# Built-ins and methods that iterate their argument before returning.
+_CONSUMING_CALLS = frozenset({
+  "list", "tuple", "set", "frozenset", "dict", "sorted", "sum", "any", "all",
+  "min", "max", "next",
+})
+_CONSUMING_METHODS = frozenset({"join", "extend", "update"})
+
+
+def _consumes_arguments(call: ast.Call) -> bool:
+  if isinstance(call.func, ast.Name):
+    return call.func.id in _CONSUMING_CALLS
+  return isinstance(call.func, ast.Attribute) and call.func.attr in _CONSUMING_METHODS
+
+
 def _called_within(body: list[ast.stmt]) -> set[int]:
   """Functions and lambdas a block both defines and calls.
 
@@ -165,8 +179,9 @@ def _called_within(body: list[ast.stmt]) -> set[int]:
   only creates a coroutine or generator, so those count only when the block
   also runs it: awaits the coroutine (directly or as an argument of an
   awaited call such as ``asyncio.gather``), or consumes the generator (loops
-  over it, passes it to a call such as ``list``, or delegates with
-  ``yield from``).
+  over it, unpacks it with ``*``, delegates with ``yield from``, or passes it
+  to a built-in that iterates its argument, such as ``list``). Any other call
+  may only store the generator, so it is no evidence the body ran.
   """
   nodes = [node for statement in body for node in ast.walk(statement)]
   calls = [node for node in nodes if isinstance(node, ast.Call)]
@@ -186,9 +201,11 @@ def _called_within(body: list[ast.stmt]) -> set[int]:
   awaited = names(awaited_calls) | names(
     argument for call in awaited_calls for argument in arguments(call)
   )
-  consumed = names(argument for call in calls for argument in arguments(call)) | names(
+  consumed = names(
+    argument for call in calls if _consumes_arguments(call) for argument in arguments(call)
+  ) | names(
     node.iter for node in nodes if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension))
-  ) | names(node.value for node in nodes if isinstance(node, ast.YieldFrom))
+  ) | names(node.value for node in nodes if isinstance(node, (ast.YieldFrom, ast.Starred)))
   found = {id(call.func) for call in calls if isinstance(call.func, ast.Lambda)}
   for node in nodes:
     if isinstance(node, ast.AsyncFunctionDef) and node.name in awaited:
