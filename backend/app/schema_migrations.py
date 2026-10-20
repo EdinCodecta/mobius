@@ -6813,7 +6813,29 @@ def _enforce_unique_live_claim_follows(eng) -> None:
 
   if "goal_dependencies" not in inspect(eng).get_table_names():
     return
+  live = ("target_kind = 'claim_acquisition' "
+          "AND result_disposition IS NULL AND withdrawn_at IS NULL")
   with eng.begin() as conn:
+    # Before this index only the owner fence prevented a second live follow
+    # of one acquisition, so an owner database may already hold duplicates.
+    # Keep one per Goal (an owed result first, then the newest) and withdraw
+    # the rest exactly as Stop following would; never fail the upgrade.
+    groups = conn.execute(text(
+      "SELECT waiting_goal_id, target_acquisition_id FROM goal_dependencies "
+      f"WHERE {live} GROUP BY waiting_goal_id, target_acquisition_id "
+      "HAVING count(*) > 1"
+    )).all()
+    for goal_id, acquisition_id in groups:
+      rows = conn.execute(text(
+        "SELECT id FROM goal_dependencies "
+        f"WHERE {live} AND waiting_goal_id = :goal AND target_acquisition_id = :acq "
+        "ORDER BY CASE WHEN resolved_at IS NULL THEN 1 ELSE 0 END, created_at DESC, id DESC"
+      ), {"goal": goal_id, "acq": acquisition_id}).scalars().all()
+      for row_id in rows[1:]:
+        conn.execute(text(
+          "UPDATE goal_dependencies SET withdrawn_at = CURRENT_TIMESTAMP, "
+          "result_disposition = 'withdrawn' WHERE id = :id"
+        ), {"id": row_id})
     conn.execute(text(
       "CREATE UNIQUE INDEX IF NOT EXISTS uq_goal_dependencies_live_claim_acquisition "
       "ON goal_dependencies (waiting_goal_id, target_acquisition_id) "
