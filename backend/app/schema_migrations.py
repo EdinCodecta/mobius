@@ -6807,6 +6807,21 @@ def _retire_legacy_claim_notice_carriers(eng) -> None:
         conn.execute(update_pending, {"chat_id": chat_id, "pending": kept})
 
 
+def _enforce_unique_live_claim_follows(eng) -> None:
+  """A Goal may have one live subscription to each claim acquisition."""
+  from sqlalchemy import inspect, text
+
+  if "goal_dependencies" not in inspect(eng).get_table_names():
+    return
+  with eng.begin() as conn:
+    conn.execute(text(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_goal_dependencies_live_claim_acquisition "
+      "ON goal_dependencies (waiting_goal_id, target_acquisition_id) "
+      "WHERE target_kind = 'claim_acquisition' "
+      "AND result_disposition IS NULL AND withdrawn_at IS NULL"
+    ))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -6923,6 +6938,7 @@ _SCHEMA_MIGRATIONS = (
   ("0092_transfer_notice_revision", _add_transfer_notice_revision),
   ("0093_pending_goal_dependency_indexes", _index_pending_goal_dependencies),
   ("0094_retire_legacy_claim_notice_carriers", _retire_legacy_claim_notice_carriers),
+  ("0095_unique_live_claim_follows", _enforce_unique_live_claim_follows),
 )
 
 

@@ -7,10 +7,65 @@ import pytest
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import models, schema_migrations
 from app.chat_writer import create_chat
+
+
+def test_unused_dependency_task_mapping_needs_no_existing_column_change(tmp_path):
+  eng = create_engine(f"sqlite:///{tmp_path / 'unused-task.db'}")
+  # The shipped migration retains its nullable column; the current mapper
+  # neither reads nor writes it and does not need an ALTER on owner databases.
+  schema_migrations._add_goal_dependencies(eng)
+  models.Base.metadata.create_all(eng)
+  assert 'task_id' in {col['name'] for col in inspect(eng).get_columns('goal_dependencies')}
+  assert 'task_id' not in models.GoalDependency.__table__.columns
+  with Session(eng) as db:
+    db.add(create_chat(id='chat', messages=[]))
+    db.add(models.GoalDependency(id='follow', waiting_goal_id='goal', waiting_chat_id='chat',
+      target_kind='claim_acquisition', target_key='claim:acquisition',
+      target_acquisition_id='acquisition'))
+    db.commit()
+    assert db.get(models.GoalDependency, 'follow').target_acquisition_id == 'acquisition'
+  eng.dispose()
+
+
+@pytest.mark.parametrize("start", ["fresh", "upgrade"])
+@pytest.mark.parametrize("live_state", ["pending", "result_owed", "owner_suppressed"])
+def test_live_claim_follow_unique_index_preserves_historical_receipts(tmp_path, start, live_state):
+  eng = create_engine(f"sqlite:///{tmp_path / 'unique-follows.db'}")
+  models.Base.metadata.create_all(eng)
+  if start == "upgrade":
+    with eng.begin() as conn:
+      conn.execute(text("DROP INDEX uq_goal_dependencies_live_claim_acquisition"))
+  def insert(conn, suffix, *, disposition=None, withdrawn=None):
+    conn.execute(text(
+      "INSERT INTO goal_dependencies (id, waiting_goal_id, waiting_chat_id, "
+      "target_kind, target_key, target_acquisition_id, result_disposition, "
+      "withdrawn_at, created_at) VALUES (:id, 'goal', 'chat', "
+      "'claim_acquisition', :key, 'acquisition', :disposition, :withdrawn, CURRENT_TIMESTAMP)"
+    ), {"id": suffix, "key": f"claim:acquisition:{suffix}",
+        "disposition": disposition, "withdrawn": withdrawn})
+
+  with eng.begin() as conn:
+    insert(conn, "delivered", disposition="delivered")
+    insert(conn, "withdrawn", withdrawn=datetime(2026, 10, 20))
+    insert(conn, "live")
+    if live_state != "pending":
+      column = "resolved_at" if live_state == "result_owed" else "owner_suppressed_at"
+      conn.execute(text(f"UPDATE goal_dependencies SET {column} = CURRENT_TIMESTAMP WHERE id = 'live'"))
+  schema_migrations._enforce_unique_live_claim_follows(eng)
+  schema_migrations._enforce_unique_live_claim_follows(eng)
+  indexes = {item["name"]: item for item in inspect(eng).get_indexes("goal_dependencies")}
+  assert indexes["uq_goal_dependencies_live_claim_acquisition"]["unique"]
+  with pytest.raises(IntegrityError):
+    with eng.begin() as conn:
+      insert(conn, "duplicate")
+  with eng.connect() as conn:
+    assert conn.execute(text("SELECT count(*) FROM goal_dependencies")).scalar_one() == 3
+  eng.dispose()
 
 
 def _seed_legacy_follow(eng, *, suffix, source_status="running", card=False,
