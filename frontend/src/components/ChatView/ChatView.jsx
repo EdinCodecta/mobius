@@ -106,9 +106,6 @@ import ConnectionStatus from './ConnectionStatus.jsx'
 import ProgressRail from './ProgressRail.jsx'
 import GoalPlanDetails from './GoalPlanDetails.jsx'
 import GoalDraftChip from './GoalDraftChip.jsx'
-import GoalAutoResumePrompt, {
-  shouldOfferGoalAutoResume,
-} from './GoalAutoResumePrompt.jsx'
 import WaitingChip from './WaitingChip.jsx'
 import { currentChatAnnouncement, currentProgressGoal, goalAwaitsChanges, goalContinuationHandoff } from './chatHandoffPresentation.js'
 import AssistantReply from './AssistantReply.jsx'
@@ -524,12 +521,11 @@ export default function ChatView({
     messagesRef,
     offset,
     offsetRef,
+    hasUnloadedNewer,
+    setHasUnloadedNewer,
     applyMessagesToView,
     commitMessages,
   } = useTranscriptState({ cacheKey: transcriptCacheKey, cached, queryClient })
-  const [hasUnloadedNewer, setHasUnloadedNewer] = useState(
-    () => hasUnloadedNewerMessages(cached),
-  )
   const loadingLatestRef = useRef(false)
   const messageHistory = useMemo(
     () => composerHistoryFromMessages(messages),
@@ -1471,7 +1467,7 @@ export default function ChatView({
           recentOffset: data.offset || 0,
           preserveLocalSuffix: true,
         })
-        commitMessages(refreshed.messages, refreshed.offset)
+        commitMessages(refreshed.messages, refreshed.offset, { total: data.total })
         setTranscriptReconcileSeq(seq => seq + 1)
       } else if (!staleSnapshot) {
         const refreshed = mergeRecentMessagesIntoLoadedWindow({
@@ -1480,7 +1476,7 @@ export default function ChatView({
           recentMessages: msgs,
           recentOffset: data.offset || 0,
         })
-        commitMessages(refreshed.messages, refreshed.offset)
+        commitMessages(refreshed.messages, refreshed.offset, { total: data.total })
         setTranscriptReconcileSeq(seq => seq + 1)
       }
       if (data.running) {
@@ -5976,13 +5972,6 @@ export default function ChatView({
     authoritativeHandoff: serverHandoff,
   })
   const goalHandoff = goalPresentation?.handoff?.kind || 'none'
-  const goalAutoResumeOffered = shouldOfferGoalAutoResume({
-    embedded,
-    goal: goalPresentation,
-    autoResumeEnabled,
-    policyKnown: chatInfo != null,
-    limitParked: Boolean(pendingLimitPark),
-  })
   const goalResumeBlocked = useCallback(() => resumeBlocked() || !canResumeGoal(goalPresentation, {
     turnActive, hasPendingQuestion, chatHandoff,
   }), [resumeBlocked, goalPresentation, turnActive, hasPendingQuestion, chatHandoff])
@@ -6566,15 +6555,6 @@ export default function ChatView({
             </div>
           )}
         </div>
-        {goalAutoResumeOffered && (
-          <GoalAutoResumePrompt
-            chatId={chatId}
-            goalKey={goalPresentation?.id}
-            saving={autoResumeSaving}
-            error={autoResumeErrorSource === 'goal' ? autoResumeError : ''}
-            onEnable={(next) => handleAutoResumeChange(next, 'goal')}
-          />
-        )}
         <ProgressRail
           items={progressRail}
           resetKey={goalPresentation?.id || visibleGoalObjective || 'build-progress'}
