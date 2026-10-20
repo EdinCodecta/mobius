@@ -1698,6 +1698,10 @@ class GoalDependency(Base):
   waiting_goal_id = Column(String(64), nullable=False, index=True)
   waiting_chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
   created_by_run_id = Column(String(64), nullable=True)
+  # Unused, but still mapped: create_all runs before migrations, so dropping
+  # it would build new goal_dependencies tables without the column and a
+  # rolled-back previous release (which maps it) would report a schema gap.
+  task_id = Column(String(64), nullable=True)
   target_kind = Column(String(32), nullable=False)
   target_key = Column(String(160), nullable=False)
   target_claim_id = Column(String(64), nullable=True, index=True)

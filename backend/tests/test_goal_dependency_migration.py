@@ -14,23 +14,15 @@ from app import models, schema_migrations
 from app.chat_writer import create_chat
 
 
-def test_unused_dependency_task_mapping_needs_no_existing_column_change(tmp_path):
-  eng = create_engine(f"sqlite:///{tmp_path / 'unused-task.db'}")
-  # The shipped migration retains its nullable column; the current mapper
-  # neither reads nor writes it and does not need an ALTER on owner databases.
-  schema_migrations._add_goal_dependencies(eng)
+def test_fresh_dependency_table_keeps_columns_previous_releases_map(tmp_path):
+  # create_all runs before migrations. A table it creates must still carry
+  # every column a previous release maps, or rolling back reports a schema gap.
+  eng = create_engine(f"sqlite:///{tmp_path / 'fresh-dependencies.db'}")
   models.Base.metadata.create_all(eng)
+  schema_migrations._add_goal_dependencies(eng)
   assert 'task_id' in {col['name'] for col in inspect(eng).get_columns('goal_dependencies')}
-  assert 'task_id' not in models.GoalDependency.__table__.columns
-  with Session(eng) as db:
-    db.add(create_chat(id='chat', messages=[]))
-    db.add(models.GoalDependency(id='follow', waiting_goal_id='goal', waiting_chat_id='chat',
-      target_kind='claim_acquisition', target_key='claim:acquisition',
-      target_acquisition_id='acquisition'))
-    db.commit()
-    assert db.get(models.GoalDependency, 'follow').target_acquisition_id == 'acquisition'
+  assert schema_migrations.mapped_schema_gaps(eng) == []
   eng.dispose()
-
 
 @pytest.mark.parametrize("start", ["fresh", "upgrade"])
 @pytest.mark.parametrize("live_state", ["pending", "result_owed", "owner_suppressed"])
