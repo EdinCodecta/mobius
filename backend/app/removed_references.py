@@ -143,20 +143,42 @@ def _caught(handler: ast.ExceptHandler) -> set[str]:
   }
 
 
+def _is_generator(function: ast.FunctionDef) -> bool:
+  """Whether the function's own body yields (nested scopes do not count)."""
+  pending: list[ast.AST] = list(function.body)
+  while pending:
+    node = pending.pop()
+    if isinstance(node, (ast.Yield, ast.YieldFrom)):
+      return True
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+      pending.extend(ast.iter_child_nodes(node))
+  return False
+
+
 def _called_within(body: list[ast.stmt]) -> set[int]:
   """Functions and lambdas a block both defines and calls.
 
   Their bodies may run while the block is still executing, so a guard around
   the block may cover them; the check abstains as it does for the block's own
   statements. A lambda counts when it is called on the spot or bound to a
-  name the block calls.
+  name the block calls. Calling an ``async def`` only creates a coroutine, so
+  it counts only when the block awaits that call; calling a generator
+  function runs nothing, so it never counts.
   """
   nodes = [node for statement in body for node in ast.walk(statement)]
   calls = [node for node in nodes if isinstance(node, ast.Call)]
   called = {call.func.id for call in calls if isinstance(call.func, ast.Name)}
+  awaited = {
+    node.value.func.id for node in nodes
+    if isinstance(node, ast.Await) and isinstance(node.value, ast.Call)
+    and isinstance(node.value.func, ast.Name)
+  }
   found = {id(call.func) for call in calls if isinstance(call.func, ast.Lambda)}
   for node in nodes:
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in called:
+    if isinstance(node, ast.AsyncFunctionDef) and node.name in awaited:
+      found.add(id(node))
+    elif (isinstance(node, ast.FunctionDef) and node.name in called
+          and not _is_generator(node)):
       found.add(id(node))
     elif (isinstance(node, ast.Assign) and isinstance(node.value, ast.Lambda)
           and any(isinstance(target, ast.Name) and target.id in called

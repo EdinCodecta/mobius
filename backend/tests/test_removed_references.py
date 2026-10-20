@@ -127,6 +127,10 @@ def test_references_guarded_by_a_lookup_fallback_are_left_to_the_tests(repo, sou
   "  VALUE = read()\nexcept AttributeError:\n  VALUE = None\n",
   "from app import install\ntry:\n  read = lambda: install.read_receipt()\n"
   "  VALUE = read()\nexcept AttributeError:\n  VALUE = None\n",
+  # A coroutine awaited inside the try runs under its handler.
+  "from app import install\n\nasync def main():\n  try:\n    async def read():\n"
+  "      return install.read_receipt()\n    return await read()\n"
+  "  except AttributeError:\n    return None\n",
 ])
 def test_lookups_that_run_inside_a_matching_handler_are_left_to_the_tests(repo, source):
   baseline = {**_MOVED_BEFORE, "backend/app/gone.py": "thing = 1\n"}
@@ -139,6 +143,13 @@ def test_lookups_that_run_inside_a_matching_handler_are_left_to_the_tests(repo, 
   "except Exception:\n  read = None\nVALUE = read()\n",
   "from app import install\ntry:\n  read = lambda: install.read_receipt()\n"
   "except AttributeError:\n  read = None\n",
+  # Calling an async def only creates the coroutine; it runs at the later await.
+  "from app import install\n\nasync def main():\n  try:\n    async def read():\n"
+  "      return install.read_receipt()\n    task = read()\n"
+  "  except AttributeError:\n    task = None\n  return await task\n",
+  # Calling a generator function runs nothing until it is iterated.
+  "from app import install\ntry:\n  def items():\n    yield install.read_receipt()\n"
+  "  values = items()\nexcept AttributeError:\n  values = ()\nVALUE = list(values)\n",
 ])
 def test_a_function_body_is_not_guarded_by_the_try_that_defines_it(repo, source):
   # The body runs when called, after the try has finished.
