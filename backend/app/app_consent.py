@@ -91,10 +91,18 @@ HANDLED_DATA_KEYS = frozenset(
 
 
 def _row(row_id: str, title: str, text: str, *, level: str | None = None,
-         rank: int = 1) -> dict[str, Any]:
+         rank: int = 1, scope: list[str] | None = None) -> dict[str, Any]:
+  """One thing an app asks for.
+
+  ``rank`` orders levels of the same permission (read < write). ``scope`` names
+  the specific things a row covers (secret names, an install-time run): an
+  accepted answer covers a request only when it includes every name, so
+  adding or swapping one asks again.
+  """
   return {
     "id": row_id, "title": title, "text": text, "level": level,
     "rank": rank, "critical": row_id in CRITICAL,
+    "scope": sorted(set(scope)) if scope else None,
   }
 
 
@@ -135,6 +143,23 @@ def rows_from_contract(
     rows.append(_row(
       "job_secret_read", "Read named secrets in its job",
       "Its background job can read the secrets it names: " + ", ".join(names) + ".",
+      scope=[str(name) for name in names],
+    ))
+  background = contract.get("background")
+  if isinstance(background, dict):
+    scheduled = background.get("mode") == "scheduled"
+    timing = (
+      f"Runs on schedule {background.get('cron') or ''}".strip()
+      if scheduled else "Runs only on demand"
+    )
+    initialize = bool(background.get("initialize_on_install"))
+    rows.append(_row(
+      "background_job", "Run a background job",
+      f"{timing}{' and starts a run immediately after install' if initialize else ''}. "
+      "It runs as reviewed owner-installed code with Möbius process access and "
+      "receives a short-lived app token for API calls.",
+      rank=2 if scheduled else 1,
+      scope=["initialize_on_install"] if initialize else None,
     ))
   if agent.get("embeds_agent"):
     rows.append(_row(
@@ -185,7 +210,10 @@ def rows_from_contract(
 
 def request_digest(rows: list[dict[str, Any]]) -> str:
   canonical = json.dumps(
-    sorted((r["id"], int(r.get("rank") or 1), r.get("level")) for r in rows),
+    sorted(
+      (r["id"], int(r.get("rank") or 1), r.get("level"), r.get("scope") or [])
+      for r in rows
+    ),
     separators=(",", ":"),
   )
   return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -209,6 +237,13 @@ def current_rows(app: models.App) -> list[dict[str, Any]]:
   )
 
 
+def _stored_row(row: dict[str, Any]) -> dict[str, Any]:
+  stored: dict[str, Any] = {"id": row["id"], "rank": int(row.get("rank") or 1)}
+  if row.get("scope"):
+    stored["scope"] = list(row["scope"])
+  return stored
+
+
 def _record(rows: list[dict[str, Any]], via: str) -> dict[str, Any]:
   """What is stored when an app is accepted: the rows themselves.
 
@@ -218,24 +253,27 @@ def _record(rows: list[dict[str, Any]], via: str) -> dict[str, Any]:
   """
   return {
     "version": ROWS_VERSION,
-    "rows": [{"id": r["id"], "rank": int(r.get("rank") or 1)} for r in rows],
+    "rows": [_stored_row(r) for r in rows],
     "digest": request_digest(rows),
     "at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "via": via,
   }
 
 
-def accepted_ranks(app: models.App) -> dict[str, int] | None:
-  """Row id to accepted rank, or None when the app was never accepted."""
+def accepted_rows(app: models.App) -> dict[str, dict[str, Any]] | None:
+  """Row id to its accepted ``rank`` and ``scope``; None when never accepted."""
   record = app.accepted_consent
   if not isinstance(record, dict):
     return None
   if isinstance(record.get("rows"), list):
-    return {r["id"]: int(r.get("rank") or 1) for r in record["rows"]}
+    return {
+      r["id"]: {"rank": int(r.get("rank") or 1), "scope": set(r.get("scope") or [])}
+      for r in record["rows"]
+    }
   # Records written by the grandfathering migration hold a contract copy.
   if isinstance(record.get("contract"), dict):
     return {
-      r["id"]: int(r.get("rank") or 1)
+      r["id"]: {"rank": int(r.get("rank") or 1), "scope": set(r.get("scope") or [])}
       for r in rows_from_contract(
         record["contract"], project_builders=bool(record.get("project_builders")),
       )
@@ -243,13 +281,28 @@ def accepted_ranks(app: models.App) -> dict[str, int] | None:
   return None
 
 
+def accepted_ranks(app: models.App) -> dict[str, int] | None:
+  """Row id to accepted rank, or None when the app was never accepted."""
+  rows = accepted_rows(app)
+  return None if rows is None else {key: value["rank"] for key, value in rows.items()}
+
+
+def _covered(row: dict[str, Any], accepted: dict[str, dict[str, Any]]) -> bool:
+  held = accepted.get(row["id"])
+  return (
+    held is not None
+    and held["rank"] >= int(row.get("rank") or 1)
+    and set(row.get("scope") or []) <= held["scope"]
+  )
+
+
 def needed_rows(app: models.App) -> list[dict[str, Any]]:
   """Rows the current contract asks for that the accepted answer does not cover."""
   rows = current_rows(app)
-  covered = accepted_ranks(app)
-  if covered is None:
+  accepted = accepted_rows(app)
+  if accepted is None:
     return rows
-  return [r for r in rows if covered.get(r["id"], 0) < int(r.get("rank") or 1)]
+  return [r for r in rows if not _covered(r, accepted)]
 
 
 def status(app: models.App) -> str:

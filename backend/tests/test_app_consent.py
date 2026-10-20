@@ -241,3 +241,56 @@ def test_platform_apps_are_accepted_at_first_boot(db):
   app = _app(db, "platformapp", contract=contract, accepted=acceptance)
   assert acceptance["via"] == "platform"
   assert app_consent.status(app) == "accepted"
+
+
+def _accepted(db, slug, contract):
+  app = _app(db, slug, contract=contract)
+  assert app_consent.accept(app, app_consent.request_digest(app_consent.current_rows(app)))
+  return app
+
+
+def test_named_secrets_are_part_of_the_accepted_answer(db):
+  app = _accepted(db, "secrets", _contract(job_secret_read=["A"]))
+  assert app.accepted_consent["rows"] == [
+    {"id": "job_secret_read", "rank": 1, "scope": ["A"]},
+  ]
+  assert app_consent.status(app) == "accepted"
+  # Fewer names is no new request; an added or swapped name asks again.
+  app.capability_contract = _contract()
+  assert app_consent.status(app) == "accepted"
+  app.capability_contract = _contract(job_secret_read=["A", "B"])
+  assert [r["id"] for r in app_consent.needed_rows(app)] == ["job_secret_read"]
+  app.capability_contract = _contract(job_secret_read=["B"])
+  assert app_consent.status(app) == "required"
+
+
+def test_changed_secret_names_change_the_digest_so_a_stale_accept_fails(db):
+  app = _app(db, "stale", contract=_contract(job_secret_read=["A"]))
+  shown = app_consent.request_digest(app_consent.current_rows(app))
+  app.capability_contract = _contract(job_secret_read=["B"])
+  assert not app_consent.accept(app, shown)
+  assert app.accepted_consent is None
+
+
+def test_background_work_is_a_row_with_timing_and_authority():
+  contract = _contract()
+  contract["background"] = {
+    "job": "job.py", "mode": "scheduled", "cron": "0 6 * * *",
+    "user_configurable": False, "initialize_on_install": True,
+  }
+  (row,) = app_consent.rows_from_contract(contract)
+  assert row["id"] == "background_job"
+  assert "0 6 * * *" in row["text"] and "immediately after install" in row["text"]
+  assert "process access" in row["text"]
+
+
+def test_background_escalation_asks_again(db):
+  on_demand = _contract()
+  on_demand["background"] = {"job": "j.py", "mode": "on_demand", "cron": None,
+                             "initialize_on_install": False}
+  app = _accepted(db, "jobs", on_demand)
+  scheduled = _contract()
+  scheduled["background"] = {"job": "j.py", "mode": "scheduled", "cron": "* * * * *",
+                             "initialize_on_install": False}
+  app.capability_contract = scheduled
+  assert [r["id"] for r in app_consent.needed_rows(app)] == ["background_job"]
