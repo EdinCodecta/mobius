@@ -234,6 +234,17 @@ _MERGED_NON_SOURCE = managed_paths.MERGED_NON_SOURCE
 
 _HTTP_TIMEOUT = 15.0
 _SIZE_LOOKUP_CONCURRENCY = 16
+# The download size is optional metadata on the preview that gates Install, so
+# a host that stalls HEAD requests costs this long at most, not a timeout per
+# batch of lookups.
+_SIZE_LOOKUP_DEADLINE = 3.0
+# Reopening a listing sizes the same files again. Remembering each size for a
+# few minutes keeps that off the request budget installs share, at the cost of
+# a file edited meanwhile showing its earlier size until the TTL ends.
+_FILE_SIZE_TTL = 600.0
+_FILE_SIZE_CACHE_MAX = 512
+# URL -> (monotonic time sized, bytes). Insertion order is oldest first.
+_FILE_SIZE_CACHE: dict[str, tuple[float, int]] = {}
 
 # Tests override this module attribute to prevent production cron mutation.
 CRON_SCAFFOLD = app_cron.BAKED_CRON_SCAFFOLD
@@ -747,12 +758,23 @@ async def _http_get(client: httpx.AsyncClient, url: str, max_bytes: int) -> byte
     return b"".join(chunks)
 
 
+def _remember_file_size(url: str, size: int) -> None:
+  _FILE_SIZE_CACHE.pop(url, None)  # a refreshed entry is the newest again
+  _FILE_SIZE_CACHE[url] = (time.monotonic(), size)
+  if len(_FILE_SIZE_CACHE) > _FILE_SIZE_CACHE_MAX:
+    del _FILE_SIZE_CACHE[next(iter(_FILE_SIZE_CACHE))]
+
+
 async def _remote_file_size(client: httpx.AsyncClient, url: str) -> int | None:
   """A remote file's size from its response headers, or None when unknown.
 
   Asks for `identity` encoding: httpx advertises gzip by default, and a
-  compressed length is not the number of bytes install writes.
+  compressed length is not the number of bytes install writes. A known size is
+  reused for `_FILE_SIZE_TTL`; an unknown one is looked up again next time.
   """
+  cached = _FILE_SIZE_CACHE.get(url)
+  if cached is not None and time.monotonic() - cached[0] < _FILE_SIZE_TTL:
+    return cached[1]
   try:
     async with _validated_response(
       client, url, "HEAD", {"Accept-Encoding": "identity"},
@@ -763,7 +785,9 @@ async def _remote_file_size(client: httpx.AsyncClient, url: str) -> int | None:
     return None
   if encoding != "identity" or not length.isdigit():
     return None
-  return int(length)
+  size = int(length)
+  _remember_file_size(url, size)
+  return size
 
 
 async def package_download_bytes(manifest: Mapping, raw_base: str) -> int | None:
@@ -771,7 +795,9 @@ async def package_download_bytes(manifest: Mapping, raw_base: str) -> int | None
 
   The pre-install review shows this, so it reads response headers only and
   never fetches app code; install still fetches and binds the bytes itself.
-  The sum is `package_bytes`, the same count the package limit uses.
+  The sum is `package_bytes`, the same count the package limit uses. Lookups
+  still running after `_SIZE_LOOKUP_DEADLINE` are cancelled and the size is
+  unknown.
   """
   paths = sorted(set(package_input_paths(manifest)))
   # A manifest may declare many files; keep the burst on one host small.
@@ -782,7 +808,13 @@ async def package_download_bytes(manifest: Mapping, raw_base: str) -> int | None
       async with gate:
         return await _remote_file_size(client, raw_base + quote(rel))
 
-    sizes = dict(zip(paths, await asyncio.gather(*map(size_of, paths))))
+    try:
+      found = await asyncio.wait_for(
+        asyncio.gather(*map(size_of, paths)), _SIZE_LOOKUP_DEADLINE,
+      )
+    except TimeoutError:
+      return None
+  sizes = dict(zip(paths, found))
   if None in sizes.values():
     return None
   return package_bytes(manifest, sizes.__getitem__)
