@@ -143,25 +143,53 @@ def _caught(handler: ast.ExceptHandler) -> set[str]:
   }
 
 
+def _called_within(body: list[ast.stmt]) -> set[int]:
+  """Functions and lambdas a block both defines and calls.
+
+  Their bodies may run while the block is still executing, so a guard around
+  the block may cover them; the check abstains as it does for the block's own
+  statements. A lambda counts when it is called on the spot or bound to a
+  name the block calls.
+  """
+  nodes = [node for statement in body for node in ast.walk(statement)]
+  calls = [node for node in nodes if isinstance(node, ast.Call)]
+  called = {call.func.id for call in calls if isinstance(call.func, ast.Name)}
+  found = {id(call.func) for call in calls if isinstance(call.func, ast.Lambda)}
+  for node in nodes:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in called:
+      found.add(id(node))
+    elif (isinstance(node, ast.Assign) and isinstance(node.value, ast.Lambda)
+          and any(isinstance(target, ast.Name) and target.id in called
+                  for target in node.targets)):
+      found.add(id(node.value))
+  return found
+
+
 def _guards(tree: ast.Module) -> dict[int, frozenset[str]]:
   """Exception names the enclosing ``try`` handlers catch when each node runs.
 
-  A function or lambda body runs only when called, after the ``try`` that
-  defines it has finished, so it starts unguarded; ``try`` statements inside
-  it still count. Handlers, ``else`` and ``finally`` are outside their own
-  ``try``'s protection.
+  A function or lambda body runs only when called. One the ``try`` body also
+  calls may run under that ``try``'s handlers and keeps their protection; any
+  other starts unguarded, because it can run after the ``try`` has finished.
+  ``try`` statements inside a body always count. Handlers, ``else`` and
+  ``finally`` are outside their own ``try``'s protection.
   """
   guards: dict[int, frozenset[str]] = {}
-  pending: list[tuple[ast.AST, frozenset[str]]] = [(tree, frozenset())]
+  # (node, handlers catching when it runs, callables run under those handlers)
+  pending: list[tuple[ast.AST, frozenset[str], frozenset[int]]] = [
+    (tree, frozenset(), frozenset()),
+  ]
   while pending:
-    node, caught = pending.pop()
+    node, caught, run_here = pending.pop()
     if caught:
       guards[id(node)] = caught
     if isinstance(node, (ast.Try, ast.TryStar)):
       inner = caught.union(*(_caught(handler) for handler in node.handlers))
-      pending.extend((statement, inner) for statement in node.body)
+      run_inner = run_here | _called_within(node.body)
+      pending.extend((statement, inner, run_inner) for statement in node.body)
       pending.extend(
-        (part, caught) for part in (*node.handlers, *node.orelse, *node.finalbody)
+        (part, caught, run_here)
+        for part in (*node.handlers, *node.orelse, *node.finalbody)
       )
       continue
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -170,8 +198,10 @@ def _guards(tree: ast.Module) -> dict[int, frozenset[str]]:
       deferred = {id(node.body)}
     else:
       deferred = set()
+    if id(node) in run_here:
+      deferred = set()
     pending.extend(
-      (child, frozenset() if id(child) in deferred else caught)
+      (child, frozenset(), frozenset()) if id(child) in deferred else (child, caught, run_here)
       for child in ast.iter_child_nodes(node)
     )
   return guards

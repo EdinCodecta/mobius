@@ -120,6 +120,13 @@ def test_references_guarded_by_a_lookup_fallback_are_left_to_the_tests(repo, sou
   "except AttributeError:\n  read = None\n",
   # A removed module raises ModuleNotFoundError, which this handler catches.
   "try:\n  from app.gone import thing\nexcept ModuleNotFoundError:\n  thing = None\n",
+  # Callables the try itself calls run under its handler.
+  "from app import install\ntry:\n  VALUE = (lambda: install.read_receipt())()\n"
+  "except AttributeError:\n  VALUE = None\n",
+  "from app import install\ntry:\n  def read():\n    return install.read_receipt()\n"
+  "  VALUE = read()\nexcept AttributeError:\n  VALUE = None\n",
+  "from app import install\ntry:\n  read = lambda: install.read_receipt()\n"
+  "  VALUE = read()\nexcept AttributeError:\n  VALUE = None\n",
 ])
 def test_lookups_that_run_inside_a_matching_handler_are_left_to_the_tests(repo, source):
   baseline = {**_MOVED_BEFORE, "backend/app/gone.py": "thing = 1\n"}
