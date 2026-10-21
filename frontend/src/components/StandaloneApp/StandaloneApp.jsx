@@ -109,9 +109,10 @@ export default function StandaloneApp({ initialApp }) {
     if (event.type === 'app_deleted') {
       setRemoved(true)
     } else if (['app_updated', 'app_recovered', 'app_preview_ready'].includes(event.type)) {
+      void appQueries.consent.invalidate(queryClient, initialApp.id)
       void refreshApp().catch(() => {})
     }
-  }, [initialApp.id, refreshApp]), {
+  }, [initialApp.id, queryClient, refreshApp]), {
     // Reconnect reconciliation is best-effort; the next system event or
     // explicit update tap retries it without leaking a rejected promise.
     onOpen: () => { void refreshApp().catch(() => {}) },

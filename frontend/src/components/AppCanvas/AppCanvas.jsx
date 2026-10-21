@@ -27,6 +27,7 @@ import { createCapabilityHost } from '../../lib/capabilityHost.js'
 import { builtInCapabilityProviders } from '../../lib/capabilityProviders.js'
 import { clampCameraPreviewRect } from '../../lib/cameraPreview.js'
 import { requestAppCodeWarm } from '../../lib/appPrecache.js'
+import AppConsentPanel from './AppConsentPanel.jsx'
 import { appHostRequest } from '../../lib/appHostRequest.js'
 import {
   accountLinkCompletion,
@@ -385,12 +386,18 @@ const AppCanvas = forwardRef(function AppCanvas({
   // Fresh app tokens are persisted for their remaining short lifetime so a
   // fully cached app can cold-boot offline. The cache is app-id scoped and JWT
   // claims are checked on read; the long-lived owner token never enters a frame.
+  // A Store app is dormant until the owner has accepted what it asks for. Ask
+  // first; mint the token only once nothing is pending. Offline (paused) the
+  // check is skipped so a fully cached app still opens from its cached token.
+  const consentQuery = appQueries.consent.useQuery(appId)
+  const consentRequired = consentQuery.data?.status === 'required'
+  const consentReady = consentQuery.status !== 'pending' || consentQuery.fetchStatus === 'paused'
   const {
     data: appToken,
     error: appTokenError,
     isFetching: appTokenFetching,
     refetch: refetchAppToken,
-  } = appQueries.token.useQuery(appId)
+  } = appQueries.token.useQuery(appId, { enabled: consentReady && !consentRequired })
   // Real reachability (probes /api/health), NOT navigator.onLine — which reads
   // a stale "true" on a COLD offline reopen (close the PWA offline, reopen,
   // open an app from the drawer): the SW serves the shell from cache so the
@@ -1553,6 +1560,14 @@ const AppCanvas = forwardRef(function AppCanvas({
     )
   }
 
+  if (consentRequired && online) {
+    // Offline the answer cannot be saved, so fall through to the offline note.
+    // Never prompt from a hidden or warm canvas; the pane that is on screen asks.
+    return visible
+      ? <AppConsentPanel appId={appId} appName={appName} request={consentQuery.data} />
+      : <div className="canvas-wrap" />
+  }
+
   if (tokenStartupState !== AppTokenStartupState.READY) {
     if (
       tokenStartupState === AppTokenStartupState.OFFLINE_MISSING
@@ -1564,7 +1579,9 @@ const AppCanvas = forwardRef(function AppCanvas({
         : 'Open this app once you’re online'
       const detail = onlineError
         ? 'Möbius couldn’t create the app’s secure session. Your app data is safe.'
-        : 'This app needs a cached, app-specific session before it can open offline.'
+        : consentRequired
+          ? 'This app is waiting for your permission. Allow it once while online, then it can open offline.'
+          : 'This app needs a cached, app-specific session before it can open offline.'
       return (
         <div className="canvas-wrap">
           <div className="canvas-loading" aria-live="polite">

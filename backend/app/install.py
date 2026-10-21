@@ -60,7 +60,7 @@ from app import (
   models,
   settled,
 )
-from app import app_cron
+from app import app_consent, app_cron
 from app.build_admission import BuildLeaseUnavailable
 from app.app_capabilities import contract_and_digest
 from app.app_compile_contract import RolldownStalled
@@ -2564,6 +2564,7 @@ def _require_reviewed_capabilities(
       "manifest": manifest,
       "capability_contract": capability_contract,
       "capability_digest": capability_digest,
+      "access_rows": app_consent.rows_for_manifest(manifest, capability_contract),
     })
 
 
@@ -3270,6 +3271,15 @@ async def _prepare_app_row(
     system_prompt_file=manifest.get("system_prompt") or None,
     capability_contract=capability_contract,
     project_templates_json=manifest.get("project_templates") or None,
+    # Apps that ship with the platform are accepted with it; every other
+    # Store install waits for the owner's first-open answer.
+    accepted_consent=(
+      app_consent.platform_acceptance(
+        capability_contract,
+        project_builders=bool(manifest.get("project_templates")),
+      )
+      if source == "bootstrap" else None
+    ),
   )
   db.add(app)
   db.flush()

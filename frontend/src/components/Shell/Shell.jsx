@@ -3174,6 +3174,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
         void chatAppArtifactQueries.detail.invalidate(queryClient, ev.chatId)
       }
       if (ev.appId) void appSourceQueries.invalidate(queryClient, ev.appId)
+      // An update (or a revoke) can change whether the app needs the owner's
+      // answer; the persisted consent status must not outlive that.
+      if (ev.appId) void appQueries.consent.invalidate(queryClient, ev.appId)
       const placementRequest = workspaceRequestFromSystemEvent(ev)
       // app_updated is also the reinstall event for a tombstoned store app,
       // while app_created may carry an integer id freed by TTL purge and reused

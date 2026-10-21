@@ -34,6 +34,12 @@ required by the advanced feature below. An installable app starts as a
 root-level repository package and is installed from its raw `mobius.json` URL;
 an ordinary local app stays on the quickstart path.
 
+A Store-installed app is dormant until the owner accepts what it asks for in
+one popup the first time they open it. Declare what the app needs in
+`mobius.json` as before; neither you nor the app can approve it. The rows and
+their wording are defined once by the platform (`CAPABILITIES.md`, "First-open
+consent for Store apps").
+
 ### Accepting a local chat-history scope for an installed app
 
 Editing and applying a Store-installed app's source never silently widens its

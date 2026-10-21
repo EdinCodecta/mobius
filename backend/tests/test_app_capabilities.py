@@ -1220,7 +1220,9 @@ def _runtime_refuses(contract):
   from app import app_services
 
   try:
-    app_services.service_contract(SimpleNamespace(capability_contract=contract), access="public")
+    app_services.service_contract(
+      SimpleNamespace(capability_contract=contract, manifest_url=None), access="public",
+    )
   except HTTPException as exc:
     assert exc.status_code == 503
     return True

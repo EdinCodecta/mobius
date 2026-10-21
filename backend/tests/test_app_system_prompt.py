@@ -1,5 +1,6 @@
 """Installed-app system-prompt composition and uninstall boundary."""
 from app.chat_writer import create_chat
+from test_app_fixtures import accept_app_consent
 
 from datetime import datetime, UTC
 import json
@@ -135,6 +136,10 @@ def test_install_persists_system_prompt_capability(
   app = db.query(models.App).filter(models.App.slug == "memory").one()
   assert app.system_prompt_file == "memory-core.md"
   assert response.json()["system_prompt_file"] == "memory-core.md"
+  # A Store app's instructions reach agents only after the owner accepted it.
+  assert "RETRIEVE ON DEMAND" not in compose_system_prompt("BASE", db)
+  accept_app_consent(client, auth, app.id)
+  db.expire_all()
   assert "RETRIEVE ON DEMAND" in compose_system_prompt("BASE", db)
 
 

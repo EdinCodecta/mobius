@@ -73,7 +73,7 @@ test('background persistence bounds inactive chat history to the cold page', () 
 })
 
 test('top-level domains persist by head segment', () => {
-  for (const head of ['chats', 'chat-messages', 'theme', 'apps']) {
+  for (const head of ['chats', 'chat-messages', 'theme', 'apps', 'app-consent']) {
     assert.equal(shouldPersistQueryKey([head]), true, `${head} should persist`)
   }
   // The head match ignores trailing segments (e.g. a chat id).
