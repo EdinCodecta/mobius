@@ -185,13 +185,16 @@ def rows_from_contract(
     ))
   service = contract.get("service") or {}
   public = contract.get("public") or {}
-  if service.get("access") in ("apps", "public") or public.get("network") or (
+  anyone = service.get("access") == "public" or public.get("network") or (
     (public.get("storage") or {}).get("read")
-  ):
+  )
+  if anyone or service.get("access") == "apps":
     rows.append(_row(
-      "reach", "Be reachable by other apps or the public",
-      "Lets other apps, or anyone without signing in, call its service or "
-      "see its published surface.",
+      "reach",
+      "Be reachable by anyone" if anyone else "Be reachable by other apps",
+      "Lets anyone, without signing in, call its service or see its published surface."
+      if anyone else "Lets your other installed apps call its service.",
+      level="public" if anyone else "apps", rank=2 if anyone else 1,
     ))
   if project_builders:
     rows.append(_row(

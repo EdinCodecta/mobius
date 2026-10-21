@@ -341,3 +341,25 @@ def test_notes_never_name_an_app_that_was_not_accepted(db):
   newcomer = _app(db, "asker", contract=_contract(github_access=True))
   (row,) = app_consent.build_request(db, newcomer)["rows"]
   assert "Silent" not in row["note"] and "No installed app holds this yet" in row["note"]
+
+
+def test_widening_from_app_only_to_public_asks_again(db):
+  def contract(**exposure):
+    c = _contract()
+    c["service"] = exposure.get("service", {})
+    c["public"] = exposure.get("public", {"network": []})
+    return c
+
+  apps_only = contract(service={"access": "apps"})
+  app = _app(db, "widener", contract=apps_only, accepted=app_consent.platform_acceptance(apps_only))
+  assert app_consent.status(app) == "accepted"
+  for wider in (
+    contract(service={"access": "public"}),
+    contract(service={"access": "apps"}, public={"network": [], "storage": {"read": True}}),
+    contract(service={"access": "apps"}, public={"network": ["example.com"]}),
+  ):
+    app.capability_contract = wider
+    assert app_consent.status(app) == "required"
+    assert [r["id"] for r in app_consent.needed_rows(app)] == ["reach"]
+    assert app_consent.request_digest(app_consent.current_rows(app)) != app_consent.request_digest(
+      app_consent.rows_from_contract(apps_only))
