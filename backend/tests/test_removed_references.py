@@ -166,12 +166,36 @@ def test_modules_that_resolve_names_dynamically_are_never_reported(repo, release
   assert _find(repo, baseline=_MOVED_BEFORE, release=release, local=local) == []
 
 
-def test_names_defined_inside_top_level_blocks_still_resolve(repo):
-  release = {**_MOVED_AFTER, "backend/app/install.py": (
-    "try:\n  import fast\nexcept ImportError:\n  def read_receipt():\n    return 1\n"
-  )}
+@pytest.mark.parametrize("install", [
+  "try:\n  import fast\nexcept ImportError:\n  def read_receipt():\n    return 1\n",
+  "type read_receipt = int\n",
+  "import os\nif (read_receipt := os.getenv('X')) is None:\n  pass\n",
+  # A form the reader does not model makes the module define every name.
+  "import os\nmatch os.name:\n  case 'posix':\n    def read_receipt():\n      return 1\n",
+])
+def test_names_defined_inside_top_level_blocks_still_resolve(repo, install):
+  release = {**_MOVED_AFTER, "backend/app/install.py": install}
   local = {"backend/app/voice.py": "from app import install\nVALUE = install.read_receipt\n"}
   assert _find(repo, baseline=_MOVED_BEFORE, release=release, local=local) == []
+
+
+@pytest.mark.parametrize("test", ["TYPE_CHECKING", "typing.TYPE_CHECKING"])
+def test_imports_only_type_checkers_read_are_never_reported(repo, test):
+  # The block never runs, so a moved name there cannot break the update.
+  local = {"backend/app/voice.py": (
+    f"import typing\nfrom typing import TYPE_CHECKING\nif {test}:\n"
+    "  from app.install import read_receipt\n"
+  )}
+  assert _find(repo, baseline=_MOVED_BEFORE, release=_MOVED_AFTER, local=local) == []
+
+
+def test_the_else_of_a_type_checking_block_still_runs(repo):
+  local = {"backend/app/voice.py": (
+    "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n  pass\n"
+    "else:\n  from app.install import read_receipt\n"
+  )}
+  found = _find(repo, baseline=_MOVED_BEFORE, release=_MOVED_AFTER, local=local)
+  assert [entry.split(" uses ")[1] for entry in found] == ["app.install.read_receipt"]
 
 
 def test_only_files_the_local_delta_changed_are_read(repo):

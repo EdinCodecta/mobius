@@ -141,6 +141,39 @@ def test_node_reports_without_complete_evidence_are_unavailable(tmp_path, cases,
   assert lt._read_node_report(report, exit_code, tmp_path).unavailable
 
 
+def _node_run(tmp_path: Path, name: str, cases: str, exit_code: int, **totals):
+  report = tmp_path / f"{name}.xml"
+  report.write_text(_node_report(cases, **totals))
+  return lt._read_node_report(report, exit_code, tmp_path)
+
+
+def test_a_frontend_file_that_no_longer_loads_fails_the_tests_that_passed_before(tmp_path):
+  # node --test reports a file that cannot load as one failure named after it.
+  before = _node_run(tmp_path, "before", _case(tmp_path, "uses lib"), 0, tests=1, **{"pass": 1})
+  after = _node_run(
+    tmp_path, "after", _case(tmp_path, "a.test.js", '<failure type="testCodeFailure"/>'), 1,
+    tests=1, fail=1,
+  )
+  report = lt.compare(["frontend/src/a.test.js"], before, after)
+  assert report["status"] == "regression"
+  assert report["regressions"] == ["frontend/src/a.test.js::test::uses lib"]
+
+
+def test_a_new_failure_beside_tests_that_still_ran_is_not_a_load_failure(tmp_path):
+  before = _node_run(
+    tmp_path, "before", _case(tmp_path, "kept") + _case(tmp_path, "renamed"), 0,
+    tests=2, **{"pass": 2},
+  )
+  after = _node_run(
+    tmp_path, "after",
+    _case(tmp_path, "kept") + _case(tmp_path, "new name", '<failure type="testCodeFailure"/>'), 1,
+    tests=2, **{"pass": 1, "fail": 1},
+  )
+  report = lt.compare(["frontend/src/a.test.js"], before, after)
+  assert report["status"] == "incomplete"
+  assert report["regressions"] == []
+
+
 _FAKE_NPM = """#!/bin/bash
 printf '%s\\n' "$@" > "$(dirname "$0")/../args-$$"
 for arg in "$@"; do

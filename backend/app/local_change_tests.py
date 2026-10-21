@@ -416,8 +416,27 @@ def newly_failing(before: LocalTestRun, after: LocalTestRun) -> list[str]:
   A test identity exists only for a test that executed and reported, so a
   suite that produced no evidence on either side adds nothing here while the
   suites that did run still count.
+
+  A frontend test file that cannot load on the candidate (the usual break
+  after a release removes an export it uses) reports one failure under its
+  own name instead of its tests. When a file fails and none of its baseline
+  tests ran on the candidate, each test that passed before counts as failing.
   """
-  return sorted(after.failed & before.passed)
+  broken = set(after.failed & before.passed)
+  ran = after.passed | after.failed | after.skipped
+  for file in {_frontend_file(ident) for ident in after.failed} - {None}:
+    baseline = {
+      ident for ident in before.passed | before.failed | before.skipped
+      if _frontend_file(ident) == file
+    }
+    if baseline and not baseline & ran:
+      broken |= {ident for ident in before.passed if _frontend_file(ident) == file}
+  return sorted(broken)
+
+
+def _frontend_file(ident: str) -> str | None:
+  """The test file of a frontend identity (``frontend/<file>::<suite>::<name>``)."""
+  return ident.split("::", 1)[0] if ident.startswith("frontend/") else None
 
 
 def describe(broken: list[str]) -> str:

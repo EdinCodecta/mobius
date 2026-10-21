@@ -12,8 +12,10 @@ tests, so names that were already dynamic or unresolvable never block an
 update. Resolution is static and deliberately conservative. A module with a
 module-level ``__getattr__`` or a star import is treated as defining every
 name, a module alias that the referring file rebinds anywhere is ignored, and
-references inside a handled ``try`` are never reported: an old-name import
-with a fallback to the new one works across a move, and the tests judge it.
+references inside a handled ``try`` or an ``if TYPE_CHECKING:`` block are
+never reported: an old-name import with a fallback to the new one works across
+a move, and the tests judge it. A module statement the reader does not model
+(such as ``match``) makes the module define every name.
 """
 
 from __future__ import annotations
@@ -38,6 +40,15 @@ _LOOKUP_HANDLERS = frozenset({
 def _module_name(path: str) -> str:
   parts = Path(path).with_suffix("").relative_to("backend").parts
   return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+
+
+_TYPE_ALIAS = getattr(ast, "TypeAlias", ())
+# Statements whose own bindings, if any, the walrus scan below covers.
+_BINDS_NOTHING_ITSELF = (
+  ast.Expr, ast.If, ast.While, ast.Try, ast.TryStar, ast.ExceptHandler, ast.Pass,
+  ast.Raise, ast.Assert, ast.Delete, ast.Global, ast.Nonlocal, ast.Return,
+  ast.Break, ast.Continue,
+)
 
 
 def _bound_names(body: list[ast.stmt]) -> set[str] | object:
@@ -77,9 +88,17 @@ def _bound_names(body: list[ast.stmt]) -> set[str] | object:
       if any(alias.name == "*" for alias in node.names):
         return _DYNAMIC
       names.update(alias.asname or alias.name for alias in node.names)
-    elif isinstance(node, ast.Expr) and isinstance(node.value, ast.NamedExpr):
-      targets(node.value.target)
+    elif isinstance(node, _TYPE_ALIAS):
+      targets(node.name)
+    elif not isinstance(node, _BINDS_NOTHING_ITSELF):
+      return _DYNAMIC  # A form this reader does not model, such as ``match``.
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+      # A walrus anywhere in the statement's own expressions binds here.
+      for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.expr):
+          for inner in ast.walk(child):
+            if isinstance(inner, ast.NamedExpr):
+              targets(inner.target)
       for field in ("body", "orelse", "finalbody", "handlers"):
         pending.extend(getattr(node, field, ()) or ())
   return names
@@ -138,7 +157,8 @@ def _catches_lookup(handler: ast.ExceptHandler) -> bool:
 
 
 def _guarded(tree: ast.Module) -> set[int]:
-  """Every node in the body of a ``try`` that has a lookup-catching handler.
+  """Every node in the body of a ``try`` that has a lookup-catching handler,
+  or of an ``if TYPE_CHECKING:`` block, which never runs.
 
   The position is lexical: whatever the body nests (a function, a lambda, a
   generator) counts, even when it runs after the ``try`` has finished. A
@@ -147,10 +167,18 @@ def _guarded(tree: ast.Module) -> set[int]:
   """
   guarded: set[int] = set()
   for node in ast.walk(tree):
-    if (isinstance(node, (ast.Try, ast.TryStar))
-        and any(_catches_lookup(handler) for handler in node.handlers)):
+    if ((isinstance(node, (ast.Try, ast.TryStar))
+         and any(_catches_lookup(handler) for handler in node.handlers))
+        or (isinstance(node, ast.If) and _is_type_checking(node.test))):
       guarded.update(id(child) for statement in node.body for child in ast.walk(statement))
   return guarded
+
+
+def _is_type_checking(test: ast.expr) -> bool:
+  """``if TYPE_CHECKING:`` or ``if typing.TYPE_CHECKING:``, whose body never runs."""
+  return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+    isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+  )
 
 
 class _Reference(NamedTuple):
