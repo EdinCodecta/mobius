@@ -74,6 +74,24 @@ async def _sync_app_skills(
   manifest: dict,
   warnings: list[str],
 ) -> None:
+  """Sync an app's skills; a dormant app's end up set aside, whatever happens.
+
+  Skills reach every agent, so they follow the owner's permission answer here,
+  at the one place every writer (install, update, apply) goes through.
+  """
+  try:
+    await _materialize_app_skills(db, app, manifest, warnings)
+  finally:
+    if app_consent.dormant(app):
+      warnings.extend(await deactivate_app_skills(app.id))
+
+
+async def _materialize_app_skills(
+  db: Session,
+  app: "models.App",
+  manifest: dict,
+  warnings: list[str],
+) -> None:
   """Materializes manifest-declared skill files into /data/shared/skills.
 
   Post-commit best-effort phase (same contract as cron): the app row is
@@ -365,17 +383,6 @@ async def deactivate_app_skills(app_id: int) -> list[str]:
   return warnings
 
 
-async def follow_consent(app: "models.App") -> list[str]:
-  """Keep an app's skills in step with its permission answer.
-
-  Skills reach every agent, so a dormant app's stay set aside (the same
-  tombstone uninstall uses) until the owner accepts.
-  """
-  if app_consent.dormant(app):
-    return await deactivate_app_skills(app.id)
-  return await restore_app_skills(app.id)
-
-
 def holds_restorable_skill(db: Session, skills_dir: Path, skill_id: str) -> bool:
   """Whether a set-aside app skill could still come back under ``skill_id``.
 
@@ -449,7 +456,13 @@ async def restore_app_skills(app_id: int) -> list[str]:
   the newer skill.
   """
   from app import skills as skills_mod
+  from app.database import SessionLocal
 
+  # A dormant app's skills stay set aside, whoever asks (recover, consent).
+  with SessionLocal() as db:
+    row = db.get(models.App, app_id)
+    if row is not None and app_consent.dormant(row):
+      return []
   warnings: list[str] = []
   skills_dir = Path(get_settings().data_dir) / "shared" / "skills"
   async with fs_locks.shared_skills_lock():

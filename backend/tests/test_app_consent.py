@@ -544,3 +544,63 @@ def test_installed_rows_use_the_installed_versions_templates():
   ).model_dump()
   assert "project_builders" in {r["id"] for r in preview["access_rows"]}
   assert "project_builders" not in {r["id"] for r in preview["installed_access_rows"]}
+
+
+def _install_dormant_skilled(client, auth):
+  from tests.test_app_skills import SKILL_V1, JSX, _install, _skill_manifest
+
+  installed = _install(client, auth, _skill_manifest(), {"index.jsx": JSX, "contributing.md": SKILL_V1})
+  assert installed.status_code == 201, installed.text
+  return installed.json()["id"]
+
+
+def test_recovering_a_dormant_app_does_not_publish_its_skills(
+  client, auth, owner_token, bypass_url_validation,
+):
+  from tests.test_app_skills import SKILL_V1, _skills_dir
+
+  app_id = _install_dormant_skilled(client, auth)
+  assert client.delete(f"/api/apps/{app_id}", headers=auth).status_code == 204
+  assert client.post(f"/api/apps/{app_id}/recover", headers=auth).status_code == 200
+  skill = _skills_dir() / "contributing.md"
+  assert not skill.exists()
+  headers = _owner_headers(client, owner_token)
+  digest = client.get(f"/api/apps/{app_id}/consent", headers=headers).json()["digest"]
+  assert client.post(f"/api/apps/{app_id}/consent", json={"digest": digest}, headers=headers).status_code == 200
+  assert skill.read_text() == SKILL_V1
+
+
+def test_a_sync_that_fails_after_writing_still_leaves_a_dormant_skill_aside(
+  client, auth, bypass_url_validation, monkeypatch,
+):
+  from app import app_skills
+  from tests.test_app_skills import _skills_dir
+
+  real = app_skills._regenerate_skills_index
+  calls = []
+
+  def fail_once(skills_dir):
+    calls.append(1)
+    if len(calls) == 1:
+      raise OSError("index write failed")
+    return real(skills_dir)
+
+  monkeypatch.setattr(app_skills, "_regenerate_skills_index", fail_once)
+  _install_dormant_skilled(client, auth)
+  assert len(calls) >= 2  # the sync failed after writing, and the cleanup still ran
+  assert not (_skills_dir() / "contributing.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_resyncing_a_dormant_app_keeps_its_skills_aside(
+  client, auth, db, bypass_url_validation,
+):
+  """Apply and update both resync through the same function."""
+  from app import app_skills
+  from tests.test_app_skills import _skill_manifest, _skills_dir
+
+  app_id = _install_dormant_skilled(client, auth)
+  app = db.get(models.App, app_id)
+  warnings = []
+  await app_skills._sync_app_skills(db, app, _skill_manifest(), warnings)
+  assert not (_skills_dir() / "contributing.md").exists()

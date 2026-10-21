@@ -113,7 +113,7 @@ from app.storage_io import atomic_write
 # `fetch_app_commit`, `_sync_app_skills` and `clear_pending_conflict_update`
 # here to reach the install path, and routes call `fetch_app_commit` and
 # apply calls `_sync_app_skills` through this module for the same reason.
-from app.app_skills import _sync_app_skills, follow_consent
+from app.app_skills import _sync_app_skills
 from app.git_transfers import (
   _stage, discard_staged, fetch_app_commit, git_transfer_root,
 )
@@ -3088,8 +3088,6 @@ async def _run_post_commit_effects(
   except Exception as exc:
     log.exception("install: skill sync failed post-commit")
     warnings.append(f"skills: sync failed — {exc!r}")
-  else:
-    warnings.extend(await follow_consent(app))
   if mode == "update" and app_consent.dormant(app) and (
     app_consent.accepted_rows(app) is not None
   ):

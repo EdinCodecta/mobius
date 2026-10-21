@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app import activity, app_consent, models
-from app.app_skills import follow_consent
+from app.app_skills import deactivate_app_skills, restore_app_skills
 from app.app_jobs import launch_app_job
 from app.broadcast import get_system_broadcast
 from app.database import get_db
@@ -86,7 +86,7 @@ async def accept_consent(
       "message": "The app's request changed after it was shown. Review it again.",
     })
   db.commit()
-  await follow_consent(app)
+  await restore_app_skills(app.id)
   activity.log_event(
     "app_consent", app_id=app.id, slug=app.slug, action="accepted",
     rows=[r["id"] for r in app.accepted_consent["rows"]],
@@ -111,7 +111,7 @@ async def revoke_consent(
     raise HTTPException(status_code=409, detail="This app does not use first-open consent.")
   app_consent.revoke(app)
   db.commit()
-  await follow_consent(app)
+  await deactivate_app_skills(app.id)
   activity.log_event("app_consent", app_id=app.id, slug=app.slug, action="revoked")
   get_system_broadcast().publish({"type": "app_updated", "appId": str(app.id)})
   return {"status": "required", "app_id": app.id}
