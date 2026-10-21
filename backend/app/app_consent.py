@@ -266,26 +266,18 @@ def accepted_rows(app: models.App) -> dict[str, dict[str, Any]] | None:
   record = app.accepted_consent
   if not isinstance(record, dict):
     return None
-  if isinstance(record.get("rows"), list):
-    return {
-      r["id"]: {"rank": int(r.get("rank") or 1), "scope": set(r.get("scope") or [])}
-      for r in record["rows"]
-    }
-  # Records written by the grandfathering migration hold a contract copy.
-  if isinstance(record.get("contract"), dict):
-    return {
-      r["id"]: {"rank": int(r.get("rank") or 1), "scope": set(r.get("scope") or [])}
-      for r in rows_from_contract(
-        record["contract"], project_builders=bool(record.get("project_builders")),
-      )
-    }
-  return None
-
-
-def accepted_ranks(app: models.App) -> dict[str, int] | None:
-  """Row id to accepted rank, or None when the app was never accepted."""
-  rows = accepted_rows(app)
-  return None if rows is None else {key: value["rank"] for key, value in rows.items()}
+  stored = record.get("rows")
+  if not isinstance(stored, list):
+    # Records written by the grandfathering migration hold a contract copy.
+    if not isinstance(record.get("contract"), dict):
+      return None
+    stored = rows_from_contract(
+      record["contract"], project_builders=bool(record.get("project_builders")),
+    )
+  return {
+    r["id"]: {"rank": int(r.get("rank") or 1), "scope": set(r.get("scope") or [])}
+    for r in stored
+  }
 
 
 def _covered(row: dict[str, Any], accepted: dict[str, dict[str, Any]]) -> bool:
@@ -310,11 +302,11 @@ def status(app: models.App) -> str:
   """``not_applicable``, ``required`` (ask first) or ``accepted``."""
   if not gated(app):
     return "not_applicable"
-  return "required" if needed_rows(app) or accepted_ranks(app) is None else "accepted"
+  return "required" if accepted_rows(app) is None or needed_rows(app) else "accepted"
 
 
 def never_accepted(app: models.App) -> bool:
-  return gated(app) and accepted_ranks(app) is None
+  return gated(app) and accepted_rows(app) is None
 
 
 def _holders(db: Session, app: models.App) -> dict[str, list[tuple[str, int]]]:
@@ -327,11 +319,11 @@ def _holders(db: Session, app: models.App) -> dict[str, list[tuple[str, int]]]:
   for other in others:
     if never_accepted(other):
       continue
-    ranks = accepted_ranks(other)
-    if ranks is None:
-      ranks = {r["id"]: int(r.get("rank") or 1) for r in current_rows(other)}
-    for row_id, rank in ranks.items():
-      held.setdefault(row_id, []).append((other.name, rank))
+    accepted = accepted_rows(other)
+    if accepted is None:  # a local app: what its contract asks for today
+      accepted = {r["id"]: {"rank": int(r.get("rank") or 1)} for r in current_rows(other)}
+    for row_id, row in accepted.items():
+      held.setdefault(row_id, []).append((other.name, row["rank"]))
   return held
 
 
@@ -374,7 +366,7 @@ def build_request(db: Session, app: models.App) -> dict[str, Any]:
     "app_name": app.name,
     "app_description": app.description,
     "digest": request_digest(current_rows(app)),
-    "is_update": accepted_ranks(app) is not None,
+    "is_update": accepted_rows(app) is not None,
     "rows": [{**row, "note": _note(row, held)} for row in needed_rows(app)],
     "baseline": BASELINE,
   }
