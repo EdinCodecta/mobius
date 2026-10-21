@@ -411,3 +411,25 @@ def test_an_update_that_widens_exposure_blocks_service_calls_until_accepted(db):
   with pytest.raises(HTTPException) as err:
     app_services.service_contract(app, access="public")
   assert err.value.status_code == 404
+
+
+def test_a_token_from_before_a_revoke_stays_dead_after_reaccepting(client, owner_token, db):
+  headers = _owner_headers(client, owner_token)
+  contract = _contract(github_access=True)
+  app = _app(db, "revived", contract=contract)
+  accept = lambda: client.post(
+    f"/api/apps/{app.id}/consent",
+    json={"digest": client.get(f"/api/apps/{app.id}/consent", headers=headers).json()["digest"]},
+    headers=headers,
+  )
+  assert accept().status_code == 200
+  token = client.post("/api/auth/app-token", json={"app_id": app.id}, headers=headers).json()["token"]
+  old = {"Authorization": f"Bearer {token}"}
+  assert client.get(f"/api/storage/apps/{app.id}/note.json", headers=old).status_code != 401
+  assert client.delete(f"/api/apps/{app.id}/consent", headers=headers).status_code == 200
+  assert accept().status_code == 200
+  assert client.get(f"/api/storage/apps/{app.id}/note.json", headers=old).status_code == 401
+  fresh = client.post("/api/auth/app-token", json={"app_id": app.id}, headers=headers).json()["token"]
+  assert client.get(
+    f"/api/storage/apps/{app.id}/note.json", headers={"Authorization": f"Bearer {fresh}"},
+  ).status_code != 401

@@ -661,9 +661,11 @@ stages the app. Source: `backend/app/app_consent.py`.
   token is not involved too: no job token, no system-prompt fragment, no agent
   tools. An app whose contract asks for more than was accepted gets no token,
   no job token and no service invocation either. Token validation
-  (`deps._enforce_app_scope`) refuses any app that needs consent, so revoking
-  ends sessions already issued without touching the app's install identity
-  (token nonce, storage generation, publications). The first acceptance starts
+  (`deps._enforce_app_scope`) refuses any app that needs consent, and every
+  app, job and service credential carries the id of the acceptance it was issued
+  under, so a token from before a revoke stays dead after re-accepting. Revoking
+  never touches the app's install identity (token nonce, storage generation,
+  publications). The first acceptance starts
   the `initialize_on_install` run that install could not.
 - **Who can answer.** `POST /api/apps/{id}/consent` takes the digest of the
   request that was shown and accepts only a human owner session

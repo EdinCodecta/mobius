@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 from datetime import UTC, datetime
 from typing import Any
 
@@ -255,6 +256,7 @@ def _record(rows: list[dict[str, Any]], via: str) -> dict[str, Any]:
   a new question. ``version`` names the row vocabulary for a future migration.
   """
   return {
+    "id": secrets.token_hex(8),
     "version": ROWS_VERSION,
     "rows": [_stored_row(r) for r in rows],
     "digest": request_digest(rows),
@@ -383,12 +385,23 @@ def accept(app: models.App, digest: str, *, via: str = "owner") -> bool:
   return True
 
 
+def session_id(app: models.App) -> str | None:
+  """Names the acceptance a credential was issued under (None for old records)."""
+  record = app.accepted_consent
+  return record.get("id") if isinstance(record, dict) else None
+
+
+def session_valid(app: models.App, claim: str | None) -> bool:
+  """Whether a credential issued under ``claim`` may act for the app now."""
+  return status(app) != "required" and claim == session_id(app)
+
+
 def revoke(app: models.App) -> None:
   """Make the app dormant again; the next open asks from scratch.
 
-  Sessions already issued stop working because token validation refuses a
-  required app (``deps._enforce_app_scope``), so the app's install identity,
-  storage generation and publications are left alone.
+  Credentials carry the id of the acceptance they were issued under, so a new
+  acceptance never revives an old one. The app's install identity (token nonce,
+  storage generation, publications) is left alone.
   """
   app.accepted_consent = None
 

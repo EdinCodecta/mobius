@@ -1136,6 +1136,7 @@ def service_environment(app, owner, service: dict, *, public: bool, browser: Bro
       owner.username,
       owner.token_epoch,
       app_nonce=app.token_nonce,
+      consent=app_consent.session_id(app),
       expires_delta=timedelta(minutes=5),
       service="public" if public else "private",
       browser=browser,

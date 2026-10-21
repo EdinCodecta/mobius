@@ -527,7 +527,7 @@ def _enforce_app_scope(payload: dict, db: Session) -> int | None:
   stamped = payload.get("app_nonce")
   if stamped is not None and stamped != app.token_nonce:
     raise HTTPException(status_code=401, detail="App token no longer valid.")
-  if app_consent.status(app) == "required":
+  if not app_consent.session_valid(app, payload.get("consent")):
     raise HTTPException(status_code=401, detail="App has not been approved.")
   return app_id
 

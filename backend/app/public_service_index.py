@@ -56,6 +56,9 @@ def _build(db: Session) -> dict[str, tuple[str, int]]:
     db.query(
       models.App.id, models.App.slug, models.App.service_id,
       models.App.capability_contract,
+      # What app_consent.status reads: a dormant app is not a public service.
+      models.App.manifest_url, models.App.accepted_consent,
+      models.App.project_templates_json,
     )
     .filter(models.App.deleted_at.is_(None))
     .all()
