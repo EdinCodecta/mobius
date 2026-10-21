@@ -163,3 +163,39 @@ def test_launcher_preserves_seed_when_live_helper_is_missing(tmp_path):
     _install_pm_commit_launcher(source, target)
 
   assert target.read_text() == "usable image copy\n"
+
+
+def test_a_root_shell_commits_as_the_repository_owner(tmp_path):
+  """A Recovery-style root shell is refused by Git ("dubious ownership") and
+  would leave root-owned objects, so the helper re-runs as the owner."""
+  work = tmp_path / "repo"
+  work.mkdir()
+  work, start = repo(work)
+  fake = tmp_path / "bin"
+  fake.mkdir()
+  log = tmp_path / "runuser.log"
+  # Root until the helper has switched users, then the owner.
+  (fake / "id").write_text('#!/bin/sh\n[ -n "$AS_OWNER" ] && echo 1000 || echo 0\n')
+  (fake / "runuser").write_text(
+    '#!/bin/sh\nprintf "%s\\n" "$@" > "$RUNUSER_LOG"\nshift 3\nexec env AS_OWNER=1 "$@"\n'
+  )
+  for name in ("id", "runuser"):
+    (fake / name).chmod(0o755)
+  (work / "owned.txt").write_text("repaired\n")
+
+  result = subprocess.run(
+    [str(SCRIPT), "--from", start, "save a recovery repair", "--", "owned.txt"],
+    env={
+      **os.environ, "PM_COMMIT_ROOT": str(work), "RUNUSER_LOG": str(log),
+      "PATH": f"{fake}:{os.environ['PATH']}",
+    },
+    capture_output=True,
+    text=True,
+  )
+
+  assert result.returncode == 0, result.stderr
+  owner = subprocess.run(
+    ["stat", "-c", "%U", str(work)], capture_output=True, text=True, check=True,
+  ).stdout.strip()
+  assert log.read_text().splitlines()[:3] == ["-u", owner, "--"]
+  assert git(work, "log", "-1", "--format=%s") == "save a recovery repair"

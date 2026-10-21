@@ -8,6 +8,14 @@
 set -euo pipefail
 cd "${PM_COMMIT_ROOT:-/data}"
 
+# A plain root shell, such as a Recovery session, cannot commit here: Git
+# refuses a repository owned by another user ("dubious ownership"), and
+# trusting it as root would leave root-owned objects that break the owner's
+# later commits. Commit as the repository's owner instead.
+if [ "$(id -u)" -eq 0 ] && [ "$(stat -c %U .)" != root ]; then
+  exec runuser -u "$(stat -c %U .)" -- "$0" "$@"
+fi
+
 DENY='^(agent-browser-profiles|compiled|logs|cron-logs|push|generated)(/|$)'
 
 usage() {

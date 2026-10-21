@@ -33,6 +33,12 @@ Either way the shell attaches to the normal live container; there is no
 separate Recovery boot profile. Never try to start or repair an in-container
 Recovery service; none should exist.
 
+That shell runs as root, so plain `git` refuses the owner's repositories
+("dubious ownership"). Save a repair with `pm-commit` (it commits as the
+repository's owner); never add `safe.directory` as root, which leaves
+root-owned objects that break later commits. Uncommitted repairs still run, but
+nothing records them for undo or a later update.
+
 ## Host-owned container replacement
 
 A container recreation is not an ordinary server restart. Use the Settings
