@@ -122,8 +122,8 @@ function MessageSources({
 // Pagination rebuilds reply groups around unchanged historical messages. The
 // source hook serializes every block group, so skip that work when its actual
 // inputs (rather than the freshly allocated wrapper arrays) are unchanged.
-// Absent inputs mean "none", exactly as the hook reads them, so a caller that
-// omits one renders no references instead of failing every later render.
+// Absent inputs mean "none", exactly as the hook reads them. That only keeps
+// a stale local caller from crashing; the update gate is what catches one.
 export function sameMessageSourcesProps(previous, next) {
   if (previous.chatId !== next.chatId || previous.disclosureKey !== next.disclosureKey) return false
   return sameItems(previous.groups, next.groups) && sameItems(previous.refs, next.refs)

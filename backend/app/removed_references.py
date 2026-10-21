@@ -11,9 +11,9 @@ does not on the candidate: the same pass-before/fail-after rule as the local
 tests, so names that were already dynamic or unresolvable never block an
 update. Resolution is static and deliberately conservative. A module with a
 module-level ``__getattr__`` or a star import is treated as defining every
-name, a module alias that the referring file rebinds anywhere is ignored, and a
-reference whose failed lookup an enclosing ``try`` catches is left to the
-tests: an old-name import with a fallback to the new one works across a move.
+name, a module alias that the referring file rebinds anywhere is ignored, and
+references inside a handled ``try`` are never reported: an old-name import
+with a fallback to the new one works across a move, and the tests judge it.
 """
 
 from __future__ import annotations
@@ -28,16 +28,11 @@ from app import app_git
 PACKAGE = "app"
 SOURCE_ROOT = "backend/app"
 _DYNAMIC = object()
-# The handler names that catch each failed lookup: the error itself and its
-# built-in bases. A broad handler counts: the static check cannot tell what
-# the fallback does, so it abstains.
-_CATCHERS = {
-  "AttributeError": frozenset({"AttributeError", "Exception", "BaseException"}),
-  "ImportError": frozenset({"ImportError", "Exception", "BaseException"}),
-  "ModuleNotFoundError": frozenset({
-    "ModuleNotFoundError", "ImportError", "Exception", "BaseException",
-  }),
-}
+# Handlers that can catch a failed lookup. A bare ``except`` counts too.
+_LOOKUP_HANDLERS = frozenset({
+  "AttributeError", "ImportError", "ModuleNotFoundError", "NameError",
+  "Exception", "BaseException",
+})
 
 
 def _module_name(path: str) -> str:
@@ -132,159 +127,42 @@ def _absolute(module: str, node: ast.ImportFrom, path: str) -> str | None:
   return ".".join([*base, *([node.module] if node.module else [])])
 
 
-def _caught(handler: ast.ExceptHandler) -> set[str]:
-  """Exception class names one handler names; a bare ``except`` catches all."""
+def _catches_lookup(handler: ast.ExceptHandler) -> bool:
   if handler.type is None:
-    return {"BaseException"}
+    return True
   kinds = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
-  return {
-    kind.id if isinstance(kind, ast.Name) else kind.attr
+  return any(
+    (kind.id if isinstance(kind, ast.Name) else kind.attr) in _LOOKUP_HANDLERS
     for kind in kinds if isinstance(kind, (ast.Name, ast.Attribute))
-  }
-
-
-def _is_generator(function: ast.FunctionDef) -> bool:
-  """Whether the function's own body yields (nested scopes do not count)."""
-  pending: list[ast.AST] = list(function.body)
-  while pending:
-    node = pending.pop()
-    if isinstance(node, (ast.Yield, ast.YieldFrom)):
-      return True
-    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-      pending.extend(ast.iter_child_nodes(node))
-  return False
-
-
-# Built-ins and methods that iterate their argument before returning.
-_CONSUMING_CALLS = frozenset({
-  "list", "tuple", "set", "frozenset", "dict", "sorted", "sum", "any", "all",
-  "min", "max", "next",
-})
-_CONSUMING_METHODS = frozenset({"join", "extend", "update"})
-
-
-def _consumes_arguments(call: ast.Call) -> bool:
-  if isinstance(call.func, ast.Name):
-    return call.func.id in _CONSUMING_CALLS
-  return isinstance(call.func, ast.Attribute) and call.func.attr in _CONSUMING_METHODS
-
-
-def _called_within(body: list[ast.stmt]) -> set[int]:
-  """Functions and lambdas a block both defines and calls.
-
-  Their bodies may run while the block is still executing, so a guard around
-  the block may cover them; the check abstains as it does for the block's own
-  statements. A lambda counts when it is called on the spot or bound to a
-  name the block calls. Calling an ``async def`` or a generator function
-  only creates a coroutine or generator, so those count only when the block
-  also runs it: awaits the coroutine (directly or as an argument of an
-  awaited call such as ``asyncio.gather``), or consumes the generator (loops
-  over it, unpacks it with ``*``, delegates with ``yield from``, or passes it
-  to a built-in that iterates its argument, such as ``list``). Any other call
-  may only store the generator, so it is no evidence the body ran.
-  """
-  nodes = [node for statement in body for node in ast.walk(statement)]
-  calls = [node for node in nodes if isinstance(node, ast.Call)]
-
-  def names(candidates) -> set[str]:
-    return {
-      call.func.id for call in candidates
-      if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
-    }
-
-  def arguments(call: ast.Call) -> list[ast.expr]:
-    return [*call.args, *(keyword.value for keyword in call.keywords)]
-
-  called = names(calls)
-  awaited_calls = [node.value for node in nodes
-                   if isinstance(node, ast.Await) and isinstance(node.value, ast.Call)]
-  awaited = names(awaited_calls) | names(
-    argument for call in awaited_calls for argument in arguments(call)
   )
-  consumed = names(
-    argument for call in calls if _consumes_arguments(call) for argument in arguments(call)
-  ) | names(
-    node.iter for node in nodes if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension))
-  ) | names(node.value for node in nodes if isinstance(node, (ast.YieldFrom, ast.Starred)))
-  found = {id(call.func) for call in calls if isinstance(call.func, ast.Lambda)}
-  for node in nodes:
-    if isinstance(node, ast.AsyncFunctionDef) and node.name in awaited:
-      found.add(id(node))
-    elif (isinstance(node, ast.FunctionDef)
-          and node.name in (consumed if _is_generator(node) else called)):
-      found.add(id(node))
-    elif (isinstance(node, ast.Assign) and isinstance(node.value, ast.Lambda)
-          and any(isinstance(target, ast.Name) and target.id in called
-                  for target in node.targets)):
-      found.add(id(node.value))
-  return found
 
 
-def _guards(tree: ast.Module) -> dict[int, frozenset[str]]:
-  """Exception names the enclosing ``try`` handlers catch when each node runs.
+def _guarded(tree: ast.Module) -> set[int]:
+  """Every node in the body of a ``try`` that has a lookup-catching handler.
 
-  A function or lambda body runs only when called. One the ``try`` body also
-  calls may run under that ``try``'s handlers and keeps their protection; any
-  other starts unguarded, because it can run after the ``try`` has finished.
-  ``try`` statements inside a body always count. Handlers, ``else`` and
-  ``finally`` are outside their own ``try``'s protection.
+  The position is lexical: whatever the body nests (a function, a lambda, a
+  generator) counts, even when it runs after the ``try`` has finished. A
+  missed break here is still caught by the tests; a false rejection would
+  block a working update, so the check abstains.
   """
-  guards: dict[int, frozenset[str]] = {}
-  # (node, handlers catching when it runs, callables run under those handlers)
-  pending: list[tuple[ast.AST, frozenset[str], frozenset[int]]] = [
-    (tree, frozenset(), frozenset()),
-  ]
-  while pending:
-    node, caught, run_here = pending.pop()
-    if caught:
-      guards[id(node)] = caught
-    if isinstance(node, (ast.Try, ast.TryStar)):
-      inner = caught.union(*(_caught(handler) for handler in node.handlers))
-      run_inner = run_here | _called_within(node.body)
-      pending.extend((statement, inner, run_inner) for statement in node.body)
-      pending.extend(
-        (part, caught, run_here)
-        for part in (*node.handlers, *node.orelse, *node.finalbody)
-      )
-      continue
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-      deferred = {id(statement) for statement in node.body}
-    elif isinstance(node, ast.Lambda):
-      deferred = {id(node.body)}
-    else:
-      deferred = set()
-    if id(node) in run_here:
-      deferred = set()
-    pending.extend(
-      (child, frozenset(), frozenset()) if id(child) in deferred else (child, caught, run_here)
-      for child in ast.iter_child_nodes(node)
-    )
-  return guards
+  guarded: set[int] = set()
+  for node in ast.walk(tree):
+    if (isinstance(node, (ast.Try, ast.TryStar))
+        and any(_catches_lookup(handler) for handler in node.handlers)):
+      guarded.update(id(child) for statement in node.body for child in ast.walk(statement))
+  return guarded
 
 
 class _Reference(NamedTuple):
   line: int
   module: str
   name: str
-  imported: bool  # ``from module import name``, not ``module.name``
-  caught: frozenset[str]  # what enclosing handlers catch when it runs
-
-
-def _absorbs(reference: _Reference, candidate: _Tree) -> bool:
-  """Whether a handler around ``reference`` catches the error its lookup raises."""
-  if not reference.imported:
-    raised = "AttributeError"
-  elif candidate.is_module(reference.module):
-    raised = "ImportError"
-  else:
-    raised = "ModuleNotFoundError"
-  return not reference.caught.isdisjoint(_CATCHERS[raised])
 
 
 def _references(tree: ast.Module, path: str, is_module) -> list[_Reference]:
   """Every name this file takes from the backend package."""
   module = _module_name(path)
-  guards = _guards(tree)
+  guarded = _guarded(tree)
   found: list[_Reference] = []
   # Every binding of a name: the backend module an import binds it to, or
   # None for any other binding. Repeating one import inside each function is
@@ -304,9 +182,8 @@ def _references(tree: ast.Module, path: str, is_module) -> list[_Reference]:
       for alias in node.names:
         if alias.name == "*":
           continue
-        found.append(_Reference(
-          node.lineno, source, alias.name, True, guards.get(id(node), frozenset()),
-        ))
+        if id(node) not in guarded:
+          found.append(_Reference(node.lineno, source, alias.name))
         target = f"{source}.{alias.name}"
         bind(alias.asname or alias.name, target if is_module(target) else None)
     elif isinstance(node, ast.Import):
@@ -337,11 +214,9 @@ def _references(tree: ast.Module, path: str, is_module) -> list[_Reference]:
   }
   for node in ast.walk(tree):
     if (isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
-        and isinstance(node.value, ast.Name) and node.value.id in stable):
-      found.append(_Reference(
-        node.lineno, stable[node.value.id], node.attr, False,
-        guards.get(id(node), frozenset()),
-      ))
+        and isinstance(node.value, ast.Name) and node.value.id in stable
+        and id(node) not in guarded):
+      found.append(_Reference(node.lineno, stable[node.value.id], node.attr))
   return found
 
 
@@ -373,8 +248,7 @@ def find(repo: Path, release: str, candidate: str, baseline: str) -> list[str]:
     except SyntaxError:
       continue  # The import probe owns syntax errors.
     for ref in _references(tree, path, is_module):
-      if (before.defines(ref.module, ref.name) and not after.defines(ref.module, ref.name)
-          and not _absorbs(ref, after)):
+      if before.defines(ref.module, ref.name) and not after.defines(ref.module, ref.name):
         removed.add((path, ref.line, f"{ref.module}.{ref.name}"))
   return [f"{path}:{line} uses {name}" for path, line, name in sorted(removed)]
 

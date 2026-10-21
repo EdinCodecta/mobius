@@ -108,41 +108,14 @@ def test_references_that_did_not_break_with_this_release_are_not_reported(repo, 
   "  try:\n    return install.read_receipt()\n"
   "  except AttributeError:\n    return pending_update.read_receipt()\n",
   "try:\n  from app.install import read_receipt\nexcept (ModuleNotFoundError, ImportError):\n  read_receipt = None\n",
+  "try:\n  from app.gone import thing\nexcept ModuleNotFoundError:\n  thing = None\n",
+  # Any handler that can catch a failed lookup counts, not only the exact error.
+  "try:\n  from app.install import read_receipt\nexcept AttributeError:\n  pass\n",
+  "from app import install\ntry:\n  VALUE = install.read_receipt\nexcept NameError:\n  pass\n",
+  "from app import install\ntry:\n  VALUE = install.read_receipt\nexcept builtins.Exception:\n  pass\n",
+  "from app import install\ntry:\n  VALUE = install.read_receipt\nexcept:\n  pass\n",
 ])
 def test_references_guarded_by_a_lookup_fallback_are_left_to_the_tests(repo, source):
-  local = {"backend/app/voice.py": source}
-  assert _find(repo, baseline=_MOVED_BEFORE, release=_MOVED_AFTER, local=local) == []
-
-
-@pytest.mark.parametrize("source", [
-  # A default value is read when the function is defined, inside the try.
-  "from app import install\ntry:\n  def read(receipt=install.read_receipt):\n    return receipt\n"
-  "except AttributeError:\n  read = None\n",
-  # A removed module raises ModuleNotFoundError, which this handler catches.
-  "try:\n  from app.gone import thing\nexcept ModuleNotFoundError:\n  thing = None\n",
-  # Callables the try itself calls run under its handler.
-  "from app import install\ntry:\n  VALUE = (lambda: install.read_receipt())()\n"
-  "except AttributeError:\n  VALUE = None\n",
-  "from app import install\ntry:\n  def read():\n    return install.read_receipt()\n"
-  "  VALUE = read()\nexcept AttributeError:\n  VALUE = None\n",
-  "from app import install\ntry:\n  read = lambda: install.read_receipt()\n"
-  "  VALUE = read()\nexcept AttributeError:\n  VALUE = None\n",
-  # A coroutine awaited inside the try runs under its handler.
-  "from app import install\n\nasync def main():\n  try:\n    async def read():\n"
-  "      return install.read_receipt()\n    return await read()\n"
-  "  except AttributeError:\n    return None\n",
-  "import asyncio\nfrom app import install\n\nasync def main():\n  try:\n    async def read():\n"
-  "      return install.read_receipt()\n    return await asyncio.gather(read())\n"
-  "  except AttributeError:\n    return None\n",
-  # A generator consumed inside the try runs under its handler.
-  "from app import install\ntry:\n  def items():\n    yield install.read_receipt()\n"
-  "  VALUE = list(items())\nexcept AttributeError:\n  VALUE = []\n",
-  "from app import install\ntry:\n  def items():\n    yield install.read_receipt()\n"
-  "  for item in items():\n    pass\nexcept AttributeError:\n  pass\n",
-  "from app import install\ntry:\n  def items():\n    yield install.read_receipt()\n"
-  "  VALUE = ', '.join(items())\nexcept AttributeError:\n  VALUE = ''\n",
-])
-def test_lookups_that_run_inside_a_matching_handler_are_left_to_the_tests(repo, source):
   baseline = {**_MOVED_BEFORE, "backend/app/gone.py": "thing = 1\n"}
   local = {"backend/app/voice.py": source}
   assert _find(repo, baseline=baseline, release=_MOVED_AFTER, local=local) == []
@@ -153,32 +126,22 @@ def test_lookups_that_run_inside_a_matching_handler_are_left_to_the_tests(repo, 
   "except Exception:\n  read = None\nVALUE = read()\n",
   "from app import install\ntry:\n  read = lambda: install.read_receipt()\n"
   "except AttributeError:\n  read = None\n",
-  # Calling an async def only creates the coroutine; it runs at the later await.
-  "from app import install\n\nasync def main():\n  try:\n    async def read():\n"
-  "      return install.read_receipt()\n    task = read()\n"
-  "  except AttributeError:\n    task = None\n  return await task\n",
-  # Calling a generator function runs nothing until it is iterated.
   "from app import install\ntry:\n  def items():\n    yield install.read_receipt()\n"
   "  values = items()\nexcept AttributeError:\n  values = ()\nVALUE = list(values)\n",
-  # Passing it to a call that only stores it does not run it either.
-  "from app import install\nHELD = []\ntry:\n  def items():\n    yield install.read_receipt()\n"
-  "  HELD.append(items())\nexcept AttributeError:\n  pass\nVALUE = list(HELD[0])\n",
 ])
-def test_a_function_body_is_not_guarded_by_the_try_that_defines_it(repo, source):
-  # The body runs when called, after the try has finished.
+def test_anything_nested_in_a_handled_try_is_left_to_the_tests(repo, source):
+  # The documented limit: the position is lexical, so a body the try only
+  # defines is not reported even though it runs later. The tests still run.
   local = {"backend/app/voice.py": source}
-  found = _find(repo, baseline=_MOVED_BEFORE, release=_MOVED_AFTER, local=local)
-  assert [entry.split(" uses ")[1] for entry in found] == ["app.install.read_receipt"]
+  assert _find(repo, baseline=_MOVED_BEFORE, release=_MOVED_AFTER, local=local) == []
 
 
 @pytest.mark.parametrize("source", [
-  # A moved name in a module that still exists raises ImportError.
-  "try:\n  from app.install import read_receipt\nexcept AttributeError:\n  pass\n",
-  "try:\n  from app.install import read_receipt\nexcept ModuleNotFoundError:\n  pass\n",
-  # A missing module attribute raises AttributeError.
-  "from app import install\ntry:\n  VALUE = install.read_receipt\nexcept ImportError:\n  pass\n",
+  "try:\n  pass\nexcept ImportError:\n  from app.install import read_receipt\n",
+  "try:\n  pass\nexcept ImportError:\n  pass\nelse:\n  from app.install import read_receipt\n",
+  "try:\n  pass\nexcept ImportError:\n  pass\nfinally:\n  from app.install import read_receipt\n",
 ])
-def test_a_handler_for_another_lookup_error_does_not_guard_a_moved_name(repo, source):
+def test_a_handler_else_or_finally_is_outside_its_own_try(repo, source):
   local = {"backend/app/voice.py": source}
   found = _find(repo, baseline=_MOVED_BEFORE, release=_MOVED_AFTER, local=local)
   assert [entry.split(" uses ")[1] for entry in found] == ["app.install.read_receipt"]
