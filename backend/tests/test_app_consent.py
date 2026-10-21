@@ -516,3 +516,31 @@ def test_every_preview_carries_proposed_and_installed_rows():
   ).model_dump()
   assert {r["id"] for r in preview["access_rows"]} == {"github_access", "manage_apps"}
   assert {r["id"] for r in preview["installed_access_rows"]} == {"github_access"}
+
+
+def test_a_runtime_limit_change_changes_the_row_text():
+  def rows(limit):
+    contract = _contract()
+    contract["runtime"] = {"device.asset-cache": {
+      "title": "Store large files", "description": "Download verified assets.",
+      "limits": {"max_bytes": limit}, "reason": None,
+    }}
+    return {r["id"]: r["text"] for r in app_consent.rows_from_contract(contract)}
+
+  assert rows(256 * 1024 * 1024)["device.asset-cache"] == (
+    "Download verified assets. Limits: max_bytes 256 MiB."
+  )
+  assert rows(2 * 1024 ** 3)["device.asset-cache"].endswith("max_bytes 2 GiB.")
+
+
+def test_installed_rows_use_the_installed_versions_templates():
+  from app import schemas
+
+  contract = _contract()
+  preview = schemas.AppPreviewOut(
+    manifest={"project_templates": [{"id": "x"}]}, capability_contract=contract,
+    capability_digest="d", installed_contract=contract, capability_diff={},
+    installed_project_templates=False,
+  ).model_dump()
+  assert "project_builders" in {r["id"] for r in preview["access_rows"]}
+  assert "project_builders" not in {r["id"] for r in preview["installed_access_rows"]}

@@ -11464,7 +11464,7 @@ def test_install_preview_sizes_files_while_reading_the_installed_contract(
   def read_installed_contract(_manifest, _source):
     # Awaited one after the other, the lookup would only start once this returns.
     assert sizing_started.wait(timeout=5)
-    return None
+    return None, False
 
   with patch.object(install, "package_download_bytes", sizing), patch(
     "app.routes.apps._installed_contract_for_preview", read_installed_contract,
