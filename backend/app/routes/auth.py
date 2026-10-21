@@ -548,7 +548,7 @@ def create_app_token_endpoint(
     raise HTTPException(status_code=404, detail="App not found.")
   # A Store-installed app is dormant until the owner accepts what it asks for
   # (app_consent.py). The shell answers this with its first-open popup.
-  if app_consent.status(app) == "required":
+  if app_consent.dormant(app):
     raise HTTPException(status_code=409, detail={
       "code": "consent_required",
       "message": "This app requires your approval before it opens.",
@@ -589,7 +589,7 @@ def create_app_job_token_endpoint(
   if not app:
     raise HTTPException(status_code=404, detail="App not found.")
   # Nothing of a Store app runs before the owner accepts what it asks for.
-  if app_consent.never_accepted(app):
+  if app_consent.dormant(app):
     raise HTTPException(status_code=409, detail={
       "code": "consent_required",
       "message": "This app has not been accepted yet.",

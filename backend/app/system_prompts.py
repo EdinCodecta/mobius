@@ -114,7 +114,7 @@ def fragment_sources(db: Session) -> tuple[FragmentSource, ...]:
       app.id, app.slug, app.source_dir, app.source_commit, app.system_prompt_file,
     )
     for app in rows
-    if not app_consent.never_accepted(app)
+    if not app_consent.dormant(app)
   )
 
 

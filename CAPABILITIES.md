@@ -654,19 +654,18 @@ stages the app. Source: `backend/app/app_consent.py`.
   (`owner`, `platform` for first-boot apps, `migration` for apps that existed
   before this shipped). Saving rows, not the contract, means rewording or
   re-deriving rows can never turn an old answer into a new question.
-- **When it asks.** The app token mint answers `409 consent_required` until the
-  app was never accepted or its contract now asks for a row, or a higher level
-  of a row, that the accepted answer does not cover. A narrower or equal request
-  never asks. Until an app was accepted at least once it is dormant everywhere a
-  token is not involved too: no job token, no system-prompt fragment, no agent
-  tools. An app whose contract asks for more than was accepted gets no token,
-  no job token and no service invocation either. Token validation
-  (`deps._enforce_app_scope`) refuses any app that needs consent, and every
-  app, job and service credential carries the id of the acceptance it was issued
-  under, so a token from before a revoke stays dead after re-accepting. Revoking
-  never touches the app's install identity (token nonce, storage generation,
-  publications). The first acceptance starts
-  the `initialize_on_install` run that install could not.
+- **When it asks.** An app is *dormant* (`app_consent.dormant`) until the owner
+  answers: it was never accepted, or its contract now asks for a row, or a
+  higher level of a row, that the accepted answer does not cover. A narrower or
+  equal request never asks. A dormant app gets no app or job token (`409
+  consent_required`), no service invocation, no system-prompt fragment and no
+  agent tools. Token validation (`deps._enforce_app_scope`) refuses a dormant
+  app, and every app, job and service credential carries the id of the
+  acceptance it was issued under, so a token from before a revoke stays dead
+  after re-accepting. Revoking never touches the app's install identity (token
+  nonce, storage generation, publications). The first acceptance starts the
+  `initialize_on_install` run that install could not; that job should be
+  idempotent, because a revoke followed by a new acceptance starts it again.
 - **Who can answer.** `POST /api/apps/{id}/consent` takes the digest of the
   request that was shown and accepts only a human owner session
   (`get_current_owner_for_owner_input`): agent runs, delegated helpers, apps and

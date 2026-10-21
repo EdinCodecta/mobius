@@ -433,3 +433,21 @@ def test_a_token_from_before_a_revoke_stays_dead_after_reaccepting(client, owner
   assert client.get(
     f"/api/storage/apps/{app.id}/note.json", headers={"Authorization": f"Bearer {fresh}"},
   ).status_code != 401
+
+
+def test_a_widened_update_pauses_every_surface_not_just_tokens(client, owner_token, db):
+  from app import app_tools, system_prompts
+
+  old = _service_contract()
+  app = _app(db, "paused", contract=old, accepted=app_consent.platform_acceptance(old))
+  app.system_prompt_file = "paused.md"
+  db.commit()
+  assert [s.slug for s in system_prompts.fragment_sources(db)] == ["paused"]
+  wider = _service_contract(github_access=True)
+  app.capability_contract = wider
+  db.commit()
+  assert not system_prompts.fragment_sources(db)
+  assert not app_tools.live_app_tools(db)
+  assert client.post(
+    "/api/auth/app-job-token", json={"app_id": app.id}, headers=_owner_headers(client, owner_token),
+  ).status_code == 409

@@ -883,7 +883,7 @@ def _reject_json_constant(value: str):
 
 def service_contract(app, *, access: str) -> dict:
   # Every service path passes here: a Store app is dormant until accepted.
-  if app_consent.status(app) == "required":
+  if app_consent.dormant(app):
     raise HTTPException(404, "App service not found.")
   contract = app.capability_contract if isinstance(app.capability_contract, dict) else {}
   service = contract.get("service")

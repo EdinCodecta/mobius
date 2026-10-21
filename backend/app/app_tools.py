@@ -89,7 +89,7 @@ def live_app_tools(db: Session) -> list[AppTool]:
     contract = app.capability_contract
     if not isinstance(contract, dict) or not isinstance(contract.get("service"), dict):
       continue
-    if app_consent.never_accepted(app):
+    if app_consent.dormant(app):
       continue
     for declaration in agent_tools_from_contract(contract):
       exposed = exposed_tool_name(app.slug, declaration["name"])

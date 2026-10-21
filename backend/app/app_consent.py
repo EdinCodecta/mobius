@@ -309,6 +309,12 @@ def status(app: models.App) -> str:
   return "required" if accepted_rows(app) is None or needed_rows(app) else "accepted"
 
 
+def dormant(app: models.App) -> bool:
+  """Whether the app must do nothing until the owner answers: its tokens,
+  jobs, service, agent tools and prompt fragment are all held back."""
+  return status(app) == "required"
+
+
 def never_accepted(app: models.App) -> bool:
   return gated(app) and accepted_rows(app) is None
 
@@ -393,7 +399,7 @@ def session_id(app: models.App) -> str | None:
 
 def session_valid(app: models.App, claim: str | None) -> bool:
   """Whether a credential issued under ``claim`` may act for the app now."""
-  return status(app) != "required" and claim == session_id(app)
+  return not dormant(app) and claim == session_id(app)
 
 
 def revoke(app: models.App) -> None:
