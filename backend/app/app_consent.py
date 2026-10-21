@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import secrets
 from datetime import UTC, datetime
 from typing import Any
 
@@ -156,7 +155,7 @@ def rows_from_contract(
     initialize = bool(background.get("initialize_on_install"))
     rows.append(_row(
       "background_job", "Run a background job",
-      f"{timing}{' and starts a run immediately after install' if initialize else ''}. "
+      f"{timing}{' and starts a run as soon as you allow it' if initialize else ''}. "
       "It runs as reviewed owner-installed code with Möbius process access and "
       "receives a short-lived app token for API calls.",
       rank=2 if scheduled else 1,
@@ -387,11 +386,11 @@ def accept(app: models.App, digest: str, *, via: str = "owner") -> bool:
 def revoke(app: models.App) -> None:
   """Make the app dormant again; the next open asks from scratch.
 
-  Rotating the token nonce ends every app and job session already issued, so
-  revoking takes effect at once, not when those credentials expire.
+  Sessions already issued stop working because token validation refuses a
+  required app (``deps._enforce_app_scope``), so the app's install identity,
+  storage generation and publications are left alone.
   """
   app.accepted_consent = None
-  app.token_nonce = secrets.token_hex(16)
 
 
 def platform_acceptance(

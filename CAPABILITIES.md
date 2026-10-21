@@ -650,8 +650,12 @@ stages the app. Source: `backend/app/app_consent.py`.
   of a row, that the accepted answer does not cover. A narrower or equal request
   never asks. Until an app was accepted at least once it is dormant everywhere a
   token is not involved too: no job token, no system-prompt fragment, no agent
-  tools and no service invocation. Revoking rotates the token nonce, so every
-  session already issued stops working at once.
+  tools. An app whose contract asks for more than was accepted gets no token,
+  no job token and no service invocation either. Token validation
+  (`deps._enforce_app_scope`) refuses any app that needs consent, so revoking
+  ends sessions already issued without touching the app's install identity
+  (token nonce, storage generation, publications). The first acceptance starts
+  the `initialize_on_install` run that install could not.
 - **Who can answer.** `POST /api/apps/{id}/consent` takes the digest of the
   request that was shown and accepts only a human owner session
   (`get_current_owner_for_owner_input`): agent runs, delegated helpers, apps and

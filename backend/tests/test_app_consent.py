@@ -280,7 +280,7 @@ def test_background_work_is_a_row_with_timing_and_authority():
   }
   (row,) = app_consent.rows_from_contract(contract)
   assert row["id"] == "background_job"
-  assert "0 6 * * *" in row["text"] and "immediately after install" in row["text"]
+  assert "0 6 * * *" in row["text"] and "as soon as you allow it" in row["text"]
   assert "process access" in row["text"]
 
 
@@ -363,3 +363,51 @@ def test_widening_from_app_only_to_public_asks_again(db):
     assert [r["id"] for r in app_consent.needed_rows(app)] == ["reach"]
     assert app_consent.request_digest(app_consent.current_rows(app)) != app_consent.request_digest(
       app_consent.rows_from_contract(apps_only))
+
+
+def test_revoke_and_reaccept_keep_the_apps_identity(client, owner_token, db):
+  headers = _owner_headers(client, owner_token)
+  contract = _contract(github_access=True)
+  app = _app(db, "identity", contract=contract, accepted=app_consent.platform_acceptance(contract))
+  nonce = app.token_nonce
+  assert client.delete(f"/api/apps/{app.id}/consent", headers=headers).status_code == 200
+  digest = client.get(f"/api/apps/{app.id}/consent", headers=headers).json()["digest"]
+  assert client.post(f"/api/apps/{app.id}/consent", json={"digest": digest}, headers=headers).status_code == 200
+  db.refresh(app)
+  assert app.token_nonce == nonce
+
+
+def test_first_acceptance_starts_the_install_time_run(client, owner_token, db, monkeypatch):
+  from app.routes import app_consent as route
+
+  launched = []
+  monkeypatch.setattr(route, "launch_app_job", lambda *a, **k: launched.append(a))
+  headers = _owner_headers(client, owner_token)
+  contract = _contract()
+  contract["background"] = {"job": "job.sh", "mode": "on_demand", "cron": None,
+                            "initialize_on_install": True}
+  app = _app(db, "firstrun", contract=contract)
+  digest = client.get(f"/api/apps/{app.id}/consent", headers=headers).json()["digest"]
+  assert client.post(f"/api/apps/{app.id}/consent", json={"digest": digest}, headers=headers).status_code == 200
+  assert len(launched) == 1 and str(launched[0][1]).endswith("firstrun/job.sh")
+  # A later re-accept after a widening does not run it again.
+  client.delete(f"/api/apps/{app.id}/consent", headers=headers)
+  digest = client.get(f"/api/apps/{app.id}/consent", headers=headers).json()["digest"]
+  client.post(f"/api/apps/{app.id}/consent", json={"digest": digest}, headers=headers)
+  assert len(launched) == 2  # revoke returns it to never-accepted, so it is a first acceptance again
+
+
+def test_an_update_that_widens_exposure_blocks_service_calls_until_accepted(db):
+  from fastapi import HTTPException
+  from app import app_services
+
+  apps_only = _service_contract()
+  apps_only["service"]["access"] = "apps"
+  app = _app(db, "wideservice", contract=apps_only, accepted=app_consent.platform_acceptance(apps_only))
+  app_services.service_contract(app, access="self")
+  widened = _service_contract()
+  widened["service"]["access"] = "public"
+  app.capability_contract = widened
+  with pytest.raises(HTTPException) as err:
+    app_services.service_contract(app, access="public")
+  assert err.value.status_code == 404

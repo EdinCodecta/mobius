@@ -8,7 +8,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from starlette.requests import HTTPConnection
 
-from app import access_signal, auth, browser_access, connect_outbound, models
+from app import access_signal, app_consent, auth, browser_access, connect_outbound, models
 from app.app_capabilities import storage_grant
 from app.browser_access import BrowserLineage
 from app.config import get_settings
@@ -527,6 +527,8 @@ def _enforce_app_scope(payload: dict, db: Session) -> int | None:
   stamped = payload.get("app_nonce")
   if stamped is not None and stamped != app.token_nonce:
     raise HTTPException(status_code=401, detail="App token no longer valid.")
+  if app_consent.status(app) == "required":
+    raise HTTPException(status_code=401, detail="App has not been approved.")
   return app_id
 
 
