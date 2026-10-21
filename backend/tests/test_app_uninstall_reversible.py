@@ -19,7 +19,7 @@ import pytest
 
 from app import models
 from app.config import get_settings
-from test_app_fixtures import write_git_package
+from test_app_fixtures import accept_app_consent, write_git_package
 
 JSX = "export default function App() { return <div>ok</div> }"
 
@@ -103,13 +103,10 @@ BASE = "https://raw.githubusercontent.com/x/app-revtest/main/"
 
 def _app_token(client, auth, app_id):
   """Mint the app's token, first accepting what it asks for (Store apps wait)."""
-  consent = client.get(f"/api/apps/{app_id}/consent", headers=auth).json()
-  if consent["status"] == "required":
-    accepted = client.post(
-      f"/api/apps/{app_id}/consent", json={"digest": consent["digest"]}, headers=auth,
-    )
-    assert accepted.status_code == 200, accepted.text
-  return _app_token(client, auth, app_id)
+  accept_app_consent(client, auth, app_id)
+  minted = client.post("/api/auth/app-token", headers=auth, json={"app_id": app_id})
+  assert minted.status_code == 200, minted.text
+  return minted.json()["token"]
 
 
 def _install(client, auth, manifest=MANIFEST, base=BASE):

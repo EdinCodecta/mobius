@@ -294,3 +294,50 @@ def test_background_escalation_asks_again(db):
                              "initialize_on_install": False}
   app.capability_contract = scheduled
   assert [r["id"] for r in app_consent.needed_rows(app)] == ["background_job"]
+
+
+def _service_contract(**data):
+  contract = _contract(**data)
+  contract["service"] = {"protocol": "json-v1", "entry": "service.py", "access": "self"}
+  contract["agent"]["tools"] = [{
+    "name": "lookup", "description": "Look something up.", "input_schema": {"type": "object"},
+  }]
+  return contract
+
+
+def test_a_never_accepted_app_adds_nothing_to_agents_or_services(db):
+  """Dormant means dormant: prompt fragment, tools and service wait for the answer."""
+  from fastapi import HTTPException
+  from app import app_services, app_tools, system_prompts
+
+  contract = _service_contract()
+  waiting = _app(db, "waiting", contract=contract)
+  waiting.system_prompt_file = "waiting.md"
+  accepted = _app(db, "answered", contract=contract, accepted=app_consent.platform_acceptance(contract))
+  accepted.system_prompt_file = "answered.md"
+  db.commit()
+
+  assert [s.slug for s in system_prompts.fragment_sources(db)] == ["answered"]
+  assert {t.app_id for t in app_tools.live_app_tools(db)} == {accepted.id}
+  with pytest.raises(HTTPException) as refused:
+    app_services.service_contract(waiting, access="self")
+  assert refused.value.status_code == 404
+  assert app_services.service_contract(accepted, access="self")["entry"] == "service.py"
+
+
+def test_revoking_ends_sessions_that_were_already_issued(client, owner_token, db):
+  headers = _owner_headers(client, owner_token)
+  contract = _contract(github_access=True)
+  app = _app(db, "sessions", contract=contract, accepted=app_consent.platform_acceptance(contract))
+  token = client.post("/api/auth/app-token", json={"app_id": app.id}, headers=headers).json()["token"]
+  app_headers = {"Authorization": f"Bearer {token}"}
+  assert client.get(f"/api/storage/apps/{app.id}/note.json", headers=app_headers).status_code != 401
+  assert client.delete(f"/api/apps/{app.id}/consent", headers=headers).status_code == 200
+  assert client.get(f"/api/storage/apps/{app.id}/note.json", headers=app_headers).status_code == 401
+
+
+def test_notes_never_name_an_app_that_was_not_accepted(db):
+  _app(db, "silent", contract=_contract(github_access=True))
+  newcomer = _app(db, "asker", contract=_contract(github_access=True))
+  (row,) = app_consent.build_request(db, newcomer)["rows"]
+  assert "Silent" not in row["note"] and "No installed app holds this yet" in row["note"]

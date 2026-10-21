@@ -24,7 +24,7 @@ from typing import Any
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app import app_services, models
+from app import app_consent, app_services, models
 from app.app_capabilities import agent_tools_from_contract
 
 
@@ -88,6 +88,8 @@ def live_app_tools(db: Session) -> list[AppTool]:
   for app in rows:
     contract = app.capability_contract
     if not isinstance(contract, dict) or not isinstance(contract.get("service"), dict):
+      continue
+    if app_consent.never_accepted(app):
       continue
     for declaration in agent_tools_from_contract(contract):
       exposed = exposed_tool_name(app.slug, declaration["name"])

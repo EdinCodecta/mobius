@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 from datetime import UTC, datetime
 from typing import Any
 
@@ -324,6 +325,8 @@ def _holders(db: Session, app: models.App) -> dict[str, list[tuple[str, int]]]:
     .all()
   )
   for other in others:
+    if never_accepted(other):
+      continue
     ranks = accepted_ranks(other)
     if ranks is None:
       ranks = {r["id"]: int(r.get("rank") or 1) for r in current_rows(other)}
@@ -387,8 +390,13 @@ def accept(app: models.App, digest: str, *, via: str = "owner") -> bool:
 
 
 def revoke(app: models.App) -> None:
-  """Make the app dormant again; the next open asks from scratch."""
+  """Make the app dormant again; the next open asks from scratch.
+
+  Rotating the token nonce ends every app and job session already issued, so
+  revoking takes effect at once, not when those credentials expire.
+  """
   app.accepted_consent = None
+  app.token_nonce = secrets.token_hex(16)
 
 
 def platform_acceptance(

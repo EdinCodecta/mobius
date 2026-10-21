@@ -36,7 +36,7 @@ from typing import Callable
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
-from app import app_git, models
+from app import app_consent, app_git, models
 from app.config import get_settings
 
 log = logging.getLogger("moebius.chat")
@@ -108,11 +108,13 @@ def fragment_sources(db: Session) -> tuple[FragmentSource, ...]:
     .order_by(models.App.id.asc())
     .all()
   )
+  # A Store app's instructions reach agents only after the owner accepted it.
   return tuple(
     FragmentSource(
       app.id, app.slug, app.source_dir, app.source_commit, app.system_prompt_file,
     )
     for app in rows
+    if not app_consent.never_accepted(app)
   )
 
 

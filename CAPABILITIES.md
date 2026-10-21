@@ -648,7 +648,10 @@ stages the app. Source: `backend/app/app_consent.py`.
 - **When it asks.** The app token mint answers `409 consent_required` until the
   app was never accepted or its contract now asks for a row, or a higher level
   of a row, that the accepted answer does not cover. A narrower or equal request
-  never asks. Job tokens are refused until an app was accepted at least once.
+  never asks. Until an app was accepted at least once it is dormant everywhere a
+  token is not involved too: no job token, no system-prompt fragment, no agent
+  tools and no service invocation. Revoking rotates the token nonce, so every
+  session already issued stops working at once.
 - **Who can answer.** `POST /api/apps/{id}/consent` takes the digest of the
   request that was shown and accepts only a human owner session
   (`get_current_owner_for_owner_input`): agent runs, delegated helpers, apps and
