@@ -165,37 +165,52 @@ def test_launcher_preserves_seed_when_live_helper_is_missing(tmp_path):
   assert target.read_text() == "usable image copy\n"
 
 
-def test_a_root_shell_commits_as_the_repository_owner(tmp_path):
+def _root_shell(tmp_path):
+  """Fake a root shell over a repository owned by "owner" (uid 1000).
+
+  ``stat`` reports that owner even when the tests themselves run as root,
+  where the temporary repository really is root-owned.
+  """
+  fake = tmp_path / "bin"
+  fake.mkdir()
+  # Root until the helper has switched users, then the owner.
+  (fake / "id").write_text('#!/bin/sh\n[ -n "$AS_OWNER" ] && echo 1000 || echo 0\n')
+  (fake / "stat").write_text(
+    '#!/bin/sh\n'
+    'case "$2" in %u) echo 1000 ;; %U) echo owner ;; *) exec /usr/bin/stat "$@" ;; esac\n'
+  )
+  (fake / "runuser").write_text(
+    '#!/bin/sh\nprintf "%s\\n" "$@" > "$RUNUSER_LOG"\nshift 3\nexec env AS_OWNER=1 "$@"\n'
+  )
+  for name in ("id", "stat", "runuser"):
+    (fake / name).chmod(0o755)
+  return fake
+
+
+@pytest.mark.parametrize("relative_root", [False, True])
+def test_a_root_shell_commits_as_the_repository_owner(tmp_path, relative_root):
   """A Recovery-style root shell is refused by Git ("dubious ownership") and
   would leave root-owned objects, so the helper re-runs as the owner."""
   work = tmp_path / "repo"
   work.mkdir()
   work, start = repo(work)
-  fake = tmp_path / "bin"
-  fake.mkdir()
+  fake = _root_shell(tmp_path)
   log = tmp_path / "runuser.log"
-  # Root until the helper has switched users, then the owner.
-  (fake / "id").write_text('#!/bin/sh\n[ -n "$AS_OWNER" ] && echo 1000 || echo 0\n')
-  (fake / "runuser").write_text(
-    '#!/bin/sh\nprintf "%s\\n" "$@" > "$RUNUSER_LOG"\nshift 3\nexec env AS_OWNER=1 "$@"\n'
-  )
-  for name in ("id", "runuser"):
-    (fake / name).chmod(0o755)
   (work / "owned.txt").write_text("repaired\n")
 
   result = subprocess.run(
     [str(SCRIPT), "--from", start, "save a recovery repair", "--", "owned.txt"],
+    cwd=str(tmp_path),
     env={
-      **os.environ, "PM_COMMIT_ROOT": str(work), "RUNUSER_LOG": str(log),
-      "PATH": f"{fake}:{os.environ['PATH']}",
+      **os.environ, "PM_COMMIT_ROOT": "repo" if relative_root else str(work),
+      "RUNUSER_LOG": str(log), "PATH": f"{fake}:{os.environ['PATH']}",
     },
     capture_output=True,
     text=True,
   )
 
   assert result.returncode == 0, result.stderr
-  owner = subprocess.run(
-    ["stat", "-c", "%U", str(work)], capture_output=True, text=True, check=True,
-  ).stdout.strip()
-  assert log.read_text().splitlines()[:3] == ["-u", owner, "--"]
+  assert log.read_text().splitlines()[:5] == [
+    "-u", "owner", "--", str(SCRIPT), "--from",
+  ]
   assert git(work, "log", "-1", "--format=%s") == "save a recovery repair"

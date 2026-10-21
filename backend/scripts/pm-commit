@@ -12,8 +12,9 @@ cd "${PM_COMMIT_ROOT:-/data}"
 # refuses a repository owned by another user ("dubious ownership"), and
 # trusting it as root would leave root-owned objects that break the owner's
 # later commits. Commit as the repository's owner instead.
-if [ "$(id -u)" -eq 0 ] && [ "$(stat -c %U .)" != root ]; then
-  exec runuser -u "$(stat -c %U .)" -- "$0" "$@"
+# Pass the resolved root on, so a relative one is not resolved a second time.
+if [ "$(id -u)" -eq 0 ] && [ "$(stat -c %u .)" -ne 0 ]; then
+  exec env PM_COMMIT_ROOT="$PWD" runuser -u "$(stat -c %U .)" -- "$0" "$@"
 fi
 
 DENY='^(agent-browser-profiles|compiled|logs|cron-logs|push|generated)(/|$)'
