@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, text
 
 from app import app_consent, auth, models
 from app.schema_migrations import _add_app_accepted_consent
+from tests.test_apps_install import _stub_resolver_run_chat, bypass_url_validation  # noqa: F401
 
 STORE_URL = "https://example.test/store-app/mobius.json"
 
@@ -451,3 +452,67 @@ def test_a_widened_update_pauses_every_surface_not_just_tokens(client, owner_tok
   assert client.post(
     "/api/auth/app-job-token", json={"app_id": app.id}, headers=_owner_headers(client, owner_token),
   ).status_code == 409
+
+
+def test_a_dormant_apps_skills_wait_for_acceptance(client, auth, owner_token, bypass_url_validation):
+  from tests.test_app_skills import SKILL_V1, JSX, _install, _skill_manifest, _skills_dir
+
+  installed = _install(client, auth, _skill_manifest(), {"index.jsx": JSX, "contributing.md": SKILL_V1})
+  assert installed.status_code == 201, installed.text
+  app_id = installed.json()["id"]
+  skill = _skills_dir() / "contributing.md"
+  assert not skill.exists()  # installed, but dormant: agents do not see it yet
+  headers = _owner_headers(client, owner_token)
+  digest = client.get(f"/api/apps/{app_id}/consent", headers=headers).json()["digest"]
+  assert client.post(f"/api/apps/{app_id}/consent", json={"digest": digest}, headers=headers).status_code == 200
+  assert skill.read_text() == SKILL_V1
+  assert client.delete(f"/api/apps/{app_id}/consent", headers=headers).status_code == 200
+  assert not skill.exists()
+
+
+def test_an_update_that_pauses_an_accepted_app_notifies_the_owner(
+  client, auth, owner_token, db, bypass_url_validation,
+):
+  import json as _json
+  from unittest.mock import patch
+
+  from app import models as m
+  from tests.test_app_skills import BASE, JSX, _fake_async_client, _skill_manifest
+
+  def serve(manifest):
+    responses = {BASE + "mobius.json": (200, _json.dumps(manifest).encode()),
+                 BASE + "index.jsx": (200, JSX.encode()),
+                 BASE + "contributing.md": (200, b"# c\n")}
+    return patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses))
+
+  with serve(_skill_manifest()):
+    app_id = client.post("/api/apps/install", headers=auth, json={"manifest_url": BASE + "mobius.json"}).json()["id"]
+  headers = _owner_headers(client, owner_token)
+  digest = client.get(f"/api/apps/{app_id}/consent", headers=headers).json()["digest"]
+  client.post(f"/api/apps/{app_id}/consent", json={"digest": digest}, headers=headers)
+
+  wider = _skill_manifest(version="2.0.0", permissions={
+    "cross_app_access": "none", "share_with_apps": "none", "github_access": True})
+  with serve(wider):
+    update = client.post("/api/apps/install", headers=auth, json={"manifest_url": BASE + "mobius.json"})
+    if update.status_code == 409:  # the platform asks the caller to confirm the new access
+      update = client.post("/api/apps/install", headers=auth, json={
+        "manifest_url": BASE + "mobius.json",
+        "reviewed_capability_digest": update.json()["detail"]["preview"]["capability_digest"]})
+  assert update.status_code in (200, 201), update.text
+  assert app_consent.dormant(db.get(m.App, app_id))
+  note = db.query(m.Notification).filter(m.Notification.source_id == str(app_id)).one()
+  assert "needs your approval" in note.title
+
+
+def test_every_preview_carries_proposed_and_installed_rows():
+  from app import schemas
+
+  old = _contract(github_access=True)
+  new = _contract(github_access=True, manage_apps=True)
+  preview = schemas.AppPreviewOut(
+    manifest={}, capability_contract=new, capability_digest="d",
+    installed_contract=old, capability_diff={},
+  ).model_dump()
+  assert {r["id"] for r in preview["access_rows"]} == {"github_access", "manage_apps"}
+  assert {r["id"] for r in preview["installed_access_rows"]} == {"github_access"}

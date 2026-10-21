@@ -22,7 +22,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from app import data_git, fs_locks, models, settled
+from app import app_consent, data_git, fs_locks, models, settled
 from app.config import get_settings
 from app.manifest_contract import SKILL_MAX_BYTES as _CONTRACT_SKILL_MAX_BYTES
 from app.manifest_contract import skill_member_paths
@@ -363,6 +363,17 @@ async def deactivate_app_skills(app_id: int) -> list[str]:
     # mutation's newer index.
     _regenerate_skills_index(skills_dir)
   return warnings
+
+
+async def follow_consent(app: "models.App") -> list[str]:
+  """Keep an app's skills in step with its permission answer.
+
+  Skills reach every agent, so a dormant app's stay set aside (the same
+  tombstone uninstall uses) until the owner accepts.
+  """
+  if app_consent.dormant(app):
+    return await deactivate_app_skills(app.id)
+  return await restore_app_skills(app.id)
 
 
 def holds_restorable_skill(db: Session, skills_dir: Path, skill_id: str) -> bool:

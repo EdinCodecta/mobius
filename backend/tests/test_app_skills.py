@@ -37,6 +37,15 @@ from tests.test_apps_install import (  # noqa: F401
 from tests.test_skills_platform import _fake_fetch
 
 BASE = "https://skills.test/repo/"
+
+
+@pytest.fixture(autouse=True)
+def _sync_tests_are_not_about_consent(monkeypatch):
+  """These tests pin the sync machinery; consent has its own tests."""
+  from app import app_consent
+
+  monkeypatch.setattr(app_consent, "dormant", lambda app: False)
+
 SKILL_V1 = "# contributing v1\nStudy existing work first.\n"
 SKILL_V2 = "# contributing v2\nStage the plan, then the green light.\n"
 SKILL_AGENT = "# contributing v1\nMy own hard-won addendum.\n"

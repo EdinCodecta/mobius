@@ -666,6 +666,11 @@ stages the app. Source: `backend/app/app_consent.py`.
   nonce, storage generation, publications). The first acceptance starts the
   `initialize_on_install` run that install could not; that job should be
   idempotent, because a revoke followed by a new acceptance starts it again.
+  Install stages the rest the same way: a dormant app's shared skills are set
+  aside (`app_skills.follow_consent`, the tombstone uninstall uses) and come
+  back on acceptance, scheduled runs log `skipped: waiting for owner approval`
+  instead of timing out, and an update that pauses an accepted app sends the
+  owner one notification so an app they rarely open does not stop silently.
 - **Who can answer.** `POST /api/apps/{id}/consent` takes the digest of the
   request that was shown and accepts only a human owner session
   (`get_current_owner_for_owner_input`): agent runs, delegated helpers, apps and
