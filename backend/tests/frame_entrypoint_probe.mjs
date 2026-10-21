@@ -2,8 +2,20 @@
 // come from app-frame.html; declaration ranges are parsed, never brace-sliced.
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const { parse } = createRequire(import.meta.url)('acorn')
+// acorn is a frontend dependency: resolve it from the frontend tree (CI installs
+// it there) or the explicitly supplied one, as check-built-globals.mjs does.
+const configuredModules = process.env.MOBIUS_FRONTEND_NODE_MODULES
+const dependencyRoot = configuredModules
+  ? path.resolve(
+      path.basename(configuredModules) === 'node_modules'
+        ? path.dirname(configuredModules)
+        : configuredModules,
+    )
+  : path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../frontend')
+const { parse } = createRequire(path.join(dependencyRoot, 'package.json'))('acorn')
 const options = JSON.parse(readFileSync(0, 'utf8'))
 const scripts = [...options.html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)]
   .map(([, attributes, source]) => ({
