@@ -12,6 +12,7 @@ import { clearReadingPositions } from '../components/ChatView/scroll/readingPosi
 import { clearDurableComposerDrafts } from '../components/ChatView/composerDraft.js'
 import { clearChatOutbox } from '../components/ChatView/chatOutbox.js'
 import { setActiveSharedBrowserGrantId, sharedBrowserCacheBuster } from '../lib/sharedBrowserWorkspace.js'
+import { notifyAppSignedOut } from '../lib/nativeSession.js'
 import {
   reportNetworkReachable,
   verifyConnectivity,
@@ -335,6 +336,39 @@ export async function clearExpiredOwnerSession() {
   await clearOwnerClientState({ preserveChatOutbox: true })
 }
 
+// Whether a rejected owner credential was cancelled before its own expiry (for
+// example "sign out everywhere"), as opposed to simply timing out.
+function credentialEndedEarly(credential, now = Date.now()) {
+  try {
+    const encoded = String(credential || '').split('.')[1]
+    if (!encoded) return false
+    const normalized = encoded.replace(/-/g, '+').replace(/_/g, '/')
+    const payload = JSON.parse(atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=')))
+    const expiresAt = Number(payload?.exp) * 1000
+    return Number.isFinite(expiresAt) && expiresAt > now
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The one place the shell ends an owner session it found expired or revoked:
+ * retire the credential, then reload into the sign-in screen. The reload is
+ * deferred one tick so callers' error handling can settle first.
+ *
+ * Only a credential cancelled early is handed to the Möbius phone app (it
+ * signs its own account out, closes the page and shows its start screen). An
+ * ordinary timeout is not: the app's own sign-in outlives the workspace
+ * credential, so signing it out would only add a second sign-in.
+ */
+export async function endExpiredOwnerSession({ credential } = {}) {
+  await clearExpiredOwnerSession()
+  // A shared-browser guest is not the app's account holder.
+  if (!sharedBrowserEnabled && credentialEndedEarly(credential)
+      && await notifyAppSignedOut()) return
+  setTimeout(() => window.location.reload(), 100)
+}
+
 // Remove browser-local queues and mirrors after an explicit app-data wipe.
 // Soft uninstall intentionally preserves these records so Undo can restore
 // offline work. The runtime owns the IndexedDB schemas, so keep the record
@@ -565,13 +599,11 @@ export async function apiFetch(path, options = {}) {
     // Keep accepted chat intent through an expired credential. Each record is
     // partitioned by owner+epoch and can only replay after a matching login;
     // explicit Settings logout still uses the default full wipe.
-    await clearExpiredOwnerSession()
-    // Defer reload one tick and throw a typed error so callers'
-    // try/catch/finally blocks run (stopping spinners) before the
-    // page goes away. Previously we returned a never-resolving
-    // promise, which left finally{} clauses dangling for the entire
-    // reload window — visible as stuck loading state.
-    setTimeout(() => window.location.reload(), 100)
+    await endExpiredOwnerSession({ credential: ownerTokenAtSend })
+    // Throw a typed error so callers' try/catch/finally blocks run (stopping
+    // spinners) before the page goes away. Previously we returned a
+    // never-resolving promise, which left finally{} clauses dangling for the
+    // entire reload window — visible as stuck loading state.
     throw new Error('AUTH_EXPIRED')
   }
 

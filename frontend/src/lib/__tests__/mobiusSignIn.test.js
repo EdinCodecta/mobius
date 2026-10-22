@@ -6,6 +6,7 @@ import {
   recordSignInRedirect,
   shouldRedirectToMobiusSignIn,
 } from '../mobiusSignIn.js'
+import { handOffExplicitSignOut, resetNativeSessionForTests } from '../nativeSession.js'
 
 function memoryStores() {
   return { local: memoryStorage(), session: memoryStorage() }
@@ -34,6 +35,33 @@ test('an explicit sign-out keeps the card so the owner is not signed straight ba
   const stores = memoryStores()
   markExplicitSignOut(stores)
   assert.equal(shouldRedirectToMobiusSignIn({ authMode: 'mobius', stores }), false)
+})
+
+test('inside the phone app a sign-out the app took over does not ask for another tap', () => {
+  // Signing in to the app again is the deliberate way back.
+  const stores = memoryStores()
+  markExplicitSignOut(stores, { handedToApp: true })
+  assert.equal(shouldRedirectToMobiusSignIn({ authMode: 'mobius', appOwnsSignOut: true, stores }), true)
+})
+
+test('inside the phone app an ordinary explicit sign-out still keeps the card', () => {
+  // The app did not take this sign-out over and may still be signed in.
+  const stores = memoryStores()
+  markExplicitSignOut(stores)
+  assert.equal(shouldRedirectToMobiusSignIn({ authMode: 'mobius', appOwnsSignOut: true, stores }), false)
+})
+
+test('a browser keeps the card even for a sign-out an app took over', () => {
+  const stores = memoryStores()
+  markExplicitSignOut(stores, { handedToApp: true })
+  assert.equal(shouldRedirectToMobiusSignIn({ authMode: 'mobius', stores }), false)
+})
+
+test('the phone app still gets the card after a sign-in round trip that did not finish', () => {
+  const stores = memoryStores()
+  markExplicitSignOut(stores, { handedToApp: true })
+  recordSignInRedirect(stores)
+  assert.equal(shouldRedirectToMobiusSignIn({ authMode: 'mobius', appOwnsSignOut: true, stores }), false)
 })
 
 test('coming back from mobius.you without signing in shows the card instead of looping', () => {
@@ -105,4 +133,33 @@ test('an explicit sign-out drops an older session-expired flag so the card does 
   stores.session.setItem('auth_expired', '1')
   markExplicitSignOut(stores)
   assert.equal(stores.session.getItem('auth_expired'), null)
+})
+
+function phoneApp(signOut) {
+  resetNativeSessionForTests()
+  return { MobiusNative: { signOut } }
+}
+
+function redirectsInApp(stores) {
+  return shouldRedirectToMobiusSignIn({ authMode: 'mobius', appOwnsSignOut: true, stores })
+}
+
+test('a sign-out the app takes over lets the app sign straight back in later', async () => {
+  const stores = memoryStores()
+  assert.equal(await handOffExplicitSignOut({ win: phoneApp(async () => null), stores }), true)
+  assert.equal(redirectsInApp(stores), true)
+})
+
+test('a failed hand-off keeps the explicit sign-out across the fallback reload', async () => {
+  // The app is still signed in to mobius.you: redirecting would undo the sign-out.
+  const stores = memoryStores()
+  const win = phoneApp(async () => { throw new Error('bridge unavailable') })
+  assert.equal(await handOffExplicitSignOut({ win, stores }), false)
+  assert.equal(redirectsInApp(stores), false)
+})
+
+test('a browser sign-out is not handed anywhere', async () => {
+  const stores = memoryStores()
+  assert.equal(await handOffExplicitSignOut({ win: {}, stores }), false)
+  assert.equal(stores.local.getItem('mobius_signed_out'), null)
 })
