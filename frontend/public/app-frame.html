@@ -300,6 +300,16 @@
       var Tracked = function () {
         var context = Reflect.construct(Native, arguments, new.target || Tracked);
         trackedContexts.add(new WeakRef(context));
+        // resume() is asynchronous: one requested while visible can still be
+        // 'suspended' when the hide arrives, so hold() skips it, and its later
+        // completion would start audio while hidden. Catch the transition to
+        // 'running' while holding, suspend it, and retain it for return.
+        context.addEventListener('statechange', function () {
+          if (holding && context.state === 'running') {
+            heldContexts.add(context);
+            api.suspend.call(context).catch(ignore);
+          }
+        });
         // A context born while hidden (an app booting in the background)
         // starts held and runs once the app is foreground.
         if (holding) {

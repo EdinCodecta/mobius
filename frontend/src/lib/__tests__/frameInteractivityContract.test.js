@@ -276,10 +276,15 @@ function bootFrame() {
   }
 
   class FakeAudioContext {
-    constructor() { this.state = 'running' }
-    resume() { this.state = 'running'; return Promise.resolve() }
-    suspend() { this.state = 'suspended'; return Promise.resolve() }
-    close() { this.state = 'closed'; return Promise.resolve() }
+    constructor() { this.state = 'running'; this._listeners = []; this._deferResume = false }
+    addEventListener(type, fn) { if (type === 'statechange') this._listeners.push(fn) }
+    _setState(s) { if (this.state === s) return; this.state = s; this._listeners.forEach(fn => fn()) }
+    // When _deferResume is set, model a native resume still in flight: the
+    // promise settles but the state only flips once completeResume() runs.
+    resume() { if (!this._deferResume) this._setState('running'); return Promise.resolve() }
+    completeResume() { this._deferResume = false; this._setState('running') }
+    suspend() { this._setState('suspended'); return Promise.resolve() }
+    close() { this._setState('closed'); return Promise.resolve() }
   }
   class FakeMediaElement {
     constructor() { this.paused = true; this.isConnected = false }
@@ -374,6 +379,31 @@ test('resume() while hidden is held until return, and an app suspend() cancels i
   await settle()
   assert.equal(sfx.state, 'running')
   assert.equal(ambience.state, 'suspended')
+})
+
+test('a native resume that completes after the hide message does not leave audio running', async () => {
+  const app = bootFrame()
+  const ctx = new app.window.AudioContext()
+  await ctx.suspend()
+  assert.equal(ctx.state, 'suspended')
+
+  // The app requests resume while visible; the native resume is still in flight
+  // (state stays 'suspended') when the hide arrives, so hold() skips it.
+  ctx._deferResume = true
+  ctx.resume()
+  assert.equal(ctx.state, 'suspended')
+
+  app.shell({ visible: false })
+  await settle()
+  assert.equal(ctx.state, 'suspended')
+
+  // The native resume now completes; the statechange handler must re-suspend it.
+  ctx.completeResume()
+  assert.equal(ctx.state, 'suspended', 'a resume landing while hidden is caught and re-suspended')
+
+  app.shell({ visible: true })
+  await settle()
+  assert.equal(ctx.state, 'running', 'and the playback intent is restored on return')
 })
 
 test('a context created while hidden waits silently for the foreground', async () => {
