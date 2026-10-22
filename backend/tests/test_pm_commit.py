@@ -187,20 +187,29 @@ def _root_shell(tmp_path):
   return fake
 
 
-@pytest.mark.parametrize("relative_root", [False, True])
-def test_a_root_shell_commits_as_the_repository_owner(tmp_path, relative_root):
+@pytest.mark.parametrize("relative_root, relative_helper", [
+  (False, False), (True, False), (False, True),
+])
+def test_a_root_shell_commits_as_the_repository_owner(
+  tmp_path, relative_root, relative_helper,
+):
   """A Recovery-style root shell is refused by Git ("dubious ownership") and
-  would leave root-owned objects, so the helper re-runs as the owner."""
+  would leave root-owned objects, so the helper re-runs as the owner, from the
+  same helper even when root named it by a path relative to another folder."""
   work = tmp_path / "repo"
   work.mkdir()
   work, start = repo(work)
   fake = _root_shell(tmp_path)
   log = tmp_path / "runuser.log"
   (work / "owned.txt").write_text("repaired\n")
+  if relative_helper:
+    caller_dir, helper = SCRIPT.parents[1], "scripts/pm-commit"
+  else:
+    caller_dir, helper = tmp_path, str(SCRIPT)
 
   result = subprocess.run(
-    [str(SCRIPT), "--from", start, "save a recovery repair", "--", "owned.txt"],
-    cwd=str(tmp_path),
+    [helper, "--from", start, "save a recovery repair", "--", "owned.txt"],
+    cwd=str(caller_dir),
     env={
       **os.environ, "PM_COMMIT_ROOT": "repo" if relative_root else str(work),
       "RUNUSER_LOG": str(log), "PATH": f"{fake}:{os.environ['PATH']}",
