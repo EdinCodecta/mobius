@@ -183,16 +183,16 @@ test('credential expiry preserves principal-bound intent while explicit logout w
   )
   assert.match(
     apiClient,
-    /async function endExpiredOwnerSession\(\) \{\s*await clearExpiredOwnerSession\(\)/,
+    /async function endExpiredOwnerSession\([^)]*\) \{\s*await clearExpiredOwnerSession\(\)/,
     'every expiry must retire the credential through the outbox-preserving cleanup',
   )
   assert.match(
     apiClient,
-    /status === 401[\s\S]*?await endExpiredOwnerSession\(\)/,
+    /status === 401[\s\S]*?await endExpiredOwnerSession\(\{ credential: ownerTokenAtSend \}\)/,
   )
   assert.match(
     systemStream,
-    /res\.status === 401[\s\S]*?await endExpiredOwnerSession\(\)/,
+    /res\.status === 401[\s\S]*?await endExpiredOwnerSession\(\{ credential \}\)/,
   )
   assert.match(
     settingsView,

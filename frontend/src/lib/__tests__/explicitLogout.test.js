@@ -180,7 +180,13 @@ test('explicit logout records that it was deliberate for the sign-in screen', as
   assert.equal(localStorage.getItem('mobius_signed_out'), '1')
 })
 
-async function endExpiryWith(MobiusNative) {
+function credentialExpiring(offsetMs) {
+  const exp = Math.floor((Date.now() + offsetMs) / 1000)
+  const payload = Buffer.from(JSON.stringify({ sub: 'owner', epoch: 3, exp })).toString('base64url')
+  return `stub.${payload}.stub`
+}
+
+async function endExpiryWith(MobiusNative, credential) {
   const reloads = []
   const originalLocation = globalThis.location
   const originalSetTimeout = globalThis.setTimeout
@@ -189,7 +195,7 @@ async function endExpiryWith(MobiusNative) {
   globalThis.location = { reload: () => reloads.push('reload') }
   globalThis.setTimeout = (fn) => { fn(); return 0 }
   try {
-    await endExpiredOwnerSession()
+    await endExpiredOwnerSession({ credential })
   } finally {
     delete globalThis.MobiusNative
     globalThis.location = originalLocation
@@ -199,17 +205,28 @@ async function endExpiryWith(MobiusNative) {
   return reloads
 }
 
-test('an expired session in the phone app hands over to the app after cleanup', async () => {
+test('a cancelled session in the phone app hands over to the app after cleanup', async () => {
   let tokenWhenTold = 'not told'
   const reloads = await endExpiryWith({
     signOut: async () => { tokenWhenTold = getToken(); return null },
-  })
+  }, credentialExpiring(24 * 3600 * 1000))
   assert.equal(tokenWhenTold, null, 'the workspace session is retired before the app is told')
   assert.deepEqual(reloads, [], 'the app closes the page; the shell must not reload it')
 })
 
+test('a timed-out session in the phone app keeps the app signed in and reloads', async () => {
+  // The app's own sign-in outlives the workspace credential; signing it out
+  // would only add a second sign-in.
+  let told = false
+  const reloads = await endExpiryWith({
+    signOut: async () => { told = true; return null },
+  }, credentialExpiring(-60 * 1000))
+  assert.equal(told, false)
+  assert.deepEqual(reloads, ['reload'])
+})
+
 test('an expired session in a normal browser reloads into the sign-in screen', async () => {
-  const reloads = await endExpiryWith(undefined)
+  const reloads = await endExpiryWith(undefined, credentialExpiring(24 * 3600 * 1000))
   assert.equal(getToken(), null)
   assert.deepEqual(reloads, ['reload'])
 })

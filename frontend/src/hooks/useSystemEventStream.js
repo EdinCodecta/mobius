@@ -136,6 +136,8 @@ export default function useSystemEventStream(
       active = attempt
       armDeadline(attempt)
       let reader
+      // The credential this connection rides with, so a 401 is judged against it.
+      const credential = getToken()
       try {
         const res = await fetch(`${BASE}/api/events/system`, {
           headers: getAuthHeaders(),
@@ -151,7 +153,7 @@ export default function useSystemEventStream(
           // Renewal preserves principal-partitioned accepted owner intent.
           // Never turn an expired credential into an endless reconnect loop.
           stopped = true
-          if (!setupSession.isInProgress()) await endExpiredOwnerSession()
+          if (!setupSession.isInProgress()) await endExpiredOwnerSession({ credential })
           return
         }
         if (!res.ok || !res.body) throw new Error(`system stream status ${res.status}`)

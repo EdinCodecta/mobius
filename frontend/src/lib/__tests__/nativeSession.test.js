@@ -1,9 +1,7 @@
 import { beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { shouldRedirectToMobiusSignIn } from '../mobiusSignIn.js'
 import {
-  handOffExplicitSignOut,
   isNativeSignOutAvailable,
   notifyAppSignedOut,
   resetNativeSessionForTests,
@@ -74,41 +72,4 @@ test('a bridge that throws immediately can still be tried again', async () => {
   fail = false
   assert.equal(await notifyAppSignedOut({ win }), true)
   assert.equal(calls.length, 2)
-})
-
-function memoryStores() {
-  const storage = () => {
-    const data = new Map()
-    return {
-      getItem: (key) => (data.has(key) ? data.get(key) : null),
-      setItem: (key, value) => { data.set(key, String(value)) },
-      removeItem: (key) => { data.delete(key) },
-    }
-  }
-  return { local: storage(), session: storage() }
-}
-
-function redirectsAfterReload(stores) {
-  return shouldRedirectToMobiusSignIn({ authMode: 'mobius', appOwnsSignOut: true, stores })
-}
-
-test('a sign-out the app takes over lets the app sign straight back in later', async () => {
-  const stores = memoryStores()
-  const { win } = appWindow(async () => null)
-  assert.equal(await handOffExplicitSignOut({ win, stores }), true)
-  assert.equal(redirectsAfterReload(stores), true)
-})
-
-test('a failed hand-off keeps the explicit sign-out across the fallback reload', async () => {
-  // The app is still signed in to mobius.you: redirecting would undo the sign-out.
-  const stores = memoryStores()
-  const { win } = appWindow(async () => { throw new Error('bridge unavailable') })
-  assert.equal(await handOffExplicitSignOut({ win, stores }), false)
-  assert.equal(redirectsAfterReload(stores), false)
-})
-
-test('a browser sign-out is not handed anywhere', async () => {
-  const stores = memoryStores()
-  assert.equal(await handOffExplicitSignOut({ win: {}, stores }), false)
-  assert.equal(stores.local.getItem('mobius_signed_out'), null)
 })
