@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "//": "test:lib and test:hooks: backend/app/local_change_tests.py reads each script's --loader=... and $(find ...) listings to run a local edit's frontend tests. Keep that form when editing them.",
   "scripts": {
     "dev": "vite",
     "build": "node scripts/safe-build.mjs",

@@ -456,6 +456,9 @@ class AppPreviewOut(BaseModel):
   # What a fresh install would download; None when any declared file's size is
   # unknown, and for update previews, which arrive as a Git transfer instead.
   download_bytes: int | None = None
+  # The owner-facing rows for this contract (app_consent.py): the one source of
+  # wording that the install dialog and the first-open popup both show.
+  access_rows: list[dict] = Field(default_factory=list)
 
 
 class ReconciliationReceiptOut(BaseModel):

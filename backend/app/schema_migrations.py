@@ -1452,6 +1452,54 @@ def _add_app_connect_manage(eng) -> None:
     ))
 
 
+def _add_app_accepted_consent(eng) -> None:
+  """Add the first-open consent record and grandfather every installed app.
+
+  Existing apps keep exactly what they hold today: their current contract
+  becomes their accepted copy, marked as coming from this migration, so an
+  upgrade never asks anything about an app the owner already runs.
+  """
+  import json
+  from sqlalchemy import inspect as sa_inspect, text
+
+  columns = {
+    column["name"] for column in sa_inspect(eng).get_columns("apps")
+  }
+  if "accepted_consent" not in columns:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE apps ADD COLUMN accepted_consent JSON"))
+  columns |= {"accepted_consent"}
+  if "capability_contract" not in columns:
+    return
+  templates_column = (
+    "project_templates_json" if "project_templates_json" in columns else "NULL"
+  )
+  now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+  with eng.begin() as conn:
+    rows = conn.execute(text(
+      f"SELECT id, capability_contract, {templates_column} FROM apps "
+      "WHERE accepted_consent IS NULL AND capability_contract IS NOT NULL"
+    )).fetchall()
+    for app_id, contract, templates in rows:
+      try:
+        parsed = json.loads(contract) if isinstance(contract, str) else contract
+      except ValueError:
+        continue
+      if not isinstance(parsed, dict):
+        continue
+      record = {
+        "contract": parsed,
+        "project_builders": bool(templates) and templates not in ("null", "[]", "{}"),
+        "digest": None,
+        "at": now,
+        "via": "migration",
+      }
+      conn.execute(
+        text("UPDATE apps SET accepted_consent = :record WHERE id = :id"),
+        {"record": json.dumps(record), "id": app_id},
+      )
+
+
 def _add_owner_auth_mode(eng) -> None:
   """Add the durable owner login mode (models.Owner.auth_mode).
 
@@ -6807,6 +6855,43 @@ def _retire_legacy_claim_notice_carriers(eng) -> None:
         conn.execute(update_pending, {"chat_id": chat_id, "pending": kept})
 
 
+def _enforce_unique_live_claim_follows(eng) -> None:
+  """A Goal may have one live subscription to each claim acquisition."""
+  from sqlalchemy import inspect, text
+
+  if "goal_dependencies" not in inspect(eng).get_table_names():
+    return
+  live = ("target_kind = 'claim_acquisition' "
+          "AND result_disposition IS NULL AND withdrawn_at IS NULL")
+  with eng.begin() as conn:
+    # Before this index only the owner fence prevented a second live follow
+    # of one acquisition, so an owner database may already hold duplicates.
+    # Keep one per Goal (an owed result first, then the newest) and withdraw
+    # the rest exactly as Stop following would; never fail the upgrade.
+    groups = conn.execute(text(
+      "SELECT waiting_goal_id, target_acquisition_id FROM goal_dependencies "
+      f"WHERE {live} GROUP BY waiting_goal_id, target_acquisition_id "
+      "HAVING count(*) > 1"
+    )).all()
+    for goal_id, acquisition_id in groups:
+      rows = conn.execute(text(
+        "SELECT id FROM goal_dependencies "
+        f"WHERE {live} AND waiting_goal_id = :goal AND target_acquisition_id = :acq "
+        "ORDER BY CASE WHEN resolved_at IS NULL THEN 1 ELSE 0 END, created_at DESC, id DESC"
+      ), {"goal": goal_id, "acq": acquisition_id}).scalars().all()
+      for row_id in rows[1:]:
+        conn.execute(text(
+          "UPDATE goal_dependencies SET withdrawn_at = CURRENT_TIMESTAMP, "
+          "result_disposition = 'withdrawn' WHERE id = :id"
+        ), {"id": row_id})
+    conn.execute(text(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_goal_dependencies_live_claim_acquisition "
+      "ON goal_dependencies (waiting_goal_id, target_acquisition_id) "
+      "WHERE target_kind = 'claim_acquisition' "
+      "AND result_disposition IS NULL AND withdrawn_at IS NULL"
+    ))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -6923,6 +7008,8 @@ _SCHEMA_MIGRATIONS = (
   ("0092_transfer_notice_revision", _add_transfer_notice_revision),
   ("0093_pending_goal_dependency_indexes", _index_pending_goal_dependencies),
   ("0094_retire_legacy_claim_notice_carriers", _retire_legacy_claim_notice_carriers),
+  ("0095_unique_live_claim_follows", _enforce_unique_live_claim_follows),
+  ("0096_app_accepted_consent", _add_app_accepted_consent),
 )
 
 
