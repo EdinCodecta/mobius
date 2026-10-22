@@ -604,3 +604,88 @@ async def test_resyncing_a_dormant_app_keeps_its_skills_aside(
   warnings = []
   await app_skills._sync_app_skills(db, app, _skill_manifest(), warnings)
   assert not (_skills_dir() / "contributing.md").exists()
+
+
+def test_a_failed_first_ownership_write_never_publishes_a_dormant_skill(
+  client, auth, db, bypass_url_validation, monkeypatch,
+):
+  from app import app_skills, skills
+  from tests.test_app_skills import _skills_dir
+
+  real_write = app_skills.atomic_write
+  failures = []
+
+  def fail_first_ownership_write(path, content, *args, **kwargs):
+    if path.name == ".app-skills.json" and not failures:
+      failures.append(path)
+      raise OSError("simulated ownership write failure")
+    return real_write(path, content, *args, **kwargs)
+
+  monkeypatch.setattr(app_skills, "atomic_write", fail_first_ownership_write)
+  app_id = _install_dormant_skilled(client, auth)
+  assert failures
+  assert app_consent.dormant(db.get(models.App, app_id))
+  assert not (_skills_dir() / "contributing.md").exists()
+  assert "contributing.md" not in [
+    s.read_path.name for s in skills.enumerate_skills(_skills_dir())
+  ]
+
+
+def test_a_dormant_skill_is_never_live_during_its_sync(
+  client, auth, bypass_url_validation, monkeypatch,
+):
+  from app import app_skills
+  from tests.test_app_skills import _skills_dir
+
+  live = _skills_dir() / "contributing.md"
+  real_write = app_skills.atomic_write
+  writes = []
+
+  def watch(path, content, *args, **kwargs):
+    assert path != live and not live.exists()
+    writes.append(path)
+    return real_write(path, content, *args, **kwargs)
+
+  monkeypatch.setattr(app_skills, "atomic_write", watch)
+  _install_dormant_skilled(client, auth)
+  assert _skills_dir() / ".inactive" in [p.parents[1] for p in writes if p.suffix == ".md"]
+  assert not live.exists()
+
+
+def test_an_update_that_pauses_an_app_sets_its_new_skill_aside_until_accepted(
+  client, auth, owner_token, db, bypass_url_validation,
+):
+  import json as _json
+  from unittest.mock import patch
+
+  from tests.test_app_skills import BASE, JSX, _fake_async_client, _skill_manifest, _skills_dir
+
+  def serve(manifest, skill):
+    responses = {BASE + "mobius.json": (200, _json.dumps(manifest).encode()),
+                 BASE + "index.jsx": (200, JSX.encode()),
+                 BASE + "contributing.md": (200, skill)}
+    return patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses))
+
+  headers = _owner_headers(client, owner_token)
+  with serve(_skill_manifest(), b"# v1\n"):
+    app_id = client.post("/api/apps/install", headers=auth, json={"manifest_url": BASE + "mobius.json"}).json()["id"]
+  digest = client.get(f"/api/apps/{app_id}/consent", headers=headers).json()["digest"]
+  client.post(f"/api/apps/{app_id}/consent", json={"digest": digest}, headers=headers)
+  live = _skills_dir() / "contributing.md"
+  assert live.read_bytes() == b"# v1\n"
+
+  wider = _skill_manifest(version="2.0.0", permissions={
+    "cross_app_access": "none", "share_with_apps": "none", "github_access": True})
+  with serve(wider, b"# v2\n"):
+    update = client.post("/api/apps/install", headers=auth, json={"manifest_url": BASE + "mobius.json"})
+    if update.status_code == 409:
+      update = client.post("/api/apps/install", headers=auth, json={
+        "manifest_url": BASE + "mobius.json",
+        "reviewed_capability_digest": update.json()["detail"]["preview"]["capability_digest"]})
+  assert update.status_code in (200, 201), update.text
+  assert app_consent.dormant(db.get(models.App, app_id))
+  assert not live.exists()
+
+  digest = client.get(f"/api/apps/{app_id}/consent", headers=headers).json()["digest"]
+  assert client.post(f"/api/apps/{app_id}/consent", json={"digest": digest}, headers=headers).status_code == 200
+  assert live.read_bytes() == b"# v2\n"
