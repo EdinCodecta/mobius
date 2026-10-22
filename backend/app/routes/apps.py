@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session, defer
 
 from app import chat_writer
 from app import (
-  activity, app_activity, app_apply, app_badge, app_capability_acceptance, app_consent,
+  activity, app_activity, app_apply, app_badge, app_capability_acceptance,
   app_git, app_jobs, app_recency, chat_app_artifacts, chat_queue, drawer_pins, fs_locks,
   git_transfers, icon_cache, models, pending_update, project_git, providers, schemas,
   settled, source_dirs, store_listing_source, workspace_files,
@@ -796,7 +796,7 @@ async def preview_app_install(
   source = body.manifest_url if body.manifest_url is not None else raw_base
   # Release the request session first: the worker opens its own short one.
   db.close()
-  installed_contract, download_bytes = await asyncio.gather(
+  (installed_contract, installed_templates), download_bytes = await asyncio.gather(
     settled.run_settled(_installed_contract_for_preview, manifest, source),
     install.package_download_bytes(manifest, raw_base),
   )
@@ -805,14 +805,15 @@ async def preview_app_install(
     capability_contract=contract,
     capability_digest=digest,
     installed_contract=installed_contract,
+    installed_project_templates=installed_templates,
     capability_diff=diff_contracts(installed_contract, contract),
     download_bytes=download_bytes,
-    access_rows=app_consent.rows_for_manifest(manifest, contract),
   )
 
 
-def _installed_contract_for_preview(manifest: dict, source: str) -> dict | None:
-  """The capability contract of the live row install would update, or None.
+def _installed_contract_for_preview(manifest: dict, source: str) -> tuple[dict | None, bool]:
+  """The capability contract (and whether it ships project templates) of the
+  live row install would update, or ``(None, False)``.
 
   Install's one identity rule (``install.resolve_package_row``). Source
   identities are not resolved here, so a move that only a provider repository
@@ -825,8 +826,8 @@ def _installed_contract_for_preview(manifest: dict, source: str) -> dict | None:
   with database.SessionLocal() as db:
     existing = install.resolve_package_row(db, manifest, source).row
     if existing is None or existing.deleted_at is not None:
-      return None
-    return existing.capability_contract
+      return None, False
+    return existing.capability_contract, bool(existing.project_templates_json)
 
 
 @router.post(
@@ -1737,6 +1738,7 @@ async def update_candidate_preview(
   installed_source_identity = app.source_identity
   source_dir = app.source_dir
   installed_contract = app.capability_contract
+  installed_templates = bool(app.project_templates_json)
   if not installed_manifest_url:
     raise HTTPException(400, "App has no update source.")
   repo = Path(source_dir)
@@ -1805,6 +1807,7 @@ async def update_candidate_preview(
       capability_contract=contract,
       capability_digest=digest,
       installed_contract=installed_contract,
+      installed_project_templates=installed_templates,
       capability_diff=diff_contracts(installed_contract, contract),
     ),
     app_id=app_id,

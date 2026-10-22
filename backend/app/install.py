@@ -3088,6 +3088,30 @@ async def _run_post_commit_effects(
   except Exception as exc:
     log.exception("install: skill sync failed post-commit")
     warnings.append(f"skills: sync failed — {exc!r}")
+  if mode == "update" and app_consent.dormant(app) and (
+    app_consent.accepted_rows(app) is not None
+  ):
+    # Only the owner's answer re-enables it, and an app they rarely open would
+    # otherwise stop without a word.
+    app_id, app_name = app.id, app.name
+    try:
+      from app import push
+      from app.database import SessionLocal
+
+      # Its own session: the notification's commit must not expire the
+      # install's app row, which the caller still reads.
+      with SessionLocal() as notify_db:
+        owner = notify_db.query(models.Owner).first()
+        if owner is not None:
+          push.notify_owner(
+            notify_db, owner.id, title=f"{app_name} needs your approval",
+            body="An update asks for more access. Open the app to review it.",
+            source_type="app", source_id=str(app_id),
+            target=f"/shell/?app={app_id}", tag=f"app-consent-{app_id}",
+          )
+    except Exception as exc:
+      log.exception("install: approval notification failed post-commit")
+      warnings.append(f"notification: not sent — {exc!r}")
 
   if (
     mode == "install"
@@ -3095,6 +3119,8 @@ async def _run_post_commit_effects(
     and schedule.get("initialize_on_install") is True
     and job_name
     and app.source_dir
+    # A dormant app's first run starts when the owner accepts (routes/app_consent).
+    and not app_consent.dormant(app)
   ):
     try:
       from app.app_jobs import launch_app_job

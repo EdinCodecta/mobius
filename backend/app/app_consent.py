@@ -206,10 +206,38 @@ def rows_from_contract(
       continue
     rows.append(_row(
       capability, str(declaration.get("title") or capability),
-      str(declaration.get("description") or capability),
+      _runtime_text(capability, declaration),
     ))
   rows.sort(key=lambda row: (not row["critical"], row["title"]))
   return rows
+
+
+def _limit_text(key: str, value: Any) -> str:
+  if key.endswith("_bytes") and isinstance(value, (int, float)) and not isinstance(value, bool):
+    size, unit = float(value), "bytes"
+    for unit in ("bytes", "KiB", "MiB", "GiB"):
+      if size < 1024 or unit == "GiB":
+        break
+      size /= 1024
+    return f"{round(size, 1):g} {unit}"
+  return str(value)
+
+
+def _runtime_text(capability: str, declaration: dict[str, Any]) -> str:
+  """A runtime capability's wording with its reviewed limits and reason, so
+  raising a limit changes what the owner reads."""
+  limits = dict(declaration.get("limits") or {})
+  duration = limits.pop("max_duration_ms", None)
+  text = str(declaration.get("description") or capability)
+  if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+    text += f" for up to {round(duration / 1000, 1):g} seconds per request"
+  if limits:
+    text += " Limits: " + ", ".join(
+      f"{key} {_limit_text(key, value)}" for key, value in sorted(limits.items())
+    ) + "."
+  if declaration.get("reason"):
+    text += f" Reason: {declaration['reason']}"
+  return text
 
 
 def request_digest(rows: list[dict[str, Any]]) -> str:

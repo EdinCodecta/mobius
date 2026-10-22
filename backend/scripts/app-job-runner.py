@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
@@ -40,6 +41,10 @@ TOKEN_FILE = DATA_DIR / "service-token.txt"
 SUPERVISOR_LOG = DATA_DIR / "cron-logs" / "app-jobs.log"
 SUPERVISOR_LOG_CAP = 2 * 1024 * 1024
 READY_WAIT_SECONDS = 90
+
+
+class _AwaitingApproval(Exception):
+  """The app is dormant until the owner answers its permission request."""
 WALL_CLOCK_STATE_DIR = DATA_DIR / "run" / "app-wall-clock"
 
 
@@ -83,6 +88,8 @@ def _wait_for_ready(
           token = _mint_app_token(app_id)
           if token:
             return token
+    except _AwaitingApproval:
+      raise
     except Exception:
       pass
     remaining = deadline - time.monotonic()
@@ -250,6 +257,10 @@ def _mint_app_token(app_id: int) -> str | None:
       value = json.load(response)
     token = value.get("token") if isinstance(value, dict) else None
     return token.strip() if isinstance(token, str) and token.strip() else None
+  except urllib.error.HTTPError as exc:
+    if exc.code == 409 and b"consent_required" in exc.read():
+      raise _AwaitingApproval from exc
+    return None
   except Exception:
     return None
 
@@ -361,11 +372,15 @@ def _execute_job(
   }
   _atomic_json(lease, lease_value)
   try:
-    app_token = (
-      _wait_for_ready(app_id)
-      if wait_for_ready
-      else _mint_app_token(app_id)
-    )
+    try:
+      app_token = (
+        _wait_for_ready(app_id)
+        if wait_for_ready
+        else _mint_app_token(app_id)
+      )
+    except _AwaitingApproval:
+      _log(app_id, "skipped: waiting for owner approval")
+      return 4
     if not app_token:
       _log(app_id, "failed: timed out waiting for backend and app credential")
       return 4
