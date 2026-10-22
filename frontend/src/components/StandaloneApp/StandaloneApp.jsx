@@ -244,6 +244,7 @@ export default function StandaloneApp({ initialApp }) {
         ref={canvasRef}
         appId={app.id}
         appName={app.name}
+        themeColor={app.theme_color}
         appSlug={app.slug}
         version={appFrameVersion(app)}
         storageGeneration={app.storage_generation}
