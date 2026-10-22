@@ -12,6 +12,8 @@
 // finished (the app removes the page as soon as it gets the call) and before
 // any redirect or reload (which would prevent the call).
 
+import { markExplicitSignOut } from './mobiusSignIn.js'
+
 let notification = null
 
 export function isNativeSignOutAvailable(win = globalThis.window) {
@@ -38,6 +40,21 @@ export function notifyAppSignedOut({ win = globalThis.window } = {}) {
       })
   }
   return notification
+}
+
+/**
+ * Settings sign-out, after the workspace cleanup: hand it to the app. The mark
+ * records the hand-off first, because the app may close the page before the
+ * call resolves; a failed hand-off restores the ordinary explicit sign-out
+ * mark, so the fallback reload cannot sign straight back in through the app's
+ * still-signed-in mobius.you account. Resolves like notifyAppSignedOut.
+ */
+export async function handOffExplicitSignOut({ win = globalThis.window, stores } = {}) {
+  if (!isNativeSignOutAvailable(win)) return false
+  markExplicitSignOut(stores, { handedToApp: true })
+  if (await notifyAppSignedOut({ win })) return true
+  markExplicitSignOut(stores)
+  return false
 }
 
 export function resetNativeSessionForTests() {

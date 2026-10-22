@@ -9,7 +9,7 @@ import { authQueries, modelQueries, settingsQueries, themeQueries } from '../../
 import { settleBackgroundAgentSave } from '../../lib/backgroundAgentSave.js'
 import { connectedProvidersFirst, disablesLastConnectedProvider, moveConnectedProvider } from '../../lib/backgroundProviderOrder.js'
 import { clearExplicitOwnerSession } from '../../lib/explicitLogout.js'
-import { notifyAppSignedOut } from '../../lib/nativeSession.js'
+import { handOffExplicitSignOut } from '../../lib/nativeSession.js'
 import { stopShellInstallPassPreparation } from '../../lib/shellInstallPass.js'
 import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.js'
 import {
@@ -878,7 +878,7 @@ export default function SettingsView({
       })
       // Only after the workspace sign-out is complete: the Möbius phone app
       // closes this page as soon as it is told.
-      appTookOver = await notifyAppSignedOut()
+      appTookOver = await handOffExplicitSignOut()
     } finally {
       if (!appTookOver) window.location.reload()
     }
