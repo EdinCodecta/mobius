@@ -624,6 +624,9 @@ const AppCanvas = forwardRef(function AppCanvas({
   visibleRef.current = visible
   const frameVisibleRef = useRef(frameVisible)
   frameVisibleRef.current = frameVisible
+  // Assigned once sendVisibility is declared; the message handler calls it by
+  // ref so it never enters that effect's dependency list.
+  const resyncBackgroundPlaybackRef = useRef(() => {})
   const capabilityContractRef = useRef(capabilityContract)
   capabilityContractRef.current = capabilityContract
   const shellShortcutsRef = useRef(Array.isArray(shellShortcuts) ? shellShortcuts : [])
@@ -1023,11 +1026,19 @@ const AppCanvas = forwardRef(function AppCanvas({
         if (mediaEvent.event === 'close') {
           if (currentSessionId !== mediaEvent.sessionId) return
           frameMediaSessionRef.current.delete(srcVersion)
+          // backgroundPlayback just flipped true -> false; re-send the
+          // visibility verdict so a hidden frame drops its exemption now.
+          resyncBackgroundPlaybackRef.current(srcVersion)
           onMediaSessionRef.current?.(appId, mediaEvent)
           return
         }
         if (mediaEvent.event === 'update' && currentSessionId !== mediaEvent.sessionId) return
+        const hadSession = frameMediaSessionRef.current.has(srcVersion)
         frameMediaSessionRef.current.set(srcVersion, mediaEvent.sessionId)
+        // A session that opens while the frame is hidden flips backgroundPlayback
+        // false -> true; re-send so the frame exempts its deliberate playback
+        // instead of staying held until the next show/hide.
+        if (!hadSession) resyncBackgroundPlaybackRef.current(srcVersion)
         const source = e.source
         onMediaSessionRef.current?.(appId, mediaEvent, (action) => {
           if (!['play', 'pause', 'stop', 'cycle-speed'].includes(action)) return false
@@ -1453,6 +1464,19 @@ const AppCanvas = forwardRef(function AppCanvas({
       backgroundPlayback: frameMediaSessionRef.current.has(v),
     })
   }
+
+  // backgroundPlayback only rides along a frame-visibility message. When a media
+  // session opens or closes, the per-frame flag changes but no show/hide flip
+  // follows, so a hidden live frame would keep its stale hold-or-exempt state.
+  // Re-send the current verdict (with the updated flag) to the live frame. The
+  // message handler reaches this through a ref so it stays out of that effect's
+  // dependency list, like the other handler callbacks.
+  function resyncBackgroundPlayback(v) {
+    if (v === liveVersionRef.current && loadedDocsRef.current.has(v)) {
+      sendVisibility(v, frameVisibleRef.current)
+    }
+  }
+  resyncBackgroundPlaybackRef.current = resyncBackgroundPlayback
 
   function sendInteractivity(v, enabled, frameIsVisible = frameVisibleRef.current) {
     postToFrame(v, {

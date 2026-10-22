@@ -898,9 +898,14 @@ instant. While an app is hidden, its frame reads as a hidden page the standard
 way (`document.hidden`, `document.visibilityState`, and `visibilitychange` on
 the way out and back), so engines and libraries that follow the Page Visibility
 API pause themselves. The frame also pauses the app's sound: it suspends every
-Web Audio context and pauses playing `<audio>`/`<video>` elements, holds any
-`resume()` or `play()` the app calls while hidden, and on return resumes
-exactly what it paused, never what the app paused itself.
+Web Audio context and pauses playing `<audio>`/`<video>` elements — including
+media that begins on its own while hidden, such as autoplay or a clip that was
+still loading — holds any `resume()` or `play()` the app calls while hidden, and
+on return resumes exactly what it paused, never what the app paused itself (nor
+an element the app removed from the page while hidden). A held `resume()` or
+`play()` resolves right away: it reports that the request was accepted, not that
+audio is playing, and a later failure when it actually starts on return is not
+surfaced — so don't treat that resolution as proof sound is audible.
 
 Timers keep running, so pause polling, animation, and game clocks yourself and
 catch up on return:

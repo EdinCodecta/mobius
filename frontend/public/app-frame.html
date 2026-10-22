@@ -246,7 +246,11 @@
   var shellHidden = false;
   var holding = false;
   var heldContexts = new Set();
-  var heldMedia = new Set();
+  // element -> wasConnected at the time it was held. release() resumes each
+  // held element except one that was in the page when held and the app has
+  // since removed while hidden: restarting a detached element would play audio
+  // the app discarded and nobody could stop.
+  var heldMedia = new Map();
   var trackedMedia = new Set();
   var knownMedia = new WeakSet();
   function ignore() {}
@@ -275,6 +279,11 @@
       api = { Native: Native, resume: proto.resume, suspend: proto.suspend, close: proto.close };
       proto.resume = function () {
         if (holding && this.state !== 'closed') {
+          // Held while hidden: resolve now rather than start audio in the
+          // background. The promise reports "accepted", not "running" — nothing
+          // plays until release() resumes it on return, and a later native
+          // resume failure won't surface to this caller. Accepted so an app's
+          // playback-start path isn't blocked for the whole time it's hidden.
           heldContexts.add(this);
           return Promise.resolve();
         }
@@ -321,7 +330,9 @@
       trackedMedia.add(new WeakRef(this));
     }
     if (holding) {
-      heldMedia.add(this);
+      // Held, not played: see the AudioContext.resume() note above. Resolves
+      // now; release() starts it on return, and a later failure won't surface.
+      heldMedia.set(this, this.isConnected);
       return Promise.resolve();
     }
     return nativePlay.apply(this, arguments);
@@ -350,10 +361,22 @@
     document.querySelectorAll('audio, video').forEach(function (element) { media.push(element); });
     media.forEach(function (element) {
       if (element.paused || heldMedia.has(element)) return;
-      heldMedia.add(element);
+      heldMedia.set(element, element.isConnected);
       nativePause.call(element);
     });
   }
+
+  // Browser-initiated playback (autoplay once its policy allows, or an element
+  // that starts after loading) never passes through the play() override above.
+  // hold() only scans what is attached on entry, so catch these in the capture
+  // phase while holding: pause and retain the element so release() resumes it.
+  document.addEventListener('play', function (event) {
+    if (!holding) return;
+    var element = event.target;
+    if (!(element instanceof HTMLMediaElement)) return;
+    if (!heldMedia.has(element)) heldMedia.set(element, element.isConnected);
+    nativePause.call(element);
+  }, true);
 
   function release() {
     var contexts = Array.from(heldContexts);
@@ -363,7 +386,12 @@
     contexts.forEach(function (context) {
       if (context.state !== 'closed') contextApi(context).resume.call(context).catch(ignore);
     });
-    media.forEach(function (element) {
+    media.forEach(function (entry) {
+      var element = entry[0];
+      var wasConnected = entry[1];
+      // The app removed a once-attached element while hidden: it discarded that
+      // playback. Resuming would play a detached element nobody can stop.
+      if (wasConnected && !element.isConnected) return;
       nativePlay.call(element).catch(ignore);
     });
   }

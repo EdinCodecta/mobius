@@ -266,9 +266,14 @@ function bootFrame() {
   }
   const visibilityEvents = []
   const attached = []
+  const captureListeners = new Map()
   const document = new FakeDocument()
   document.dispatchEvent = (event) => { visibilityEvents.push(event.type) }
   document.querySelectorAll = () => attached
+  document.addEventListener = (type, callback, capture) => {
+    assert.equal(capture, true, 'frame playback listener is capture-phase')
+    captureListeners.set(type, callback)
+  }
 
   class FakeAudioContext {
     constructor() { this.state = 'running' }
@@ -277,7 +282,7 @@ function bootFrame() {
     close() { this.state = 'closed'; return Promise.resolve() }
   }
   class FakeMediaElement {
-    constructor() { this.paused = true }
+    constructor() { this.paused = true; this.isConnected = false }
     play() { this.paused = false; return Promise.resolve() }
     pause() { this.paused = true }
   }
@@ -305,6 +310,15 @@ function bootFrame() {
     setNativeVisibility(value) { nativeVisibility = value },
     shell(data, origin = SHELL_ORIGIN, eventSource = parent) {
       messageListener({ source: eventSource, origin, data: { type: 'moebius:frame-visibility', ...data } })
+    },
+    // The browser begins playback on its own (autoplay, or a clip that was
+    // still loading): it starts playing, then dispatches a capture-phase play
+    // event the frame's override never saw.
+    browserPlay(element) {
+      element.paused = false
+      const onPlay = captureListeners.get('play')
+      assert.ok(onPlay, 'frame registers a capture-phase play listener')
+      onPlay({ target: element })
     },
   }
 }
@@ -414,4 +428,48 @@ test('only the shell parent can background the app', async () => {
   await settle()
   assert.equal(music.state, 'running')
   assert.equal(app.document.hidden, false)
+})
+
+test('media that starts playing on its own while hidden is paused and resumes on return', async () => {
+  const app = bootFrame()
+  const autoplay = new app.Media()
+  autoplay.isConnected = true
+  app.attached.push(autoplay) // present but not yet playing when the frame hides
+
+  // A browser-initiated play while visible is left alone.
+  app.browserPlay(autoplay)
+  assert.equal(autoplay.paused, false)
+  autoplay.pause()
+
+  app.shell({ visible: false })
+  await settle()
+  assert.equal(autoplay.paused, true, 'nothing played at hide time')
+
+  // Autoplay policy now lets it start, bypassing the play() override entirely.
+  app.browserPlay(autoplay)
+  assert.equal(autoplay.paused, true, 'caught in the capture phase and paused while hidden')
+
+  app.shell({ visible: true })
+  await settle()
+  assert.equal(autoplay.paused, false, 'resumes on return like anything else held')
+})
+
+test('an element the app removes while hidden is not restarted on return', async () => {
+  const app = bootFrame()
+  const clip = new app.Media()
+  clip.isConnected = true
+  clip.paused = false
+  app.attached.push(clip)
+
+  app.shell({ visible: false })
+  await settle()
+  assert.equal(clip.paused, true, 'held while hidden')
+
+  // The app tears the element out of the page while hidden (scene change or
+  // re-render); nobody could stop a detached element we restarted.
+  clip.isConnected = false
+
+  app.shell({ visible: true })
+  await settle()
+  assert.equal(clip.paused, true, 'a once-attached, now-detached element is left paused')
 })
