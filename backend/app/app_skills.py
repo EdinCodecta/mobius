@@ -22,7 +22,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from app import data_git, fs_locks, models, settled
+from app import app_consent, data_git, fs_locks, models, settled
 from app.config import get_settings
 from app.manifest_contract import SKILL_MAX_BYTES as _CONTRACT_SKILL_MAX_BYTES
 from app.manifest_contract import skill_member_paths
@@ -74,6 +74,27 @@ async def _sync_app_skills(
   manifest: dict,
   warnings: list[str],
 ) -> None:
+  """Sync an app's skills; a dormant app's end up set aside, whatever happens.
+
+  Skills reach every agent, so they follow the owner's permission answer here,
+  at the one place every writer (install, update, apply) goes through. A
+  dormant app's new bytes are written straight to its set-aside area; the
+  cleanup below only moves aside files that were already live before this sync
+  (for example an approved version whose snapshot failed, so it was kept).
+  """
+  try:
+    await _materialize_app_skills(db, app, manifest, warnings)
+  finally:
+    if app_consent.dormant(app):
+      warnings.extend(await deactivate_app_skills(app.id))
+
+
+async def _materialize_app_skills(
+  db: Session,
+  app: "models.App",
+  manifest: dict,
+  warnings: list[str],
+) -> None:
   """Materializes manifest-declared skill files into /data/shared/skills.
 
   Post-commit best-effort phase (same contract as cron): the app row is
@@ -94,6 +115,10 @@ async def _sync_app_skills(
   skills_dir = data_dir / "shared" / "skills"
   source_dir = Path(app.source_dir)
   version = str(manifest.get("version", "unknown"))
+  # Unapproved instructions must never enter discovery, not even between a
+  # write and a later cleanup: a concurrent reader or a failed ownership write
+  # would otherwise expose them.
+  dormant = app_consent.dormant(app)
   async with fs_locks.shared_skills_lock():
     from app import skills as skills_mod
 
@@ -233,12 +258,12 @@ async def _sync_app_skills(
         continue
       rec = records.get(rel)
       owner_id = rec.get("app_id") if isinstance(rec, dict) else None
+      inactive = skills_dir / ".inactive" / str(app.id) / rel
       if (
         isinstance(rec, dict)
         and owner_id == app.id
         and rec.get("active", True) is False
       ):
-        inactive = skills_dir / ".inactive" / str(app.id) / rel
         if inactive.is_file():
           retired = (
             skills_dir / ".inactive" / str(app.id) / "retired" / rel
@@ -274,19 +299,36 @@ async def _sync_app_skills(
             warnings.append(
               f"skill {rel}: updated, no /data repo for snapshot"
             )
-      target.parent.mkdir(parents=True, exist_ok=True)
-      atomic_write(target, content)
-      # 0o664 mirrors init_skills' boot convention — group-writable so the
-      # agent can edit the skill no matter which uid materialized it.
-      os.chmod(target, 0o664)
-      records[rel] = {
+      digest = hashlib.sha256(content).hexdigest()
+      record = {
         "app_id": app.id,
         "slug": app.slug,
         "manifest_url": app.manifest_url,
-        "sha256": hashlib.sha256(content).hexdigest(),
+        "sha256": digest,
         "installed_at": datetime.now(UTC).isoformat(),
-        "active": True,
+        "active": not dormant,
       }
+      # 0o664 mirrors init_skills' boot convention — group-writable so the
+      # agent can edit the skill no matter which uid materialized it.
+      if dormant:
+        inactive.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(inactive, content)
+        os.chmod(inactive, 0o664)
+        # Any live file here was snapshotted above when it held edits; the
+        # new version replaces it, set aside until the owner approves.
+        if target.is_file():
+          target.unlink()
+          _prune_empty_skill_folder(skills_dir, rel)
+        record.update(
+          inactive_path=str(inactive.relative_to(skills_dir)),
+          inactive_sha256=digest,
+          deactivated_at=record["installed_at"],
+        )
+      else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(target, content)
+        os.chmod(target, 0o664)
+      records[rel] = record
       # Persist provenance immediately after each file lands: a crash
       # between files must never leave an installed skill without its
       # ownership record (the next install would treat it as agent-modified
@@ -438,7 +480,13 @@ async def restore_app_skills(app_id: int) -> list[str]:
   the newer skill.
   """
   from app import skills as skills_mod
+  from app.database import SessionLocal
 
+  # A dormant app's skills stay set aside, whoever asks (recover, consent).
+  with SessionLocal() as db:
+    row = db.get(models.App, app_id)
+    if row is not None and app_consent.dormant(row):
+      return []
   warnings: list[str] = []
   skills_dir = Path(get_settings().data_dir) / "shared" / "skills"
   async with fs_locks.shared_skills_lock():

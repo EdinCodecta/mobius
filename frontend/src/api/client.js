@@ -1166,6 +1166,11 @@ export const api = {
     markOpened: (appId) => apiFetch(`/apps/${appId}/opened`, {
       method: 'POST',
     }),
+    // First-open consent: what a Store app asks for, and the owner's answer.
+    consent: (appId) => apiFetch(`/apps/${appId}/consent`),
+    acceptConsent: (appId, digest) => apiFetch(`/apps/${appId}/consent`, {
+      method: 'POST', body: JSON.stringify({ digest }),
+    }),
     markActivitySeen: (appId, activityVersion, appCreatedAt) => apiFetch(`/apps/${appId}/activity/seen`, {
       method: 'POST',
       body: JSON.stringify({ activity_version: activityVersion, app_created_at: appCreatedAt }),

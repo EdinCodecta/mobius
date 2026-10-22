@@ -13,7 +13,7 @@ from app.app_capabilities import diff_contracts
 from app.app_capabilities import normalize_runtime_capabilities
 from app.config import get_settings
 from app.manifest_contract import ManifestContractError, validate_manifest_contract
-from test_app_fixtures import create_local_app, write_local_source
+from test_app_fixtures import accept_app_consent, create_local_app, write_local_source
 from tests.test_apps_install import (  # noqa: F401
   JSX,
   _bypass_cron_scaffold,
@@ -695,11 +695,13 @@ def test_matching_digest_is_persisted_with_explicit_system_identity(
   app = db.query(models.App).filter(models.App.slug == "memory").one()
   assert app.capability_contract == contract
   assert response.json()["capability_contract"] == contract
-  launch.assert_called_once_with(
+  # A Store app is dormant until accepted, so its first run waits for that.
+  launch.assert_not_called()
+  with patch("app.routes.app_consent.launch_app_job") as first_run:
+    accept_app_consent(client, auth, app.id)
+  first_run.assert_called_once_with(
     app.id, Path(app.source_dir) / "memory-job.sh", Path(app.source_dir),
-    wait_for_ready=True,
   )
-  assert "initialization waiting for startup readiness" in response.json()["warnings"]
 
 
 def test_model_catalog_changes_are_not_access_changes():
@@ -1220,7 +1222,9 @@ def _runtime_refuses(contract):
   from app import app_services
 
   try:
-    app_services.service_contract(SimpleNamespace(capability_contract=contract), access="public")
+    app_services.service_contract(
+      SimpleNamespace(capability_contract=contract, manifest_url=None), access="public",
+    )
   except HTTPException as exc:
     assert exc.status_code == 503
     return True
