@@ -313,9 +313,11 @@ function bootFrame() {
     },
     // The browser begins playback on its own (autoplay, or a clip that was
     // still loading): it starts playing, then dispatches a capture-phase play
-    // event the frame's override never saw.
-    browserPlay(element) {
-      element.paused = false
+    // event the frame's override never saw. With keepPaused, the element is
+    // left paused to model a stale play event delivered after an explicit
+    // pause() — play events are asynchronous, so one can arrive late.
+    browserPlay(element, { keepPaused = false } = {}) {
+      if (!keepPaused) element.paused = false
       const onPlay = captureListeners.get('play')
       assert.ok(onPlay, 'frame registers a capture-phase play listener')
       onPlay({ target: element })
@@ -452,6 +454,29 @@ test('media that starts playing on its own while hidden is paused and resumes on
   app.shell({ visible: true })
   await settle()
   assert.equal(autoplay.paused, false, 'resumes on return like anything else held')
+})
+
+test('a stale play event for media the app already paused does not restart it on return', async () => {
+  const app = bootFrame()
+  const clip = new app.Media()
+  clip.isConnected = true
+  app.attached.push(clip)
+
+  // The app plays then explicitly pauses while visible; the browser's play
+  // event is still queued for later delivery.
+  await clip.play()
+  clip.pause()
+  assert.equal(clip.paused, true)
+
+  app.shell({ visible: false })
+  await settle()
+
+  // The queued play event is delivered while hidden, targeting a paused element.
+  app.browserPlay(clip, { keepPaused: true })
+
+  app.shell({ visible: true })
+  await settle()
+  assert.equal(clip.paused, true, 'the app\'s explicit pause wins over a stale play event')
 })
 
 test('an element the app removes while hidden is not restarted on return', async () => {

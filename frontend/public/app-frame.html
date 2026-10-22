@@ -374,6 +374,11 @@
     if (!holding) return;
     var element = event.target;
     if (!(element instanceof HTMLMediaElement)) return;
+    // play events are delivered asynchronously, so a stale one can arrive after
+    // the app has already paused the element (play() then pause() before we go
+    // hidden). The element is paused by now, so there is nothing to hold —
+    // holding it would restart playback the app deliberately stopped.
+    if (element.paused) return;
     if (!heldMedia.has(element)) heldMedia.set(element, element.isConnected);
     nativePause.call(element);
   }, true);
