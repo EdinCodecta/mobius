@@ -1293,6 +1293,10 @@ class App(Base):
   # Server-derived, versioned capability contract reviewed at install time.
   # Null is a legitimate legacy state for apps installed before contracts.
   capability_contract = Column(JSON, nullable=True, default=None)
+  # What the owner accepted at first open (app_consent.py): the accepted rows
+  # plus who/when/how. Null means not yet accepted. Only Store-installed apps
+  # are gated on it; the rest keep their present behaviour.
+  accepted_consent = Column(JSON, nullable=True, default=None)
   # First-class project types contributed by this installed app. The installer
   # stores the validated manifest declaration verbatim enough for project
   # creation to snapshot it; existing projects never read this live value.

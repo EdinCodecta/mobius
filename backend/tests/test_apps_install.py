@@ -31,7 +31,7 @@ from app import (
   transcript_rows,
 )
 from app.config import get_settings
-from test_app_fixtures import create_local_app
+from test_app_fixtures import accept_app_consent, create_local_app
 from tests.cancel_helpers import assert_cancellation_drains_worker_under_lock
 
 
@@ -6664,6 +6664,7 @@ def test_service_rename_requires_and_routes_one_reviewed_transition_alias(
   assert unsafe.status_code == 409
   assert "previous identity" in unsafe.text
   assert transition.status_code == 201, transition.text
+  accept_app_consent(client, auth, transition.json()["id"])
   assert client.get("/api/app-services/social/status").status_code == 200
   assert client.get("/api/app-services/common/status").status_code == 200
   app = db.query(models.App).filter_by(package_id="app.example.social").one()
@@ -7287,6 +7288,7 @@ def test_catalog_rename_adopts_trusted_checkout_with_unrelated_git_history(
     Path(get_settings().data_dir) / "apps" / "social" / "index.jsx"
   ).read_text() == new_index
   assert storage.read_text() == '{"kept": true}'
+  accept_app_consent(client, auth, app_id)
   assert client.get("/api/app-services/social/status").status_code == 200
   assert client.get("/api/app-services/common/status").status_code == 200
 
@@ -11462,7 +11464,7 @@ def test_install_preview_sizes_files_while_reading_the_installed_contract(
   def read_installed_contract(_manifest, _source):
     # Awaited one after the other, the lookup would only start once this returns.
     assert sizing_started.wait(timeout=5)
-    return None
+    return None, False
 
   with patch.object(install, "package_download_bytes", sizing), patch(
     "app.routes.apps._installed_contract_for_preview", read_installed_contract,
