@@ -1174,7 +1174,8 @@ def _confirm_on_account() -> None:
     "code": ACCOUNT_CONFIRMED_CODE,
     "message": (
       "Finish this on your mobius.you dashboard. For safety, Möbius can't "
-      "create, delete, resize or recover deployments by itself."
+      "create, delete, resize or recover deployments, or change the Railway "
+      "connection, by itself."
     ),
     "confirm_url": _account_origin() + "/dashboard",
   })
