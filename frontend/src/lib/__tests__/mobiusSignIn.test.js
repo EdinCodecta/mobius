@@ -36,6 +36,19 @@ test('an explicit sign-out keeps the card so the owner is not signed straight ba
   assert.equal(shouldRedirectToMobiusSignIn({ authMode: 'mobius', stores }), false)
 })
 
+test('inside the phone app a leftover sign-out mark does not ask for another tap', () => {
+  // The app owns sign-out there: signing in to the app again is the way back.
+  const stores = memoryStores()
+  markExplicitSignOut(stores)
+  assert.equal(shouldRedirectToMobiusSignIn({ authMode: 'mobius', appOwnsSignOut: true, stores }), true)
+})
+
+test('the phone app still gets the card after a sign-in round trip that did not finish', () => {
+  const stores = memoryStores()
+  recordSignInRedirect(stores)
+  assert.equal(shouldRedirectToMobiusSignIn({ authMode: 'mobius', appOwnsSignOut: true, stores }), false)
+})
+
 test('coming back from mobius.you without signing in shows the card instead of looping', () => {
   const stores = memoryStores()
   recordSignInRedirect(stores)

@@ -12,6 +12,7 @@ import { clearReadingPositions } from '../components/ChatView/scroll/readingPosi
 import { clearDurableComposerDrafts } from '../components/ChatView/composerDraft.js'
 import { clearChatOutbox } from '../components/ChatView/chatOutbox.js'
 import { setActiveSharedBrowserGrantId, sharedBrowserCacheBuster } from '../lib/sharedBrowserWorkspace.js'
+import { notifyAppSignedOut } from '../lib/nativeSession.js'
 import {
   reportNetworkReachable,
   verifyConnectivity,
@@ -335,6 +336,20 @@ export async function clearExpiredOwnerSession() {
   await clearOwnerClientState({ preserveChatOutbox: true })
 }
 
+/**
+ * The one place the shell ends an owner session it found expired or revoked:
+ * retire the credential, then hand over to the Möbius phone app when it hosts
+ * this page (it closes the page and shows its own start screen), otherwise
+ * reload into the sign-in screen. The reload is deferred one tick so callers'
+ * error handling can settle first.
+ */
+export async function endExpiredOwnerSession() {
+  await clearExpiredOwnerSession()
+  // A shared-browser guest is not the app's account holder.
+  if (!sharedBrowserEnabled && await notifyAppSignedOut()) return
+  setTimeout(() => window.location.reload(), 100)
+}
+
 // Remove browser-local queues and mirrors after an explicit app-data wipe.
 // Soft uninstall intentionally preserves these records so Undo can restore
 // offline work. The runtime owns the IndexedDB schemas, so keep the record
@@ -565,13 +580,11 @@ export async function apiFetch(path, options = {}) {
     // Keep accepted chat intent through an expired credential. Each record is
     // partitioned by owner+epoch and can only replay after a matching login;
     // explicit Settings logout still uses the default full wipe.
-    await clearExpiredOwnerSession()
-    // Defer reload one tick and throw a typed error so callers'
-    // try/catch/finally blocks run (stopping spinners) before the
-    // page goes away. Previously we returned a never-resolving
-    // promise, which left finally{} clauses dangling for the entire
-    // reload window — visible as stuck loading state.
-    setTimeout(() => window.location.reload(), 100)
+    await endExpiredOwnerSession()
+    // Throw a typed error so callers' try/catch/finally blocks run (stopping
+    // spinners) before the page goes away. Previously we returned a
+    // never-resolving promise, which left finally{} clauses dangling for the
+    // entire reload window — visible as stuck loading state.
     throw new Error('AUTH_EXPIRED')
   }
 

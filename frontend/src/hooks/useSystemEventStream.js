@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import {
   BASE, getToken, getAuthHeaders, isEphemeralAuth,
-  clearExpiredOwnerSession,
+  endExpiredOwnerSession,
 } from '../api/client.js'
 import * as setupSession from '../lib/setupSession.js'
 import {
@@ -151,10 +151,7 @@ export default function useSystemEventStream(
           // Renewal preserves principal-partitioned accepted owner intent.
           // Never turn an expired credential into an endless reconnect loop.
           stopped = true
-          if (!setupSession.isInProgress()) {
-            await clearExpiredOwnerSession()
-            setTimeout(() => window.location.reload(), 100)
-          }
+          if (!setupSession.isInProgress()) await endExpiredOwnerSession()
           return
         }
         if (!res.ok || !res.body) throw new Error(`system stream status ${res.status}`)

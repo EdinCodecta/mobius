@@ -5,6 +5,7 @@ import { IDBFactory } from 'fake-indexeddb'
 import {
   clearExpiredOwnerSession,
   clearQueryCache,
+  endExpiredOwnerSession,
   getToken,
   setToken,
 } from '../../api/client.js'
@@ -15,6 +16,7 @@ import {
   outboxPrincipalKey,
 } from '../../components/ChatView/chatOutbox.js'
 import { clearExplicitOwnerSession } from '../explicitLogout.js'
+import { resetNativeSessionForTests } from '../nativeSession.js'
 
 const originalGlobals = {
   caches: globalThis.caches,
@@ -176,4 +178,38 @@ test('explicit logout records that it was deliberate for the sign-in screen', as
   })
 
   assert.equal(localStorage.getItem('mobius_signed_out'), '1')
+})
+
+async function endExpiryWith(MobiusNative) {
+  const reloads = []
+  const originalLocation = globalThis.location
+  const originalSetTimeout = globalThis.setTimeout
+  resetNativeSessionForTests()
+  globalThis.MobiusNative = MobiusNative
+  globalThis.location = { reload: () => reloads.push('reload') }
+  globalThis.setTimeout = (fn) => { fn(); return 0 }
+  try {
+    await endExpiredOwnerSession()
+  } finally {
+    delete globalThis.MobiusNative
+    globalThis.location = originalLocation
+    globalThis.setTimeout = originalSetTimeout
+    resetNativeSessionForTests()
+  }
+  return reloads
+}
+
+test('an expired session in the phone app hands over to the app after cleanup', async () => {
+  let tokenWhenTold = 'not told'
+  const reloads = await endExpiryWith({
+    signOut: async () => { tokenWhenTold = getToken(); return null },
+  })
+  assert.equal(tokenWhenTold, null, 'the workspace session is retired before the app is told')
+  assert.deepEqual(reloads, [], 'the app closes the page; the shell must not reload it')
+})
+
+test('an expired session in a normal browser reloads into the sign-in screen', async () => {
+  const reloads = await endExpiryWith(undefined)
+  assert.equal(getToken(), null)
+  assert.deepEqual(reloads, ['reload'])
 })

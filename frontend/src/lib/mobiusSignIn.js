@@ -8,6 +8,10 @@
 //     silently undo it, in every tab: that mark lives in localStorage, which
 //     is shared by the browser, and the sign-in itself (a token written to the
 //     same localStorage) is shared too;
+//     except inside the Möbius phone app, which owns sign-out there: the
+//     workspace hands a sign-out to the app (MobiusNative.signOut), the app
+//     shows its own start screen, and signing in to the app again is the
+//     deliberate way back, so a leftover mark must not ask for another tap;
 //   - this tab already went to mobius.you and came back without signing in
 //     (Back button, a failed round trip): that mark is per tab, in
 //     sessionStorage, and the card is the way to retry.
@@ -64,6 +68,7 @@ function storageAcceptsWrites(storage) {
 export function shouldRedirectToMobiusSignIn({
   authMode,
   standalone = false,
+  appOwnsSignOut = false,
   stores = browserStores(),
 }) {
   if (authMode !== 'mobius' || standalone) return false
@@ -72,7 +77,7 @@ export function shouldRedirectToMobiusSignIn({
   const { local, session } = stores
   if (!local || !session || !storageAcceptsWrites(local) || !storageAcceptsWrites(session)) return false
   try {
-    return !local.getItem(SIGNED_OUT_KEY) && !session.getItem(REDIRECTED_KEY)
+    return (appOwnsSignOut || !local.getItem(SIGNED_OUT_KEY)) && !session.getItem(REDIRECTED_KEY)
   } catch {
     return false
   }
