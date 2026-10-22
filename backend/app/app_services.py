@@ -30,7 +30,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from app import app_python_env, auth, models, service_preload, settled, tracing
+from app import app_consent, app_python_env, auth, models, service_preload, settled, tracing
 from app.applied_app_runtime import AppliedRuntimeUnavailable, hold_runtime, runtime_root
 from app.browser_access import BrowserLineage, require_live
 from app.config import get_settings
@@ -882,6 +882,9 @@ def _reject_json_constant(value: str):
 
 
 def service_contract(app, *, access: str) -> dict:
+  # Every service path passes here: a Store app is dormant until accepted.
+  if app_consent.dormant(app):
+    raise HTTPException(404, "App service not found.")
   contract = app.capability_contract if isinstance(app.capability_contract, dict) else {}
   service = contract.get("service")
   if not isinstance(service, dict) or service.get("protocol") != "json-v1":
@@ -1133,6 +1136,7 @@ def service_environment(app, owner, service: dict, *, public: bool, browser: Bro
       owner.username,
       owner.token_epoch,
       app_nonce=app.token_nonce,
+      consent=app_consent.session_id(app),
       expires_delta=timedelta(minutes=5),
       service="public" if public else "private",
       browser=browser,

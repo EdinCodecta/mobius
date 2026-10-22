@@ -356,6 +356,39 @@ def test_job_runner_fails_a_declaring_apps_job_without_its_env(tmp_path, monkeyp
   assert "Automatic restoration" in (tmp_path / "app-jobs.log").read_text()
 
 
+def test_job_runner_skips_a_dormant_app_instead_of_timing_out(tmp_path, monkeypatch):
+  import io
+  import urllib.error
+
+  runner = _load_runner()
+  monkeypatch.setattr(runner, "DATA_DIR", tmp_path)
+  monkeypatch.setattr(runner, "SUPERVISOR_LOG", tmp_path / "app-jobs.log")
+  (tmp_path / "token").write_text("owner")
+  monkeypatch.setattr(runner, "TOKEN_FILE", tmp_path / "token")
+
+  class Ready:
+    status = 200
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
+
+  def refuse(request, timeout=None):
+    if request.full_url.endswith("/api/ready"):
+      return Ready()
+    raise urllib.error.HTTPError(
+      request.full_url, 409, "Conflict", {},
+      io.BytesIO(b'{"detail":{"code":"consent_required"}}'),
+    )
+
+  monkeypatch.setattr(runner.urllib.request, "urlopen", refuse)
+  monkeypatch.setattr(runner.os, "setsid", lambda: None)
+  code = runner._execute_job(
+    7, tmp_path / "apps" / "x" / "job.sh", wait_for_ready=True, scheduled=True,
+    run_lock_fd=0,
+  )
+  assert code == 4
+  assert "skipped: waiting for owner approval" in (tmp_path / "app-jobs.log").read_text()
+
+
 # --- Services and preload hosts ----------------------------------------------
 
 def test_service_without_its_env_fails_visibly_instead_of_borrowing(tmp_path):

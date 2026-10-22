@@ -179,6 +179,7 @@ def create_app_token(
   token_epoch: int,
   app_nonce: str | None = None,
   *,
+  consent: str | None = None,
   expires_delta: timedelta = timedelta(hours=8),
   delegation_id: str | None = None,
   delegation_chat: str | None = None,
@@ -218,6 +219,9 @@ def create_app_token(
   claims = {"sub": owner_username, "scope": scope, "app_id": app_id}
   if app_nonce is not None:
     claims["app_nonce"] = app_nonce
+  if consent is not None:
+    # The acceptance this credential was issued under (app_consent.session_id).
+    claims["consent"] = consent
   if service == "private":
     claims["service"] = True
   if job_secrets is not None:

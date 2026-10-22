@@ -33,6 +33,9 @@ being external attackers reaching the public HTTPS endpoint.
   the app's exact installed permissions. Opacity protects ambient **owner**
   authority — it is not a promise that ordinary app code never sees its own
   scoped credential.
+- **First-open consent:** a Store-installed app is dormant until the owner
+  accepts what it asks for (all or nothing, only a human owner session can
+  answer); see "First-open consent for Store apps" in `CAPABILITIES.md`.
 - **Standalone mini-app host:** `/apps/<slug>/` is a signed platform host, not
   a second app runtime. It renders the same `AppCanvas` opaque frame used by
   the workspace, so app-authored code never executes in the top-level owner
