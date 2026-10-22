@@ -42,6 +42,8 @@ test('several sessions ending at once make a single call to the app', async () =
   let finish
   const { win, calls } = appWindow(() => new Promise((resolve) => { finish = resolve }))
   const results = [notifyAppSignedOut({ win }), notifyAppSignedOut({ win }), notifyAppSignedOut({ win })]
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(calls.length, 1)
   finish(null)
   assert.deepEqual(await Promise.all(results), [true, true, true])
   assert.equal(await notifyAppSignedOut({ win }), true)
@@ -53,6 +55,18 @@ test('a failed call falls back to the browser path and can be tried again', asyn
   const { win, calls } = appWindow(async () => {
     if (fail) throw new Error('bridge unavailable')
     return null
+  })
+  assert.equal(await notifyAppSignedOut({ win }), false)
+  fail = false
+  assert.equal(await notifyAppSignedOut({ win }), true)
+  assert.equal(calls.length, 2)
+})
+
+test('a bridge that throws immediately can still be tried again', async () => {
+  let fail = true
+  const { win, calls } = appWindow(() => {
+    if (fail) throw new Error('bridge unavailable')
+    return Promise.resolve(null)
   })
   assert.equal(await notifyAppSignedOut({ win }), false)
   fail = false

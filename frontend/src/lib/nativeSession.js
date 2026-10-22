@@ -27,16 +27,15 @@ export function isNativeSignOutAvailable(win = globalThis.window) {
 export function notifyAppSignedOut({ win = globalThis.window } = {}) {
   if (!isNativeSignOutAvailable(win)) return Promise.resolve(false)
   if (!notification) {
-    notification = (async () => {
-      try {
-        await win.MobiusNative.signOut()
-        return true
-      } catch {
+    // Call the bridge in a continuation so a synchronous throw is handled after
+    // `notification` is stored, and the reset below is not overwritten.
+    notification = Promise.resolve()
+      .then(() => win.MobiusNative.signOut())
+      .then(() => true, () => {
         // The app did not take over; let a later session end try again.
         notification = null
         return false
-      }
-    })()
+      })
   }
   return notification
 }
