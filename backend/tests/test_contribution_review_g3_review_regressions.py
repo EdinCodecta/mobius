@@ -1,6 +1,12 @@
 """Reviewer regressions for repair receipts, checkout ownership and admission."""
 import asyncio
+import subprocess
+import threading
+import logging
+from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -12,6 +18,7 @@ from app.chat_writer import create_chat
 from app.contribution_review_effects import DispatchResult
 from app.deps import Principal
 from app.routes import contribution_reviews as routes
+from app.runtime_supervisors import RuntimeSupervisors
 from tests.test_contribution_review_runs import setup, ITEM
 from tests.test_contribution_review_workflows import (BASE, NEW, SHA, checkout_body,
   configure_repair, publish_body, takeover)
@@ -97,6 +104,50 @@ def test_gc_protects_active_and_uncertain_but_collects_stopped_and_orphans(setup
   assert not paths["terminal"].exists() and not paths["orphan"].exists()
 
 
+def test_cancelled_but_still_running_child_protects_parent_checkout(setup, monkeypatch, tmp_path):
+  db, row, principal = setup
+  parent = tmp_path / "repair-parent"
+  parent.mkdir()
+  monkeypatch.setattr(repairs, "_checkout_root", lambda: tmp_path)
+  db.get(models.ChatRun, principal.run_id).status = "stopped"
+  db.add(create_chat(id="cancelled-child", title="Unsettled child"))
+  db.add(models.ChatRun(id="cancelled-child-run", chat_id="cancelled-child", status="running"))
+  db.add(models.Delegation(id="cancelled-child-delegation", parent_chat_id=row.chat_id,
+    parent_root_run_id=principal.run_id, task_key="repair-check", child_chat_id="cancelled-child",
+    provider="codex", model="test", effort="low", scope="write", cwd="/tmp",
+    prompt_sha256="a" * 64, cancelled_at=datetime.now(timezone.utc)))
+  db.commit()
+  domain.save_outcome(db, row, domain.key(ITEM), {"state": "repairing",
+    "checkout": {"checkout": str(parent)}})
+  monkeypatch.setattr(repairs, "_last_activity", lambda path: 0)
+  scope = actions.checkout_gc_scope(db)
+  assert str(parent) in scope["protected_paths"]
+  repairs.sweep_stale_checkouts(**scope, now=10**12)
+  assert parent.exists()
+
+
+def test_boot_and_periodic_checkout_gc_uses_durable_receipts(setup, monkeypatch):
+  db, row, _ = setup
+  monkeypatch.setattr(actions, "SessionLocal", lambda: nullcontext(db))
+  scopes = []
+  monkeypatch.setattr(repairs, "sweep_stale_checkouts", lambda **scope: scopes.append(scope))
+  actions.sweep_checkout_receipts_once()
+  assert len(scopes) == 1 and "protected_paths" in scopes[0]
+  visited = threading.Event()
+  monkeypatch.setattr(actions, "sweep_checkout_receipts_once", visited.set)
+  supervisors = RuntimeSupervisors(settings=SimpleNamespace(data_dir="/tmp"),
+    logger=logging.getLogger("test.repair-gc"), restart_authorization=None,
+    restart_fallback_chats=[])
+  async def exercise():
+    task = asyncio.create_task(supervisors._repair_checkout_gc_loop())
+    try:
+      assert await asyncio.to_thread(visited.wait, 3)
+    finally:
+      task.cancel()
+      await asyncio.gather(task, return_exceptions=True)
+  asyncio.run(exercise())
+
+
 def test_stranded_pushing_observation_becomes_visible_unknown(setup, monkeypatch):
   db, row, principal = configure_repair(setup, monkeypatch)
   outcome = row.outcomes_json[domain.key(ITEM)]
@@ -105,6 +156,21 @@ def test_stranded_pushing_observation_becomes_visible_unknown(setup, monkeypatch
       "head_sha": NEW, "base_sha": BASE, "checkout": "/fake/server-repair"}]})
   monkeypatch.setattr(actions, "reconcile_push", lambda *a, **kw: asyncio.sleep(0, result=False))
   asyncio.run(routes.observe_review(1, row.id, db, Principal(owner=principal.owner, app_id=None)))
+  assert row.outcomes_json[domain.key(ITEM)]["repair_attempts"][-1]["state"] == "push_unknown"
+
+
+def test_timeout_observation_is_unknown_and_never_replays_push(setup, monkeypatch):
+  db, row, principal = configure_repair(setup, monkeypatch)
+  outcome = row.outcomes_json[domain.key(ITEM)]
+  domain.save_outcome(db, row, domain.key(ITEM), {**outcome, "state": "pushing",
+    "repair_attempts": [{"id": "timeout", "state": "pushing", "from_sha": SHA,
+      "head_sha": NEW, "base_sha": BASE, "checkout": "/fake/server-repair"}]})
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(
+    subprocess.TimeoutExpired(["gh", "api"], 10)))
+  monkeypatch.setattr(repairs, "push_repair", lambda *a, **kw: pytest.fail("push replayed"))
+  owner = Principal(owner=principal.owner, app_id=None)
+  for _ in range(2):
+    asyncio.run(routes.observe_review(1, row.id, db, owner))
   assert row.outcomes_json[domain.key(ITEM)]["repair_attempts"][-1]["state"] == "push_unknown"
 
 

@@ -519,7 +519,7 @@ def push_repair(gh, cwd: Path, row, target: dict, validation: dict, *, before_pu
     remote_head = _branch_head(gh, cwd, slug, branch)
     if remote_head == fresh["head_sha"]:
       return DispatchResult.confirmed(fresh)
-    if (result.returncode != 0 and remote_head == target["head_sha"]
+    if (result.returncode > 0 and remote_head == target["head_sha"]
         and _exact_ref_rejected(getattr(result, "stdout", ""), fresh["head_sha"], branch)):
       # Git completed and named only this ref as rejected; the exact old tip
       # still exists. This proves no branch update, unlike timeout or EOF.
@@ -534,7 +534,14 @@ def _exact_ref_rejected(porcelain: str, head: str, branch: str) -> bool:
   if not isinstance(porcelain, str):
     return False
   exact = f"{head}:refs/heads/{branch}"
-  records = [line.split("\t") for line in porcelain.splitlines() if line.startswith("!")]
+  records = []
+  for line in porcelain.splitlines():
+    if line.startswith("To ") or line == "Done":
+      continue
+    fields = line.split("\t")
+    if len(fields) != 3 or fields[0] not in {"!", "=", "*", "+", "-", " "}:
+      return False
+    records.append(fields)
   return (len(records) == 1 and len(records[0]) == 3
           and records[0][0] == "!" and records[0][1] == exact
           and (records[0][2].startswith("[rejected]")

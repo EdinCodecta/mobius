@@ -4,9 +4,11 @@ The route supplies one live-authority callback. This executor owns the persisted
 attempt and exact non-dispatch release; confirmed facts survive revoked authority.
 """
 import asyncio
+import subprocess
 
 from fastapi import HTTPException
 
+from app.database import SessionLocal
 from app import agent_work_claims, chat_queue, contribution_review_runs as reviews, models, settled
 from app import contribution_review_repairs as repairs
 from app.contribution_errors import ContributionSubmitError
@@ -22,8 +24,7 @@ def checkout_gc_scope(db) -> dict[str, set[str]]:
   active_chats = {chat_id for (chat_id,) in db.query(models.ChatRun.chat_id).filter(
     models.ChatRun.status.in_(models.NONTERMINAL_RUN_STATUSES)).all()}
   active_parents = {parent for (parent,) in db.query(models.Delegation.parent_chat_id).filter(
-    models.Delegation.child_chat_id.in_(active_chats),
-    models.Delegation.cancelled_at.is_(None)).all()} if active_chats else set()
+    models.Delegation.child_chat_id.in_(active_chats)).all()} if active_chats else set()
   protected: set[str] = set()
   terminal: set[str] = set()
   dormant: set[str] = set()
@@ -51,6 +52,12 @@ def checkout_gc_scope(db) -> dict[str, set[str]]:
         terminal.add(path)
   return {"protected_paths": protected, "terminal_paths": terminal,
           "dormant_paths": dormant}
+
+
+def sweep_checkout_receipts_once() -> None:
+  """Boot/periodic pass; no chat or public GitHub effect is started."""
+  with SessionLocal() as db:
+    repairs.sweep_stale_checkouts(**checkout_gc_scope(db))
 
 
 async def dispatch_repair(row, target, validation, *, gh, cwd, authorize):
@@ -114,7 +121,7 @@ async def reconcile_push(db, row, original, previous, pending, *, gh, cwd):
   candidate = {**original, "head_sha": pending["head_sha"], "base_sha": pending["base_sha"]}
   try:
     await asyncio.to_thread(reviews.current_pull, gh, cwd, candidate)
-  except (HTTPException, ContributionSubmitError, OSError, ValueError):
+  except (HTTPException, ContributionSubmitError, OSError, ValueError, subprocess.SubprocessError):
     return False
   attempts = [{**r, "state": "pushed"} if r is pending else r
               for r in previous.get("repair_attempts", [])]
