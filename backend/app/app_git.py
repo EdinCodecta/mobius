@@ -3931,10 +3931,12 @@ def unit_chain(
 
   Each unit's commit sets the paths it owns to ``tree``'s bytes; a unit with
   nothing left to change (retired, or already upstream) emits no commit.
-  Changed paths no unit owns, such as a resolver's additions, go into
-  ``resolution``. A path other units also touched is committed with those
-  units named in ``Mobius-Overlay-Also`` trailers, one commit per distinct set,
-  so their dispositions still guard it after the original commits are gone.
+  Changed paths no unit owns, such as a resolver's additions or a path a
+  stray working-edits commit took from its owner, go into ``resolution``. A
+  path other units also touched is committed with those units named in
+  ``Mobius-Overlay-Also`` trailers, one commit per distinct set, resolution
+  included, so their dispositions still guard it after the original commits
+  are gone.
   Raises ``RuntimeError`` unless the chain's tip tree is exactly ``tree``;
   callers then fall back to one commit.
   """
@@ -3947,17 +3949,16 @@ def unit_chain(
     for path in unit.touched:
       shaped_by.setdefault(path, set()).add((unit.slug, unit.disposition))
   plan = []
-  for unit in units:
+  for unit in [*units, resolution]:
     by_also: dict[tuple[tuple[str, str], ...], list[str]] = {}
-    for path in unit.paths:
+    owned = unit.paths if unit is not resolution else sorted(remaining)
+    for path in owned:
       if remaining.pop(path, None):
         also = tuple(sorted(
           c for c in shaped_by.get(path, ()) if c[0] != unit.slug
         ))
         by_also.setdefault(also, []).append(path)
-    plan.extend((unit.message(also), owned) for also, owned in by_also.items())
-  if remaining:
-    plan.append((resolution.message(), sorted(remaining)))
+    plan.extend((unit.message(also), paths) for also, paths in by_also.items())
   tip = target
   with tempfile.TemporaryDirectory(prefix="mobius-unit-chain-") as tmp:
     index = Path(tmp) / "index"

@@ -426,6 +426,28 @@ def test_a_co_contributor_still_guards_the_file_after_updates_carry_it(
   assert result.status == "conflict" and result.conflict_paths == ["greet.py"]
 
 
+def test_a_stray_working_edits_commit_keeps_the_owner_choice_across_updates(repo):
+  # A working-edits commit left in committed history takes the file from its
+  # owner, so the chain files it under the resolution commit, which must still
+  # name the owner's choice for later updates.
+  _commit(repo, {"greet.py": _BASE + "# owner tweak\n"},
+          _unit_msg("Owner tweak", "owner", "owner-choice:local"))
+  local = _commit(repo, {"greet.py": _BASE + "# owner tweak\n# edit\n"},
+                  _unit_msg("Working edits", app_git.OVERLAY_WORKING_UNIT))
+  release = "upstream"
+  for n in (2, 3):
+    release = _release(repo, [({"notes.md": f"v{n}\n"}, f"upstream {n}")], start=release)
+    merged = app_git.merge_refs(repo, local, release).merged_tree_oid
+    local = platform_update._net_overlay_commit(repo, release, merged, local)
+
+    units = {u.slug: u for u in app_git.overlay_units(repo, local, release)}
+    assert units["owner"].disposition == "owner-choice:local"
+    assert units["owner"].touched == ("greet.py",)
+  assert _show(repo, local, "greet.py") == _BASE + "# owner tweak\n# edit\n"
+  body = _git(repo, "log", "-1", "--format=%B", local)
+  assert "Mobius-Overlay-Also: owner=owner-choice:local" in body
+
+
 def test_only_merged_pr_contributors_still_retire_after_a_unit_chain(repo):
   _commit(repo, {"greet.py": _BASE + "# extra\n"},
           _unit_msg("Extra", "extra", "pending-pr:#5"))
