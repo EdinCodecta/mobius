@@ -5653,6 +5653,38 @@ def test_review_status_releases_db_before_git_inspection(
   assert observed == [baseline]
 
 
+def test_review_status_reads_the_ledger_window_off_the_event_loop(
+  client, owner_token, monkeypatch,
+):
+  """A large ledger scan must not block unrelated requests on the loop."""
+  import asyncio
+  _write_token(login="octocat", user_id=42)
+  app_id, app_token = _app_token(
+    client, owner_token, github_access=True,
+  )
+  _prepared_real_review(app_id, "review-thread")
+  threads = []
+  original = github_routes._recent_contribution_record_paths
+
+  def paths(contribution_dir, **kwargs):
+    try:
+      asyncio.get_running_loop()
+      threads.append(True)
+    except RuntimeError:
+      threads.append(False)
+    return original(contribution_dir, **kwargs)
+
+  monkeypatch.setattr(github_routes, "_recent_contribution_record_paths", paths)
+  response = client.get(
+    f"/api/github/contributions/{app_id}/review-status",
+    headers={"Authorization": f"Bearer {app_token}"},
+  )
+
+  assert response.status_code == 200, response.text
+  assert threads == [False]
+  assert "review-thread" in response.text
+
+
 def test_repository_head_query_batches_distinct_targets_with_variables():
   query, variables, aliases = github_routes._build_repository_heads_query([
     "mobius-os/mobius",

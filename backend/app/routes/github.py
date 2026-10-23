@@ -1125,6 +1125,18 @@ def _recent_contribution_record_paths(
   return [path for _mtime, _name, path in paths_with_mtime[:limit]]
 
 
+def _read_recent_contribution_records(contribution_dir: Path) -> list[dict]:
+  """Blocking read of the bounded recent ledger window; call off-loop."""
+  if not contribution_dir.exists():
+    return []
+  records = []
+  for path in _recent_contribution_record_paths(contribution_dir):
+    record = _read_record_tolerant(path)
+    if record is not None and record.get("id"):
+      records.append(record)
+  return records
+
+
 def _publication_status(
   record: dict,
   expected_head: str,
@@ -1381,13 +1393,12 @@ async def contribution_review_status(
   db.close()
   contribution_dir = _contributions_dir(app_id)
   async with fs_locks.app_storage_lock(app_id):
-    records = []
-    if contribution_dir.exists():
-      for path in _recent_contribution_record_paths(contribution_dir):
-
-        record = _read_record_tolerant(path)
-        if record is not None and record.get("id"):
-          records.append(record)
+    # Thousands of stat/read calls must not run on the event loop: under I/O
+    # pressure they stalled unrelated requests (e.g. /github/status) long
+    # enough for clients to time out. The storage lock still spans the read.
+    records = await asyncio.to_thread(  # unsettled: read-only (contribution ledger window)
+      _read_recent_contribution_records, contribution_dir,
+    )
 
   # Include malformed/legacy PR rows as well: the inspector below owns the
   # invalid-plan verdict, and silently omitting one would strand its review
