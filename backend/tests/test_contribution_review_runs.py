@@ -169,12 +169,13 @@ def test_merge_failure_summary_keeps_untrusted_exception_generic():
   )
 
 
-def test_lost_merge_receipt_preserves_safe_diagnostic(setup, monkeypatch):
+def test_explicit_http_422_rejection_disarms_exact_merge_claim(setup, monkeypatch):
   def lose(*args):
     raise ContributionSubmitError("gh: HTTP 422: merge blocked")
   monkeypatch.setattr(domain, "perform_merge", lose)
   item = report(setup)["run"]["items"][0]
-  assert item["state"] == "merge_unknown"
+  assert item["state"] == "needs_you"
+  assert item["merge_attempted"] is False
   assert "HTTP 422" in item["summary"]
 
 
@@ -198,7 +199,7 @@ def test_temporarily_changed_head_cannot_erase_an_ambiguous_attempt(setup, monke
     raise HTTPException(409, "This head changed")
   monkeypatch.setattr(domain, "current_pull", unavailable)
   item = report(setup)["run"]["items"][0]
-  assert item["state"] == "needs_you"
+  assert item["state"] == "merge_unknown"
   assert item["merge_attempted"] is True
   monkeypatch.setattr(domain, "current_pull", lambda *args: (REPO, PULL))
   assert report(setup)["run"]["items"][0]["state"] == "merge_unknown"

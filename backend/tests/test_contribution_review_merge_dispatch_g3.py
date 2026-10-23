@@ -58,4 +58,4 @@ def test_cancellation_during_final_base_read_releases_only_unspent_claim(monkeyp
     with pytest.raises(asyncio.CancelledError):
       await task
   asyncio.run(scenario())
-  assert released == ["Cancelled before merge dispatch."]
+  assert len(released) == 1 and "cancelled" in released[0].lower()

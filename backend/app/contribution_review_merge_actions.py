@@ -4,11 +4,11 @@ import asyncio
 from fastapi import HTTPException
 
 from app import chat_queue, contribution_review_runs as reviews, settled
-from app.contribution_review_effects import DispatchResult, NotDispatched
+from app.contribution_review_effects import DispatchResult, NotDispatched, classify_dispatch_error
 from app.github_connection import _github_connection_transaction
 
 
-async def dispatch_merge(gh, cwd, target, repo, checks, authorize):
+async def dispatch_merge(gh, cwd, target, repo, checks, authorize, method=None):
   """Authority refusal precedes dispatch; a received remote fact survives Stop."""
   try:
     authorize()
@@ -19,26 +19,24 @@ async def dispatch_merge(gh, cwd, target, repo, checks, authorize):
   except HTTPException as exc:
     return DispatchResult.not_dispatched(str(exc.detail))
   except asyncio.CancelledError:
-    # The read settled, but no mutation was entered. The caller persists the
-    # exact release before propagating cancellation.
-    return DispatchResult.not_dispatched("Cancelled before merge dispatch.")
+    return DispatchResult.not_dispatched("The review was cancelled before any merge request began.")
   except Exception:
     return DispatchResult.not_dispatched("The final target-base check failed before merge dispatch.")
   try:
     if checks.get("isMergeQueueEnabled") is True:
       receipt = await settled.run_settled(reviews.enqueue, gh, cwd, target)
       return DispatchResult.confirmed({"state": "queued", **reviews.queue_receipt(receipt)})
-    receipt = await settled.run_settled(reviews.perform_merge, gh, cwd, target, repo)
+    receipt = await settled.run_settled(reviews.perform_merge, gh, cwd, target, repo, method)
+    if receipt.get("merged") is False:
+      raise NotDispatched("GitHub refused the merge request without applying it.")
     if receipt.get("merged") is not True:
-      raise HTTPException(409, "GitHub did not confirm a merge.")
+      return DispatchResult.unknown("GitHub returned no usable merge confirmation. Reconcile without retry.")
     return DispatchResult.confirmed({"state": "merged", "merge_sha": receipt.get("sha")})
-  except NotDispatched as exc:
-    return DispatchResult.not_dispatched(str(exc))
   except Exception as exc:
-    return DispatchResult.unknown(reviews.merge_failure_summary(exc))
+    return classify_dispatch_error(exc)
 
 
-async def _reserve_and_dispatch(db, row, target, outcome, repo, checks, principal, *, gh, cwd, authorize):
+async def _reserve_and_dispatch(db, row, target, outcome, repo, checks, principal, *, gh, cwd, authorize, method=None):
   async with chat_queue.get_transition_lock(f"review-admission:{row.id}"):
     authorize()
     try:
@@ -54,11 +52,11 @@ async def _reserve_and_dispatch(db, row, target, outcome, repo, checks, principa
       return None
   db.refresh(row)
   armed = dict(row.outcomes_json[reviews.key(target)])
-  result = await dispatch_merge(gh, cwd, target, repo, checks, authorize)
+  result = await dispatch_merge(gh, cwd, target, repo, checks, authorize, method)
   if result.state == "not_dispatched":
     reviews.disarm_merge(db, row, target, armed, result.reason)
     if asyncio.current_task().cancelling():
-      raise asyncio.CancelledError
+      raise asyncio.CancelledError()
     return None
   if result.state == "confirmed":
     return {**armed, **result.receipt}
@@ -83,8 +81,7 @@ async def merge_reviewed_target(db, row, target, outcome, repo, pull, principal,
     authorize()
     reviews.save_outcome(db, row, reviews.key(target), {**outcome, "state": "needs_you", "summary": blocker})
     return
-  if not checks.get("isMergeQueueEnabled"):
-    reviews.merge_method(repo)  # Known no-method refusal occurs before reservation.
+  method = reviews.merge_method(repo) if not checks.get("isMergeQueueEnabled") else None
   async with _github_connection_transaction():
     actor = await asyncio.to_thread(reviews.read, gh, cwd, "user")  # unsettled: read-only (GitHub actor identity)
     if str(actor.get("id") or "") != row.github_actor_id:
@@ -94,6 +91,6 @@ async def merge_reviewed_target(db, row, target, outcome, repo, pull, principal,
       return
     await asyncio.to_thread(reviews.assert_current_base, gh, cwd, target)  # unsettled: read-only (GitHub target base)
     result = await _reserve_and_dispatch(db, row, target, outcome, repo, checks, principal,
-      gh=gh, cwd=cwd, authorize=authorize)
+      gh=gh, cwd=cwd, authorize=authorize, method=method)
     if result is not None:
       reviews.save_effect_outcome(db, row, reviews.key(target), result)
