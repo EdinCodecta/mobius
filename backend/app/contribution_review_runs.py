@@ -277,7 +277,9 @@ def require_public_transition_clear(db, row, target):
         raise HTTPException(409,
           f"An earlier public attempt in review run {grant.id}, owning chat {grant.chat_id}, "
           "may affect this PR or head branch. Observe it read-only in that chat. "
-          "If it remains ambiguous, do not replay the public action; ask the owner to resolve the old receipt.")
+          "Absence alone cannot prove there is no delayed effect. The owner may complete the exact "
+          "intended GitHub action, then observe its matching result. If it remains ambiguous, "
+          "preserve the receipt and do not replay the public action.")
 
 
 def reserve_public_work(db, row, principal, work_key, summary, action):
