@@ -781,7 +781,7 @@ def test_stop_during_final_push_preflight_is_rechecked_before_public_io(setup, m
   monkeypatch.setattr(repairs, "push_repair", preflight)
   result = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
   assert result["run"]["items"][0]["repair_attempts"] == []
-  assert "No push was attempted" in result["run"]["items"][0]["summary"]
+  assert "No branch update was applied" in result["run"]["items"][0]["summary"]
 
 
 def test_cross_grant_uncertain_push_fence_cannot_be_replayed(setup, monkeypatch):
@@ -1321,7 +1321,8 @@ def test_pending_later_repair_with_new_base_keeps_detail_list_and_observation_re
   listed = routes.list_reviews(1, db, owner)["runs"][0]
   observed = asyncio.run(routes.observe_review(1, row.id, db, owner))["run"]
   for view in (detail, listed, observed):
-    assert view["items"][0]["repair_attempts"][-1]["state"] == state
+    expected = "push_unknown" if view is observed and state == "pushing" else state
+    assert view["items"][0]["repair_attempts"][-1]["state"] == expected
     assert view["items"][0]["successor"] == {"head_sha": head, "base_sha": BASE}
     assert view["execution_state"] == "stopped"
 
@@ -1533,7 +1534,8 @@ def test_stop_observation_and_parent_resume_do_not_clear_pending_repair_admissio
   monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("PUBLIC_MERGE"))
   observed = asyncio.run(routes.observe_review(1, row.id, db, Principal(owner=principal.owner, app_id=None)))
   assert observed["run"]["execution_state"] == "stopped"
-  assert observed["run"]["items"][0]["repair_attempts"] == [attempt]
+  expected_attempt = {**attempt, "state": "push_unknown"} if state == "pushing" else attempt
+  assert observed["run"]["items"][0]["repair_attempts"] == [expected_attempt]
   db.add(models.ChatRun(id="resumed-parent", chat_id=row.chat_id, status="running"))
   db.commit()
   principal.run_id = "resumed-parent"
@@ -1542,5 +1544,5 @@ def test_stop_observation_and_parent_resume_do_not_clear_pending_repair_admissio
   assert error.value.status_code == 409
   db.rollback()
   db.refresh(row)
-  assert row.outcomes_json[domain.key(ITEM)]["repair_attempts"] == [attempt]
+  assert row.outcomes_json[domain.key(ITEM)]["repair_attempts"] == [expected_attempt]
   assert not row.outcomes_json[domain.key(ITEM)].get("merge_attempted")

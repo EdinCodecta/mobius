@@ -576,6 +576,7 @@ async def core_report_outcome(run_id: str, body: ReviewOutcome, db: Session = De
              dependencies=[Depends(reject_cross_site), Depends(require_nondelegated_owner_or_app_control)])
 async def stop_review(app_id: int | None, run_id: str, db: Session = Depends(get_db),
                       principal: Principal = Depends(get_principal)):
+  from app import contribution_review_repairs as repairs
   from app.chat import stop_chat_for
   row = _row(db, app_id, run_id, principal)
   # An app may stop only the dedicated app-created review chat, never the
@@ -610,13 +611,13 @@ async def stop_review(app_id: int | None, run_id: str, db: Session = Depends(get
   ).all()
   children_stopped = not any(derived_status(db, child, load_result=False)[0]
                              in ACTIVE_DELEGATION_STATUSES for child in remaining)
-  if parent_stopped and children_stopped:
-    # The outcome lock waits for any already admitted dispatcher. Only then
-    # can a stopped editor's path be classified as abandoned; uncertain push
-    # evidence stays available indefinitely for read-only reconciliation.
-    async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
-      db.refresh(row)
-      await repair_actions.abandon_checkouts(row)
+  # Sweep even when cancellation has not settled. The receipt classifier
+  # protects active editors and uncertain effects; a later Stop/prepare can
+  # collect what was still active at this boundary.
+  async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
+    db.refresh(row)
+    await settled.run_settled(repairs.sweep_stale_checkouts,
+      **repair_actions.checkout_gc_scope(db))
   db.refresh(row)
   return {"stopped": parent_stopped and children_stopped, "run": _run_view(db, row)}
 
@@ -659,6 +660,7 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
                       if a.get("state") in {"pushing", "push_unknown"}), None)
       if pending:
         if not await repair_actions.reconcile_push(db, row, original, previous, pending, gh=_gh, cwd=cwd):
+          repair_actions.escalate_unconfirmed_push(db, row, original, previous, pending)
           continue
         previous = row.outcomes_json[reviews.key(original)]
       target = reviews.effective_target(row, original)
@@ -824,6 +826,8 @@ async def repair_checkout(app_id: int | None, run_id: str, body: RepairCheckout,
   _parent(db, row, principal)
   async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
     db.refresh(row)
+    await settled.run_settled(repairs.sweep_stale_checkouts,
+      **repair_actions.checkout_gc_scope(db))
     target = _target(row, body)
     previous = row.outcomes_json.get(reviews.key(target), {})
     if previous.get("merge_attempted") or previous.get("state") in {"merged", "queued", "merge_unknown"}:
