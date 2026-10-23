@@ -412,9 +412,16 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
             db.refresh(row)
             outcome = dict(row.outcomes_json[item_key])
             try:
+              # Reprove the target base after reservation, immediately before
+              # dispatch. A drift here is a definite nonattempt, not unknown.
+              await settled.run_settled(reviews.assert_current_base, _gh, cwd, target)
               _parent(db, row, principal)
             except HTTPException as exc:
               result = DispatchResult.not_dispatched(str(exc.detail))
+            except asyncio.CancelledError:
+              reviews.disarm_merge(db, row, target, outcome,
+                "The review was cancelled before any merge request began.")
+              raise
             else:
               try:
                 if checks.get("isMergeQueueEnabled") is True:
