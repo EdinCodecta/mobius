@@ -268,6 +268,7 @@ def test_shared_fence_projects_only_overlapping_or_unmatchable_grants(setup):
     "unicode-ref": {**target, "number": 13, "head_ref": "\u3000legacy"},
     "disjoint": {**target, "number": 12, "head_repo_id": 99, "head_ref": "different"},
     "disjoint-case": {**target, "repo": "another/repo", "head_ref": "different"},
+    "legacy-other-repo": {**TARGET, "repo": "another/repo"},
   }
   for name, item in selections.items():
     db.add(models.ContributionReviewRun(id=name, app_id=row.app_id, owner_id=row.owner_id,
@@ -277,8 +278,9 @@ def test_shared_fence_projects_only_overlapping_or_unmatchable_grants(setup):
   candidates = domain._transition_candidates(db, row.owner_id, target)
   assert {grant.id for grant in candidates} == {row.id, "same-pr", "same-branch", "legacy", "bad-type", "bad-ref", "unicode-ref"}
   assert all(set(grant._mapping) == {"id", "chat_id", "targets_json", "outcomes_json"} for grant in candidates)
-  # Legacy caller identity cannot prove disjointness from any grant.
-  assert len(domain._transition_candidates(db, row.owner_id, TARGET)) == len(selections) + 1
+  # Legacy caller identity is uncertain within its repository, not account-wide.
+  assert {grant.id for grant in domain._transition_candidates(db, row.owner_id, TARGET)} == (
+    {row.id, *selections} - {"disjoint-case", "legacy-other-repo"})
 
 
 def test_removed_attempt_snapshot_excludes_recursive_aggregate_history(monkeypatch):
