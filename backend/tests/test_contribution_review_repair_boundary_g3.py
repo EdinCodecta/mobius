@@ -168,14 +168,16 @@ def test_repeated_proof_drift_never_dispatches_push(checkout, monkeypatch, drift
     assert len(guards) == 2
 
 
-@pytest.mark.parametrize("porcelain,remote,expected", [
-  ("!\t{head}:refs/heads/topic\t[rejected] (non-fast-forward)\n", "initial", "not_dispatched"),
-  ("!\t{head}:refs/heads/topic\t[remote rejected] (protected branch)\n", "initial", "not_dispatched"),
-  ("!\t{head}:refs/heads/other\t[rejected] (non-fast-forward)\n", "initial", "unknown"),
-  ("!\t{head}:refs/heads/topic\t[remote failure] (EOF)\n", "initial", "unknown"),
-  ("!\t{head}:refs/heads/topic\t[rejected] (non-fast-forward)\n", "moved", "unknown"),
+@pytest.mark.parametrize("porcelain,remote,returncode,expected", [
+  ("!\t{head}:refs/heads/topic\t[rejected] (non-fast-forward)\n", "initial", 1, "not_dispatched"),
+  ("!\t{head}:refs/heads/topic\t[remote rejected] (protected branch)\n", "initial", 1, "not_dispatched"),
+  ("!\t{head}:refs/heads/other\t[rejected] (non-fast-forward)\n", "initial", 1, "unknown"),
+  ("!\t{head}:refs/heads/topic\t[remote failure] (EOF)\n", "initial", 1, "unknown"),
+  ("!\t{head}:refs/heads/topic\t[rejected] (non-fast-forward)\n", "moved", 1, "unknown"),
+  ("!\t{head}:refs/heads/topic\t[rejected] (non-fast-forward)\n=\tother:refs/heads/other\t[up to date]\n", "initial", 1, "unknown"),
+  ("!\t{head}:refs/heads/topic\t[rejected] (non-fast-forward)\n", "initial", -9, "unknown"),
 ])
-def test_exact_porcelain_rejection_releases_only_when_remote_unchanged(checkout, monkeypatch, porcelain, remote, expected):
+def test_exact_porcelain_rejection_releases_only_when_remote_unchanged(checkout, monkeypatch, porcelain, remote, returncode, expected):
   path, initial = checkout
   validation = {"checkout": str(path), "initial_head_sha": initial,
                 "head_repo": "owner/fork", "head_repo_id": 2, "head_ref": "topic",
@@ -189,7 +191,7 @@ def test_exact_porcelain_rejection_releases_only_when_remote_unchanged(checkout,
   monkeypatch.setattr(repairs, "_branch_head", lambda *a: ("d" * 40 if remote == "moved" else initial) if pushed else initial)
   def rejected(*args, **kwargs):
     pushed.append(1)
-    return type("Result", (), {"returncode": 1, "stdout": porcelain.format(head="b" * 40)})()
+    return type("Result", (), {"returncode": returncode, "stdout": porcelain.format(head="b" * 40)})()
   monkeypatch.setattr(repairs, "_git", rejected)
   assert repairs.push_repair(None, path, None, target, validation).state == expected
   assert pushed == [1]
