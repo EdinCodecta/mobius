@@ -631,7 +631,8 @@ def test_owner_choice_noted_on_a_legacy_squash_keeps_its_files(repo, marked):
     assert app_git.LEGACY_OVERLAY_UNIT not in units
     assert result.status == "clean"
     return
-  guard = units[app_git.LEGACY_OVERLAY_UNIT]
+  assert app_git.LEGACY_OVERLAY_UNIT not in units
+  guard = units[f"{app_git.LEGACY_OVERLAY_UNIT}-{(outer if marked == 'outer' else inner)[:12]}"]
   assert guard.disposition == "owner-choice:local"
   assert "greet.py" in guard.touched and guard.paths == ()
   assert result.reconciliation.retired_paths == ()
@@ -642,7 +643,263 @@ def test_owner_choice_noted_on_a_legacy_squash_keeps_its_files(repo, marked):
     repo, r2, app_git.merge_refs(repo, outer, r2).merged_tree_oid, outer,
   )
   body = _git(repo, "log", "-1", "--format=%B", chained)
-  assert f"Mobius-Overlay-Also: {app_git.LEGACY_OVERLAY_UNIT}=owner-choice:local" in body
+  assert f"Mobius-Overlay-Also: {guard.slug}=owner-choice:local" in body
+
+
+def _nested_squashes(repo: Path, *, between: dict | None = None) -> dict[str, str]:
+  """A ``pending-pr:#7`` draft of greet.py carried through two legacy squashes.
+
+  ``between`` is committed after the inner squash, so only the outer one
+  carries it. Returns the draft, both squashes and the release merging #7.
+  """
+  start = _commit(repo, {"greet.py": _HEADER + _BASE}, "header")
+  _git(repo, "branch", "-f", "upstream", start)
+  draft = _commit(repo, {"greet.py": _HEADER + _DRAFT},
+                  _unit_msg("Draft greet", "greet", "pending-pr:#7"))
+  r1 = _release(repo, [({"notes.md": "v2\n"}, "upstream 1")])
+  inner = platform_update._single_overlay_commit(
+    repo, r1, app_git.merge_refs(repo, draft, r1).merged_tree_oid, draft,
+  )
+  _git(repo, "reset", "-q", "--hard", inner)
+  before_outer = _commit(repo, between, _unit_msg("Late", "late", "pending-pr:#8")) \
+    if between else inner
+  r2 = _release(repo, [({"notes.md": "v3\n"}, "upstream 2")], start=r1)
+  outer = platform_update._single_overlay_commit(
+    repo, r2, app_git.merge_refs(repo, before_outer, r2).merged_tree_oid, before_outer,
+  )
+  _git(repo, "reset", "-q", "--hard", outer)
+  merge = _release(
+    repo, [({"greet.py": _HEADER + _MERGED}, "Reviewed greeting (#7)")], start=r2,
+  )
+  return {"start": start, "draft": draft, "inner": inner, "outer": outer,
+          "r2": r2, "merge": merge}
+
+
+def _prove_merged(repo: Path, proof: str, draft: str, merge: str, base: str) -> None:
+  """Give the updater one proof that greet.py's local bytes went into #7."""
+  if proof == "witness":
+    assert _witness(repo, draft, merge, ["greet.py"])
+  elif proof == "draft":
+    assert app_git.mark_draft_superseded(
+      repo, contribution_id="rec-7", base_sha=base, head_sha=draft, upstream_sha=merge,
+    )
+
+
+@pytest.mark.parametrize("proof", ["pending-pr", "witness", "draft"])
+@pytest.mark.parametrize("outer_note, inner_note", [
+  (None, None),
+  ("owner-choice:local", "pending-pr:#7"),
+  ("owner-choice:local", "local-only"),
+  ("pending-pr:#7", "owner-choice:local"),
+  ("local-only", "owner-choice:local"),
+])
+def test_an_owner_choice_on_any_nested_squash_outranks_other_squash_notes(
+  repo, proof, outer_note, inner_note,
+):
+  """Nested legacy squashes share one slug; each noted squash still keeps its
+  own claim, so no older or newer note on another squash undoes an owner's
+  choice to keep the file, under any of the three proofs."""
+  at = _nested_squashes(repo)
+  if proof != "pending-pr":
+    # Only the named proof applies: the draft's unit is no longer pending.
+    app_git.mark_overlay_disposition(repo, at["draft"], "local-only")
+  _prove_merged(repo, proof, at["draft"], at["merge"], at["start"])
+  for squash, note in (("outer", outer_note), ("inner", inner_note)):
+    if note:
+      app_git.mark_overlay_disposition(repo, at[squash], note)
+
+  units = {u.slug: u for u in app_git.overlay_units(repo, at["outer"], at["merge"])}
+  result = platform_update._final_tree_merge(repo, at["outer"], at["merge"])
+
+  if outer_note is None:
+    assert result.status == "clean"
+    assert _show(repo, result.merged_tree_oid, "greet.py") == _HEADER + _MERGED
+    return
+  guards = {
+    note: units[f"{app_git.LEGACY_OVERLAY_UNIT}-{at[squash][:12]}"].disposition
+    for squash, note in (("outer", outer_note), ("inner", inner_note))
+  }
+  assert guards == {outer_note: outer_note, inner_note: inner_note}
+  assert result.reconciliation.retired_paths == ()
+  assert _show(repo, result.local_oid, "greet.py") == _HEADER + _DRAFT
+  assert result.status == "conflict" and result.conflict_paths == ["greet.py"]
+
+
+def test_each_noted_squash_guards_only_the_paths_it_carried(repo):
+  """An owner's choice noted on the inner squash keeps greet.py; it does not
+  stretch to late.py, which only the outer squash carried."""
+  at = _nested_squashes(repo, between={"late.py": "L = 1\n"})
+  app_git.mark_overlay_disposition(repo, at["inner"], "owner-choice:local")
+  app_git.mark_overlay_disposition(repo, at["outer"], "local-only")
+  late_head = _pr_head(repo, {"late.py": "L = 1\n"}, start=at["r2"])
+  release = _release(
+    repo, [({"late.py": "L = 2\n"}, "Reviewed late (#8)")], start=at["merge"],
+  )
+  assert _witness(repo, late_head, release, ["late.py"], number=8)
+
+  units = {u.slug: u for u in app_git.overlay_units(repo, at["outer"], release)}
+  result = platform_update._final_tree_merge(repo, at["outer"], release)
+
+  inner = units[f"{app_git.LEGACY_OVERLAY_UNIT}-{at['inner'][:12]}"]
+  outer = units[f"{app_git.LEGACY_OVERLAY_UNIT}-{at['outer'][:12]}"]
+  assert (inner.disposition, inner.touched) == ("owner-choice:local", ("greet.py",))
+  assert (outer.disposition, outer.touched) == ("local-only", ("greet.py", "late.py"))
+  assert [(r.path, r.pr) for r in result.reconciliation.retired_paths] == [("late.py", 8)]
+  assert _show(repo, result.local_oid, "greet.py") == _HEADER + _DRAFT
+  assert result.status == "conflict" and result.conflict_paths == ["greet.py"]
+
+
+def test_a_shared_slug_recorded_by_an_older_chain_keeps_an_owner_choice(repo):
+  """Chains written before guards had their own slugs may record two
+  dispositions for ``platform-local-tree``; the owner's choice wins."""
+  _commit(repo, {"greet.py": _DRAFT}, app_git.overlay_message(
+    "Draft greet", unit="greet", disposition="pending-pr:#7",
+    also=[(app_git.LEGACY_OVERLAY_UNIT, "pending-pr:#7"),
+          (app_git.LEGACY_OVERLAY_UNIT, "owner-choice:local")],
+  ))
+  local = _commit(repo, {"local.py": "OWNER = True\n"}, "unrelated local work")
+  release = _release(repo, [({"greet.py": _MERGED}, "Reviewed greeting (#7)")])
+
+  units = {u.slug: u for u in app_git.overlay_units(repo, local, release)}
+  result = platform_update._final_tree_merge(repo, local, release)
+
+  assert units[app_git.LEGACY_OVERLAY_UNIT].disposition == "owner-choice:local"
+  assert result.reconciliation.retired_paths == ()
+  assert result.status == "conflict"
+
+
+# --- A merge the same update reverts leaves the local change alone ----------
+
+
+@pytest.mark.parametrize("proof", ["pending-pr", "witness", "draft"])
+def test_a_pr_merged_and_reverted_in_one_update_keeps_the_local_change(repo, proof):
+  draft = _commit(repo, {"greet.py": _DRAFT}, _unit_msg(
+    "Draft greet", "greet", "pending-pr:#7" if proof == "pending-pr" else "local-only",
+  ))
+  local = _commit(repo, {"local.py": "OWNER = True\n"}, "unrelated local work")
+  merge = _release(repo, [({"greet.py": _MERGED}, "Reviewed greeting (#7)")])
+  release = _release(repo, [
+    ({"greet.py": _BASE}, 'Revert "Reviewed greeting (#7)" (#9)'),
+    ({"notes.md": "v2\n"}, "later upstream work"),
+  ], start=merge)
+  _prove_merged(repo, proof, draft, merge, _git(repo, "rev-parse", "upstream"))
+
+  result = platform_update._final_tree_merge(repo, local, release)
+
+  assert result.reconciliation.retired_paths == ()
+  assert result.local_oid == local
+  assert result.status == "clean"
+  assert _show(repo, result.merged_tree_oid, "greet.py") == _DRAFT
+
+
+# --- Labels come only from the trailer block ---------------------------------
+
+
+def test_a_body_line_quoting_a_disposition_labels_nothing(repo):
+  _commit(repo, {"greet.py": _DRAFT}, (
+    "Draft greet\n\nA reviewer suggested\nMobius-Disposition: pending-pr:#7\n"
+    "but this stays local.\n"
+  ))
+  local = _commit(repo, {"local.py": "OWNER = True\n"}, "unrelated local work")
+  release = _release(repo, [({"greet.py": _MERGED}, "Reviewed greeting (#7)")])
+
+  units = app_git.overlay_units(repo, local, release)
+  result = platform_update._final_tree_merge(repo, local, release)
+
+  assert {u.disposition for u in units} == {"local-only"}
+  assert result.reconciliation.retired_paths == ()
+  assert result.status == "conflict"
+
+
+def test_superseded_drafts_are_still_set_aside_when_unit_labelling_fails(
+  repo, monkeypatch,
+):
+  start = _commit(repo, {"greet.py": _HEADER + _BASE}, "header")
+  _git(repo, "branch", "-f", "upstream", start)
+  draft = _commit(repo, {"greet.py": _HEADER + _DRAFT}, "Draft greet")
+  merge = _release(repo, [({"greet.py": _HEADER + _MERGED}, "Reviewed greeting")])
+  assert app_git.mark_draft_superseded(
+    repo, contribution_id="rec-7", base_sha=start, head_sha=draft, upstream_sha=merge,
+  )
+
+  def unlabelled(*_args, **_kwargs):
+    raise RuntimeError("labelling failed")
+
+  monkeypatch.setattr(app_git, "overlay_units", unlabelled)
+  result = platform_update._final_tree_merge(repo, draft, merge)
+
+  assert result.local_oid != draft
+  assert result.status == "clean"
+  assert _show(repo, result.merged_tree_oid, "greet.py") == _HEADER + _MERGED
+
+
+# --- Witness formats -----------------------------------------------------------
+
+
+def _legacy_witness(repo: Path, source: str, number: int = 7) -> str:
+  """A format-1 witness as earlier Contribute builds wrote it."""
+  metadata = (
+    f'{{"contribution_id":"rec-{number}","merge_sha":null,"number":{number},'
+    f'"paths":["greet.py"],"source_sha":"{source}","version":1}}'
+  )
+  anchor = _git(repo, "commit-tree", f"{source}^{{tree}}", "-p", source, "-m", metadata)
+  ref = f"{app_git.MERGED_CONTRIBUTION_PREFIX}/{number}"
+  _git(repo, "update-ref", ref, anchor)
+  return ref
+
+
+def test_a_format_1_witness_never_retires_and_waits_for_the_backfill(repo):
+  draft = _commit(repo, {"greet.py": _DRAFT}, "Draft greet")
+  local = _commit(repo, {"local.py": "OWNER = True\n"}, "unrelated local work")
+  release = _release(repo, [({"greet.py": _MERGED}, "Reviewed greeting (#7)")])
+  ref = _legacy_witness(repo, draft)
+
+  result = platform_update._final_tree_merge(repo, local, release)
+  app_git.retire_landed_equivalent_changes(repo, release)
+
+  assert result.reconciliation.retired_paths == ()
+  assert _git(repo, "for-each-ref", "--format=%(refname)", ref) == ref
+  assert app_git.drop_legacy_merged_contributions(repo, dry_run=True) == [7]
+  assert _git(repo, "for-each-ref", "--format=%(refname)", ref) == ref
+
+
+def test_recording_the_same_witness_again_keeps_the_overlay_evidence(repo):
+  head = _pr_head(repo, {"greet.py": _DRAFT})
+  merge = _release(repo, [({"greet.py": _MERGED}, "Reviewed greeting (#7)")])
+  ref = _witness(repo, head, merge, ["greet.py"])
+  first = _git(repo, "rev-parse", ref)
+  evidence = app_git.overlay_evidence_fingerprint(repo)
+
+  assert _witness(repo, head, merge, ["greet.py"]) == ref
+  assert _git(repo, "rev-parse", ref) == first
+  assert app_git.overlay_evidence_fingerprint(repo) == evidence
+
+
+# --- Retired copies stay pinned, newest few only -------------------------------
+
+
+def test_only_the_newest_retired_pins_are_kept(repo):
+  served = []
+  for n in range(5):
+    tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    served.append(subprocess.run(
+      ["git", "-C", str(repo), "commit-tree", tree, "-m", f"served {n}"],
+      capture_output=True, text=True, check=True,
+      env={**app_git._git_env(repo), "GIT_AUTHOR_NAME": "T",
+           "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "T",
+           "GIT_COMMITTER_EMAIL": "t@example.invalid",
+           "GIT_COMMITTER_DATE": f"2026-01-0{n + 1}T00:00:00Z"},
+    ).stdout.strip())
+  stamped = f"{platform_update._SET_ASIDE_PREFIX}/20260101T000000000000Z"
+  _git(repo, "update-ref", stamped, served[0])
+
+  for n, commit in enumerate(served):
+    platform_update._pin_retired_local_copies(repo, f"{n:08d}" + "f" * 32, commit)
+
+  pins = _git(repo, "for-each-ref", "--format=%(refname)",
+              platform_update._SET_ASIDE_PREFIX).split()
+  kept = [f"{platform_update._SET_ASIDE_PREFIX}/retired-{n:08d}" for n in (2, 3, 4)]
+  assert sorted(pins) == sorted([stamped, *kept])
 
 
 # --- One planner: status counts what Apply sets aside -----------------------

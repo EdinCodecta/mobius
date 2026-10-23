@@ -447,7 +447,9 @@ class PlatformUpdatePreview(TypedDict):
   # reports them and never waits on them.
   local_image_paths: list[str]
   # Unchanged local copies of pull requests this release merged; Apply takes
-  # the release's version of each (``app_git.without_retired_units``).
+  # the release's version of each (``app_git.without_retired_units``). The
+  # Settings update review does not list them yet; the old copies stay
+  # recoverable under the ``retired-*`` set-aside pins.
   retired_paths: NotRequired[list[dict]]
   # Evidence from preparation, not a claim about later replayed edits.
   local_tests: NotRequired[dict]
@@ -2956,37 +2958,23 @@ def _final_tree_merge(repo: Path, source: str, target: str) -> app_git.MergeResu
   A local draft of a contribution the release merged in revised form is set
   aside first, so the merged version arrives instead of a draft-vs-final
   conflict. Likewise an unchanged local copy of a pull request the release
-  merged is retired (``app_git.without_merged_local_copies``). Review, Apply
+  merged is retired (``app_git.set_aside_merged_work``). Review, Apply
   and the agent handoff all call this, so the conflict Review predicts is the
   conflict Apply would park. It writes Git objects only; no ref, index or
-  working tree moves.
+  working tree moves. ``local_oid`` names the local commit actually merged.
   """
-  local, retired = _without_merged_local_copies(repo, source, target)
+  local, retired = app_git.set_aside_merged_work(repo, source, target)
   merged = (
     app_git.merge_with_equivalent_changes(repo, local, target)
     or app_git.merge_refs(repo, local, target)
   )
-  merged.local_oid = local
-  if retired:
-    merged.reconciliation = replace(merged.reconciliation, retired_paths=retired)
-  return merged
-
-
-def _without_merged_local_copies(
-  repo: Path, source: str, target: str,
-) -> tuple[str, tuple[app_git.RetiredPath, ...]]:
-  """``source`` with merged contributions' local copies set aside, or as is.
-
-  Setting them aside is an optimization over the ordinary merge: without unit
-  labels an owner's choice to keep a file local is unknown, and without a
-  proof every local copy simply stays for the resolver.
-  """
-  try:
-    units = app_git.overlay_units(repo, source, target)
-    return app_git.without_merged_local_copies(repo, source, target, units)
-  except Exception:
-    log.warning("platform: could not set aside merged local copies", exc_info=True)
-    return source, ()
+  return replace(
+    merged, local_oid=local,
+    reconciliation=(
+      replace(merged.reconciliation, retired_paths=retired) if retired
+      else merged.reconciliation
+    ),
+  )
 
 
 def _apply_overlay(
@@ -3041,12 +3029,7 @@ def _merged_candidate(
   If live edits changed under that answer, they are merged afresh instead.
   """
   if merged.reconciliation.retired_paths:
-    # The retired local copies stay in the served commit; pin it so they
-    # remain recoverable (status lists it under ``recovery_refs``).
-    _git(
-      "update-ref", f"{_SET_ASIDE_PREFIX}/retired-{target[:8]}", carried.served,
-      repo=repo,
-    )
+    _pin_retired_local_copies(repo, target, carried.served)
   if merged.status == "conflict":
     return _park_net_conflict(
       repo, carried, target, source=merged.local_oid or carried.served,
@@ -3073,6 +3056,27 @@ def _merged_candidate(
       raise PlatformUpdateError("The working-tree merge returned no tree.")
     tip = _working_overlay_commit(repo, tip, dirty.merged_tree_oid)
   return _Candidate(tip, reconciliation, {"mode": "net", "source": carried.served})
+
+
+# Updates that retired local copies keep the served commit they came from
+# pinned, newest first, so the owner can recover them; older pins are dropped.
+_RETIRED_PINS_KEPT = 3
+
+
+def _pin_retired_local_copies(repo: Path, target: str, served: str) -> str:
+  """Pin ``served``, which still holds the copies an update to ``target``
+  retired (status lists it under ``recovery_refs``), and drop the oldest
+  ``retired-*`` pins beyond the newest few. Other set-aside refs belong to
+  rollback and resolver recovery and are never touched here."""
+  ref = f"{_SET_ASIDE_PREFIX}/retired-{target[:8]}"
+  _git("update-ref", ref, served, repo=repo)
+  pins = _git(
+    "for-each-ref", "--sort=-committerdate", "--format=%(refname)",
+    f"{_SET_ASIDE_PREFIX}/retired-*", repo=repo,
+  ).stdout.split()
+  for stale in [pin for pin in pins if pin != ref][_RETIRED_PINS_KEPT - 1:]:
+    _git("update-ref", "-d", stale, repo=repo, check=False)
+  return ref
 
 
 def _park_net_conflict(
@@ -3165,7 +3169,7 @@ def _park_for_repair(
   ).stdout.strip()
   if merged.status == "conflict":
     _park_net_conflict(
-      repo, carried, target, source=merged.local_oid or source, right=target,
+      repo, carried, target, source=merged.local_oid, right=target,
       base=base, stage="committed", reconciliation=merged.reconciliation,
     )
     flag = _read_conflict_flag() or {}
@@ -3174,7 +3178,7 @@ def _park_for_repair(
     }
     _write_conflict_flag(target, list(flag.get("paths") or []), overlay=parked)
     return
-  left = merged.local_oid or source
+  left = merged.local_oid
   worktree = _overlay_candidate_path(repo)
   app_git.remove_overlay_worktree(repo, worktree)
   _git("worktree", "add", "--detach", "-q", str(worktree), left, repo=repo)
@@ -4747,6 +4751,7 @@ def park_update_for_agent(
 # when the local tip, the installed release, the checked target, or a
 # disposition note or merged-contribution witness moves.
 _overlay_summary_cache: dict[tuple, dict | None] = {}
+_OVERLAY_SUMMARY_MISS = object()
 _LARGE_OVERLAY_FILES = 100
 _LARGE_OVERLAY_LINES = 5000
 _OVERLAY_SUMMARY_UNITS = 20
@@ -4769,8 +4774,10 @@ def local_overlay_summary(
   key = (
     str(repo), local, release, target, app_git.overlay_evidence_fingerprint(repo),
   )
-  if key in _overlay_summary_cache:
-    return _overlay_summary_cache[key]
+  # Another status poll may clear the cache between a check and a read.
+  cached = _overlay_summary_cache.get(key, _OVERLAY_SUMMARY_MISS)
+  if cached is not _OVERLAY_SUMMARY_MISS:
+    return cached
   try:
     summary = _compute_overlay_summary(repo, local, release, target)
   except Exception:
@@ -4809,7 +4816,7 @@ def _compute_overlay_summary(
   retired: tuple[app_git.RetiredPath, ...] = ()
   if target and _rev(repo, target) and not _is_ancestor(repo, target, local):
     # Exactly what Apply sets aside: superseded drafts and retired copies.
-    tip, retired = _without_merged_local_copies(repo, local, target)
+    tip, retired = app_git.set_aside_merged_work(repo, local, target)
     if tip != local:
       set_aside = _git(
         "diff", "--name-only", "-z", "--no-renames", local, tip, repo=repo,

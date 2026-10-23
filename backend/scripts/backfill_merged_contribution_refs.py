@@ -10,6 +10,12 @@ release repository whose source is this checkout, whose merge commit is
 recorded, and which the installed release does not carry yet. It never
 matches a pull request by number alone. It is idempotent and offline.
 
+Run it again after an update that loads the format-2 witnesses: it rewrites
+each format-1 witness an earlier Contribute wrote (staging-source tree, no
+merge commit, never used for retirement) from Contribute's records, then
+drops the format-1 witnesses no record supports any longer. Re-running it
+leaves current witnesses untouched.
+
   python3 backend/scripts/backfill_merged_contribution_refs.py \\
     --records /data/apps/<contribute app id>/contributions [--dry-run]
 """
@@ -72,7 +78,9 @@ def backfill(
   release = app_git.UPSTREAM_BRANCH
   if not app_git.ref_exists(repo, f"{release}^{{commit}}"):
     raise SystemExit(f"{repo} has no installed release ({release})")
-  outcome: dict[str, list[int]] = {"written": [], "integrated": [], "unavailable": []}
+  outcome: dict[str, list[int]] = {
+    "written": [], "integrated": [], "unavailable": [], "dropped_legacy": [],
+  }
   for record in _merged_platform_records(records, repo, github_repo):
     number = record["number"]
     plan = record["plan"]
@@ -94,6 +102,13 @@ def backfill(
       outcome["written"].append(number)
     else:
       outcome["unavailable"].append(number)
+  if not dry_run:
+    outcome["dropped_legacy"] = app_git.drop_legacy_merged_contributions(repo)
+  else:
+    outcome["dropped_legacy"] = [
+      number for number in app_git.drop_legacy_merged_contributions(repo, dry_run=True)
+      if number not in outcome["written"]
+    ]
   return {key: sorted(set(values)) for key, values in outcome.items()}
 
 
@@ -111,7 +126,9 @@ def main(argv: list[str] | None = None) -> int:
   print(
     f"{verb} {len(outcome['written'])} witnesses; "
     f"{len(outcome['integrated'])} already in the installed release; "
-    f"{len(outcome['unavailable'])} without a reviewed head or merge commit"
+    f"{len(outcome['unavailable'])} without a reviewed head or merge commit; "
+    f"{len(outcome['dropped_legacy'])} unsupported format-1 witnesses "
+    f"{'to drop' if args.dry_run else 'dropped'}"
   )
   return 0
 

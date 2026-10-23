@@ -86,9 +86,46 @@ def test_backfill_writes_witnesses_only_for_merged_prs_the_release_lacks(repo, t
   assert _git(repo, "for-each-ref", app_git.MERGED_CONTRIBUTION_PREFIX) == ""
   outcome = backfill.backfill(records, repo)
 
-  assert outcome == {"written": [7], "integrated": [5], "unavailable": [11, 12]}
+  assert outcome == {
+    "written": [7], "integrated": [5], "unavailable": [11, 12], "dropped_legacy": [],
+  }
   assert _git(repo, "for-each-ref", "--format=%(refname)",
               app_git.MERGED_CONTRIBUTION_PREFIX) == f"{app_git.MERGED_CONTRIBUTION_PREFIX}/7"
   result = platform_update._final_tree_merge(repo, local, release)
   assert result.status == "clean"
   assert _show(repo, result.merged_tree_oid, "greet.py") == _MERGED
+
+
+def test_backfill_rewrites_format_1_witnesses_and_reruns_leave_them(repo, tmp_path):
+  """Witnesses written before the reviewed-head format are rewritten from
+  Contribute's records; ones no record supports are dropped."""
+  from tests.test_overlay_units import _legacy_witness
+
+  draft = _commit(repo, {"greet.py": _DRAFT}, "Draft greet")
+  local = _commit(repo, {"local.py": "OWNER = True\n"}, "unrelated local work")
+  head = _pr_head(repo, {"greet.py": _DRAFT})
+  release = _release(repo, [({"greet.py": _MERGED}, "Reviewed greeting (#7)")])
+  _legacy_witness(repo, draft, number=7)
+  orphan = _legacy_witness(repo, draft, number=8)
+  records = tmp_path / "contributions"
+  records.mkdir()
+  (records / "a.json").write_text(json.dumps({
+    "id": "a", "status": "merged", "number": 7, "merge_commit_sha": release,
+    "plan": {"repo": app_git.PLATFORM_RELEASE_REPO, "head_sha": head, "files": ["greet.py"]},
+  }))
+  assert platform_update._final_tree_merge(repo, local, release).status == "conflict"
+
+  assert backfill.backfill(records, repo, dry_run=True)["dropped_legacy"] == [8]
+  outcome = backfill.backfill(records, repo)
+
+  assert outcome["written"] == [7] and outcome["dropped_legacy"] == [8]
+  ref = f"{app_git.MERGED_CONTRIBUTION_PREFIX}/7"
+  meta = json.loads(_git(repo, "log", "-1", "--format=%B", ref))
+  assert (meta["version"], meta["head_sha"], meta["merge_sha"]) == (2, head, release)
+  assert _git(repo, "for-each-ref", orphan) == ""
+  result = platform_update._final_tree_merge(repo, local, release)
+  assert result.status == "clean"
+  assert _show(repo, result.merged_tree_oid, "greet.py") == _MERGED
+  rewritten = _git(repo, "rev-parse", ref)
+  assert backfill.backfill(records, repo) == {**outcome, "dropped_legacy": []}
+  assert _git(repo, "rev-parse", ref) == rewritten
