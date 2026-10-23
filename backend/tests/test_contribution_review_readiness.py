@@ -487,8 +487,7 @@ def test_refusal_after_arming_readiness_is_not_attempted_and_can_retry(setup, mo
     db.get(models.Chat, row.chat_id).agent_settings_json = {"model": "gpt-5", "effort": "xhigh"}
   db.commit()
   monkeypatch.setattr(domain, "arm_ready", arm)
-  confirmed = iter([(REPO, {**PULL, "draft": True}), (REPO, {**PULL, "draft": False})])
-  monkeypatch.setattr(domain, "current_pull", lambda *a: next(confirmed))
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (REPO, {**PULL, "draft": not calls}))
   result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
   assert calls == [1]
   assert result["run"]["items"][0]["ready_attempt"]["state"] == "ready"
@@ -675,9 +674,12 @@ def test_merge_retains_ready_receipt_resolved_during_claim_commit(setup, monkeyp
 
 def test_readiness_audit_preserves_admission_and_confirmation(setup, monkeypatch):
   db, row, principal = ready_takeover(setup, monkeypatch)
-  confirmed = iter([(REPO, {**PULL, "draft": True}), (REPO, {**PULL, "draft": False})])
-  monkeypatch.setattr(domain, "current_pull", lambda *a: next(confirmed))
-  monkeypatch.setattr(domain, "mark_ready", lambda *a: {"id": "PR_7", "isDraft": False, "headRefOid": SHA})
+  stage = {"ready": False}
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (REPO, {**PULL, "draft": not stage["ready"]}))
+  def mark_ready(*args):
+    stage["ready"] = True
+    return {"id": "PR_7", "isDraft": False, "headRefOid": SHA}
+  monkeypatch.setattr(domain, "mark_ready", mark_ready)
   result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
   attempt = result["run"]["items"][0]["ready_attempt"]
   audit = row.outcomes_json[domain.key(ITEM)]["ready_audit"]
@@ -873,6 +875,39 @@ def test_stop_after_ready_arm_refuses_dispatch_and_releases_exact_claim(setup, m
   db.refresh(row)
   assert not dispatched
   assert row.outcomes_json[routes.REVIEW_STOP_KEY]["state"] == "requested"
+  assert "ready_attempt" not in row.outcomes_json[domain.key(ITEM)]
+  claim = db.query(models.AgentWorkClaim).filter_by(
+    work_key=domain.ready_work_key(row.targets_json[0])).one()
+  assert claim.released_at is not None
+
+
+@pytest.mark.parametrize("drift", ["head", "base"])
+def test_ready_refuses_target_drift_after_arm_without_dispatch(setup, monkeypatch, drift):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  calls = {"pull": 0, "base": 0}
+  dispatched = []
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: dispatched.append(1))
+
+  def pull(*args):
+    calls["pull"] += 1
+    if drift == "head" and calls["pull"] > 1:
+      raise HTTPException(409, "The selected PR head moved.")
+    return REPO, {**PULL, "draft": True}
+
+  def base(*args):
+    calls["base"] += 1
+    if drift == "base" and calls["base"] > 1:
+      raise HTTPException(409, "The selected base moved.")
+
+  monkeypatch.setattr(domain, "current_pull", pull)
+  monkeypatch.setattr(domain, "assert_current_base", base)
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert error.value.status_code == 409
+  assert not dispatched
+  assert calls["pull"] >= (2 if drift == "head" else 1)
+  assert calls["base"] >= (2 if drift == "base" else 1)
+  db.refresh(row)
   assert "ready_attempt" not in row.outcomes_json[domain.key(ITEM)]
   claim = db.query(models.AgentWorkClaim).filter_by(
     work_key=domain.ready_work_key(row.targets_json[0])).one()

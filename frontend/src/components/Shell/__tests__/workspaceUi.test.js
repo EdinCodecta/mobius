@@ -926,19 +926,19 @@ test('chat drawer indicators distinguish owner input, active work, waiting, and 
     'completion must refresh Changes even when its local card missed the active-to-idle transition',
   )
   assert.match(
-    shell.slice(shell.indexOf("ev.type === 'chat_run_finished'"), shell.indexOf("ev.type === 'delegation_changed'")),
+    shell.slice(shell.indexOf("ev.type === 'chat_run_finished'"), shell.indexOf("ev.type === 'shell_rebuilt'")),
     /projectChatLookup[\s\S]*?dispatchEvent\(new CustomEvent\('mobius:project-change'/,
     'a project agent run completion must refresh an open project file without waiting for its backed-off cursor poll',
   )
   assert.doesNotMatch(
-    shell.slice(shell.indexOf("ev.type === 'chat_run_finished'"), shell.indexOf("ev.type === 'delegation_changed'")),
+    shell.slice(shell.indexOf("ev.type === 'chat_run_finished'"), shell.indexOf("ev.type === 'shell_rebuilt'")),
     /markChatOwnerInput\(chatId, \{ kind: null, questionId: null \}\)/,
     'run completion must not erase an owner-input request that is still pending',
   )
-  assert.match(
+  assert.doesNotMatch(
     shell,
-    /ev\.type === 'delegation_changed'[\s\S]*?invalidateChatChangesQueries\(queryClient, chatId\)[\s\S]*?\['completed', 'failed', 'needs_review'\][\s\S]*?setAttentionChatIds/,
-    'source-attached completion must refresh its parent and mark hidden work for attention',
+    /ev\.type === 'delegation_changed'/,
+    'the retired attached-work status event has no publisher and no shell consumer',
   )
   assert.match(
     shell,
