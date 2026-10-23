@@ -14,10 +14,14 @@ async def dispatch_merge(gh, cwd, target, repo, checks, authorize):
     authorize()
     # The earlier gate ran before reservation and claim persistence. A moved
     # target tip is a known refusal, not an uncertain merge/queue attempt.
-    await asyncio.to_thread(reviews.assert_current_base, gh, cwd, target)
+    await settled.run_settled(reviews.assert_current_base, gh, cwd, target)
     authorize()
   except HTTPException as exc:
     return DispatchResult.not_dispatched(str(exc.detail))
+  except asyncio.CancelledError:
+    # The read settled, but no mutation was entered. The caller persists the
+    # exact release before propagating cancellation.
+    return DispatchResult.not_dispatched("Cancelled before merge dispatch.")
   except Exception:
     return DispatchResult.not_dispatched("The final target-base check failed before merge dispatch.")
   try:
@@ -53,6 +57,8 @@ async def _reserve_and_dispatch(db, row, target, outcome, repo, checks, principa
   result = await dispatch_merge(gh, cwd, target, repo, checks, authorize)
   if result.state == "not_dispatched":
     reviews.disarm_merge(db, row, target, armed, result.reason)
+    if asyncio.current_task().cancelling():
+      raise asyncio.CancelledError
     return None
   if result.state == "confirmed":
     return {**armed, **result.receipt}
