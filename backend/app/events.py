@@ -22,6 +22,7 @@ from app.tool_sources import (
   enrich_tool_source,
   normalize_tool_sources,
 )
+from app.viewed_images import SNAPSHOT_NAME
 
 
 # The canonical terminal subagent statuses the persisted block stores, matching
@@ -74,6 +75,7 @@ EventType = Literal[
   "tool_output",
   "tool_sources",
   "tool_end",
+  "viewed_image",
   "skill_loaded",
   "generated_file",
   "task_start",
@@ -105,7 +107,8 @@ SYSTEM_EVENT_TYPES: frozenset[str] = frozenset({
   # Explicit agent-initiated "open this in the partner's workspace" request
   # (split-pane design §6.3). The agent POSTs it with a typed item + optional
   # source + placement/activation; Shell confirms the item exists, then routes
-  # it through the same pane-aware resolver as app_preview_ready. Like that
+  # it through the same pane-aware resolver as app_preview_ready. itemKind
+  # settings instead navigates to Settings (optionally one section). Like that
   # preview action it is system-bus-only (an action must never replay).
   "open_item",
   "app_updated",
@@ -267,7 +270,8 @@ def _persisted_block(block: dict) -> dict:
 #    fragmented one continuous reasoning pass into dozens of ~1s "Thought for 1
 #    second" blocks (even splitting mid-word). They change no block, so they must
 #    not touch thinking structure.
-#  - tool_input / tool_output / tool_sources / tool_end / skill_loaded only MUTATE
+#  - tool_input / tool_output / tool_sources / tool_end / viewed_image /
+#    skill_loaded only MUTATE
 #    an existing tool block. tool_start (which IS in this set) has already closed
 #    thinking and made a tool the trailing block before any of these arrive, so a
 #    later thinking auto-separates regardless.
@@ -768,7 +772,7 @@ def _process_subagent_event(event: dict, assistant_blocks: list) -> bool:
 
 _TOOL_EVENT_TYPES = frozenset({
   "tool_start", "tool_input", "tool_output", "tool_sources", "tool_end",
-  "skill_loaded", "generated_file",
+  "viewed_image", "skill_loaded", "generated_file",
 })
 
 
@@ -882,6 +886,10 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
       # can suppress transport without guessing from tool names or output.
       if isinstance(event.get("owner_card_question_id"), str):
         blk["owner_card_question_id"] = event["owner_card_question_id"]
+      # A screenshot step names its saved chat-media picture (stamped by the
+      # sink from the full result; see screenshot_steps).
+      if isinstance(event.get("saved_image"), str):
+        blk["saved_image"] = event["saved_image"]
       return True
     return False
 
@@ -912,6 +920,27 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
       digest = event["viewed_image_sha256"]
       if isinstance(digest, str):
         blk["viewed_image_sha256"] = digest
+    return True
+
+  if event_type == "viewed_image":
+    # Codex records a view's model-bound image only after the view completes,
+    # so the runner binds the chat snapshot of it once the turn has ended.
+    # Exact id only: a snapshot must never be adopted by a different view.
+    view_id = event.get("tool_use_id")
+    blk = next((
+      candidate for candidate in reversed(assistant_blocks)
+      if view_id and candidate.get("type") == "tool"
+      and candidate.get("tool_use_id") == view_id
+    ), None)
+    name = event.get("viewed_image_media")
+    if (
+      blk is None
+      or blk.get("tool") != "ViewImage"
+      or not isinstance(name, str)
+      or not SNAPSHOT_NAME.fullmatch(name)
+    ):
+      return False
+    blk["viewed_image_media"] = name
     return True
 
   if event_type == "skill_loaded":
@@ -967,9 +996,9 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
     return True
 
   if event_type == "generated_file":
-    # Deliverables belong to the completed assistant turn, not to a guessed
-    # provider tool. A dedicated block keeps the transcript contract identical
-    # across providers and lets the UI render one handoff after the final text.
+    # Deliverables belong to the assistant turn, never to a guessed provider
+    # tool. A dedicated block keeps the transcript contract identical across
+    # providers and lets the UI render one handoff after the final text.
     name = event.get("name")
     if not isinstance(name, str) or not name:
       return False
@@ -981,6 +1010,15 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
     }
     if isinstance(event.get("sha256"), str):
       entry["sha256"] = event["sha256"]
+    # A native picture's runner knows (not guesses) the step that produced
+    # it and its decoded size: the UI shows it beside that step in a frame
+    # sized before any byte loads.
+    source = event.get("source_tool_use_id")
+    if isinstance(source, str) and source:
+      entry["source_tool_use_id"] = source
+    width, height = event.get("width"), event.get("height")
+    if all(type(side) is int and side > 0 for side in (width, height)):
+      entry["width"], entry["height"] = width, height
     target = next((
       block for block in reversed(assistant_blocks)
       if block.get("type") == "generated_files"

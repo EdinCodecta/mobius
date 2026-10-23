@@ -1,5 +1,5 @@
 import {
-  forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useMemo,
+  forwardRef, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo,
   useReducer, useRef, useState,
 } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -7,12 +7,15 @@ import { api } from '../../api/client.js'
 import { appQueries, themeQueries } from '../../hooks/queries.js'
 import { serviceSurfaceFrameUrl } from '../../lib/serviceSurface.js'
 import { useReachabilityPhase } from '../../hooks/useOnlineStatus.js'
+import useDialogFocus from '../../hooks/useDialogFocus.js'
+import { contrastingAccentFg } from '../../theme.js'
 import { getOnlineSnapshot, ReachabilityPhase } from '../../lib/connectivityStore.js'
 import {
   AppTokenStartupState, appTokenIdentity, appTokenStartupState,
   liveAppToken, resolveLatchedToken,
 } from '../../lib/appToken.js'
 import { createAppStorageHost } from '../../lib/appStorageHost.js'
+import { acquireAudioSession } from '../../lib/audioSession.js'
 import { validNavLocationText } from '../../lib/appNavLocation.js'
 import { readAppNavLocation, writeValidatedAppNavLocation } from '../../lib/appNavLocationStore.js'
 import {
@@ -26,6 +29,7 @@ import { createCapabilityHost } from '../../lib/capabilityHost.js'
 import { builtInCapabilityProviders } from '../../lib/capabilityProviders.js'
 import { clampCameraPreviewRect } from '../../lib/cameraPreview.js'
 import { requestAppCodeWarm } from '../../lib/appPrecache.js'
+import AppConsentPanel from './AppConsentPanel.jsx'
 import { appHostRequest } from '../../lib/appHostRequest.js'
 import {
   accountLinkCompletion,
@@ -38,12 +42,16 @@ import {
   applyVirtualStorageMutation,
   attributedFrameVersion,
   attributedShellShortcutAction,
+  confirmAppFileExport,
+  retireStaleAppFileExport,
+  serveAppFileExportRequest,
   serveClipboardWrite,
   serveModuleRequest,
   serveStorageRpc,
 } from './appFrameProtocol.js'
 import { useManagedAppFrameForwarding } from '../../hooks/useManagedAppEvents.js'
 import { writeClipboardText } from '../../runtime/clipboard.js'
+import { finishAppFileExport } from '../../lib/appFileExport.js'
 import {
   initSwapState, reduceSwap, compareVersions, INCOMING_SWAP_TIMEOUT_MS,
 } from '../../lib/previewSwapState.js'
@@ -53,6 +61,45 @@ import './AppCanvas.css'
 function appFrameRequestUrl(appId, version, frameRev) {
   return `${api.apps.frameUrl(appId)}?v=${encodeURIComponent(version)}`
     + (frameRev ? `-${frameRev}` : '')
+}
+
+function fileExportInk(color) {
+  const contrast = contrastingAccentFg(color)
+  return contrast === '#000000' ? '#172008' : contrast || undefined
+}
+
+function AppFileExportDialog({ appName, themeColor, request, onCancel, onConfirm }) {
+  const dialogRef = useRef(null)
+  const cancelRef = useRef(null)
+  const titleId = useId()
+  useDialogFocus({
+    containerRef: dialogRef, initialFocusRef: cancelRef, onClose: onCancel,
+  })
+  useEffect(() => {
+    if (request.busy) dialogRef.current?.focus({ preventScroll: true })
+  }, [request.busy])
+  return (
+    <div className="canvas-file-export" role="dialog" aria-modal="true"
+      aria-labelledby={titleId} ref={dialogRef} tabIndex={-1}>
+      <div className="canvas-file-export__card" style={themeColor ? {
+        '--file-export-accent': themeColor,
+        '--file-export-ink': fileExportInk(themeColor),
+      } : undefined}>
+        <div className="canvas-file-export__eyebrow">FILE EXPORT</div>
+        <h2 id={titleId}>Save a file from {appName || 'this app'}?</h2>
+        <p className="canvas-file-export__name">{request.name}</p>
+        <p>Only this app’s own file is accessible. Nothing downloads until you confirm.</p>
+        {request.error && <p className="canvas-file-export__error" role="alert">{request.error}</p>}
+        <div className="canvas-file-export__actions">
+          <button type="button" ref={cancelRef} onClick={onCancel}>Cancel</button>
+          <button type="button" className="canvas-file-export__primary"
+            onClick={onConfirm} disabled={request.busy}>
+            {request.busy ? 'Preparing…' : 'Save file'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 // =================================================================
@@ -99,6 +146,9 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //      live visible frame → parent, answered by moebius:clipboard-write-result.
 //      The host is a fallback for engines that deny clipboard access inside an
 //      opaque frame; source attribution and visibility gate the side effect.
+//   File export: {type:'moebius:file-export', requestId, path, name?}
+//      live visible frame → shell confirmation → own storage file download.
+//      The app supplies no app id or token; result is file-export-result.
 //
 //   2. {type: 'moebius:frame-mounted', appId}              frame → parent
 //      Fired by the frame AFTER its first render COMMITS (MountSignal's
@@ -219,7 +269,8 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //
 // Host-level messages (attributed and narrowed here, outcomes owned by the
 // `onHostRequest` callback):
-//   - {type: 'moebius:new-chat', draft?, autoSend?}          frame → host
+//   - {type: 'moebius:new-chat', draft?}                     frame → host
+//     (always an editable draft; see appHostRequest)
 //   - {type: 'moebius:open-chat', chatId, draft?}            frame → host
 //   - {type: 'moebius:open-app', appId, intent?}             frame → host
 //   - {type: 'moebius:open-settings', section?}              frame → host
@@ -335,7 +386,8 @@ function CameraPreviewLayer({ preview }) {
 // well within the server-side validity window. The token is app-scoped (keyed
 // by appId server-side), so it is identical for both buffered versions.
 const AppCanvas = forwardRef(function AppCanvas({
-  appId, version = 0, storageGeneration = null, appName, appSlug, offlineCapable = false,
+  appId, version = 0, storageGeneration = null, appName, appSlug, themeColor,
+  offlineCapable = false,
   capabilityContract = null,
   subscribeManagedAppEvents = null,
   // The shell's applied presentation for this app: full-bleed immersive,
@@ -371,21 +423,32 @@ const AppCanvas = forwardRef(function AppCanvas({
   onAppFocus, onImmersive, onIntentDelivered, onAppError, onHostRequest,
   onMediaSession, onShellShortcut,
 }, hostRef) {
+  // Before app code can play: app frames cannot set the page's audio session.
+  useLayoutEffect(() => acquireAudioSession('playback'), [])
+
   const queryClient = useQueryClient()
   const [serviceSurface, setServiceSurface] = useState(null)
   const [cameraPreview, setCameraPreview] = useState(null)
+  const [pendingFileExport, setPendingFileExport] = useState(null)
+  const pendingFileExportRef = useRef(null)
   const canvasWrapRef = useRef(null)
   const serviceRequestRef = useRef(0)
   const serviceFrameRef = useRef(null)
   // Fresh app tokens are persisted for their remaining short lifetime so a
   // fully cached app can cold-boot offline. The cache is app-id scoped and JWT
   // claims are checked on read; the long-lived owner token never enters a frame.
+  // A Store app is dormant until the owner has accepted what it asks for. Ask
+  // first; mint the token only once nothing is pending. Offline (paused) the
+  // check is skipped so a fully cached app still opens from its cached token.
+  const consentQuery = appQueries.consent.useQuery(appId)
+  const consentRequired = consentQuery.data?.status === 'required'
+  const consentReady = consentQuery.status !== 'pending' || consentQuery.fetchStatus === 'paused'
   const {
     data: appToken,
     error: appTokenError,
     isFetching: appTokenFetching,
     refetch: refetchAppToken,
-  } = appQueries.token.useQuery(appId)
+  } = appQueries.token.useQuery(appId, { enabled: consentReady && !consentRequired })
   // Real reachability (probes /api/health), NOT navigator.onLine — which reads
   // a stale "true" on a COLD offline reopen (close the PWA offline, reopen,
   // open an app from the drawer): the SW serves the shell from cache so the
@@ -576,11 +639,16 @@ const AppCanvas = forwardRef(function AppCanvas({
           // AppCanvas can temporarily render a service/loading surface without
           // unmounting itself. Ref removal is the exhaustive boundary for the
           // exact live document, including those non-component teardown paths.
+          const detachedSource = framesRef.current.get(v)?.contentWindow
+          const pendingExport = pendingFileExportRef.current
+          if (pendingExport?.source === detachedSource) {
+            finishFileExport(pendingExport, { cancelled: true })
+          }
           capabilityHostRef.current?.detachSource?.(
-            framesRef.current.get(v)?.contentWindow,
+            detachedSource,
           )
-          storageHostRef.current.detachSource(framesRef.current.get(v)?.contentWindow)
-          if (accountLinkRef.current?.source === framesRef.current.get(v)?.contentWindow) {
+          storageHostRef.current.detachSource(detachedSource)
+          if (accountLinkRef.current?.source === detachedSource) {
             clearAccountLinkRegistration()
           }
           retireFrameMediaSession(v)
@@ -615,6 +683,21 @@ const AppCanvas = forwardRef(function AppCanvas({
   visibleRef.current = visible
   const frameVisibleRef = useRef(frameVisible)
   frameVisibleRef.current = frameVisible
+  function finishFileExport(request, result) {
+    finishAppFileExport({ request, pendingRef: pendingFileExportRef, setPending: setPendingFileExport, result })
+  }
+  function cancelFileExport() {
+    const request = pendingFileExportRef.current
+    if (request) finishFileExport(request, { cancelled: true })
+  }
+  function confirmFileExport() {
+    return confirmAppFileExport({ pendingRef: pendingFileExportRef,
+      setPending: setPendingFileExport, appId,
+      getVisible: () => visibleRef.current,
+      getLiveVersion: () => liveVersionRef.current,
+      getSourceVersion: source => attributedFrameVersion(framesRef.current, source),
+      getToken: () => hostTokenRef.current })
+  }
   const capabilityContractRef = useRef(capabilityContract)
   capabilityContractRef.current = capabilityContract
   const shellShortcutsRef = useRef(Array.isArray(shellShortcuts) ? shellShortcuts : [])
@@ -829,6 +912,10 @@ const AppCanvas = forwardRef(function AppCanvas({
       if (e.origin !== 'null' && e.origin !== window.location.origin) return
       const msg = e.data
       if (!msg || typeof msg !== 'object') return
+      if (serveAppFileExportRequest({ message: msg, source: e.source,
+        frames: framesRef.current, liveVersion: liveVersionRef.current,
+        visible: visibleRef.current, pendingRef: pendingFileExportRef,
+        setPending: setPendingFileExport, appId })) return
       // ATTRIBUTE the message to the exact frame that sent it. Two frames are
       // alive during a swap, so we must NOT assume a single contentWindow —
       // compare e.source to each mounted frame's window and recover its version.
@@ -1203,6 +1290,18 @@ const AppCanvas = forwardRef(function AppCanvas({
     clearAccountLinkRegistration()
   }, [appId])
 
+  // A confirmation belongs to one visible frame. Switching away or promoting
+  // a new version cannot leave a stale prompt able to export the old file.
+  useLayoutEffect(() => {
+    retireStaleAppFileExport({ pendingRef: pendingFileExportRef,
+      setPending: setPendingFileExport, appId, visible,
+      liveVersion: swap.liveVersion, frames: framesRef.current })
+  }, [appId, visible, swap.liveVersion])
+  useEffect(() => () => {
+    const request = pendingFileExportRef.current
+    if (request) finishFileExport(request, { cancelled: true })
+  }, [appId])
+
   // Capabilities belong to a visible workspace pane, not merely the focused
   // pane. Finish/cancel active-frame work before a cached app becomes hidden.
   useLayoutEffect(() => {
@@ -1548,6 +1647,14 @@ const AppCanvas = forwardRef(function AppCanvas({
     )
   }
 
+  if (consentRequired && online) {
+    // Offline the answer cannot be saved, so fall through to the offline note.
+    // Never prompt from a hidden or warm canvas; the pane that is on screen asks.
+    return visible
+      ? <AppConsentPanel appId={appId} appName={appName} request={consentQuery.data} />
+      : <div className="canvas-wrap" />
+  }
+
   if (tokenStartupState !== AppTokenStartupState.READY) {
     if (
       tokenStartupState === AppTokenStartupState.OFFLINE_MISSING
@@ -1559,7 +1666,9 @@ const AppCanvas = forwardRef(function AppCanvas({
         : 'Open this app once you’re online'
       const detail = onlineError
         ? 'Möbius couldn’t create the app’s secure session. Your app data is safe.'
-        : 'This app needs a cached, app-specific session before it can open offline.'
+        : consentRequired
+          ? 'This app is waiting for your permission. Allow it once while online, then it can open offline.'
+          : 'This app needs a cached, app-specific session before it can open offline.'
       return (
         <div className="canvas-wrap">
           <div className="canvas-loading" aria-live="polite">
@@ -1769,6 +1878,11 @@ const AppCanvas = forwardRef(function AppCanvas({
         )
       })}
       <CameraPreviewLayer preview={cameraPreview} />
+      {pendingFileExport && visible && (
+        <AppFileExportDialog appName={appName} themeColor={themeColor} request={pendingFileExport}
+          onCancel={cancelFileExport}
+          onConfirm={confirmFileExport} />
+      )}
       {/* One-shot "updated" shimmer on a successful swap. Keyed on the SWAP
           COUNT — not the live version and not gated on liveLoaded — so it
           remounts (replays) exactly when a promotion lands, and a live-frame

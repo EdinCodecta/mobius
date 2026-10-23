@@ -22,7 +22,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import socket
 import time
 import uuid
 from dataclasses import dataclass
@@ -33,9 +32,8 @@ from sqlalchemy.orm import Session
 from app import app_git, fs_locks, models
 from app.broadcast import get_system_broadcast
 from app.manifest_identity import canonical_manifest_identity_key
-from app.install import (
-  discard_staged, install_from_manifest, stage_package_clone,
-)
+from app.git_transfers import discard_staged
+from app.install import install_from_manifest, prepare_package, transient_failure
 from app.timeutil import now_naive_utc
 
 log = logging.getLogger("mobius.bootstrap")
@@ -135,29 +133,6 @@ class BootstrapOutcome:
   retry_after: int | None = None
 
 
-def _transient_failure(exc: Exception) -> tuple[bool, int | None]:
-  """Whether an install failure is worth retrying, and any upstream wait."""
-  if isinstance(exc, app_git.GitTransferFailed):
-    # Staging a clone is the first network step; a failure there, including
-    # an unreachable host, is the network until proven otherwise.
-    return True, None
-  if not isinstance(exc, HTTPException):
-    return False, None
-  if isinstance(exc.__cause__, socket.gaierror):
-    # The catalog hosts are fixed, so failing to resolve one is the network.
-    return True, None
-  detail = exc.detail
-  if exc.status_code not in (429, 502, 504) and not (
-    isinstance(detail, dict) and detail.get("code") == "git_transfer_timeout"
-  ):
-    return False, None
-  try:
-    wait = int((exc.headers or {}).get("Retry-After") or 0)
-  except ValueError:
-    wait = 0
-  return True, wait or None
-
-
 def _default_store_pin_pending(db: Session) -> bool:
   """Return whether this deployment still owes its default Store pin.
 
@@ -254,13 +229,13 @@ async def ensure_bootstrap_apps_installed(
   rate_limited = False
   retry_after: int | None = None
   for bootstrap_app in _CORE_BOOTSTRAP_APPS:
-    staged_clone = None
+    prepared = None
     stage_error: Exception | None = None
     if retry is not None and bootstrap_app.manifest_id in retry:
       # A retry holds the lifecycle lock below; no network may run under it,
-      # so the clone is staged first and simply discarded if it goes unused.
+      # so the package is fetched first and simply discarded if it goes unused.
       try:
-        staged_clone = await stage_package_clone(bootstrap_app.manifest_url)
+        prepared = await prepare_package(bootstrap_app.manifest_url)
       except Exception as exc:
         stage_error = exc
     try:
@@ -271,9 +246,13 @@ async def ensure_bootstrap_apps_installed(
         fs_locks.install_uninstall_lock() if retry is not None
         else contextlib.nullcontext()
       ):
-        # Use the installer's identity resolver here too: bootstrap and an
+        # Use the installer's address lookup here too: bootstrap and an
         # explicit Store action must agree across ref moves and legacy rows whose
-        # matching catalog origin predates persisted manifest identity.
+        # matching catalog origin predates persisted manifest identity. This is
+        # only the address half of `install.resolve_package_row`: it runs before
+        # any package is fetched, so there is no `package_id` to check, and it
+        # must see a deleted predecessor to keep an owner's uninstall. The
+        # install below applies the whole rule to the fetched package.
         existing = _find_install_identity_row(
           db,
           source_url=bootstrap_app.manifest_url,
@@ -342,15 +321,15 @@ async def ensure_bootstrap_apps_installed(
           if stage_error is not None:
             raise stage_error
           if retry is None:
-            # First boot holds no lock, so the clone is staged here.
-            staged_clone = await stage_package_clone(bootstrap_app.manifest_url)
+            # First boot holds no lock, so the package is fetched here.
+            prepared = await prepare_package(bootstrap_app.manifest_url)
           result = await install_from_manifest(
             db,
             manifest_url=bootstrap_app.manifest_url,
             manifest=None,
             raw_base=None,
             source="bootstrap",
-            staged_clone=staged_clone,
+            prepared=prepared,
           )
           app = result.app
           mode = result.mode
@@ -361,7 +340,7 @@ async def ensure_bootstrap_apps_installed(
           log.exception(
             "bootstrap: %s install failed — %s", bootstrap_app.manifest_id, exc,
           )
-          transient, wait = _transient_failure(exc)
+          transient, wait = transient_failure(exc)
           if transient:
             pending.append(bootstrap_app.manifest_id)
             rate_limited = rate_limited or (
@@ -384,7 +363,8 @@ async def ensure_bootstrap_apps_installed(
       # pin) installed after the page loaded appears without a reload.
       _publish_app_updated(app.id)
     finally:
-      await asyncio.to_thread(discard_staged, staged_clone)
+      if prepared is not None:
+        await asyncio.to_thread(discard_staged, prepared.staged_clone)
   return BootstrapOutcome(tuple(pending), rate_limited, retry_after)
 
 
@@ -450,7 +430,7 @@ async def _notify_owner_pending(
     names[0] if len(names) == 1
     else ", ".join(names[:-1]) + " and " + names[-1]
   )
-  cause = "GitHub rate limit" if outcome.rate_limited else "network problem"
+  cause = "GitHub rate limit" if outcome.rate_limited else "temporary problem"
   try:
     with SessionLocal() as db:
       owner = db.query(models.Owner.id).first()

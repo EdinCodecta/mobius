@@ -106,8 +106,8 @@ test('the composer accepts an offline send so it can queue in the durable outbox
   // offline). Gating it on offline silently swallowed offline taps.
   assert.match(
     chatInputBar,
-    /aria-label="Send"[\s\S]{0,700}?disabled=\{hasUploading \|\| submissionBlocked\}/,
-    'the Send button must gate only on uploads / provider-switch, not offline',
+    /aria-label=\{holdsQueuedEdit \? 'Save queued message' : 'Send'\}[\s\S]{0,700}?disabled=\{!holdsQueuedEdit && \(\(hasUploading && !resendsHistory\) \|\| submissionBlocked\)\}/,
+    'the Send button must gate only on uploads the send would take / provider-switch, not offline',
   )
   assert.doesNotMatch(
     chatInputBar,
@@ -183,11 +183,16 @@ test('credential expiry preserves principal-bound intent while explicit logout w
   )
   assert.match(
     apiClient,
-    /status === 401[\s\S]*?await clearExpiredOwnerSession\(\)/,
+    /async function endExpiredOwnerSession\([^)]*\) \{\s*await clearExpiredOwnerSession\(\)/,
+    'every expiry must retire the credential through the outbox-preserving cleanup',
+  )
+  assert.match(
+    apiClient,
+    /status === 401[\s\S]*?await endExpiredOwnerSession\(\{ credential: ownerTokenAtSend \}\)/,
   )
   assert.match(
     systemStream,
-    /res\.status === 401[\s\S]*?await clearExpiredOwnerSession\(\)/,
+    /res\.status === 401[\s\S]*?await endExpiredOwnerSession\(\{ credential \}\)/,
   )
   assert.match(
     settingsView,

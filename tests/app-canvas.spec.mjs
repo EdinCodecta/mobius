@@ -740,6 +740,50 @@ test.describe('AppCanvas: iframe-mount contract', () => {
     expect(routes.getAppsFetches()).toBeGreaterThan(fetchesBeforeRequest)
   })
 
+  test('an app new-chat request stays an editable draft even right after a click in the app', async ({ page }) => {
+    // A submitted first message runs with the owner's full authority, so only
+    // the owner's own composer Send may approve app-chosen text. A click inside
+    // the app activates the shell too, which is why browser activation cannot
+    // vouch for the request; the immediate and delayed posts below must both
+    // land as unsent drafts.
+    const appId = 66
+    const frameHTML = mockFrameHTML(appId).replace('</body>', `
+<button id="ask">Do it now</button>
+<script>
+  document.getElementById('ask').addEventListener('click', function () {
+    window.parent.postMessage(
+      { type: 'moebius:new-chat', draft: 'Act on my answers', autoSend: true }, '*');
+  });
+</script>
+</body>`)
+    await setupAppRoutes(page, appId, frameHTML)
+    let sends = 0
+    await page.route(/\/api\/chats\/[^/?]+\/messages(?:\?.*)?$/, route => {
+      if (route.request().method() === 'POST') sends += 1
+      return route.fulfill({ status: 409, body: '' })
+    })
+
+    await page.goto(`${BASE}/shell/?app=${appId}`, { waitUntil: 'domcontentloaded' })
+    await expect(page.locator('.canvas-loading')).toBeHidden({ timeout: 10000 })
+    const frame = await waitForContentFrame(page, `iframe[data-app-id="${appId}"]`)
+    await frame.locator('#ask').click()
+
+    const composer = page.getByRole('textbox', { name: 'Message Möbius…' })
+    await expect(composer).toHaveValue('Act on my answers', { timeout: 8000 })
+    await page.waitForTimeout(800)
+    expect(sends).toBe(0)
+
+    // A later post (after a timer or a slow write) is no more authoritative.
+    await page.goto(`${BASE}/shell/?app=${appId}`, { waitUntil: 'domcontentloaded' })
+    await expect(page.locator('.canvas-loading')).toBeHidden({ timeout: 10000 })
+    const reloaded = await waitForContentFrame(page, `iframe[data-app-id="${appId}"]`)
+    await reloaded.evaluate(() => setTimeout(() => window.parent.postMessage(
+      { type: 'moebius:new-chat', draft: 'Delayed request', autoSend: true }, '*'), 300))
+    await expect(composer).toHaveValue('Delayed request', { timeout: 8000 })
+    await page.waitForTimeout(800)
+    expect(sends).toBe(0)
+  })
+
   test('app-error from a hidden incoming frame is swallowed; the live frame forwards a crash draft', async ({ page }) => {
     // The double-buffered version swap runs the app's NEW module in a hidden
     // incoming frame. A failed swap is usually a broken build, and the swap
@@ -925,6 +969,99 @@ test.describe('AppCanvas: iframe-mount contract', () => {
     await expect(page.getByRole('textbox', { name: 'Message Möbius…' }))
       .toHaveValue(/crashed with this error/, { timeout: 8000 })
     expect(chatsCreated).toBe(1)
+  })
+
+  test('cleared builder chat sends a stale frame crash report to a new chat without reloading', async ({ page }) => {
+    const appId = 78
+    const formerChatId = 'former-builder'
+    let chatId = formerChatId
+    let appsFetches = 0
+    let framesFetched = 0
+    let chatsCreated = 0
+    await page.setViewportSize({ width: 412, height: 915 })
+    await page.addInitScript(() => localStorage.setItem('token', 'mock-owner-token'))
+    await setupShellBasics(page)
+    await page.route(/\/api\/apps\/$/, route => {
+      if (route.request().method() !== 'GET') return route.fallback()
+      appsFetches += 1
+      return route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([{
+          id: appId, name: chatId ? 'AssociatedToy' : 'ClearedToy', slug: 'clearedtoy',
+          description: 'test', compiled_path: `/data/compiled/app-${appId}.js`,
+          chat_id: chatId, source_dir: null, created_at: '1000',
+          updated_at: chatId ? '1000' : '2000', frame_version: 'same-frame',
+        }]),
+      })
+    })
+    await page.route(/\/api\/auth\/app-token$/, route => route.fulfill({
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: 'mock-app-token' }),
+    }))
+    await page.route(new RegExp(`/api/apps/${appId}/frame`), route => {
+      framesFetched += 1
+      return route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        body: mockFrameHTML(appId),
+      })
+    })
+    await page.route(/\/api\/chats(?:\?.*)?$/, route => {
+      if (route.request().method() === 'POST') {
+        chatsCreated += 1
+        return route.fulfill({
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: 'fresh-report', title: 'New chat', ...emptyChatPage(),
+          }),
+        })
+      }
+      return route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([{
+          id: formerChatId, title: 'Former builder', has_messages: true,
+          running: false, created_at: '1000', updated_at: '1000',
+        }]),
+      })
+    })
+    await page.route(/\/api\/chats\/fresh-report(?:\?.*)?$/, route => route.fulfill({
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 'fresh-report', title: 'New chat', ...emptyChatPage() }),
+    }))
+    await page.route(/\/api\/chats\/[^/]+\/stream$/, route =>
+      route.fulfill({ status: 204, body: '' }))
+
+    await page.goto(`${BASE}/shell/?app=${appId}`, { waitUntil: 'domcontentloaded' })
+    await page.waitForSelector('iframe.canvas--live[data-frame-version="same-frame"]', {
+      state: 'attached', timeout: 30000,
+    })
+    await expect(page.locator('.canvas-loading')).toBeHidden({ timeout: 8000 })
+    const frame = await waitForContentFrame(page, 'iframe.canvas--live')
+    const initialFramesFetched = framesFetched
+    chatId = ''
+    const beforeRefetch = appsFetches
+    await frame.evaluate(() => window.parent.postMessage(
+      { type: 'moebius:open-app', appId: 'no-such-app' }, window.location.origin,
+    ))
+    await expect.poll(() => appsFetches).toBeGreaterThan(beforeRefetch)
+    await expect(page.getByText('ClearedToy')).toBeVisible({ timeout: 8000 })
+    expect(framesFetched).toBe(initialFramesFetched)
+
+    // The still-mounted document retains the former chat_id embedded when it
+    // was served. The current app row's explicit clear must override it.
+    await frame.evaluate(([id, staleChatId]) => window.parent.postMessage({
+      type: 'moebius:app-error', appId: String(id), chatId: staleChatId,
+      error: 'stale-frame crash',
+    }, window.location.origin), [appId, formerChatId])
+    await expect(page.getByRole('textbox', { name: 'Message Möbius…' }))
+      .toHaveValue(/ClearedToy.*crashed with this error/, { timeout: 8000 })
+    expect(chatsCreated).toBe(1)
+    expect(framesFetched).toBe(initialFramesFetched)
   })
 })
 

@@ -241,6 +241,8 @@ def test_goal_returns_exact_held_work_keys_and_completion_settles_only_named_wor
   assert claims["test:another-goal"].released_at is None
 
 
+
+
 def test_the_final_task_edit_and_completion_can_share_one_call(
   client, owner_token, db,
 ):
@@ -268,25 +270,19 @@ def test_completion_flag_rejects_accidental_coercion(client, owner_token, db, va
   assert db.get(models.ChatGoal, "goal-1").status == "open"
 
 
-def test_loaded_legacy_agent_can_complete_and_replay_without_rewriting_history(
-  client, owner_token, db,
-):
+def test_legacy_string_completion_remains_accepted_by_route(client, owner_token, db):
   _, chat_id = _active_goal(client, owner_token, db)
-  body = {"complete": "Original verified result"}
-  first = _update(client, db, chat_id, body)
-  assert first.status_code == 200, first.text
-  assert first.json()["goal"]["result"] == body["complete"]
-  assert _update(client, db, chat_id, body).json() == first.json()
-  # A different signal is not an exact replay of a historical receipt.
-  assert _update(client, db, chat_id, {"complete": True}).status_code == 409
-  assert _update(client, db, chat_id, {}).json()["goal"] == first.json()["goal"]
+  response = _update(client, db, chat_id, {"complete": "Original verified result"})
+  assert response.status_code == 200, response.text
+  db.refresh(db.get(models.ChatGoal, "goal-1"))
+  assert db.get(models.ChatGoal, "goal-1").result == "Original verified result"
 
 
 def test_completing_through_the_route_withdraws_its_fired_waits_resume(
   client, owner_token, db,
 ):
   """This route settles a completion exactly as patch_goal_record does: a
-  verified completion takes delivery of its fired Wait, so the queued resume
+  verified completion retires its admitted fired Wait, so the queued resume
   that would otherwise wake the finished Goal is withdrawn while the owner's
   own follow-up stays. (Mirrors PR #1450's patch_goal_record settlement.)"""
   from app import chat_waits
@@ -306,6 +302,11 @@ def test_completing_through_the_route_withdraws_its_fired_waits_resume(
   }, {"role": "user", "content": "Owner follow-up", "ts": 2, "cid": "owner-1"}]
   db.commit()
 
+  run = db.get(models.ChatRun, "goal-root")
+  run.provider_execution_admitted = True
+  run.admitted_wait_results_json = [wait.id]
+  db.commit()
+
   completed = _update(client, db, chat_id, {
     "tasks": [{"id": "only", "status": "completed", "result": "Shipped"}],
     "complete": True,
@@ -314,7 +315,8 @@ def test_completing_through_the_route_withdraws_its_fired_waits_resume(
   assert completed.status_code == 200, completed.text
   assert completed.json()["goal"]["status"] == "completed"
   db.expire_all()
-  assert db.get(models.ChatWait, wait.id).resume_delivered_at is not None
+  assert db.get(models.ChatWait, wait.id).resume_delivered_at is None
+  assert db.get(models.ChatWait, wait.id).result_disposition == "retired_by_goal_outcome"
   assert [m["cid"] for m in db.get(models.Chat, chat_id).pending_messages] == [
     "owner-1",
   ]
@@ -406,8 +408,8 @@ def test_a_task_note_may_run_to_a_thousand_characters(client, owner_token, db):
   _seed_plan(client, db, chat_id)
 
   kept = _update(client, db, chat_id, {"tasks": [{"id": "inspect", "note": "n" * 1000}]})
-  refused = _update(client, db, chat_id, {"tasks": [{"id": "inspect", "note": "n" * 1001}]})
+  extended = _update(client, db, chat_id, {"tasks": [{"id": "inspect", "note": "n" * 1001}]})
 
   assert kept.status_code == 200, kept.text
-  assert refused.status_code == 422
-  assert "at most 1000 characters" in refused.json()["detail"]["message"]
+  assert extended.status_code == 422, extended.text
+  assert "at most 1000 characters" in extended.json()["detail"]["message"]

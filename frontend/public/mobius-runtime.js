@@ -4443,6 +4443,52 @@ function makeClipboard() {
 }
 
 //#endregion
+//#region src/runtime/fileExport.js
+function makeFileExport() {
+	const pending = /* @__PURE__ */ new Map();
+	function onMessage(event) {
+		if (event.source !== window.parent || event.origin !== window.location.origin) return;
+		const message = event.data;
+		if (message?.type !== "moebius:file-export-result") return;
+		const settle = pending.get(message.requestId);
+		if (!settle) return;
+		pending.delete(message.requestId);
+		if (message.ok) settle.resolve(true);
+		else if (message.cancelled) settle.resolve(false);
+		else settle.reject(new Error(message.error || "File export failed."));
+	}
+	window.addEventListener("message", onMessage);
+	return {
+		save(path, name) {
+			if (typeof path !== "string" || !path) return Promise.reject(/* @__PURE__ */ new Error("File path is required."));
+			const requestId = globalThis.crypto?.randomUUID?.() || `export-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			return new Promise((resolve, reject) => {
+				pending.set(requestId, {
+					resolve,
+					reject
+				});
+				try {
+					window.parent.postMessage({
+						type: "moebius:file-export",
+						requestId,
+						path,
+						name
+					}, "*");
+				} catch (error) {
+					pending.delete(requestId);
+					reject(error);
+				}
+			});
+		},
+		_destroy() {
+			window.removeEventListener("message", onMessage);
+			for (const settle of pending.values()) settle.resolve(false);
+			pending.clear();
+		}
+	};
+}
+
+//#endregion
 //#region src/runtime/projects.js
 const REQUEST_TIMEOUT_MS = 15e3;
 function cleanText(value, maximum = 256) {
@@ -4516,6 +4562,50 @@ function makeProjects() {
 }
 
 //#endregion
+//#region src/runtime/visibility.js
+function makeVisibility({ win, doc } = {}) {
+	let frameVisible = true;
+	let visible = !doc?.hidden;
+	const listeners = /* @__PURE__ */ new Set();
+	function recompute() {
+		const next = frameVisible && !doc?.hidden;
+		if (next === visible) return;
+		visible = next;
+		for (const cb of [...listeners]) try {
+			cb(next);
+		} catch (e) {}
+	}
+	function setFrameVisible(next) {
+		if (typeof next !== "boolean") return;
+		frameVisible = next;
+		recompute();
+	}
+	if (win && win.parent && win.parent !== win) win.addEventListener("message", (e) => {
+		if (e.source !== win.parent) return;
+		const msg = e.data;
+		if (!msg || msg.type !== "moebius:frame-visibility") return;
+		setFrameVisible(msg.visible);
+	});
+	doc?.addEventListener?.("visibilitychange", recompute);
+	return {
+		get visible() {
+			return visible;
+		},
+		setFrameVisible,
+		onVisibilityChange(cb) {
+			if (typeof cb !== "function") return () => {};
+			listeners.add(cb);
+			try {
+				cb(visible);
+			} catch (e) {}
+			return () => {
+				listeners.delete(cb);
+			};
+		}
+	};
+}
+
+//#endregion
 //#region src/runtime/index.js
 let _online = typeof navigator !== "undefined" ? navigator.onLine : true;
 const _onlineListeners = /* @__PURE__ */ new Set();
@@ -4544,14 +4634,20 @@ if (typeof window !== "undefined") {
 	window.addEventListener("online", () => _seedOnline(true));
 	window.addEventListener("offline", () => _seedOnline(false));
 }
+const _visibility = typeof window !== "undefined" ? makeVisibility({
+	win: window,
+	doc: typeof document !== "undefined" ? document : null
+}) : makeVisibility();
 let _runtimeContext = null;
 const runtimeFeatures = Object.freeze({
 	authoritativeVersionedReads: true,
+	frameVisibility: true,
 	idleDocument: true,
 	navLocation: true,
 	projects: true
 });
-function init({ appId, appInstanceId = null, getToken, capabilityContract = null, navLocation = null, waitForNavigationReady = false }) {
+function init({ appId, appInstanceId = null, getToken, capabilityContract = null, navLocation = null, waitForNavigationReady = false, frameVisible }) {
+	_visibility.setFrameVisible(frameVisible);
 	const identityKey = `${String(appId)}:${appInstanceId || "legacy"}`;
 	if (_runtimeContext && _runtimeContext.identityKey === identityKey) {
 		_runtimeContext.tokenRef.current = getToken;
@@ -4564,6 +4660,7 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 		_runtimeContext.capabilities?._destroy?.();
 		_runtimeContext.projects?._destroy?.();
 		_runtimeContext.chat?._destroy?.();
+		_runtimeContext.fileExport?._destroy?.();
 	}
 	const tokenRef = { current: getToken };
 	const scopedToken = async (options) => {
@@ -4584,6 +4681,7 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 		getToken: scopedToken,
 		storage
 	});
+	const fileExport = makeFileExport();
 	const api = {
 		appId,
 		get online() {
@@ -4599,6 +4697,10 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 				_onlineListeners.delete(cb);
 			};
 		},
+		get visible() {
+			return _visibility.visible;
+		},
+		onVisibilityChange: _visibility.onVisibilityChange,
 		storage,
 		DurableWriteError,
 		durableWrite: storage.durableWrite,
@@ -4616,6 +4718,7 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 		split: makeSplit(),
 		immersive: makeImmersive({ appId }),
 		clipboard: makeClipboard(),
+		fileExport,
 		projects
 	};
 	window.mobius = api;
@@ -4627,6 +4730,7 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 		capabilities,
 		projects,
 		chat,
+		fileExport,
 		api
 	};
 	storage._drain();
@@ -4638,4 +4742,4 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 }
 
 //#endregion
-export { CapabilityError, DurableWriteError, appChatMetadataBody, conflictContextItems, createUseDocument, init, makeCapabilities, makeChat, makeEmbedAuthorizationHandoff, makeEmbedFrameReveal, makeImmersive, makeNav, makeProjects, makeSignal, makeSplit, makeStorage, overlayPending, purgeAppRuntimeData, runtimeFeatures, sanitizeEmbedGuidance };
+export { CapabilityError, DurableWriteError, appChatMetadataBody, conflictContextItems, createUseDocument, init, makeCapabilities, makeChat, makeEmbedAuthorizationHandoff, makeEmbedFrameReveal, makeImmersive, makeNav, makeProjects, makeSignal, makeSplit, makeStorage, makeVisibility, overlayPending, purgeAppRuntimeData, runtimeFeatures, sanitizeEmbedGuidance };

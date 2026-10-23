@@ -4462,6 +4462,68 @@ def test_lock_update_the_image_may_not_install_still_needs_an_image(
   assert pu.image_input_drift(platform) == ["backend/requirements.lock"]
 
 
+def _shallow_seed_at(tmp_path, origin, sha: str) -> Path:
+  """A served checkout as an image seeds it: one commit deep, nothing fetched
+  since, so it holds neither a newer image's commit nor its history."""
+  seed = tmp_path / f"seed-{sha[:8]}"
+  _git(tmp_path, "init", "-q", str(seed))
+  _git(seed, "fetch", "-q", "--depth", "1", f"file://{origin}", sha)
+  _git(seed, "checkout", "-q", "-B", "main", "FETCH_HEAD")
+  _git(seed, "update-ref", "refs/remotes/origin/main", sha)
+  _git(seed, "branch", "-f", "upstream", sha)
+  return seed
+
+
+def _image_built_from(monkeypatch, tmp_path, platform, sha: str) -> None:
+  """Run as the image built from ``sha``: its package inputs and lineage."""
+  monkeypatch.setattr(pu, "_build_info", lambda: {
+    "sha": sha,
+    "image_inputs": {
+      path: hashlib.sha256(
+        _git(platform, "show", f"{sha}:{path}").stdout.encode(),
+      ).hexdigest()
+      for path in pu._PYTHON_DEPENDENCY_INPUTS
+    },
+  })
+  lineage = tmp_path / f"lineage-{sha[:8]}"
+  lineage.write_text(_git(platform, "rev-list", sha).stdout)
+  monkeypatch.setenv("MOBIUS_IMAGE_LINEAGE_PATH", str(lineage))
+
+
+def test_container_only_upgrade_across_a_package_release_boots_on_a_shallow_seed(
+  clone_env, monkeypatch, tmp_path,
+):
+  """A newer image under its older release's source is a container-only
+  upgrade, even when the checkout never fetched the image's commit."""
+  origin, _ = clone_env
+  platform, base, target, _ = _lock_only_update(
+    clone_env, _IMAGE_LOCK.replace("package-a==1", "package-a==2"),
+  )
+  seed = _shallow_seed_at(tmp_path, origin, base)
+  _image_built_from(monkeypatch, tmp_path, platform, target)
+
+  assert pu.release_packages_missing_from_image(seed, target) is None
+
+  # Without the image's recorded lineage the seed cannot order the two.
+  monkeypatch.setenv("MOBIUS_IMAGE_LINEAGE_PATH", str(tmp_path / "absent"))
+  assert "newer release" in pu.release_packages_missing_from_image(seed, target)
+
+
+def test_image_rollback_under_a_newer_package_release_is_still_refused(
+  clone_env, monkeypatch, tmp_path,
+):
+  """The lineage proves only ancestry: an older image never serves source
+  from a release it does not descend from."""
+  origin, _ = clone_env
+  platform, base, target, _ = _lock_only_update(
+    clone_env, _IMAGE_LOCK.replace("package-a==1", "package-a==2"),
+  )
+  seed = _shallow_seed_at(tmp_path, origin, target)
+  _image_built_from(monkeypatch, tmp_path, platform, base)
+
+  assert "newer release" in pu.release_packages_missing_from_image(seed, base)
+
+
 @pytest.mark.asyncio
 async def test_source_apply_refuses_image_owned_update_before_mutation(clone_env):
   origin, platform = clone_env
@@ -7850,7 +7912,26 @@ def test_update_rolls_back_when_it_breaks_a_local_edits_own_test(clone_env):
   origin, platform = clone_env
   _release_with_test_runner(origin, platform)
   pre = _local_commit(platform, edits=_LOCAL_VOICE, msg="local voice")
-  # Text-clean and import-clean: only running the local code shows the break.
+  # Text-clean, import-clean and every name still resolves: only running the
+  # local code shows the break.
+  _advance_origin(origin, edits={"backend/app/store.py": "MESSAGES = ['goodbye']\n"},
+                  msg="change store contents")
+
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "rolled_back"
+  assert _served_sha(platform) == pre
+  assert "test_last_reads_the_store" in pu._read_rolled_back_flag()["error"]
+  assert (platform / "backend/app/store.py").read_text() == _STORE_PY
+
+
+def test_update_rolls_back_when_a_local_edit_uses_a_name_the_release_moved(clone_env):
+  origin, platform = clone_env
+  _release_with_test_runner(origin, platform)
+  # No local tests: only reading the edited file shows the moved name.
+  pre = _local_commit(platform, edits={
+    "backend/app/voice.py": _LOCAL_VOICE["backend/app/voice.py"],
+  }, msg="local voice without tests")
   _advance_origin(origin, edits={"backend/app/store.py": "LEGACY = ['hello']\n"},
                   msg="rename store field")
 
@@ -7858,7 +7939,7 @@ def test_update_rolls_back_when_it_breaks_a_local_edits_own_test(clone_env):
 
   assert res.status == "rolled_back"
   assert _served_sha(platform) == pre
-  assert "test_last_reads_the_store" in pu._read_rolled_back_flag()["error"]
+  assert "backend/app/voice.py:3 uses app.store.MESSAGES" in pu._read_rolled_back_flag()["error"]
   assert (platform / "backend/app/store.py").read_text() == _STORE_PY
 
 
@@ -7912,7 +7993,7 @@ def test_reviewed_prepare_checks_local_tests_without_touching_served_checkout(cl
   _release_with_test_runner(origin, platform)
   pre = _local_commit(platform, edits=_LOCAL_VOICE, msg="local voice")
   target = _advance_origin(origin, edits={
-    "backend/app/store.py": "LEGACY = ['hello']\n" if breaks else _STORE_PY + "OTHER = 1\n",
+    "backend/app/store.py": "MESSAGES = ['goodbye']\n" if breaks else _STORE_PY + "OTHER = 1\n",
   })
   pu._fetch(platform)
   # A concurrent working edit is not part of the frozen reviewed snapshot.
@@ -7946,7 +8027,7 @@ def test_prepare_retains_limits_of_local_test_evidence(clone_env, monkeypatch, m
   if mode == "missing_runner":
     changes["scripts/wt-pytest.sh"] = "exit 78\n"
   elif mode == "collection":
-    changes["backend/app/store.py"] = "raise ImportError('no dependency')\n"
+    changes["backend/app/store.py"] = _STORE_PY + "raise ImportError('no dependency')\n"
     # Collection imports store; a collection error is not a failed test id.
     pre = _local_commit(platform, edits={
       "backend/tests/test_voice.py": "from app import store\n" + _LOCAL_VOICE["backend/tests/test_voice.py"],
@@ -7990,19 +8071,19 @@ def test_local_runner_requires_comparable_executed_test_ids(tmp_path, baseline, 
   tests.mkdir(parents=True)
   test = tests / "test_local.py"
   test.write_text(baseline)
-  before = lt.run(tmp_path, ["tests/test_local.py"])
+  before = lt.run(tmp_path, ["backend/tests/test_local.py"])
   test.write_text(candidate)
   # Avoid Python's same-second bytecode cache affecting this tiny fixture.
   import shutil
   shutil.rmtree(tests / "__pycache__", ignore_errors=True)
-  after = lt.run(tmp_path, ["tests/test_local.py"])
-  report = lt.compare(["tests/test_local.py"], before, after)
+  after = lt.run(tmp_path, ["backend/tests/test_local.py"])
+  report = lt.compare(["backend/tests/test_local.py"], before, after)
   assert report["status"] == expected
 
 
 def test_local_runner_rejects_missing_files_and_exit_report_disagreement(tmp_path):
   from app import local_change_tests as lt
-  assert lt.run(tmp_path, ["tests/missing.py"]).unavailable
+  assert lt.run(tmp_path, ["backend/tests/missing.py"]).unavailable
   report = tmp_path / "report.xml"
   report.write_text('<testsuite tests="1" failures="0" errors="0" skipped="0">'
                     '<testcase classname="tests.test_a" name="test_a"/></testsuite>')
@@ -8052,7 +8133,7 @@ def test_local_runner_timeout_kills_descendants_and_removes_runtime(tmp_path):
     'mktemp -d "$TMPDIR/runtime.XXXXXX" > runtime-path\n'
     'sleep 60 &\necho $! > child-pid\nwait\n'
   )
-  result = lt.run(tmp_path, ["tests/test_local.py"], timeout=1)
+  result = lt.run(tmp_path, ["backend/tests/test_local.py"], timeout=1)
   assert "timed out" in result.unavailable
   assert not Path((tmp_path / "runtime-path").read_text().strip()).exists()
   pid = int((tmp_path / "child-pid").read_text().strip())
@@ -8066,7 +8147,7 @@ def test_local_runner_unavailable_output_is_not_retained(tmp_path):
   (tmp_path / "backend/tests").mkdir(parents=True)
   (tmp_path / "backend/tests/test_local.py").touch()
   (tmp_path / "scripts/wt-pytest.sh").write_text('echo private-local-data; exit 78\n')
-  result = lt.run(tmp_path, ["tests/test_local.py"])
+  result = lt.run(tmp_path, ["backend/tests/test_local.py"])
   assert result.unavailable == "local tests produced no report (exit 78)"
 
 

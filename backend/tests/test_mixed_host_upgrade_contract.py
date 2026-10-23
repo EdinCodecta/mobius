@@ -632,8 +632,11 @@ def _nested_snapshot(tmp_path):
   old = "exec) fails docker_exec && return 7; printf 'head\\nrefs\\nprepared: absent\\n' ;;"
   assert old in program
   program = program.replace(old, 'exec) shift 4; PATH="$FIXTURE_BIN:/usr/bin:/bin" "$@" ;;')
-  program = program.replace("/data/", str(root / "data") + "/")
-  assert "/data/" not in program.replace(str(root / "data") + "/", "")
+  # Rewrite only container paths. The host fixture itself may also live under
+  # /data, and a blanket replacement would corrupt its already-mapped paths.
+  for path in ("/data/platform", "/data/mobius-rebuild/inbox", "/data/.platform-prepared-update.json"):
+    assert path in program
+    program = program.replace(path, str(root) + path)
   program += '\nbefore=$(untouched_state) || exit 71\nprintf "%s\\n" "$before"'
   env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(root), "FIXTURE_BIN": str(binary)}
   return program, env, root, inbox

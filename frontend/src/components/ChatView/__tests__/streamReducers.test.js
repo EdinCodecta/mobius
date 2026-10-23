@@ -16,6 +16,7 @@ import assert from 'node:assert/strict'
 
 import {
   upsertQuestionItem,
+  attachViewedImage,
   attachToolOutput,
   closeToolLifecycle,
   closeAllToolLifecycles,
@@ -72,6 +73,22 @@ test('generated image fingerprints reach the live attachment entry', () => {
     previewable: true, sha256: digest,
   })
   assert.equal(items[0].files[0].sha256, digest)
+})
+
+test('a native picture keeps its producing step and capture size live', () => {
+  const items = attachGeneratedFile([], {
+    name: 'generated-image-1.png', size: 12, mime_type: 'image/png', previewable: true,
+    source_tool_use_id: 'ig_1', width: 1536, height: 1024,
+  })
+  assert.deepEqual(items[0].files[0], {
+    name: 'generated-image-1.png', size: 12, mime_type: 'image/png', previewable: true,
+    source_tool_use_id: 'ig_1', width: 1536, height: 1024,
+  })
+  // An unproven size never reaches the frame.
+  const unsized = attachGeneratedFile([], {
+    name: 'x.png', mime_type: 'image/png', width: 0, height: '9', source_tool_use_id: '',
+  })
+  assert.deepEqual(Object.keys(unsized[0].files[0]).sort(), ['mime_type', 'name', 'previewable', 'size'])
 })
 
 function questionEvent(id, text) {
@@ -928,6 +945,15 @@ test('completed owner-card receipt identity reaches the live tool item', () => {
   assert.equal(next[0].owner_card_question_id, 'saved-card')
 })
 
+test('a live screenshot step keeps the name of the picture it saved', () => {
+  const prev = [toolItem('mcp__mobius_control__screenshot', { tool_use_id: 'shot' })]
+  const next = attachToolOutput(prev, 'excerpt', {
+    tool_use_id: 'shot', output_truncated: true, output_full_len: 264566,
+    saved_image: 'shot-1.png',
+  })
+  assert.equal(next[0].saved_image, 'shot-1.png')
+})
+
 test('suppresses every AskUserQuestion twin when two questions are in one message', () => {
   const blocks = [
     { type: 'tool', tool: 'AskUserQuestion', input: 'Q1', output: '', status: 'done' },
@@ -1310,4 +1336,22 @@ test('replaceThinkingContent adds a thought that never streamed and ignores no-o
   assert.equal(added[1].content, 'Unseen thought.')
   assert.equal(replaceThinkingContent(added, 'think-2', 'Unseen thought.'), added)
   assert.equal(replaceThinkingContent(added, null, 'x'), added)
+})
+
+test('viewed_image binds a snapshot only to its exact finished view', () => {
+  const name = `viewed-${'a'.repeat(64)}.png`
+  const prev = [
+    { type: 'tool', tool: 'ViewImage', tool_use_id: 'view-1', status: 'done' },
+    { type: 'tool', tool: 'Bash', tool_use_id: 'shell', status: 'done' },
+  ]
+  assert.equal(attachViewedImage(prev, { tool_use_id: 'shell', viewed_image_media: name }), prev)
+  assert.equal(attachViewedImage(prev, { tool_use_id: 'missing', viewed_image_media: name }), prev)
+  assert.equal(attachViewedImage(prev, { viewed_image_media: name }), prev)
+  assert.equal(attachViewedImage(prev, { tool_use_id: 'view-1', viewed_image_media: '../x.png' }), prev)
+
+  const next = attachViewedImage(prev, { tool_use_id: 'view-1', viewed_image_media: name })
+  assert.equal(next[0].viewed_image_media, name)
+  assert.equal(prev[0].viewed_image_media, undefined)
+  // Catch-up replay of the same event changes nothing.
+  assert.equal(attachViewedImage(next, { tool_use_id: 'view-1', viewed_image_media: name }), next)
 })

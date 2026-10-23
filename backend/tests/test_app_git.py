@@ -4632,7 +4632,7 @@ def test_read_ref_tree_skips_gitlinks(tmp_path):
 def test_conflict_markers_count_only_in_paths_the_resolution_changed(tmp_path):
   """Upstream content that legitimately contains a boundary-looking line is
   not a conflict; a marker the resolution itself commits is."""
-  from app import install
+  from app import pending_update
 
   repo = tmp_path / "markers"
   subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
@@ -4645,11 +4645,11 @@ def test_conflict_markers_count_only_in_paths_the_resolution_changed(tmp_path):
 
   (repo / "index.jsx").write_text("export default 2\n")
   subprocess.run([*commit, "-am", "clean resolution"], check=True)
-  assert install.committed_conflict_marker_paths(repo, "HEAD", upstream) == []
+  assert pending_update.committed_conflict_marker_paths(repo, "HEAD", upstream) == []
 
   (repo / "index.jsx").write_text("<<<<<<< HEAD\nexport default 3\n")
   subprocess.run([*commit, "-am", "marked resolution"], check=True)
-  assert install.committed_conflict_marker_paths(repo, "HEAD", upstream) == [
+  assert pending_update.committed_conflict_marker_paths(repo, "HEAD", upstream) == [
     "index.jsx",
   ]
 
@@ -5025,10 +5025,10 @@ def test_adopt_clone_undo_restores_the_staged_checkout(tmp_path):
 
 
 def test_boot_sweep_removes_unfinished_transfers(tmp_path, monkeypatch):
-  from app import install, startup
+  from app import git_transfers, startup
 
-  monkeypatch.setattr(install, "get_settings", lambda: type("S", (), {"data_dir": str(tmp_path)})())
-  root = install.git_transfer_root()
+  monkeypatch.setattr(git_transfers, "get_settings", lambda: type("S", (), {"data_dir": str(tmp_path)})())
+  root = git_transfers.git_transfer_root()
   assert root == tmp_path / "apps" / ".git-transfers"
   from app import source_dirs
   # Staging can never be claimed as an app's source, which the sweep would delete.
