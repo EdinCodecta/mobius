@@ -3046,6 +3046,7 @@ async def _run_post_commit_effects(
   mode: str,
   candidate: InstallCandidate,
   warnings: list[str],
+  was_usable: bool = False,
 ) -> None:
   """Converge cron, skills, and initialization after durability.
 
@@ -3088,9 +3089,7 @@ async def _run_post_commit_effects(
   except Exception as exc:
     log.exception("install: skill sync failed post-commit")
     warnings.append(f"skills: sync failed — {exc!r}")
-  if mode == "update" and app_consent.dormant(app) and (
-    app_consent.accepted_rows(app) is not None
-  ):
+  if mode == "update" and was_usable and app_consent.dormant(app):
     # Only the owner's answer re-enables it, and an app they rarely open would
     # otherwise stop without a word.
     app_id, app_name = app.id, app.name
@@ -3997,6 +3996,12 @@ async def _install_candidate(
   existing = target.existing
   revive_after_commit = bool(existing and existing.deleted_at is not None)
   mode = target.mode
+  # Whether the app could run before this install changes its contract: an
+  # update that stops it is one the owner must be told about.
+  was_usable = (
+    existing is not None and existing.deleted_at is None
+    and not app_consent.dormant(existing)
+  )
   canonical_manifest_url = target.canonical_manifest_url
 
   warnings: list[str] = []
@@ -4805,6 +4810,7 @@ async def _install_candidate(
     mode=mode,
     candidate=candidate,
     warnings=warnings,
+    was_usable=was_usable,
   )
   # Only now is the update fully converged. Until the receipt goes, a retry
   # reruns this whole install, post-commit effects included.
