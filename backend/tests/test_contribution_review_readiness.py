@@ -851,6 +851,33 @@ def test_stop_admission_lock_prevents_ready_arm_after_preflight(setup, monkeypat
   assert not armed and "ready_attempt" not in row.outcomes_json[domain.key(ITEM)]
 
 
+def test_stop_after_ready_arm_refuses_dispatch_and_releases_exact_claim(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  dispatched = []
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: dispatched.append(1))
+  original_arm = routes._arm_ready
+
+  async def arm_then_stop(*args):
+    receipt = await original_arm(*args)
+    # The arm function has released review-admission. Stop wins before the
+    # mutation can enter the lock again; the reservation is not an effect.
+    domain.save_outcome(db, row, routes.REVIEW_STOP_KEY,
+      {"state": "requested", "actor": "owner"})
+    return receipt
+
+  monkeypatch.setattr(routes, "_arm_ready", arm_then_stop)
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert error.value.status_code == 409
+  db.refresh(row)
+  assert not dispatched
+  assert row.outcomes_json[routes.REVIEW_STOP_KEY]["state"] == "requested"
+  assert "ready_attempt" not in row.outcomes_json[domain.key(ITEM)]
+  claim = db.query(models.AgentWorkClaim).filter_by(
+    work_key=domain.ready_work_key(row.targets_json[0])).one()
+  assert claim.released_at is not None
+
+
 def test_start_refuses_draft_takeover_without_ready_scope(setup, monkeypatch):
   db, _, principal = setup
   owner = Principal(owner=principal.owner, app_id=None)

@@ -37,6 +37,12 @@ def test_not_dispatched_all_clear_retries_only_recorded_evidence(setup, monkeypa
   with pytest.raises(HTTPException) as exc:
     report(setup, summary='changed evidence')
   assert exc.value.status_code == 409
+  # Publishing retries are checked at the writer-fenced admission boundary,
+  # not by a duplicate route guard.
+  with pytest.raises(HTTPException) as exc:
+    report(setup, publish=True, summary='changed evidence')
+  assert exc.value.status_code == 409
+  assert calls == []
   report(setup, publish=True)
   report(setup, publish=True)
   assert len(calls) == 1

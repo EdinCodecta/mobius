@@ -171,6 +171,13 @@ def test_postgres_gc_skips_unsupported_fence_and_warns_once(monkeypatch, caplog)
   assert caplog.text.count("repair checkout GC skipped") == 1
 
 
+def test_public_review_brief_keeps_exact_dispatch_freeze_guidance(setup):
+  _db, row, _principal = setup
+  row.mode = "review"
+  row.options_json = {"post_review": True}
+  assert "Evidence freezes once dispatch is armed; identical retry is read-only." in reviews.brief(row)
+
+
 def test_frozen_and_live_scopes_use_one_file_reader(monkeypatch):
   calls = []
   monkeypatch.setattr(repairs, "_changed_files", lambda _gh, _cwd, target:

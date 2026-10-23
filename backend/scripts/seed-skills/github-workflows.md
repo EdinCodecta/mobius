@@ -121,6 +121,10 @@ unmerged PR or unchanged projection does not prove a push or merge was never
 applied. If exact nonapplication cannot be proved, there is currently no safe
 self-service release of that old receipt: stop and request owner-supervised
 recovery rather than resetting it or replaying the write.
+For an unidentified legacy fork head, the repository-scoped fence cannot
+identify the same fork branch across different base repositories; do not
+interpret an unrelated-repository admission as proof that old uncertainty
+is settled.
 Pending checks/queues remain owned by the existing
 conversation's durable Wait; these routes do not create automatic waits.
 
