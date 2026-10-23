@@ -135,18 +135,17 @@ def _fingerprint(snapshot):
   return hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def _options_input(body, frozen_options=None):
+def _options_input(body):
   if body.options is None:
     return None
-  options = body.options.model_dump(exclude_none=True)
-  # Keep null as an explicit uncapped selection, unlike absent prompt overrides.
-  options["max_rounds"] = body.options.max_rounds
-  previous = (frozen_options or {}).get("input_options") or {}
-  if "max_rounds" not in body.options.model_fields_set and previous.get("max_rounds") == 5:
-    # Prior requests materialized the then-default finite limit. A retry with
-    # the same omitted field still names that saved grant, not today's default.
-    options["max_rounds"] = 5
-  return options
+  options = body.options.model_dump(exclude_none=True, exclude_unset=True)
+  if options.get("fix_prompt") not in (None, presets.FIX_PROMPT):
+    raise HTTPException(422, "fix_prompt is not supported by this review-only workflow")
+  if options.get("max_rounds") is not None:
+    raise HTTPException(422, "max_rounds is not supported by this review-only workflow")
+  if options.get("autopilot") is True:
+    raise HTTPException(422, "autopilot is not supported by this review-only workflow")
+  return {key: options[key] for key in presets.PROMPT_KEYS if key in options}
 
 
 def _snapshot(db, body, principal):
@@ -166,10 +165,13 @@ def _snapshot(db, body, principal):
     chat = db.get(models.Chat, principal.chat_id)
     if chat:
       actual = {"provider": chat.provider, **coerce_agent_settings(chat.agent_settings_json)}
-      if actual.get("model"):
-        if requested and any(actual.get(k) != choice.get(k) for k in ("provider", "model", "effort")):
-          raise HTTPException(409, "The owning chat is executing a different model. Preview its actual run choice.")
-        choice = {k: actual[k] for k in ("provider", "model", "effort") if k in actual}
+      if not actual.get("model"):
+        raise HTTPException(409, "The owning chat has no snapshotted model. Select one before previewing this review.")
+      if requested and any(actual.get(k) != choice.get(k) for k in ("provider", "model", "effort")):
+        raise HTTPException(409, "The owning chat is executing a different model. Preview its actual run choice.")
+      choice = {k: actual[k] for k in ("provider", "model", "effort") if k in actual}
+    else:
+      raise HTTPException(409, "The owning chat is unavailable. No review was started.")
   try:
     return presets.resolve_options(db, _options_input(body), choice=choice)
   except ValueError as exc:
@@ -220,7 +222,7 @@ async def start_reviews(app_id: int | None, body: StartReviews,
       previous = [{"repo": t["repo"].lower(), **{k: t[k] for k in ("number", "head_sha", "base_ref", "base_sha")}} for t in row.targets_json]
       if (row.mode != body.mode or previous != selection
           or (row.options_json and (
-            row.options_json.get("input_options") != (_options_input(body, row.options_json) or {})
+            row.options_json.get("input_options") != (_options_input(body) or {})
             or row.options_json.get("input_agent") != (body.agent.model_dump() if body.agent else None)
             or (body.preview_sha256 and row.options_json.get("preview_sha256") != body.preview_sha256)))):
         raise HTTPException(409, "This request already approves a different selection.")
@@ -269,8 +271,7 @@ async def start_reviews(app_id: int | None, body: StartReviews,
     if not db.query(models.ChatRun).filter_by(chat_id=row.chat_id).first():
       chat = db.get(models.Chat, row.chat_id)
       frozen = row.options_json or {}
-      actual = coerce_agent_settings(chat.agent_settings_json)
-      if frozen.get("model") and (chat.provider != frozen["provider"] or actual.get("model") != frozen["model"] or actual.get("effort") != frozen.get("reasoning_effort")):
+      if not _frozen_model_matches(frozen, chat):
         raise HTTPException(409, "The saved review chat no longer matches the frozen provider/model/effort.")
       _assert_app_current(db, row.app_id, row.app_nonce)
       started = await start_programmatic_chat_turn(chat_id=chat.id, title=chat.title,
@@ -307,6 +308,30 @@ def _last_reply_error(chat) -> str:
   return ""
 
 
+def _frozen_model_matches(frozen, chat) -> bool:
+  if not frozen.get("model"):
+    return True
+  actual = coerce_agent_settings(chat.agent_settings_json) if chat else {}
+  return bool(chat and chat.provider == frozen.get("provider")
+              and actual.get("model") == frozen["model"]
+              and actual.get("effort") == frozen.get("reasoning_effort"))
+
+
+def _merge_attempted(outcome) -> bool:
+  return outcome.get("merge_attempted") is True or outcome.get("state") in {"merging", "merge_unknown", "queued", "merged"}
+
+
+async def _reconcile_merge(previous, target, pull, cwd):
+  if pull.get("merged"):
+    return {**previous, "state": "merged", "merge_sha": pull.get("merge_commit_sha")}
+  checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
+  entry = reviews.queue_entry(checks, target)
+  if entry:
+    return {**previous, "state": "queued", "queue_entry_id": entry["id"]}
+  return {**previous, "state": "merge_unknown", "summary":
+    "The earlier merge or queue request is not confirmed. Check GitHub; it was not repeated."}
+
+
 @router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/outcomes",
              dependencies=[Depends(reject_cross_site)])
 async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
@@ -322,7 +347,7 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     if target is None or target["head_sha"] != body.head_sha:
       raise HTTPException(409, "This head was not in the approved selection.")
     previous = row.outcomes_json.get(item_key, {})
-    attempted = previous.get("merge_attempted") is True or previous.get("state") in {"merging", "merge_unknown", "queued", "merged"}
+    attempted = _merge_attempted(previous)
     if previous.get("state") == "merged" or (row.mode == "review" and previous.get("state") == "all_clear"):
       return {"run": _run_view(db, row)}
     if body.state == "all_clear" and (set(body.scope) != SCOPE or not body.tests.strip() or body.tests_passed is False):
@@ -344,11 +369,13 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     except HTTPException as exc:
       # A failed live read cannot rewrite private evidence or a public receipt.
       if not attempted:
-        reviews.save_outcome(db, row, item_key, {**previous, "state": "needs_you",
-          "summary": body.summary, "scope": body.scope, "tests": body.tests,
-          "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
-          "head_sha": body.head_sha, "review_chat_id": row.chat_id,
-          "review_run_id": principal.run_id, "live_blocker": str(exc.detail)})
+        async with chat_queue.get_transition_lock(f"review-admission:{run_id}"):
+          _parent(db, row, principal)
+          reviews.save_outcome(db, row, item_key, {**previous, "state": "needs_you",
+            "summary": body.summary, "scope": body.scope, "tests": body.tests,
+            "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
+            "head_sha": body.head_sha, "review_chat_id": row.chat_id,
+            "review_run_id": principal.run_id, "live_blocker": str(exc.detail)})
       return {"run": _run_view(db, row)}
     outcome = {**previous, "state": body.state, "summary": body.summary, "scope": body.scope,
                "tests": body.tests, "tests_passed": body.tests_passed,
@@ -356,16 +383,7 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
                "head_sha": body.head_sha,
                "review_chat_id": row.chat_id, "review_run_id": principal.run_id}
     if attempted:
-      if pull.get("merged"):
-        outcome = {**previous, "state": "merged", "merge_sha": pull.get("merge_commit_sha")}
-      else:
-        checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
-        entry = reviews.queue_entry(checks, target)
-        if entry:
-          outcome = {**previous, "state": "queued", "queue_entry_id": entry["id"]}
-        else:
-          outcome = {**previous, "state": "merge_unknown", "summary":
-            "The earlier merge or queue request is not confirmed. Check GitHub; it was not repeated."}
+      outcome = await _reconcile_merge(previous, target, pull, cwd)
       reviews.save_effect_outcome(db, row, item_key, outcome)
       return {"run": _run_view(db, row)}
     # A private review remains true of its pinned base after that base moves.
@@ -374,12 +392,8 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
       await merge_actions.merge_reviewed_target(db, row, target, outcome, repo, pull, principal,
         gh=_gh, cwd=cwd, authorize=lambda: _parent(db, row, principal))
       return {"run": _run_view(db, row)}
-    if not outcome.get("merge_attempted"):
-      _parent(db, row, principal)
-    if outcome.get("merge_attempted"):
-      reviews.save_effect_outcome(db, row, item_key, outcome)
-    else:
-      reviews.save_outcome(db, row, item_key, outcome)
+    _parent(db, row, principal)
+    reviews.save_outcome(db, row, item_key, outcome)
     return {"run": _run_view(db, row)}
 
 
@@ -435,8 +449,7 @@ def _run_view(db, row, *, context_app_id=None):
   value["can_stop"] = bool(chat and (stop_context is None or chat.created_by_app_id == stop_context))
   value["stop_semantics"] = "revokes_future_actions; an already-admitted public action may finish"
   frozen = row.options_json or {}
-  actual = coerce_agent_settings(chat.agent_settings_json) if chat else {}
-  if value["state"] != "complete" and frozen.get("model") and (not chat or chat.provider != frozen["provider"] or actual.get("model") != frozen["model"] or actual.get("effort") != frozen.get("reasoning_effort")):
+  if value["state"] != "complete" and not _frozen_model_matches(frozen, chat):
     value.update(state="needs_you", summary="The owning chat model choice no longer matches this frozen workflow.")
   last = db.query(models.ChatRun).filter_by(chat_id=row.chat_id).order_by(
     models.ChatRun.started_at.desc()).first()
@@ -466,7 +479,7 @@ def _run_view(db, row, *, context_app_id=None):
         projected["public_review"] = {key: public[key] for key in ("state", "url") if key in public}
       items.append(projected)
     value = {key: value[key] for key in ("id", "chat_id", "state", "execution_state", "mode", "created_at") if key in value} | {
-      "app_id": None, "can_stop": False, "post_review": bool((row.options_json or {}).get("post_review")),
+      "app_id": None, "can_stop": False,
       "details_in_owning_chat": True, "items": items,
     }
   return value
@@ -481,11 +494,9 @@ def _parent(db, row, principal):
     raise HTTPException(403, "Only this review's owning conversation may report an outcome or merge.")
   _assert_execution_live(db, row, principal)
   frozen = row.options_json or {}
-  if frozen.get("model"):
-    chat = db.query(models.Chat).populate_existing().filter_by(id=row.chat_id).first()
-    settings = coerce_agent_settings(chat.agent_settings_json) if chat else {}
-    if not chat or chat.provider != frozen["provider"] or settings.get("model") != frozen["model"] or settings.get("effort") != frozen.get("reasoning_effort"):
-      raise HTTPException(409, "The owning conversation's model choice changed. This frozen workflow cannot continue under a different choice.")
+  chat = db.query(models.Chat).populate_existing().filter_by(id=row.chat_id).first()
+  if not _frozen_model_matches(frozen, chat):
+    raise HTTPException(409, "The owning conversation's model choice changed. This frozen workflow cannot continue under a different choice.")
 
 
 @router.post("/api/github/review-runs", dependencies=[Depends(reject_cross_site), Depends(require_nondelegated_owner_or_app_control)])
@@ -591,19 +602,13 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
     db.refresh(row)
     for original in row.targets_json:
       previous = row.outcomes_json.get(reviews.key(original), {})
-      attempted = previous.get("merge_attempted") is True or previous.get("state") in {"merging", "merge_unknown", "queued", "merged"}
+      attempted = _merge_attempted(previous)
       if not attempted:
         continue
       target = original
       try:
         _repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
-        if attempted and pull.get("merged"):
-          outcome = {**previous, "state": "merged", "merge_sha": pull.get("merge_commit_sha")}
-        elif attempted:
-          checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
-          entry = reviews.queue_entry(checks, target)
-          outcome = ({**previous, "state": "queued", "queue_entry_id": entry["id"]} if entry else
-            {**previous, "state": "merge_unknown", "summary": "The exact earlier merge/queue attempt remains unclear. It was not repeated."})
+        outcome = await _reconcile_merge(previous, target, pull, cwd)
       except HTTPException:
         # A failed read proves no new fact; historical review evidence and the
         # exact public-attempt fence both remain intact.
