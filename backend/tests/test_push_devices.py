@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import threading
+import time
+import uuid
+
 import pytest
 
 from app import models, push_relay
+from app import push as app_push
 from app.push import notify_owner
+
+# The real hand-off to the native-push workers; the relay fixture swaps it for
+# an inline call so most tests can assert right after notify_owner returns.
+REAL_SEND_NATIVE_LATER = app_push._send_native_later
 
 FCM = "fcm:" + "a" * 140
 
@@ -39,6 +48,7 @@ class FakeRelay:
 
 @pytest.fixture
 def relay(monkeypatch):
+  monkeypatch.setattr(app_push, "_send_native_later", app_push._deliver_native_and_clean)
   return FakeRelay(monkeypatch)
 
 
@@ -280,3 +290,61 @@ def test_a_removed_phone_that_stayed_removed_is_only_unbound(client, auth, db, r
   _unbind_removed([FCM])
 
   assert relay.unbinds == [FCM] and relay.binds == []
+
+
+def test_a_slow_relay_does_not_hold_up_the_notification(client, auth, db, relay, monkeypatch):
+  monkeypatch.setattr(app_push, "_send_native_later", REAL_SEND_NATIVE_LATER)
+  _put(client, auth, token=FCM)
+  release, sent = threading.Event(), threading.Event()
+
+  def slow_send(tokens, **message):
+    release.wait(5)
+    sent.set()
+    return ["ok"] * len(tokens)
+
+  monkeypatch.setattr(push_relay, "send", slow_send)
+  started = time.monotonic()
+  notify_owner(db, _owner_id(db), title="Hi", body=None, source_type="agent")
+
+  assert time.monotonic() - started < 2 and not sent.is_set()
+  release.set()
+  assert sent.wait(5)
+
+
+def test_a_failing_background_send_is_logged_not_raised(client, auth, db, relay, monkeypatch, caplog):
+  _put(client, auth, token=FCM)
+
+  def broken(tokens, **message):
+    raise RuntimeError("boom")
+
+  monkeypatch.setattr(push_relay, "send", broken)
+
+  notify_owner(db, _owner_id(db), title="Hi", body=None, source_type="agent")
+
+  assert "native push delivery failed" in caplog.text
+  assert _tokens(db) == [FCM]
+
+
+def test_racing_registrations_of_a_new_phone_both_succeed(client, auth, db, relay, monkeypatch):
+  from app.database import SessionLocal
+  from app.routes import push as push_routes
+
+  real_find = push_routes._find_device
+  calls = []
+
+  def find_after_a_concurrent_insert(session, token):
+    calls.append(token)
+    if len(calls) == 1:
+      # Another request inserts the same new token between our lookup and commit.
+      with SessionLocal() as other:
+        other.add(models.PushDevice(id=str(uuid.uuid4()), owner_id=_owner_id(other), token=token))
+        other.commit()
+      return None
+    return real_find(session, token)
+
+  monkeypatch.setattr(push_routes, "_find_device", find_after_a_concurrent_insert)
+
+  response = _put(client, auth, token=FCM)
+
+  assert response.status_code == 200
+  assert len(calls) == 2 and _tokens(db) == [FCM]

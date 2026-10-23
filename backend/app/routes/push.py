@@ -4,6 +4,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import models, push_relay
@@ -106,16 +107,29 @@ def register_device(
         409, "Link this Möbius to your mobius.you account to get phone notifications.",
       )
     raise HTTPException(502, "The notification service could not be reached.")
-  device = db.query(models.PushDevice).filter(
-    models.PushDevice.token == body.token,
-  ).one_or_none()
-  if device is None:
-    device = models.PushDevice(id=str(uuid.uuid4()), token=body.token)
-    db.add(device)
-  device.owner_id = owner.id
-  device.registered_at = now_naive_utc()
-  db.commit()
+  # Two registrations of the same new token can race to insert it; the one
+  # that loses the unique constraint updates the winner's row instead.
+  for attempt in range(2):
+    device = _find_device(db, body.token)
+    if device is None:
+      device = models.PushDevice(id=str(uuid.uuid4()), token=body.token)
+      db.add(device)
+    device.owner_id = owner.id
+    device.registered_at = now_naive_utc()
+    try:
+      db.commit()
+      break
+    except IntegrityError:
+      db.rollback()
+      if attempt:
+        raise
   return {"status": "registered"}
+
+
+def _find_device(db: Session, token: str) -> models.PushDevice | None:
+  return db.query(models.PushDevice).filter(
+    models.PushDevice.token == token,
+  ).one_or_none()
 
 
 @router.get("/devices")

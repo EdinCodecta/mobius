@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -364,8 +365,22 @@ def _prepare_owner_notification(
   )
 
 
+# Phone sends go through the identity broker and the mobius.you relay and can
+# take tens of seconds when either is slow. They run here, off the caller's
+# thread, so no notification producer (sync or async) waits on the relay.
+_NATIVE_SENDS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="native-push")
+
+
+def _send_native_later(prepared: _PreparedPush) -> None:
+  _NATIVE_SENDS.submit(_deliver_native_and_clean, prepared)
+
+
 def _deliver_prepared_push(prepared: _PreparedPush) -> None:
-  """Perform remote delivery from scalar data; safe to call in a worker."""
+  """Perform remote delivery from scalar data; safe to call in a worker.
+
+  Web Push is delivered before this returns; phone sends are handed to the
+  native-push workers.
+  """
   stale_ids = []
   for sub in prepared.subscriptions:
     sub_info = {
@@ -379,14 +394,26 @@ def _deliver_prepared_push(prepared: _PreparedPush) -> None:
     except Exception:
       logger.exception("push delivery failed for sub %s", sub["id"][:8])
 
-  stale_devices = _deliver_native(prepared)
+  if prepared.devices:
+    _send_native_later(prepared)
 
-  if stale_ids or stale_devices:
+  if stale_ids:
     from app.database import SessionLocal
     with SessionLocal() as cleanup_db:
       cleanup_db.query(models.PushSubscription).filter(
         models.PushSubscription.id.in_(stale_ids)
       ).delete(synchronize_session=False)
+      cleanup_db.commit()
+
+
+def _deliver_native_and_clean(prepared: _PreparedPush) -> None:
+  """Send to the owner's phones, then forget the ones the relay reports dead."""
+  try:
+    stale_devices = _deliver_native(prepared)
+    if not stale_devices:
+      return
+    from app.database import SessionLocal
+    with SessionLocal() as cleanup_db:
       for device in stale_devices:
         # A phone that registered again while the send was in flight has a
         # fresh relay binding; keep it.
@@ -395,6 +422,8 @@ def _deliver_prepared_push(prepared: _PreparedPush) -> None:
           models.PushDevice.registered_at == device["registered_at"],
         ).delete(synchronize_session=False)
       cleanup_db.commit()
+  except Exception:
+    logger.exception("native push delivery failed for notification %s", prepared.notification_id[:8])
 
 
 def _deliver_native(prepared: _PreparedPush) -> list[dict]:

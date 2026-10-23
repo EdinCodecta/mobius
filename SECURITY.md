@@ -75,7 +75,12 @@ These are intentional design decisions appropriate for a single-owner app:
   its own, and the owner can disconnect a phone through `DELETE
   /api/push/devices/{id}`. The last installation to register a phone owns it,
   so a phone signed in to two installations gets notifications only from the
-  most recent one.
+  most recent one. The same rule means a linked installation that obtained
+  another phone's push token could take it over and show it arbitrary text;
+  tokens are not exposed outside the phone and its own installation, the relay
+  rate-limits and can revoke each installation, and the mobile app must open a
+  notification's tap link only when it is on the origin of the Möbius it is
+  signed in to, so a taken-over phone can be shown text but not sent elsewhere.
 - **90-day service token:** The app-job supervisor reads it only to mint a
   short-lived app token; job scripts do not inherit it. It is stored at
   `/data/service-token.txt` (chmod 600, mobius user only).
