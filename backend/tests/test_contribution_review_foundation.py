@@ -140,12 +140,14 @@ def test_stop_after_dispatch_cannot_erase_confirmed_merge(setup, monkeypatch):
   assert row.outcomes_json[routes.REVIEW_STOP_KEY]["state"] == "requested"
 
 
-def test_core_migration_adopts_prior_0079_variant_without_rewriting_it(tmp_path):
+@pytest.mark.parametrize("nonce_nullable", [False, True])
+def test_core_migration_adopts_prior_0079_variant_without_rewriting_it(tmp_path, nonce_nullable):
   eng = create_engine(f"sqlite:///{tmp_path / 'old-review.db'}")
   with eng.begin() as conn:
     conn.execute(text("CREATE TABLE schema_migrations (version VARCHAR(128) PRIMARY KEY, applied_at TIMESTAMP)"))
     conn.execute(text("INSERT INTO schema_migrations VALUES ('0079_core_contribution_review_runs', CURRENT_TIMESTAMP)"))
-    conn.execute(text("CREATE TABLE contribution_review_runs (id VARCHAR(64) PRIMARY KEY, app_id INTEGER NOT NULL, app_nonce VARCHAR(64) NOT NULL, request_id VARCHAR(64), owner_id INTEGER)"))
+    nullable = "" if nonce_nullable else " NOT NULL"
+    conn.execute(text("CREATE TABLE contribution_review_runs (id VARCHAR(64) PRIMARY KEY, app_id INTEGER NOT NULL, app_nonce VARCHAR(64)" + nullable + ", request_id VARCHAR(64), owner_id INTEGER)"))
     conn.execute(text("INSERT INTO contribution_review_runs VALUES ('old-run', 2, 'old-nonce', 'old-request', 1)"))
   schema_migrations._allow_core_contribution_review_runs(eng)
   schema_migrations._allow_core_contribution_review_runs(eng)
