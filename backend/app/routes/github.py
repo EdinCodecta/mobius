@@ -2245,6 +2245,98 @@ async def contribution_source_chats(
   return {"chats": await asyncio.to_thread(_source_chat_metadata, app_id, source_root)}
 
 
+# Retired chat-attached contribution routes. Chat Changes is informational
+# and nothing prepares, sends or settles work from it any more, but deployed
+# callers outlive one platform release: Contribute's shipped
+# ``settle_chat_changes.py`` exits 1 on any HTTP error, and an already-loaded
+# shell still has the old Changes actions. Keep this facade, with the same
+# authentication and app scope as the removed routes, until supported
+# Contribute releases no longer call it; then remove it separately.
+_RETIRED_CHAT_WORK_NOTICE = (
+  "Chat Changes is now informational: it lists a chat's source edits and no "
+  "longer prepares, sends, stops or settles contribution work. Nothing was "
+  "started or recorded. Reload Möbius and prepare contributions from Contribute."
+)
+# The removed routes' chat-id rule, so an old caller sees the same validation.
+_RETIRED_CHAT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_RETIRED_SETTLEMENT_NOTICE = (
+  "Chat Changes no longer records local-only settlements, so nothing was "
+  "recorded. Reviewed local edits need no settlement step."
+)
+
+
+def _retired_chat_route_principal(
+  app_id: int, chat_id: str, principal: Principal, db: Session,
+) -> None:
+  _validate_submit_app(app_id, principal, db)
+  if principal.app_id is not None:
+    raise HTTPException(status_code=403, detail="Owner authority is required.")
+  if not _RETIRED_CHAT_ID.fullmatch(chat_id):
+    raise HTTPException(status_code=422, detail="Invalid chat id.")
+
+
+@router.post(
+  "/contributions/{app_id}/for-chat/{chat_id}/settle",
+  dependencies=[Depends(reject_cross_site)],
+)
+@_limiter.limit("30/minute")
+async def retired_settle_chat_changes(
+  request: Request,
+  app_id: int,
+  chat_id: str,
+  db: Session = Depends(get_db),
+  principal: Principal = Depends(get_principal),
+):
+  """Compatibility no-op for Contribute's shipped settlement step."""
+  _retired_chat_route_principal(app_id, chat_id, principal, db)
+  return {
+    "retired": True,
+    "notice": _RETIRED_SETTLEMENT_NOTICE,
+    "updated_at": _now_iso(),
+    "settlements": [],
+  }
+
+
+@router.api_route(
+  "/contributions/{app_id}/for-chat/{chat_id}",
+  methods=["GET"],
+)
+@router.api_route(
+  "/contributions/{app_id}/for-chat/{chat_id}/work/history",
+  methods=["GET"],
+)
+@router.api_route(
+  "/contributions/{app_id}/for-chat/{chat_id}/work",
+  methods=["POST"],
+  dependencies=[Depends(reject_cross_site)],
+)
+@router.api_route(
+  "/contributions/{app_id}/for-chat/{chat_id}/work/stop",
+  methods=["POST"],
+  dependencies=[Depends(reject_cross_site)],
+)
+@router.api_route(
+  "/contributions/{app_id}/for-chat/{chat_id}/coverage",
+  methods=["POST"],
+  dependencies=[Depends(reject_cross_site)],
+)
+@_limiter.limit("30/minute")
+async def retired_chat_contribution_route(
+  request: Request,
+  app_id: int,
+  chat_id: str,
+  db: Session = Depends(get_db),
+  principal: Principal = Depends(get_principal),
+):
+  """Explicitly refuse a removed Changes action; it never starts work."""
+  _retired_chat_route_principal(app_id, chat_id, principal, db)
+  raise HTTPException(status_code=410, detail={
+    "retired": True,
+    "started": False,
+    "notice": _RETIRED_CHAT_WORK_NOTICE,
+  })
+
+
 @router.post(
   "/contributions/{app_id}/{record_id}/submit",
   dependencies=[
