@@ -331,7 +331,7 @@ def view(row):
            else "complete" if all(s in {"all_clear", "merged"} for s in states)
            else "queued" if all(s in {"queued", "merged", "all_clear"} for s in states)
            else "reviewing")
-  if any((outcomes.get(key(t), {}).get("public_review") or {}).get("state") in {"posting", "unknown"} for t in row.targets_json):
+  if any((outcomes.get(key(t), {}).get("public_review") or {}).get("state") in {"posting", "unknown", "not_dispatched"} for t in row.targets_json):
     state = "needs_you"
   return {"id": row.id, "request_id": row.request_id, "mode": row.mode,
           "chat_id": row.chat_id, "source_chat_id": row.chat_id, "app_id": row.app_id,

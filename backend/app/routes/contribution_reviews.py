@@ -355,7 +355,10 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     except HTTPException as exc:
       # A failed live read cannot rewrite private evidence or a public receipt.
       if not attempted:
-        reviews.save_outcome(db, row, item_key, {**previous, "state": "needs_you",
+        _parent(db, row, principal)
+        posting = row.mode == "review" and (row.options_json or {}).get("post_review") is True
+        reviews.save_outcome(db, row, item_key, {**previous, "state": body.state if posting else "needs_you",
+          **({"public_review": {"state": "not_dispatched", "summary": str(exc.detail)}} if posting else {}),
           "summary": body.summary, "scope": body.scope, "tests": body.tests,
           "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
           "head_sha": body.head_sha, "review_chat_id": row.chat_id,

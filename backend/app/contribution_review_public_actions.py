@@ -14,6 +14,7 @@ async def post_public_review(db, row, item_key, target, outcome, principal, cwd,
   body = public.review_comment_body(outcome, marker=marker)
   async with _github_connection_transaction():
     actor = await asyncio.to_thread(reviews.read, gh, cwd, "user")  # unsettled: read-only (GitHub actor lookup)
+    authorize()
     if str(actor.get("id") or "") != row.github_actor_id:
       return {**outcome, "public_review": {"state": "not_dispatched",
         "summary": "The connected GitHub account changed; no review was posted."}}
