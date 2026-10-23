@@ -1,6 +1,7 @@
 """Draft readiness: explicit scope, shared admission and no replay."""
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
@@ -876,6 +877,54 @@ def test_stop_after_ready_arm_refuses_dispatch_and_releases_exact_claim(setup, m
   claim = db.query(models.AgentWorkClaim).filter_by(
     work_key=domain.ready_work_key(row.targets_json[0])).one()
   assert claim.released_at is not None
+
+
+def test_stop_waits_for_in_flight_ready_mutation_admission(setup, monkeypatch):
+  from app import chat_queue
+  from app.database import SessionLocal
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  mutation_started = threading.Event()
+  release_mutation = threading.Event()
+
+  def mark_ready(*args):
+    mutation_started.set()
+    assert release_mutation.wait(5), "test did not release the provider call"
+    return {"id": "PR_7", "isDraft": False, "headRefOid": SHA}
+
+  monkeypatch.setattr(domain, "mark_ready", mark_ready)
+
+  async def race():
+    ready_task = asyncio.create_task(routes.mark_draft_ready(
+      1, row.id, ready_body(), db, principal))
+    stop_started = asyncio.Event()
+    stop_admitted = asyncio.Event()
+
+    async def stop():
+      stop_started.set()
+      # This is Stop's durable admission boundary, using its own DB session.
+      async with chat_queue.get_transition_lock(f"review-admission:{row.id}"):
+        stop_admitted.set()
+        with SessionLocal() as stop_db:
+          stop_row = stop_db.get(models.ContributionReviewRun, row.id)
+          domain.save_outcome(stop_db, stop_row, routes.REVIEW_STOP_KEY,
+            {"state": "requested", "actor": "owner"})
+
+    try:
+      assert await asyncio.wait_for(asyncio.to_thread(mutation_started.wait, 5), 6)
+      stop_task = asyncio.create_task(stop())
+      await asyncio.wait_for(stop_started.wait(), 5)
+      await asyncio.sleep(0.05)
+      assert not stop_admitted.is_set(), "Stop landed during the admitted mutation"
+    finally:
+      release_mutation.set()
+    result = await asyncio.wait_for(ready_task, 5)
+    await asyncio.wait_for(stop_task, 5)
+    assert result["run"]["items"][0]["ready_attempt"]["state"] == "ready"
+
+  asyncio.run(race())
+  db.refresh(row)
+  assert row.outcomes_json[routes.REVIEW_STOP_KEY]["state"] == "requested"
+  assert row.outcomes_json[domain.key(ITEM)]["ready_attempt"]["state"] == "ready"
 
 
 def test_start_refuses_draft_takeover_without_ready_scope(setup, monkeypatch):
