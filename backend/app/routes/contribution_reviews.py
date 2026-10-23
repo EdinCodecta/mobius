@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import re
 import subprocess
 import uuid
 from contextlib import AsyncExitStack
@@ -39,6 +40,7 @@ SCOPE = {"correctness", "maintainability", "simplicity", "tests", "security_priv
 REVIEW_CAPABILITIES = {"post_review": True, "review_fix_merge": True, "draft_takeover": True}
 TAKEOVER_SCOPES = {"named_pr_repairs_and_reviewed_successors", "named_pr_repairs_ready_and_reviewed_successors"}
 REVIEW_STOP_KEY = "_review_stop"
+READY_HEAD_MOVED = "The head changed; GitHub's ready event cannot identify the reviewed head. No action was repeated."
 
 
 class PullIdentity(BaseModel):
@@ -414,7 +416,7 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     # A private review remains true of its pinned base after that base moves.
     # Only an actual merge candidate requires current-base proof.
     if body.state == "all_clear" and row.mode in {"review_merge", "review_fix_merge"}:
-      _require_ready_attempt_resolved(previous)
+      _require_ready_attempt_resolved(previous, target)
       await merge_actions.merge_reviewed_target(db, row, target, outcome, repo, pull, principal,
         gh=_gh, cwd=cwd, authorize=lambda: _parent(db, row, principal))
       return {"run": _run_view(db, row)}
@@ -665,6 +667,7 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
         blocked = await _confirm_ready_attempt(target, cwd)
         if blocked:
           _escalate_unconfirmed_ready(db, row, reviews.key(original), previous, attempt)
+          _record_unattributable_ready(db, row, reviews.key(original), attempt, blocked)
           continue
         reviews.save_ready_attempt(db, row, reviews.key(original), {**attempt, "state": "ready"})
         previous = row.outcomes_json[reviews.key(original)]
@@ -826,7 +829,7 @@ async def repair_checkout(app_id: int | None, run_id: str, body: RepairCheckout,
     await settled.run_settled(repair_actions.sweep_checkout_receipts_once)
     target = _target(row, body)
     previous = row.outcomes_json.get(reviews.key(target), {})
-    _require_ready_attempt_resolved(previous)
+    _require_ready_attempt_resolved(previous, target)
     attempts = previous.get("repair_attempts", [])
     if any(r.get("state") in {"pushing", "push_unknown"} for r in attempts):
       raise HTTPException(409, "An earlier push has an unclear public outcome. Reconcile it; do not prepare another repair.")
@@ -882,14 +885,15 @@ async def publish_repair(app_id: int | None, run_id: str, body: RepairPublish,
       raise HTTPException(409, "This PR is not named in the takeover grant.")
     previous = row.outcomes_json.get(reviews.key(original), {})
     attempts = list(previous.get("repair_attempts", []))
-    pending = next((r for r in attempts if r.get("from_sha") == body.head_sha), None)
+    pending = next((r for r in attempts if r.get("from_sha") == body.head_sha
+                    and r.get("state") in {"pushing", "push_unknown", "pushed"}), None)
     cwd = Path(get_settings().data_dir) / "platform"
     if pending:
       confirmed = await repair_actions.reconcile_push(db, row, original, previous, pending, gh=_gh, cwd=cwd)
       return {"run": _run_view(db, row), **({} if confirmed else {
         "blocked": "The earlier push is not confirmed. It was not repeated."})}
-    _require_ready_attempt_resolved(previous)
     target = _target(row, body)
+    _require_ready_attempt_resolved(previous, target)
     if body.tests_passed is not True:
       raise HTTPException(422, "Failed or unknown tests block public repair publication.")
     if not body.summary.strip() or not body.tests.strip():
@@ -1033,9 +1037,10 @@ def _save_base_advance(db, row, original, previous, advanced, principal):
   reviews.save_outcome(db, row, reviews.key(original), advanced)
 
 
-def _require_ready_attempt_resolved(previous):
+def _require_ready_attempt_resolved(previous, target):
   attempt = previous.get("ready_attempt")
-  if attempt and attempt.get("state") != "ready":
+  if attempt and attempt.get("state") != "ready" and not (
+      attempt.get("state") == "unattributable" and attempt.get("head_sha") != target["head_sha"]):
     raise HTTPException(409, "The draft readiness attempt is uncertain. Reconcile it read-only before any new public action.")
 
 
@@ -1055,11 +1060,15 @@ async def _confirm_ready_attempt(target, cwd) -> str | None:
     except (HTTPException, ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
       return "The earlier readiness attempt is uncertain; it was not repeated."
     if (not isinstance(repo, dict) or not isinstance(pull, dict)
-        or repo.get("id") != target["repo_id"] or pull.get("node_id") != target["pr_id"]):
+        or type(repo.get("id")) is not int or repo["id"] != target["repo_id"]
+        or not isinstance(pull.get("node_id"), str) or pull["node_id"] != target["pr_id"]):
       return "The earlier readiness attempt cannot be tied to this pull request; it was not repeated."
     head = pull.get("head")
-    if not isinstance(head, dict) or head.get("sha") != target["head_sha"]:
-      return "The head changed; GitHub's ready event cannot identify the reviewed head. No action was repeated."
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+      return "The earlier readiness attempt has no trustworthy live head; it was not repeated."
+    if head_sha != target["head_sha"]:
+      return READY_HEAD_MOVED
   except (ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
     return "The earlier readiness attempt is uncertain; it was not repeated."
   if pull.get("draft") is not False:
@@ -1072,6 +1081,13 @@ def _escalate_unconfirmed_ready(db, row, item_key, previous, attempt):
   # confirmed must surface to the owner instead of silently blocking.
   if attempt.get("state") == "attempting":
     reviews.save_ready_attempt(db, row, item_key, {**attempt, "state": "unknown"})
+
+
+def _record_unattributable_ready(db, row, item_key, attempt, blocked):
+  # Preserve the old-head receipt and audit, but retire its cross-head fence
+  # only after the provider proves this exact PR now has a different head.
+  if attempt.get("state") == "unknown" and blocked == READY_HEAD_MOVED:
+    reviews.save_ready_attempt(db, row, item_key, {**attempt, "state": "unattributable"})
 
 
 class DraftReady(PullIdentity):
@@ -1101,9 +1117,12 @@ async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
     attempt = previous.get("ready_attempt")
     if attempt:
       # The mutation is unrepeatable after admission, including lost responses.
+      if attempt.get("state") == "unattributable":
+        return {"run": _run_view(db, row), "blocked": READY_HEAD_MOVED}
       blocked = await _confirm_ready_attempt(target, cwd)
       if blocked:
         _escalate_unconfirmed_ready(db, row, item_key, previous, attempt)
+        _record_unattributable_ready(db, row, item_key, attempt, blocked)
         return {"run": _run_view(db, row), "blocked": blocked}
       if attempt.get("state") != "ready":
         reviews.save_ready_attempt(db, row, item_key, {**attempt, "state": "ready"})

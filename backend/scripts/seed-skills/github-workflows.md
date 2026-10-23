@@ -127,12 +127,16 @@ shared Stop admission lock precede the single public attempt.
 A validated mark-ready response confirms the saved PR/head immediately; a
 later Stop, actor or rights change cannot undo that fact. If the response is
 lost, `/observe` may confirm the exact PR/head is non-draft, independently of
-the old base and current actor or rights. A moved head stays unknown: GitHub's
+the old base and current actor or rights. A moved head cannot confirm attribution: GitHub's
 `ReadyForReviewEvent` has no head SHA, so its timeline entry alone cannot
 attribute readiness to the reviewed head. Do not replay the mutation or claim
-that a later non-draft head proves this attempt. Readiness does not authorize
+that a later non-draft head proves this attempt. Once exact PR identity and a
+different live head are verified, a finished unknown receipt becomes visibly
+`unattributable`: its old-head claim and audit remain, but it no longer fences
+new grants on other heads. An `attempting` receipt must first surface as
+unknown; an unsafe identity read cannot retire it. Readiness never authorizes
 merge using an old review. Unknown readiness remains visible and fences new
-public actions; an abandoned attempting receipt escalates to unknown.
+public actions until that conservative observation succeeds.
 
 ## Recover a confirmed queue removal
 

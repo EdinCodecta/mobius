@@ -291,7 +291,7 @@ def require_public_transition_clear(db, row, target):
       repair_pending = any(a.get("state") in {"pushing", "push_unknown"}
         for a in item.get("repair_attempts", []))
       ready = item.get("ready_attempt")
-      unresolved = merge_pending or repair_pending or (ready and ready.get("state") != "ready")
+      unresolved = merge_pending or repair_pending or (ready and ready.get("state") not in {"ready", "unattributable"})
       merged_head = item.get("state") == "merged" and item.get("head_sha") == target["head_sha"]
       if not (unresolved or merged_head):
         continue
@@ -422,12 +422,14 @@ def view(row):
     # private-review evidence. Unknown must be visible and block new actions.
     if attempt.get("state") == "unknown":
       return {**outcome, "state": "ready_unknown"}
+    if attempt.get("state") == "unattributable":
+      return {**outcome, "state": "ready_unattributable"}
     if attempt.get("state") == "attempting":
       return {**outcome, "state": "marking_ready"}
     return outcome
   projected_items = [projected(t) for t in row.targets_json]
   states = [item["state"] for item in projected_items]
-  state = ("needs_you" if any(s in {"needs_you", "merge_unknown", "ready_unknown"} for s in states)
+  state = ("needs_you" if any(s in {"needs_you", "merge_unknown", "ready_unknown", "ready_unattributable"} for s in states)
            else "complete" if all(s in {"all_clear", "merged"} for s in states)
            else "queued" if all(s in {"queued", "merged", "all_clear"} for s in states)
            else "marking_ready" if any(s == "marking_ready" for s in states)
@@ -540,6 +542,8 @@ def _receipted_target(original, outcome):
   current = original["head_sha"]
   confirmed = None
   for receipt in receipts:
+    if receipt.get("state") == "rejected":
+      continue  # Audited non-effect, not part of the successor chain.
     if receipt.get("state") != "pushed":
       break
     if receipt.get("from_sha") != current:
@@ -623,7 +627,7 @@ def repair_round_limit(row):
 
 def require_repair_round_available(row, attempts):
   limit = repair_round_limit(row)
-  if limit is not None and len(attempts) >= limit:
+  if limit is not None and sum(a.get("state") != "rejected" for a in attempts) >= limit:
     raise HTTPException(409, "The approved repair round limit is exhausted. Ask the owner.")
 
 
@@ -844,6 +848,23 @@ def save_effect_outcome(db, row, item_key, outcome):
         and public_receipt.get("marker") != (outcome.get("public_review") or {}).get("marker")):
       # Only the dispatcher/observer of this exact attempt can settle it.
       return
+    current_ready = current.get("ready_attempt")
+    incoming_ready = outcome.get("ready_attempt")
+    if current_ready and incoming_ready:
+      # A stale observer must not replace another attempt or erase a later
+      # confirmed/retired receipt. A confirmed fact may still upgrade an
+      # unattributable observation of the same exact attempt.
+      if (current_ready.get("id") != incoming_ready.get("id")
+          or current_ready.get("head_sha") != incoming_ready.get("head_sha")
+          or (current_ready.get("state") == "ready" and incoming_ready.get("state") != "ready")
+          or (current_ready.get("state") == "unattributable"
+              and incoming_ready.get("state") not in {"unattributable", "ready"})):
+        return
+      audit = list(current.get("ready_audit") or [])
+      for event in outcome.get("ready_audit") or []:
+        if event not in audit:
+          audit.append(event)
+      outcome = {**outcome, "ready_audit": audit}
     revision = row.revision
     values = {**row.outcomes_json, item_key: outcome}
     changed = db.execute(update(models.ContributionReviewRun).where(
