@@ -1,10 +1,11 @@
 """Deprecated: the retired per-app secret routes, answered by the key vault.
 
 Apps written for ``/api/apps/{id}/secrets/{name}`` keep working for one
-release while they move to the vault handshake (``/api/keys``). Each app's
-secret name maps to a vault key granted to that app (``key_vault.app_key_names``),
-the same mapping the one-time import uses, so imported and newly saved values
-meet in one place.
+release while they move to the vault handshake (``/api/keys``). These routes
+see only the app's own keys: the vault keys created for that app's secret
+names (by the one-time import or by these routes), recorded with that origin.
+A key the owner created or merely lets the app borrow is never visible or
+writable here.
 
 What changed for callers: an app may still save, check and delete its own
 values, but no app token reads one back any more, including the app's own
@@ -53,11 +54,18 @@ def _authorize_app(db: Session, principal: Principal, app_id: int) -> models.App
   return app
 
 
-async def _granted(app_id: int, name: str) -> str | None:
+async def _keys() -> list[dict]:
   try:
-    return await key_vault.granted_key(app_id, name)
+    return (await key_vault.vault_call("GET", "/keys"))["keys"]
   except key_vault.VaultUnavailable as exc:
     raise HTTPException(503, str(exc)) from exc
+
+
+async def _owned(app_id: int, name: str) -> dict:
+  key = key_vault.owned_key_in(await _keys(), app_id, name)
+  if key is None:
+    raise HTTPException(status_code=404, detail="Secret not found.")
+  return key
 
 
 @router.put(
@@ -85,8 +93,7 @@ async def secret_exists(
   db: Session = Depends(get_db), principal: Principal = Depends(get_principal),
 ):
   _authorize_app(db, principal, app_id)
-  if await _granted(app_id, name) is None:
-    raise HTTPException(status_code=404, detail="Secret not found.")
+  await _owned(app_id, name)
   return Response(status_code=204, headers=_DEPRECATION)
 
 
@@ -102,12 +109,10 @@ async def get_secret(
       "(see 'Keys' in the building-apps guide).",
     )
   _authorize_app(db, principal, app_id)
-  key = await _granted(app_id, name)
-  if key is None:
-    raise HTTPException(status_code=404, detail="Secret not found.")
+  key = await _owned(app_id, name)
   caller = f"agent:{principal.chat_id}" if principal.chat_id else "owner"
   try:
-    value = (await key_vault.vault_call("GET", f"/keys/{key}/value", caller=caller))["value"]
+    value = (await key_vault.vault_call("GET", f"/keys/{key['name']}/value", caller=caller))["value"]
   except key_vault.VaultUnavailable as exc:
     raise HTTPException(503, str(exc)) from exc
   return Response(content=value, media_type="text/plain", headers=_DEPRECATION)
@@ -124,19 +129,15 @@ async def delete_secret(
 ):
   """Delete the app's key, or only its grant when other apps share the key."""
   _authorize_app(db, principal, app_id)
+  key = await _owned(app_id, name)
   try:
-    keys = (await key_vault.vault_call("GET", "/keys"))["keys"]
-    name_in_vault = key_vault.granted_key_in(keys, app_id, name)
-    if name_in_vault is None:
-      raise HTTPException(status_code=404, detail="Secret not found.")
-    key = next(k for k in keys if k["name"] == name_in_vault)
     others = [a for a in key["grants"]["apps"] if a != app_id]
     if others:
-      await key_vault.vault_call("PUT", f"/keys/{name_in_vault}", {
+      await key_vault.vault_call("PUT", f"/keys/{key['name']}", {
         "inject": key["inject"], "grants": {**key["grants"], "apps": others},
       })
     else:
-      await key_vault.vault_call("DELETE", f"/keys/{name_in_vault}")
+      await key_vault.vault_call("DELETE", f"/keys/{key['name']}")
   except key_vault.VaultUnavailable as exc:
     raise HTTPException(503, str(exc)) from exc
   return Response(status_code=204, headers=_DEPRECATION)

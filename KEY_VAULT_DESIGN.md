@@ -73,9 +73,12 @@ reads that key at turn launch while the owner's grant to the app stands
 **Upgrade.** Once per server start, after the vault answers, values in
 `/data/app-secrets/<id>/<name>` move into the vault (`import_legacy_app_secrets`):
 each becomes a key granted to its own app and the owner's agents, sent as a
-bearer token, with no sites until the owner adds them. Each app's old name
-maps to the plain vault name when free, otherwise to `app<id>-<name>`; model
-providers and the adapter below resolve names the same way. A ledger
+bearer token, with no sites until the owner adds them. Each key records its
+origin (the app and its exact old name), set once at creation, and is created
+atomically at the first free name (`api.key` → `api-key`, then
+`app<id>-api-key`, then numbered), so distinct old names never merge and no
+existing key is overwritten. Model providers and the adapter below find a
+secret by that origin, not by its vault name. A ledger
 (`.vault-import.json`) next to the old files means a key the owner deletes is
 never re-imported, unreadable values are retried, and a purged app's leftover
 values are skipped because its id may be reused. The old ciphertext stays in
@@ -85,7 +88,9 @@ place for one release.
 (`routes/app_secrets_compat.py`, marked `Deprecation: true`) answers from the
 vault: apps may still save, check and delete their own values, and the owner
 and agents may read them, but no app token reads a value back (services and
-jobs included); they borrow it through `/api/keys/use`.
+jobs included); they borrow it through `/api/keys/use`. These routes see only
+keys the app itself created and still holds: a key the owner made, or merely
+lets the app borrow, can never be replaced through them.
 
 ## Future work: sandbox for app server code
 

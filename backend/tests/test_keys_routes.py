@@ -329,3 +329,42 @@ def test_the_deprecated_secret_routes_use_the_vault(client, auth, db, vault):
   assert client.delete(path, headers=app_auth).status_code == 204
   assert [k["grants"]["apps"] for k in vault.list_keys()] == [[other.id]]
   assert client.head(path, headers=app_auth).status_code == 404
+
+
+def test_borrowing_a_key_never_lets_an_app_replace_it(client, auth, db, vault):
+  weather = _app(db, "weather")
+  owner_record = {"value": DUMMY, "inject": ASK["inject"],
+                  "grants": {"apps": [weather.id], "agents": False, "sites": [SITE]}}
+  vault.put_key("provider-key", owner_record)                    # the owner's key, lent to the app
+  vault.put_key(f"app{weather.id}-provider-key", {**owner_record, "grants": {"apps": [], "sites": []}})
+  path = f"/api/apps/{weather.id}/secrets/provider-key"
+  app_auth = _app_auth(db, weather)
+  # The old routes do not even see a key the app only borrows.
+  assert client.head(path, headers=app_auth).status_code == 404
+  assert client.put(path, headers=app_auth, json={"value": "app-chosen"}).status_code == 204
+  assert vault.reveal("provider-key", ("owner", "")) == DUMMY
+  assert vault.reveal(f"app{weather.id}-provider-key", ("owner", "")) == DUMMY
+  # The app's value went to a free name of its own instead.
+  [own] = [k for k in vault.list_keys() if k["origin"] == {"app": weather.id, "name": "provider-key"}]
+  assert own["name"] == f"app{weather.id}-provider-key-2"
+  assert vault.reveal(own["name"], ("owner", "")) == "app-chosen"
+  assert client.delete(path, headers=app_auth).status_code == 204
+  assert vault.reveal("provider-key", ("owner", "")) == DUMMY
+
+
+def test_distinct_old_names_stay_distinct_keys(client, auth, db, vault):
+  import asyncio
+  app = _app(db, "names")
+  _legacy_secret(app.id, "api.key", "dotted-value")
+  _legacy_secret(app.id, "api-key", "dashed-value")
+  long_a, long_b = "y" * 63 + "1", "y" * 63 + "2"
+  vault.put_key(long_a, {"value": DUMMY, "inject": ASK["inject"], "grants": {}})
+  vault.put_key(long_b, {"value": DUMMY, "inject": ASK["inject"], "grants": {}})
+  _legacy_secret(app.id, long_a, "long-a-value")
+  _legacy_secret(app.id, long_b, "long-b-value")
+  moved = asyncio.run(key_vault.import_legacy_app_secrets({app.id}))
+  assert len(set(moved.values())) == 4
+  for name, value in (("api.key", "dotted-value"), ("api-key", "dashed-value"),
+                      (long_a, "long-a-value"), (long_b, "long-b-value")):
+    assert key_vault.reveal_for_app_platform_use(app.id, name) == value
+  assert vault.reveal(long_a, ("owner", "")) == DUMMY    # the occupied names were untouched

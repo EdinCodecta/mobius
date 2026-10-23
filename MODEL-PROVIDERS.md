@@ -20,10 +20,11 @@ The app owns its setup UI and connection instructions; its key lives in the
 owner's key vault. The app asks for the key named by `secret_name`
 (`POST /api/keys/requests`) and the owner enters and approves it in
 **Settings › Keys**; it is not a manifest value and never passes through the
-app or a chat prompt. A name that is not a valid vault name (for example one
-with a dot) maps to one (`api.key` → `api-key`), and when another app already
-uses that name the key is scoped to the app (`app<id>-api-key`). The models
-are available while the owner's grant to the app stands. At turn launch the platform reads the key for the inference
+app or a chat prompt. The platform looks for the app's own key created for
+that name (for example by the upgrade import, which keeps names like `api.key`
+distinct even when stored as `api-key` or `app<id>-api-key`), and otherwise a
+key with exactly that name. The models are available while the owner's grant
+to the app stands. At turn launch the platform reads the key for the inference
 transport (logged as `platform:app-<id>`) and excludes that environment
 variable from Codex shell tools. The provider app's endpoint receives the
 conversation and tool requests, so installing and connecting one is a

@@ -136,11 +136,12 @@ async def vault_use(
 # -- an app's own key names --------------------------------------------------
 #
 # Before the vault, each app had its own secret namespace, so two apps could
-# both save "api_key". Vault names are shared: an app's name maps to the plain
-# name when that is free, otherwise to an app-scoped one.
-
-_VAULT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
-
+# both save "api_key", and one app could hold both "api.key" and "api-key".
+# Vault names are shared, so each such secret becomes its own key, recorded
+# with its origin (the app and the exact original name). That origin, not the
+# vault name, is how the platform finds it again, and only a key the app itself
+# created that way can be written through the deprecated secret routes: a key
+# the owner merely lets the app borrow is never the app's to replace.
 
 def _vault_safe(name: str) -> str:
   cleaned = re.sub(r"[^A-Za-z0-9_-]", "-", name)
@@ -149,30 +150,51 @@ def _vault_safe(name: str) -> str:
   return cleaned[:64]
 
 
-def app_key_names(app_id: int, name: str) -> tuple[str, str]:
-  """The plain and the app-scoped vault names for an app's ``name``."""
+def _candidate_names(app_id: int, name: str):
+  """Vault names to try for a new app-owned key, most readable first."""
   plain = _vault_safe(name)
-  return plain, f"app{int(app_id)}-{plain}"[:64]
+  yield plain
+  scoped = f"app{int(app_id)}-{plain}"
+  yield scoped[:64]
+  for n in range(2, 100):
+    suffix = f"-{n}"
+    yield scoped[:64 - len(suffix)] + suffix
 
 
-def granted_key_in(keys: list[dict], app_id: int, name: str) -> str | None:
-  for candidate in app_key_names(app_id, name):
-    if any(k["name"] == candidate and app_id in k["grants"]["apps"] for k in keys):
-      return candidate
+def owned_key_in(keys: list[dict], app_id: int, name: str) -> dict | None:
+  """The key ``app_id`` created for its own secret ``name`` and still holds.
+
+  An app that gave up a key the owner shares with others no longer owns it,
+  and saving that name again creates a fresh key of its own.
+  """
+  want = {"app": int(app_id), "name": name}
+  return next(
+    (k for k in keys if k.get("origin") == want and int(app_id) in k["grants"]["apps"]),
+    None,
+  )
+
+
+def resolve_key_in(keys: list[dict], app_id: int, name: str) -> str | None:
+  """The granted key an app means by ``name``.
+
+  The app's own key for that name comes first; otherwise a key with exactly
+  that vault name, as an app asks for through the handshake.
+  """
+  owned = owned_key_in(keys, app_id, name)
+  if owned is not None:
+    return owned["name"]
+  exact = next((k for k in keys if k["name"] == name), None)
+  if exact is not None and app_id in exact["grants"]["apps"]:
+    return exact["name"]
   return None
 
 
 def granted_key_sync(app_id: int, name: str) -> str | None:
-  """The vault key an app's ``name`` refers to, if the owner granted it."""
   try:
     keys = vault_call_sync("GET", "/keys")["keys"]
   except (VaultUnavailable, VaultRefused):
     return None
-  return granted_key_in(keys, app_id, name)
-
-
-async def granted_key(app_id: int, name: str) -> str | None:
-  return granted_key_in((await vault_call("GET", "/keys"))["keys"], app_id, name)
+  return resolve_key_in(keys, app_id, name)
 
 
 def app_may_use(app_id: int, name: str) -> bool:
@@ -199,29 +221,34 @@ def reveal_for_app_platform_use(app_id: int, name: str) -> str | None:
 
 
 async def store_app_key(app_id: int, name: str, value: str) -> str:
-  """Save ``value`` as the key an app's ``name`` refers to; return its name.
+  """Save ``value`` as ``app_id``'s own secret ``name``; return the vault name.
 
-  An existing key granted to the app is replaced. A new key is granted to the
-  app and its owner's agents, sent as a bearer token, with no sites yet: the
-  owner adds those before the app can borrow it.
+  The app's existing key for that name is replaced, keeping the owner's
+  choices for it. Otherwise a new key is created at the first free name,
+  atomically, granted to the app and the owner's agents, sent as a bearer
+  token, with no sites until the owner adds them.
   """
   keys = (await vault_call("GET", "/keys"))["keys"]
-  existing = granted_key_in(keys, app_id, name)
-  if existing is not None:
-    record = next(k for k in keys if k["name"] == existing)
-    await vault_call("PUT", f"/keys/{existing}", {
-      "value": value, "inject": record["inject"], "grants": record["grants"],
+  owned = owned_key_in(keys, app_id, name)
+  if owned is not None:
+    await vault_call("PUT", f"/keys/{owned['name']}", {
+      "value": value, "inject": owned["inject"], "grants": owned["grants"],
     })
-    return existing
-  taken = {k["name"] for k in keys}
-  plain, scoped = app_key_names(app_id, name)
-  target = plain if plain not in taken else scoped
-  await vault_call("PUT", f"/keys/{target}", {
-    "value": value,
-    "inject": {"type": "header", "name": "Authorization", "prefix": "Bearer "},
-    "grants": {"apps": [int(app_id)], "agents": True, "sites": []},
-  })
-  return target
+    return owned["name"]
+  for candidate in _candidate_names(app_id, name):
+    try:
+      await vault_call("PUT", f"/keys/{candidate}", {
+        "value": value,
+        "inject": {"type": "header", "name": "Authorization", "prefix": "Bearer "},
+        "grants": {"apps": [int(app_id)], "agents": True, "sites": []},
+        "origin": {"app": int(app_id), "name": name},
+        "create_only": True,
+      })
+      return candidate
+    except VaultRefused as exc:
+      if exc.status != 409:
+        raise
+  raise VaultRefused(409, f"No free vault name for {name}.")
 
 
 # -- one-time import of the retired per-app secret store ----------------------
@@ -280,7 +307,7 @@ def _pending_legacy_secrets(root: Path, ledger: dict) -> list[tuple[int, Path]]:
 async def import_legacy_app_secrets(live_app_ids: set[int]) -> dict:
   """Move ``/data/app-secrets/<app>/<name>`` values into the vault, once each.
 
-  Each value becomes the key its app's name refers to (``store_app_key``), so
+  Each value becomes that app's own key for the name (``store_app_key``), so
   model providers and the deprecated secrets adapter keep finding it. A ledger
   next to the old files records what moved, so a key the owner later deletes
   is never re-imported; unreadable values are retried on the next start. The

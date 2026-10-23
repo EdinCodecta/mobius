@@ -166,6 +166,21 @@ def validate_site(raw) -> dict:
   return {"host": host, "methods": methods, "paths": sorted(set(clean_paths))}
 
 
+LEGACY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def validate_origin(raw) -> dict:
+  """The app and the app's own secret name a key was created for."""
+  if not isinstance(raw, dict):
+    raise VaultError(400, "A key's origin names an app id and its secret name.")
+  app_id, name = raw.get("app"), raw.get("name")
+  if isinstance(app_id, bool) or not isinstance(app_id, int) or app_id < 1:
+    raise VaultError(400, "Invalid origin app id.")
+  if not isinstance(name, str) or not LEGACY_NAME_RE.fullmatch(name):
+    raise VaultError(400, "Invalid origin secret name.")
+  return {"app": app_id, "name": name}
+
+
 def validate_grants(raw) -> dict:
   if raw is None:
     raw = {}
@@ -508,17 +523,28 @@ class Vault:
         "grants": record["grants"],
         "created_at": record["created_at"],
         "updated_at": record["updated_at"],
+        "origin": record.get("origin"),
         **stats.get(name, {"uses": 0, "denied": 0, "last_used": None}),
       }
       for name, record in sorted(records.items())
     ]
 
   def put_key(self, name: str, body: dict) -> dict:
+    """Create or update a key.
+
+    ``create_only`` refuses an occupied name atomically, so a caller choosing a
+    free name can never overwrite another key. ``origin`` records the app and
+    the app's own secret name a key was created for; it is set once, at
+    creation, and never changed by an update.
+    """
     validate_name(name)
     inject = validate_inject(body.get("inject"))
     grants = validate_grants(body.get("grants"))
+    origin = validate_origin(body["origin"]) if body.get("origin") is not None else None
     with self._lock:
       existing = self._records.get(name)
+      if existing is not None and body.get("create_only"):
+        raise VaultError(409, f"A key named {name} already exists.")
       if existing is None and len(self._records) >= MAX_KEYS:
         raise VaultError(400, f"The vault holds at most {MAX_KEYS} keys.")
       if body.get("value") is not None:
@@ -535,6 +561,9 @@ class Vault:
         "created_at": existing["created_at"] if existing else now,
         "updated_at": now,
       }
+      kept_origin = existing.get("origin") if existing else origin
+      if kept_origin:
+        self._records[name]["origin"] = kept_origin
       self._save()
       granted = [rid for rid, item in self._requests.items()
                  if item["key"] == name and item["app"] in grants["apps"]]

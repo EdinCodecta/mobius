@@ -423,3 +423,15 @@ def test_decoding_is_bounded_and_strips_the_encoding(monkeypatch):
     kv.decoded_body([("Content-Encoding", "gzip, br")], b"")
   with pytest.raises(kv.VaultError, match="could not be decompressed"):
     kv.decoded_body([("Content-Encoding", "gzip")], b"not gzip")
+
+
+def test_create_only_refuses_an_occupied_name_and_origin_is_set_once(vault):
+  with pytest.raises(kv.VaultError, match="already exists"):
+    vault.put_key("echo", {"value": "other", "inject": HEADER_SLOT, "create_only": True})
+  assert vault.reveal("echo", ("owner", "")) == DUMMY
+  vault.put_key("mine", {"value": DUMMY, "inject": HEADER_SLOT, "create_only": True,
+                         "origin": {"app": 7, "name": "api.key"}})
+  vault.put_key("mine", {"value": "next", "inject": HEADER_SLOT,
+                         "origin": {"app": 8, "name": "stolen"}})
+  [mine] = [k for k in vault.list_keys() if k["name"] == "mine"]
+  assert mine["origin"] == {"app": 7, "name": "api.key"}
