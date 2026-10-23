@@ -73,7 +73,7 @@ def test_new_draft_scope_admits_open_draft_without_widening_old_request_id(setup
     db.commit()
     return True
   monkeypatch.setattr(routes, "start_programmatic_chat_turn", admit)
-  preview = routes.review_preview(1, routes.ReviewPreview(), db, owner)
+  preview = routes.review_preview(1, routes.ReviewPreview(mode="review_fix_merge"), db, owner)
   body = routes.StartReviews(request_id="draft-grant-123", mode="review_fix_merge", items=[ITEM],
     confirmation_scope="named_pr_repairs_ready_and_reviewed_successors",
     preview_sha256=preview["preview_sha256"])
@@ -860,7 +860,7 @@ def test_start_refuses_draft_takeover_without_ready_scope(setup, monkeypatch):
   async def no_start(**kwargs):
     pytest.fail("draft without ready scope admitted")
   monkeypatch.setattr(routes, "start_programmatic_chat_turn", no_start)
-  preview = routes.review_preview(1, routes.ReviewPreview(), db, owner)
+  preview = routes.review_preview(1, routes.ReviewPreview(mode="review_fix_merge"), db, owner)
   body = routes.StartReviews(request_id="draft-without-ready", mode="review_fix_merge", items=[ITEM],
     confirmation_scope="named_pr_repairs_and_reviewed_successors",
     preview_sha256=preview["preview_sha256"])
