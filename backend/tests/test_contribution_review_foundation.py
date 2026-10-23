@@ -21,7 +21,7 @@ def test_app_less_routes_do_not_expose_repair_or_posting():
   assert "/api/github/review-preview" in paths
   assert "/api/github/review-runs/{run_id}/outcomes" in paths
   assert not any("repair-checkout" in path or path.endswith("/repairs") for path in paths)
-  assert routes.REVIEW_CAPABILITIES == {"post_review": False, "review_fix_merge": False}
+  assert routes.REVIEW_CAPABILITIES == {"post_review": True, "review_fix_merge": False}
   with pytest.raises(ValueError):
     routes.StartReviews(mode="review_fix_merge", request_id="request-123", items=[ITEM])
 
@@ -71,8 +71,8 @@ def test_core_admission_is_null_app_and_app_context_is_read_only(setup, monkeypa
   app = Principal(owner=principal.owner, app_id=1)
   projected = next(item for item in routes.list_reviews(1, db, app)["runs"] if item["id"] == row.id)
   assert set(projected) <= {"id", "chat_id", "state", "execution_state", "app_id", "can_stop", "items",
-                            "mode", "created_at", "details_in_owning_chat"}
-  assert projected["details_in_owning_chat"] is True and "post_review" not in projected
+                            "mode", "created_at", "post_review", "details_in_owning_chat"}
+  assert projected["details_in_owning_chat"] is True and projected["post_review"] is True
   assert projected["mode"] == "review" and projected["created_at"]
   assert all(set(item) <= {"repo", "number", "head_sha", "base_ref", "base_sha", "state", "public_review"} for item in projected["items"])
   assert projected["items"][0]["base_ref"] == ITEM["base_ref"]

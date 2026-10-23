@@ -13,6 +13,9 @@ from sqlalchemy.orm import Session
 
 from app import chat_queue, chat_writer, contribution_review_runs as reviews, models, providers, transcript_rows
 from app import contribution_review_presets as presets
+from app import contribution_review_public as public
+from app.contribution_review_public_actions import post_public_review
+from app.contribution_review_public import EVIDENCE_MAX_CHARS
 from app import contribution_review_merge_actions as merge_actions
 from app.chat_start import start_programmatic_chat_turn
 from app.chat_visibility import coerce_agent_settings
@@ -27,7 +30,7 @@ from app.github_contribution_git import _gh
 router = APIRouter(tags=["contribution-reviews"])
 APP_PREFIX = "/api/github/contributions"
 SCOPE = {"correctness", "maintainability", "simplicity", "tests", "security_privacy", "technical_debt"}
-REVIEW_CAPABILITIES = {"post_review": False, "review_fix_merge": False}
+REVIEW_CAPABILITIES = {"post_review": True, "review_fix_merge": False}
 REVIEW_STOP_KEY = "_review_stop"
 
 
@@ -62,6 +65,7 @@ class ReviewOptions(BaseModel):
   merge_prompt: str | None = Field(default=None, max_length=20000)
   max_rounds: int | None = Field(default=None, ge=1, strict=True)
   autopilot: bool = False
+  post_review: bool | None = None
 
 
 class ReviewAgentChoice(BaseModel):
@@ -83,10 +87,11 @@ class StartReviews(BaseModel):
 
 
 class ReviewOutcome(PullIdentity):
+  publish: bool = Field(default=False, strict=True)
   state: Literal["all_clear", "needs_you"]
-  summary: str = Field(min_length=1, max_length=4000)
+  summary: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
   scope: list[str] = Field(default_factory=list, max_length=6)
-  tests: str = Field(default="", max_length=4000)
+  tests: str = Field(default="", max_length=EVIDENCE_MAX_CHARS)
   tests_passed: bool | None = None
   reviewed_base_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
 
@@ -145,7 +150,28 @@ def _options_input(body):
     raise HTTPException(422, "max_rounds is not supported by this review-only workflow")
   if options.get("autopilot") is True:
     raise HTTPException(422, "autopilot is not supported by this review-only workflow")
-  return {key: options[key] for key in presets.PROMPT_KEYS if key in options}
+  selected = {key: options[key] for key in presets.PROMPT_KEYS if key in options}
+  if options.get("post_review") is True:
+    selected["post_review"] = True
+  return selected
+
+
+
+def _saved_options_input(row):
+  """Compare legacy no-op defaults without rewriting frozen consent.
+
+  These fields are unused only in review/review_merge. A takeover grant may
+  enforce them, so its exact option comparison must remain untouched.
+  """
+  saved = row.options_json.get("input_options")
+  if row.mode not in {"review", "review_merge"} or not isinstance(saved, dict):
+    return saved
+  normalized = dict(saved)
+  for key, default in (("max_rounds", None), ("autopilot", False),
+                       ("fix_prompt", presets.FIX_PROMPT)):
+    if key in normalized and type(normalized[key]) is type(default) and normalized[key] == default:
+      del normalized[key]
+  return normalized
 
 
 def _snapshot(db, body, principal):
@@ -210,6 +236,8 @@ async def start_reviews(app_id: int | None, body: StartReviews,
   approval = _chat_approval(db, body, principal)
   app_nonce = _authorize_context(db, app_id, principal)
   _assert_app_current(db, app_id, app_nonce)
+  if body.options is not None and body.options.post_review and body.mode != "review":
+    raise HTTPException(422, "Posting a review on GitHub is available for Review only.")
   selection = sorted([{**i.model_dump(), "repo": i.repo.lower()} for i in body.items], key=reviews.key)
   if len({reviews.key(i) for i in selection}) != len(selection):
     raise HTTPException(422, "Select each pull request only once.")
@@ -222,7 +250,7 @@ async def start_reviews(app_id: int | None, body: StartReviews,
       previous = [{"repo": t["repo"].lower(), **{k: t[k] for k in ("number", "head_sha", "base_ref", "base_sha")}} for t in row.targets_json]
       if (row.mode != body.mode or previous != selection
           or (row.options_json and (
-            row.options_json.get("input_options") != (_options_input(body) or {})
+            _saved_options_input(row) != (_options_input(body) or {})
             or row.options_json.get("input_agent") != (body.agent.model_dump() if body.agent else None)
             or (body.preview_sha256 and row.options_json.get("preview_sha256") != body.preview_sha256)))):
         raise HTTPException(409, "This request already approves a different selection.")
@@ -234,10 +262,10 @@ async def start_reviews(app_id: int | None, body: StartReviews,
       if body.preview_sha256 and body.preview_sha256 != _fingerprint(snapshot):
         raise HTTPException(409, "The resolved prompts or model changed. Preview and confirm again.")
       cwd = Path(get_settings().data_dir) / "platform"
-      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub API reads)
+      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub observation)
       if not actor.get("id"):
         raise HTTPException(409, "Connect GitHub before starting this review.")
-      targets = [await asyncio.to_thread(reviews.inspect_target, _gh, cwd, item, body.mode)  # unsettled: read-only (GitHub API reads)
+      targets = [await asyncio.to_thread(reviews.inspect_target, _gh, cwd, item, body.mode)  # unsettled: read-only (GitHub observation)
                  for item in selection]
       # Consent in chat stays in that chat. An app selection without a source
       # conversation still receives its own durable review conversation.
@@ -289,7 +317,59 @@ def list_reviews(app_id: int | None, db: Session = Depends(get_db),
     models.ContributionReviewRun.owner_id == principal.owner.id,
     _read_context_filter(app_id),
   ).order_by(models.ContributionReviewRun.created_at.desc()).limit(100).all()
-  return {"runs": [_run_view(db, row, context_app_id=app_id) for row in rows]}
+  return {"runs": [_list_run_view(db, row, app_id) for row in rows]}
+
+
+def _list_run_view(db, row, app_id):
+  """Keep owning clients compatible; bound only privacy-projected navigation."""
+  value = _run_view(db, row, context_app_id=app_id)
+  if app_id is None or row.app_id == app_id:
+    return value
+  fields = ("repo", "number", "head_sha", "base_ref", "base_sha", "state", "url", "title",
+            "review_chat_id", "review_run_id", "merge_sha", "queue_entry_id")
+  items = []
+  for item in value["items"]:
+    brief = {key: item[key] for key in fields if key in item}
+    if item.get("summary"):
+      summary = item["summary"]
+      if len(summary) > 240:
+        omission = "… open this run for the full findings"
+        brief.update(summary=summary[:240-len(omission)] + omission, summary_truncated=True)
+      else:
+        brief["summary"] = summary
+    if item.get("public_review"):
+      receipt = item["public_review"]
+      brief["public_review"] = {key: receipt[key] for key in ("state", "url", "id") if key in receipt}
+    items.append(brief)
+  value["items"] = items
+  if "options" in value:
+    value["options"] = {key: val for key, val in (value["options"] or {}).items()
+      if key in {"provider", "model", "reasoning_effort", "post_review", "confirmation_scope"}}
+  return value
+
+
+def _reported_outcome(previous, body, row, principal):
+  """Build private review evidence once; callers add only transition facts."""
+  return {**previous, "state": body.state, "summary": body.summary, "scope": body.scope,
+    "tests": body.tests, "tests_passed": body.tests_passed,
+    "reviewed_base_sha": body.reviewed_base_sha, "head_sha": body.head_sha,
+    "review_chat_id": row.chat_id, "review_run_id": principal.run_id}
+
+
+async def _record_failed_live_read(db, row, item_key, body, principal, error):
+  """A read failure cannot erase a receipt another worker armed during I/O."""
+  async with chat_queue.get_transition_lock(f"review-admission:{row.id}"):
+    _parent(db, row, principal)  # Refresh before considering any private evidence.
+    current = (row.outcomes_json or {}).get(item_key, {})
+    if ((current.get("public_review") or {}).get("state") in {"posting", "posted", "unknown"}
+        or _merge_attempted(current)):
+      return
+    posting = body.publish and row.mode == "review" and (row.options_json or {}).get("post_review") is True
+    outcome = _reported_outcome(current, body, row, principal)
+    outcome.update(state=body.state if posting else "needs_you", live_blocker=str(error.detail))
+    if posting:
+      outcome["public_review"] = {"state": "not_dispatched", "summary": str(error.detail)}
+    reviews.save_outcome(db, row, item_key, outcome)
 
 
 def _last_reply_error(chat) -> str:
@@ -347,41 +427,41 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     if target is None or target["head_sha"] != body.head_sha:
       raise HTTPException(409, "This head was not in the approved selection.")
     previous = row.outcomes_json.get(item_key, {})
-    attempted = _merge_attempted(previous)
-    if previous.get("state") == "merged" or (row.mode == "review" and previous.get("state") == "all_clear"):
+    if public.require_same_evidence(previous, body.model_dump()):
       return {"run": _run_view(db, row)}
+    attempted = _merge_attempted(previous)
+    if previous.get("state") == "merged":
+      return {"run": _run_view(db, row)}
+    if row.mode == "review" and previous.get("state") == "all_clear":
+      if not (row.options_json or {}).get("post_review"):
+        return {"run": _run_view(db, row)}
+      # Failed-live-read reporting also writes evidence without arming a post.
+      # Preserve this precheck as well as the concurrent writer-fenced check.
+      if public.evidence(previous) != public.evidence(body.model_dump()):
+        raise HTTPException(409, "Retry the public review with its recorded evidence unchanged.")
     if body.state == "all_clear" and (set(body.scope) != SCOPE or not body.tests.strip() or body.tests_passed is False):
       raise HTTPException(422, "Record the complete review scope and test evidence before all clear.")
-    if row.mode == "review" and not attempted:
+    if body.publish and not (row.mode == "review" and (row.options_json or {}).get("post_review") is True):
+      raise HTTPException(403, "This grant does not authorize a public review.")
+    if row.mode == "review" and not attempted and not body.publish:
       # Private findings are facts about the selected head, not the live PR.
       # A moved or temporarily unreadable PR must not replace their evidence.
       async with chat_queue.get_transition_lock(f"review-admission:{run_id}"):
         _parent(db, row, principal)
-        reviews.save_outcome(db, row, item_key, {**previous, "state": body.state,
-          "summary": body.summary, "scope": body.scope, "tests": body.tests,
-          "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
-          "head_sha": body.head_sha, "review_chat_id": row.chat_id,
-          "review_run_id": principal.run_id})
+        current = (row.outcomes_json or {}).get(item_key, {})
+        if public.require_same_evidence(current, body.model_dump()):
+          return {"run": _run_view(db, row)}
+        if current != previous:
+          raise HTTPException(409, "This review changed during private reporting. Refresh before continuing.")
+        reviews.save_outcome(db, row, item_key, _reported_outcome(current, body, row, principal))
       return {"run": _run_view(db, row)}
     cwd = Path(get_settings().data_dir) / "platform"
     try:
-      repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
+      repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
     except HTTPException as exc:
-      # A failed live read cannot rewrite private evidence or a public receipt.
-      if not attempted:
-        async with chat_queue.get_transition_lock(f"review-admission:{run_id}"):
-          _parent(db, row, principal)
-          reviews.save_outcome(db, row, item_key, {**previous, "state": "needs_you",
-            "summary": body.summary, "scope": body.scope, "tests": body.tests,
-            "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
-            "head_sha": body.head_sha, "review_chat_id": row.chat_id,
-            "review_run_id": principal.run_id, "live_blocker": str(exc.detail)})
+      await _record_failed_live_read(db, row, item_key, body, principal, exc)
       return {"run": _run_view(db, row)}
-    outcome = {**previous, "state": body.state, "summary": body.summary, "scope": body.scope,
-               "tests": body.tests, "tests_passed": body.tests_passed,
-               "reviewed_base_sha": body.reviewed_base_sha,
-               "head_sha": body.head_sha,
-               "review_chat_id": row.chat_id, "review_run_id": principal.run_id}
+    outcome = _reported_outcome(previous, body, row, principal)
     if attempted:
       outcome = await _reconcile_merge(previous, target, pull, cwd)
       reviews.save_effect_outcome(db, row, item_key, outcome)
@@ -392,8 +472,17 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
       await merge_actions.merge_reviewed_target(db, row, target, outcome, repo, pull, principal,
         gh=_gh, cwd=cwd, authorize=lambda: _parent(db, row, principal))
       return {"run": _run_view(db, row)}
-    _parent(db, row, principal)
-    reviews.save_outcome(db, row, item_key, outcome)
+    if (body.publish and row.mode == "review" and (row.options_json or {}).get("post_review") is True
+        and outcome.get("state") in {"all_clear", "needs_you"}
+        and (previous.get("public_review") or {}).get("state") not in {"posting", "posted", "unknown"}):
+      outcome = await post_public_review(db, row, item_key, target, outcome, principal, cwd,
+        gh=_gh, authorize=lambda: _parent(db, row, principal))
+    if not outcome.get("merge_attempted") and not outcome.get("public_review"):
+      _parent(db, row, principal)
+    if outcome.get("merge_attempted") or outcome.get("public_review"):
+      reviews.save_effect_outcome(db, row, item_key, outcome)
+    else:
+      reviews.save_outcome(db, row, item_key, outcome)
     return {"run": _run_view(db, row)}
 
 
@@ -479,7 +568,7 @@ def _run_view(db, row, *, context_app_id=None):
         projected["public_review"] = {key: public[key] for key in ("state", "url") if key in public}
       items.append(projected)
     value = {key: value[key] for key in ("id", "chat_id", "state", "execution_state", "mode", "created_at") if key in value} | {
-      "app_id": None, "can_stop": False,
+      "app_id": None, "can_stop": False, "post_review": bool((row.options_json or {}).get("post_review")),
       "details_in_owning_chat": True, "items": items,
     }
   return value
@@ -602,6 +691,11 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
     db.refresh(row)
     for original in row.targets_json:
       previous = row.outcomes_json.get(reviews.key(original), {})
+      receipt = previous.get("public_review") or {}
+      if receipt.get("state") in {"posting", "unknown"}:
+        observed = await asyncio.to_thread(public.reconcile_review, _gh, cwd, original, receipt, row.github_actor_id)  # unsettled: read-only (public review receipt observation)
+        reviews.save_effect_outcome(db, row, reviews.key(original), {**previous, "public_review": observed})
+        continue
       attempted = _merge_attempted(previous)
       if not attempted:
         continue

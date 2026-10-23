@@ -62,3 +62,13 @@ def test_default_unsupported_options_are_neither_advertised_nor_frozen(options):
 def test_finite_limit_is_refused_until_enforced(limit):
   with pytest.raises(ValueError, match="not supported"):
     subject.resolve_options(object(), {"max_rounds": limit})
+
+
+def test_post_review_is_frozen_only_when_chosen_so_old_snapshots_keep_their_hash():
+  choice = {"provider": "codex", "model": "gpt-5", "effort": "high"}
+  plain = subject.resolve_options(None, {}, choice=choice)
+  assert "post_review" not in plain
+  assert subject.resolve_options(None, {"post_review": False}, choice=choice) == plain
+  assert subject.resolve_options(None, {"post_review": True}, choice=choice)["post_review"] is True
+  with pytest.raises(ValueError):
+    subject.resolve_options(None, {"post_review": "yes"}, choice=choice)
