@@ -325,7 +325,7 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
       raise HTTPException(409, "This head was not in the approved selection.")
     previous = row.outcomes_json.get(item_key, {})
     attempted = previous.get("merge_attempted") is True or previous.get("state") in {"merging", "merge_unknown", "queued", "merged"}
-    if previous.get("state") == "merged":
+    if previous.get("state") == "merged" or (row.mode == "review" and previous.get("state") == "all_clear"):
       return {"run": _run_view(db, row)}
     cwd = Path(get_settings().data_dir) / "platform"
     try:
@@ -622,7 +622,7 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
     db.refresh(row)
     for original in row.targets_json:
       previous = row.outcomes_json.get(reviews.key(original), {})
-      if not previous:
+      if not previous or (row.mode == "review" and previous.get("state") == "all_clear"):
         continue
       target = original
       attempted = previous.get("merge_attempted") is True or previous.get("state") in {"merging", "merge_unknown", "queued", "merged"}
