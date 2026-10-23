@@ -365,6 +365,14 @@ def _list_run_view(db, row, app_id):
   return value
 
 
+def _reported_outcome(previous, body, row, principal):
+  """Build private review evidence once; callers add only transition facts."""
+  return {**previous, "state": body.state, "summary": body.summary, "scope": body.scope,
+    "tests": body.tests, "tests_passed": body.tests_passed,
+    "reviewed_base_sha": body.reviewed_base_sha, "head_sha": body.head_sha,
+    "review_chat_id": row.chat_id, "review_run_id": principal.run_id}
+
+
 async def _record_failed_live_read(db, row, item_key, body, principal, error):
   """A read failure cannot erase a receipt another worker armed during I/O."""
   async with chat_queue.get_transition_lock(f"review-admission:{row.id}"):
@@ -374,12 +382,11 @@ async def _record_failed_live_read(db, row, item_key, body, principal, error):
         or _merge_attempted(current)):
       return
     posting = body.publish and row.mode == "review" and (row.options_json or {}).get("post_review") is True
-    reviews.save_outcome(db, row, item_key, {**current, "state": body.state if posting else "needs_you",
-      **({"public_review": {"state": "not_dispatched", "summary": str(error.detail)}} if posting else {}),
-      "summary": body.summary, "scope": body.scope, "tests": body.tests,
-      "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
-      "head_sha": body.head_sha, "review_chat_id": row.chat_id,
-      "review_run_id": principal.run_id, "live_blocker": str(error.detail)})
+    outcome = _reported_outcome(current, body, row, principal)
+    outcome.update(state=body.state if posting else "needs_you", live_blocker=str(error.detail))
+    if posting:
+      outcome["public_review"] = {"state": "not_dispatched", "summary": str(error.detail)}
+    reviews.save_outcome(db, row, item_key, outcome)
 
 
 def _last_reply_error(chat) -> str:
@@ -445,7 +452,7 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     if row.mode == "review" and previous.get("state") == "all_clear":
       if not (row.options_json or {}).get("post_review"):
         return {"run": _run_view(db, row)}
-      if public.evidence(previous) != public.evidence(body.model_dump()):
+      if not body.publish and public.evidence(previous) != public.evidence(body.model_dump()):
         raise HTTPException(409, "Retry the public review with its recorded evidence unchanged.")
     if body.state == "all_clear" and (set(body.scope) != SCOPE or not body.tests.strip() or body.tests_passed is False):
       raise HTTPException(422, "Record the complete review scope and test evidence before all clear.")
@@ -461,11 +468,7 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
           return {"run": _run_view(db, row)}
         if current != previous:
           raise HTTPException(409, "This review changed during private reporting. Refresh before continuing.")
-        reviews.save_outcome(db, row, item_key, {**current, "state": body.state,
-          "summary": body.summary, "scope": body.scope, "tests": body.tests,
-          "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
-          "head_sha": body.head_sha, "review_chat_id": row.chat_id,
-          "review_run_id": principal.run_id})
+        reviews.save_outcome(db, row, item_key, _reported_outcome(current, body, row, principal))
       return {"run": _run_view(db, row)}
     cwd = Path(get_settings().data_dir) / "platform"
     try:
@@ -473,11 +476,8 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     except HTTPException as exc:
       await _record_failed_live_read(db, row, item_key, body, principal, exc)
       return {"run": _run_view(db, row)}
-    outcome = {**previous, "state": body.state, "summary": body.summary, "scope": body.scope,
-               "tests": body.tests, "tests_passed": body.tests_passed,
-               "reviewed_base_sha": body.reviewed_base_sha, "independent_receipt_id": body.independent_receipt_id,
-               "head_sha": body.head_sha,
-               "review_chat_id": row.chat_id, "review_run_id": principal.run_id}
+    outcome = {**_reported_outcome(previous, body, row, principal),
+               "independent_receipt_id": body.independent_receipt_id}
     if attempted:
       outcome = await _reconcile_merge(previous, target, pull, cwd)
       reviews.save_effect_outcome(db, row, item_key, outcome)
@@ -919,7 +919,10 @@ async def repair_checkout(app_id: int | None, run_id: str, body: RepairCheckout,
   _parent(db, row, principal)
   async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
     db.refresh(row)
-    await settled.run_settled(repair_actions.sweep_checkout_receipts_once)
+    try:
+      await settled.run_settled(repair_actions.sweep_checkout_receipts_once)
+    except Exception:
+      _log.exception("repair checkout GC failed before checkout preparation for review run %s", run_id)
     target = _target(row, body)
     previous = row.outcomes_json.get(reviews.key(target), {})
     _require_ready_attempt_resolved(previous, target)

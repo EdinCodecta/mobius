@@ -368,6 +368,15 @@ def test_checkout_preparation_runs_writer_fenced_gc(setup, monkeypatch):
   assert calls == [1]
 
 
+def test_checkout_gc_failure_is_logged_but_does_not_block_preparation(setup, monkeypatch, caplog):
+  def broken_gc():
+    raise OSError("temporary cleanup failure")
+  monkeypatch.setattr(actions, "sweep_checkout_receipts_once", broken_gc)
+  db, row, _principal = configure_repair(setup, monkeypatch)
+  assert row.outcomes_json[domain.key(ITEM)]["checkout"]["checkout"] == "/fake/server-repair"
+  assert "repair checkout GC failed before checkout preparation" in caplog.text
+
+
 def test_stop_admission_lock_blocks_repair_arm(setup, monkeypatch):
   db, row, principal = configure_repair(setup, monkeypatch)
   monkeypatch.setattr(repairs, "push_repair", lambda *a, **kw: pytest.fail("push after Stop"))

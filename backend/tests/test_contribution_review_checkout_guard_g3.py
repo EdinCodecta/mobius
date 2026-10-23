@@ -162,12 +162,16 @@ def test_textconv_never_runs_in_the_canonical_diff_of_a_rejected_checkout(owned)
   tmp_path, checkout = owned
   git(checkout, "config", "user.name", "x"); git(checkout, "config", "user.email", "x@x")
   (checkout / "a.txt").write_text("one\n"); git(checkout, "add", "a.txt"); git(checkout, "commit", "-qm", "1")
+  initial = git(checkout, "rev-parse", "HEAD")
+  (checkout / "a.txt").write_text("two\n"); git(checkout, "add", "a.txt"); git(checkout, "commit", "-qm", "2")
+  head = git(checkout, "rev-parse", "HEAD")
   marker = tmp_path / "textconv-ran"
   git(checkout, "config", "--local", "diff.evil.textconv", f"sh -c 'touch {marker}; cat \"$0\"'")
   (checkout / ".git" / "info").mkdir(exist_ok=True)
   (checkout / ".git" / "info" / "attributes").write_text("* diff=evil\n")
   with pytest.raises(HTTPException):
     repairs.owned_checkout(checkout)
+  assert app_git._canonical_diff(checkout, initial, head, read_only=True)
   assert not marker.exists()
 
 

@@ -237,3 +237,14 @@ def test_public_holder_lookup_occurs_after_database_writer_fence(setup, monkeypa
   monkeypatch.setattr(public, 'post_review', lambda *a: pytest.fail('holder at write fence was missed'))
   with pytest.raises(HTTPException, match='fence-holder'):
     report(setup, publish=True)
+
+
+def test_report_builder_preserves_transition_facts_without_mutating_saved_evidence(setup):
+  db, row, principal = setup
+  previous = {"state": "needs_you", "summary": "old", "public_review": {"state": "not_dispatched"}}
+  body = routes.ReviewOutcome(**{**ITEM, "state": "needs_you", "summary": "new", "tests": "verified"})
+  result = routes._reported_outcome(previous, body, row, principal)
+  assert result == {**previous, "summary": "new", "scope": body.scope, "tests": "verified",
+    "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
+    "head_sha": body.head_sha, "review_chat_id": row.chat_id, "review_run_id": principal.run_id}
+  assert previous["summary"] == "old"
