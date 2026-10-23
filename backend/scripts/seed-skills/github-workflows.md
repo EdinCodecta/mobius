@@ -7,8 +7,8 @@ description: Privately review named GitHub PRs or conditionally merge an exact p
 GitHub is connected through Möbius Settings. The core endpoints at
 `/api/github/review-runs` do not depend on Contribute. The optional app can
 read core runs, but cannot spend their public grant. This version supports
-private `review` and pinned `review_merge` only: it has no repair/push or
-posted-review mode. Do not use an app-specific CLI to reimplement selection.
+private `review`, explicitly opted-in public COMMENT reviews, and pinned
+`review_merge`: it has no repair/push mode. Do not use an app-specific CLI to reimplement selection.
 
 ## Authority
 
@@ -68,3 +68,16 @@ conversation, then observe again. Do not leave an in-memory poll running.
 
 Contribute's `contributing` skill covers local proposal publication and app
 workspace presentation; this guide is the single core review execution guide.
+
+## Optional public review
+
+Only an explicit owner opt-in may set `post_review:true` in the preview's
+options JSON, and only for `review` mode. Confirm the public audience before
+including private evidence. The server posts one COMMENT review on the exact
+head, never APPROVE or REQUEST_CHANGES. Once posting is armed the recorded
+verdict and evidence are immutable; identical replay only reads the saved
+receipt. Transport uncertainty never permits another post.
+
+Private evidence fields accept up to 200,000 characters each. The public copy
+is bounded conservatively to 65,536 UTF-16 units with explicit omission
+markers; the full accepted private evidence is retained.

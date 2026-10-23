@@ -50,7 +50,7 @@ MANDATORY_INSTRUCTIONS = (
 )
 
 PROMPT_KEYS = ("review_prompt", "fix_prompt", "merge_prompt")
-OPTION_KEYS = frozenset((*PROMPT_KEYS, "max_rounds", "autopilot"))
+OPTION_KEYS = frozenset((*PROMPT_KEYS, "max_rounds", "autopilot", "post_review"))
 MAX_PROMPT_BYTES = 16_384
 
 
@@ -100,12 +100,16 @@ def resolve_options(db, options: dict | None = None, *, choice: dict | None = No
   if type(autopilot) is not bool:
     raise ValueError("autopilot must be a boolean")
 
+  post_review = options.get("post_review", False)
+  if type(post_review) is not bool:
+    raise ValueError("post_review must be a boolean")
   choice = dict(choice) if choice is not None else contribution_autopilot.resolve_round_choice(db)
   mandatory_bytes = MANDATORY_INSTRUCTIONS.encode("utf-8")
   return {
     **resolved,
     "max_rounds": max_rounds,
     "autopilot": autopilot,
+    **({"post_review": True} if post_review else {}),
     "mandatory_instructions": MANDATORY_INSTRUCTIONS,
     "prompt_bytes_b64": {
       key: base64.b64encode(value).decode("ascii") for key, value in raw_bytes.items()

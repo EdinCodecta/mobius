@@ -4,7 +4,7 @@ import json
 
 IDENTITY_FIELDS = ("repo", "number", "head_sha", "base_ref", "base_sha")
 OPTION_FIELDS = ("review_prompt", "fix_prompt", "merge_prompt", "max_rounds", "autopilot")
-OPTIONAL_OPTION_FIELDS = ()
+OPTIONAL_OPTION_FIELDS = ("post_review",)
 
 def review_path(app_id, suffix):
   prefix = f"/api/github/contributions/{app_id}" if app_id is not None else "/api/github"

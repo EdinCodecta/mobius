@@ -19,7 +19,7 @@ def test_app_less_routes_do_not_expose_repair_or_posting():
   assert "/api/github/review-preview" in paths
   assert "/api/github/review-runs/{run_id}/outcomes" in paths
   assert not any("repair-checkout" in path or path.endswith("/repairs") for path in paths)
-  assert routes.REVIEW_CAPABILITIES == {"post_review": False, "review_fix_merge": False}
+  assert routes.REVIEW_CAPABILITIES == {"post_review": True, "review_fix_merge": False}
   with pytest.raises(ValueError):
     routes.StartReviews(mode="review_fix_merge", request_id="request-123", items=[ITEM])
 
