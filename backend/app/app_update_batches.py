@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 import json
 import logging
 from pathlib import Path
+import subprocess
 import time
 from uuid import UUID
 
@@ -107,6 +108,42 @@ async def install_reviewed_update(update: dict) -> dict:
     }
 
 
+class SettlementUnreadable(Exception):
+  """Durable app state could not be read, so whether an update landed is
+  unknown. Never a verdict: the entry keeps its state and is read again."""
+
+
+def _pending_receipt(source_dir: str, app_id: int, commit: str) -> dict | None:
+  """The pending-update receipt naming ``commit``; none only once proven."""
+  try:
+    return pending_update.checked_pending_conflict_update_receipt(
+      source_dir, app_id=app_id, upstream_commit=commit,
+    )
+  except OSError as exc:
+    raise SettlementUnreadable(f"pending update receipt of app {app_id}") from exc
+
+
+def _contains(source_dir: str, reviewed_commit: str, source_commit: str) -> bool:
+  """Whether the served revision contains the reviewed commit.
+
+  Git answers only for commits it has: a served revision present with its
+  full history and without the reviewed commit cannot contain it (an update
+  that never fetched). Anything else Git cannot answer is unknown.
+  """
+  contained = app_git.ref_is_ancestor(source_dir, reviewed_commit, source_commit)
+  if contained is not None:
+    return contained
+  try:
+    if (
+      app_git.present_commit(source_dir, source_commit)
+      and app_git.present_commit(source_dir, reviewed_commit) is None
+    ):
+      return False
+  except (OSError, subprocess.SubprocessError) as exc:
+    raise SettlementUnreadable(f"history of {source_dir}") from exc
+  raise SettlementUnreadable(f"history of {source_dir}")
+
+
 def _reviewed_commit_landed(
   source_dir: str, app_id: int, reviewed_commit: str, source_commit: str | None,
 ) -> bool:
@@ -117,12 +154,11 @@ def _reviewed_commit_landed(
   ``source_commit`` is evidence. Only a receipt that names this commit means
   it is still pending: a leftover pending directory or checkout is harmless,
   and a receipt for a later update does not unseat an earlier one that landed.
+  Raises ``SettlementUnreadable`` rather than guess.
   """
-  return bool(source_commit) and (
-    app_git.ref_is_ancestor(source_dir, reviewed_commit, source_commit) is True
-  ) and pending_update.read_pending_conflict_update_receipt(
-    source_dir, app_id=app_id, upstream_commit=reviewed_commit,
-  ) is None
+  return bool(source_commit) and _contains(
+    source_dir, reviewed_commit, source_commit,
+  ) and _pending_receipt(source_dir, app_id, reviewed_commit) is None
 
 
 def _settled_outcomes(reviewed: dict[int, str]) -> dict[int, dict]:
@@ -131,8 +167,9 @@ def _settled_outcomes(reviewed: dict[int, str]) -> dict[int, dict]:
   ``reviewed`` maps app id to its reviewed upstream commit. For each app:
   ``updated`` iff the accepted source contains that commit and no pending
   update remains; ``conflict`` iff a pending-update receipt names that
-  commit (with the resolver chat opened for it); otherwise not applied.
-  Callers apply the returned patches to their record on the event loop.
+  commit (with the resolver chat opened for it); not applied only once both
+  reads succeed. A failed read raises ``SettlementUnreadable``, never a
+  verdict. Callers apply the returned patches to their record on the loop.
   """
   with SessionLocal() as db:
     rows = {
@@ -155,19 +192,12 @@ def _settled_outcomes(reviewed: dict[int, str]) -> dict[int, dict]:
       }
       continue
     source_dir, source_commit, version, resolver, resolver_commit = row
-    try:
-      if _reviewed_commit_landed(source_dir, app_id, commit, source_commit):
-        outcomes[app_id] = {
-          "status": "updated", "version": version, "error": "",
-          "error_code": None, "retryable": False, "resolver_chat_id": None,
-        }
-        continue
-      pending = pending_update.read_pending_conflict_update_receipt(
-        source_dir, app_id=app_id, upstream_commit=commit,
-      )
-    except (OSError, RuntimeError):
-      pending = None
-    if pending is not None:
+    if _reviewed_commit_landed(source_dir, app_id, commit, source_commit):
+      outcomes[app_id] = {
+        "status": "updated", "version": version, "error": "",
+        "error_code": None, "retryable": False, "resolver_chat_id": None,
+      }
+    elif _pending_receipt(source_dir, app_id, commit) is not None:
       outcomes[app_id] = {
         "status": "conflict", "version": version, "error": "",
         "error_code": None, "retryable": False,
@@ -478,7 +508,12 @@ class AppUpdateBatches:
     actionable = _unfinished(record, record["entries"], {"conflict", "failed"})
     if not actionable:
       return
-    outcomes = await asyncio.to_thread(_settled_outcomes, actionable)
+    try:
+      outcomes = await asyncio.to_thread(_settled_outcomes, actionable)
+    except SettlementUnreadable:
+      # Unknown is not a new answer: the saved result stands until a read works.
+      log.warning("app update batch %s results could not be re-read", key, exc_info=True)
+      return
     failed = {e["app_id"] for e in record["entries"] if e["status"] == "failed"}
     outcomes = {
       app_id: patch for app_id, patch in outcomes.items()
@@ -541,10 +576,16 @@ class AppUpdateBatches:
         # Shutdown, queued or running: the installer has settled. Read what
         # actually landed off the loop, then apply it here, where siblings
         # also save this record.
-        _apply(record, await asyncio.to_thread(
-          _settled_outcomes, _unfinished(record, [entry]),
-        ))
-        await self._save_off_loop(record)
+        try:
+          outcomes = await asyncio.to_thread(
+            _settled_outcomes, _unfinished(record, [entry]),
+          )
+        except SettlementUnreadable:
+          # Unknown stays unfinished, never "not applied": boot settles it.
+          log.warning("app update for %s could not be settled", entry["app_id"], exc_info=True)
+        else:
+          _apply(record, outcomes)
+          await self._save_off_loop(record)
         raise
       activity.log_event(
         "app_update_outcome", batch_id=record["id"], app_id=entry["app_id"],

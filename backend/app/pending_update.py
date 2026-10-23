@@ -172,15 +172,29 @@ def read_pending_conflict_update_receipt(
 
   Receipts written by earlier releases (schemas 1-3) carried a resolution
   policy and a reviewed tree; both are ignored because the resolver's own
-  commit is now the complete answer.
+  commit is now the complete answer. A receipt that cannot be read reads as
+  none; ``checked_pending_conflict_update_receipt`` tells the two apart.
   """
+  try:
+    return checked_pending_conflict_update_receipt(
+      source_dir, app_id=app_id, upstream_commit=upstream_commit,
+    )
+  except OSError:
+    return None
+
+
+def checked_pending_conflict_update_receipt(
+  source_dir: str | Path, *, app_id: int, upstream_commit: str | None,
+) -> dict | None:
+  """As ``read_pending_conflict_update_receipt``, but only a missing receipt
+  reads as none: one that exists and cannot be read raises ``OSError``."""
   root = Path(source_dir) / ".git" / _PENDING_UPDATE_DIR
   receipt_path = root / "receipt.json"
   if root.is_symlink() or receipt_path.is_symlink():
     return None
   try:
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-  except (OSError, ValueError):
+  except (FileNotFoundError, NotADirectoryError, ValueError):
     return None
   if not isinstance(receipt, dict):
     return None

@@ -1140,3 +1140,103 @@ async def test_a_prune_skips_a_batch_whose_save_is_in_flight(tmp_path):
     assert key in owner.records and (owner.root / f"{key}.json").exists()
   owner._prune_finished()
   assert key not in owner.records and not (owner.root / f"{key}.json").exists()
+
+
+def _unknown_history(monkeypatch):
+  """Git cannot answer: a timeout, a lock, or damaged metadata."""
+  monkeypatch.setattr(batches.app_git, "ref_is_ancestor", lambda *args: None)
+  monkeypatch.setattr(batches.app_git, "present_commit", lambda path, ref: None)
+
+
+def _unreadable_receipt(source_dir):
+  """A receipt that exists and cannot be read (here, not a regular file)."""
+  pending_update.pending_update_receipt_file(source_dir).mkdir(parents=True)
+
+
+@pytest.mark.asyncio
+async def test_unreadable_settlement_state_is_never_a_failed_update(tmp_path, db, monkeypatch):
+  """Restart settles only from reads that worked; unknown pauses and retries."""
+  app_id = add_app(db, tmp_path, "unknown", version="1.0", upstream_commit=COMMIT,
+    source_commit=LANDED)
+  body = request(app_id)
+  key = str(body.id)
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  await owner.start()
+  owner._save({"id": key, "created_at": _now(),
+    "updates": [u.model_dump() for u in body.updates],
+    "entries": [{"app_id": app_id, "status": "applying", "version": "1.0", "error": ""}]})
+
+  async def assert_paused():
+    reboot = batches.AppUpdateBatches(str(tmp_path))
+    await reboot.start()
+    assert not reboot.accepting and reboot.failure == batches._UNREADABLE
+    saved = json.loads((reboot.root / f"{key}.json").read_text())
+    assert (saved["phase"], saved["entries"][0]["status"]) == ("applying", "applying")
+    return reboot
+
+  with monkeypatch.context() as patch:
+    _unknown_history(patch)
+    await assert_paused()
+  monkeypatch.setattr(batches.app_git, "ref_is_ancestor",
+    lambda path, reviewed, accepted: reviewed == COMMIT and accepted == LANDED)
+  _unreadable_receipt(tmp_path / "unknown")
+  reboot = await assert_paused()
+
+  # Once the reads work again, the next request settles what really happened.
+  pending_update.pending_update_receipt_file(tmp_path / "unknown").rmdir()
+  await reboot.retry_start()
+  assert reboot.accepting
+  entry = reboot.snapshot(key)["entries"][0]
+  assert (entry["status"], entry["version"]) == ("updated", "1.0")
+
+
+def test_a_reviewed_commit_never_fetched_proves_not_applied(tmp_path, db):
+  """Git cannot compare a commit it lacks; a full served history without it
+  still proves the update did not land."""
+  repo = tmp_path / "unfetched"
+  subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+  subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+    "commit", "-q", "--allow-empty", "-m", "served"], check=True)
+  served = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+    capture_output=True, text=True, check=True).stdout.strip()
+  app = models.App(name="Unfetched", slug="unfetched", jsx_source="export default 1",
+    source_dir=str(repo), source_commit=served, version="1.0")
+  db.add(app)
+  db.commit()
+  assert batches.app_git.ref_is_ancestor(str(repo), COMMIT, served) is None
+  outcome = batches._settled_outcomes({app.id: COMMIT})[app.id]
+  assert (outcome["status"], outcome["error_code"]) == ("failed", "update_not_applied")
+
+
+@pytest.mark.asyncio
+async def test_unreadable_state_keeps_saved_results_and_unfinished_entries(
+  tmp_path, db, git_state, monkeypatch,
+):
+  """Refresh and shutdown keep what they knew when a read fails."""
+  conflicted = add_app(db, tmp_path, "conflicted", version="1.0", source_commit="1" * 40)
+  running = add_app(db, tmp_path, "running", version="1.0", source_commit="1" * 40)
+  started = asyncio.Event()
+
+  async def execute(update):
+    if update["app_id"] == conflicted:
+      git_state.add(tmp_path / "conflicted", conflicted)
+      return {"status": "conflict"}
+    started.set()
+    await asyncio.Event().wait()
+
+  owner = batches.AppUpdateBatches(str(tmp_path), execute=execute)
+  await owner.start()
+  conflict_key = owner.submit(request(conflicted), db)["id"]
+  running_key = owner.submit(request(running), db)["id"]
+  await started.wait()
+  while owner.snapshot(conflict_key)["phase"] != "complete":
+    await asyncio.sleep(0)
+  git_state.clear()
+  _unreadable_receipt(tmp_path / "conflicted")
+  await owner.refresh_results(conflict_key, db)
+  assert owner.snapshot(conflict_key)["entries"][0]["status"] == "conflict"
+
+  _unknown_history(monkeypatch)
+  await owner.stop()
+  saved = json.loads((owner.root / f"{running_key}.json").read_text())
+  assert saved["entries"][0]["status"] == "applying"  # boot settles it
