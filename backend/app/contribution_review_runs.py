@@ -499,6 +499,8 @@ def _receipted_target(original, outcome):
   current = original["head_sha"]
   confirmed = None
   for receipt in receipts:
+    if receipt.get("state") == "rejected":
+      continue  # Audited non-effect, not part of the successor chain.
     if receipt.get("state") != "pushed":
       break
     if receipt.get("from_sha") != current:
@@ -582,7 +584,7 @@ def repair_round_limit(row):
 
 def require_repair_round_available(row, attempts):
   limit = repair_round_limit(row)
-  if limit is not None and len(attempts) >= limit:
+  if limit is not None and sum(a.get("state") != "rejected" for a in attempts) >= limit:
     raise HTTPException(409, "The approved repair round limit is exhausted. Ask the owner.")
 
 

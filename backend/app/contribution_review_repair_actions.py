@@ -32,7 +32,9 @@ def checkout_gc_scope(db) -> dict[str, set[str]]:
   for row in db.query(models.ContributionReviewRun).populate_existing().all():
     active_editor = row.chat_id in active_chats or row.chat_id in active_parents
     stopped = (row.outcomes_json or {}).get("_review_stop", {}).get("state") == "requested"
-    for outcome in (row.outcomes_json or {}).values():
+    for original in row.targets_json or []:
+      item_key = reviews.key(original)
+      outcome = (row.outcomes_json or {}).get(item_key, {})
       if not isinstance(outcome, dict):
         continue
       attempts = outcome.get("repair_attempts") or []
@@ -40,17 +42,28 @@ def checkout_gc_scope(db) -> dict[str, set[str]]:
         path = attempt.get("checkout") if isinstance(attempt, dict) else None
         if not isinstance(path, str):
           continue
-        (protected if attempt.get("state") in {"pushing", "push_unknown"} else terminal).add(path)
+        state = attempt.get("state")
+        if state == "pushed":
+          terminal.add(path)
+        elif state != "rejected":
+          protected.add(path)
       checkout = outcome.get("checkout") or {}
       path = checkout.get("checkout") if isinstance(checkout, dict) else None
       if not isinstance(path, str):
         continue
+      try:
+        effective_head = reviews.effective_target(row, original)["head_sha"]
+      except (HTTPException, KeyError, ValueError):
+        effective_head = None  # Ambiguous history cannot authorize deletion.
+      initial_head = checkout.get("initial_head_sha")
+      superseded = (isinstance(initial_head, str) and isinstance(effective_head, str)
+                    and initial_head != effective_head)
       if active_editor:
         protected.add(path)
-      elif not stopped and outcome.get("state") == "repairing":
-        dormant.add(path)
-      else:
+      elif stopped or outcome.get("state") == "merged" or superseded:
         terminal.add(path)
+      else:
+        dormant.add(path)
   return {"protected_paths": protected, "terminal_paths": terminal,
           "dormant_paths": dormant}
 
@@ -70,11 +83,8 @@ def sweep_checkout_receipts_once() -> None:
       # same-filesystem rename. No recursive delete runs in that transaction.
       db.execute(text("UPDATE contribution_review_runs SET revision=revision "
                       "WHERE id=(SELECT id FROM contribution_review_runs LIMIT 1)"))
-    elif dialect == "postgresql":
-      db.execute(text("LOCK TABLE chat_runs, delegations, contribution_review_runs "
-                      "IN SHARE ROW EXCLUSIVE MODE"))
     else:
-      raise RuntimeError("Repair checkout GC requires a writer-fenced database.")
+      raise RuntimeError("Repair checkout GC requires SQLite's single-writer fence.")
     repairs.quarantine_stale_checkouts(**checkout_gc_scope(db))
     db.commit()
   repairs.delete_quarantined_checkouts()
@@ -118,8 +128,13 @@ async def publish_attempt(db, row, target, validation, receipt, principal, *, gh
   else:
     result = await dispatch_repair(row, target, validation, gh=gh, cwd=cwd, authorize=authorize)
   if result.state == "not_dispatched":
+    remote_rejection = (isinstance(result.receipt, dict)
+      and result.receipt.get("kind") == "remote_ref_rejection"
+      and result.receipt.get("head_sha") == attempts[-1]["head_sha"])
+    saved_attempts = ([*attempts[:-1], {**attempts[-1], "state": "rejected"}]
+      if remote_rejection else attempts[:-1])
     reviews.save_effect_outcome(db, row, reviews.key(target), {**previous,
-      "repair_attempts": attempts[:-1], "state": "needs_you",
+      "repair_attempts": saved_attempts, "state": "needs_you",
       "summary": f"No branch update was applied: {result.reason}"})
     agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
       work_key=attempts[-1]["work_key"], outcome="Repair branch update was not applied.", release=True)

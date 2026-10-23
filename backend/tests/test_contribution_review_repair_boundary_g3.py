@@ -193,7 +193,10 @@ def test_exact_porcelain_rejection_releases_only_when_remote_unchanged(checkout,
     pushed.append(1)
     return type("Result", (), {"returncode": returncode, "stdout": porcelain.format(head="b" * 40)})()
   monkeypatch.setattr(repairs, "_git", rejected)
-  assert repairs.push_repair(None, path, None, target, validation).state == expected
+  result = repairs.push_repair(None, path, None, target, validation)
+  assert result.state == expected
+  if expected == "not_dispatched":
+    assert result.receipt == {"kind": "remote_ref_rejection", "head_sha": "b" * 40}
   assert pushed == [1]
 
 
@@ -220,5 +223,14 @@ def test_forged_ancestry_metadata_is_rejected(checkout, marker):
   altered = path / ".git" / marker
   altered.parent.mkdir(exist_ok=True)
   altered.write_text(initial + "\n")
+  with pytest.raises(HTTPException):
+    repairs.owned_checkout(path)
+
+
+def test_valid_but_forbidden_commondir_redirect_is_rejected(checkout):
+  path, _ = checkout
+  # A self-pointing common dir is valid Git metadata; the explicit guard
+  # must reject it rather than a later Git parse failure doing so by accident.
+  (path / ".git/commondir").write_text(".\n")
   with pytest.raises(HTTPException):
     repairs.owned_checkout(path)

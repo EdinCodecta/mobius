@@ -57,6 +57,30 @@ def test_push_result_releases_only_definite_non_effect(setup, monkeypatch, resul
     assert not peer.outcomes_json[domain.key(target)].get("repair_attempts")
 
 
+def test_remote_rejection_keeps_audit_but_allows_fresh_proved_repair(setup, monkeypatch):
+  db, row, principal = configure_repair(setup, monkeypatch)
+  row.options_json = {**row.options_json, "max_rounds": 1}
+  db.commit()
+  calls = []
+  def push(*args, **kwargs):
+    calls.append(1)
+    if len(calls) == 1:
+      return DispatchResult("not_dispatched",
+        receipt={"kind": "remote_ref_rejection", "head_sha": NEW},
+        reason="GitHub rejected the exact repair ref; no branch update was applied.")
+    return DispatchResult.confirmed({"head_sha": NEW})
+  monkeypatch.setattr(repairs, "push_repair", push)
+  first = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))["run"]["items"][0]
+  assert first["repair_attempts"][-1]["state"] == "rejected"
+  assert first["repair_attempts"][-1]["head_sha"] == NEW
+  assert db.query(models.AgentWorkClaim).one().released_at is not None
+  second = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))["run"]["items"][0]
+  assert calls == [1, 1]
+  assert [a["state"] for a in second["repair_attempts"]] == ["rejected", "pushed"]
+  assert second["successor"]["head_sha"] == NEW
+  assert domain.effective_target(row, row.targets_json[0])["head_sha"] == NEW
+
+
 def test_confirmed_publish_discards_checkout_after_durable_fact(setup, monkeypatch):
   db, row, principal = configure_repair(setup, monkeypatch)
   discarded = []
@@ -96,7 +120,8 @@ def test_gc_protects_active_and_uncertain_but_collects_stopped_and_orphans(setup
   db.add(create_chat(id="completed-editor", title="Completed repair editor"))
   other = models.ContributionReviewRun(id="old-gc", app_id=row.app_id, owner_id=row.owner_id,
     request_id="old-gc", mode=row.mode, targets_json=row.targets_json,
-    outcomes_json={domain.key(ITEM): {"state": "needs_you", "checkout": {"checkout": str(paths["terminal"])}}},
+    outcomes_json={"_review_stop": {"state": "requested"}, domain.key(ITEM): {
+      "state": "needs_you", "checkout": {"checkout": str(paths["terminal"])}}},
     chat_id="completed-editor", github_actor_id=row.github_actor_id, app_nonce=row.app_nonce)
   db.add(other)
   db.commit()
@@ -104,6 +129,65 @@ def test_gc_protects_active_and_uncertain_but_collects_stopped_and_orphans(setup
   repairs.sweep_stale_checkouts(**actions.checkout_gc_scope(db), now=10**12)
   assert paths["active"].exists() and paths["unknown"].exists()
   assert not paths["terminal"].exists() and not paths["orphan"].exists()
+
+
+@pytest.mark.parametrize("state,summary,base_advance", [
+  ("needs_you", "Commit or discard working changes before validating.", None),
+  ("needs_you", "The target base moved before repair dispatch.", None),
+  ("reviewing", "Target base advanced; review the combined result.", {
+    "head_sha": SHA, "from_base_sha": BASE, "base_sha": "d" * 40}),
+])
+def test_idle_live_grant_keeps_unpushed_files_until_dormant_grace(setup, monkeypatch, tmp_path,
+                                                                    state, summary, base_advance):
+  db, row, principal = setup
+  row.mode = "review_fix_merge"
+  db.get(models.ChatRun, principal.run_id).status = "completed"
+  path = tmp_path / "repair-idle"
+  path.mkdir()
+  (path / "unpushed.py").write_text("important unpushed edit\n")
+  monkeypatch.setattr(repairs, "_checkout_root", lambda: tmp_path)
+  outcome = {"state": state, "summary": summary,
+    "checkout": {"checkout": str(path), "initial_head_sha": SHA}}
+  if base_advance:
+    outcome["base_advance"] = base_advance
+  domain.save_outcome(db, row, domain.key(ITEM), outcome)
+  monkeypatch.setattr(repairs, "_last_activity", lambda candidate: 0)
+  scope = actions.checkout_gc_scope(db)
+  assert str(path) in scope["dormant_paths"] and str(path) not in scope["terminal_paths"]
+  repairs.sweep_stale_checkouts(**scope, now=repairs.STALE_EDIT_SECONDS - 1)
+  assert (path / "unpushed.py").read_text() == "important unpushed edit\n"
+  repairs.sweep_stale_checkouts(**scope, now=repairs.STALE_EDIT_SECONDS)
+  assert not path.exists()
+
+
+def test_unreceipted_checkout_gets_one_hour_orphan_grace(monkeypatch, tmp_path):
+  monkeypatch.setattr(repairs, "_checkout_root", lambda: tmp_path)
+  path = tmp_path / "repair-unreceipted"
+  path.mkdir()
+  monkeypatch.setattr(repairs, "_last_activity", lambda candidate: 0)
+  scope = {"protected_paths": set(), "terminal_paths": set(), "dormant_paths": set()}
+  repairs.sweep_stale_checkouts(**scope, now=repairs.ORPHAN_GRACE_SECONDS - 1)
+  assert path.exists()
+  repairs.sweep_stale_checkouts(**scope, now=repairs.ORPHAN_GRACE_SECONDS)
+  assert not path.exists()
+
+
+@pytest.mark.parametrize("settlement", ["merged", "superseded"])
+def test_idle_settled_or_superseded_checkout_is_terminal(setup, monkeypatch, tmp_path, settlement):
+  db, row, principal = setup
+  row.mode = "review_fix_merge"
+  db.get(models.ChatRun, principal.run_id).status = "completed"
+  path = tmp_path / "repair-settled"
+  path.mkdir()
+  monkeypatch.setattr(repairs, "_checkout_root", lambda: tmp_path)
+  outcome = {"state": "merged" if settlement == "merged" else "reviewing",
+    "checkout": {"checkout": str(path), "initial_head_sha": SHA}}
+  if settlement == "superseded":
+    outcome.update(successor={"head_sha": NEW, "base_sha": BASE},
+      repair_attempts=[{"state": "pushed", "from_sha": SHA, "head_sha": NEW, "base_sha": BASE}])
+  domain.save_outcome(db, row, domain.key(ITEM), outcome)
+  scope = actions.checkout_gc_scope(db)
+  assert str(path) in scope["terminal_paths"]
 
 
 def test_cancelled_but_still_running_child_protects_parent_checkout(setup, monkeypatch, tmp_path):
@@ -199,6 +283,24 @@ def test_periodic_gc_cancellation_waits_for_quarantine_and_delete(monkeypatch):
     result = await asyncio.gather(task, return_exceptions=True)
     assert isinstance(result[0], asyncio.CancelledError)
   asyncio.run(exercise())
+
+
+def test_runtime_database_services_spawn_repair_gc(monkeypatch):
+  from app import chat
+  from app.chat import ContinuationSweepResult
+  async def no_parks(*args, **kwargs):
+    return ContinuationSweepResult()
+  monkeypatch.setattr(chat, "sweep_reset_parks", no_parks)
+  supervisors = RuntimeSupervisors(settings=SimpleNamespace(data_dir="/tmp"),
+    logger=logging.getLogger("test.repair-gc-spawn"), restart_authorization=None,
+    restart_fallback_chats=[])
+  names = []
+  def capture(name, coroutine):
+    names.append(name)
+    coroutine.close()
+  monkeypatch.setattr(supervisors, "_spawn", capture)
+  asyncio.run(supervisors._start_chat_supervisors())
+  assert "repair-checkout-gc" in names
 
 
 def test_stranded_pushing_observation_becomes_visible_unknown(setup, monkeypatch):

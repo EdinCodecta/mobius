@@ -898,7 +898,8 @@ async def publish_repair(app_id: int | None, run_id: str, body: RepairPublish,
       raise HTTPException(409, "This PR is not named in the takeover grant.")
     previous = row.outcomes_json.get(reviews.key(original), {})
     attempts = list(previous.get("repair_attempts", []))
-    pending = next((r for r in attempts if r.get("from_sha") == body.head_sha), None)
+    pending = next((r for r in attempts if r.get("from_sha") == body.head_sha
+                    and r.get("state") in {"pushing", "push_unknown", "pushed"}), None)
     cwd = Path(get_settings().data_dir) / "platform"
     if pending:
       confirmed = await repair_actions.reconcile_push(db, row, original, previous, pending, gh=_gh, cwd=cwd)
