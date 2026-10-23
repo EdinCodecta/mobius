@@ -460,3 +460,53 @@ def test_finish_rejects_source_that_moved_behind_selected_release(client, auth, 
   response = client.get("/api/platform/update-preview?intent=finish", headers=auth)
   assert response.status_code == 503
   assert response.json()["detail"]["code"] == "update_plan_stale"
+
+
+def test_restart_refusal_names_the_package_gap(client, auth, monkeypatch):
+  from app.restart_util import RestartSourceInvalid
+
+  gap = {"packages": [{"name": "pkg", "declared": "==2", "installed": None,
+                       "kind": "missing"}], "blocking": True}
+
+  def refuse():
+    raise RestartSourceInvalid(
+      "Restart stopped: pkg is missing",
+      {"reason": "image_packages_behind_source", "gap": gap},
+    )
+
+  expected = {
+    "code": "platform_source_invalid", "reason": "image_packages_behind_source",
+    "gap": gap, "message": "Restart stopped: pkg is missing",
+  }
+  monkeypatch.setattr("app.routes.platform.validate_restart_source", refuse)
+  response = client.post("/api/platform/restart", headers=auth)
+  assert response.status_code == 409
+  assert response.json()["detail"] == expected
+
+  # The admin restart keeps the same stable code beside the reason.
+  monkeypatch.setattr("app.routes.admin.validate_restart_source", refuse)
+  response = client.post("/api/admin/restart", headers=auth)
+  assert response.status_code == 409
+  assert response.json()["detail"] == expected
+
+
+def test_conflict_resolver_chat_resume_restarts_the_stalled_resolver(client, auth, monkeypatch):
+  calls = []
+
+  async def resume(db):
+    calls.append("resume")
+    return {"chat_id": "resolver", "created": False, "started": True}
+
+  async def create(db):
+    calls.append("create")
+    return {"chat_id": "resolver", "created": False, "started": False}
+
+  monkeypatch.setattr("app.routes.platform.platform_update.resume_platform_conflict_resolver", resume)
+  monkeypatch.setattr("app.routes.platform.platform_update.create_platform_conflict_resolver_chat", create)
+
+  resumed = client.post("/api/platform/conflict-resolver-chat", headers=auth, json={"resume": True})
+  opened = client.post("/api/platform/conflict-resolver-chat", headers=auth)
+
+  assert resumed.status_code == 200 and resumed.json()["started"] is True
+  assert opened.status_code == 200
+  assert calls == ["resume", "create"]

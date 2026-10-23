@@ -37,7 +37,6 @@
 .app-consent__row span { color: var(--muted, #a1a1aa); font-size: 12.5px; line-height: 1.4; }
 .app-consent__row .app-consent__note { color: var(--accent-text, #b9a7f5); font-size: 12px; }
 .app-consent__dot { flex: none; width: 10px; height: 10px; margin-top: 5px; border-radius: 50%; background: var(--danger, #f87171); }
-.app-consent__empty { margin: 0; padding: 10px 12px; border: 1px solid var(--border, #252b36); border-radius: 12px; background: var(--surface-2, #1a1f28); color: var(--muted, #a1a1aa); font-size: 13px; }
 .app-consent__meta { margin: 0; color: var(--muted, #a1a1aa); font-size: 12px; line-height: 1.4; }
 .app-consent__error { margin: 0; color: var(--danger, #f87171); font-size: 12.5px; }
 .app-consent__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; }

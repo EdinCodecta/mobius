@@ -261,8 +261,18 @@ The script queues the helper for the latest official image (`--target` names an
 exact release instead; `--check` only reports whether it would) after checking,
 under the updater's lock, that the target is an official release that ships this
 bridge and is newer than the running image and the source's official package
-declarations, that no update is prepared or parked, and that the helper is
-idle. The helper drains chats, replaces only
+declarations, that the target image still installs every package the source's
+release declares and satisfies every local declaration's version range (every
+declaration of a package must hold, and a dependency line naming no package,
+such as `-e`, `-r` or a path or URL, counts as one it cannot verify; a
+declaration whose environment marker excludes the target image counts for
+nothing, judged by this container's platform values and the Python version of
+the target Dockerfile's `python:X.Y` base, and a marker those cannot decide,
+such as one on `python_full_version`, also counts as unverifiable; each
+shortfall is named, a local one with the local commit to revert;
+`--allow-package-loss` accepts the loss knowingly, for example a package the
+target image provides another way), that no update is prepared
+or parked, and that the helper is idle. The helper drains chats, replaces only
 the container, and attempts to restore the previous container if the new one is
 unhealthy. If exact restoration cannot be confirmed, the host retains the
 transaction and reports `needs_recovery`; the request is not safely retryable.
