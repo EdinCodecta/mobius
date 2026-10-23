@@ -348,21 +348,7 @@ def arm_merge(db, row, target, outcome, principal):
 
 def write_outcome(db, row, item_key, outcome):
   """CAS an outcome inside the caller's admission transaction; do not commit."""
-  revision = row.revision
-  previous = (row.outcomes_json or {}).get(item_key, {})
-  history = list(previous.get("steps", []))[-99:]
-  # Receipts are already retained in the owning item's dedicated audit lists.
-  # A small step envelope avoids recursively copying all history each time.
-  history.append({k: outcome[k] for k in (
-    "state", "head_sha", "review_run_id", "merge_attempted", "merge_sha"
-  ) if k in outcome})
-  outcomes = {**row.outcomes_json, item_key: {**outcome, "steps": history}}
-  changed = db.execute(update(models.ContributionReviewRun).where(
-    models.ContributionReviewRun.id == row.id,
-    models.ContributionReviewRun.revision == revision,
-  ).values(outcomes_json=outcomes, revision=revision + 1))
-  if changed.rowcount != 1:
-    db.rollback()
+  if not _cas_outcome(db, row, item_key, outcome, commit=False):
     raise HTTPException(409, "This review changed. Refresh before continuing.")
 
 
@@ -734,22 +720,30 @@ def disarm_merge(db, row, target, reason):
         or current.get("review_selection_id", row.id) != row.id
         or current.get("head_sha") != target["head_sha"]):
       raise HTTPException(409, "The merge reservation changed; it cannot be released.")
-    revision = row.revision
-    values = {**row.outcomes_json, item_key: {**current, "state": "needs_you",
-      "summary": reason, "merge_attempted": False}}
-    changed = db.execute(update(models.ContributionReviewRun).where(
-      models.ContributionReviewRun.id == row.id,
-      models.ContributionReviewRun.revision == revision,
-    ).values(outcomes_json=values, revision=revision + 1))
-    if changed.rowcount == 1:
-      db.commit()
-      db.refresh(row)
+    if _cas_outcome(db, row, item_key, {**current, "state": "needs_you",
+                            "summary": reason, "merge_attempted": False}):
       break
-    db.rollback()
   else:
     raise HTTPException(409, "The merge reservation changed; observe this run.")
   agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
     work_key=merge_work_key(target), outcome=reason, release=True)
+
+
+def _cas_outcome(db, row, item_key, outcome, *, commit=True):
+  """One revision-fenced target write; callers choose their conflict policy."""
+  revision = row.revision
+  outcomes = {**(row.outcomes_json or {}), item_key: outcome}
+  changed = db.execute(update(models.ContributionReviewRun).where(
+    models.ContributionReviewRun.id == row.id,
+    models.ContributionReviewRun.revision == revision,
+  ).values(outcomes_json=outcomes, revision=revision + 1))
+  if changed.rowcount != 1:
+    db.rollback()
+    return False
+  if commit:
+    db.commit()
+    db.refresh(row)
+  return True
 
 
 def save_effect_outcome(db, row, item_key, outcome):
@@ -771,15 +765,7 @@ def save_effect_outcome(db, row, item_key, outcome):
         and public_receipt.get("marker") != (outcome.get("public_review") or {}).get("marker")):
       # Only the dispatcher/observer of this exact attempt can settle it.
       return
-    revision = row.revision
-    values = {**row.outcomes_json, item_key: outcome}
-    changed = db.execute(update(models.ContributionReviewRun).where(
-      models.ContributionReviewRun.id == row.id,
-      models.ContributionReviewRun.revision == revision,
-    ).values(outcomes_json=values, revision=revision + 1))
-    if changed.rowcount == 1:
-      db.commit()
-      db.refresh(row)
+    if _cas_outcome(db, row, item_key, outcome):
       return
-    db.rollback()
   raise HTTPException(409, "The remote result could not be recorded after concurrent changes; observe this run.")
+

@@ -399,8 +399,17 @@ def approved_body(request_id="chat-approved"):
     chat_approval={"context": "The owner said: review this exact PR and merge it if safe."})
 
 
+def snapshot_owning_chat(db, principal):
+  choice = routes.resolve_round_choice(db)
+  chat = db.get(models.Chat, principal.chat_id)
+  chat.provider = choice["provider"]
+  chat.agent_settings_json = {"model": choice["model"], "effort": choice.get("effort")}
+  db.commit()
+
+
 def test_explicit_chat_consent_stays_in_owning_chat_with_durable_provenance(setup, monkeypatch):
   db, _, principal = setup
+  snapshot_owning_chat(db, principal)
   monkeypatch.setattr(domain, "inspect_target", lambda *args: TARGET)
   async def forbidden(**kwargs):
     pytest.fail("Approval must not create a second review conversation")
@@ -478,6 +487,7 @@ def test_http_admission_accepts_explicit_chat_consent_but_not_an_unapproved_agen
   from fastapi import FastAPI
   from fastapi.testclient import TestClient
   db, _, principal = setup
+  snapshot_owning_chat(db, principal)
   application = FastAPI()
   application.include_router(routes.router)
   application.dependency_overrides[routes.get_db] = lambda: db

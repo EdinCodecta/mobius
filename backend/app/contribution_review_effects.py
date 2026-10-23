@@ -48,6 +48,26 @@ def _gh_http_status(detail: str) -> int | None:
   return int(next(group for group in match.groups() if group)) if match else None
 
 
+def _proved_graphql_refusal(errors: list[dict], data, status: int | None) -> bool:
+  """Require typed refusal and no successful mutation field before releasing."""
+  safe_status = status is None or 200 <= status < 300 or (400 <= status < 500 and status not in (408, 429))
+  if not safe_status:
+    return False
+  types = [item.get("type") or (item.get("extensions") or {}).get("type")
+           or (item.get("extensions") or {}).get("code") for item in errors]
+  if not all(isinstance(kind, str) and kind.upper() in _GRAPHQL_REFUSAL_TYPES for kind in types):
+    return False
+  if data is None:
+    return True
+  if not isinstance(data, dict) or not data or not all(value is None for value in data.values()):
+    return False
+  # A nullable mutation resolver can fail as {data:{field:null}, errors:[...]}
+  # rather than data:null. Every error must identify a failed root field.
+  return all(isinstance(item.get("path"), list) and item["path"]
+             and isinstance(item["path"][0], str) and item["path"][0] in data
+             for item in errors)
+
+
 def classify_dispatch_error(exc: Exception) -> DispatchResult:
   """Classify only a *proved* provider refusal as non-effect.
 
@@ -90,16 +110,11 @@ def graphql_mutation_result(response) -> dict:
                    (item.get("extensions") is None or isinstance(item["extensions"], dict))
                    for item in errors)):
       raise ContributionSubmitError("GitHub returned malformed GraphQL errors.", code="graphql_response_invalid_shape")
-    if "data" not in result or result["data"] is None:
-      status = _gh_http_status(getattr(response, "stderr", "") or "")
-      types = [item.get("type") or (item.get("extensions") or {}).get("type")
-               or (item.get("extensions") or {}).get("code") for item in errors]
-      if (all(isinstance(kind, str) and kind.upper() in _GRAPHQL_REFUSAL_TYPES for kind in types)
-          and (status is None or 200 <= status < 300
-               or (400 <= status < 500 and status not in (408, 429)))):
-        raise NotDispatched("GitHub rejected the GraphQL mutation without applying it.")
-      raise ContributionSubmitError("GitHub did not establish whether the GraphQL mutation applied.",
-                                    code="graphql_response_uncertain")
+    status = _gh_http_status(getattr(response, "stderr", "") or "")
+    if _proved_graphql_refusal(errors, result.get("data"), status):
+      raise NotDispatched("GitHub rejected the GraphQL mutation without applying it.")
+    raise ContributionSubmitError("GitHub did not establish whether the GraphQL mutation applied.",
+                                  code="graphql_response_uncertain")
   if getattr(response, "returncode", 0):
     raise ContributionSubmitError((getattr(response, "stderr", "") or "GitHub GraphQL request failed.")[:600])
   return result
