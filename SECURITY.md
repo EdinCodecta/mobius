@@ -65,6 +65,17 @@ These are intentional design decisions appropriate for a single-owner app:
   evolve, and there is no synchronous `/api/ai` surface.
 - **`unsafe-inline` in style-src CSP:** Required for server-injected theme
   CSS. The owner controls the theme content.
+- **Phone notification content passes through mobius.you:** Web Push payloads
+  are end-to-end encrypted to the browser, but native push to the Möbius mobile
+  app is not. To reach a phone, each notification's title and text pass in
+  plaintext through the mobius.you push relay and then Google's or Apple's push
+  service; mobius.you stores none of it (only a keyed hash of each phone's
+  token and which installation owns it). Whether a phone gets notifications is
+  that phone's own notification setting for the app; Möbius has no switch of
+  its own, and the owner can disconnect a phone through `DELETE
+  /api/push/devices/{id}`. The last installation to register a phone owns it,
+  so a phone signed in to two installations gets notifications only from the
+  most recent one.
 - **90-day service token:** The app-job supervisor reads it only to mint a
   short-lived app token; job scripts do not inherit it. It is stored at
   `/data/service-token.txt` (chmod 600, mobius user only).

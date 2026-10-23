@@ -217,5 +217,5 @@ def remove_device(
   owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
   db: Session = Depends(get_db),
 ):
-  """Disconnect one of the owner's phones (Settings → Disconnect, from the app or a browser)."""
+  """Disconnect one of the owner's phones (API; there is no Settings UI, the phone's own notification setting decides)."""
   _remove(db, background, owner.id, models.PushDevice.id == device_id)

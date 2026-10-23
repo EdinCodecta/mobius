@@ -11,10 +11,9 @@
 // Whether this phone gets notifications is the phone's own notification
 // setting for the app; Möbius has no switch of its own. Each time the app
 // opens, the page asks for the token: a token registers (or refreshes) this
-// phone, and no token (notifications not allowed) forgets it, so Settings
-// lists exactly the phones that can receive. Signing out forgets the phone
-// while the credential still works; Disconnect in Settings removes a phone
-// until the app opens on it again.
+// phone, and no token (notifications not allowed) forgets it, so the server
+// keeps exactly the phones that can receive. Signing out forgets the phone
+// while the credential still works.
 
 import { api } from '../api/client.js'
 
@@ -125,12 +124,6 @@ export function isNativePushAvailable(win = globalThis.window) {
   return typeof win?.MobiusNative?.registerPush === 'function'
 }
 
-/** Whether a registered device (by its token's last characters) is this phone. */
-export function isThisPhone(tokenTail) {
-  const token = storedToken()
-  return !!token && !!tokenTail && token.endsWith(tokenTail)
-}
-
 /** Forgets this phone's token at the server; resolves to null or an error message. */
 async function forgetThisPhone(push) {
   await pending.catch(() => {})
@@ -161,24 +154,6 @@ export async function registerNativePush({ win = globalThis.window, push = api.p
   if (signedOut) return
   if (result?.token) await save(result, push)
   else await forgetThisPhone(push)
-}
-
-/**
- * Settings → Disconnect, for any listed phone. If it is this phone and the
- * app stays allowed to notify, it connects again the next time the app opens.
- * Resolves to null or an error message.
- */
-export async function disconnectPhone(device, { push = api.push } = {}) {
-  const thisPhone = isThisPhone(device?.tokenTail)
-  if (thisPhone) await pending.catch(() => {})
-  try {
-    const response = await push.devices.remove(device.id)
-    if (!response?.ok) return failure(response, "Couldn't disconnect this phone. Try again.")
-  } catch {
-    return "Couldn't reach Möbius. Try again."
-  }
-  if (thisPhone) write(TOKEN_KEY, null)
-  return null
 }
 
 /** Sign-out: stop notifications to this phone while the credential works. */

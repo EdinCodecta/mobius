@@ -2,9 +2,7 @@ import { afterEach, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
-  disconnectPhone,
   forgetNativePush,
-  isThisPhone,
   registerNativePush,
   resetNativePushForTests,
 } from '../nativePush.js'
@@ -13,7 +11,7 @@ const originalLocalStorage = globalThis.localStorage
 const values = new Map()
 const TOKEN_KEY = 'mobius.nativePush.token'
 
-function fakePush({ ok = true, forgetOk = true, removeOk = true } = {}) {
+function fakePush({ ok = true, forgetOk = true } = {}) {
   const calls = []
   return {
     calls,
@@ -25,10 +23,6 @@ function fakePush({ ok = true, forgetOk = true, removeOk = true } = {}) {
           : { ok: false, status: 409, json: async () => ({ detail: 'Link this Möbius first.' }) }
       },
       forget: async (body) => { calls.push(['forget', body]); return { ok: forgetOk, status: forgetOk ? 204 : 500 } },
-      remove: async (id) => {
-        calls.push(['remove', id])
-        return removeOk ? { ok: true, status: 204 } : { ok: false, status: 500, json: async () => ({}) }
-      },
     },
   }
 }
@@ -103,7 +97,6 @@ test('a refused registration leaves this phone unrecorded', async () => {
   await registerNativePush({ win: app({ token: 'tok-1' }), push })
 
   assert.equal(values.has(TOKEN_KEY), false)
-  assert.equal(isThisPhone('tok-1'), false)
 })
 
 test('a new token for this phone replaces the old one instead of adding a second phone', async () => {
@@ -185,49 +178,6 @@ test('signing out while the app is still answering keeps the phone unregistered'
 
   assert.deepEqual(push.calls, [])
   assert.equal(values.has(TOKEN_KEY), false)
-})
-
-test('Settings recognizes this phone by the end of its registered token', async () => {
-  assert.equal(isThisPhone('ab12cd'), false)
-  await registerNativePush({ win: app({ token: 'token-ab12cd' }), push: fakePush() })
-
-  assert.equal(isThisPhone('ab12cd'), true)
-  assert.equal(isThisPhone('zz99zz'), false)
-  assert.equal(isThisPhone(''), false)
-})
-
-test('disconnecting this phone removes it, and it connects again on the next app open', async () => {
-  const push = fakePush()
-  const win = app({ token: 'token-ab12cd' })
-  await registerNativePush({ win, push })
-
-  assert.equal(await disconnectPhone({ id: 'dev-1', tokenTail: 'ab12cd' }, { push }), null)
-  assert.equal(isThisPhone('ab12cd'), false)
-  await registerNativePush({ win, push })
-
-  assert.deepEqual(push.calls.map(([kind, arg]) => [kind, kind === 'remove' ? arg : arg.token]), [
-    ['register', 'token-ab12cd'], ['remove', 'dev-1'], ['register', 'token-ab12cd'],
-  ])
-})
-
-test('disconnecting another phone leaves this phone connected', async () => {
-  const push = fakePush()
-  await registerNativePush({ win: app({ token: 'token-ab12cd' }), push })
-
-  assert.equal(await disconnectPhone({ id: 'dev-2', tokenTail: 'zz99zz' }, { push }), null)
-
-  assert.deepEqual(push.calls.at(-1), ['remove', 'dev-2'])
-  assert.equal(isThisPhone('ab12cd'), true)
-})
-
-test('a failed disconnect says so and keeps this phone recorded', async () => {
-  const push = fakePush({ removeOk: false })
-  await registerNativePush({ win: app({ token: 'token-ab12cd' }), push })
-
-  const message = await disconnectPhone({ id: 'dev-1', tokenTail: 'ab12cd' }, { push })
-
-  assert.match(message, /Couldn't disconnect/)
-  assert.equal(isThisPhone('ab12cd'), true)
 })
 
 test('an old token whose cleanup failed is retried until the server confirms', async () => {
