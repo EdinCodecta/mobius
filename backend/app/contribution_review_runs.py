@@ -345,7 +345,8 @@ def brief(row):
   frozen = row.options_json or {}
   public_note = (
     "The owner explicitly opted into one public COMMENT review per head. "
-    "Report the verdict and tests through /outcomes; the server posts it, never a raw mutation. "
+    "Set publish:true only for a deliberate public verdict in /outcomes; the server posts it, never a raw mutation. "
+    "Owner questions and blocked work use publish:false (the default) and stay private. "
     "Evidence freezes once dispatch is armed; identical retry is read-only. "
     "Keep owner-only questions and private data out of public evidence.\n"
     if frozen.get("post_review") is True else ""

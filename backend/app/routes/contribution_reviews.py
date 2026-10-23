@@ -87,6 +87,7 @@ class StartReviews(BaseModel):
 
 
 class ReviewOutcome(PullIdentity):
+  publish: bool = Field(default=False, strict=True)
   state: Literal["all_clear", "needs_you"]
   summary: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
   scope: list[str] = Field(default_factory=list, max_length=6)
@@ -294,7 +295,45 @@ def list_reviews(app_id: int | None, db: Session = Depends(get_db),
     models.ContributionReviewRun.owner_id == principal.owner.id,
     _read_context_filter(app_id),
   ).order_by(models.ContributionReviewRun.created_at.desc()).limit(100).all()
-  return {"runs": [_run_view(db, row, context_app_id=app_id) for row in rows]}
+  return {"runs": [_list_run_view(db, row, app_id) for row in rows]}
+
+
+def _list_run_view(db, row, app_id):
+  """Lists are navigation summaries; full evidence belongs to exact-run detail."""
+  value = _run_view(db, row, context_app_id=app_id)
+  fields = ("repo", "number", "head_sha", "base_ref", "base_sha", "state", "url", "title",
+            "review_chat_id", "review_run_id", "merge_sha", "queue_entry_id")
+  items = []
+  for item in value["items"]:
+    brief = {key: item[key] for key in fields if key in item}
+    if item.get("summary"):
+      brief["summary"] = item["summary"][:240]
+    if item.get("public_review"):
+      receipt = item["public_review"]
+      brief["public_review"] = {key: receipt[key] for key in ("state", "url", "id") if key in receipt}
+    items.append(brief)
+  value["items"] = items
+  if "options" in value:
+    value["options"] = {key: val for key, val in (value["options"] or {}).items()
+      if key in {"provider", "model", "reasoning_effort", "post_review", "confirmation_scope", "max_rounds"}}
+  return value
+
+
+async def _record_failed_live_read(db, row, item_key, body, principal, error):
+  """A read failure cannot erase a receipt another worker armed during I/O."""
+  async with chat_queue.get_transition_lock(f"review-admission:{row.id}"):
+    _parent(db, row, principal)  # Refresh before considering any private evidence.
+    current = (row.outcomes_json or {}).get(item_key, {})
+    if ((current.get("public_review") or {}).get("state") in {"posting", "posted", "unknown"}
+        or current.get("merge_attempted") or current.get("state") in {"merging", "merged", "queued", "merge_unknown"}):
+      return
+    posting = body.publish and row.mode == "review" and (row.options_json or {}).get("post_review") is True
+    reviews.save_outcome(db, row, item_key, {**current, "state": body.state if posting else "needs_you",
+      **({"public_review": {"state": "not_dispatched", "summary": str(error.detail)}} if posting else {}),
+      "summary": body.summary, "scope": body.scope, "tests": body.tests,
+      "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
+      "head_sha": body.head_sha, "review_chat_id": row.chat_id,
+      "review_run_id": principal.run_id, "live_blocker": str(error.detail)})
 
 
 def _last_reply_error(chat) -> str:
@@ -340,7 +379,9 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
         raise HTTPException(409, "Retry the public review with its recorded evidence unchanged.")
     if body.state == "all_clear" and (set(body.scope) != SCOPE or not body.tests.strip() or body.tests_passed is False):
       raise HTTPException(422, "Record the complete review scope and test evidence before all clear.")
-    if row.mode == "review" and not attempted and not (row.options_json or {}).get("post_review"):
+    if body.publish and not (row.mode == "review" and (row.options_json or {}).get("post_review") is True):
+      raise HTTPException(403, "This grant does not authorize a public review.")
+    if row.mode == "review" and not attempted and not body.publish:
       # Private findings are facts about the selected head, not the live PR.
       # A moved or temporarily unreadable PR must not replace their evidence.
       async with chat_queue.get_transition_lock(f"review-admission:{run_id}"):
@@ -355,16 +396,7 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     try:
       repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
     except HTTPException as exc:
-      # A failed live read cannot rewrite private evidence or a public receipt.
-      if not attempted:
-        _parent(db, row, principal)
-        posting = row.mode == "review" and (row.options_json or {}).get("post_review") is True
-        reviews.save_outcome(db, row, item_key, {**previous, "state": body.state if posting else "needs_you",
-          **({"public_review": {"state": "not_dispatched", "summary": str(exc.detail)}} if posting else {}),
-          "summary": body.summary, "scope": body.scope, "tests": body.tests,
-          "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
-          "head_sha": body.head_sha, "review_chat_id": row.chat_id,
-          "review_run_id": principal.run_id, "live_blocker": str(exc.detail)})
+      await _record_failed_live_read(db, row, item_key, body, principal, exc)
       return {"run": _run_view(db, row)}
     outcome = {**previous, "state": body.state, "summary": body.summary, "scope": body.scope,
                "tests": body.tests, "tests_passed": body.tests_passed,
@@ -390,7 +422,7 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
       await merge_actions.merge_reviewed_target(db, row, target, outcome, repo, pull, principal,
         gh=_gh, cwd=cwd, authorize=lambda: _parent(db, row, principal))
       return {"run": _run_view(db, row)}
-    if (row.mode == "review" and (row.options_json or {}).get("post_review") is True
+    if (body.publish and row.mode == "review" and (row.options_json or {}).get("post_review") is True
         and outcome.get("state") in {"all_clear", "needs_you"}
         and (previous.get("public_review") or {}).get("state") not in {"posting", "posted", "unknown"}):
       outcome = await post_public_review(db, row, item_key, target, outcome, principal, cwd,

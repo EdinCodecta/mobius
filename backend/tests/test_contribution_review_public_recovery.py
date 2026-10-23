@@ -29,7 +29,7 @@ def test_not_dispatched_all_clear_retries_only_recorded_evidence(setup, monkeypa
   db, row, _ = setup
   opted_in(setup)
   monkeypatch.setattr(domain, 'read', lambda *a: {'id': 99})
-  report(setup)
+  report(setup, publish=True)
   assert row.outcomes_json[domain.key(ITEM)]['public_review']['state'] == 'not_dispatched'
   monkeypatch.setattr(domain, 'read', lambda *a: {'id': 42})
   calls = []
@@ -37,8 +37,8 @@ def test_not_dispatched_all_clear_retries_only_recorded_evidence(setup, monkeypa
   with pytest.raises(HTTPException) as exc:
     report(setup, summary='changed evidence')
   assert exc.value.status_code == 409
-  report(setup)
-  report(setup)
+  report(setup, publish=True)
+  report(setup, publish=True)
   assert len(calls) == 1
 
 
@@ -69,7 +69,7 @@ def test_observe_recovers_only_exact_review_without_reposting(setup, monkeypatch
   db, row, principal = setup
   opted_in(setup)
   monkeypatch.setattr(public, 'post_review', lambda *a: public.DispatchResult.unknown('response lost'))
-  first = report(setup, state=verdict)['run']
+  first = report(setup, publish=True, state=verdict)['run']
   assert first['state'] == 'needs_you'
   previous = row.outcomes_json[domain.key(ITEM)]
   receipt = {**previous['public_review'], 'state': initial}
@@ -140,7 +140,7 @@ def test_public_admission_rechecks_receipt_after_remote_actor_read(setup, monkey
     return {'id': 42}
   monkeypatch.setattr(domain, 'read', actor)
   monkeypatch.setattr(public, 'post_review', lambda *a: pytest.fail('another worker already armed this review'))
-  result = report(setup)['run']['items'][0]
+  result = report(setup, publish=True)['run']['items'][0]
   assert result['public_review']['marker'] == 'another-worker-marker'
 
 
@@ -174,10 +174,10 @@ def test_provider_refusal_releases_only_own_public_attempt_for_retry(setup, monk
       raise ContributionSubmitError('gh: rejected commit (HTTP 422)')
     return SimpleNamespace(stdout='{"id":77}')
   monkeypatch.setattr(routes, '_gh', gh)
-  report(setup)
+  report(setup, publish=True)
   first = row.outcomes_json[domain.key(ITEM)]['public_review']
   assert first['state'] == 'not_dispatched'
-  report(setup)
+  report(setup, publish=True)
   final = row.outcomes_json[domain.key(ITEM)]['public_review']
   assert final['state'] == 'posted' and final['id'] == 77
   assert final['marker'] != first['marker'] and len(calls) == 2
@@ -190,7 +190,7 @@ def test_moved_head_keeps_reported_verdict_but_blocks_public_post(setup, monkeyp
     raise HTTPException(409, 'The selected head moved; approve a new selection.')
   monkeypatch.setattr(domain, 'current_pull', moved)
   monkeypatch.setattr(public, 'post_review', lambda *args: pytest.fail('stale head must not post'))
-  result = report(setup)['run']
+  result = report(setup, publish=True)['run']
   item = result['items'][0]
   assert item['state'] == 'all_clear' and item['summary'] == 'Full diff reviewed'
   assert item['public_review']['state'] == 'not_dispatched'
@@ -213,7 +213,7 @@ def test_stop_during_account_lookup_refuses_even_account_changed_path(setup, mon
   monkeypatch.setattr(domain, 'read', actor)
   monkeypatch.setattr(public, 'post_review', lambda *args: pytest.fail('must not post after Stop'))
   with pytest.raises(HTTPException) as error:
-    report(setup)
+    report(setup, publish=True)
   assert error.value.status_code == 409
   db.refresh(row)
   assert domain.key(ITEM) not in row.outcomes_json
