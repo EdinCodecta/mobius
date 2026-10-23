@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import subprocess
 import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -1144,7 +1145,7 @@ async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
       result = await _dispatch_ready(row, target, cwd)
       if result.state == "not_dispatched":
         reviews.disarm_ready(db, row, target, receipt["id"])
-        raise HTTPException(409, "Readiness was refused before dispatch; no public attempt started.")
+        raise HTTPException(409, result.reason or "Readiness was refused without applying a public effect.")
       receipt["state"] = "ready" if result.state == "confirmed" else "unknown"
       db.refresh(row)
       reviews.save_ready_attempt(db, row, item_key, receipt)
@@ -1160,7 +1161,7 @@ async def _dispatch_ready(row, target, cwd):
   """One settled mutation; read-only confirmation never depends on the old base."""
   try:
     mutation = await settled.run_settled(reviews.mark_ready, _gh, cwd, target)
-  except (NotDispatched, ContributionSubmitError, HTTPException, OSError, json.JSONDecodeError) as exc:
+  except (NotDispatched, ContributionSubmitError, HTTPException, subprocess.SubprocessError, OSError, json.JSONDecodeError) as exc:
     return classify_dispatch_error(exc)
   blocked = await _confirm_ready_attempt(row, target, cwd)
   return DispatchResult.unknown(blocked) if blocked else DispatchResult.confirmed(mutation)

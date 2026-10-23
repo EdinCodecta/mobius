@@ -670,3 +670,27 @@ def test_malformed_graphql_error_shape_is_unknown_not_dispatched(setup, monkeypa
   assert first["run"]["items"][0]["ready_attempt"]["state"] == "unknown"
   retry = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
   assert retry["blocked"] and calls == [1]
+
+
+def test_readiness_timeout_keeps_unknown_receipt_without_replay(setup, monkeypatch):
+  import subprocess
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  calls = []
+  def timeout(*args):
+    calls.append(1)
+    raise subprocess.TimeoutExpired(['gh', 'api', 'graphql'], 30)
+  monkeypatch.setattr(domain, 'mark_ready', timeout)
+  first = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert first['run']['items'][0]['ready_attempt']['state'] == 'unknown'
+  retry = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert retry['blocked'] and calls == [1]
+
+
+def test_real_ready_gh_exit_one_preserves_structured_refusal(tmp_path, monkeypatch):
+  from app import github_contribution_git as transport
+  fake = tmp_path / 'gh'
+  fake.write_text('#!/bin/sh\necho \'{"errors":[{"message":"not allowed"}],"data":null}\'\nexit 1\n')
+  fake.chmod(0o755)
+  monkeypatch.setattr(transport, '_git_env', lambda cwd: {'PATH': str(tmp_path)+':/usr/bin:/bin'})
+  with pytest.raises(NotDispatched):
+    domain.mark_ready(transport._gh, tmp_path, TARGET)
