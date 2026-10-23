@@ -134,6 +134,24 @@ def test_private_all_clear_survives_moved_base(setup, monkeypatch):
   assert asyncio.run(routes.observe_review(1, row.id, db, Principal(owner=row_owner(db, row), app_id=None)))["run"]["items"][0]["state"] == "all_clear"
 
 
+def test_first_private_all_clear_does_not_depend_on_live_pr_read(setup, monkeypatch):
+  """Historical verdict on the selected head survives a move before reporting.
+
+  Removing the review-only shortcut would send this through the live-read
+  failure path, which rewrites an all-clear as needs-you.
+  """
+  db, row, _ = setup
+  row.mode = "review"
+  db.commit()
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(
+    HTTPException(409, "PR head moved before the first verdict")))
+  item = report(setup)["run"]["items"][0]
+  assert item["state"] == "all_clear"
+  assert item["summary"] == "Full diff reviewed"
+  assert item["head_sha"] == ITEM["head_sha"]
+  assert item["reviewed_base_sha"] is None
+
+
 def test_observe_preserves_private_needs_you_evidence_when_live_read_fails(setup, monkeypatch):
   db, row, _ = setup
   row.mode = "review"
