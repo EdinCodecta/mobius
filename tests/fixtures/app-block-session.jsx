@@ -9,9 +9,15 @@ export const appBlockSessions = true
 const CONFIRMATION = Array.from({ length: 12 }, (_, i) => ({
   title: i ? `fixture/repo: Change ${i + 1}` : 'fixture/repo: Change one', facts: [{ label: 'Version', value: `abc12${i}` }] }))
 
+// For the `swap:` action: one target first, then 256 that push the list end
+// far below the fold, as an app that refreshes its list after asking may.
+const ONE = [{ title: 'fixture/repo: Only change', facts: [{ label: 'Version', value: 'abc' }] }]
+const MANY = Array.from({ length: 256 }, (_, i) => ({ title: `fixture/repo: Swapped ${i + 1}`, facts: [] }))
+const listFor = (key, swapped) => !key.startsWith('swap:') ? CONFIRMATION : swapped ? MANY : ONE
+
 function Session({ blockSession }) {
   const [log, setLog] = useState([])
-  const owner = useRef({ confirming: null, sent: 0, ack: null })
+  const owner = useRef({ confirming: null, sent: 0, ack: null, swapped: false })
   useLayoutEffect(() => {
     const publish = () => {
       const state = owner.current
@@ -23,7 +29,7 @@ function Session({ blockSession }) {
         actions: blockSession.actions.map(action => ({
           key: action.key, label: action.label, status: state.sent ? 'Sent' : 'Ready',
           confirming: state.confirming === action.key,
-          ...(state.confirming === action.key ? { confirmation: CONFIRMATION } : {}),
+          ...(state.confirming === action.key ? { confirmation: listFor(action.key, state.swapped) } : {}),
         })),
       }, window.location.origin)
     }
@@ -36,7 +42,12 @@ function Session({ blockSession }) {
         const state = owner.current
         if (data.nonce === state.ack) return
         state.ack = data.nonce
-        if (data.event === 'activate') state.confirming = data.key
+        if (data.event === 'activate') {
+          state.confirming = data.key
+          state.swapped = false
+          // The swap arrives after the one-item list has had time to arm.
+          if (data.key.startsWith('swap:')) setTimeout(() => { state.swapped = true; publish() }, 1500)
+        }
         else if (data.event === 'cancel') state.confirming = null
         else if (data.event === 'confirm') { state.confirming = null; state.sent += 1 }
       }

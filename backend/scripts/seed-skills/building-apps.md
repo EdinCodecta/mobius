@@ -563,7 +563,9 @@ malformed `confirmation` keeps Confirm disabled and shows "Open the app to
 review this action. Its full current identity is unavailable here." Confirm
 replaces the action's button in place, with "Not now" beside it. It stays
 disabled until, during this showing of that exact confirmation (the action
-and its list), the end of the list has been on screen at least once, and
+and its list), the end of the list has been on screen at least once (as
+observed after this showing's own layout; a position under an earlier list
+never counts), and
 then Confirm itself has been on screen in a visible page for about 500 ms
 without interruption. The list is drawn below Confirm, so its end having been
 on screen means the whole list has passed through the viewport; a long list

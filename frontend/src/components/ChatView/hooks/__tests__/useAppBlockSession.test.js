@@ -12,13 +12,42 @@ const block = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.s
   action: { label: 'Send all', intent: 'send-batch:sel-1' },
   items: [{ title: 'Row', intent: 'open:b', action: { label: 'Send', intent: 'send:b' } }] }) })
 
+/* Like PassiveAppBlock, each observation names the showing it was made for:
+   the one committed when the test supplied it. A new showing is unseen until
+   the test observes again (`h.observe()`), as an IntersectionObserver reports
+   only after the new layout. */
+function renderObserved(initial) {
+  let committed = null
+  let lastProps = null
+  let observation = { showing: null }
+  const h = renderHook(props => {
+    if (props !== lastProps) {
+      lastProps = props
+      observation = { showing: committed, confirm: props.confirmVisible === true, end: props.listEndVisible === true }
+    }
+    const { confirmVisible: _c, listEndVisible: _l, ...rest } = props
+    // The unkeyed booleans are what 5272c66 read; they show the old head
+    // borrowing a stale observation. The keyed views are what counts now.
+    const session = useAppBlockSession({ ...rest,
+      confirmVisible: observation.confirm, listEndVisible: observation.end,
+      confirmView: { showing: observation.showing, visible: observation.confirm },
+      listEndView: { showing: observation.showing, visible: observation.end } })
+    committed = session.showing
+    return session
+  }, initial)
+  h.observe = () => h.rerender({ ...lastProps })
+  return h
+}
+
 function mounted(near = true) {
-  const h = renderHook(props => useAppBlockSession(props), { block, near, confirmVisible: true, listEndVisible: true })
-  const report = (fields, generation = h.result.current.generation) => h.result.current.onBlockState({
+  const h = renderObserved( { block, near, confirmVisible: true, listEndVisible: true })
+  const raw = (fields, generation = h.result.current.generation) => h.result.current.onBlockState({
     type: 'moebius:app-block-state', sessionId: h.result.current.sessionId,
     actions: [{ key: 'send-batch:sel-1', label: 'Send all' }, { key: 'send:b', label: 'Send' }], ...fields,
   }, { generation })
-  return { h, report, capability: (supported, generation, reset = true) => h.result.current.onBlockCapability(supported, { generation, reset }) }
+  // A report, then the observers report the new layout with the same visibility.
+  const report = (...args) => { raw(...args); h.observe() }
+  return { h, report, raw, capability: (supported, generation, reset = true) => h.result.current.onBlockCapability(supported, { generation, reset }) }
 }
 
 test('the session envelope names every block action and no state is shown before a report', () => {
@@ -286,7 +315,7 @@ test('a Confirm press spends its showing: an acknowledgement does not allow a se
 test('Confirm arms only after the list end has been on screen during this showing, and Confirm is on screen', () => {
   mock.timers.enable({ apis: ['setTimeout'] })
   try {
-    const h = renderHook(props => useAppBlockSession(props), { block, near: true, confirmVisible: true, listEndVisible: false })
+    const h = renderObserved( { block, near: true, confirmVisible: true, listEndVisible: false })
     const report = fields => h.result.current.onBlockState({ type: 'moebius:app-block-state',
       sessionId: h.result.current.sessionId, ...fields }, { generation: 1 })
     h.result.current.onBlockCapability(true, { generation: 1, reset: true })
@@ -310,7 +339,7 @@ test('Confirm arms only after the list end has been on screen during this showin
 })
 
 test('an unsupported verdict belongs to one applied revision; a newer revision negotiates again', () => {
-  const h = renderHook(props => useAppBlockSession(props), { block, near: true, revision: 'r1' })
+  const h = renderObserved( { block, near: true, revision: 'r1' })
   h.result.current.onBlockCapability(false, { generation: 1, reset: true })
   assert.equal(h.result.current.supported, false)
   assert.equal(h.result.current.frameMounted, false)
@@ -322,7 +351,7 @@ test('an unsupported verdict belongs to one applied revision; a newer revision n
 })
 
 test('a retained session keeps its unsupported negotiation across a revision change', () => {
-  const h = renderHook(props => useAppBlockSession(props), { block, near: true, revision: 'r1' })
+  const h = renderObserved( { block, near: true, revision: 'r1' })
   h.result.current.onBlockCapability(true, { generation: 1, reset: true })
   h.result.current.onBlockState({ type: 'moebius:app-block-state', sessionId: h.result.current.sessionId,
     actions: [], retain: true, checkpoint: { id: 'c1', data: 'x' } }, { generation: 1 })
@@ -332,4 +361,30 @@ test('a retained session keeps its unsupported negotiation across a revision cha
   assert.equal(h.result.current.supported, false)
   assert.equal(h.result.current.frameMounted, true, 'the unresolved owner keeps its frame')
   assert.deepEqual(h.result.current.blockSession.checkpoint, { id: 'c1', data: 'x' })
+})
+
+test('a replacement list cannot borrow the old sentinel\'s intersection (round-3 review)', () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const { h, capability, report, raw } = mounted()
+    capability(true, 1)
+    report(confirmList('Single old item'))
+    mock.timers.tick(CONFIRM_ARM_MS)
+    assert.equal(h.result.current.confirmArmed, true)
+    // 256 new items push the same sentinel far below the fold. The old
+    // "visible" still names the previous showing until the observer reports.
+    raw({ actions: [{ key: 'send-batch:sel-1', confirming: true,
+      confirmation: Array.from({ length: 256 }, (_, i) => ({ title: `Unseen new ${i}`, facts: [] })) }] })
+    mock.timers.tick(CONFIRM_ARM_MS * 2)
+    assert.equal(h.result.current.confirmArmed, false)
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), false, 'the new list end was never observed on screen')
+    // The observer reports the new position: Confirm visible, the list end not.
+    h.rerender({ block, near: true, confirmVisible: true, listEndVisible: false })
+    mock.timers.tick(CONFIRM_ARM_MS * 2)
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), false)
+    // Only once the new end is seen, and then Confirm, does it arm.
+    h.rerender({ block, near: true, confirmVisible: true, listEndVisible: true })
+    mock.timers.tick(CONFIRM_ARM_MS)
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), true)
+  } finally { mock.timers.reset() }
 })

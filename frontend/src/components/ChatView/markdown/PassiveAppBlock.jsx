@@ -9,25 +9,29 @@ import { AppBlockLayout, AppCanvas, StaticAppBlock } from './AppBlockParts.jsx'
 import { usePassiveSlot } from './passiveSlots.js'
 import { useNearViewport } from './blockViewport.js'
 
-/** Whether an element is actually on screen in a visible document: no
- *  prefetch margin. Only this time counts toward arming Confirm. */
-export function useOnScreen() {
+/** Whether an element is actually on screen in a visible document (no
+ *  prefetch margin), as `{ showing, visible }`. The observation belongs to the
+ *  showing it was made for: on a new showing it starts unseen and a fresh
+ *  observer reports the element's position after that showing's layout, so a
+ *  previous showing's intersection is never borrowed. */
+export function useOnScreen(showing) {
   const [node, setNode] = useState(null)
-  const [intersecting, setIntersecting] = useState(false)
+  const [seen, setSeen] = useState({ showing: null, intersecting: false })
   const [documentVisible, setDocumentVisible] = useState(() =>
     typeof document === 'undefined' || document.visibilityState === 'visible')
   useEffect(() => {
-    if (!node || typeof IntersectionObserver === 'undefined') { setIntersecting(false); return undefined }
-    const observer = new IntersectionObserver(entries => setIntersecting(entries.at(-1).isIntersecting))
+    setSeen({ showing, intersecting: false })
+    if (!node || !showing || typeof IntersectionObserver === 'undefined') return undefined
+    const observer = new IntersectionObserver(entries => setSeen({ showing, intersecting: entries.at(-1).isIntersecting }))
     observer.observe(node)
-    return () => { observer.disconnect(); setIntersecting(false) }
-  }, [node])
+    return () => observer.disconnect()
+  }, [node, showing])
   useEffect(() => {
     const update = () => setDocumentVisible(document.visibilityState === 'visible')
     document.addEventListener('visibilitychange', update)
     return () => document.removeEventListener('visibilitychange', update)
   }, [])
-  return [setNode, intersecting && documentVisible]
+  return [setNode, { showing: seen.showing, visible: seen.intersecting && documentVisible }]
 }
 
 /** Static unless an admitted, supporting session has a frame slot. A view
@@ -121,14 +125,17 @@ function SessionHost({ app, session }) {
 
 export default function PassiveAppBlock({ block, app, onInternalNav }) {
   const [sectionRef, { near, distance }] = useNearViewport()
-  const [confirmRef, confirmOnScreen] = useOnScreen()
-  const [listEndRef, listEndOnScreen] = useOnScreen()
+  // Observers follow the committed showing (set after it renders).
+  const [showing, setShowing] = useState(null)
+  const [confirmRef, confirmView] = useOnScreen(showing)
+  const [listEndRef, listEndView] = useOnScreen(showing)
   const [retained, setRetained] = useState(false)
   const [staticOpen, setStaticOpen] = useState(false)
   const granted = usePassiveSlot(app.id, { wanted: near && !staticOpen, retained, distance })
   const session = useAppBlockSession({ block, near: near && granted && !staticOpen,
     revision: `${app.passive_block_module_digest}:${appFrameVersion(app)}`,
-    confirmVisible: confirmOnScreen, listEndVisible: listEndOnScreen })
+    confirmView, listEndView })
+  useEffect(() => setShowing(session.showing), [session.showing])
   useEffect(() => setRetained(session.retained), [session.retained])
   if (passiveBlockMode({ supported: session.supported, near, granted, retained: session.retained, staticOpen }) === 'static') {
     return <StaticAppBlock block={block} app={app} appsLoading={false} onInternalNav={onInternalNav}

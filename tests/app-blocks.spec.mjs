@@ -183,6 +183,33 @@ test('with the action at the bottom edge, Confirm arms only after the list end h
   await expect(block.locator('.md-app-block__summary')).toHaveText('Sent 1')
 })
 
+test('a list replaced after Confirm armed must have its own end seen (no borrowed intersection)', async ({ page, request }) => {
+  await page.setViewportSize({ width: 390, height: 700 })
+  await installFixtures(page, request)
+  const chat = await openTranscript(page, { assistant: fence({ app: 'e2e-block-session', intent: 'open:swap',
+    title: 'Swapping list', interaction: 'inline', action: { label: 'Send all', intent: 'swap:sel-1' } }) })
+  const block = chat.locator('.md-app-block')
+  const action = block.locator('footer .md-app-block__action')
+  await expect(action).toHaveText('Send all')
+  await action.click()
+  const confirm = block.locator('footer .md-app-block__action')
+  // One target: its end is on screen, so Confirm arms.
+  await expect(confirm).toBeEnabled()
+  // The app replaces it with 256 targets while the old end was visible.
+  await expect(block.locator('.md-app-block__confirmation li')).toHaveCount(256)
+  expect(await block.locator('.md-app-block__list-end').evaluate(node => node.getBoundingClientRect().top > window.innerHeight)).toBe(true)
+  await page.waitForTimeout(900)
+  await expect(confirm).toBeDisabled()
+  const frame = await sessionFrame(page)
+  await confirm.evaluate(button => button.click())
+  await page.waitForTimeout(200)
+  expect((await frame.locator('#block-log').textContent()).split('\n').filter(line => line.endsWith(' confirm'))).toHaveLength(0)
+  // Scrolling to the new end and back arms it.
+  await block.locator('.md-app-block__list-end').scrollIntoViewIfNeeded()
+  await confirm.evaluate(button => button.scrollIntoView({ block: 'end' }))
+  await expect(confirm).toBeEnabled()
+})
+
 test('a document reload discards idle controls until the new document reports', async ({ page, request }) => {
   await installFixtures(page, request)
   const chat = await openTranscript(page, { assistant: fence({ app: 'e2e-block-session', intent: 'open:one',

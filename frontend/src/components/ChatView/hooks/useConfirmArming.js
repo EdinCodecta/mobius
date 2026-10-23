@@ -10,6 +10,9 @@
      screen at least once during this showing, and
    - Confirm itself is on screen in a visible page,
    and the second condition has then held continuously for CONFIRM_ARM_MS.
+   Both observations arrive as `{ showing, visible }` and count only for the
+   showing they name: an element's position under an earlier list (the same
+   sentinel before 256 items pushed it down) can never arm a new showing.
    The list is drawn below Confirm, so its end having been on screen means
    the whole list has passed through the viewport; a long list just needs
    scrolling. A double-click, a swapped list or an unseen list never arms. */
@@ -22,7 +25,9 @@ export function confirmationIdentity(state) {
   return action ? JSON.stringify([action.key, action.confirmation]) : null
 }
 
-export default function useConfirmArming({ state, generation, supported, confirmVisible, listEndVisible }) {
+const seenFor = (view, showing) => Boolean(showing) && view?.showing === showing && view.visible === true
+
+export default function useConfirmArming({ state, generation, supported, confirmView, listEndView }) {
   const identity = confirmationIdentity(state)
   const [disarms, setDisarms] = useState(0)
   // Unique per showing: a disarm or new generation changes it even when the
@@ -37,7 +42,8 @@ export default function useConfirmArming({ state, generation, supported, confirm
   }, [showing, action, identity, state?.recoveryPending])
 
   const [endSeen, setEndSeen] = useState(null)
-  const ready = Boolean(showing) && endSeen === showing && confirmVisible
+  const listEndVisible = seenFor(listEndView, showing)
+  const ready = Boolean(showing) && endSeen === showing && seenFor(confirmView, showing)
 
   const [armed, setArmed] = useState(null)
   const armedRef = useRef(null)
@@ -75,5 +81,5 @@ export default function useConfirmArming({ state, generation, supported, confirm
     return Boolean(current.showing) && armedRef.current === current.showing && current.action === key
   }, [])
 
-  return { armed: ready && armed === showing, disarm, noteReport, mayConfirm }
+  return { armed: ready && armed === showing, showing, disarm, noteReport, mayConfirm }
 }

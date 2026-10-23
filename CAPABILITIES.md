@@ -837,7 +837,7 @@ while another view is on screen. At most 3 idle session frames run per app
 (nearest the viewport centre, measured as the page scrolls; a reader-opened
 static view is never torn down for a slot). Confirm arms only after the end of
 its exact list (a sentinel after the last item, drawn below Confirm) has been
-on screen during the current showing and Confirm itself has then been on
+observed on screen after the current showing's layout and Confirm itself has then been on
 screen in a visible page for about 500 ms; every new showing starts over. The
 wire protocol and the confirmation contract are in
 `building-apps.md` "Passive block sessions".
