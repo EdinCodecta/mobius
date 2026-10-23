@@ -32,6 +32,13 @@ def ready_takeover(setup, monkeypatch):
   return db, row, principal
 
 
+def successor_grant(db, row):
+  grant = overlapping_grant(db, row)
+  grant.targets_json = [{**grant.targets_json[0], "head_sha": NEW}]
+  db.commit()
+  return grant, grant.targets_json[0]
+
+
 def test_draft_readiness_requires_new_frozen_scope_and_preserves_legacy_grant(setup, monkeypatch):
   db, row, principal = takeover(setup, monkeypatch)
   monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("legacy grant widened"))
@@ -265,9 +272,8 @@ def test_confirmed_mutation_response_is_final_despite_later_drift(setup, monkeyp
 @pytest.mark.parametrize("changed", ["actor", "rights"])
 def test_lost_ready_response_confirms_same_head_without_current_authority(setup, monkeypatch, changed):
   db, row, principal = ready_takeover(setup, monkeypatch)
-  previous = row.outcomes_json[domain.key(ITEM)]
-  domain.save_outcome(db, row, domain.key(ITEM), {**previous,
-    "ready_attempt": {"id": "old-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE}})
+  domain.save_ready_attempt(db, row, domain.key(ITEM),
+    {"id": "old-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE})
   repo = {**REPO, "permissions": {"push": False}} if changed == "rights" else REPO
   monkeypatch.setattr(domain, "current_pull", lambda *a: (repo, {**PULL, "draft": False}))
   if changed == "actor":
@@ -277,11 +283,10 @@ def test_lost_ready_response_confirms_same_head_without_current_authority(setup,
   assert observed["items"][0]["ready_attempt"]["state"] == "ready"
 
 
-def test_moved_head_without_attributable_ready_event_stays_unknown(setup, monkeypatch):
+def test_moved_head_retires_finished_unknown_without_attributing_ready_event(setup, monkeypatch):
   db, row, principal = ready_takeover(setup, monkeypatch)
-  previous = row.outcomes_json[domain.key(ITEM)]
-  domain.save_outcome(db, row, domain.key(ITEM), {**previous,
-    "ready_attempt": {"id": "old-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE}})
+  domain.save_ready_attempt(db, row, domain.key(ITEM),
+    {"id": "old-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE})
   monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "head moved")))
   def read(_gh, _cwd, path):
     if path == f"repos/{ITEM['repo']}":
@@ -291,9 +296,66 @@ def test_moved_head_without_attributable_ready_event_stays_unknown(setup, monkey
     pytest.fail("No actor read is needed")
   monkeypatch.setattr(domain, "read", read)
   observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]
-  assert observed["items"][0]["ready_attempt"]["state"] == "unknown"
+  assert observed["items"][0]["ready_attempt"]["state"] == "unattributable"
+  assert observed["items"][0]["state"] == "ready_unattributable"
+  assert [a["state"] for a in observed["items"][0]["ready_audit"]] == ["unknown", "unattributable"]
+  successor, new_head = successor_grant(db, row)
+  domain.require_public_transition_clear(db, successor, new_head)
+  with pytest.raises(HTTPException):
+    domain.arm_ready(db, row, row.targets_json[0], {"id": "again", "state": "attempting",
+      "head_sha": SHA, "base_sha": BASE}, principal)
+  with pytest.raises(HTTPException):
+    routes._require_ready_attempt_resolved(row.outcomes_json[domain.key(ITEM)], row.targets_json[0])
+  routes._require_ready_attempt_resolved(row.outcomes_json[domain.key(ITEM)], new_head)
+  domain.arm_ready(db, successor, new_head, {"id": "new-ready", "state": "attempting",
+    "head_sha": NEW, "base_sha": BASE}, principal)
+  assert successor.outcomes_json[domain.key(ITEM)]["ready_attempt"]["head_sha"] == NEW
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("old head must never replay"))
+  retry = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert retry["blocked"] and retry["run"]["items"][0]["ready_attempt"]["state"] == "unattributable"
   reason = asyncio.run(routes._confirm_ready_attempt(row.targets_json[0], "/tmp"))
   assert "ready event" in reason
+
+
+@pytest.mark.parametrize("state", ["attempting", "unknown"])
+@pytest.mark.parametrize("invalid", ["missing_repo", "wrong_pr", "missing_head", "malformed_head"])
+def test_moved_head_requires_safe_exact_identity_before_retirement(setup, monkeypatch, state, invalid):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  previous = row.outcomes_json[domain.key(ITEM)]
+  domain.save_ready_attempt(db, row, domain.key(ITEM), {"id": "old-ready", "state": state,
+    "head_sha": SHA, "base_sha": BASE})
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "head moved")))
+  def read(_gh, _cwd, path):
+    if path == f"repos/{ITEM['repo']}":
+      return {} if invalid == "missing_repo" else REPO
+    if path == f"repos/{ITEM['repo']}/pulls/{ITEM['number']}":
+      return {**PULL, "node_id": "other" if invalid == "wrong_pr" else PULL["node_id"],
+        "head": {} if invalid == "missing_head" else {"sha": "bad" if invalid == "malformed_head" else NEW}}
+    pytest.fail("unexpected read")
+  monkeypatch.setattr(domain, "read", read)
+  observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]["items"][0]
+  assert observed["ready_attempt"]["state"] == ("unknown" if state == "attempting" else state)
+  successor, new_head = successor_grant(db, row)
+  with pytest.raises(HTTPException):
+    domain.require_public_transition_clear(db, successor, new_head)
+
+
+def test_moved_head_attempting_must_first_surface_unknown_then_retire(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  domain.save_ready_attempt(db, row, domain.key(ITEM), {"id": "old-ready", "state": "attempting",
+    "head_sha": SHA, "base_sha": BASE})
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "head moved")))
+  monkeypatch.setattr(domain, "read", lambda _gh, _cwd, path: REPO if path.endswith("project") else
+    {**PULL, "head": {"sha": NEW}})
+  first = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]["items"][0]
+  assert first["ready_attempt"]["state"] == "unknown"
+  successor, new_head = successor_grant(db, row)
+  with pytest.raises(HTTPException):
+    domain.require_public_transition_clear(db, successor, new_head)
+  second = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]["items"][0]
+  assert second["ready_attempt"]["state"] == "unattributable"
+  assert [a["state"] for a in second["ready_audit"]] == ["attempting", "unknown", "unattributable"]
+  domain.require_public_transition_clear(db, successor, new_head)
 
 
 

@@ -258,7 +258,7 @@ def require_public_transition_clear(db, row, target):
       repair_pending = any(a.get("state") in {"pushing", "push_unknown"}
         for a in item.get("repair_attempts", []))
       ready = item.get("ready_attempt")
-      unresolved = merge_pending or repair_pending or (ready and ready.get("state") != "ready")
+      unresolved = merge_pending or repair_pending or (ready and ready.get("state") not in {"ready", "unattributable"})
       merged_head = item.get("state") == "merged" and item.get("head_sha") == target["head_sha"]
       if not (unresolved or merged_head):
         continue
@@ -381,12 +381,14 @@ def view(row):
     # private-review evidence. Unknown must be visible and block new actions.
     if attempt.get("state") == "unknown":
       return {**outcome, "state": "ready_unknown"}
+    if attempt.get("state") == "unattributable":
+      return {**outcome, "state": "ready_unattributable"}
     if attempt.get("state") == "attempting":
       return {**outcome, "state": "marking_ready"}
     return outcome
   projected_items = [projected(t) for t in row.targets_json]
   states = [item["state"] for item in projected_items]
-  state = ("needs_you" if any(s in {"needs_you", "merge_unknown", "ready_unknown"} for s in states)
+  state = ("needs_you" if any(s in {"needs_you", "merge_unknown", "ready_unknown", "ready_unattributable"} for s in states)
            else "complete" if all(s in {"all_clear", "merged"} for s in states)
            else "queued" if all(s in {"queued", "merged", "all_clear"} for s in states)
            else "marking_ready" if any(s == "marking_ready" for s in states)
