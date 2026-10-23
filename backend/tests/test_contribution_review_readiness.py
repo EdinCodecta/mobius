@@ -790,3 +790,19 @@ def test_lost_ready_response_confirms_same_head_after_base_ref_moves(setup, monk
   monkeypatch.setattr(domain, "read", read)
   observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]
   assert observed["items"][0]["ready_attempt"]["state"] == "ready"
+
+
+def test_confirmed_ready_receipt_merges_concurrent_stop_revision(setup, monkeypatch):
+  from app.database import SessionLocal
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  receipt = {"id": "ready-race", "state": "attempting", "head_sha": SHA, "base_sha": BASE}
+  domain.save_ready_attempt(db, row, domain.key(ITEM), receipt)
+  revision = row.revision
+  with SessionLocal() as writer:
+    current = writer.get(models.ContributionReviewRun, row.id)
+    domain.save_outcome(writer, current, routes.REVIEW_STOP_KEY, {"state": "requested", "actor": "owner"})
+  assert row.revision == revision  # The dispatcher has not reloaded Stop yet.
+  domain.save_ready_attempt(db, row, domain.key(ITEM), {**receipt, "state": "ready"})
+  db.refresh(row)
+  assert row.outcomes_json[routes.REVIEW_STOP_KEY]["state"] == "requested"
+  assert row.outcomes_json[domain.key(ITEM)]["ready_attempt"]["state"] == "ready"
