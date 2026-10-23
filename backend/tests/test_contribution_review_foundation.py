@@ -9,7 +9,7 @@ from app import contribution_review_runs as domain, models
 from app import schema_migrations
 from app.deps import Principal
 from app.routes import contribution_reviews as routes
-from tests.test_contribution_review_runs import ITEM, CHECKS, REPO, PULL, TARGET, setup, report
+from tests.test_contribution_review_runs import ITEM, CHECKS, REPO, PULL, TARGET, setup, report, snapshot_owning_chat
 from scripts import github_review as cli
 from scripts.github_review_selection import review_path, start_body, verify_selection
 from app.contribution_review_effects import NotDispatched, classify_dispatch_error, graphql_mutation_result
@@ -33,8 +33,8 @@ def test_cli_app_adapter_identity_and_body_use_canonical_helpers(monkeypatch):
   assert tuple(signature(cli.prepare_selection).parameters) == ("references", "mode", "chat_id", "app_id")
   assert tuple(signature(cli.freeze_preview).parameters) == ("selection", "options", "agent")
   monkeypatch.setattr(cli, "inspect_pr", lambda ref: {**ITEM, "title": "Safe change", "url": "https://github.com/example/project/pull/7"})
-  snapshot = {"review_prompt": "Review", "fix_prompt": "Fix", "merge_prompt": "Merge",
-    "max_rounds": None, "autopilot": False, "provider": "codex", "model": "test-model",
+  snapshot = {"review_prompt": "Review", "merge_prompt": "Merge",
+    "provider": "codex", "model": "test-model",
     "reasoning_effort": "high"}
   monkeypatch.setattr(cli, "api", lambda path, **kw: {"options": snapshot, "preview_sha256": routes._fingerprint(snapshot)})
   core = cli.prepare_selection(["example/project#7"], "review", "chat-1")
@@ -52,6 +52,7 @@ def test_cli_app_adapter_identity_and_body_use_canonical_helpers(monkeypatch):
 
 def test_core_admission_is_null_app_and_app_context_is_read_only(setup, monkeypatch):
   db, existing, principal = setup
+  snapshot_owning_chat(db, principal)
   principal.scope = "owner"
   monkeypatch.setattr(domain, "inspect_target", lambda *a: existing.targets_json[0])
   body = routes.StartReviews(request_id="core-request-123", mode="review",
@@ -88,6 +89,39 @@ def test_core_admission_is_null_app_and_app_context_is_read_only(setup, monkeypa
   with pytest.raises(HTTPException) as denied:
     routes._row(db, 1, row.id, principal)
   assert denied.value.status_code == 404
+
+
+def test_owning_chat_without_actual_model_refuses_preview_before_grant(setup):
+  db, _row, principal = setup
+  body = routes.ReviewPreview()
+  with pytest.raises(HTTPException, match="no snapshotted model") as refused:
+    routes.review_preview(1, body, db, principal)
+  assert refused.value.status_code == 409
+
+
+@pytest.mark.parametrize("options", [
+  {"fix_prompt": "Please fix"}, {"max_rounds": 3}, {"autopilot": True},
+])
+def test_unenforced_options_refused_before_snapshot(setup, options):
+  db, _row, principal = setup
+  snapshot_owning_chat(db, principal)
+  with pytest.raises(HTTPException, match="not supported") as refused:
+    routes.review_preview(1, routes.ReviewPreview(options=options), db, principal)
+  assert refused.value.status_code == 422
+
+
+def test_live_read_failure_after_stop_does_not_admit_new_evidence(setup, monkeypatch):
+  db, row, principal = setup
+  def stopped_read(*_args):
+    domain.save_outcome(db, row, routes.REVIEW_STOP_KEY, {"state": "requested", "actor": "owner"})
+    raise HTTPException(409, "PR moved")
+  monkeypatch.setattr(domain, "current_pull", stopped_read)
+  body = routes.ReviewOutcome(**ITEM, state="needs_you", summary="new private finding",
+                              scope=sorted(routes.SCOPE), tests="focused tests")
+  with pytest.raises(HTTPException, match="stopped"):
+    asyncio.run(routes.report_outcome(1, row.id, body, db, principal))
+  db.refresh(row)
+  assert domain.key(ITEM) not in row.outcomes_json
 
 
 def test_private_all_clear_survives_moved_base(setup, monkeypatch):
@@ -285,12 +319,12 @@ def test_definite_github_merge_rejection_is_not_unknown(setup, monkeypatch):
   assert item["state"] == "needs_you" and item["merge_attempted"] is False
 
 
-def test_real_gh_graphql_no_data_rejection_is_definite(tmp_path, monkeypatch):
+def test_real_gh_graphql_nullable_mutation_refusal_is_definite(tmp_path, monkeypatch):
   from app import github_contribution_git as transport
   fake_bin = tmp_path / "bin"
   fake_bin.mkdir()
   fake = fake_bin / "gh"
-  fake.write_text("#!/bin/sh\necho '{\"errors\":[{\"type\":\"UNPROCESSABLE\",\"message\":\"not queueable\"}],\"data\":null}'\nexit 1\n")
+  fake.write_text("#!/bin/sh\necho '{\"errors\":[{\"type\":\"UNPROCESSABLE\",\"path\":[\"enqueuePullRequest\"],\"message\":\"not queueable\"}],\"data\":{\"enqueuePullRequest\":null}}'\nexit 1\n")
   fake.chmod(0o755)
   monkeypatch.setattr(transport, "_git_env", lambda _cwd: {"PATH": str(fake_bin) + ":/usr/bin:/bin"})
   with pytest.raises(NotDispatched):
@@ -317,6 +351,46 @@ def test_valid_graphql_no_data_error_certifies_refusal():
   response = SimpleNamespace(stdout='{"errors":[{"type":"UNPROCESSABLE","message":"rejected"}],"data":null}', stderr="", returncode=1)
   with pytest.raises(NotDispatched):
     graphql_mutation_result(response)
+
+
+@pytest.mark.parametrize("data,paths,expected", [
+  ({"enqueuePullRequest": None}, [["enqueuePullRequest"]], "not_dispatched"),
+  ({"enqueuePullRequest": None}, [["otherField"]], "unknown"),
+  ({"enqueuePullRequest": None}, [None], "unknown"),
+  ({"enqueuePullRequest": {"mergeQueueEntry": {"id": "q"}}}, [["enqueuePullRequest"]], "unknown"),
+  ({"enqueuePullRequest": None, "otherField": {"ok": True}}, [["enqueuePullRequest"]], "unknown"),
+  ({"enqueuePullRequest": None, "otherField": None}, [["enqueuePullRequest"], None], "unknown"),
+])
+def test_nullable_mutation_field_requires_matching_typed_root_error(data, paths, expected):
+  from types import SimpleNamespace
+  import json
+  errors = [{"type": "UNPROCESSABLE", "message": "rejected", **({"path": path} if path else {})}
+            for path in paths]
+  response = SimpleNamespace(stdout=json.dumps({"data": data, "errors": errors}), stderr="", returncode=1)
+  try:
+    graphql_mutation_result(response)
+  except Exception as exc:
+    assert classify_dispatch_error(exc).state == expected
+  else:
+    pytest.fail("An error response must not be treated as success")
+
+
+@pytest.mark.parametrize("kind,stderr,expected", [
+  ("UNPROCESSABLE", "gh: HTTP 422: refused", "not_dispatched"),
+  ("NOT_FOUND", "", "not_dispatched"),
+  ("FORBIDDEN", "gh: HTTP 503: unavailable", "unknown"),
+  ("TIMEOUT", "gh: HTTP 422: timed out", "unknown"),
+  ("UNPROCESSABLE", "gh: HTTP 429: retry later", "unknown"),
+])
+def test_nullable_mutation_field_requires_refusal_type_and_safe_status(kind, stderr, expected):
+  from types import SimpleNamespace
+  import json
+  payload = {"data": {"enqueuePullRequest": None},
+             "errors": [{"type": kind, "path": ["enqueuePullRequest"], "message": "not applied"}]}
+  response = SimpleNamespace(stdout=json.dumps(payload), stderr=stderr, returncode=1)
+  with pytest.raises((NotDispatched, ContributionSubmitError)) as exc:
+    graphql_mutation_result(response)
+  assert classify_dispatch_error(exc.value).state == expected
 
 
 @pytest.mark.parametrize("types,stderr,expected", [
