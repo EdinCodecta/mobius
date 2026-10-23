@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -44,8 +45,9 @@ _RESTART_ADMITTED = False
 class RestartSourceInvalid(RuntimeError):
   """The editable platform would not survive the next startup probe.
 
-  ``detail`` carries a structured reason when one exists: ``{"code":
-  "image_packages_behind_source", "gap": PackageGap}``.
+  ``detail`` carries a structured reason when one exists: ``{"reason":
+  "image_packages_behind_source", "gap": PackageGap}``. The restart routes
+  add it beside their stable ``platform_source_invalid`` code.
   """
 
   def __init__(self, message: str, detail: dict | None = None) -> None:
@@ -166,14 +168,23 @@ def validate_restart_source(platform_root: Path | None = None) -> None:
   )
 
 
+_PACKAGE_CHECK_PROTOCOL = re.compile(r"^PACKAGE_CHECK_PROTOCOL = (\d+)$", re.MULTILINE)
+# The image's own check answers in about a second; a status poll must not
+# wait on a stuck one for the startup check's full minute.
+PACKAGE_CHECK_TIMEOUT_SECONDS = 20
+
+
 def image_boot_checks_packages() -> bool:
-  """Whether this image's boot has ``check-packages`` and its relaxed rule:
-  only a missing official-newer distribution refuses a boot."""
+  """Whether this image's boot has ``check-packages`` and its relaxed rule
+  (only a missing official-newer distribution refuses a boot), by the
+  explicit ``platform_boot.PACKAGE_CHECK_PROTOCOL`` marker in its baked
+  source: importing it would run the served interpreter's view instead."""
   try:
     source = (BAKED_BACKEND / "app" / "platform_boot.py").read_text(encoding="utf-8")
   except (OSError, UnicodeDecodeError):
     return False
-  return '"check-packages"' in source
+  marker = _PACKAGE_CHECK_PROTOCOL.search(source)
+  return bool(marker) and int(marker.group(1)) >= 1
 
 
 def _baked_package_verdict(platform_root: Path) -> tuple[bool, dict | None] | None:
@@ -197,7 +208,7 @@ def _baked_package_verdict(platform_root: Path) -> tuple[bool, dict | None] | No
       [sys.executable or "python3", "-m", "app.platform_boot", "check-packages",
        str(platform_root)],
       cwd=BAKED_BACKEND, env=env, capture_output=True, text=True,
-      timeout=STARTUP_CHECK_TIMEOUT_SECONDS, check=False,
+      timeout=PACKAGE_CHECK_TIMEOUT_SECONDS, check=False,
     )
   except (OSError, subprocess.SubprocessError):
     return None
@@ -244,7 +255,7 @@ def _refuse_what_the_image_boot_refuses(platform_root: Path) -> None:
   )
   raise RestartSourceInvalid(
     f"Restart stopped: {reason}",
-    {"code": "image_packages_behind_source", "gap": gap},
+    {"reason": "image_packages_behind_source", "gap": gap},
   )
 
 

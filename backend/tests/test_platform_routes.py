@@ -471,17 +471,23 @@ def test_restart_refusal_names_the_package_gap(client, auth, monkeypatch):
   def refuse():
     raise RestartSourceInvalid(
       "Restart stopped: pkg is missing",
-      {"code": "image_packages_behind_source", "gap": gap},
+      {"reason": "image_packages_behind_source", "gap": gap},
     )
 
+  expected = {
+    "code": "platform_source_invalid", "reason": "image_packages_behind_source",
+    "gap": gap, "message": "Restart stopped: pkg is missing",
+  }
   monkeypatch.setattr("app.routes.platform.validate_restart_source", refuse)
   response = client.post("/api/platform/restart", headers=auth)
-
   assert response.status_code == 409
-  assert response.json()["detail"] == {
-    "code": "image_packages_behind_source", "gap": gap,
-    "message": "Restart stopped: pkg is missing",
-  }
+  assert response.json()["detail"] == expected
+
+  # The admin restart keeps the same stable code beside the reason.
+  monkeypatch.setattr("app.routes.admin.validate_restart_source", refuse)
+  response = client.post("/api/admin/restart", headers=auth)
+  assert response.status_code == 409
+  assert response.json()["detail"] == expected
 
 
 def test_conflict_resolver_chat_resume_restarts_the_stalled_resolver(client, auth, monkeypatch):

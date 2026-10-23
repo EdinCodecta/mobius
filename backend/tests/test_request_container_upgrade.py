@@ -285,6 +285,57 @@ def test_a_declaration_the_check_cannot_judge_is_refused_not_passed(install, cap
   assert "which this check cannot verify" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(("declared", "joined"), [
+  ("pkg>=3\npkg<4\n", ">=3,<4"),  # the later line alone admits the target's 2
+  ("pkg<4\nPkg>=3\n", "<4,>=3"),
+  ("pkg<4\npKg >= 3 ; python_version >= '3'\n", "<4,>=3"),
+])
+def test_every_declaration_of_a_package_must_hold(install, capsys, declared, joined):
+  """Repeated declarations, however the name is spelled, all constrain it."""
+  _commit(install["platform"], "local-repeat", requirements=declared)
+
+  assert upgrade.main(["--check"]) == 1
+  assert f"pkg: source declares {joined}, target image installs 2" in capsys.readouterr().err
+
+
+def test_repeated_and_differently_spelled_names_join_into_one_spec():
+  from app import platform_update
+
+  data = b"Some_Pkg>=3\nsome-pkg<4\nsome.pkg\nother==1\n"
+  expected = {"some-pkg": ">=3,<4", "other": "==1"}
+  assert upgrade.parse_requirements(data) == expected
+  assert platform_update.declared_python_packages(data) == expected
+  assert platform_update.unmet_declaration(">=3,<4", "2.0") == "version"
+  assert platform_update.unmet_declaration(">=3,<4", "3.5") is None
+
+
+@pytest.mark.parametrize("line", [
+  "-e ./local-package", "--editable=./local-package", "-r local-requirements.txt",
+  "-c constraints.txt", "./local-package", "/abs/local-package", "local-package/",
+  "https://example.invalid/pkg.tar.gz", "git+https://example.invalid/pkg",
+  "pkg-1.0-py3-none-any.whl",
+])
+def test_a_dependency_line_naming_no_package_is_unsupported_not_ignored(
+  install, capsys, line,
+):
+  """Only comments and pure options are skipped: a dependency the check
+  cannot name could disappear with the replaced container."""
+  from app import platform_update
+
+  data = f"{line}\n--index-url https://example.invalid\n--hash=sha256:aa\n# note\n".encode()
+  assert upgrade.parse_requirements(data) == {line: None}
+  assert platform_update.declared_python_packages(data) == {line: None}
+  assert upgrade.unmet_declaration(None, None) == "unsupported"
+  assert platform_update.unmet_declaration(None, "1.0") == "unsupported"
+
+  _commit(install["platform"], "local-reference", requirements=f"{line}\n")
+  assert upgrade.main(["--check"]) == 1
+  err = capsys.readouterr().err
+  assert f"{line}: a declaration this check cannot verify" in err
+  assert "--allow-package-loss" in err
+  assert upgrade.main(["--check", "--allow-package-loss"]) == 0
+
+
 _REQUIREMENT_CORPUS = (
   b"fastapi[standard]>=0.110 ; python_version >= '3.11'  # web\n"
   b"Some_Pkg.Name==1.2.3 \\\n    --hash=sha256:aa \\\n    --hash=sha256:bb\n"
@@ -305,6 +356,7 @@ def test_the_script_and_backend_requirement_judgments_agree():
     (repo / "backend/requirements.lock").read_bytes(),
   ):
     assert upgrade.parse_requirements(data) == platform_update.declared_python_packages(data)
+  assert upgrade.parse_requirements(_REQUIREMENT_CORPUS)["-r other.txt"] is None
   for spec in upgrade.parse_requirements(_REQUIREMENT_CORPUS).values():
     for installed in (None, "1.0", "2.3", "3.0", "not a version"):
       assert upgrade.unmet_declaration(spec, installed) == (

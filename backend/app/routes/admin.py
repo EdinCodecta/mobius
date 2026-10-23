@@ -245,7 +245,7 @@ def restart_server(
   except RestartSourceInvalid as exc:
     raise HTTPException(
       status_code=409,
-      detail={"code": "platform_source_invalid", **exc.detail, "message": str(exc)},
+      detail={**exc.detail, "code": "platform_source_invalid", "message": str(exc)},
     ) from exc
   return JSONResponse(
     {"status": "restarting"},

@@ -43,6 +43,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# The served worker reads this line from the image's baked copy of this file
+# (``restart_util.image_boot_checks_packages``) to learn that this image has
+# ``check-packages`` and serves a version-only package gap. Keep its spelling;
+# raise it when that command's contract changes.
+PACKAGE_CHECK_PROTOCOL = 1
+
 BOOT_LOG = Path("/data/logs/platform-boot.jsonl")
 _BOOT_LOG_RECORDS = 200
 _STDERR_CHARS = 2000

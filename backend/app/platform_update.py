@@ -367,7 +367,9 @@ class PlatformStatus(TypedDict):
   unfinished_update: UnfinishedUpdate | None
   # Python packages the served source declares that this image lacks. When
   # ``blocking`` restarts are refused (``restart_util.validate_restart_source``);
-  # otherwise it is a warning that a container replacement closes.
+  # otherwise Settings shows it as a warning naming each package and its fix
+  # (``platformPackageWarning``): a container update for an official-newer
+  # gap, reverting the local declaration for a local one.
   restart_blocker: NotRequired[PackageGap | None]
 
 
@@ -3721,10 +3723,12 @@ class PackageShortfall(TypedDict):
   """One declared distribution this image does not install as declared.
 
   ``origin`` is the declaring input's (``PackageGap``); a gap may mix both.
+  ``declared`` is None for a line naming no distribution (``-e``, a path or
+  URL), whose ``name`` is then the line itself.
   """
 
   name: str
-  declared: str
+  declared: str | None
   installed: str | None
   kind: Literal["missing", "version", "unsupported"]
   origin: Literal["official_newer", "local"]
@@ -3738,7 +3742,8 @@ class PackageGap(TypedDict):
   refuse a boot: a distribution an official-newer input declares and this
   image lacks entirely, or declares in a form this check cannot verify
   (``unmet_declaration``). A version-only gap, or one only a local input
-  declares, is a warning; the import-level startup check stays the hard
+  declares, is a warning (status ``restart_blocker``, which Settings shows
+  as one naming each package); the import-level startup check stays the hard
   gate, and ``fix`` names what closes the gap (with the local ``commit`` to
   revert when a local input also falls short).
   """
@@ -3752,38 +3757,59 @@ class PackageGap(TypedDict):
 
 
 _REQUIREMENT_NAME = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?")
+# Requirement-file options that bring in or constrain distributions; every
+# other option (index, hash, binary policy) only changes how pip fetches.
+_DEPENDENCY_OPTION = re.compile(r"-[erc]|--(?:editable|requirement|constraint)\b")
+_ARCHIVE_SUFFIXES = (".whl", ".zip", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")
 
 
-def declared_python_packages(data: bytes) -> dict[str, str]:
+def declared_python_packages(data: bytes) -> dict[str, str | None]:
   """Package name (normalized) to version spec, for requirements or a lock.
+
+  Every declaration of a name counts: repeated ones join into one spec
+  (``pkg>=3`` and ``Pkg<4`` give ``>=3,<4``), so a later line cannot drop an
+  earlier constraint. A line that declares a dependency this cannot name or
+  judge (``-e``, ``-r``, ``-c``, a bare path, archive or URL) maps its own
+  text to None, which ``unmet_declaration`` reports as ``unsupported``; only
+  comments and pure options are ignored.
 
   ``scripts/request-container-upgrade.py`` keeps a copy, with
   ``unmet_declaration`` (it runs from fetched upstream on older installations
   and cannot import this module); ``test_request_container_upgrade`` pins
   that the copies agree.
   """
-  packages: dict[str, str] = {}
+  packages: dict[str, str | None] = {}
   text = re.sub(r"\\\r?\n", " ", data.decode("utf-8", "replace"))
   for logical in text.splitlines():
     line = re.sub(r"(^|\s)#.*$", "", logical).strip()
-    match = _REQUIREMENT_NAME.match(line)
-    if not line or line.startswith("-") or not match:
+    if not line or (line.startswith("-") and not _DEPENDENCY_OPTION.match(line)):
+      continue
+    match = None if line.startswith("-") else _REQUIREMENT_NAME.match(line)
+    if (
+      match is None or line[match.end():match.end() + 1] in {"/", "\\", ":", "+"}
+      or match.group(1).lower().endswith(_ARCHIVE_SUFFIXES)
+    ):
+      packages[line] = None
       continue
     rest = line[match.end():].split(";", 1)[0].split()
     spec = "".join(token for token in rest if not token.startswith("--"))
-    packages[re.sub(r"[-_.]+", "-", match.group(1)).lower()] = spec
+    name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
+    packages[name] = ",".join(part for part in (packages.get(name), spec) if part)
   return packages
 
 
 def unmet_declaration(
-  spec: str, installed: str | None,
+  spec: str | None, installed: str | None,
 ) -> Literal["missing", "version", "unsupported"] | None:
   """How ``installed`` falls short of the declared ``spec``, or None.
 
   ``spec`` is judged with PEP 440 semantics (ranges, ``~=``, wildcards), and
   an empty one accepts any version. A declaration this cannot judge, such as
-  a URL or path reference, is ``unsupported``: never assumed satisfied.
+  a URL or path reference (None from ``declared_python_packages``), is
+  ``unsupported``: never assumed satisfied.
   """
+  if spec is None:
+    return "unsupported"
   if installed is None:
     return "missing"
   try:
@@ -3865,7 +3891,7 @@ def python_package_gap(
   # Official-newer inputs first: a distribution both declare is the release's.
   for _path, served, is_newer in sorted(unmet, key=lambda item: not item[2]):
     for name, spec in declared_python_packages(served).items():
-      installed = _installed_version(name)
+      installed = _installed_version(name) if spec is not None else None
       kind = unmet_declaration(spec, installed)
       if name in shortfalls or kind is None:
         continue
@@ -3908,6 +3934,8 @@ def python_package_gap(
 def describe_package_gap(gap: PackageGap) -> str:
   """Owner-facing sentences naming each package and what closes its part."""
   def shortfall(item: PackageShortfall) -> str:
+    if item["declared"] is None:
+      return f"{item['name']}: a declaration this check cannot verify"
     if item["kind"] == "unsupported":
       return f"{item['name']}: source declares {item['declared']}, which this check cannot verify"
     return f"{item['name']}: source declares {item['declared'] or 'it'}, this image " + (
@@ -3932,15 +3960,18 @@ def describe_package_gap(gap: PackageGap) -> str:
   local = detail("local")
   if gap["origin"] == "local" or local:
     commit = (fix.get("commit") or "")[:12]
+    revert = f"Revert local commit {commit}" if commit else "Revert the uncommitted edit"
     sentences.append(
       f"{'A' if sentences else 'a'} local change declares Python packages this "
-      f"container image does not install{local}. Revert local commit "
-      f"{commit or 'the uncommitted edit'} or wait for its release."
+      f"container image does not install{local}. {revert} or wait for its release."
     )
   return " ".join(sentences)
 
 
 _RESTART_BLOCKER_CACHE: dict[tuple, PackageGap | None] = {}
+# One image check at a time: concurrent status polls on a stale cache wait
+# for the first one's answer rather than each starting the subprocess.
+_RESTART_BLOCKER_LOCK = threading.Lock()
 
 
 def _installed_distributions_stamp() -> tuple:
@@ -3963,7 +3994,8 @@ def restart_blocker(repo: Path = PLATFORM_REPO) -> PackageGap | None:
   boot decides it. Cached per image, served inputs, fetched release and
   installed distributions (so a live install that closes the gap shows at
   once), because the image's check and the history scan are too slow for
-  every status poll."""
+  every status poll. The image's check is bounded
+  (``restart_util.PACKAGE_CHECK_TIMEOUT_SECONDS``) and runs once at a time."""
   from app.restart_util import image_boot_checks_packages, image_package_verdict
 
   inputs = tuple(
@@ -3975,11 +4007,12 @@ def restart_blocker(repo: Path = PLATFORM_REPO) -> PackageGap | None:
     _rev(repo, "refs/remotes/origin/main"), recorded_upstream_sha(repo),
     _installed_distributions_stamp(),
   )
-  if key not in _RESTART_BLOCKER_CACHE:
-    _allowed, gap = image_package_verdict(repo)
-    _RESTART_BLOCKER_CACHE.clear()
-    _RESTART_BLOCKER_CACHE[key] = gap
-  return _RESTART_BLOCKER_CACHE[key]
+  with _RESTART_BLOCKER_LOCK:
+    if key not in _RESTART_BLOCKER_CACHE:
+      _allowed, gap = image_package_verdict(repo)
+      _RESTART_BLOCKER_CACHE.clear()
+      _RESTART_BLOCKER_CACHE[key] = gap
+    return _RESTART_BLOCKER_CACHE[key]
 
 
 def _commit_declaring(repo: Path, commit: str, path: str, data: bytes) -> str | None:
@@ -4947,6 +4980,43 @@ def _naive_utc_timestamp(value: datetime | None) -> float | None:
   return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).timestamp()
 
 
+def _bound_resolver_chat(db: Session, flag: dict):
+  """The live owner chat the conflict flag binds as this update's resolver."""
+  from app import models
+
+  chat_id = flag.get("chat_id")
+  if not chat_id:
+    return None
+  return (
+    db.query(models.Chat)
+    .filter(
+      models.Chat.id == chat_id, models.Chat.deleted_at.is_(None),
+      models.Chat.created_by_app_id.is_(None),
+    )
+    .first()
+  )
+
+
+def _resolver_is_busy(db: Session, chat) -> bool:
+  """Whether the resolver chat is running or waiting on an owner answer."""
+  from app import questions
+  from app.run_state import running_chat_ids
+
+  return bool(
+    chat.pending_question_id or questions.is_waiting(chat.id)
+    or chat.id in running_chat_ids(db, [chat.id])
+  )
+
+
+def _remaining_conflict_paths(flag: dict) -> list[str]:
+  """Files the parked update still has unresolved: the candidate's unmerged
+  paths, or the flag's recorded ones when there is no candidate."""
+  worktree = (flag.get("overlay") or {}).get("worktree")
+  if worktree and Path(worktree).is_dir():
+    return _unmerged_paths(Path(worktree))
+  return list(flag.get("paths") or [])
+
+
 def detect_update_stall(
   db: Session,
   pending: UnfinishedUpdate | None,
@@ -4966,9 +5036,6 @@ def detect_update_stall(
   container replacement bound to it is under way: that replacement is the
   progress, and the new image is what closes the gap.
   """
-  from app import models, questions
-  from app.run_state import running_chat_ids
-
   if not pending:
     return None
   now = time.time() if now is None else now
@@ -4992,19 +5059,8 @@ def detect_update_stall(
   if pending["stage"] != "resolve":
     return None
   flag = _read_conflict_flag() or {}
-  chat_id = flag.get("chat_id")
-  chat = (
-    db.query(models.Chat.id, models.Chat.updated_at, models.Chat.pending_question_id)
-    .filter(
-      models.Chat.id == chat_id, models.Chat.deleted_at.is_(None),
-      models.Chat.created_by_app_id.is_(None),
-    )
-    .first()
-  ) if chat_id else None
-  if chat is not None and (
-    chat.pending_question_id or questions.is_waiting(chat.id)
-    or chat.id in running_chat_ids(db, [chat.id])
-  ):
+  chat = _bound_resolver_chat(db, flag)
+  if chat is not None and _resolver_is_busy(db, chat):
     return None
   moved = [
     signals["parked_at"], signals["worktree_changed_at"],
@@ -5013,11 +5069,7 @@ def detect_update_stall(
   last = max((value for value in moved if value is not None), default=now)
   if now - last < _update_stall_hours() * 3600:
     return None
-  worktree = (flag.get("overlay") or {}).get("worktree")
-  remaining = (
-    _unmerged_paths(Path(worktree)) if worktree and Path(worktree).is_dir()
-    else list(flag.get("paths") or [])
-  )
+  remaining = _remaining_conflict_paths(flag)
   return StalledUpdate(
     since=datetime.fromtimestamp(last, timezone.utc).isoformat(timespec="seconds"),
     idle_hours=round((now - last) / 3600, 1),
@@ -5059,6 +5111,9 @@ async def notify_update_stall_once(session_factory, repo: Path = PLATFORM_REPO) 
   pending_action = pending["action"] if pending else None
   if stalled is None or _read_text(STALL_NOTIFIED_PATH) == stalled["episode"]:
     return None
+  if stalled["reason"] == "restart_blocked" and await _container_replacement_active():
+    # Settings shows no pause then either: the new image closes the gap.
+    return None
   notification_id = f"platform-stall-{stalled['episode']}"
   chat_id = stalled["resolver_chat_id"]
   body = {
@@ -5078,7 +5133,7 @@ async def notify_update_stall_once(session_factory, repo: Path = PLATFORM_REPO) 
     await push.notify_owner_async(
       db, owner[0], title="Platform update paused", body=body,
       source_type="platform_stall", notification_id=notification_id,
-      target=f"/shell/?chat={chat_id}" if chat_id else None,
+      target=f"/shell/?chat={chat_id}" if chat_id else "/shell/?settings",
     )
   with session_factory() as db:
     delivered = db.query(models.Notification.id).filter(
@@ -5088,6 +5143,19 @@ async def notify_update_stall_once(session_factory, repo: Path = PLATFORM_REPO) 
     return None
   _atomic_write_text(STALL_NOTIFIED_PATH, stalled["episode"])
   return notification_id
+
+
+async def _container_replacement_active() -> bool:
+  """Whether a container replacement is under way, bound to this update or
+  not; an unreadable status counts as none, so a real stall still notifies."""
+  from app import deployment_control
+
+  try:
+    status = await deployment_control.read_rebuild_status()
+  except Exception:  # noqa: BLE001 - any controller failure reads as "none"
+    log.warning("platform update watch could not read the rebuild status", exc_info=True)
+    return False
+  return status.get("state") in deployment_control._ACTIVE_STATES
 
 
 def _read_text(path: Path) -> str | None:
@@ -5763,28 +5831,22 @@ def _apply_platform_update_sync(
 
 
 async def create_platform_conflict_resolver_chat(
-  db: Session, repo: Path = PLATFORM_REPO,
+  db: Session, repo: Path = PLATFORM_REPO, *, replace_bound: bool = False,
 ) -> PlatformConflictResolverChatOut:
-  """Create or return the owner-clicked resolver chat for a platform conflict."""
-  from app import models
+  """Create or return the owner-clicked resolver chat for a platform conflict.
 
+  ``replace_bound`` opens a new one even when the bound chat still exists
+  (resuming a chat that cannot take a system turn) and rebinds the update.
+  """
   flag = _read_conflict_flag() or {}
   if not (CONFLICT_FLAG.exists() or _reconcile_in_progress(repo)):
     raise PlatformUpdateError("No unresolved platform update conflict.")
 
-  existing_chat_id = flag.get("chat_id")
-  if existing_chat_id:
-    existing = (
-      db.query(models.Chat)
-      .filter(models.Chat.id == existing_chat_id)
-      .filter(models.Chat.deleted_at.is_(None))
-      .filter(models.Chat.created_by_app_id.is_(None))
-      .first()
+  existing = None if replace_bound else _bound_resolver_chat(db, flag)
+  if existing is not None:
+    return PlatformConflictResolverChatOut(
+      chat_id=existing.id, created=False, started=False,
     )
-    if existing is not None:
-      return PlatformConflictResolverChatOut(
-        chat_id=existing.id, created=False, started=False,
-      )
 
   conflict_paths = flag.get("paths") or _unmerged_paths(repo)
   target_sha = flag.get("upstream") or _rev(repo, DEFAULT_TARGET_REF)
@@ -5810,57 +5872,51 @@ async def resume_platform_conflict_resolver(
   db: Session, repo: Path = PLATFORM_REPO,
 ) -> PlatformConflictResolverChatOut:
   """Start the stalled resolver again: a new turn in its bound chat when it
-  exists and is idle, otherwise a new resolver chat bound to the update."""
-  from app import models, questions
-  from app.chat_start import start_programmatic_chat_turn
-  from app.run_state import running_chat_ids
+  exists and is idle, otherwise a new resolver chat bound to the update.
+
+  A bound chat with no explicitly selected model cannot take a system turn
+  (``require_programmatic_chat_model``), so it is replaced the same way.
+  """
+  from app.chat_start import ProgrammaticChatModelRequired, start_programmatic_chat_turn
 
   flag = _read_conflict_flag() or {}
   if not flag.get("upstream"):
     raise PlatformUpdateError("No unresolved platform update conflict.")
-  chat = (
-    db.query(models.Chat)
-    .filter(models.Chat.id == flag["chat_id"])
-    .filter(models.Chat.deleted_at.is_(None))
-    .filter(models.Chat.created_by_app_id.is_(None))
-    .first()
-  ) if flag.get("chat_id") else None
+  chat = _bound_resolver_chat(db, flag)
   if chat is None:
-    # Opens a new resolver and rebinds the update to it.
     return await create_platform_conflict_resolver_chat(db, repo)
-  if (
-    chat.pending_question_id or questions.is_waiting(chat.id)
-    or chat.id in running_chat_ids(db, [chat.id])
-  ):
+  if _resolver_is_busy(db, chat):
     return PlatformConflictResolverChatOut(chat_id=chat.id, created=False, started=False)
-  started = await start_programmatic_chat_turn(
-    chat_id=chat.id, title=chat.title, provider=chat.provider,
-    content=_platform_conflict_resolver_resume_message(flag),
-  )
+  try:
+    started = await start_programmatic_chat_turn(
+      chat_id=chat.id, title=chat.title, provider=chat.provider,
+      content=_platform_conflict_resolver_resume_message(flag),
+    )
+  except ProgrammaticChatModelRequired:
+    return await create_platform_conflict_resolver_chat(db, repo, replace_bound=True)
   return PlatformConflictResolverChatOut(chat_id=chat.id, created=False, started=started)
 
 
 def _platform_conflict_resolver_resume_message(flag: dict) -> str:
-  """Where the stopped resolution stands, and how to finish it."""
-  overlay = flag.get("overlay") or {}
-  worktree = overlay.get("worktree")
-  remaining = (
-    _unmerged_paths(Path(worktree)) if worktree and Path(worktree).is_dir()
-    else list(flag.get("paths") or [])
-  )
-  state = (
-    "These files still have conflict markers: " + ", ".join(remaining) + "."
-    if remaining else
-    "Every file is resolved and staged, so an answer is waiting to be continued."
-  )
+  """Where the stopped resolution stands, then the same instructions this
+  kind of conflict was opened with (``_platform_conflict_resolver_message``):
+  an older updater's conflict is abandoned, not continued."""
+  overlay = flag.get("overlay") or None
+  state = ""
+  if overlay and (overlay.get("replay") or overlay.get("mode") == "net"):
+    remaining = _remaining_conflict_paths(flag)
+    state = (
+      " These files still have conflict markers: " + ", ".join(remaining) + "."
+      if remaining else
+      " Every file is resolved and staged, so an answer is waiting to be continued."
+    )
   return (
     "The owner asked you to resume this platform update; it stopped before "
-    f"finishing. {state} Re-read the original instructions above, finish "
-    f"resolving in `{worktree or 'the isolated candidate'}`, stage the files, "
-    "run their tests, then run `cd /data/platform/backend && python3 -c "
-    "\"from app.platform_update import continue_platform_overlay_update as c; "
-    "print(c())\"`. If you cannot finish, say exactly why, so the owner can "
-    "retry or cancel the update in Settings."
+    f"finishing.{state} If you cannot finish, say exactly why, so the owner "
+    "can retry or cancel the update in Settings.\n\n"
+    + _platform_conflict_resolver_message(
+      str(flag.get("upstream") or ""), list(flag.get("paths") or []), overlay,
+    )
   )
 
 

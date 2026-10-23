@@ -53,7 +53,7 @@ except ImportError:  # only a transitive dependency; pip vendors the same librar
     from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
     from pip._vendor.packaging.version import InvalidVersion, Version
 
-DATA =Path(os.environ.get("DATA_DIR", "/data"))
+DATA = Path(os.environ.get("DATA_DIR", "/data"))
 PLATFORM = DATA / "platform"
 CONTROL = DATA / "mobius-rebuild"
 BUILD_INFO = Path(os.environ.get("MOBIUS_BUILD_INFO_PATH", "/app/build-info.json"))
@@ -148,27 +148,44 @@ def declared_in_history(commit: str, path: str, data: bytes) -> bool:
 # on older installations, so it cannot import them.
 # ``test_request_container_upgrade`` pins that the copies agree.
 _REQUIREMENT = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?")
+_DEPENDENCY_OPTION = re.compile(r"-[erc]|--(?:editable|requirement|constraint)\b")
+_ARCHIVE_SUFFIXES = (".whl", ".zip", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")
 
 
-def parse_requirements(data: bytes) -> dict[str, str]:
-    """Package name to version spec for a requirements file or pip lock."""
-    packages: dict[str, str] = {}
+def parse_requirements(data: bytes) -> dict[str, str | None]:
+    """Package name to version spec for a requirements file or pip lock.
+
+    Repeated declarations of a name join into one spec; a line declaring a
+    dependency this cannot name or judge (``-e``, ``-r``, ``-c``, a path,
+    archive or URL) maps its own text to None. Only comments and pure
+    options are ignored.
+    """
+    packages: dict[str, str | None] = {}
     text = re.sub(r"\\\r?\n", " ", data.decode("utf-8", "replace"))
     for logical in text.splitlines():
         line = re.sub(r"(^|\s)#.*$", "", logical).strip()
-        match = _REQUIREMENT.match(line)
-        if not line or line.startswith("-") or not match:
+        if not line or (line.startswith("-") and not _DEPENDENCY_OPTION.match(line)):
+            continue
+        match = None if line.startswith("-") else _REQUIREMENT.match(line)
+        if (
+            match is None or line[match.end():match.end() + 1] in {"/", "\\", ":", "+"}
+            or match.group(1).lower().endswith(_ARCHIVE_SUFFIXES)
+        ):
+            packages[line] = None
             continue
         rest = line[match.end():].split(";", 1)[0].split()
         spec = "".join(token for token in rest if not token.startswith("--"))
-        packages[re.sub(r"[-_.]+", "-", match.group(1)).lower()] = spec
+        name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
+        packages[name] = ",".join(part for part in (packages.get(name), spec) if part)
     return packages
 
 
-def unmet_declaration(spec: str, installed: str | None) -> str | None:
+def unmet_declaration(spec: str | None, installed: str | None) -> str | None:
     """How ``installed`` falls short of the declared ``spec`` (``missing``,
     ``version`` or ``unsupported``), or None: PEP 440 semantics, and a
     declaration this cannot judge (a URL or path reference) never passes."""
+    if spec is None:
+        return "unsupported"
     if installed is None:
         return "missing"
     try:
@@ -188,9 +205,12 @@ def package_loss(served: bytes, installed: dict[str, str]) -> list[str]:
     of what the source declares, one description per package."""
     lost = []
     for name, spec in parse_requirements(served).items():
-        version = locked_version(installed[name]) if name in installed else None
+        pinned = installed.get(name) if spec is not None else None
+        version = locked_version(pinned) if pinned is not None else None
         kind = unmet_declaration(spec, version)
-        if kind == "missing":
+        if spec is None:
+            lost.append(f"{name}: a declaration this check cannot verify against the target image")
+        elif kind == "missing":
             lost.append(f"{name}: source declares {spec or 'it'}, target image does not install it")
         elif kind == "version":
             lost.append(f"{name}: source declares {spec}, target image installs {version}")
@@ -279,7 +299,11 @@ def check_served_packages_survive(
         except OSError:
             continue
         if declared_in_history(target, path, served):
-            dropped = sorted(parse_requirements(served).keys() - installed.keys())
+            # A line naming no distribution is unverifiable, so it counts too.
+            dropped = sorted(
+                name for name, spec in parse_requirements(served).items()
+                if spec is None or name not in installed
+            )
             if dropped and not allow_package_loss:
                 raise Refused(
                     f"the target image no longer installs Python packages the "

@@ -262,7 +262,9 @@ exact release instead; `--check` only reports whether it would) after checking,
 under the updater's lock, that the target is an official release that ships this
 bridge and is newer than the running image and the source's official package
 declarations, that the target image still installs every package the source's
-release declares and satisfies every local declaration's version range (each
+release declares and satisfies every local declaration's version range (every
+declaration of a package must hold, and a dependency line naming no package,
+such as `-e`, `-r` or a path or URL, counts as one it cannot verify; each
 shortfall is named, a local one with the local commit to revert;
 `--allow-package-loss` accepts the loss knowingly, for example a package the
 target image provides another way), that no update is prepared

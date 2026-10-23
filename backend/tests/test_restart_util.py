@@ -135,12 +135,23 @@ def _baked_image(root: Path, monkeypatch, *, exit_code: int | None, gap=None) ->
   else:
     body = (
       "import json, sys\n"
+      "PACKAGE_CHECK_PROTOCOL = 1\n"
       "assert sys.argv[1] == \"check-packages\"\n"
       f"print(json.dumps({gap!r}))\n"
       f"raise SystemExit({exit_code})\n"
     )
   (app / "platform_boot.py").write_text(body, encoding="utf-8")
   monkeypatch.setattr(ru, "BAKED_BACKEND", root)
+
+
+def test_this_images_boot_declares_its_package_check(monkeypatch):
+  """The marker restart admission reads is in this image's own boot module,
+  and an older boot module without it keeps the strict fallback."""
+  monkeypatch.setattr(ru, "BAKED_BACKEND", Path(ru.__file__).resolve().parents[1])
+  assert ru.image_boot_checks_packages()
+
+  monkeypatch.setattr(ru, "BAKED_BACKEND", Path("/nonexistent-baked-backend"))
+  assert not ru.image_boot_checks_packages()
 
 
 def test_admission_uses_baked_check_packages_when_available(monkeypatch, tmp_path):
@@ -162,7 +173,7 @@ def test_admission_uses_baked_check_packages_when_available(monkeypatch, tmp_pat
   try:
     ru.validate_restart_source()
   except ru.RestartSourceInvalid as exc:
-    assert exc.detail == {"code": "image_packages_behind_source", "gap": blocking}
+    assert exc.detail == {"reason": "image_packages_behind_source", "gap": blocking}
     assert "claude-agent-sdk: source declares ==0.2.165, this image does not have it" in str(exc)
   else:
     raise AssertionError("a missing distribution was admitted")

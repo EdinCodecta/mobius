@@ -6557,6 +6557,38 @@ def test_restart_blocker_is_recomputed_after_a_live_install(clone_env, monkeypat
   assert len(verdicts) == 2
 
 
+def test_concurrent_status_reads_share_one_image_check(clone_env, monkeypatch):
+  """Status polls on a stale cache wait for the one running image check
+  instead of each starting its own subprocess."""
+  import threading
+
+  from app import restart_util
+
+  _origin, platform = clone_env
+  entered = threading.Event()
+  release = threading.Event()
+  calls = []
+
+  def slow_verdict(root):
+    calls.append(root)
+    entered.set()
+    release.wait(5)
+    return True, None
+
+  monkeypatch.setattr(restart_util, "image_package_verdict", slow_verdict)
+  pu._RESTART_BLOCKER_CACHE.clear()
+  readers = [threading.Thread(target=pu.restart_blocker, args=(platform,)) for _ in range(3)]
+  readers[0].start()
+  assert entered.wait(5)
+  for reader in readers[1:]:
+    reader.start()
+  release.set()
+  for reader in readers:
+    reader.join(5)
+
+  assert len(calls) == 1
+
+
 @pytest.mark.parametrize("declared,installed,kind", [
   (">=3", "2", "version"),
   (">=2", "2.1", None),
@@ -6585,6 +6617,48 @@ def test_package_gap_judges_declarations_by_their_version_range(
 
   kinds = {item["name"]: item["kind"] for item in (gap or {}).get("packages", [])}
   assert kinds.get("pkg") == kind
+
+
+def test_package_gap_holds_every_declaration_and_reports_unnamed_ones(
+  clone_env, monkeypatch,
+):
+  """Repeated declarations all constrain a package (a later ``Pkg<4`` cannot
+  drop ``pkg>=3``), and a dependency line naming no package is reported as
+  unverifiable rather than skipped."""
+  _origin, platform = clone_env
+  _with_python_inputs(platform, _origin)
+  image = _served_sha(platform)
+  image_lock = (platform / "backend/requirements.lock").read_bytes()
+  _local_commit(platform, edits={
+    "backend/requirements.lock": "fastapi==1\npkg>=3\nPkg<4\n-e ./local-package\n",
+  })
+  _boot_image(image)
+  _record_image_inputs(platform, image_lock)
+  monkeypatch.setattr(pu, "_installed_version", {"fastapi": "1", "pkg": "2"}.get)
+
+  gap = pu.python_package_gap(platform)
+
+  assert {item["name"]: (item["declared"], item["kind"]) for item in gap["packages"]} == {
+    "pkg": (">=3,<4", "version"),
+    "-e ./local-package": (None, "unsupported"),
+  }
+  reason = pu.describe_package_gap(gap)
+  assert "-e ./local-package: a declaration this check cannot verify" in reason
+  assert "pkg: source declares >=3,<4, this image has 2" in reason
+
+
+def test_an_uncommitted_local_gap_says_to_revert_the_edit():
+  gap = {
+    "packages": [{"name": "pkg", "declared": "==2", "installed": None,
+                  "kind": "missing", "origin": "local"}],
+    "inputs": ["backend/requirements.lock"], "origin": "local", "declared_by": None,
+    "fix": {"action": "revert_local_declaration", "commit": None}, "blocking": False,
+  }
+
+  reason = pu.describe_package_gap(gap)
+
+  assert "Revert the uncommitted edit or wait for its release." in reason
+  assert "local commit" not in reason
 
 
 def test_the_boot_protocol_can_only_advance_with_a_new_image():
@@ -8594,6 +8668,8 @@ async def test_stall_notification_fires_once_per_episode(
   assert first and first.startswith("platform-stall-")
   assert await pu.notify_update_stall_once(SessionLocal, platform) is None
   assert len(sent) == 1 and sent[0]["source_type"] == "platform_stall"
+  # No resolver chat to open, so it links to Settings, as its text says.
+  assert sent[0]["target"] == "/shell/?settings"
   assert len(sent[0]["source_type"]) <= 16
 
   later = then + _HOURS  # progress, then idle past the threshold again
@@ -8634,6 +8710,20 @@ async def test_a_blocked_marker_only_finish_notifies_once_across_passes(
 
   monkeypatch.setattr(push, "notify_owner_async", record)
 
+  # Settings hides the pause while any container replacement runs, so the
+  # bell stays quiet then too.
+  async def replacing():
+    return True
+
+  monkeypatch.setattr(pu, "_container_replacement_active", replacing)
+  assert await pu.notify_update_stall_once(SessionLocal, platform) is None
+  assert sent == []
+
+  async def idle():
+    return False
+
+  monkeypatch.setattr(pu, "_container_replacement_active", idle)
+
   now = time.time()
   episodes = [
     pu.detect_update_stall(db, pending, blocker={"blocking": True}, repo=platform,
@@ -8649,6 +8739,7 @@ async def test_a_blocked_marker_only_finish_notifies_once_across_passes(
   # This finish needs a new container, so the alert points at replacing it.
   assert pending["action"] == "replace"
   assert "choose Finish update to replace the container" in sent[0]["body"]
+  assert sent[0]["target"] == "/shell/?settings"
 
 
 @pytest.mark.asyncio
@@ -8675,6 +8766,67 @@ async def test_resume_restarts_the_idle_bound_resolver(clone_env, db, monkeypatc
   assert "backend/app/main.py" in started[0]["content"]
   assert str(worktree) in started[0]["content"]
   assert "continue_platform_overlay_update" in started[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_resume_of_an_older_updaters_conflict_repeats_its_abandon_instructions(
+  clone_env, db, monkeypatch,
+):
+  """A conflict an older updater recorded is abandoned and reviewed again,
+  never continued in a candidate it does not have."""
+  from app.chat_writer import create_chat
+
+  _origin, platform = clone_env
+  target = _served_sha(platform)
+  pu._write_conflict_flag(target, ["backend/app/main.py"], "resolver-old")
+  db.add(create_chat(id="resolver-old", title="Resolve platform update conflict",
+                     messages=[], pending_messages=[], provider="claude"))
+  db.commit()
+  started = []
+
+  async def fake_start(**kwargs):
+    started.append(kwargs)
+    return True
+
+  monkeypatch.setattr("app.chat_start.start_programmatic_chat_turn", fake_start)
+
+  await pu.resume_platform_conflict_resolver(db, platform)
+
+  content = started[0]["content"]
+  assert "abandon_platform_overlay_update" in content
+  assert "continue_platform_overlay_update" not in content
+  assert "recorded by an older updater" in content
+
+
+@pytest.mark.asyncio
+async def test_resume_opens_a_new_resolver_when_the_bound_chat_has_no_model(
+  clone_env, db, monkeypatch,
+):
+  """A system turn needs an explicitly selected model; without one, Resume
+  opens a new resolver (which gets the background-agent model) instead of
+  failing."""
+  from app.chat_start import ProgrammaticChatModelRequired
+  from app.chat_writer import create_chat
+
+  _origin, platform = clone_env
+  _parked_update(platform, chat_id="resolver-no-model")
+  db.add(create_chat(id="resolver-no-model", title="Resolve platform update conflict",
+                     messages=[], pending_messages=[], provider="claude"))
+  db.commit()
+
+  async def refuse(**kwargs):
+    raise ProgrammaticChatModelRequired("no explicitly selected model")
+
+  async def fake_spawn(session, paths, target_sha, overlay=None):
+    return {"chat_id": "new-resolver", "created": True, "started": True}
+
+  monkeypatch.setattr("app.chat_start.start_programmatic_chat_turn", refuse)
+  monkeypatch.setattr(pu, "spawn_platform_conflict_chat", fake_spawn)
+
+  result = await pu.resume_platform_conflict_resolver(db, platform)
+
+  assert result == {"chat_id": "new-resolver", "created": True, "started": True}
+  assert pu._read_conflict_flag()["chat_id"] == "new-resolver"
 
 
 @pytest.mark.asyncio
