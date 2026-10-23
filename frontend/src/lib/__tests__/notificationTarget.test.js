@@ -25,6 +25,22 @@ test('in-scope shell chat target parses', () => {
     { view: 'chat', chatId: 'abc-123', focusQuestion: true })
 })
 
+test('a Settings target opens a known section, or Settings itself otherwise', () => {
+  assert.deepEqual(parseNotificationTarget('/shell/?settings=ai-providers'),
+    { view: 'settings', section: 'ai-providers' })
+  assert.deepEqual(parseNotificationTarget('/shell/?settings'),
+    { view: 'settings', section: null })
+  // An unknown or hostile section never reaches SettingsView's focus target; a
+  // link minted before a section was renamed still lands on Settings.
+  assert.deepEqual(parseNotificationTarget('/shell/?settings=old-section'),
+    { view: 'settings', section: null })
+  assert.deepEqual(parseNotificationTarget('/shell/?settings=<script>'),
+    { view: 'settings', section: null })
+  // app and chat keep their meaning; a malformed one is not rescued as Settings.
+  assert.equal(parseNotificationTarget('/shell/?app=7&settings=github').view, 'canvas')
+  assert.equal(parseNotificationTarget('/shell/?app=<x>&settings=github'), null)
+})
+
 test('retired out-of-scope app and chat routes fail closed', () => {
   assert.equal(parseNotificationTarget('/app/42'), null)
   assert.equal(parseNotificationTarget('/chat/abc123'), null)
@@ -92,4 +108,9 @@ test('unknown views, paths, and junk parse to null', () => {
   assert.equal(parseNotificationTarget(''), null)
   assert.equal(parseNotificationTarget(null), null)
   assert.equal(parseNotificationTarget(42), null)
+})
+
+test('saved decision navigation focuses the named card even after answer', () => {
+  assert.deepEqual(parseNotificationTarget('/shell/?chat=source&focus=question&question=saved-card'),
+    { view: 'chat', chatId: 'source', focusQuestion: true, questionId: 'saved-card' })
 })

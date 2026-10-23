@@ -21,7 +21,8 @@ function stubServer({ preview, install = { status: 200, body: {} } }) {
 }
 
 const CONTRACT = { agent: { skills: ['maps-app.md'] }, data: {} }
-const PREVIEW = { body: { capability_contract: CONTRACT, capability_digest: 'd1' } }
+const ROWS = [{ id: 'agent_extend', title: 'Add skills and tools to your agents', text: 'Installs the skills it ships.', critical: false }]
+const PREVIEW = { body: { capability_contract: CONTRACT, capability_digest: 'd1', access_rows: ROWS } }
 
 test('tapping_install_opens_the_access_review_without_installing_anything', async () => {
   const calls = stubServer({ preview: PREVIEW })
@@ -29,7 +30,7 @@ test('tapping_install_opens_the_access_review_without_installing_anything', asyn
   await result.current.begin('maps')
   assert.deepEqual(calls.map(call => call.path), ['/apps/preview'])
   assert.equal(result.current.confirmation.id, 'maps')
-  assert.deepEqual(result.current.confirmation.rows.map(row => row.label), ['Agent skills'])
+  assert.deepEqual(result.current.confirmation.rows.map(row => row.title), ['Add skills and tools to your agents'])
   assert.equal(result.current.statusOf('maps'), null)
 })
 
@@ -56,7 +57,7 @@ test('cancelling_the_review_installs_nothing', async () => {
 test('access_that_changed_since_the_review_reopens_it_with_a_notice', async () => {
   stubServer({
     preview: PREVIEW,
-    install: { status: 409, body: { detail: { code: 'capability_changed', capability_contract: { data: { manage_apps: true } }, capability_digest: 'd2' } } },
+    install: { status: 409, body: { detail: { code: 'capability_changed', capability_contract: { data: { manage_apps: true } }, capability_digest: 'd2', access_rows: [{ id: 'manage_apps', title: 'Install and remove apps' }] } } },
   })
   const { result } = renderHook(useAppInstall, CATALOG)
   await result.current.begin('maps')

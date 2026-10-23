@@ -29,7 +29,7 @@ from slowapi.util import get_remote_address
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app import auth, models, runtime_identity, schemas
+from app import app_consent, auth, models, runtime_identity, schemas
 from app.broadcast import get_system_broadcast
 from app.config import get_settings
 from app.database import get_db
@@ -546,6 +546,13 @@ def create_app_token_endpoint(
   )
   if not app:
     raise HTTPException(status_code=404, detail="App not found.")
+  # A Store-installed app is dormant until the owner accepts what it asks for
+  # (app_consent.py). The shell answers this with its first-open popup.
+  if app_consent.dormant(app):
+    raise HTTPException(status_code=409, detail={
+      "code": "consent_required",
+      "message": "This app requires your approval before it opens.",
+    })
   owner = principal.owner
   # Preserve the delegation lineage on the down-scoped token. create_agent_token
   # keeps agent_chat == delegation_chat, so principal.chat_id is the child chat
@@ -557,6 +564,7 @@ def create_app_token_endpoint(
     owner.username,
     owner.token_epoch,
     app_nonce=app.token_nonce,
+    consent=app_consent.session_id(app),
     delegation_id=delegation_id,
     delegation_chat=delegation_chat,
     browser=principal.browser,
@@ -580,12 +588,19 @@ def create_app_job_token_endpoint(
   )
   if not app:
     raise HTTPException(status_code=404, detail="App not found.")
+  # Nothing of a Store app runs before the owner accepts what it asks for.
+  if app_consent.dormant(app):
+    raise HTTPException(status_code=409, detail={
+      "code": "consent_required",
+      "message": "This app has not been accepted yet.",
+    })
   return {
     "token": auth.create_app_token(
       body.app_id,
       owner.username,
       owner.token_epoch,
       app_nonce=app.token_nonce,
+      consent=app_consent.session_id(app),
       expires_delta=timedelta(hours=2),
       job_secrets=(app.capability_contract or {}).get("data", {}).get("job_secret_read", []),
     )
@@ -878,8 +893,8 @@ async def providers_status(
   is_owner_caller = principal.app_id is None and principal.scope == "owner"
   from app.providers import PROVIDERS, provider_selectable
   data_dir = get_settings().data_dir
-  from app.providers import sync_app_model_providers
-  sync_app_model_providers(data_dir)
+  from app.providers import refresh_app_model_providers
+  await refresh_app_model_providers(data_dir)
   out = {}
   for pid, provider in PROVIDERS.items():
     enabled = provider_selectable(data_dir, pid)
@@ -978,6 +993,7 @@ from pathlib import Path
 
 from app.codex_login_parse import banner_has_code, parse_login_banner
 from app.runtime_identity import broker_request as _mobius_broker_request
+from app.providers import mobius_account_changed
 
 _codex_login_procs: dict[str, asyncio.subprocess.Process] = {}
 _codex_login_status: dict[str, str] = {}  # "complete" | "failed"
@@ -1111,14 +1127,15 @@ async def mobius_login_callback(
 
 # -- mobius.you OAuth completion and owner login (either/or with local) -----
 #
-# When the singleton owner is in ``auth_mode == "mobius"``, the login screen
-# offers one "Sign in with mobius.you" button that navigates to
-# ``/mobius/login/start``. Trust comes entirely from the TLS + PKCE receipt the
-# callback fetches itself from mobius.you ``/identity/token`` (mirroring the
-# account-link callback above): the app holds no SaaS secret and verifies no
-# signature. This is login only — the owner row and its bound ``sso_subject``
-# already exist; the setup-status reconciliation created them from the root
-# broker's verified first-boot identity.
+# When the singleton owner is in ``auth_mode == "mobius"``, the shell sends a
+# signed-out visitor straight to ``/mobius/login/start`` (after an explicit
+# sign-out, or when that redirect just happened, the login screen offers one
+# "Sign in with mobius.you" button to the same address). Trust comes entirely
+# from the TLS + PKCE receipt the callback fetches itself from mobius.you
+# ``/identity/token`` (mirroring the account-link callback above): the app holds
+# no SaaS secret and verifies no signature. This is login only — the owner row
+# and its bound ``sso_subject`` already exist; the setup-status reconciliation
+# created them from the root broker's verified first-boot identity.
 
 
 def _mobius_authorization_issuer() -> str:
@@ -1278,9 +1295,13 @@ async def _complete_mobius_enrollment(
   ):
     return _mobius_enroll_error_redirect()
 
-  await _mobius_broker_request(
-    "POST", "/identity/enroll", {"receipt": receipt}
-  )
+  try:
+    await _mobius_broker_request(
+      "POST", "/identity/enroll", {"receipt": receipt}
+    )
+  finally:
+    # Even an uncertain enroll outcome may have linked the runtime.
+    mobius_account_changed()
   # The conditional update preserves the same no-rebind invariant if the
   # owner row changes while the external enrollment request is in flight.
   updated = db.query(models.Owner).filter(
@@ -1323,14 +1344,21 @@ async def mobius_web_login_start(
     raise HTTPException(
       status_code=404, detail="mobius.you sign-in is not enabled."
     )
-  identity = await _mobius_broker_request("GET", "/identity")
-  # mobius.you only accepts the account-link callback path as the
-  # redirect_uri (_valid_identity_redirect hardcodes it), so the login
-  # rides the shared /provider/mobius/callback and is told apart there by
-  # the browser-binding cookie.
-  url, state = await _begin_mobius_pkce(
-    identity, owner.username, select_account=select_account,
-  )
+  # The shell navigates here automatically for a signed-out visitor, so a
+  # broker or launcher failure must land on the retryable error screen rather
+  # than a bare JSON page with no way back.
+  try:
+    identity = await _mobius_broker_request("GET", "/identity")
+    # mobius.you only accepts the account-link callback path as the
+    # redirect_uri (_valid_identity_redirect hardcodes it), so the login
+    # rides the shared /provider/mobius/callback and is told apart there by
+    # the browser-binding cookie.
+    url, state = await _begin_mobius_pkce(
+      identity, owner.username, select_account=select_account,
+    )
+  except Exception:
+    log.warning("mobius login start failed", exc_info=True)
+    return _mobius_login_error_redirect()
   response = RedirectResponse(url=url, status_code=303)
   # One-use browser binding: the callback requires this cookie to equal the
   # echoed state, so a callback link opened in a different browser cannot
@@ -1406,9 +1434,12 @@ async def _complete_mobius_web_login(
     ):
       return _mobius_login_error_redirect()
   else:
-    enrolled = await _mobius_broker_request(
-      "POST", "/identity/enroll", {"receipt": receipt}
-    )
+    try:
+      enrolled = await _mobius_broker_request(
+        "POST", "/identity/enroll", {"receipt": receipt}
+      )
+    finally:
+      mobius_account_changed()
     if (
       enrolled.get("linked") is not True
       or not secrets.compare_digest(

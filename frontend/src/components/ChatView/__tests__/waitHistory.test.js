@@ -2,14 +2,9 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 
-const vite = await createServer({
-  appType: 'custom',
-  logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui'] },
-})
+const vite = await createSsrRenderServer()
 const { default: WaitHistoryCard } = await vite.ssrLoadModule(
   '/src/components/ChatView/WaitHistoryCard.jsx',
 )
@@ -197,4 +192,50 @@ test('history distinguishes a saved result from the continuation it has not woke
   assert.doesNotMatch(html, /Wait completed/)
   assert.match(html, /follow-up pending/)
   assert.equal(waitWokeItsAnswer({ ...summary, delivery_pending: false }), true)
+})
+
+test('Goal completion and cancellation without a receipt trail the owning answer', async () => {
+  const previousWindow = globalThis.window
+  globalThis.window = { location: { href: 'http://localhost/' } }
+  after(() => { globalThis.window = previousWindow })
+  const { default: MsgContent } = await vite.ssrLoadModule(
+    '/src/components/ChatView/MsgContent.jsx',
+  )
+  for (const [status, result_disposition, label] of [
+    ['met', 'retired_by_goal_outcome', 'Wait completed'],
+    ['cancelled', 'withdrawn', 'Wait stopped'],
+    ['met', 'withdrawn', 'Wait completed'],
+  ]) {
+    const summary = {
+      id: result_disposition, description: 'Exact Goal result', status,
+      result_disposition, delivery_pending: false,
+    }
+    assert.equal(waitWokeItsAnswer(summary), false)
+    const html = renderToStaticMarkup(createElement(MsgContent, {
+      msg: { id: 'owning-answer', role: 'assistant', content: 'Goal closed.', wait_summaries: [summary] },
+    }))
+    assert.ok(html.indexOf('Goal closed.') < html.indexOf(label), `${result_disposition} must not start an answer`)
+    assert.doesNotMatch(html, /chat__answer-cause/)
+  }
+})
+
+test('normal delivery wakes an answer; legacy and activation receipts keep their placement', async () => {
+  const previousWindow = globalThis.window
+  globalThis.window = { location: { href: 'http://localhost/' } }
+  after(() => { globalThis.window = previousWindow })
+  const { default: MsgContent } = await vite.ssrLoadModule(
+    '/src/components/ChatView/MsgContent.jsx',
+  )
+  const base = { description: 'Exact Goal result', status: 'met', delivery_pending: false }
+  for (const result_disposition of ['delivered', 'legacy_consumed', 'scheduled', null]) {
+    const summary = { ...base, id: String(result_disposition), result_disposition }
+    assert.equal(waitWokeItsAnswer(summary), true, String(result_disposition))
+    const html = renderToStaticMarkup(createElement(MsgContent, {
+      msg: { id: 'receiving-answer', role: 'assistant', content: 'Follow-up begins.', wait_summaries: [summary] },
+    }))
+    assert.ok(html.indexOf('Wait completed') < html.indexOf('Follow-up begins.'), String(result_disposition))
+  }
+  assert.equal(waitWokeItsAnswer(base), true, 'old summaries omit the disposition')
+  assert.equal(waitWokeItsAnswer({ ...base, result_disposition: 'legacy_consumed', delivery_pending: true }), false)
+  assert.equal(waitWokeItsAnswer({ ...base, status: 'cancelled', result_disposition: null }), false)
 })

@@ -67,7 +67,9 @@ from typing import Callable, Literal, NotRequired, TypedDict
 
 from sqlalchemy.orm import Session
 
-from app import app_git, local_change_tests, platform_activation, runtime_provenance
+from app import (
+  app_git, local_change_tests, platform_activation, removed_references, runtime_provenance,
+)
 from app.platform_activation import PlatformActivationImpact
 from app.restart_util import run_candidate_startup_check
 
@@ -2083,6 +2085,23 @@ def _build_info() -> dict:
   return data if isinstance(data, dict) else {}
 
 
+def image_lineage() -> frozenset[str]:
+  """Every commit the running image's source descends from, recorded at build.
+
+  The served checkout cannot prove image ancestry by itself: images seed a
+  shallow clone, and a container-only upgrade fetches nothing. Empty when the
+  image recorded no lineage, so callers fall back to their checkout's proof.
+  """
+  path = Path(os.environ.get("MOBIUS_IMAGE_LINEAGE_PATH", "/app/platform-lineage"))
+  try:
+    text = path.read_text(encoding="ascii")
+  except (OSError, UnicodeError):
+    return frozenset()
+  return frozenset(
+    sha for sha in text.split() if re.fullmatch(r"[0-9a-f]{40}", sha)
+  )
+
+
 def frozen_image_sha() -> str | None:
   """The running image's own source commit, from its frozen build record.
 
@@ -2820,9 +2839,9 @@ def _finalize_update(
       return _roll_back_update(
         repo, local, pre, tip, target, err, err,
       )
-  if local_report["regressions"]:
-    message = local_change_tests.describe(local_report["regressions"])
-    return _roll_back_update(repo, local, pre, tip, target, message, message)
+  rejection = _local_change_rejection(local_report)
+  if rejection:
+    return _roll_back_update(repo, local, pre, tip, target, rejection, rejection)
 
   previous_upstream_sha = _rev(repo, UPSTREAM_BRANCH) or None
   result = ReconcileResult(
@@ -3177,10 +3196,14 @@ def _check_local_tests(
   Worktrees share installed dependencies, not working files or runtime data.
   Another image's tests must not be judged against this image's dependencies.
   """
-  tests = local_change_tests.select(repo, target, prepared)
+  # Static and image-independent, so it runs first: when it already rejects
+  # the candidate, running the tests could not change that verdict.
+  removed = removed_references.find(repo, target, prepared, snapshot)
+  tests = local_change_tests.select(repo, target, prepared, snapshot)
   unavailable = (
-    "target image test runtime is not available before activation" if requires_image
-    else "no local tests selected by filename convention" if not tests else None
+    "local changes use names this release removed" if removed
+    else "target image test runtime is not available before activation" if requires_image
+    else "no local tests selected for the changed files" if not tests else None
   )
   if unavailable:
     result = local_change_tests.LocalTestRun(unavailable=unavailable)
@@ -3197,8 +3220,18 @@ def _check_local_tests(
           app_git.remove_overlay_worktree(repo, checkout)
   return {
     **local_change_tests.compare(tests, *runs),
+    "removed_references": removed,
     "baseline_sha": snapshot, "candidate_sha": prepared, "target_sha": target,
   }
+
+
+def _local_change_rejection(report: dict) -> str | None:
+  """Why the owner's local changes cannot run on this candidate, if they cannot."""
+  if report["removed_references"]:
+    return removed_references.describe(report["removed_references"])
+  if report["regressions"]:
+    return local_change_tests.describe(report["regressions"])
+  return None
 
 
 def _prepare(
@@ -3239,8 +3272,9 @@ def _prepare(
     repo, snapshot=snapshot, prepared=prepared, target=target,
     requires_image=requires_image,
   )
-  if local_report["regressions"]:
-    raise PlatformUpdateError(local_change_tests.describe(local_report["regressions"]))
+  rejection = _local_change_rejection(local_report)
+  if rejection:
+    raise PlatformUpdateError(rejection)
   _git("update-ref", _PREPARED_REF, prepared, repo=repo)
   record = PreparedUpdate(
     state="prepared", snapshot=snapshot, prepared=prepared, target=target,
@@ -3643,7 +3677,11 @@ def release_packages_missing_from_image(
   (``image_installs_python_input``) is judged on its own:
 
   - declared somewhere in this image's own history: not newer than the image,
-    so a newer image under older source (a container-only upgrade) is fine;
+    so a newer image under older source (a container-only upgrade) is fine.
+    The checkout need not hold the image's commit (an image seeds a shallow
+    clone, and a container-only upgrade fetches nothing), so the image's
+    build-recorded lineage (``image_lineage``) also proves the recorded
+    release's own declarations are not newer;
   - declared in the official history (``origin/main``) but never in the
     image's: a newer official release, so the checkout is refused;
   - declared in neither: a local package declaration, which stays allowed.
@@ -3661,11 +3699,14 @@ def release_packages_missing_from_image(
   # so only a complete clone may call an input local by its absence.
   official = "" if _is_shallow(repo) else _rev(repo, "refs/remotes/origin/main")
   release = recorded_upstream_sha(repo)
+  release_in_image = bool(release) and release in image_lineage()
   for path in _PYTHON_DEPENDENCY_INPUTS:
     served = _served_bytes(repo, path)
     if served is None or image_installs_python_input(repo, path, served):
       continue
     if image and _declared_in_history(repo, image, path, served):
+      continue
+    if release_in_image and _git_blob(repo, release, path) == served:
       continue
     if official:
       newer = _declared_in_history(repo, official, path, served)

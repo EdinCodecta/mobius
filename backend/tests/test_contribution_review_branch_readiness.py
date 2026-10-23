@@ -7,7 +7,8 @@ from fastapi import HTTPException
 from app import contribution_review_runs as domain
 from app.routes import contribution_reviews as routes
 from tests.test_contribution_review_runs import setup, SHA, BASE
-from tests.test_contribution_review_workflows import ready_takeover, ready_body, overlapping_grant
+from tests.test_contribution_review_readiness import ready_takeover, ready_body
+from tests.test_contribution_review_workflows import overlapping_grant
 from tests.test_contribution_review_branch_admission import inspected_target, pending_outcome
 
 

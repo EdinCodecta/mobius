@@ -56,6 +56,7 @@ admin_router = _load("admin")
 agent_coordination_router = _load("agent_coordination")
 apps_router = _load("apps")
 app_services_router = _load("app_services")
+app_consent_router = _load("app_consent")
 app_tools_router = _load("app_tools")
 auth_router = _load("auth")
 chat_router = _load("chat")
@@ -115,6 +116,7 @@ __all__ = [
   "auth_router",
   "apps_router",
   "app_services_router",
+  "app_consent_router",
   "app_tools_router",
   "storage_router",
   "fs_router",

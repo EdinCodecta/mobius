@@ -69,6 +69,7 @@ async def start_programmatic_chat_turn(
   hidden: bool = False,
   message_kind: str | None = None,
   source_work_id: str | None = None,
+  goal_id: str | None = None,
 ) -> bool:
   """Durably start one system-initiated turn if the chat can be claimed.
 
@@ -100,6 +101,10 @@ async def start_programmatic_chat_turn(
       user_msg["kind"] = message_kind
     if source_work_id is not None:
       user_msg["source_work_id"] = source_work_id
+    from app.continuations import PEER_MESSAGE_WAKE_KIND
+    if goal_id is not None or message_kind == PEER_MESSAGE_WAKE_KIND:
+      # Capture ownership before the referenced physical source can rebind.
+      user_msg["goal_id"] = goal_id
     result = await await_ack(get_writer().submit(StartTurn(
       chat_id=chat_id,
       run_token=run_token,
@@ -233,6 +238,11 @@ async def start_programmatic_chat_continuation(
                 return False
               if is_chat_running(chat_id):
                 return True
+              # A retried receipt must not cross a newer owner-input barrier.
+              if programmatic_start_blocker(
+                db, chat_id, activation_wait_id=activation_wait_id,
+              ):
+                return False
               chat = db.query(models.Chat).filter(
                 models.Chat.id == chat_id,
                 models.Chat.deleted_at.is_(None),
@@ -358,6 +368,21 @@ async def start_programmatic_chat_continuation(
     raise
 
 
+def _activity_start_precheck(chat_id: str, run_token: str) -> tuple[bool, bool]:
+  """Whether the activity run exists, and whether a fresh start is blocked."""
+  from app.chat import programmatic_start_blocker
+  from app.database import SessionLocal
+
+  with SessionLocal() as db:
+    exists = db.query(models.ChatRun.id).filter(
+      models.ChatRun.id == run_token,
+      models.ChatRun.chat_id == chat_id,
+    ).first() is not None
+    return exists, (
+      False if exists else bool(programmatic_start_blocker(db, chat_id))
+    )
+
+
 async def start_programmatic_activity_continuation(
   *, chat_id: str, root_run_id: str, run_token: str,
   source_work_id: str, activity_id: str,
@@ -376,7 +401,6 @@ async def start_programmatic_activity_continuation(
     is_chat_running,
     is_draining,
     mark_starting,
-    programmatic_start_blocker,
   )
   from app.chat_writer import (
     FinishRun,
@@ -400,13 +424,19 @@ async def start_programmatic_activity_continuation(
           if is_draining():
             return False
           orphaned = None
+          # The common fresh start needs only these durable reads; do them
+          # in a worker. The locks held above order them against any start.
+          exists, blocked = await asyncio.to_thread(  # unsettled: read-only (run existence and start blockers)
+            _activity_start_precheck, chat_id, run_token,
+          )
+          # A drain may have begun during that read; its runs stay its own.
+          if is_draining() or (not exists and blocked):
+            return False
           with SessionLocal() as db:
             existing = db.query(models.ChatRun).filter(
               models.ChatRun.id == run_token,
               models.ChatRun.chat_id == chat_id,
-            ).first()
-            if existing is None and programmatic_start_blocker(db, chat_id):
-              return False
+            ).first() if exists else None
             if existing is not None:
               if (
                 (existing.root_run_id or existing.id) != root_run_id

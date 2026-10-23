@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from app import contribution_review_runs as domain, models
+from app import contribution_review_runs as domain, contribution_review_public as public, models
+from app.contribution_review_effects import DispatchResult
 from app.contribution_errors import ContributionSubmitError
 from app.database import SessionLocal
 from app.deps import Principal
@@ -77,6 +78,38 @@ def test_exact_clear_head_merges_once_and_replay_is_read_only(setup, monkeypatch
   assert report(setup)["run"]["items"][0]["state"] == "merged"
   report(setup)
   assert calls == [TARGET]
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_a_cancelled_report_holds_the_transition_lock_through_the_merge(
+  setup, monkeypatch, queued,
+):
+  """The merge or enqueue thread ends under the lock before the cancel lands."""
+  from app import chat_queue
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  db, row, principal = setup
+  monkeypatch.setattr(
+    domain, "pull_checks", lambda *args: {**CHECKS, "isMergeQueueEnabled": queued},
+  )
+  worker = BlockedWorker(
+    (lambda: {"id": "queue-1"}) if queued else (lambda: {"merged": True, "sha": "landed"}),
+  )
+  monkeypatch.setattr(domain, "enqueue" if queued else "perform_merge", worker)
+  data = {**ITEM, "state": "all_clear", "summary": "Full diff reviewed",
+          "scope": sorted(routes.SCOPE), "tests": "Focused tests passed"}
+
+  transition = chat_queue.get_transition_lock(f"review-outcome:{row.id}")
+  outcome = asyncio.run(cancel_while_worker_blocked(
+    SimpleNamespace(locked=transition._lock.locked),
+    lambda: routes.report_outcome(1, row.id, routes.ReviewOutcome(**data), db, principal),
+    worker,
+  ))
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  db.refresh(row)
+  # The armed attempt stays durable, so the next report reconciles, never replays.
+  assert row.outcomes_json[domain.key(ITEM)]["merge_attempted"] is True
 
 
 def test_foreign_chat_cannot_report_or_consume_grant(setup):
@@ -200,22 +233,15 @@ def test_github_blockers_stop_before_merge(changes):
 
 
 @pytest.mark.parametrize("rollup", [None, {"state": "SUCCESS"}])
-def test_merge_and_draft_readiness_agree_on_passing_or_absent_checks(rollup):
+def test_merge_accepts_passing_or_absent_checks(rollup):
   checks = {**CHECKS, "commits": {"nodes": [{"commit": {"statusCheckRollup": rollup}}]}}
   assert domain.merge_blocker(TARGET, REPO, PULL, checks) is None
-  assert domain.readiness_blocker(TARGET, REPO, {**PULL, "draft": True}, checks) is None
 
 
 @pytest.mark.parametrize("rollup", [{"state": "PENDING"}, {"state": "FAILURE"}, {}])
-def test_merge_and_draft_readiness_refuse_any_unsuccessful_rollup(rollup):
+def test_merge_refuses_any_unsuccessful_rollup(rollup):
   checks = {**CHECKS, "commits": {"nodes": [{"commit": {"statusCheckRollup": rollup}}]}}
   assert domain.merge_blocker(TARGET, REPO, PULL, checks)
-  assert domain.readiness_blocker(TARGET, REPO, {**PULL, "draft": True}, checks)
-
-
-def test_draft_readiness_still_requires_the_head_commit_check_result():
-  checks = {**CHECKS, "commits": {"nodes": []}}
-  assert domain.readiness_blocker(TARGET, REPO, {**PULL, "draft": True}, checks)
 
 
 def test_removed_permission_stops_merge():
@@ -516,6 +542,39 @@ def test_peer_owns_exact_merge_so_review_links_to_it_without_public_action(setup
   item = report(setup)["run"]["items"][0]
   assert item["state"] == "needs_you"
   assert item["review_chat_id"] == "peer-chat"
+  assert item["goal_follow_status"] == "no_open_top_level_goal"
+  assert "No new Goal follow was created" in item["summary"]
+
+
+@pytest.mark.parametrize("follow_status", ["followed", "result_owed"])
+def test_peer_claim_result_only_promises_goal_follow_when_registered(setup, monkeypatch, follow_status):
+  from app import agent_work_claims
+  db, row, principal = setup
+  monkeypatch.setattr(agent_work_claims, "claim_work", lambda *args, **kwargs: {
+    "state": "held_by_peer", "owner_chat_id": "peer-chat", "follow_status": follow_status,
+  })
+  result = domain.arm_merge(db, row, TARGET, {"head_sha": SHA}, principal)
+  assert result["goal_follow_status"] == follow_status
+  assert "Your Goal follows this claim" in result["summary"]
+
+
+@pytest.mark.parametrize("conflict", [
+  "The claim changed while following; inspect it before retrying.",
+  "Transfer would create a direct Goal dependency cycle.",
+])
+def test_claim_conflict_returns_409_without_merge_or_false_goal_follow(setup, monkeypatch, conflict):
+  from app import agent_work_claims
+  db, row, _ = setup
+  monkeypatch.setattr(agent_work_claims, "claim_work", lambda *args, **kwargs:
+    (_ for _ in ()).throw(ValueError(conflict)))
+  monkeypatch.setattr(domain, "perform_merge", lambda *args: pytest.fail("Claim conflict must not merge"))
+  with pytest.raises(HTTPException) as error:
+    report(setup)
+  assert error.value.status_code == 409
+  assert "No merge attempt was started" in error.value.detail
+  assert "no new Goal follow was created" in error.value.detail
+  db.refresh(row)
+  assert row.outcomes_json == {}
 
 
 @pytest.mark.parametrize("state", ["merging", "merge_unknown", "queued", "merged"])
@@ -765,14 +824,16 @@ def test_owner_requested_review_is_posted_once_as_a_comment_on_the_exact_head(se
     db.refresh(row)
     assert row.outcomes_json[domain.key(ITEM)]["public_review"]["state"] == "posting", "receipt before I/O"
     posts.append((target["head_sha"], body))
-    return {"id": 9, "url": "https://github.com/example/project/pull/7#pullrequestreview-9"}
-  monkeypatch.setattr(domain, "post_review", post)
+    return DispatchResult.confirmed({"id": 9, "url": "https://github.com/example/project/pull/7#pullrequestreview-9"})
+  monkeypatch.setattr(public, "post_review", post)
   monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("review only merged"))
   item = report(setup)["run"]["items"][0]
   assert item["state"] == "all_clear"
-  assert item["public_review"] == {"state": "posted", "id": 9, "url": "https://github.com/example/project/pull/7#pullrequestreview-9"}
+  assert item["public_review"]["state"] == "posted" and item["public_review"]["id"] == 9
+  assert item["public_review"]["evidence"]["summary"] == "Full diff reviewed"
   assert posts[0][0] == SHA and "All clear" in posts[0][1] and "Full diff reviewed" in posts[0][1]
-  report(setup, state="needs_you", summary="A later continuation")
+  with pytest.raises(HTTPException):
+    report(setup, state="needs_you", summary="A later continuation")
   assert len(posts) == 1, "an item's review is posted at most once"
 
 
@@ -781,8 +842,8 @@ def test_lost_review_post_is_unknown_and_never_replayed(setup, monkeypatch):
   calls = []
   def lost(*args):
     calls.append(1)
-    raise RuntimeError("lost response")
-  monkeypatch.setattr(domain, "post_review", lost)
+    return DispatchResult.unknown("lost response")
+  monkeypatch.setattr(public, "post_review", lost)
   assert report(setup)["run"]["items"][0]["public_review"]["state"] == "unknown"
   report(setup)
   assert calls == [1]
@@ -790,7 +851,7 @@ def test_lost_review_post_is_unknown_and_never_replayed(setup, monkeypatch):
 
 def test_reviews_are_private_without_the_opt_in_or_outside_review_only(setup, monkeypatch):
   db, row, _ = setup
-  monkeypatch.setattr(domain, "post_review", lambda *a: pytest.fail("posted without consent"))
+  monkeypatch.setattr(public, "post_review", lambda *a: pytest.fail("posted without consent"))
   row.mode = "review"
   db.commit()
   assert "public_review" not in report(setup)["run"]["items"][0]
@@ -805,15 +866,18 @@ def test_reviews_are_private_without_the_opt_in_or_outside_review_only(setup, mo
 def test_changed_github_account_skips_the_public_review(setup, monkeypatch):
   _public_review_run(setup)
   monkeypatch.setattr(domain, "read", lambda *args: {"id": 99})
-  monkeypatch.setattr(domain, "post_review", lambda *a: pytest.fail("posted as another account"))
-  assert report(setup)["run"]["items"][0]["public_review"]["state"] == "skipped"
+  monkeypatch.setattr(public, "post_review", lambda *a: pytest.fail("posted as another account"))
+  assert report(setup)["run"]["items"][0]["public_review"]["state"] == "not_dispatched"
 
 
 def test_post_review_writes_a_comment_review_bound_to_the_head():
   calls = []
-  def gh(_cwd, *args):
-    calls.append(args)
+  def gh(_cwd, *args, **kwargs):
+    calls.append((args, kwargs))
     return SimpleNamespace(stdout='{"id": 5, "html_url": "https://github.com/x"}')
-  assert domain.post_review(gh, "/tmp", TARGET, "Body") == {"id": 5, "url": "https://github.com/x"}
-  assert "event=COMMENT" in calls[0] and f"commit_id={SHA}" in calls[0]
-  assert not any("APPROVE" in part or "REQUEST_CHANGES" in part for part in calls[0])
+  result = public.post_review(gh, "/tmp", TARGET, "Body")
+  assert result.state == "confirmed" and result.receipt["id"] == 5
+  args, kwargs = calls[0]
+  payload = json.loads(kwargs["input_text"])
+  assert payload["event"] == "COMMENT" and payload["commit_id"] == SHA
+  assert args[-2:] == ("--input", "-")

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app.chat_writer import create_chat
 from app import contribution_review_runs as domain, contribution_review_repairs as repairs, models
+from app.contribution_review_effects import DispatchResult, NotDispatched
 from app.deps import Principal
 from app.routes import contribution_reviews as routes
 from tests.test_contribution_review_runs import setup, ITEM, TARGET, SHA, BASE, REPO, PULL, CHECKS, report
@@ -67,62 +68,20 @@ def completed_repairs(db, row, count):
   return head
 
 
-def ready_body(**changes):
-  return routes.DraftReady(**{**ITEM, "reviewed_base_sha": BASE,
-    "independent_receipt_id": "independent-clear", "summary": "Exact full diff is clear",
-    "scope": sorted(routes.SCOPE), "tests": "Hosted checks and focused tests passed",
-    "tests_passed": True, **changes})
-
-
-def ready_takeover(setup, monkeypatch):
-  db, row, principal = takeover(setup, monkeypatch)
-  row.options_json = {**row.options_json,
-    "confirmation_scope": "named_pr_repairs_ready_and_reviewed_successors"}
-  db.commit()
-  domain.save_outcome(db, row, domain.key(ITEM), {"state": "reviewing",
-    "independent_reviews": [{"id": "independent-clear", "head_sha": SHA,
-      "base_sha": BASE, "state": "all_clear", "tests_passed": True}]})
-  monkeypatch.setattr(domain, "current_pull", lambda *args: (REPO, {**PULL, "draft": True}))
-  return db, row, principal
-
-
-def test_draft_readiness_requires_new_frozen_scope_and_preserves_legacy_grant(setup, monkeypatch):
-  db, row, principal = takeover(setup, monkeypatch)
-  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("legacy grant widened"))
-  with pytest.raises(HTTPException) as error:
-    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  assert error.value.status_code == 403
-  assert not domain.draft_ready_allowed(row)
-
-
-def test_new_scope_is_distinct_frozen_capability_and_repair_stays_available(setup, monkeypatch):
-  db, row, _ = ready_takeover(setup, monkeypatch)
-  assert domain.draft_ready_allowed(row)
-  routes._repair_allowed(row)
-  assert "POST /api/github/contributions/1/review-runs/batch/ready" in domain.takeover_brief(row)
-  row.options_json = {**row.options_json,
-    "confirmation_scope": "named_pr_repairs_and_reviewed_successors"}
-  db.commit()
-  assert not domain.draft_ready_allowed(row)
-  assert "does not authorize marking a draft ready" in domain.takeover_brief(row)
-
-
 def test_review_presets_advertises_capabilities_outside_preview_hash(setup, monkeypatch):
   db, _, principal = setup
   owner = Principal(owner=principal.owner, app_id=None)
   monkeypatch.setattr(routes, "resolve_round_choice", lambda *a: {"provider": "codex", "model": "gpt-5", "effort": "xhigh"})
   before = routes.review_preview(1, routes.ReviewPreview(), db, owner)
-  assert routes.review_presets(1, db, owner)["capabilities"] == {"draft_takeover": True, "post_review": True}
-  assert routes.core_review_presets(db, owner)["capabilities"] == {"draft_takeover": True, "post_review": True}
+  assert routes.review_presets(1, db, owner)["capabilities"] == {"post_review": True, "review_fix_merge": True, "draft_takeover": True}
+  assert routes.core_review_presets(db, owner)["capabilities"] == {"post_review": True, "review_fix_merge": True, "draft_takeover": True}
   assert routes.review_preview(1, routes.ReviewPreview(), db, owner) == before
   assert "capabilities" not in before["options"]
 
 
 @pytest.mark.parametrize("post_review", [False, True])
 def test_cli_frozen_review_options_reproduce_the_server_preview(setup, monkeypatch, post_review):
-  spec = importlib.util.spec_from_file_location("github_review_cli", Path(__file__).parents[1] / "scripts/github_review.py")
-  cli = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(cli)
+  from scripts import github_review as cli
   db, _, principal = setup
   owner = Principal(owner=principal.owner, app_id=None)
   monkeypatch.setattr(routes, "resolve_round_choice", lambda *a: {"provider": "codex", "model": "gpt-5", "effort": "xhigh"})
@@ -133,280 +92,6 @@ def test_cli_frozen_review_options_reproduce_the_server_preview(setup, monkeypat
   # Start re-resolves exactly these options and must match the previewed hash.
   replay = routes._snapshot(db, routes.ReviewPreview(options=frozen), owner)
   assert routes._fingerprint(replay) == preview["preview_sha256"]
-
-
-def test_new_draft_scope_admits_open_draft_without_widening_old_request_id(setup, monkeypatch):
-  db, _, principal = setup
-  owner = Principal(owner=principal.owner, app_id=None)
-  monkeypatch.setattr(routes, "resolve_round_choice", lambda *a: {"provider": "codex", "model": "gpt-5", "effort": "xhigh"})
-  monkeypatch.setattr(domain, "inspect_target", lambda *a: {**TARGET, "head_repo": REPO["full_name"],
-    "head_repo_id": 1, "head_ref": "topic"})
-  monkeypatch.setattr(domain, "repair_file_scope", lambda *a: ["owned.py"])
-  monkeypatch.setattr(domain, "current_pull", lambda *a: (REPO, {**PULL, "draft": True}))
-  async def admit(**kwargs):
-    db.add(models.ChatRun(id="draft-admitted", chat_id=kwargs["chat_id"], status="stopped"))
-    db.commit()
-    return True
-  monkeypatch.setattr(routes, "start_programmatic_chat_turn", admit)
-  preview = routes.review_preview(1, routes.ReviewPreview(), db, owner)
-  body = routes.StartReviews(request_id="draft-grant-123", mode="review_fix_merge", items=[ITEM],
-    confirmation_scope="named_pr_repairs_ready_and_reviewed_successors",
-    preview_sha256=preview["preview_sha256"])
-  result = asyncio.run(routes.start_reviews(1, body, db, owner))
-  assert result["run"]["options"]["confirmation_scope"] == body.confirmation_scope
-  assert "POST /api/github/contributions/1/review-runs/" in result["brief"]
-  old = body.model_copy(update={"confirmation_scope": "named_pr_repairs_and_reviewed_successors"})
-  with pytest.raises(HTTPException) as error:
-    asyncio.run(routes.start_reviews(1, old, db, owner))
-  assert error.value.status_code == 409
-
-
-def test_mark_ready_uses_github_documented_graphql_mutation_and_validates_exact_head():
-  calls = []
-  def gh(_cwd, *args):
-    calls.append(args)
-    return SimpleNamespace(stdout='{"data":{"markPullRequestReadyForReview":{"pullRequest":{"id":"PR_7","isDraft":false,"headRefOid":"' + SHA + '"}}}}')
-  assert domain.mark_ready(gh, "/tmp", TARGET)["isDraft"] is False
-  assert "markPullRequestReadyForReview" in " ".join(calls[0])
-  def changed(_cwd, *args):
-    return SimpleNamespace(stdout='{"data":{"markPullRequestReadyForReview":{"pullRequest":{"id":"PR_7","isDraft":false,"headRefOid":"' + NEW + '"}}}}')
-  with pytest.raises(HTTPException):
-    domain.mark_ready(changed, "/tmp", TARGET)
-
-
-def test_draft_readiness_is_receipted_once_and_retry_only_observes(setup, monkeypatch):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  calls = []
-  stage = {"ready": False}
-  monkeypatch.setattr(domain, "current_pull", lambda *args: (REPO, {**PULL, "draft": not stage["ready"]}))
-  def mutate(*args):
-    db.refresh(row)
-    assert row.outcomes_json[domain.key(ITEM)]["ready_attempt"]["state"] == "attempting"
-    calls.append(1)
-    stage["ready"] = True
-    return {"id": "PR_7", "isDraft": False, "headRefOid": SHA}
-  monkeypatch.setattr(domain, "mark_ready", mutate)
-  first = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  assert first["run"]["items"][0]["ready_attempt"]["state"] == "ready"
-  monkeypatch.setattr(domain, "current_pull", lambda *args: (REPO, {**PULL, "draft": False}))
-  asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  assert calls == [1]
-
-
-def test_draft_in_repository_without_checks_can_be_marked_ready(setup, monkeypatch):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  monkeypatch.setattr(domain, "pull_checks", lambda *a: {**CHECKS,
-    "commits": {"nodes": [{"commit": {"statusCheckRollup": None}}]}})
-  stage = {"ready": False}
-  monkeypatch.setattr(domain, "current_pull", lambda *args: (REPO, {**PULL, "draft": not stage["ready"]}))
-  def mutate(*args):
-    stage["ready"] = True
-    return {"id": "PR_7", "isDraft": False, "headRefOid": SHA}
-  monkeypatch.setattr(domain, "mark_ready", mutate)
-  result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  assert result["run"]["items"][0]["ready_attempt"]["state"] == "ready"
-
-
-def test_uncertain_draft_readiness_never_replays_and_observe_reconciles(setup, monkeypatch):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  calls = []
-  def lost(*args):
-    calls.append(1)
-    raise RuntimeError("lost response")
-  monkeypatch.setattr(domain, "mark_ready", lost)
-  result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  assert result["run"]["items"][0]["ready_attempt"]["state"] == "unknown"
-  retry = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  assert retry["blocked"] and calls == [1]
-  monkeypatch.setattr(domain, "current_pull", lambda *args: (REPO, {**PULL, "draft": False}))
-  observed = asyncio.run(routes.observe_review(1, row.id, db, principal))
-  assert observed["run"]["items"][0]["ready_attempt"]["state"] == "ready"
-  assert calls == [1]
-
-
-def test_uncertain_readiness_blocks_repair_and_merge_until_observed(setup, monkeypatch):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  prior = row.outcomes_json[domain.key(ITEM)]
-  domain.save_outcome(db, row, domain.key(ITEM), {**prior,
-    "ready_attempt": {"state": "unknown", "head_sha": SHA, "base_sha": BASE}})
-  monkeypatch.setattr(repairs, "prepare_checkout", lambda *a: pytest.fail("repair after unknown ready"))
-  monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("merge after unknown ready"))
-  with pytest.raises(HTTPException) as error:
-    asyncio.run(routes.repair_checkout(1, row.id, checkout_body(), db, principal))
-  assert error.value.status_code == 409
-  with pytest.raises(HTTPException) as error:
-    asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
-  assert error.value.status_code == 409
-  with pytest.raises(HTTPException) as error:
-    report(setup, tests_passed=True, reviewed_base_sha=BASE,
-      independent_receipt_id="independent-clear")
-  assert error.value.status_code == 409
-  monkeypatch.setattr(domain, "current_pull", lambda *a: (REPO, {**PULL, "draft": False}))
-  assert asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]["items"][0]["ready_attempt"]["state"] == "ready"
-
-
-def test_stopped_run_can_only_observe_uncertain_readiness_read_only(setup, monkeypatch):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  prior = row.outcomes_json[domain.key(ITEM)]
-  domain.save_outcome(db, row, domain.key(ITEM), {**prior,
-    "ready_attempt": {"state": "unknown", "head_sha": SHA, "base_sha": BASE}})
-  db.get(models.ChatRun, principal.run_id).status = "stopped"
-  db.commit()
-  monkeypatch.setattr(domain, "current_pull", lambda *a: (REPO, {**PULL, "draft": False}))
-  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("stopped run repeated mutation"))
-  with pytest.raises(HTTPException):
-    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  result = asyncio.run(routes.observe_review(1, row.id, db, principal))
-  assert result["run"]["items"][0]["ready_attempt"]["state"] == "ready"
-  assert db.get(models.ChatRun, principal.run_id).status == "stopped"
-
-
-def test_draft_ready_then_exact_outcome_uses_existing_merge_gate(setup, monkeypatch):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  stage = {"ready": False}
-  calls = []
-  monkeypatch.setattr(domain, "current_pull", lambda *a: (REPO, {**PULL, "draft": not stage["ready"]}))
-  def ready(*a):
-    stage["ready"] = True
-    calls.append("ready")
-    return {"id": "PR_7", "isDraft": False, "headRefOid": SHA}
-  def merge(*a):
-    calls.append("merge")
-    return {"merged": True, "sha": "landed"}
-  monkeypatch.setattr(domain, "mark_ready", ready)
-  monkeypatch.setattr(domain, "perform_merge", merge)
-  assert asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))["run"]["items"][0]["ready_attempt"]["state"] == "ready"
-  result = report(setup, tests_passed=True, reviewed_base_sha=BASE,
-    independent_receipt_id="independent-clear")
-  assert result["run"]["items"][0]["state"] == "merged"
-  assert calls == ["ready", "merge"]
-
-
-def test_ready_response_with_changed_base_stays_unknown_and_cannot_merge(setup, monkeypatch):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  stage = {"ready": False}
-  monkeypatch.setattr(domain, "current_pull", lambda *a: (REPO, {**PULL, "draft": not stage["ready"]}))
-  def ready(*a):
-    stage["ready"] = True
-    monkeypatch.setattr(domain, "assert_current_base", lambda *a: (_ for _ in ()).throw(HTTPException(409, "base drift")))
-    return {"id": "PR_7", "isDraft": False, "headRefOid": SHA}
-  monkeypatch.setattr(domain, "mark_ready", ready)
-  result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  assert result["run"]["items"][0]["ready_attempt"]["state"] == "unknown"
-  assert asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]["items"][0]["ready_attempt"]["state"] == "unknown"
-
-
-@pytest.mark.parametrize("attempt_state, item_state, run_state", [
-  ("attempting", "marking_ready", "marking_ready"),
-  ("unknown", "ready_unknown", "needs_you"),
-])
-def test_ready_attempt_projection_keeps_private_review_evidence(setup, monkeypatch,
-                                                                  attempt_state, item_state, run_state):
-  db, row, _ = ready_takeover(setup, monkeypatch)
-  prior = row.outcomes_json[domain.key(ITEM)]
-  domain.save_outcome(db, row, domain.key(ITEM), {**prior,
-    "ready_attempt": {"state": attempt_state, "head_sha": SHA, "base_sha": BASE}})
-  result = domain.view(row)
-  assert result["state"] == run_state
-  assert result["items"][0]["state"] == item_state
-  assert result["items"][0]["independent_reviews"] == prior["independent_reviews"]
-  assert row.outcomes_json[domain.key(ITEM)]["state"] == "reviewing"
-
-
-@pytest.mark.parametrize("changed", ["actor", "model", "rights"])
-def test_post_mutation_identity_or_rights_drift_is_unknown_not_replayed(setup, monkeypatch, changed):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  stage = {"ready": False}
-  calls = []
-  def pull(*a):
-    repo = {**REPO, "permissions": {"push": False}} if changed == "rights" and stage["ready"] else REPO
-    return repo, {**PULL, "draft": not stage["ready"]}
-  def actor(*a):
-    return {"id": 999 if changed == "actor" and stage["ready"] else 42}
-  def mutate(*a):
-    stage["ready"] = True
-    calls.append(1)
-    if changed == "model":
-      db.get(models.Chat, row.chat_id).agent_settings_json = {"model": "another-model", "effort": "xhigh"}
-      db.commit()
-    return {"id": "PR_7", "isDraft": False, "headRefOid": SHA}
-  monkeypatch.setattr(domain, "current_pull", pull)
-  monkeypatch.setattr(domain, "read", actor)
-  monkeypatch.setattr(domain, "mark_ready", mutate)
-  result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  assert result["run"]["items"][0]["state"] == "ready_unknown"
-  assert result["run"]["items"][0]["ready_attempt"]["state"] == "unknown"
-  if changed == "model":
-    # Reconciliation is read-only, even when a changed model cannot call the
-    # owning mutation endpoint again.
-    assert calls == [1]
-  else:
-    retry = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-    assert retry["blocked"] and calls == [1]
-
-
-@pytest.mark.parametrize("invalid", [
-  {"tests_passed": False}, {"scope": ["correctness"] * 6},
-  {"reviewed_base_sha": "c" * 40}, {"independent_receipt_id": "missing"},
-])
-def test_draft_readiness_requires_exact_fresh_independent_evidence(setup, monkeypatch, invalid):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("insufficient evidence"))
-  with pytest.raises(HTTPException) as error:
-    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(**invalid), db, principal))
-  assert error.value.status_code in {409, 422}
-
-
-@pytest.mark.parametrize("case", ["checks", "actor", "stopped", "head"])
-def test_draft_readiness_rechecks_checks_actor_stop_and_head(setup, monkeypatch, case):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("preflight failed"))
-  if case == "checks":
-    monkeypatch.setattr(domain, "pull_checks", lambda *a: {**CHECKS,
-      "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "PENDING"}}}]}})
-  elif case == "actor":
-    monkeypatch.setattr(domain, "read", lambda *a: {"id": 999})
-  elif case == "stopped":
-    db.get(models.ChatRun, principal.run_id).status = "stopped"
-    db.commit()
-  else:
-    monkeypatch.setattr(domain, "current_pull", lambda *a: (REPO, {**PULL,
-      "draft": True, "head": {"sha": "c" * 40}}))
-    # The route must not trust a changed head even if a mocked fetch bypasses
-    # current_pull's identity guard.
-    monkeypatch.setattr(domain, "pull_checks", lambda *a: {**CHECKS, "headRefOid": "c" * 40})
-  with pytest.raises(HTTPException):
-    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-
-
-@pytest.mark.parametrize("case", ["actor", "permissions", "stop", "app"])
-def test_second_draft_preflight_refuses_revoked_identity_or_rights(setup, monkeypatch, case):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("no mutation after revocation"))
-  reads = {"actor": 0, "pull": 0, "checks": 0}
-  def actor(*a):
-    reads["actor"] += 1
-    return {"id": 999 if case == "actor" and reads["actor"] == 2 else 42}
-  def pull(*a):
-    reads["pull"] += 1
-    repo = {**REPO, "permissions": {"push": False}} if case == "permissions" and reads["pull"] == 2 else REPO
-    return repo, {**PULL, "draft": True}
-  def checks(*a):
-    reads["checks"] += 1
-    if reads["checks"] == 2 and case in {"stop", "app"}:
-      if case == "stop":
-        db.get(models.ChatRun, principal.run_id).status = "stopped"
-      else:
-        db.get(models.App, row.app_id).github_access = False
-      db.commit()
-    return CHECKS
-  monkeypatch.setattr(domain, "read", actor)
-  monkeypatch.setattr(domain, "current_pull", pull)
-  monkeypatch.setattr(domain, "pull_checks", checks)
-  with pytest.raises(HTTPException):
-    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  assert reads["checks"] == 2
-  assert not row.outcomes_json[domain.key(ITEM)].get("ready_attempt")
 
 
 @pytest.mark.parametrize("options", [None, {}, {"max_rounds": None}])
@@ -461,13 +146,14 @@ def test_both_repair_gates_allow_guarded_successors_beyond_former_caps(setup, mo
   checkout = {"checkout": "/fake/server-repair", "initial_head_sha": head,
     "allowed_files": ["owned.py"]}
   monkeypatch.setattr(repairs, "prepare_checkout", lambda *a: checkout)
-  monkeypatch.setattr(repairs, "validate_repair", lambda *a: {**checkout,
+  monkeypatch.setattr(repairs, "validate_repair", lambda *a, **kw: {**checkout,
     "head_sha": NEW, "files": ["owned.py"], "diff_sha256": "d" * 64})
   calls = []
   def push(*a, **kwargs):
     db.refresh(row)
     assert row.outcomes_json[domain.key(ITEM)]["repair_attempts"][-1]["state"] == "pushing"
     calls.append(1)
+    return DispatchResult.confirmed({})
   monkeypatch.setattr(repairs, "push_repair", push)
   assert asyncio.run(routes.repair_checkout(1, row.id, checkout_body(head), db, principal))["checkout"] == checkout
   result = asyncio.run(routes.publish_repair(1, row.id, publish_body(head), db, principal))
@@ -500,7 +186,7 @@ def test_both_repair_gates_keep_saved_finite_and_missing_limit_grants(setup, mon
   domain.save_outcome(db, row, domain.key(ITEM), {**previous,
     "checkout": {"initial_head_sha": head, "checkout": "/fake/server-repair"}})
   monkeypatch.setattr(repairs, "prepare_checkout", lambda *a: pytest.fail("exhausted grant"))
-  monkeypatch.setattr(repairs, "validate_repair", lambda *a: pytest.fail("exhausted grant"))
+  monkeypatch.setattr(repairs, "validate_repair", lambda *a, **kw: pytest.fail("exhausted grant"))
   action = routes.repair_checkout if gate == "checkout" else routes.publish_repair
   body = checkout_body(head) if gate == "checkout" else publish_body(head)
   with pytest.raises(HTTPException) as error:
@@ -582,15 +268,15 @@ def test_legacy_no_snapshot_retry_does_not_uncap_or_resume_stopped_work(setup, m
   assert "new defaults as old consent" in result["brief"]
 
 
-def test_review_only_all_clear_replay_rechecks_current_base(setup, monkeypatch):
+def test_review_only_all_clear_replay_preserves_historical_base(setup, monkeypatch):
   db, row, _ = setup
   row.mode = "review"
   db.commit()
   assert report(setup)["run"]["state"] == "complete"
   monkeypatch.setattr(domain, "assert_current_base", lambda *a: (_ for _ in ()).throw(HTTPException(409, "The target base drifted")))
   value = report(setup)["run"]
-  assert value["state"] == "needs_you"
-  assert "drifted" in value["items"][0]["summary"]
+  assert value["state"] == "complete"
+  assert value["items"][0]["summary"] == "Full diff reviewed"
 
 
 @pytest.mark.parametrize("mode", ["review", "review_merge"])
@@ -715,7 +401,7 @@ def configure_repair(setup, monkeypatch):
   db, row, principal = takeover(setup, monkeypatch)
   snapshot = {"checkout": "/fake/server-repair", "initial_head_sha": SHA, "allowed_files": ["owned.py"]}
   monkeypatch.setattr(repairs, "prepare_checkout", lambda *a: snapshot)
-  monkeypatch.setattr(repairs, "validate_repair", lambda *a: {**snapshot, "head_sha": NEW, "files": ["owned.py"], "diff_sha256": "d" * 64})
+  monkeypatch.setattr(repairs, "validate_repair", lambda *a, **kw: {**snapshot, "head_sha": NEW, "files": ["owned.py"], "diff_sha256": "d" * 64})
   asyncio.run(routes.repair_checkout(1, row.id, checkout_body(), db, principal))
   return db, row, principal
 
@@ -729,6 +415,7 @@ def test_guarded_push_receipt_is_durable_and_original_grant_immutable(setup, mon
     receipt = row.outcomes_json[domain.key(ITEM)]["repair_attempts"][0]
     assert receipt["state"] == "pushing" and receipt["head_sha"] == NEW
     calls.append(1)
+    return DispatchResult.confirmed({})
   monkeypatch.setattr(repairs, "push_repair", push)
   result = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
   assert row.targets_json == [original]
@@ -748,12 +435,12 @@ def test_push_confirmed_while_pull_head_projection_lags(setup, monkeypatch):
       raise HTTPException(409, "This pull request no longer matches the approved selection.")
     return REPO, PULL
   monkeypatch.setattr(domain, "current_pull", lagging_pull)
-  monkeypatch.setattr(repairs, "validate_repair", lambda *a: {"checkout": "/fake/server-repair",
+  monkeypatch.setattr(repairs, "validate_repair", lambda *a, **kw: {"checkout": "/fake/server-repair",
     "initial_head_sha": SHA, "allowed_files": ["owned.py"], "head_repo": "example/project",
     "head_repo_id": 1, "head_ref": "topic", "head_sha": NEW, "files": ["owned.py"], "diff_sha256": "d" * 64})
   pushes = []
-  monkeypatch.setattr(repairs, "_read", lambda *a: {"object": {"sha": NEW if pushes else SHA}})
-  monkeypatch.setattr(repairs, "_git", lambda *a, **kw: pushes.append(1) or SimpleNamespace(returncode=0))
+  monkeypatch.setattr(repairs, "push_repair", lambda *a, **kw:
+    pushes.append(1) or DispatchResult.confirmed({"head_sha": NEW}))
   result = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
   item = result["run"]["items"][0]
   assert item["repair_attempts"][0]["state"] == "pushed"
@@ -767,7 +454,7 @@ def test_lost_push_receipt_reconciles_without_second_public_request(setup, monke
   calls = []
   def lose(*a, **kwargs):
     calls.append(1)
-    raise TimeoutError()
+    return DispatchResult.unknown("Lost push response")
   monkeypatch.setattr(repairs, "push_repair", lose)
   result = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
   assert result["run"]["items"][0]["repair_attempts"][0]["state"] == "push_unknown"
@@ -813,7 +500,7 @@ def test_observation_reconciles_push_after_stop_without_agent_admission(setup, m
   calls = []
   def lose(*a, **kwargs):
     calls.append(1)
-    raise TimeoutError()
+    return DispatchResult.unknown("Lost push response")
   monkeypatch.setattr(repairs, "push_repair", lose)
   asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
   db.get(models.ChatRun, principal.run_id).status = "stopped"
@@ -885,6 +572,110 @@ def reviewer_context(setup, monkeypatch):
   body = routes.ReviewOutcome(**ITEM, state="all_clear", summary="Full diff reviewed",
     scope=sorted(routes.SCOPE), tests="Passing tests", tests_passed=True, reviewed_base_sha=BASE)
   return db, row, parent, child, reviewer, body
+
+
+def test_durable_reviewer_reports_after_spawning_turn_completes(setup, monkeypatch):
+  db, row, parent, _, reviewer, body = reviewer_context(setup, monkeypatch)
+  db.get(models.ChatRun, parent.run_id).status = "completed"
+  db.commit()
+  assert asyncio.run(routes.independent_review(1, row.id, body, db, reviewer))["independent_receipt_id"]
+
+
+def test_durable_wait_does_not_revoke_completed_parent_reviewer(setup, monkeypatch):
+  from datetime import timedelta
+  from app.timeutil import now_naive_utc
+  db, row, parent, _, reviewer, body = reviewer_context(setup, monkeypatch)
+  db.get(models.ChatRun, parent.run_id).status = "completed"
+  db.add(models.ChatWait(id="review-wait", chat_id=row.chat_id,
+    created_by_run_id=parent.run_id, root_run_id=parent.run_id,
+    description="Await independent review", condition_owner="Independent reviewer",
+    kind="timer", deadline_at=now_naive_utc() + timedelta(hours=1),
+    next_check_at=now_naive_utc() + timedelta(minutes=5), status="armed"))
+  db.commit()
+  assert asyncio.run(routes.independent_review(1, row.id, body, db, reviewer))["independent_receipt_id"]
+
+
+def test_unrelated_live_turn_cannot_revive_stopped_reviewer_root(setup, monkeypatch):
+  db, row, parent, _, reviewer, body = reviewer_context(setup, monkeypatch)
+  db.get(models.ChatRun, parent.run_id).status = "stopped"
+  db.add(models.ChatRun(id="unrelated-parent-run", chat_id=row.chat_id,
+    root_run_id="unrelated-parent-run", status="running"))
+  db.commit()
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.independent_review(1, row.id, body, db, reviewer))
+  assert error.value.status_code == 409
+
+
+def test_stopped_continuation_revokes_its_original_reviewer_root(setup, monkeypatch):
+  db, row, parent, _, reviewer, body = reviewer_context(setup, monkeypatch)
+  db.get(models.ChatRun, parent.run_id).status = "completed"
+  db.add(models.ChatRun(id="stopped-continuation", chat_id=row.chat_id,
+    root_run_id=parent.run_id, status="stopped"))
+  db.add(models.ChatRun(id="unrelated-parent-run", chat_id=row.chat_id,
+    root_run_id="unrelated-parent-run", status="running"))
+  db.commit()
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.independent_review(1, row.id, body, db, reviewer))
+  assert error.value.status_code == 409
+
+
+@pytest.mark.parametrize("goal_status, admitted", [("open", True), ("stopped", False)])
+def test_goal_owned_reviewer_follows_goal_lifecycle(setup, monkeypatch, goal_status, admitted):
+  db, row, parent, child, reviewer, body = reviewer_context(setup, monkeypatch)
+  db.add(models.ChatGoal(id="review-goal", chat_id=row.chat_id,
+    objective="Review", status=goal_status))
+  root = db.get(models.ChatRun, parent.run_id)
+  root.goal_id = "review-goal"
+  root.status = "completed"
+  child.parent_root_run_id = "review-goal"
+  db.add(models.ChatRun(id="unrelated-parent-run", chat_id=row.chat_id,
+    root_run_id="unrelated-parent-run", status="running"))
+  db.commit()
+  if admitted:
+    assert asyncio.run(routes.independent_review(1, row.id, body, db, reviewer))["independent_receipt_id"]
+  else:
+    with pytest.raises(HTTPException) as error:
+      asyncio.run(routes.independent_review(1, row.id, body, db, reviewer))
+    assert error.value.status_code == 409
+
+
+def test_spawning_root_stop_during_preflight_blocks_evidence(setup, monkeypatch):
+  from app.database import SessionLocal
+  db, row, parent, _, reviewer, body = reviewer_context(setup, monkeypatch)
+  def preflight(*args):
+    with SessionLocal() as other:
+      other.get(models.ChatRun, parent.run_id).status = "stopped"
+      other.add(models.ChatRun(id="unrelated-parent-run", chat_id=row.chat_id,
+        root_run_id="unrelated-parent-run", status="running"))
+      other.commit()
+    return REPO, PULL
+  monkeypatch.setattr(domain, "current_pull", preflight)
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.independent_review(1, row.id, body, db, reviewer))
+  assert error.value.status_code == 409
+  db.refresh(row)
+  assert not row.outcomes_json[domain.key(ITEM)].get("independent_reviews")
+
+
+def test_goal_hold_during_preflight_blocks_evidence(setup, monkeypatch):
+  from app.database import SessionLocal
+  db, row, parent, child, reviewer, body = reviewer_context(setup, monkeypatch)
+  db.add(models.ChatGoal(id="review-goal", chat_id=row.chat_id,
+    objective="Review", status="open"))
+  db.get(models.ChatRun, parent.run_id).goal_id = "review-goal"
+  child.parent_root_run_id = "review-goal"
+  db.commit()
+  def preflight(*args):
+    with SessionLocal() as other:
+      other.get(models.ChatGoal, "review-goal").status = "stopped"
+      other.commit()
+    return REPO, PULL
+  monkeypatch.setattr(domain, "current_pull", preflight)
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.independent_review(1, row.id, body, db, reviewer))
+  assert error.value.status_code == 409
+  db.refresh(row)
+  assert not row.outcomes_json[domain.key(ITEM)].get("independent_reviews")
 
 
 @pytest.mark.parametrize("block", ["legacy_read", "unregistered", "wrong_head", "wrong_base", "step_hash", "step_model", "step_effort"])
@@ -982,17 +773,21 @@ def test_stop_during_final_push_preflight_is_rechecked_before_public_io(setup, m
     with SessionLocal() as other:
       other.get(models.ChatRun, principal.run_id).status = "stopped"
       other.commit()
-    before_push()
+    try:
+      before_push()
+    except NotDispatched as exc:
+      return DispatchResult.not_dispatched(str(exc))
     pytest.fail("Public push must not happen after Stop")
   monkeypatch.setattr(repairs, "push_repair", preflight)
   result = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
-  assert result["run"]["items"][0]["repair_attempts"][0]["state"] == "push_unknown"
+  assert result["run"]["items"][0]["repair_attempts"] == []
+  assert "No push was attempted" in result["run"]["items"][0]["summary"]
 
 
 def test_cross_grant_uncertain_push_fence_cannot_be_replayed(setup, monkeypatch):
   db, row, principal = configure_repair(setup, monkeypatch)
   def lose(*a, **kw):
-    raise TimeoutError()
+    return DispatchResult.unknown("Lost push response")
   monkeypatch.setattr(repairs, "push_repair", lose)
   asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
   second = models.ContributionReviewRun(id="second-repair", app_id=1, owner_id=row.owner_id,
@@ -1009,7 +804,7 @@ def test_cross_grant_uncertain_push_fence_cannot_be_replayed(setup, monkeypatch)
 
 def test_confirmed_successor_with_fresh_independent_full_diff_can_merge(setup, monkeypatch):
   db, row, principal = configure_repair(setup, monkeypatch)
-  monkeypatch.setattr(repairs, "push_repair", lambda *a, **kw: None)
+  monkeypatch.setattr(repairs, "push_repair", lambda *a, **kw: DispatchResult.confirmed({}))
   asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
   target = domain.effective_target(row, row.targets_json[0])
   assert target["head_sha"] == NEW and row.targets_json[0]["head_sha"] == SHA
@@ -1145,6 +940,288 @@ def test_review_stop_records_a_goal_hold_naming_who_stopped_it(setup, monkeypatc
   goal = SimpleNamespace(status="open", hold_json=None, revision=0)
   stage_goal_hold(goal, cause="stop", actor=kwargs["actor"], source_id="stop", actor_id=kwargs["actor_id"])
   assert (goal_hold(goal) or {}).get("actor") == expected
+
+
+@pytest.mark.parametrize("goal_owned", [False, True])
+def test_review_stop_cascades_to_running_reviewer(setup, monkeypatch, goal_owned):
+  import app.chat
+  from app.database import SessionLocal
+  from app.routes import delegations as delegation_routes
+  from datetime import UTC, datetime
+  db, row, parent, child, _, _ = reviewer_context(setup, monkeypatch)
+  previous = row.outcomes_json[domain.key(ITEM)]
+  domain.save_outcome(db, row, domain.key(ITEM), {**previous, "state": "reviewing"})
+  if goal_owned:
+    db.add(models.ChatGoal(id="review-goal", chat_id=row.chat_id,
+      objective="Review", status="open"))
+    db.get(models.ChatRun, parent.run_id).goal_id = "review-goal"
+    child.parent_root_run_id = "review-goal"
+    db.commit()
+  async def stopped(chat_id, **kwargs):
+    assert chat_id == row.chat_id
+    return True, []
+  cancelled = []
+  async def cancel_child(delegation_id):
+    cancelled.append(delegation_id)
+    with SessionLocal() as other:
+      other.get(models.Delegation, delegation_id).cancelled_at = datetime.now(UTC)
+      other.commit()
+    return True
+  monkeypatch.setattr(app.chat, "stop_chat_for", stopped)
+  monkeypatch.setattr(delegation_routes, "cancel_delegation_execution", cancel_child)
+  result = asyncio.run(routes.stop_review(1, row.id, db,
+    Principal(owner=parent.owner, app_id=None)))
+  assert result["stopped"] is True
+  assert cancelled == [child.id]
+  db.refresh(child)
+  assert child.cancelled_at is not None
+
+
+def test_review_stop_fences_completed_parent_before_child_cancel_wait(setup, monkeypatch):
+  from app import chat_queue
+  from app.database import SessionLocal
+  from app.routes import delegations as delegation_routes
+  db, row, parent, child, reviewer, body = reviewer_context(setup, monkeypatch)
+  previous = row.outcomes_json[domain.key(ITEM)]
+  domain.save_outcome(db, row, domain.key(ITEM), {**previous, "state": "reviewing"})
+  db.get(models.ChatRun, parent.run_id).status = "completed"
+  db.commit()
+  real_cascade = delegation_routes.cancel_active_for_parent
+  cascade_started = asyncio.Event()
+
+  async def cascade(*args):
+    cascade_started.set()
+    return await real_cascade(*args)
+
+  monkeypatch.setattr(delegation_routes, "cancel_active_for_parent", cascade)
+
+  async def exercise():
+    async with chat_queue.get_transition_lock(child.child_chat_id):
+      stopping = asyncio.create_task(routes.stop_review(1, row.id, db,
+        Principal(owner=parent.owner, app_id=None)))
+      await asyncio.wait_for(cascade_started.wait(), 10)
+      assert not stopping.done()  # The child cancellation still awaits its lock.
+      with SessionLocal() as evidence_db:
+        with pytest.raises(HTTPException) as error:
+          await routes.independent_review(1, row.id, body, evidence_db, reviewer)
+        assert error.value.status_code == 409
+    assert (await asyncio.wait_for(stopping, 10))["stopped"] is True
+
+  asyncio.run(exercise())
+
+
+def test_review_stop_reports_child_timeout_and_keeps_evidence_revoked(setup, monkeypatch):
+  import app.chat
+  from app.database import SessionLocal
+  db, row, parent, child, reviewer, body = reviewer_context(setup, monkeypatch)
+  previous = row.outcomes_json[domain.key(ITEM)]
+  domain.save_outcome(db, row, domain.key(ITEM), {**previous, "state": "reviewing"})
+  db.get(models.ChatRun, parent.run_id).status = "completed"
+  db.commit()
+  real_stop_locked = app.chat._stop_chat_for_locked
+
+  async def stop_locked(chat_id, *args, **kwargs):
+    if chat_id == child.child_chat_id:
+      return False, []  # Child provider is still draining.
+    return await real_stop_locked(chat_id, *args, **kwargs)
+
+  monkeypatch.setattr(app.chat, "_stop_chat_for_locked", stop_locked)
+  monkeypatch.setattr(app.chat, "is_chat_running", lambda chat_id: chat_id == child.child_chat_id)
+
+  async def exercise():
+    result = await routes.stop_review(1, row.id, db,
+      Principal(owner=parent.owner, app_id=None))
+    assert result["stopped"] is False
+    db.refresh(child)
+    assert child.cancelled_at is None
+    assert db.get(models.ChatRun, reviewer.run_id).status == "running"
+    with SessionLocal() as evidence_db:
+      with pytest.raises(HTTPException) as error:
+        await routes.independent_review(1, row.id, body, evidence_db, reviewer)
+      assert error.value.status_code == 409
+
+  asyncio.run(exercise())
+
+
+def test_review_stop_revokes_later_parent_public_actions(setup, monkeypatch):
+  import app.chat
+  db, row, parent = takeover(setup, monkeypatch)
+  async def stopped(*args, **kwargs):
+    return True, []
+  monkeypatch.setattr(app.chat, "stop_chat_for", stopped)
+  assert asyncio.run(routes.stop_review(1, row.id, db,
+    Principal(owner=parent.owner, app_id=None)))["stopped"] is True
+  db.add(models.ChatRun(id="later-owner-run", chat_id=row.chat_id,
+    root_run_id="later-owner-run", status="running"))
+  db.commit()
+  later = Principal(owner=parent.owner, app_id=None, chat_id=row.chat_id,
+    run_id="later-owner-run")
+  monkeypatch.setattr(domain, "current_pull", lambda *args: pytest.fail("stopped grant reached GitHub"))
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.report_outcome(1, row.id, routes.ReviewOutcome(**ITEM,
+      state="all_clear", summary="Clear", scope=sorted(routes.SCOPE),
+      tests="Passing", tests_passed=True), db, later))
+  assert error.value.status_code == 409
+
+
+@pytest.mark.parametrize("pause_at", ["current_pull", "pull_checks"])
+def test_stop_fences_unadmitted_merge_during_remote_preflight(setup, monkeypatch, pause_at):
+  from threading import Event
+  from app.database import SessionLocal
+  from tests.test_contribution_review_runs import REPO, PULL, CHECKS
+  db, row, parent = takeover(setup, monkeypatch)
+  domain.save_outcome(db, row, domain.key(ITEM), {"state": "reviewing",
+    "independent_reviews": [{"id": "clear", "head_sha": SHA, "base_sha": BASE,
+      "state": "all_clear", "tests_passed": True}]})
+  entered, release = Event(), Event()
+  public_calls = []
+
+  def remote(*args):
+    entered.set()
+    assert release.wait(10)
+    return (REPO, PULL) if pause_at == "current_pull" else CHECKS
+
+  monkeypatch.setattr(domain, pause_at, remote)
+  monkeypatch.setattr(domain, "perform_merge", lambda *args:
+    public_calls.append("merge") or {"merged": True, "sha": "landed"})
+  real_save = domain.save_outcome
+
+  async def exercise():
+    fenced = asyncio.Event()
+    def save(db_arg, review_row, item_key, outcome):
+      result = real_save(db_arg, review_row, item_key, outcome)
+      if item_key == routes.REVIEW_STOP_KEY:
+        fenced.set()
+      return result
+    monkeypatch.setattr(domain, "save_outcome", save)
+    with SessionLocal() as report_db, SessionLocal() as stop_db:
+      body = routes.ReviewOutcome(**ITEM, state="all_clear", summary="Clear",
+        scope=sorted(routes.SCOPE), tests="Passing", tests_passed=True,
+        reviewed_base_sha=BASE, independent_receipt_id="clear")
+      reporting = asyncio.create_task(routes.report_outcome(1, row.id, body, report_db, parent))
+      assert await asyncio.to_thread(entered.wait, 10)
+      stopping = asyncio.create_task(routes.stop_review(1, row.id, stop_db,
+        Principal(owner=parent.owner, app_id=None)))
+      try:
+        await asyncio.wait_for(fenced.wait(), 2)
+        with SessionLocal() as check_db:
+          saved = check_db.get(models.ContributionReviewRun, row.id)
+          assert routes._review_stop_requested(saved)
+          assert not saved.outcomes_json[domain.key(ITEM)].get("merge_attempted")
+        assert not public_calls
+      finally:
+        release.set()
+        report_result, stop_result = await asyncio.wait_for(asyncio.gather(
+          reporting, stopping, return_exceptions=True), 10)
+      assert not public_calls
+      assert isinstance(report_result, HTTPException) and report_result.status_code == 409
+      assert not isinstance(stop_result, Exception) and stop_result["stopped"] is True
+
+  asyncio.run(exercise())
+
+
+def test_stop_after_durable_merge_admission_only_reconciles_that_attempt(setup, monkeypatch):
+  from threading import Event
+  from app.database import SessionLocal
+  from tests.test_contribution_review_runs import REPO, PULL
+  db, row, parent = setup
+  entered, release = Event(), Event()
+  public_calls = []
+
+  def admitted_merge(*args):
+    public_calls.append("merge")
+    entered.set()
+    assert release.wait(10)
+    return {"merged": True, "sha": "landed"}
+
+  monkeypatch.setattr(domain, "perform_merge", admitted_merge)
+  real_save = domain.save_outcome
+
+  async def exercise():
+    fenced = asyncio.Event()
+    def save(db_arg, review_row, item_key, outcome):
+      result = real_save(db_arg, review_row, item_key, outcome)
+      if item_key == routes.REVIEW_STOP_KEY:
+        fenced.set()
+      return result
+    monkeypatch.setattr(domain, "save_outcome", save)
+    with SessionLocal() as report_db, SessionLocal() as stop_db:
+      body = routes.ReviewOutcome(**ITEM, state="all_clear", summary="Clear",
+        scope=sorted(routes.SCOPE), tests="Passing")
+      reporting = asyncio.create_task(routes.report_outcome(1, row.id, body, report_db, parent))
+      assert await asyncio.to_thread(entered.wait, 10)
+      stopping = asyncio.create_task(routes.stop_review(1, row.id, stop_db,
+        Principal(owner=parent.owner, app_id=None)))
+      try:
+        await asyncio.wait_for(fenced.wait(), 2)
+        with SessionLocal() as check_db:
+          saved = check_db.get(models.ContributionReviewRun, row.id)
+          assert saved.outcomes_json[domain.key(ITEM)]["merge_attempted"] is True
+          assert routes._review_stop_requested(saved)
+      finally:
+        release.set()
+        report_result, stop_result = await asyncio.wait_for(asyncio.gather(
+          reporting, stopping, return_exceptions=True), 10)
+    assert public_calls == ["merge"]
+    assert not isinstance(report_result, Exception)
+    assert report_result["run"]["items"][0]["merge_attempted"] is True
+    assert not isinstance(stop_result, Exception) and stop_result["stopped"] is True
+    with SessionLocal() as observed_db:
+      saved = observed_db.get(models.ContributionReviewRun, row.id)
+      assert saved.outcomes_json[domain.key(ITEM)]["merge_attempted"] is True
+      monkeypatch.setattr(domain, "current_pull", lambda *args:
+        (REPO, {**PULL, "merged": True, "merge_commit_sha": "landed"}))
+      viewed = await routes.observe_review(1, row.id, observed_db,
+        Principal(owner=parent.owner, app_id=None))
+      assert viewed["run"]["items"][0]["state"] == "merged"
+      assert public_calls == ["merge"]
+
+  asyncio.run(exercise())
+
+
+def test_stop_allows_read_only_observation_of_prior_merge_attempt(setup, monkeypatch):
+  from app.database import SessionLocal
+  from tests.test_contribution_review_runs import REPO, PULL
+  db, row, parent = setup
+  domain.save_outcome(db, row, domain.key(ITEM), {"state": "merge_unknown",
+    "head_sha": SHA, "merge_attempted": True})
+  owner = Principal(owner=parent.owner, app_id=None)
+  assert asyncio.run(routes.stop_review(1, row.id, db, owner))["stopped"] is True
+  monkeypatch.setattr(domain, "perform_merge", lambda *args: pytest.fail("observation retried merge"))
+  monkeypatch.setattr(domain, "current_pull", lambda *args:
+    (REPO, {**PULL, "merged": True, "merge_commit_sha": "landed"}))
+  with SessionLocal() as observed_db:
+    view = asyncio.run(routes.observe_review(1, row.id, observed_db, owner))["run"]
+    assert view["state"] == "complete"
+    assert view["items"][0]["merge_sha"] == "landed"
+    saved = observed_db.get(models.ContributionReviewRun, row.id)
+    assert routes._review_stop_requested(saved)
+    assert routes.get_review(1, row.id, observed_db, owner)["run"]["state"] == "complete"
+    observed_db.add(models.ChatRun(id="later-observation-run", chat_id=row.chat_id,
+      root_run_id="later-observation-run", status="running"))
+    observed_db.commit()
+    with pytest.raises(HTTPException) as error:
+      routes._parent(observed_db, saved, Principal(owner=parent.owner, app_id=None,
+        chat_id=row.chat_id, run_id="later-observation-run"))
+    assert error.value.status_code == 409
+
+
+@pytest.mark.parametrize("terminal", [True, False])
+def test_model_drift_preserves_terminal_history_but_gates_unfinished_run(setup, monkeypatch, terminal):
+  db, row, _ = takeover(setup, monkeypatch)
+  target = row.targets_json[0]
+  if terminal:
+    domain.save_outcome(db, row, domain.key(target), {
+      "state": "merged", "head_sha": target["head_sha"], "merge_sha": "landed"})
+  chat = db.get(models.Chat, row.chat_id)
+  chat.agent_settings_json = {"model": "different", "effort": "high"}
+  db.commit()
+  view = routes._run_view(db, row)
+  assert view["state"] == ("complete" if terminal else "needs_you")
+  if terminal:
+    assert view["items"][0]["state"] == "merged"
+  else:
+    assert "model choice" in view["summary"]
 
 
 def test_app_read_projection_stays_owner_scoped_and_excludes_other_app_grants(setup):
@@ -1415,125 +1492,6 @@ def test_pending_receipt_does_not_hide_corrupted_confirmed_successor(setup, monk
   assert error.value.status_code == 409
 
 
-@pytest.mark.parametrize("state", ["pushing", "push_unknown"])
-@pytest.mark.parametrize("overlap", [False, True])
-def test_draft_ready_cannot_cross_pending_repair_with_lagging_head(setup, monkeypatch, state, overlap):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  grant = overlapping_grant(db, row) if overlap else row
-  previous = grant.outcomes_json.get(domain.key(ITEM), {})
-  domain.save_outcome(db, grant, domain.key(ITEM), {**previous, "state": "needs_you",
-    "repair_attempts": [{"state": state, "from_sha": SHA, "head_sha": NEW, "base_sha": BASE}]})
-  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("PUBLIC_READY"))
-  with pytest.raises(HTTPException) as error:
-    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  assert error.value.status_code == 409
-  assert not row.outcomes_json[domain.key(ITEM)].get("ready_attempt")
-
-
-@pytest.mark.parametrize("state", ["merge_unknown", "queued"])
-def test_draft_ready_cannot_cross_overlapping_pending_merge(setup, monkeypatch, state):
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  peer = overlapping_grant(db, row)
-  domain.save_outcome(db, peer, domain.key(ITEM), {"state": state,
-    "head_sha": SHA, "merge_attempted": True})
-  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("PUBLIC_READY"))
-  with pytest.raises(HTTPException) as error:
-    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  assert error.value.status_code == 409
-  assert not row.outcomes_json[domain.key(ITEM)].get("ready_attempt")
-
-
-@pytest.mark.parametrize("other_action", ["merge", "repair"])
-@pytest.mark.parametrize("same_item", [False, True])
-def test_readiness_and_incompatible_action_share_database_admission_fence(setup, monkeypatch, other_action, same_item):
-  from concurrent.futures import ThreadPoolExecutor
-  from threading import Barrier
-  from app import agent_work_claims
-  from app.database import SessionLocal
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  peer = overlapping_grant(db, row, number=None if same_item else 8)
-  target, peer_target = dict(row.targets_json[0]), dict(peer.targets_json[0])
-  real_claim = agent_work_claims.claim_work
-  barrier = Barrier(2)
-  def claim(*args, **kwargs):
-    result = real_claim(*args, **kwargs)
-    barrier.wait(timeout=10)
-    return result
-  monkeypatch.setattr(agent_work_claims, "claim_work", claim)
-  def arm(action):
-    with SessionLocal() as session:
-      current = session.get(models.ContributionReviewRun, row.id if action == "ready" else peer.id)
-      try:
-        if action == "ready":
-          result = domain.arm_ready(session, current, target, {"id": "ready", "state": "attempting",
-            "head_sha": SHA, "base_sha": BASE}, principal)
-        elif action == "repair":
-          result = domain.arm_repair(session, current, peer_target, {}, {"id": "repair", "state": "pushing",
-            "from_sha": SHA, "head_sha": NEW, "base_sha": BASE}, principal)
-        else:
-          result = domain.arm_merge(session, current, peer_target, {"head_sha": SHA}, principal)
-        assert result is None
-        return "admitted"
-      except HTTPException as exc:
-        session.rollback()
-        assert exc.status_code == 409
-        return "blocked"
-  with ThreadPoolExecutor(max_workers=2) as pool:
-    results = list(pool.map(arm, ["ready", other_action]))
-  assert sorted(results) == ["admitted", "blocked"]
-  with SessionLocal() as restarted:
-    assert sum(bool(item.get("ready_attempt") or item.get("merge_attempted") or item.get("repair_attempts"))
-      for grant in restarted.query(models.ContributionReviewRun).all()
-      for item in grant.outcomes_json.values()) == 1
-
-
-@pytest.mark.parametrize("pending", ["merge", "repair"])
-def test_readiness_revalidates_pending_public_actions_after_claim_commit(setup, monkeypatch, pending):
-  from app import agent_work_claims
-  from app.database import SessionLocal
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  peer = overlapping_grant(db, row)
-  target = dict(row.targets_json[0])
-  real_claim = agent_work_claims.claim_work
-  def claim(*args, **kwargs):
-    result = real_claim(*args, **kwargs)
-    with SessionLocal() as writer:
-      saved = writer.get(models.ContributionReviewRun, peer.id)
-      outcome = ({"state": "queued", "merge_attempted": True, "head_sha": SHA}
-        if pending == "merge" else {"state": "needs_you", "repair_attempts": [
-          {"state": "push_unknown", "from_sha": SHA, "head_sha": NEW, "base_sha": BASE}]})
-      domain.save_outcome(writer, saved, domain.key(ITEM), outcome)
-    return result
-  monkeypatch.setattr(agent_work_claims, "claim_work", claim)
-  with pytest.raises(HTTPException) as error:
-    domain.arm_ready(db, row, target, {"id": "ready", "state": "attempting",
-      "head_sha": SHA, "base_sha": BASE}, principal)
-  assert error.value.status_code == 409
-  db.rollback()
-  db.refresh(row)
-  assert not row.outcomes_json[domain.key(ITEM)].get("ready_attempt")
-
-
-@pytest.mark.parametrize("action", ["merge", "repair"])
-def test_pending_readiness_in_overlapping_grant_blocks_other_public_actions(setup, monkeypatch, action):
-  db, row, principal = configure_repair(setup, monkeypatch)
-  peer = overlapping_grant(db, row)
-  domain.save_outcome(db, peer, domain.key(ITEM), {"state": "reviewing", "ready_attempt": {
-    "state": "unknown", "head_sha": SHA, "base_sha": BASE}})
-  target = dict(row.targets_json[0])
-  with pytest.raises(HTTPException) as error:
-    if action == "merge":
-      domain.arm_merge(db, row, target, {"head_sha": SHA}, principal)
-    else:
-      domain.arm_repair(db, row, target, {}, {"state": "pushing", "from_sha": SHA,
-        "head_sha": NEW, "base_sha": BASE}, principal)
-  assert error.value.status_code == 409
-  db.rollback()
-  db.refresh(row)
-  assert not row.outcomes_json[domain.key(ITEM)].get("repair_attempts")
-  assert not row.outcomes_json[domain.key(ITEM)].get("merge_attempted")
-
-
 def test_merge_keeps_new_server_receipts_admitted_during_claim_commit(setup, monkeypatch):
   from app import agent_work_claims
   from app.database import SessionLocal
@@ -1582,26 +1540,3 @@ def test_stop_observation_and_parent_resume_do_not_clear_pending_repair_admissio
   db.refresh(row)
   assert row.outcomes_json[domain.key(ITEM)]["repair_attempts"] == [attempt]
   assert not row.outcomes_json[domain.key(ITEM)].get("merge_attempted")
-
-
-def test_merge_retains_ready_receipt_resolved_during_claim_commit(setup, monkeypatch):
-  from app import agent_work_claims
-  from app.database import SessionLocal
-  db, row, principal = ready_takeover(setup, monkeypatch)
-  real_claim = agent_work_claims.claim_work
-  receipt = {"id": "confirmed-ready", "state": "ready", "head_sha": SHA, "base_sha": BASE}
-  def claim(*args, **kwargs):
-    result = real_claim(*args, **kwargs)
-    with SessionLocal() as writer:
-      current = writer.get(models.ContributionReviewRun, row.id)
-      previous = current.outcomes_json[domain.key(ITEM)]
-      domain.save_outcome(writer, current, domain.key(ITEM), {**previous, "ready_attempt": receipt})
-    return result
-  monkeypatch.setattr(agent_work_claims, "claim_work", claim)
-  monkeypatch.setattr(domain, "current_pull", lambda *a: (REPO, {**PULL, "draft": False}))
-  monkeypatch.setattr(domain, "perform_merge", lambda *a: {"merged": True, "sha": "landed"})
-  result = report(setup, tests_passed=True, reviewed_base_sha=BASE,
-    independent_receipt_id="independent-clear")
-  item = result["run"]["items"][0]
-  assert item["state"] == "merged" and item["ready_attempt"] == receipt
-  assert item["independent_reviews"][0]["id"] == "independent-clear"

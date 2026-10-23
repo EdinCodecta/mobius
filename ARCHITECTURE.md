@@ -130,6 +130,8 @@ The owner's customizations end up *on top of* the current release, as if they'd 
 - **Clean merge** → the merged tree is replayed as a single-parent commit on the new `upstream` tip and the app recompiles onto the new code.
 - **Conflict** (the release and the local edits touched the same lines) → an **owner-clicked agent chat** resolves it. The update attempt records the new upstream plus a durable receipt bound to every fetched source/static/icon/seed byte, and leaves live files untouched. When the owner chooses "Resolve in chat", apps materialize standard conflict markers (`start_conflict_merge`, a `git merge --no-commit --no-ff upstream`) for the agent to edit; the platform updater leaves the live tree untouched and writes the markers into its isolated candidate worktree for the resolver. Saving marker-free source records a *single-parent replay* — `--no-ff` points `MERGE_HEAD` at the upstream tip and the commit takes only that one parent, so even a resolved conflict stays linear (`A → B → X`), never the 2-parent commit a plain `git merge` would leave. The canonical installer then verifies the receipt and promotes source, bundle, static files, DB metadata, icon, seeds, cron, and skills through its normal lifecycle. If fetch/materialization fails after the source commit, the previous app remains served and the receipt survives for startup/user retry. Both app and platform conflicts are click-gated: the update surfaces `mode=conflict` / conflict paths or a Settings conflict state, and the owner chooses "Resolve in chat" before an agent turn starts. The owner never hand-merges; back out with `git merge --abort`.
 
+**Store update batches run on the server.** "Update all" in the App Store posts the exact reviewed commits (`POST /api/apps/update-batches` with a client-chosen batch id; per app: `app_id`, `manifest_url`, `upstream_commit`, `source_digest`, `capability_digest`). `app_update_batches.py` writes one receipt per batch under `/data/app-update-batches/` before it starts work, then runs every entry through `install.install_requested_app`, the same path a single reviewed update takes. At most two entries run at once across all batches. Their Git transfers overlap outside every lock while leaving transfer workers for interactive installs. The other entries stay `queued`. Each local install then takes the lifecycle lock in turn. One entry's failure or conflict never stops its siblings. The Store follows progress with `GET /api/apps/update-batches[/{id}]` and the `/{id}/events` SSE stream, so closing the tab changes nothing. Retrying the same id attaches to the batch already running, never a second one. An app already updating in another batch is refused with `409 app_update_running`. A conflicted entry shows its resolver chat. It becomes `updated` once the accepted source contains the reviewed commit and no pending-update receipt remains. On shutdown the owner cancels running entries; each install settles its current pass before releasing its locks. A planned restart kills the process about 30 s after shutdown begins, so a restart during "Update all" usually leaves running entries to boot settlement, and queued entries become not applied. Recovery never replays an approval. Restart, cancellation and later refreshes all use one rule to decide whether an update landed. It is `updated` only if the accepted `source_commit` contains the reviewed commit and no pending-update receipt names that commit. A later update's receipt or a leftover pending directory doesn't count. It is `conflict` only if a pending-update receipt names that commit. Otherwise the entry is `failed` (`update_not_applied`). A failed entry keeps the installer's `error_code` and `retryable`. Finished receipts are kept for 30 days. If the receipts are unreadable, only batch updates are disabled (503); the next request retries the read, and the receipt files are left in place.
+
 The platform clone fetches the selected target and fast-forwards when local
 `main` is already contained in it. Otherwise it compares the final local and
 upstream trees once, records the reconciled tree as one local commit on the
@@ -205,7 +207,7 @@ and any newly added runtime module stay image-owned.
 | **Mini-apps** (`/data/apps/<slug>`) | `.git` per app (installed apps; agent-built bespoke apps have no upstream to track) | yes — whole source tree on `upstream`, single-parent replay, so **multi-file apps update cleanly** | `backend/app/app_git.py` + `install.py` |
 | **Platform** (`/data/platform` — backend *and* frontend) | `.git` | yes — clone-native `git fetch origin`, then fast-forward or merge the final trees once into an isolated candidate (off-tree conflict handling, import probe with rollback); ancestry availability (`origin/main` not yet an ancestor of local `main`) | `backend/app/platform_update.py` |
 
-Mini-apps use **one** small tree-aware engine (`app_git.py`): `record_upstream` commits the *whole source tree* on `upstream`, `merge_upstream` verdicts a clean-vs-conflict via `git merge-tree`, and a clean apply records the merged tree as a **single-parent** commit on top of `upstream` (linear `A→B→X`). Mini-apps are thin callers of that primitive — they pass their own source tree. The platform (backend + frontend, one served clone) is clone-native instead: it uses `git fetch origin`, a provably lossless fast-forward when possible, and otherwise compares the final trees once rather than replaying historical local commits. Mini-app update discovery is different: the store compares the catalog manifest version against the installed `App.version` (the new release lives in the remote catalog, so a local ancestry check can't see it). There is no per-surface protected-file scaffolding.
+Mini-apps use **one** small tree-aware engine (`app_git.py`): `record_upstream` commits the *whole source tree* on `upstream`, `merge_upstream` verdicts a clean-vs-conflict via `git merge-tree`, and a clean apply records the merged tree as a **single-parent** commit on top of `upstream` (linear `A→B→X`). Mini-apps are thin callers of that primitive — they pass their own source tree. The platform (backend + frontend, one served clone) is clone-native instead: it uses `git fetch origin`, a provably lossless fast-forward when possible, and otherwise compares the final trees once rather than replaying historical local commits. Mini-app update discovery is different: the new release lives in the remote catalog, so a local ancestry check can't see it; `update-check` fetches the candidate commit and compares its package with the recorded `upstream` (see *Update discovery* under the manifest section). There is no per-surface protected-file scaffolding.
 
 ## Backend (`backend/app/`)
 
@@ -248,13 +250,20 @@ FastAPI app. `main.py` is the factory (CORS, rate limiting, routers, static serv
 | File | Role |
 |------|------|
 | `install.py` | Atomic install + update lifecycle for mini-apps from a manifest |
+| `pending_update.py` | A Store update parked on a conflict: its receipt under the app's `.git`, the resolver's private checkout beside it, and clearing both once the resolution is installed |
+| `app_skills.py` | Shared skills an app's manifest declares: the post-install sync into `/data/shared/skills` with its ownership sidecar, and deactivate/restore/purge across uninstall and recovery |
+| `git_transfers.py` | Git clones and fetches into private staging on their own small pool, outside any app lock; one shared transfer per commit; `OriginMismatch` refuses a source that is not the app's origin |
+| `app_update_batches.py` | Server-owned reviewed update batches: durable per-batch receipts, concurrent entries through the single-update path, restart settlement from app rows |
 | `app_git.py` | Per-app git repo (`/data/apps/<slug>/.git`): pristine `upstream` history + a local working branch |
 | `app_apply.py` | Explicitly validates, commits, compiles, and publishes one coherent mini-app source revision |
 | `storage_io.py` | Filesystem helpers for per-app + shared storage; lives apart from `routes/storage.py` so `install.py` can reuse it. Also owns `etag_matches()`, the If-Match CAS compare — RFC 9110-correct (wildcard, weak tags, multi-value) plus deliberate tolerance for a proxy content-encoding suffix (Caddy `encode` rewrites `"<tok>"` to `"<tok>-gzip"`; a strict compare would 412 every compressible CAS write) |
+| `streaming.py` | `ClosingStreamingResponse`: closes a server-sent event generator as soon as ASGI abandons a send, so a dropped reader's resources go promptly (system notify and update-batch progress streams) |
 | `fs_locks.py` | In-process async locks serializing storage-tree / source-tree mutations against app uninstall |
 | `app_compile_contract.py` | Canonical self-contained mini-app compiler contract, dependency list, and runtime ABI |
 | `app_runtime_inject.js` | React + `mobius-runtime` bridge injected into every compiled app bundle |
 | `app_services.py` | Bounded JSON request/response execution for reviewed app-owned server policy; binds every invocation to the accepted immutable runtime and a short-lived app token |
+| `commit_watch.py` | Calls back after a committed session write touches watched tables; drives `access_signal` and `public_service_index` without polling |
+| `public_service_index.py` | In-process snapshot of which ids name a public app service, with each one's rate bucket and allowance, so the anonymous door counts and refuses callers without a query per request; committed app or alias changes discard it |
 | `runtime_types.py` | Shared runtime type definitions |
 | `net_utils.py` | SSRF-safe URL validation shared by the install fetcher and the proxy |
 | `resource_access.py` | Resource-access helpers, incl. `live_app` / `live_app_or_404` (tombstone-aware app resolution) |
@@ -323,6 +332,7 @@ not part of the baked boot infrastructure.
 | `chat_log_redaction.py` | Server-side structural redaction for the gated chat-log read API |
 | `chat_media.py` | One-way startup migration that moves old chat images and stored URLs onto the canonical `/media/` path |
 | `http_caching.py` | Range/206 hardening for revalidating `FileResponse`s |
+| `settled.py` | Thread work a cancelled caller must wait out. Under a lock, each thread call uses `run_settled`, so a cancel lands at the next call and never starts a new step, such as a public GitHub write. A whole section is settled only where an in-process rollback must run (App Apply, the tombstone purge). A plain `asyncio.to_thread` is allowed only for a read, marked `# unsettled: read-only (<reason>)`. `test_settled.py` lints direct calls in lock blocks; the markers are reviewed claims |
 | `timeutil.py` | `now_naive_utc()` + `SOFT_DELETE_TTL`; SQLite stores naive datetimes (mixing aware/naive `TypeError`s on compare) |
 | `presence.py` | Chat-broadcast presence (`has_watchers(chat_id)`) — `push.notify_owner` uses it to skip a push when a live SSE subscriber is already watching |
 | `questions.py` | The AskUserQuestion pending-future registry + lifecycle (`_pending` dict; `register`/`deliver_answer`/`get`/`claim`/`claim_if`/`cancel`) — both SDK runners insert into it, `POST /messages` resolves, Stop cancels |
@@ -335,6 +345,7 @@ Each module exposes a `router`; registration is in `routes/__init__.py`.
 |------|------|
 | `auth.py` | Setup, login, CLI provider auth (`/api/auth/provider/*`) — Claude via self-managed PKCE OAuth, Codex via a `codex login --device-auth` subprocess |
 | `apps.py` | Mini-app registry CRUD, `/module` and `/frame` serving (ETag revalidation), `POST /{id}/publish` (site snapshot → `/sites/<token>/`), and `DELETE /{id}/data` — wipe an app's runtime storage keeping it installed (no tombstone/recovery window; takes only the innermost `app_storage_lock`, liveness re-checked under it) |
+| `app_update_batches.py` | `POST/GET /api/apps/update-batches`, `GET /{id}` and its `/{id}/events` SSE progress stream (owner or a `manage_apps` app; admission needs non-delegated control) |
 | `chat.py` | `POST /api/chat/stop` — interrupts the agent turn |
 | `chats.py` | Chat CRUD + reversible soft-delete with recovery; the chat-load serializer drops tool outputs >4KB to an `output_truncated`/`output_full_len` marker (read-side only — the stored message keeps the full text; blocks ≤4KB or without a message `ts` stay inline), lazy-fetched by `ToolBlock` on expand via `GET /{id}/tool-output?ts=&i=`; also `GET /{id}/agent-context` — read-only inspection of the assembled prompt (system prompt + injected memory / app-context / compaction blocks) |
 | `chats_stream.py` | `POST /messages` (starts a turn, returns 202) + `GET /stream` (SSE) |
@@ -551,7 +562,7 @@ The chat is large and self-contained; its hooks live beside it, not in `src/hook
 
 ## In-product agent context — three layers
 
-The in-product agent is a first-class reader of this code, and its behavior has three layers. (1) **Base constitution** — the live platform checkout's `skill/core.md`; `chat._read_skill_text()` caches only this tracked platform text for the process lifetime, so edits and platform updates take effect after a server restart. `/app/skill/core.md` is only the image-baked degraded-boot fallback when the live checkout is unavailable. (2) **Installed-app contributions** — any app's manifest may declare one root-level `system_prompt` markdown file; install review is the consent. When a chat starts its first turn, live (`deleted_at IS NULL`) app fragments are composed in stable id order with its effective base constitution and stored as one content-addressed prompt snapshot. Every later turn, provider switch, and compaction uses those exact bytes. Install, update, and uninstall affect chats started afterwards, while an existing chat keeps the prompt it began with. (3) **On-demand skills** — `/data/shared/skills/*.md`; platform skills reconcile against `.seed-skills.json` at server start, preserving local changes, while app-owned skills arrive through manifests and are deactivated/restored with their owner app. Independently of optional apps, every chat maintains its name, a short `## Summary`, and a cumulative `## Digest` under `/data/shared/memory/chats/<id>/index.md`. New sessions receive only recent descriptions + Summaries. The working agent writes that note through its run-bound `checkpoint_chat` tool; there is no turn-end summarizer. Compaction prefers the chat's cumulative Digest. The optional Memory app owns graph instructions, its skill, reader, seeds, builder, Git publisher, and retrieval telemetry; no router/fact note is injected. Uninstall changes future chat prompts and removes the skill/jobs while leaving existing prompt snapshots and core chat summaries intact.
+The in-product agent is a first-class reader of this code, and its behavior has three layers. (1) **Base constitution** — the live platform checkout's `skill/core.md`; `chat._read_skill_text()` caches only this tracked platform text for the process lifetime, so edits and platform updates take effect after a server restart. `/app/skill/core.md` is only the image-baked degraded-boot fallback when the live checkout is unavailable. (2) **Installed-app contributions** — any app's manifest may declare one root-level `system_prompt` markdown file; install review is the consent. When a chat starts its first turn, live (`deleted_at IS NULL`) app fragments are composed in stable id order with its effective base constitution and stored as one content-addressed prompt snapshot. Each fragment is read from the app's applied revision (`source_commit`), not from the live fragment file in its worktree, so an unapplied or half-written edit changes no prompt. Every later turn, provider switch, and compaction uses those exact bytes. Install, update, explicit Apply, and uninstall affect chats started afterwards, while an existing chat keeps the prompt it began with. (3) **On-demand skills** — `/data/shared/skills/*.md`; platform skills reconcile against `.seed-skills.json` at server start, preserving local changes, while app-owned skills arrive through manifests and are deactivated/restored with their owner app. Independently of optional apps, every chat maintains its name, a short `## Summary`, and a cumulative `## Digest` under `/data/shared/memory/chats/<id>/index.md`. New sessions receive only recent descriptions + Summaries. The working agent writes that note through its run-bound `checkpoint_chat` tool; there is no turn-end summarizer. Compaction prefers the chat's cumulative Digest. The optional Memory app owns graph instructions, its skill, reader, seeds, builder, Git publisher, and retrieval telemetry; no router/fact note is injected. Uninstall changes future chat prompts and removes the skill/jobs while leaving existing prompt snapshots and core chat summaries intact.
 
 Platform skill reconciliation is a server startup step, not part of the source
 updater or the image. The served checkout applies its own
@@ -1232,9 +1243,88 @@ saved card, or genuine automatic wake. The existing writer/continuation runner
 admits one bounded settlement pass after a clean unhanded ending; another such
 ending records a visible technical recovery failure, not a fabricated outcome.
 No separate Goal worker, unlimited retry, or automatic crash/Stop recovery exists.
-Goal labels derive only from that Goal's cards, Waits, helpers and eligible parks;
+Settlement and Goal labels share `chat_handoffs.goal_handoffs`: typed records
+for that exact Goal's cards, Waits, self-resuming helpers, claim dependencies,
+and eligible parks. A viable pending claim follow or owed automatic outcome
+prevents settlement; a missing or failed source is manual recovery, not a
+healthy handoff. The Goal presentation names the source chat and condition
+without implying a polling deadline;
 chat-wide handoff guards conflicting actions without borrowing another task's
 question. Retired revision-budget columns remain inert historical schema.
+
+
+Claim follows are `GoalDependency` rows, separate from observable/timed Waits.
+A collision or approval de-duplication registers the exact open top-level Goal
+against the claim's **acquisition UUID**, atomically with the ownership decision.
+Transfers retain that UUID; release then reacquisition gets a new UUID. Helpers,
+Goal-less callers, self-follows and direct A↔B cycles receive explicit no-follow
+results. Transfer checks existing subscribers too and rolls back if the former
+open Goal cannot retain its follow. The policy is 64 outstanding claim follows
+per Goal, independent of the eight-Wait cap. Longer cycles are not forbidden by
+admission; a detected chain of stalled sources is recovery, not promised progress.
+Graph mutation holds the tenant fence and refreshes acquisition ownership before
+checking any edge, including an existing follow. A former follower becoming the
+executor is suppressed by exact Goal, not by chat and not withdrawn: other
+Goals in that chat remain subscribed. A valid round-trip transfer can restore
+its pending follow after quota and cycle checks. Withdrawn or settled rows never
+revive this way. Same-chat Goal ownership rebinds use this same transition,
+so changing physical executors cannot strand a previously suppressed Goal.
+
+`goal_dependency_sources` owns registration and immutable source outcomes. Finish,
+release, Goal hold/end and chat deletion stamp subscribed outcomes in the same
+transaction as the source transition. A failed or clean-ended source without an
+exact-Goal native continuation produces factual `owner_not_progressing`, never
+automatic takeover. Another Goal's run or card is not proof of source liveness.
+Native progress ownership is shared with `goal_handoffs`, including accepted
+exact-Goal queued continuations between answer commit and run admission. Source
+nonviability reconciliation is a writer command serialized with those queue/run
+transitions, not a foreign-session snapshot or a cross-chat asyncio lock.
+`goal_dependencies` owns selection and delivery through the existing continuation
+queue, writer and supervisor. Scheduling is not receipt: only successful provider
+execution of the exact waiting Goal acknowledges its admitted result set. Held
+Goals retain results without reopening; terminal Goals retire them; dependent
+chat deletion withdraws them even if the chat is restored. Exhausted/ambiguous
+carriers surface manual recovery; there is no unlimited retry or new runner.
+
+Migration 0090 creates the dependency schema and claim acquisition identities.
+It performs **no legacy interest backfill**, even for apparently running sources
+or saved cards. A persisted running marker is not proof of a live executor after
+startup recovery. Every `AgentWorkInterest` stays unchanged in the old table as
+non-waking audit history; only a new follow creates a `GoalDependency`. This
+avoids inventing acquisition identity, receipt or wake authority for old work.
+Runtime follows and chat retention never read or write that table. The original
+schema is retained: audit rows have no retention guarantee after their chat is
+hard-purged. The existing chat FK may cascade-delete them; with FK enforcement
+off they may remain as inert historical provenance. Nothing reads those rows or
+relies on their presence after purge. No audit-table rebuild or destructive
+migration is applied. Completion and release send no follower peer
+notice and use no notification latch: immutable dependency outcomes drive
+exact-Goal delivery. The retry-safe claim notice and `notification_revision`
+remain solely for prompt transfer/revocation interrupts to the former executor.
+A separate `transfer_notice_revision` preserves the transfer event identity when
+completion or release advances the claim revision before its interrupt is sent.
+Ordinary peer messages and ambiguous historical messages remain intact.
+
+The same exact dependency projection supplies drawer, runtime and Goal details.
+Deliberate holds use a distinct quiet square; a stalled work source never promises
+an automatic dependency wake. Source cards and the Goal owning a live acquisition
+show deduplicated, owner-only `needed_by` chat backlinks in their existing details.
+These are read-side context, not requests, notifications or new attention.
+Exact-chat embeds receive only dependency facts already saved in their own chat,
+without foreign-chat enrichment or navigation IDs (including nested outcomes).
+Settled dependencies use Waiting's clock and typed outcome in transcript history,
+anchored only to a visible segment of the exact receiving or declaring run.
+Retiring an unresolved subscription retains safe source identity without inventing
+a source result or receiving-run receipt. The owner can **Stop following** one
+pending or owed dependency in expanded Goal details. Its authenticated route
+submits `WithdrawGoalDependency`: the writer preserves any saved outcome, stamps
+`withdrawn`, removes only its queued notices and invalidates its unentered
+carrier. Already-entered work is not stopped, but cannot receipt that withdrawn
+edge. Source cards/claims, other follows and the open/held Goal are unchanged;
+with no handoff left, ordinary settlement or Resume remains accountable.
+Repeat registration and transfers never re-arm a withdrawn edge. The bounded unfinished-settlement error
+code remains durable, but reads as calm recovery with explicit Resume rather than
+an alarm; unrelated execution failures retain their failure presentation.
 
 Persisted plans use the same task validation as plan writes. An unreadable
 plan keeps its Goal open, cannot authorize completion, and can be repaired
@@ -1256,8 +1346,8 @@ No model summarizer, delta cache, extra focus record,
 or duplicate copy of the incoming message is involved. Agents continue working
 in their current run rather than ending turns to refresh context. Task additions and updates operate on the existing record. Completion
 is an explicit revision-checked operation with verification evidence and no
-unfinished tasks or running helpers. It takes delivery of the Goal's fired
-Waits so they do not wake a finished Goal; an open card or armed Wait does not
+unfinished tasks or running helpers. It retires the Goal's fired
+Waits without claiming provider receipt, so they do not wake a finished Goal; an open card or armed Wait does not
 block it. A green plan alone is not completion.
 
 Workspace `AgentWorkClaim` rows are narrower: they serialize one shared action
@@ -1344,9 +1434,26 @@ admission, and process-group cleanup uses the session leader PID even after the
 shell has exited while children still hold output pipes.
 
 A terminal result has one deterministic message/run identity. Its delivery
-latch advances only after provider-task admission or proven adoption by a later
-completed owner turn, never merely after queue persistence. Fresh programmatic
-continuations share `programmatic_start_blocked`: saved Q&A/sealed input, usage
+receipt advances only after a successful provider call on the exact Goal's
+receiving run, never merely after admission or queue persistence. Unowned Waits
+retain chat-wide delivery. Selection, writer admission and acknowledgement all
+check the receiving run's Goal; admission freezes the carried IDs in
+`ChatRun.admitted_wait_results_json`, and `received_run_id` records the successful
+carrier. Success cannot receipt a result that fired after its prompt snapshot.
+The activation exception retains its earlier scheduling receipt (`scheduled`).
+New ordinary dispositions distinguish `delivered`, `retired_by_goal_outcome`
+and `withdrawn`; old ambiguous timestamps become `legacy_consumed`, with no
+fabricated receiving run and no historical wake storm. A Goal-owned carrier
+superseded before proven provider entry uses the existing single retry identity
+only with writer-stamped `owner_superseded_by_run_id` evidence;
+an unrelated turn cannot adopt its result. Stop/hold still blocks that wake.
+Delivery and recovery presentation select the same bounded carrier. After that
+retry fails, is interrupted, or completes without a successful receipt, the result
+stays owed for the Goal's next authorized turn and presents manual recovery,
+never another automatic replay.
+A crash after provider execution but before acknowledgement remains ambiguous:
+results stay owed, not proof of exactly-once model execution or external effects.
+Fresh programmatic continuations share `programmatic_start_blocked`: saved Q&A/sealed input, usage
 parks, and manual restart holds retain authority. Exact already-committed,
 empty continuations remain attachable; ambiguous partial execution is not
 blindly replayed. Legacy source-less Wait rows and stored `auto_continuation`
@@ -1357,13 +1464,34 @@ Goal completed. A warning means a failed check or unmet deadline, not necessaril
 failure of the external work. Goal recovery uses the declaring run and will not
 restore a stopped/dismissed Goal. The wait itself is independent: chat Stop ends
 a turn/questions/consumer but does not cancel armed monitors. Deletion cancels
-armed monitors. A remaining product decision is whether Stop should also dismiss
-terminal, queued wait results: currently their undelivered row can requeue a
-notice cleared by Stop, and the wait cancel action accepts only armed rows.
+armed monitors. For Goal-less waits, the existing undelivered row can still
+requeue a notice cleared by Stop; Goal-owned results remain blocked by their
+Goal's hold. The wait cancel action continues to accept only armed rows.
 Do not broaden Stop silently while cleaning up the implementation.
 
-History markers derive from durable wait rows, using assistant timestamps as
-temporary/final anchors; no duplicate outcomes are written into chat messages.
+The ordinary Wait lifecycle remains:
+
+| Event | Armed monitor | Fired, unreceived result |
+| --- | --- | --- |
+| Stop / owner hold | Keeps observing | Kept owed; no automatic Goal reopening |
+| Later owner continuation of that Goal | Unchanged | Eligible for that exact Goal's successful receipt |
+| Explicit Goal outcome | Keeps observing | Retired, not delivered |
+| Stop waiting | Withdrawn without a wake | Existing armed-only action does not apply |
+| Chat deletion | Withdrawn in lifecycle transaction | Existing supervisor cancels on observing deletion |
+
+Deletion/restore timing for ordinary results is unchanged: restore before the
+supervisor observes deletion can retain an owed result. Goal-less waits also
+retain their existing Stop behavior. Neither is a new cross-chat dependency
+policy: dependencies share the handoff projection and exact-Goal receipt seam,
+but retain their own source-outcome and withdrawal lifecycle.
+
+History markers derive from durable wait rows, using exact receiving-run identity
+for new receipts and timestamps only for legacy or temporary anchors; no duplicate outcomes are written into chat messages.
+Explicit retirement/withdrawal markers carry their disposition and stay beside
+the declaring answer or another visible answer of their owning Goal, never an
+invented recipient. They cannot become an answer's starting cause. Legacy
+ambiguous receipts and the activation scheduling exception retain their prior
+placement; a page with no visible owning answer omits the non-waking marker.
 This currently scans terminal history and can move a temporary marker to the
 wake's answer. Measure before changing that projection or adding a history index.
 
@@ -1797,7 +1925,7 @@ they race the shell's indexed cursor and break Safari's source-state fallback.
 
 Möbius uses one root-scoped service worker, `frontend/src/sw.js`, to keep shell and mini-app navigations same-origin when offline. The shell route is the Workbox app-shell path: `NavigationRoute(createHandlerBoundToURL('/index.html'))` serves the precached shell, with `/apps/`, `/app-assets/`, `/app-embeds/`, `/shell/embed`, `/sites`, and selected published-style paths denied so backend-owned documents don't become the SPA by accident. Mini-app code is split from that shell path: `/api/apps/{id}/frame` and `/api/apps/{id}/module` match `isAppCodeRoute()` and go through `appCodeHandler(OFFLINE_APPS_CACHE, { gated: false })` — frame/module caching is deliberately NOT gated by `offline_capable`. Standalone `/apps/<slug>/` navigations use the same handler with `gated: true`: only a `200` carrying `X-Mobius-Offline: 1` is stored; a headerless `200` purges the standalone entry. The server sets that header for `offline_capable` apps in `routes/app_runtime.py:get_frame`/`get_module` and `routes/standalone.py:standalone_shell`.
 
-`appCodeHandler()` normalizes the cache key by stripping `token`/`_`/`install` but KEEPING `v`; freshness rides `?v=<app.updated_at>` becoming a new key, not a connectivity probe. Once a versioned entry exists, `shouldServeCacheFirst()` serves it immediately while `event.waitUntil()` refreshes in the background. Cold paths and refreshes use `cache: 'reload'` through `boundedFetch()` so browser HTTP-cache revalidation can't hand the SW a bodyless `304` (`NET_TIMEOUT_MS` is a 3000ms hang guard, not a latency knob). `appCodeStoreAction()` is the storage policy: ungated frame/module stores every `200`, gated standalone stores only `X-Mobius-Offline: 1`, all non-`200` ignored; `applyAppCodeStore()` tolerates quota failures and deletes superseded same-route entries with a different `v`.
+`appCodeHandler()` normalizes the cache key by stripping `token`/`_`/`install` but KEEPING `v`; freshness rides `?v=<app.frame_version>` becoming a new key, not a connectivity probe. Once a versioned entry exists, `shouldServeCacheFirst()` serves it immediately while `event.waitUntil()` refreshes in the background. Cold paths and refreshes use `cache: 'reload'` through `boundedFetch()` so browser HTTP-cache revalidation can't hand the SW a bodyless `304` (`NET_TIMEOUT_MS` is a 3000ms hang guard, not a latency knob). `appCodeStoreAction()` is the storage policy: ungated frame/module stores every `200`, gated standalone stores only `X-Mobius-Offline: 1`, all non-`200` ignored; `applyAppCodeStore()` tolerates quota failures and deletes superseded same-route entries with a different `v`.
 
 Packaged static documents use a separate rule. `/app-embeds/` entry documents
 retain their own response-sandboxed cache key. A response-sandboxed opaque child
@@ -1833,6 +1961,8 @@ never strand an owner-requested refresh. The write may still finish after the de
 Every mini-app ships a `mobius.json`; the dependency-free source of truth is `backend/app/manifest_contract.py`, used by Store install, explicit local apply, and `backend/scripts/validate-app.py`. Five required non-empty string fields are `id`, `name`, `version`, `description`, and `entry`; `entry` must be the canonical `index.jsx` used by the source/apply lifecycle. The `id` is the package's current slug request (source dir `/data/apps/<slug>/`; `allocate_unique_slug` can diverge it on a collision, and cron registration keys off the resolved `app.slug`), so it uses charset `a-z 0-9 - _`, cannot start with `-`/`_`, and cannot be purely numeric (bare integers are reserved for the numeric-id storage tree).
 
 Published apps should generate one random UUID once and declare it as `package_id` (for example `urn:uuid:550e8400-e29b-41d4-a716-446655440000`). It remains unchanged across product, manifest-id, repository-path, and owner renames. GitHub-backed packages are additionally bound to GitHub's immutable numeric repository identity, so a repository rename or transfer only changes the fetch locator. Moving code into a different repository is an explicit trust transfer: the old trusted manifest declares the same `package_id` plus `moved_to: {"manifest_url": "https://.../mobius.json"}`. Existing installs accept the new repository only after fetching and verifying that declaration from their current source; a separate fork generates a new package id. A reviewed service uses its own stable `service.id`, independent of both the package's current `id` and installed slug. Manifests that declare both `package_id` and `service` must declare `service.id` explicitly.
+
+**Update discovery.** `GET /api/apps/{id}/update-check` and `GET /api/apps/{id}/update-candidate-preview` fetch the candidate Git commit (optionally from a catalog `manifest_url`) and resolve it to an installed row with the installer's own rule, `install.resolve_package_row`: permanent `package_id`, then the stored or ref-independent address, then a `previous_manifest_url` whose resolved GitHub repository id equals the candidate's (an unresolved identity, as on a legacy row, proves nothing), then a `previous_id` rename. The install preview uses the same rule. A candidate is offered only when that rule names this app, so discovery never offers an update that install would refuse or apply to a different row. When it doesn't, `update-check` returns `update_available: null` with `candidate_rejected: {code, message}`, and the preview answers 409 with the same object as `detail`. Discovery reads a candidate only from the app's own Git origin: a catalog `manifest_url` in another repository (a moved or renamed repository, or another owner's) is not fetched and is reported as `repository_moved`. Reinstalling from the Store follows such a move when the new repository proves it is the same app (a same-owner `previous_id` rename, or matching GitHub repository ids for a permanent package); otherwise it adds a separate app. A candidate in the app's own repository that the rule does not name as this app is `identity_mismatch`. Clients should treat unknown codes the same way. Every other unknown (no Git source, a failed fetch, an unreadable package) keeps `candidate_rejected: null`.
 
 Optional fields the parser recognizes include `package_id`, `moved_to`, `previous_id`, `icon`, colors/display, `offline_capable`, `embeds_agent`, `offline`, `permissions`, `storage_seeds`, `static_assets`, `source_files`, `skills`, `system_prompt`, `schedule`, `agent_activities`, and `shell_shortcuts` (`false` stops the app frame capturing the shell's keyboard shortcuts, for apps such as editors that need those chords). `previous_id` and `previous_manifest_url` remain bounded migration aids for installs that predate permanent package identities; they are not the steady-state identity model. Decorative-only fields such as `author`, `license`, and `homepage` are not validated or stored. Three gotchas: (1) **`runtime` (`imports`/`esm_deps`) is informational**; dependency resolution is governed by the pinned self-contained compiler in `app_compile_contract.py`. (2) **`storage_seeds` value type is a switch**: a string is a repo-relative file the installer fetches; a non-string is stored inline as JSON. (3) **`schedule.job` has dual semantics** — with an exactly five-field `schedule.default` it installs recurring cron; without it the script is an on-demand build hook. In either mode the script declares its interpreter with an absolute shebang; the platform never guesses from its filename or executable bit. Logical `static_assets` destination `x` is materialized at source path `static/x`. One 64 MiB `PACKAGE_MAX_BYTES` bounds every file a package declares (entry, icon, job, source files, static assets and file seeds), summed per declaration because each is written separately (`manifest_contract.package_bytes`): HTTP and Git installs charge that sum, local apply and `validate-app.py` check it from file sizes, and Store publication bounds both it and its whole tree, so every published app is installable. Beyond the 64 KiB manifest cap and the skill and system-prompt caps that bound agent context, no declared file or file kind has its own size or count cap; Store publication also limits a release to 250 files. The compile contract refuses a compiled module larger than the 8 MiB the shell loads, so large data belongs in `static_assets`, fetched at runtime.
 
