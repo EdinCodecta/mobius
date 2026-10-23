@@ -118,13 +118,281 @@ def _personal_publication_input(record: dict) -> dict:
   }
 
 
-def _personal_publication_input_sha256(record: dict) -> str:
+def _canonical_json_sha256(value: object) -> str:
   return hashlib.sha256(json.dumps(
-    _personal_publication_input(record),
+    value,
     sort_keys=True,
     separators=(",", ":"),
     ensure_ascii=False,
   ).encode("utf-8")).hexdigest()
+
+
+def _personal_publication_input_sha256(record: dict) -> str:
+  return _canonical_json_sha256(_personal_publication_input(record))
+
+
+# The exact proposal a publication confirmation approves: every personal
+# publication input except the lifecycle fields a claim changes. This one list
+# drives both the server digest and the capability GitHub status advertises.
+PUBLICATION_APPROVAL_FIELDS = tuple(
+  key for key in _PERSONAL_PUBLIC_INPUT_FIELDS
+  if key not in ("status", "submitter")
+)
+
+
+def publication_approval_sha256(record: object) -> str:
+  """Digest of the exact proposal one publication confirmation approves.
+
+  Target, branch, reviewed base/head/diff, public text, stack links, update
+  target and review. Callers send the frozen record they displayed; the server
+  computes both sides, so there is one projection and one encoding.
+  """
+  source = record if isinstance(record, dict) else {}
+  return _canonical_json_sha256({
+    key: source.get(key) for key in PUBLICATION_APPROVAL_FIELDS
+  })
+
+
+# Settled public lifecycles a stack may carry as already-approved context.
+_PUBLIC_PUBLICATION_STATUSES = frozenset({"draft", "open", "landing", "merged"})
+# Journal stages that leave a push's public outcome unknown.
+_UNSETTLED_PUSH_STAGES = frozenset({"push_pending", "push_ambiguous"})
+
+
+def _claims_publication_phase(record: dict, phase_actions: frozenset[str]) -> bool:
+  """Whether one publication operation claims this record as a new write.
+
+  The single rule the stack claim applies and refusal certification reuses:
+  a still-prepared record whose reviewed action this operation publishes.
+  Other prepared actions are deferred or refused; public rows are context.
+  """
+  plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+  return (
+    record.get("status") == "prepared"
+    and str(plan.get("action") or "") in phase_actions
+  )
+
+
+def _plan_value(record: dict, key: str) -> str:
+  plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+  return str(plan.get(key) or "").strip()
+
+
+def _binds_public_pr(confirmed: dict, record: dict) -> bool:
+  """Whether the confirmation already bound this row's exact public PR."""
+  url, number = record.get("url"), record.get("number")
+  return (
+    isinstance(url, str) and bool(url)
+    and isinstance(number, int) and not isinstance(number, bool)
+    and number > 0
+    and confirmed.get("url") == url
+    and confirmed.get("number") == number
+  )
+
+
+def _bound_attempt_claimed(
+  record: dict, confirmed: dict, submitter: str,
+) -> bool:
+  """Whether the ledger shows a claim of this exact bound operation.
+
+  A claim stores the digest of every approved field plus ``submitting`` and
+  its submitter. Recompute that digest from server-side values only: the bound
+  fields of the confirmation and of the ledger row, with this operation's and
+  the ledger's own submitter. The confirmation's lifecycle never enters it.
+  """
+  claimed_sha = str(record.get("personal_submit_input_sha256") or "")
+  if not claimed_sha:
+    return False
+  submitters = {
+    value for value in (submitter, record.get("submitter"))
+    if isinstance(value, str) and value
+  }
+  for proposal in (confirmed, record):
+    approval = {key: proposal.get(key) for key in PUBLICATION_APPROVAL_FIELDS}
+    for claimed_by in submitters:
+      if _personal_publication_input_sha256({
+        **approval, "status": "submitting", "submitter": claimed_by,
+      }) == claimed_sha:
+        return True
+  return False
+
+
+def _publication_never_attempted(
+  app_id: int,
+  records: list[dict],
+  expected: dict[str, dict],
+  *,
+  phase_actions: frozenset[str],
+  submitter: str,
+) -> bool:
+  """Prove a refused confirmation's write phase was never attempted.
+
+  This request wrote nothing. Certify the phase unsent only from server state:
+  the ledger rows, server-owned attempt artifacts, and the confirmation's
+  digest-bound fields. Its lifecycle fields (status, journal) are untrusted
+  and may only withhold certification, never grant it.
+
+  Every row must certify; the first that withholds makes the answer False.
+  Checked in order, per row (ledger row x confirmation for that id):
+
+  | Ledger row                        | Condition                               | Row      |
+  |-----------------------------------|-----------------------------------------|----------|
+  | ``submitting``                    | any                                     | withhold |
+  | not ``prepared``                  | confirmation says prepared/submitting   | withhold |
+  | public (draft/open/landing/merged)| this operation's claim produced it      | withhold |
+  | public                            | confirmation lacks its url + number     | withhold |
+  | public                            | confirmation bound that exact PR        | certify* |
+  | any other non-prepared status     | any                                     | withhold |
+  | prepared, in this phase (by       | pushed sha = a reviewed head, and: new  | withhold |
+  | ledger or confirmed action)       | PR, or this operation's claim, or push  |          |
+  |                                   | still unsettled                         |          |
+  | prepared, in this phase           | otherwise (no push, or an update whose  | certify* |
+  |                                   | public head predates its claim)         |          |
+  | prepared, other/deferred phase    | any                                     | certify* |
+
+  * and only if no attempt/relay artifact exists for the row (an artifact,
+  or failing to check one, withholds). "This operation's claim" is
+  ``_bound_attempt_claimed``: the ledger's claim digest matches the bound
+  fields with ``submitting`` and this or the ledger's submitter.
+  """
+  return all(
+    _row_never_attempted(
+      app_id, record, expected.get(str(record.get("id") or "")),
+      phase_actions=phase_actions, submitter=submitter,
+    )
+    for record in records
+  )
+
+
+def _row_never_attempted(
+  app_id: int, record: dict, confirmed: object, *,
+  phase_actions: frozenset[str], submitter: str,
+) -> bool:
+  """One row of ``_publication_never_attempted``'s table."""
+  confirmed = confirmed if isinstance(confirmed, dict) else {}
+  status = record.get("status")
+  if status == "submitting" or (
+    confirmed.get("status") in {"prepared", "submitting"}
+    and status != "prepared"
+  ):
+    return False
+  bound_attempt = _bound_attempt_claimed(record, confirmed, submitter)
+  if status in _PUBLIC_PUBLICATION_STATUSES:
+    certified = not bound_attempt and _binds_public_pr(confirmed, record)
+  elif status != "prepared":
+    certified = False
+  else:
+    certified = not _phase_push_seen(
+      record, confirmed, phase_actions, bound_attempt=bound_attempt,
+    )
+  return certified and not _attempt_artifacts_exist(
+    app_id, str(record.get("id") or ""),
+  )
+
+
+def _phase_push_seen(
+  record: dict, confirmed: dict, phase_actions: frozenset[str], *,
+  bound_attempt: bool,
+) -> bool:
+  """Whether a prepared row in this phase shows a push of its reviewed head
+  that this operation could have made. Other-phase rows are untouched."""
+  if not (
+    _claims_publication_phase(record, phase_actions)
+    or _plan_value(confirmed, "action") in phase_actions
+  ):
+    return False
+  heads = {
+    _plan_value(proposal, "head_sha").lower() for proposal in (confirmed, record)
+  } - {""}
+  pushed = str(record.get("last_submit_push_sha") or "").strip().lower()
+  return bool(pushed) and pushed in heads and (
+    "pr" in {_plan_value(record, "action"), _plan_value(confirmed, "action")}
+    or bound_attempt
+    or record.get("last_submit_stage") in _UNSETTLED_PUSH_STAGES
+  )
+
+
+def _attempt_artifacts_exist(app_id: int, record_id: str) -> bool:
+  """Any attempt or relay artifact, or failing to check, withholds."""
+  from app import contribution_runtime
+
+  try:
+    return any(path.exists() for path in (
+      contribution_runtime.personal_attempt_path(app_id, record_id),
+      contribution_runtime.relay_claim_path(app_id, record_id),
+      contribution_runtime.relay_request_path(app_id, record_id),
+    ))
+  except (OSError, ValueError):
+    return True
+
+
+def confirmed_publication_records(
+  record_ids: list[str], confirmed: list[object] | None,
+) -> dict[str, dict] | None:
+  """Index one confirmation's frozen records by exactly the requested ids."""
+  if confirmed is None:
+    return None
+  indexed: dict[str, dict] = {}
+  for record in confirmed:
+    record_id = str(record.get("id") or "") if isinstance(record, dict) else ""
+    if not record_id or record_id in indexed:
+      break
+    indexed[record_id] = record
+  else:
+    if len(indexed) == len(record_ids) and set(indexed) == set(record_ids):
+      return indexed
+  raise HTTPException(
+    status_code=400,
+    detail=(
+      "The confirmation must include exactly one confirmed record for each "
+      "requested contribution."
+    ),
+  )
+
+
+def _assert_publication_approval(
+  *,
+  app_id: int,
+  records: list[dict],
+  expected: dict[str, dict] | None,
+  stack: bool,
+  phase_actions: frozenset[str],
+  submitter: str,
+) -> None:
+  """Refuse publication when any confirmed record differs from the ledger.
+
+  ``expected`` maps record id to the frozen record the owner confirmed. It is
+  None only for legacy callers. ``phase_actions`` and ``submitter`` name the
+  write phase the calling operation claims. This check reads only; callers run
+  it before any receipt cleanup, resume, claim, ledger or public write.
+  """
+  if expected is None:
+    return
+  changed = [
+    str(record.get("id") or "")
+    for record in records
+    if publication_approval_sha256(expected.get(str(record.get("id") or "")))
+       != publication_approval_sha256(record)
+  ]
+  if not changed:
+    return
+  detail = {
+    "code": "approval_changed",
+    "message": (
+      "This contribution changed after you confirmed it, so nothing new was "
+      "sent. Review the current version and confirm again."
+    ),
+    "not_attempted": _publication_never_attempted(
+      app_id, records, expected,
+      phase_actions=phase_actions, submitter=submitter,
+    ),
+    "changed_record_ids": changed,
+  }
+  if stack:
+    detail["records"] = records
+  else:
+    detail["record"] = records[0]
+  raise HTTPException(status_code=409, detail=detail)
 
 
 def _publication_status(stage: str) -> str:
@@ -1123,6 +1391,7 @@ def _claim_record(
   expected_action: str = "pr",
   allow_personal_resume: bool = False,
   before_claim_write: Callable[[dict, Path, bool, dict], None] | None = None,
+  confirmed: dict[str, dict] | None = None,
 ) -> tuple[dict, Path, Path]:
   record_path, diff_path = _record_paths(app_id, record_id)
   _recheck_submit_app(db, app_id, expected_nonce)
@@ -1171,6 +1440,12 @@ def _claim_record(
         "chain together."
       ),
     )
+  # Bind the claim itself to the confirmed proposal, closing the gap between
+  # the route's read-only check and this exact record read.
+  _assert_publication_approval(
+    app_id=app_id, records=[record], expected=confirmed, stack=False,
+    phase_actions=frozenset({expected_action}), submitter=submitter,
+  )
   if resumable_successor or resumable_personal:
     claimed = {
       **record,
@@ -1334,6 +1609,7 @@ def _claim_stack_records(
   submitter: str = "contribute-stack-button",
   already_detail: str = "Every PR in this stack has already been submitted.",
   before_claim_write: Callable[[dict, Path, bool, dict], None] | None = None,
+  confirmed: dict[str, dict] | None = None,
 ) -> list[dict]:
   """Claim only the current public phase of one complete reviewed stack.
 
@@ -1405,17 +1681,23 @@ def _claim_stack_records(
           detail="A private stack layer is prepared for a different public action.",
         )
       _require_all_clear_review(item["record"])
+  # Every confirmed layer and its linked context must still be the confirmed
+  # proposal before the first claim write.
+  _assert_publication_approval(
+    app_id=app_id,
+    records=[row["record"] for row in rows],
+    expected=confirmed,
+    stack=True,
+    phase_actions=claimable_actions,
+    submitter=submitter,
+  )
   ordered = []
   now = _now_iso()
   for item in validated:
     row = by_id[item["record"]["id"]]
     record = row["record"]
     resumed = record.get("status") == "submitting"
-    if (
-      record.get("status") == "prepared"
-      and str((record.get("plan") or {}).get("action") or "")
-          in claimable_actions
-    ):
+    if _claims_publication_phase(record, claimable_actions):
       record = {
         **record,
         "status": "submitting",
