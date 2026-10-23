@@ -156,6 +156,24 @@ def _options_input(body):
   return selected
 
 
+
+def _saved_options_input(row):
+  """Compare legacy no-op defaults without rewriting frozen consent.
+
+  These fields are unused only in review/review_merge. A takeover grant may
+  enforce them, so its exact option comparison must remain untouched.
+  """
+  saved = row.options_json.get("input_options")
+  if row.mode not in {"review", "review_merge"} or not isinstance(saved, dict):
+    return saved
+  normalized = dict(saved)
+  for key, default in (("max_rounds", None), ("autopilot", False),
+                       ("fix_prompt", presets.FIX_PROMPT)):
+    if key in normalized and type(normalized[key]) is type(default) and normalized[key] == default:
+      del normalized[key]
+  return normalized
+
+
 def _snapshot(db, body, principal):
   choice = resolve_round_choice(db)
   requested = getattr(body, "agent", None)
@@ -232,7 +250,7 @@ async def start_reviews(app_id: int | None, body: StartReviews,
       previous = [{"repo": t["repo"].lower(), **{k: t[k] for k in ("number", "head_sha", "base_ref", "base_sha")}} for t in row.targets_json]
       if (row.mode != body.mode or previous != selection
           or (row.options_json and (
-            row.options_json.get("input_options") != (_options_input(body) or {})
+            _saved_options_input(row) != (_options_input(body) or {})
             or row.options_json.get("input_agent") != (body.agent.model_dump() if body.agent else None)
             or (body.preview_sha256 and row.options_json.get("preview_sha256") != body.preview_sha256)))):
         raise HTTPException(409, "This request already approves a different selection.")
@@ -326,7 +344,7 @@ def _list_run_view(db, row, app_id):
   value["items"] = items
   if "options" in value:
     value["options"] = {key: val for key, val in (value["options"] or {}).items()
-      if key in {"provider", "model", "reasoning_effort", "post_review", "confirmation_scope", "max_rounds"}}
+      if key in {"provider", "model", "reasoning_effort", "post_review", "confirmation_scope"}}
   return value
 
 
