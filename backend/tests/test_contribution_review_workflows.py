@@ -891,11 +891,12 @@ def test_app_can_read_owned_core_history_without_borrowing_mutation_authority(se
   monkeypatch.setattr(routes, "_validate_submit_app", _validate_submit_app)
   runs = routes.list_reviews(1, db, app_principal)["runs"]
   assert len(runs) == 1 and runs[0]["id"] == row.id
-  assert runs[0]["app_id"] is None and runs[0]["source_chat_id"] == row.chat_id
+  assert runs[0]["app_id"] is None and runs[0]["chat_id"] == row.chat_id
   assert runs[0]["can_stop"] is False
   detail = routes.get_review(1, row.id, db, app_principal)
   assert detail["run"]["can_stop"] is False
-  assert "/api/github/review-runs/" in detail["brief"]
+  assert detail["brief"] is None
+  assert "options" not in detail["run"]
   owner = Principal(owner=principal.owner, app_id=None)
   assert routes.core_get_review(row.id, db, owner)["run"]["can_stop"] is True
   for action in [lambda: routes._row(db, 1, row.id, app_principal),

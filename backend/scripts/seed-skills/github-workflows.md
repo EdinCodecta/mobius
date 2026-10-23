@@ -37,10 +37,12 @@ preflight; do not demand a duplicate approval click. Changed head/base,
 model, prompt or scope needs a new preview and, when consent was pinned to the
 old version, a fresh decision.
 
-An optional Contribute adapter passes `--app-id N` to each CLI command. The
-saved selection binds that app context into its request identity; `start`
-requires the same flag. This is app presentation and authorization, not a
-second workflow implementation. Without the flag, the run is core-owned.
+An optional Contribute adapter imports the CLI's `api`, `prepare_selection`,
+`freeze_preview`, `verify_selection`, `start_body`, and `review_path` functions
+in-process. The CLI also accepts `--app-id N` for direct invocation. The saved
+selection binds that app context into its request identity; starting requires
+the same context. This is app presentation and authorization, not a second
+workflow implementation. Without an app context, the run is core-owned.
 
 ```bash
 python3 "$SCRIPTS_DIR/github_review.py" start \
@@ -76,7 +78,11 @@ options JSON, and only for `review` mode. Confirm the public audience before
 including private evidence. The server posts one COMMENT review on the exact
 head, never APPROVE or REQUEST_CHANGES. Once posting is armed the recorded
 verdict and evidence are immutable; identical replay only reads the saved
-receipt. Transport uncertainty never permits another post.
+receipt. Transport uncertainty never permits another post. Call `/observe` to
+find the exact review by its server-generated marker, connected actor and head.
+A missing or unreadable result remains unknown; it never authorizes a second
+write. A definite provider refusal or a certified pre-dispatch refusal allows
+retrying the same recorded all-clear evidence after its blocker is resolved.
 
 Private evidence fields accept up to 200,000 characters each. The public copy
 is bounded conservatively to 65,536 UTF-16 units with explicit omission

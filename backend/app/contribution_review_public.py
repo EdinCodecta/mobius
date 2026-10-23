@@ -4,8 +4,10 @@ This module never approves a PR. Only the route's frozen opt-in and persisted
 attempt receipt authorize dispatch; an uncertain effect is never retried.
 """
 import json
+import subprocess
 from fastapi import HTTPException
-from app.contribution_review_effects import DispatchResult
+from app.contribution_errors import ContributionSubmitError
+from app.contribution_review_effects import DispatchResult, classify_dispatch_error
 
 EVIDENCE_MAX_CHARS = 200_000
 EVIDENCE_FIELDS = ("state", "summary", "scope", "tests", "tests_passed", "reviewed_base_sha", "head_sha")
@@ -49,7 +51,7 @@ def _clip_evidence(text: str, limit: int) -> str:
   return text[:keep].rstrip() + marker(len(text) - keep)
 
 
-def review_comment_body(outcome: dict) -> str:
+def review_comment_body(outcome: dict, *, marker: str = "") -> str:
   """The public text of an owner-requested review: verdict, findings, checks.
 
   Stored evidence is never cut. Only the posted copy is bounded to GitHub's
@@ -61,6 +63,8 @@ def review_comment_body(outcome: dict) -> str:
   summary = (outcome.get("summary") or "").strip()
   tests = (outcome.get("tests") or "").strip()
   footer = f"_Reviewed at {str(outcome.get('head_sha') or '')[:12]}._"
+  if marker:
+    footer += f"\n\n{marker}"
   def render(summary_text, tests_text):
     parts = [header, "", summary_text]
     if tests_text:
@@ -86,9 +90,41 @@ def post_review(gh, cwd, target, body):
       f"repos/{target['repo']}/pulls/{target['number']}/reviews", "--input", "-",
       input_text=json.dumps({"commit_id": target["head_sha"], "event": "COMMENT", "body": body})).stdout
     result = json.loads(response)
-    if not isinstance(result, dict) or not result.get("id"):
+    if (not isinstance(result, dict) or not isinstance(result.get("id"), int)
+        or isinstance(result["id"], bool) or result["id"] <= 0):
       return DispatchResult.unknown("GitHub did not confirm the posted review.")
     return DispatchResult.confirmed({"id": result["id"], "url": result.get("html_url")})
-  except Exception:
-    # Once transport is entered even a local-looking failure cannot prove no send.
-    return DispatchResult.unknown("GitHub did not confirm the posted review; observe it without repeating the write.")
+  except (ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError) as exc:
+    # Programming errors must surface, not become durable false uncertainty.
+    return classify_dispatch_error(exc)
+
+
+def reconcile_review(gh, cwd, target, receipt, actor_id):
+  """Find only this armed attempt, without ever treating absence as permission to retry.
+
+  A bounded scan may miss a very old review; that leaves uncertainty intact.
+  Legacy receipts without a unique marker cannot be attributed to this grant.
+  """
+  marker = receipt.get("marker")
+  if not marker:
+    return {**receipt, "state": "unknown", "summary": "This older receipt lacks a unique review marker; inspect GitHub without repeating the write."}
+  try:
+    for page in range(1, 11):
+      response = gh(cwd, "api", f"repos/{target['repo']}/pulls/{target['number']}/reviews?per_page=100&page={page}")
+      rows = json.loads(response.stdout)
+      if not isinstance(rows, list):
+        break
+      for review in rows:
+        if (isinstance(review, dict) and isinstance(review.get("user"), dict)
+            and str(review["user"].get("id")) == str(actor_id)
+            and review.get("commit_id") == target["head_sha"]
+            and review.get("state") == "COMMENTED"
+            and isinstance(review.get("body"), str) and marker in review["body"]
+            and isinstance(review.get("id"), int) and not isinstance(review["id"], bool)):
+          return {**receipt, "state": "posted", "id": review["id"], "url": review.get("html_url"),
+                  "summary": "The exact public review was confirmed by a read-only observation."}
+      if len(rows) < 100:
+        break
+  except (ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
+    pass
+  return {**receipt, "state": "unknown", "summary": "The exact public review is not confirmed; no write was repeated."}
