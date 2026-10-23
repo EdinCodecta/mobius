@@ -151,3 +151,42 @@ export function platformUpdateStall(platform, rebuild) {
       : `Update paused: this container cannot restart into it${needs}.`
   return { message, canResume: actions.has('resume'), canRetry: actions.has('retry') }
 }
+
+function packageShortfall(item) {
+  if (item.declared == null) return `${item.name} (a declaration Möbius cannot verify)`
+  const declared = item.declared || 'any version'
+  if (item.kind === 'unsupported') return `${item.name} (source declares ${declared}, which Möbius cannot verify)`
+  return `${item.name} (source declares ${declared}, container ${item.installed ? `has ${item.installed}` : 'does not have it'})`
+}
+
+/**
+ * The warning Settings shows while the served source declares Python
+ * packages this container does not install as declared, or null. Boot keeps
+ * serving such source (only the import check is the hard gate), so this is
+ * the owner's signal that, for example, a security version bump is unmet.
+ * A stall that already names the gap, or a container replacement already
+ * under way, needs no second notice.
+ */
+export function platformPackageWarning(platform, rebuild) {
+  const gap = platform?.restart_blocker
+  const packages = gap?.packages || []
+  if (!packages.length || rebuildIsActive(rebuild)) return null
+  if (platform?.unfinished_update?.stalled?.reason === 'restart_blocked') return null
+  const listed = packages.map(packageShortfall).join('; ')
+  const running = gap.blocking
+    ? 'Möbius keeps running, but cannot restart onto this source'
+    : 'Möbius keeps running on the installed versions'
+  const commit = (gap.fix?.commit || '').slice(0, 12)
+  const revert = commit ? `revert local commit ${commit}` : 'revert the uncommitted edit'
+  if (gap.origin === 'official_newer') {
+    return {
+      title: 'Container packages are behind the platform source',
+      message: `${running} until the container is updated: ${listed}. A container update (Finish update) installs them.`
+        + (gap.fix?.commit ? ` Some come from a local change; if the new container still lacks them, ${revert}.` : ''),
+    }
+  }
+  return {
+    title: 'A local change needs Python packages this container lacks',
+    message: `${running}: ${listed}. To fix it, ${revert}, or update the container once that change is released.`,
+  }
+}

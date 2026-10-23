@@ -79,3 +79,26 @@ test('a stalled update offers Resume and Retry beside Cancel', () => {
   }))
   assert.doesNotMatch(quiet, /Update paused|>Resume<|>Retry</)
 })
+
+test('Settings warns when the container installs older packages than the source declares', () => {
+  const platform = {
+    state: 'up_to_date', contained_upstream_sha: target,
+    restart_blocker: {
+      origin: 'official_newer', blocking: false, fix: { action: 'replace_container', target_sha: target },
+      packages: [{ name: 'pillow', declared: '==13.0', installed: '12.3', kind: 'version', origin: 'official_newer' }],
+    },
+  }
+  const update = {
+    platform, cachedPlatform: null, rebuild: null, version: null, phase: 'idle',
+    busy: false, reconnecting: false, error: '', errorCode: '', checkResult: '',
+  }
+  const html = renderToStaticMarkup(createElement(PlatformUpdatesView, { update, onOpenChat: () => {} }))
+  assert.match(html, /Container packages are behind the platform source/)
+  assert.match(html, /pillow \(source declares ==13\.0, container has 12\.3\)/)
+  assert.match(html, /A container update \(Finish update\) installs them\./)
+
+  const current = renderToStaticMarkup(createElement(PlatformUpdatesView, {
+    update: { ...update, platform: { ...platform, restart_blocker: null } }, onOpenChat: () => {},
+  }))
+  assert.doesNotMatch(current, /packages are behind/)
+})
