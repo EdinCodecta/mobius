@@ -1230,7 +1230,15 @@ async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
     async with _github_connection_transaction():
       await _ready_preflight(row, target, cwd)
       receipt = await _arm_ready(db, row, principal, target, body)
-      result = await _dispatch_ready(target, cwd)
+      # Stop can acquire review-admission after _arm_ready releases it. Admit
+      # the actual mutation under that same lock, not merely its reservation.
+      async with chat_queue.get_transition_lock(f"review-admission:{run_id}"):
+        try:
+          _parent(db, row, principal)
+        except HTTPException as exc:
+          result = DispatchResult.not_dispatched(str(exc.detail))
+        else:
+          result = await _dispatch_ready(target, cwd)
       if result.state == "not_dispatched":
         reviews.disarm_ready(db, row, target, receipt["id"])
         raise HTTPException(409, result.reason or "Readiness was refused without applying a public effect.")
