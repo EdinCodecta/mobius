@@ -528,7 +528,7 @@ def test_model_choice_drift_blocks_merge_not_only_repair(setup, monkeypatch):
 def test_review_frozen_rename_scope_includes_both_paths():
   import json
   def gh(*a):
-    return SimpleNamespace(stdout=json.dumps([[{"filename": "new.py", "previous_filename": "old.py", "status": "renamed"}]]))
+    return SimpleNamespace(stdout=json.dumps([{"filename": "new.py", "previous_filename": "old.py", "status": "renamed"}]))
   assert domain.repair_file_scope(gh, "/tmp", TARGET) == ["new.py", "old.py"]
 
 
@@ -1320,7 +1320,10 @@ def test_pending_later_repair_with_new_base_keeps_detail_list_and_observation_re
   detail = routes.get_review(1, row.id, db, owner)["run"]
   listed = routes.list_reviews(1, db, owner)["runs"][0]
   observed = asyncio.run(routes.observe_review(1, row.id, db, owner))["run"]
-  for view in (detail, listed, observed):
+  assert "repair_attempts" not in listed["items"][0]
+  assert listed["items"][0]["successor"] == {"head_sha": head, "base_sha": BASE}
+  assert listed["execution_state"] == "stopped"
+  for view in (detail, observed):
     expected = "push_unknown" if view is observed and state == "pushing" else state
     assert view["items"][0]["repair_attempts"][-1]["state"] == expected
     assert view["items"][0]["successor"] == {"head_sha": head, "base_sha": BASE}

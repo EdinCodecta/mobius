@@ -273,18 +273,20 @@ def delete_quarantined_checkouts(paths: list[Path] | None = None) -> None:
 def prepare_checkout(gh, cwd: Path, row, target: dict, allowed_files: list[str]) -> dict:
   """Make a private, server-chosen checkout at the immutable selected head.
 
-  ``allowed_files`` is request intent, never authority: every member must be
-  among the current PR files.  The returned snapshot belongs in the outcome
+  ``allowed_files`` is frozen request intent, never authority: only its
+  nonempty intersection with current PR files may be edited. The snapshot belongs in the outcome
   repair_attempts receipt, not in the immutable selection target.
   """
   _repo, pull = _live_head(gh, cwd, target)
   slug, repo_id, branch = _head_destination(gh, cwd, pull)
   current = _changed_files(gh, cwd, target)
-  allowed = set(allowed_files) if isinstance(allowed_files, list) else set()
-  if (not allowed or len(allowed) != len(allowed_files)
-      or not all(isinstance(f, str) for f in allowed_files)
-      or not allowed <= current):
-    _fail("Allowed repair files must be a nonempty subset of current PR files.", 400)
+  frozen = set(allowed_files) if isinstance(allowed_files, list) else set()
+  if (not frozen or len(frozen) != len(allowed_files)
+      or not all(isinstance(f, str) for f in allowed_files)):
+    _fail("The frozen repair file scope is invalid.", 400)
+  allowed = frozen & current
+  if not allowed:
+    _fail("No approved repair file remains in the current PR file scope.", 409)
   _assert_path_scope(allowed, allowed, target_repo=target["repo"])
   initial = _sha(target.get("head_sha"))
   checkout = Path(tempfile.mkdtemp(prefix="repair-", dir=_checkout_root()))
@@ -414,12 +416,14 @@ def validate_repair(gh, cwd: Path, row, target: dict, checkout: dict,
     _fail("The repair checkout path is missing.")
   path = owned_checkout(raw_path)
   snapshot_allowed = checkout.get("allowed_files")
-  if (not isinstance(snapshot_allowed, list) or
-      allowed_files is not None and sorted(allowed_files) != snapshot_allowed):
+  if (not isinstance(snapshot_allowed, list) or not snapshot_allowed or
+      not all(isinstance(name, str) for name in snapshot_allowed) or
+      len(set(snapshot_allowed)) != len(snapshot_allowed) or
+      allowed_files is not None and not set(snapshot_allowed) <= set(allowed_files)):
     _fail("The repair's approved file scope changed.")
-  allowed = set(snapshot_allowed)
-  if not allowed <= _changed_files(gh, cwd, target):
-    _fail("The PR file scope changed since checkout preparation.")
+  allowed = set(snapshot_allowed) & _changed_files(gh, cwd, target)
+  if not allowed:
+    _fail("No approved repair file remains in the current PR file scope.")
   if _git(path, "status", "--porcelain", "--untracked-files=all").stdout.strip():
     _fail("Commit or discard working changes before validating the repair.")
   initial = _sha(checkout["initial_head_sha"])

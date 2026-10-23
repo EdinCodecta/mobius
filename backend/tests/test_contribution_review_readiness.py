@@ -238,6 +238,37 @@ def test_ready_attempt_projection_keeps_private_review_evidence(setup, monkeypat
   assert result["items"][0]["state"] == item_state
   assert result["items"][0]["independent_reviews"] == prior["independent_reviews"]
   assert row.outcomes_json[domain.key(ITEM)]["state"] == "reviewing"
+  if attempt_state == "unknown":
+    assert "mark it ready in GitHub" in result["items"][0]["summary"]
+    assert "different head" in result["items"][0]["summary"]
+    assert row.outcomes_json[domain.key(ITEM)].get("summary") == prior.get("summary")
+
+
+def test_same_head_draft_unknown_explains_manual_or_new_head_recovery(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  domain.save_ready_attempt(db, row, domain.key(ITEM), {"id": "old", "state": "unknown",
+    "head_sha": SHA, "base_sha": BASE})
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (REPO, {**PULL, "draft": True}))
+  result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert "mark it ready in GitHub" in result["blocked"]
+  assert "different head" in result["run"]["items"][0]["summary"]
+  assert result["run"]["items"][0]["ready_attempt"]["state"] == "unknown"
+
+
+def test_confirmed_earlier_head_receipt_requires_successor_grant_message(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  domain.save_ready_attempt(db, row, domain.key(ITEM), {"id": "old", "state": "ready",
+    "head_sha": SHA, "base_sha": BASE})
+  prior = row.outcomes_json[domain.key(ITEM)]
+  domain.save_outcome(db, row, domain.key(ITEM), {**prior, "successor": {"head_sha": NEW,
+    "base_sha": BASE}, "repair_attempts": [{"state": "pushed", "from_sha": SHA,
+    "head_sha": NEW, "base_sha": BASE}]})
+  monkeypatch.setattr(domain, "current_pull", lambda *a: pytest.fail("past receipt is already confirmed"))
+  result = asyncio.run(routes.mark_draft_ready(1, row.id,
+    ready_body(head_sha=NEW), db, principal))
+  assert "new grant" in result["blocked"]
+  assert "earlier head" in result["blocked"]
+  assert result["run"]["items"][0]["ready_attempt"]["state"] == "ready"
 
 
 @pytest.mark.parametrize("changed", ["actor", "model", "rights", "head", "stop"])

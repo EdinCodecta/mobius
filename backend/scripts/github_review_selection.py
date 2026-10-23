@@ -3,7 +3,7 @@ import hashlib
 import json
 
 IDENTITY_FIELDS = ("repo", "number", "head_sha", "base_ref", "base_sha")
-OPTION_FIELDS = ("review_prompt", "fix_prompt", "merge_prompt", "max_rounds", "autopilot")
+OPTION_FIELDS = ("review_prompt", "merge_prompt")
 OPTIONAL_OPTION_FIELDS = ("post_review",)
 
 

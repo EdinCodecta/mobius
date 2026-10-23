@@ -110,6 +110,8 @@ def test_missing_recorded_checkout_is_reprepared(setup, monkeypatch):
 
 def test_gc_protects_active_and_uncertain_but_collects_stopped_and_orphans(setup, monkeypatch, tmp_path):
   db, row, _ = setup
+  row.mode = "review_fix_merge"
+  db.commit()
   monkeypatch.setattr(repairs, "_checkout_root", lambda: tmp_path)
   paths = {name: tmp_path / f"repair-{name}" for name in ("active", "unknown", "terminal", "orphan")}
   for path in paths.values():
@@ -210,6 +212,8 @@ def test_idle_settled_or_superseded_checkout_is_terminal(setup, monkeypatch, tmp
 
 def test_cancelled_but_still_running_child_protects_parent_checkout(setup, monkeypatch, tmp_path):
   db, row, principal = setup
+  row.mode = "review_fix_merge"
+  db.commit()
   parent = tmp_path / "repair-parent"
   parent.mkdir()
   monkeypatch.setattr(repairs, "_checkout_root", lambda: tmp_path)
@@ -349,6 +353,8 @@ def test_timeout_observation_is_unknown_and_never_replays_push(setup, monkeypatc
 
 def test_stop_runs_receipt_aware_sweep(setup, monkeypatch):
   db, row, principal = setup
+  row.mode = "review_fix_merge"
+  db.commit()
   calls = []
   monkeypatch.setattr(actions, "sweep_checkout_receipts_once", lambda: calls.append(1))
   asyncio.run(routes.stop_review(1, row.id, db, Principal(owner=principal.owner, app_id=None)))

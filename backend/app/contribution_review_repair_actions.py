@@ -4,6 +4,7 @@ The route supplies one live-authority callback. This executor owns the persisted
 attempt and exact non-dispatch release; confirmed facts survive revoked authority.
 """
 import asyncio
+import logging
 import subprocess
 
 from fastapi import HTTPException
@@ -14,6 +15,10 @@ from app import agent_work_claims, chat_queue, contribution_review_runs as revie
 from app import contribution_review_repairs as repairs
 from app.contribution_errors import ContributionSubmitError
 from app.contribution_review_effects import DispatchResult, NotDispatched
+
+
+_log = logging.getLogger(__name__)
+_unsupported_gc_warned = False
 
 
 def checkout_gc_scope(db) -> dict[str, set[str]]:
@@ -29,7 +34,8 @@ def checkout_gc_scope(db) -> dict[str, set[str]]:
   protected: set[str] = set()
   terminal: set[str] = set()
   dormant: set[str] = set()
-  for row in db.query(models.ContributionReviewRun).populate_existing().all():
+  for row in db.query(models.ContributionReviewRun).filter_by(
+      mode="review_fix_merge").populate_existing().all():
     active_editor = row.chat_id in active_chats or row.chat_id in active_parents
     stopped = (row.outcomes_json or {}).get("_review_stop", {}).get("state") == "requested"
     for original in row.targets_json or []:
@@ -75,16 +81,19 @@ def sweep_checkout_receipts_once() -> None:
   a candidate is selected and atomically quarantined. After commit, any new
   admission sees a missing old path and must reprepare it.
   """
+  global _unsupported_gc_warned
   with SessionLocal() as db:
     dialect = db.get_bind().dialect.name
-    if dialect == "sqlite":
-      # The first statement is a harmless owner-row write. SQLite holds its
-      # single-writer reservation until commit, including classification and
-      # same-filesystem rename. No recursive delete runs in that transaction.
-      db.execute(text("UPDATE contribution_review_runs SET revision=revision "
-                      "WHERE id=(SELECT id FROM contribution_review_runs LIMIT 1)"))
-    else:
-      raise RuntimeError("Repair checkout GC requires SQLite's single-writer fence.")
+    if dialect != "sqlite":
+      if not _unsupported_gc_warned:
+        _log.warning("repair checkout GC skipped on %s: no cross-writer fence", dialect)
+        _unsupported_gc_warned = True
+      return
+    # The first statement is a harmless owner-row write. SQLite holds its
+    # single-writer reservation until commit, including classification and
+    # same-filesystem rename. No recursive delete runs in that transaction.
+    db.execute(text("UPDATE contribution_review_runs SET revision=revision "
+                    "WHERE id=(SELECT id FROM contribution_review_runs LIMIT 1)"))
     repairs.quarantine_stale_checkouts(**checkout_gc_scope(db))
     db.commit()
   repairs.delete_quarantined_checkouts()
@@ -184,17 +193,3 @@ def escalate_unconfirmed_push(db, row, original, previous, pending):
   reviews.save_effect_outcome(db, row, reviews.key(original), {**previous,
     "repair_attempts": attempts, "state": "needs_you",
     "summary": "The earlier repair push is not confirmed; observe it without repeating the write."})
-
-
-async def abandon_checkouts(row):
-  """Caller proved all editors stopped and holds the outcome lock.
-
-  An ambiguous receipt still owns its checkout after Stop. Only unspent work
-  is abandoned; age cannot establish that fact.
-  """
-  for outcome in (row.outcomes_json or {}).values():
-    if any(a.get("state") in {"pushing", "push_unknown"}
-           for a in outcome.get("repair_attempts", [])):
-      continue
-    checkout = outcome.get("checkout") or {}
-    await settled.run_settled(repairs.discard_checkout, checkout.get("checkout"))
