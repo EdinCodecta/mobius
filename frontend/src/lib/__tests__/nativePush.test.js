@@ -2,10 +2,8 @@ import { afterEach, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
-  disableNativePush,
-  enableNativePush,
+  disconnectPhone,
   forgetNativePush,
-  isNativePushEnabled,
   isThisPhone,
   registerNativePush,
   resetNativePushForTests,
@@ -14,9 +12,8 @@ import {
 const originalLocalStorage = globalThis.localStorage
 const values = new Map()
 const TOKEN_KEY = 'mobius.nativePush.token'
-const ENABLED_KEY = 'mobius.nativePush.enabled'
 
-function fakePush({ ok = true, forgetOk = true } = {}) {
+function fakePush({ ok = true, forgetOk = true, removeOk = true } = {}) {
   const calls = []
   return {
     calls,
@@ -28,6 +25,10 @@ function fakePush({ ok = true, forgetOk = true } = {}) {
           : { ok: false, status: 409, json: async () => ({ detail: 'Link this Möbius first.' }) }
       },
       forget: async (body) => { calls.push(['forget', body]); return { ok: forgetOk, status: forgetOk ? 204 : 500 } },
+      remove: async (id) => {
+        calls.push(['remove', id])
+        return removeOk ? { ok: true, status: 204 } : { ok: false, status: 500, json: async () => ({}) }
+      },
     },
   }
 }
@@ -64,95 +65,83 @@ test('outside the mobile app nothing is registered', async () => {
   assert.deepEqual(push.calls, [])
 })
 
-test('the shell never registers a phone the owner has not turned on', async () => {
+test('opening the app connects this phone without any switch', async () => {
   const push = fakePush()
-  await registerNativePush({ win: app({ token: 'tok-1' }), push })
-  assert.deepEqual(push.calls, [])
-})
+  await registerNativePush({ win: app({ token: 'tok-1', platform: 'android' }), push })
 
-test('Turn on registers only the token and remembers the choice', async () => {
-  const push = fakePush()
-  const result = await enableNativePush({ win: app({ token: 'tok-1', platform: 'android' }), push })
-
-  assert.deepEqual(result, { status: 'on' })
   assert.deepEqual(push.calls, [['register', { token: 'tok-1' }]])
   assert.equal(values.get(TOKEN_KEY), 'tok-1')
-  assert.equal(isNativePushEnabled(), true)
 })
 
-test('once turned on, each shell start re-registers silently', async () => {
+test('each app open refreshes the registration', async () => {
   const push = fakePush()
   const win = app({ token: 'tok-1' })
-  await enableNativePush({ win, push })
-  resetNativePushForTests()
-
+  await registerNativePush({ win, push })
   await registerNativePush({ win, push })
 
   assert.deepEqual(push.calls.map(([kind]) => kind), ['register', 'register'])
 })
 
-test('denied permission leaves notifications off', async () => {
+test('when the phone does not allow notifications, an earlier registration is forgotten', async () => {
   const push = fakePush()
-  assert.deepEqual(await enableNativePush({ win: app(null), push }), { status: 'denied' })
-  assert.deepEqual(push.calls, [])
-  assert.equal(isNativePushEnabled(), false)
-})
+  await registerNativePush({ win: app({ token: 'tok-1' }), push })
 
-test('a refused registration explains why and stays off', async () => {
-  const push = fakePush({ ok: false })
-  const result = await enableNativePush({ win: app({ token: 'tok-1' }), push })
+  await registerNativePush({ win: app(null), push })
 
-  assert.deepEqual(result, { status: 'error', message: 'Link this Möbius first.' })
-  assert.equal(isNativePushEnabled(), false)
+  assert.deepEqual(push.calls.slice(1), [['forget', { token: 'tok-1' }]])
   assert.equal(values.has(TOKEN_KEY), false)
 })
 
-test('a rotated token is registered only while turned on', async () => {
+test('a phone that never allowed notifications sends nothing', async () => {
+  const push = fakePush()
+  await registerNativePush({ win: app(null), push })
+  assert.deepEqual(push.calls, [])
+})
+
+test('a refused registration leaves this phone unrecorded', async () => {
+  const push = fakePush({ ok: false })
+  await registerNativePush({ win: app({ token: 'tok-1' }), push })
+
+  assert.equal(values.has(TOKEN_KEY), false)
+  assert.equal(isThisPhone('tok-1'), false)
+})
+
+test('a new token for this phone replaces the old one instead of adding a second phone', async () => {
   const push = fakePush()
   const win = app({ token: 'tok-1' })
-  await enableNativePush({ win, push })
+  await registerNativePush({ win, push })
 
   win.emit('mobius:push-token', { token: 'tok-2' })
   await settle()
-  assert.deepEqual(push.calls.slice(-2), [['register', { token: 'tok-2' }], ['forget', { token: 'tok-1' }]])
 
-  await disableNativePush({ push })
-  win.emit('mobius:push-token', { token: 'tok-3' })
-  await settle()
-  assert.deepEqual(push.calls.at(-1), ['forget', { token: 'tok-2' }])
+  assert.deepEqual(push.calls, [
+    ['register', { token: 'tok-1' }],
+    ['register', { token: 'tok-2' }],
+    ['forget', { token: 'tok-1' }],
+  ])
 })
 
-test('Turn off forgets this phone and the shell stops registering it', async () => {
+test('sign-out forgets the phone and a later rotation in the same page does not re-register it', async () => {
   const push = fakePush()
   const win = app({ token: 'tok-1' })
-  await enableNativePush({ win, push })
-
-  assert.equal(await disableNativePush({ push }), null)
   await registerNativePush({ win, push })
-
-  assert.deepEqual(push.calls.map(([kind]) => kind), ['register', 'forget'])
-  assert.equal(values.has(TOKEN_KEY), false)
-  assert.equal(values.has(ENABLED_KEY), false)
-})
-
-test('a failed Turn off says so and keeps the token to try again', async () => {
-  const push = fakePush({ forgetOk: false })
-  await enableNativePush({ win: app({ token: 'tok-1' }), push })
-
-  assert.equal(typeof await disableNativePush({ push }), 'string')
-  assert.equal(values.get(TOKEN_KEY), 'tok-1')
-  assert.equal(isNativePushEnabled(), false)
-})
-
-test('sign-out forgets the phone and signing in again does not re-register it', async () => {
-  const push = fakePush()
-  const win = app({ token: 'tok-1' })
-  await enableNativePush({ win, push })
 
   await forgetNativePush({ push })
-  await registerNativePush({ win, push })
+  win.emit('mobius:push-token', { token: 'tok-2' })
+  await settle()
 
   assert.deepEqual(push.calls.map(([kind]) => kind), ['register', 'forget'])
+})
+
+test('signing in again in the app connects the phone again', async () => {
+  const push = fakePush()
+  const win = app({ token: 'tok-1' })
+  await registerNativePush({ win, push })
+  await forgetNativePush({ push })
+
+  await registerNativePush({ win, push })
+
+  assert.deepEqual(push.calls.map(([kind]) => kind), ['register', 'forget', 'register'])
 })
 
 test('sign-out waits for a registration in flight and blocks later ones', async () => {
@@ -168,7 +157,6 @@ test('sign-out waits for a registration in flight and blocks later ones', async 
     },
   }
   const win = app({ token: 'tok-1' })
-  values.set(ENABLED_KEY, '1')
   const registering = registerNativePush({ win, push })
   await settle()
 
@@ -181,48 +169,65 @@ test('sign-out waits for a registration in flight and blocks later ones', async 
   assert.deepEqual(calls, [['register', { token: 'tok-1' }], ['forget', { token: 'tok-1' }]])
 })
 
+test('signing out while the app is still answering keeps the phone unregistered', async () => {
+  const push = fakePush()
+  let answer
+  const win = {
+    MobiusNative: { registerPush: () => new Promise((resolve) => { answer = resolve }) },
+    addEventListener() {},
+  }
+  const registering = registerNativePush({ win, push })
+  await settle()
+
+  await forgetNativePush({ push })
+  answer({ token: 'tok-1' })
+  await registering
+
+  assert.deepEqual(push.calls, [])
+  assert.equal(values.has(TOKEN_KEY), false)
+})
+
 test('Settings recognizes this phone by the end of its registered token', async () => {
   assert.equal(isThisPhone('ab12cd'), false)
-  await enableNativePush({ win: app({ token: 'token-ab12cd' }), push: fakePush() })
+  await registerNativePush({ win: app({ token: 'token-ab12cd' }), push: fakePush() })
 
   assert.equal(isThisPhone('ab12cd'), true)
   assert.equal(isThisPhone('zz99zz'), false)
   assert.equal(isThisPhone(''), false)
 })
 
-test('a new token for this phone replaces the old one instead of adding a second phone', async () => {
+test('disconnecting this phone removes it, and it connects again on the next app open', async () => {
   const push = fakePush()
-  const win = app({ token: 'tok-1' })
-  await enableNativePush({ win, push })
+  const win = app({ token: 'token-ab12cd' })
+  await registerNativePush({ win, push })
 
-  win.emit('mobius:push-token', { token: 'tok-2' })
-  await settle()
-  await registerNativePush({ win: app({ token: 'tok-2' }), push })
+  assert.equal(await disconnectPhone({ id: 'dev-1', tokenTail: 'ab12cd' }, { push }), null)
+  assert.equal(isThisPhone('ab12cd'), false)
+  await registerNativePush({ win, push })
 
-  assert.deepEqual(push.calls, [
-    ['register', { token: 'tok-1' }],
-    ['register', { token: 'tok-2' }],
-    ['forget', { token: 'tok-1' }],
-    ['register', { token: 'tok-2' }],
+  assert.deepEqual(push.calls.map(([kind, arg]) => [kind, kind === 'remove' ? arg : arg.token]), [
+    ['register', 'token-ab12cd'], ['remove', 'dev-1'], ['register', 'token-ab12cd'],
   ])
 })
 
-test('signing out while Turn on waits for permission keeps notifications off', async () => {
+test('disconnecting another phone leaves this phone connected', async () => {
   const push = fakePush()
-  let grant
-  const win = {
-    MobiusNative: { registerPush: () => new Promise((resolve) => { grant = resolve }) },
-    addEventListener() {},
-  }
-  const enabling = enableNativePush({ win, push })
-  await settle()
+  await registerNativePush({ win: app({ token: 'token-ab12cd' }), push })
 
-  await forgetNativePush({ push })
-  grant({ token: 'tok-1' })
+  assert.equal(await disconnectPhone({ id: 'dev-2', tokenTail: 'zz99zz' }, { push }), null)
 
-  assert.deepEqual(await enabling, { status: 'cancelled' })
-  assert.equal(isNativePushEnabled(), false)
-  assert.deepEqual(push.calls, [])
+  assert.deepEqual(push.calls.at(-1), ['remove', 'dev-2'])
+  assert.equal(isThisPhone('ab12cd'), true)
+})
+
+test('a failed disconnect says so and keeps this phone recorded', async () => {
+  const push = fakePush({ removeOk: false })
+  await registerNativePush({ win: app({ token: 'token-ab12cd' }), push })
+
+  const message = await disconnectPhone({ id: 'dev-1', tokenTail: 'ab12cd' }, { push })
+
+  assert.match(message, /Couldn't disconnect/)
+  assert.equal(isThisPhone('ab12cd'), true)
 })
 
 test('an old token whose cleanup failed is retried until the server confirms', async () => {
@@ -235,12 +240,12 @@ test('an old token whose cleanup failed is retried until the server confirms', a
     },
   }
   const win = app({ token: 'tok-1' })
-  await enableNativePush({ win, push })
+  await registerNativePush({ win, push })
   win.emit('mobius:push-token', { token: 'tok-2' })
   await settle()
 
   forgetOk = true
-  assert.equal(await disableNativePush({ push }), null)
+  await forgetNativePush({ push })
 
   assert.deepEqual(calls, [
     ['register', 'tok-1'], ['register', 'tok-2'], ['forget', 'tok-1'],

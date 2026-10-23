@@ -1,13 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Phone, X } from '@openai/apps-sdk-ui/components/Icon'
-import { Switch } from '@openai/apps-sdk-ui/components/Switch'
 import { api } from '../../api/client.js'
-import {
-  disableNativePush,
-  enableNativePush,
-  isNativePushAvailable,
-  isThisPhone,
-} from '../../lib/nativePush.js'
+import { disconnectPhone, isThisPhone } from '../../lib/nativePush.js'
 
 function lastOpened(iso) {
   const date = new Date(iso)
@@ -19,24 +13,18 @@ function phoneName(device) {
   return isThisPhone(device.tokenTail) ? 'This phone' : `Phone ···${device.tokenTail}`
 }
 
-const DENIED = "Notifications are off for Möbius in this phone's settings. Allow them there, then turn on again."
-
 /**
- * Phones registered for native push (the Möbius mobile app). Inside the app,
- * the owner turns notifications on or off for this phone here; nothing
- * registers until then. Elsewhere the list is read-only and says where to
- * change it.
+ * Phones connected for native push (the Möbius mobile app). A phone connects
+ * by itself when the app opens with notifications allowed in the phone's own
+ * settings; Möbius has no on/off switch. Here the owner sees the connected
+ * phones and can disconnect any of them.
  */
 export default function PhoneNotifications({ active = true }) {
   const [devices, setDevices] = useState([])
   const [confirming, setConfirming] = useState(null)
   const [removing, setRemoving] = useState(false)
-  // While a change is in flight the switch shows where it is going.
-  const [switching, setSwitching] = useState(null)
   const [message, setMessage] = useState('')
   const dialogRef = useRef(null)
-  const inApp = isNativePushAvailable()
-  const thisPhoneOn = devices.some((device) => isThisPhone(device.tokenTail))
 
   const load = useCallback(async () => {
     try {
@@ -60,61 +48,29 @@ export default function PhoneNotifications({ active = true }) {
     if (!confirming && dialog.open) dialog.close()
   }, [confirming])
 
-  const turnOn = async () => {
-    setSwitching('on')
-    setMessage('')
-    const result = await enableNativePush()
-    if (result.status === 'denied') setMessage(DENIED)
-    else if (result.status === 'error') setMessage(result.message)
-    await load()
-    setSwitching(null)
-  }
-
-  const turnOff = async () => {
-    setSwitching('off')
-    setMessage((await disableNativePush()) || '')
-    await load()
-    setSwitching(null)
-  }
-
-  // The × on this phone's card is Turn off, behind a confirmation.
-  const confirmTurnOff = async () => {
+  const confirmDisconnect = async () => {
     setRemoving(true)
-    setMessage((await disableNativePush()) || '')
+    setMessage((await disconnectPhone(confirming)) || '')
     setRemoving(false)
     setConfirming(null)
     load()
   }
 
+  const confirmingThisPhone = !!confirming && isThisPhone(confirming.tokenTail)
+
   return (
     <section className="settings__section settings__section--compact">
       <div className="settings__row">
         <span className="settings__label">Phone notifications</span>
-        {inApp && (
-          <Switch
-            className="settings-phone-switch"
-            aria-label="Notifications on this phone"
-            checked={switching ? switching === 'on' : thisPhoneOn}
-            disabled={!!switching}
-            onCheckedChange={(next) => (next ? turnOn() : turnOff())}
-          />
-        )}
       </div>
-      {message ? (
+      {message && (
         <p className="settings__subtext settings__subtext--tight" role="status">{message}</p>
-      ) : inApp ? (
-        !thisPhoneOn && (
-          <p className="settings__subtext settings__subtext--tight">
-            Get Möbius notifications on this phone, even when the app is closed.
-          </p>
-        )
-      ) : (
-        <p className="settings__subtext settings__subtext--tight">
-          {devices.length > 0
-            ? 'These phones get your Möbius notifications. To turn them on or off for a phone, open Settings in the Möbius app on that phone.'
-            : 'No phones connected. To get Möbius notifications on your phone, open Settings in the Möbius app there and switch them on.'}
-        </p>
       )}
+      <p className="settings__subtext settings__subtext--tight">
+        {devices.length > 0
+          ? 'These phones get your Möbius notifications. To stop them on a phone, turn off notifications for Möbius in its settings.'
+          : 'No phones connected. A phone connects when the Möbius app is opened on it with notifications allowed.'}
+      </p>
       {devices.length > 0 && (
         <div className="settings-phones">
           {devices.map((device) => (
@@ -124,20 +80,21 @@ export default function PhoneNotifications({ active = true }) {
                 <span className="settings-phone__name">{phoneName(device)}</span>
                 <span className="settings-phone__meta">Last opened {lastOpened(device.registeredAt)}</span>
               </span>
-              {inApp && isThisPhone(device.tokenTail) && (
-                <button
-                  className="settings-phone__remove"
-                  type="button"
-                  aria-label="Turn off notifications on this phone"
-                  onClick={() => setConfirming(device)}
-                >
-                  <X />
-                </button>
-              )}
+              <button
+                className="settings-phone__remove"
+                type="button"
+                aria-label={`Disconnect ${phoneName(device).toLowerCase()}`}
+                onClick={() => setConfirming(device)}
+              >
+                <X />
+              </button>
             </div>
           ))}
         </div>
       )}
+      <p className="settings__subtext settings__subtext--tight">
+        To reach your phone, notification titles and text pass through mobius.you and Google or Apple.
+      </p>
       <dialog
         ref={dialogRef}
         className="settings-phone-confirm"
@@ -145,10 +102,10 @@ export default function PhoneNotifications({ active = true }) {
         onCancel={(event) => { event.preventDefault(); if (!removing) setConfirming(null) }}
       >
         <h3 id="settings-phone-confirm-title" className="settings-phone-confirm__title">
-          Turn off notifications on this phone?
+          {confirmingThisPhone ? 'Disconnect this phone?' : `Disconnect phone ···${confirming?.tokenTail}?`}
         </h3>
         <p className="settings__subtext settings__subtext--tight">
-          This phone stops getting Möbius notifications. You can turn them on again here.
+          It stops getting Möbius notifications. If the Möbius app is opened on it again with notifications allowed, it connects again.
         </p>
         <div className="settings-phone-confirm__actions">
           <button
@@ -163,9 +120,9 @@ export default function PhoneNotifications({ active = true }) {
             className="settings__btn settings__btn--sm"
             type="button"
             disabled={removing}
-            onClick={confirmTurnOff}
+            onClick={confirmDisconnect}
           >
-            {removing ? 'Turning off…' : 'Turn off'}
+            {removing ? 'Disconnecting…' : 'Disconnect'}
           </button>
         </div>
       </dialog>

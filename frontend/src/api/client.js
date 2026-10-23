@@ -1824,6 +1824,9 @@ export const api = {
         // Sign-out reloads the page right after; let the request finish.
         keepalive: true,
       }),
+      remove: (id) => apiFetch(`/push/devices/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      }),
     },
   },
 }
