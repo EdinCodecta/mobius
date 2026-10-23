@@ -249,6 +249,7 @@ def _transition_candidates(db, owner_id, target):
   The Python fence below remains authoritative for receipt state and identity.
   """
   run = models.ContributionReviewRun
+  # SQLite JSON1 projection: SQLite is the sole shipped runtime (ARCHITECTURE.md).
   frozen = func.json_each(run.targets_json).table_valued("value").alias("frozen_target")
   value = frozen.c.value
   repo = func.json_extract(value, "$.repo")
