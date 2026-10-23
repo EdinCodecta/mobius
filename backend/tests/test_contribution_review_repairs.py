@@ -142,7 +142,7 @@ def test_push_is_confirmed_by_branch_ref_not_pull_projection(repair, monkeypatch
   monkeypatch.setattr(repairs, "_git", lambda *a, **kw: pushed.append(1) or type("Result", (), {"returncode": 0})())
   result = repairs.push_repair(None, repo, None, target, validation)
   assert result.state == "confirmed" and result.receipt["head_sha"] == "b" * 40
-  assert reads == ["head-ref", "head-ref"]
+  assert reads == ["head-ref", "head-ref", "head-ref"]
 
 
 @pytest.mark.parametrize("after_push", [None, "d" * 40])
