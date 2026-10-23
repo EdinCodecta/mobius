@@ -324,6 +324,7 @@ def test_valid_graphql_no_data_error_certifies_refusal():
   (["NOT_FOUND"], "gh: HTTP 404: missing", "not_dispatched"),
   (["UNPROCESSABLE"], "gh: request rejected (HTTP 422)", "not_dispatched"),
   (["FORBIDDEN"], "gh: HTTP 200: GraphQL error", "not_dispatched"),
+  (["FORBIDDEN"], "gh: HTTP 302: redirected", "unknown"),
   ([None], "", "unknown"),
   (["TIMEOUT"], "", "unknown"),
   (["INTERNAL"], "gh: HTTP 503: upstream failed", "unknown"),

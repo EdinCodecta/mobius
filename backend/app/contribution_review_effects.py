@@ -37,8 +37,8 @@ class DispatchResult(Generic[T]):
 
 
 _GH_HTTP_STATUS = re.compile(
-  r"(?im)^(?:gh:\s*)?HTTP\s+([245][0-9]{2})(?=\s*:)"
-  r"|^gh:[^\n]{0,240}\(HTTP\s+([245][0-9]{2})\)\s*$"
+  r"(?im)^(?:gh:\s*)?HTTP\s+([1-5][0-9]{2})(?=\s*:)"
+  r"|^gh:[^\n]{0,240}\(HTTP\s+([1-5][0-9]{2})\)\s*$"
 )
 _GRAPHQL_REFUSAL_TYPES = {"FORBIDDEN", "NOT_FOUND", "UNPROCESSABLE"}
 
