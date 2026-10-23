@@ -276,7 +276,7 @@ def test_shared_fence_projects_only_overlapping_or_unmatchable_grants(setup):
   db.commit()
   candidates = domain._transition_candidates(db, row.owner_id, target)
   assert {grant.id for grant in candidates} == {row.id, "same-pr", "same-branch", "legacy", "bad-type", "bad-ref", "unicode-ref"}
-  assert all(set(grant._mapping) == {"id", "targets_json", "outcomes_json"} for grant in candidates)
+  assert all(set(grant._mapping) == {"id", "chat_id", "targets_json", "outcomes_json"} for grant in candidates)
   # Legacy caller identity cannot prove disjointness from any grant.
   assert len(domain._transition_candidates(db, row.owner_id, TARGET)) == len(selections) + 1
 
@@ -292,3 +292,22 @@ def test_removed_attempt_snapshot_excludes_recursive_aggregate_history(monkeypat
   assert snapshot["summary"] == "Exact evidence" and snapshot["head_sha"] == SHA
   assert not {"steps", "merge_attempts", "repair_attempts", "independent_reviews",
     "reviewer_steps", "ready_audit", "checkout"}.intersection(snapshot)
+
+
+def test_repair_prior_receipts_use_the_shared_sql_projection(setup, monkeypatch):
+  from tests.test_contribution_review_workflows import configure_repair, NEW
+  db, row, principal = configure_repair(setup, monkeypatch)
+  target = row.targets_json[0]
+  real_candidates = domain._transition_candidates
+  selected = []
+  def candidates(*args):
+    result = real_candidates(*args)
+    assert all(not isinstance(grant, models.ContributionReviewRun) for grant in result)
+    selected.append(result)
+    return result
+  monkeypatch.setattr(domain, "_transition_candidates", candidates)
+  domain.arm_repair(db, row, target, {}, {"id": "projection-repair", "state": "pushing",
+    "from_sha": SHA, "head_sha": NEW, "base_sha": BASE}, principal)
+  # Prior repair receipts and the cross-action fence both use the projection.
+  assert len(selected) == 2
+  assert row.outcomes_json[domain.key(target)]["repair_attempts"][-1]["id"] == "projection-repair"

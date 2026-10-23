@@ -259,7 +259,7 @@ def _transition_candidates(db, owner_id, target):
       "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
       "\u2028\u2029\u202f\u205f\u3000") == ref), False)
   branch = head_branch_identity(target)
-  query = db.query(run.id, run.targets_json, run.outcomes_json).filter(run.owner_id == owner_id)
+  query = db.query(run.id, run.chat_id, run.targets_json, run.outcomes_json).filter(run.owner_id == owner_id)
   if branch is not None:
     overlap = or_(and_(func.lower(repo) == target["repo"].lower(), number == target["number"]),
       and_(repo_id == branch[0], ref == branch[1]), not_(usable))
@@ -711,7 +711,7 @@ def arm_repair(db, row, target, previous, receipt, principal):
     save_outcome(db, row, key(target), {**row.outcomes_json.get(key(target), {}),
       "state": "needs_you", "summary": summary, "review_chat_id": claim["owner_chat_id"]})
     return summary
-  grants = db.query(models.ContributionReviewRun).filter_by(owner_id=row.owner_id).populate_existing().all()
+  grants = _transition_candidates(db, row.owner_id, target)
   for grant in grants:
     for item in (grant.outcomes_json or {}).values():
       for attempt in item.get("repair_attempts", []):
