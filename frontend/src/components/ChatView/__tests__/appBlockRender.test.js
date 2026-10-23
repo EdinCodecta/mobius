@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import AppBlock from '../markdown/AppBlock.jsx'
 import { AppBlockView } from '../markdown/AppBlockParts.jsx'
+import { SessionConfirmation, SessionControls } from '../markdown/PassiveAppBlock.jsx'
 import { appBlockFromToken } from '../markdown/appBlock.js'
 import { appQueries } from '../../../hooks/queries.js'
 
@@ -80,4 +81,61 @@ test('the explicit view mounts the ordinary app canvas lazily', () => {
   const html = renderToStaticMarkup(createElement(AppBlockView, { app: installed[0], intent: 'open:1', height: 480, onHostRequest() {} }))
   assert.match(html, /class="md-app-block__view" style="height:480px"/)
   assert.match(html, /Opening Example…/)
+})
+
+const admitted = [{ ...installed[0], capability_contract: { runtime: { 'chat.blocks.passive': { version: 1 } } },
+  passive_block_module_digest: 'a'.repeat(64) }]
+const sessionBlock = { ...base, interaction: 'inline', action: { label: 'Contribute all', intent: 'send-batch:sel-1' },
+  badges: [{ label: 'All clear', tone: 'success' }] }
+
+test('an admitted inline session waits for its document instead of showing saved actions', () => {
+  const html = render(sessionBlock, admitted)
+  assert.match(html, /md-app-block__pending" role="status">Loading…</)
+  assert.doesNotMatch(html, />Contribute all<\/button>|md-app-block__toggle|<iframe/)
+})
+
+test('an inline session for an app without the admitted capability is a static block', () => {
+  for (const apps of [installed, [{ ...admitted[0], passive_block_module_digest: null }]]) {
+    const html = render(sessionBlock, apps)
+    assert.match(html, /aria-pressed="false">Contribute all<\/button>/)
+    assert.doesNotMatch(html, /Loading…/)
+  }
+})
+
+const controls = (state, locked = false) => renderToStaticMarkup(createElement(SessionControls,
+  { target: { label: 'Contribute all', intent: 'send-batch:sel-1' }, state, locked, onEvent() {} }))
+const live = fields => ({ label: '', disabled: false, busy: false, confirming: false, confirmation: null, hidden: false,
+  note: '', tone: 'neutral', status: '', statusTone: 'neutral', links: [], ...fields })
+
+test('Confirm takes the action\'s own fixed-size place with Not now beside it', () => {
+  const idle = controls(live({ label: 'Contribute all', status: 'Ready', links: [{ label: 'View PR', url: 'https://example.com/pr/1' }] }))
+  assert.match(idle, /md-app-block__status is-neutral">Ready</)
+  assert.match(idle, /href="https:\/\/example\.com\/pr\/1"/)
+  assert.match(idle, /class="md-app-block__action"[^>]*>Contribute all<\/button>/)
+  const confirming = controls(live({ confirming: true, confirmation: [{ title: 'Exact', facts: [] }] }))
+  assert.match(confirming, />Not now<\/button><button type="button" class="md-app-block__action">Confirm<\/button>/)
+  assert.equal((confirming.match(/class="md-app-block__action"/g) || []).length, 1)
+})
+
+test('Confirm is disabled without the complete app list or while an event awaits acknowledgement', () => {
+  assert.match(controls(live({ confirming: true, disabled: true })), /class="md-app-block__action" disabled="">Confirm/)
+  const locked = controls(live({ confirming: true, confirmation: [{ title: 'Exact', facts: [] }] }), true)
+  assert.match(locked, /class="md-app-block__cancel" disabled="">Not now/)
+  assert.match(locked, /class="md-app-block__action" disabled="">Confirm/)
+  assert.match(controls(live({ busy: true, disabled: true, label: 'Sending…' })), /disabled="" aria-busy="true"[^>]*>Sending…/)
+  assert.equal(controls(live({ hidden: true })), '')
+})
+
+test('the confirmation lists exactly the app-supplied items and marks conversation text', () => {
+  const html = renderToStaticMarkup(createElement(SessionConfirmation, { appName: 'Example', action: live({ confirming: true,
+    confirmation: [{ title: 'owner/repo: Fix it', facts: [{ label: 'Destination', value: 'owner/repo → main' }] },
+      { title: 'Second', facts: [] }] }) }))
+  assert.match(html, /Example will act on:/)
+  assert.equal((html.match(/<li>/g) || []).length, 2)
+  assert.match(html, /owner\/repo → main/)
+  assert.match(html, /The title and details above come from the conversation, not from Example\./)
+  const incomplete = renderToStaticMarkup(createElement(SessionConfirmation, { appName: 'Example',
+    action: live({ confirming: true, disabled: true, note: 'Open the app to review this action. Its full current identity is unavailable here.' }) }))
+  assert.match(incomplete, /Its full current identity is unavailable here/)
+  assert.doesNotMatch(incomplete, /<li>/)
 })

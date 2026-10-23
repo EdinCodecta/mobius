@@ -73,6 +73,9 @@ export function appBlockFromToken(token) {
   const inline = value.inline !== false
   return {
     app, intent, title, inline, href: appBlockHref(app, intent),
+    // `"interaction": "inline"` asks for a passive session (see appBlockSession.js);
+    // the host grants it only to an admitted app, otherwise the block is static.
+    session: inline && value.interaction === 'inline',
     facts: blockFacts(value.facts, APP_BLOCK_LIMITS.facts),
     badges: blockBadges(value.badges),
     // Invalid items and actions are dropped; they never widen another field.
@@ -85,9 +88,17 @@ export function appBlockFromToken(token) {
   }
 }
 
+/** The app actions a block names, keyed by their intent. */
+export function blockActions(block) {
+  return [block.action, ...block.items.map(item => item.action)].filter(Boolean)
+    .map(action => ({ key: action.intent, intent: action.intent, label: action.label }))
+}
+
 /** A transcript is not a workspace navigation owner or a chat-control
- *  authority, so an embedded view may only open a conversation or an app. */
-export function transcriptHostRequest(request, { navigate }) {
+ *  authority, so an embedded view may only open a conversation or an app,
+ *  and only while the reader can see it: a hidden session never navigates. */
+export function transcriptHostRequest(request, { visible, navigate }) {
+  if (!visible) throw new Error('Open the app to continue. A hidden transcript view cannot navigate.')
   if (request?.type === 'moebius:open-chat' && request.chatId) {
     navigate(`/shell/?${new URLSearchParams({ chat: request.chatId })}`)
   } else if (request?.type === 'moebius:open-app' && request.appId) {

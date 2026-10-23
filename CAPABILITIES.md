@@ -794,6 +794,41 @@ licensing of the bytes. A `read` consumer sends `control('next')` after taking
 ownership of every `chunk` event, so neither message port accumulates a whole
 large package in memory.
 
+### Passive transcript sessions
+
+`chat.blocks.passive` v1 lets an app's `"interaction": "inline"` chat blocks
+run its accepted code in a hidden, inert frame while the block is near the
+viewport, so the block can show current status and an in-place Confirm. It is
+an execution capability, not an HTTP permission: the app keeps its ordinary
+app token and server grants, so this is not a read-only sandbox. Its contract
+requires read-only module startup and session hydration; the app may act only
+after an explicit owner event (`activate`, `confirm`, `cancel`) and must check
+it again itself. The review copy says so: after the owner presses Confirm the
+app can act, for example publish a change. Omission is no grant; existing
+owners are never auto-granted it, and declaring it is a reviewable widening.
+
+Admission is server-owned. `AppOut.passive_block_module_digest` (also injected
+into the frame and folded into its ETag) is non-null only when the owner's live
+grant exists and the immutable applied runtime manifest declares the
+capability; it is the content address of the applied compiled bundle. It is
+computed once per (runtime revision, bundle) pair, never from the editable
+manifest, and a missing runtime cache is reported as unadmitted rather than
+rebuilt during serialization. The frame verifies the transferred module bytes
+against that SHA-256 before evaluation and fails closed, including offline or
+without WebCrypto. An admitted module that does not export
+`appBlockSessions = true` is never mounted as its ordinary view on this path;
+the block falls back to an explicit, visible open.
+
+Each frame document has a host-assigned generation. Negotiation, reported state
+and owner events are bound to it; a reload or version promotion resets idle
+controls, and an idle session released offscreen keeps nothing. A document that
+reports `retain` (an unacknowledged event, a confirmation, an operation in
+progress or an unknown outcome) stays mounted and is not replaced by an app
+update until it releases. Host requests from a hidden document (this session,
+a buffered successor or a background pane) are refused at the AppCanvas
+boundary. The wire protocol and the confirmation contract are in
+`building-apps.md` "Passive block sessions".
+
 ## Adding a capability
 
 1. Add one definition (name, version, kind, copy, lifecycle, limits) to the

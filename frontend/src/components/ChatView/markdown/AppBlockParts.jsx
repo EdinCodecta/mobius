@@ -78,16 +78,19 @@ export function AppBlockView({ app, intent, height, onHostRequest }) {
   </div>
 }
 
-/** Shared block chrome. `actionFor` renders the control for one app action. */
-export function AppBlockLayout({ block, app, appsLoading, onInternalNav, actionFor, toggle = null, children = null }) {
+/** Shared block chrome. `actionFor` renders the control for one app action;
+ *  `summary` is optional app-reported text shown under the saved title. */
+export function AppBlockLayout({ block, app, appsLoading, onInternalNav, actionFor, toggle = null,
+  summary = '', sectionRef = null, children = null }) {
   const action = actionFor(block.action)
-  return <section className="md-app-block" aria-label={block.title}>
+  return <section ref={sectionRef} className="md-app-block" aria-label={block.title}>
     <header>
       <strong>{block.title}</strong>
       <Badges badges={block.badges} />
       <AppLink className="md-app-block__open" href={block.href} onInternalNav={onInternalNav}>
         Open{app ? ` in ${app.name}` : ''}<ChevronRight width={16} height={16} aria-hidden="true" /></AppLink>
     </header>
+    {summary ? <p className="md-app-block__summary" role="status">{summary}</p> : null}
     <Facts facts={block.facts} />
     <BlockItems items={block.items} onInternalNav={onInternalNav} actionFor={actionFor} />
     {action || toggle ? <footer>{toggle}{action}</footer> : null}
@@ -96,10 +99,10 @@ export function AppBlockLayout({ block, app, appsLoading, onInternalNav, actionF
   </section>
 }
 
-export function StaticAppBlock({ block, app, appsLoading, onInternalNav }) {
+export function StaticAppBlock({ block, app, appsLoading, onInternalNav, sectionRef = null }) {
   const [viewIntent, setViewIntent] = useState(null)
   const navigate = useTranscriptNavigation(onInternalNav)
-  const onHostRequest = useCallback((_, request) => transcriptHostRequest(request, { navigate }), [navigate])
+  const onHostRequest = useCallback((_, request) => transcriptHostRequest(request, { visible: true, navigate }), [navigate])
   const openable = block.inline && app
   const toggleView = intent => setViewIntent(current => current === intent ? null : intent)
   const actionFor = target => openable && target
@@ -113,7 +116,7 @@ export function StaticAppBlock({ block, app, appsLoading, onInternalNav }) {
       {viewIntent !== null ? 'Hide details' : block.expandLabel || 'Show details here'}</button>
     : null
   return <AppBlockLayout block={block} app={app} appsLoading={appsLoading} onInternalNav={onInternalNav}
-    actionFor={actionFor} toggle={toggle}>
+    actionFor={actionFor} toggle={toggle} sectionRef={sectionRef}>
     {openable && viewIntent !== null
       ? <AppBlockView key={viewIntent} app={app} intent={viewIntent} height={block.height} onHostRequest={onHostRequest} />
       : null}

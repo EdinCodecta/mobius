@@ -32,7 +32,7 @@ function extractFunction(source, name) {
   throw new Error(`${name} is incomplete`)
 }
 
-function frameMountSignal(version, queue) {
+function frameMountSignal(version, queue, supportsAppBlocks = false) {
   const source = { version }
   const frameWindow = {
     __frameMounted: false,
@@ -46,11 +46,12 @@ function frameMountSignal(version, queue) {
     'window',
     'createElement',
     '_FRAME_APP_ID',
+    'supportsAppBlocks',
     `${extractFunction(frame, 'signalFrameMounted')}\n`
       + `${extractFunction(frame, 'MountSignal')}\n`
       + 'return MountSignal',
   )
-  return { source, mount: factory(frameWindow, createElement, '42') }
+  return { source, mount: factory(frameWindow, createElement, '42', supportsAppBlocks) }
 }
 
 test('speech startup watchdog tracks progress and ends when model loading completes', () => {
@@ -137,6 +138,16 @@ test('commit ordering keeps capability sessions on the exact live document', () 
   )
   assert.match(canvas, /capabilityHostRef\.current\.destroy\(\)/)
   assert.doesNotMatch(canvas, /deferredCapability|boundedWireBytes/)
+})
+
+test('a committed module reports whether it supports transcript block sessions', () => {
+  for (const supported of [false, true]) {
+    const queue = []
+    frameMountSignal('v', queue, supported).mount().props.ref({})
+    assert.equal(queue.length, 1)
+    assert.equal(queue[0].message.type, 'moebius:frame-mounted')
+    assert.equal(queue[0].message.supportsAppBlocks, supported)
+  }
 })
 
 test('a visible background pane remains inside the capability boundary', () => {
