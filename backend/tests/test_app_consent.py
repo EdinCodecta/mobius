@@ -689,3 +689,16 @@ def test_an_update_that_pauses_an_app_sets_its_new_skill_aside_until_accepted(
   digest = client.get(f"/api/apps/{app_id}/consent", headers=headers).json()["digest"]
   assert client.post(f"/api/apps/{app_id}/consent", json={"digest": digest}, headers=headers).status_code == 200
   assert live.read_bytes() == b"# v2\n"
+
+
+def test_an_app_that_asks_for_nothing_is_never_asked(client, owner_token, db):
+  app = _app(db, "plain", contract=_contract())
+  assert app_consent.status(app) == "accepted"
+  assert not app_consent.dormant(app)
+  headers = _owner_headers(client, owner_token)
+  assert client.post("/api/auth/app-token", json={"app_id": app.id}, headers=headers).status_code == 200
+  assert client.get(f"/api/apps/{app.id}/consent", headers=headers).json()["status"] == "accepted"
+  # An update that starts asking for something is asked, in full.
+  app.capability_contract = _contract(github_access=True)
+  assert app_consent.status(app) == "required"
+  assert [r["id"] for r in app_consent.needed_rows(app)] == ["github_access"]
