@@ -796,6 +796,23 @@ def save_effect_outcome(db, row, item_key, outcome):
         and public_receipt.get("marker") != (outcome.get("public_review") or {}).get("marker")):
       # Only the dispatcher/observer of this exact attempt can settle it.
       return
+    current_ready = current.get("ready_attempt")
+    incoming_ready = outcome.get("ready_attempt")
+    if current_ready and incoming_ready:
+      # A stale observer must not replace another attempt or erase a later
+      # confirmed/retired receipt. A confirmed fact may still upgrade an
+      # unattributable observation of the same exact attempt.
+      if (current_ready.get("id") != incoming_ready.get("id")
+          or current_ready.get("head_sha") != incoming_ready.get("head_sha")
+          or (current_ready.get("state") == "ready" and incoming_ready.get("state") != "ready")
+          or (current_ready.get("state") == "unattributable"
+              and incoming_ready.get("state") not in {"unattributable", "ready"})):
+        return
+      audit = list(current.get("ready_audit") or [])
+      for event in outcome.get("ready_audit") or []:
+        if event not in audit:
+          audit.append(event)
+      outcome = {**outcome, "ready_audit": audit}
     revision = row.revision
     values = {**row.outcomes_json, item_key: outcome}
     changed = db.execute(update(models.ContributionReviewRun).where(

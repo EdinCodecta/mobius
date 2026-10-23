@@ -868,3 +868,45 @@ def test_confirmed_ready_receipt_merges_concurrent_stop_revision(setup, monkeypa
   db.refresh(row)
   assert row.outcomes_json[routes.REVIEW_STOP_KEY]["state"] == "requested"
   assert row.outcomes_json[domain.key(ITEM)]["ready_attempt"]["state"] == "ready"
+
+
+@pytest.mark.parametrize("current,incoming", [
+  ("ready", "unattributable"), ("ready", "unknown"),
+  ("unattributable", "unknown"), ("unattributable", "attempting"),
+])
+def test_stale_ready_observer_cannot_downgrade_saved_receipt(setup, monkeypatch, current, incoming):
+  from app.database import SessionLocal
+  db, row, _ = ready_takeover(setup, monkeypatch)
+  item_key = domain.key(ITEM)
+  receipt = {"id": "one-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE}
+  domain.save_ready_attempt(db, row, item_key, receipt)
+  stale = {**row.outcomes_json[item_key], "ready_attempt": {**receipt, "state": incoming}}
+  with SessionLocal() as writer:
+    live = writer.get(models.ContributionReviewRun, row.id)
+    domain.save_ready_attempt(writer, live, item_key, {**receipt, "state": current})
+  domain.save_effect_outcome(db, row, item_key, stale)
+  db.refresh(row)
+  assert row.outcomes_json[item_key]["ready_attempt"]["state"] == current
+  assert row.outcomes_json[item_key]["ready_audit"][-1]["state"] == current
+
+
+def test_ready_slot_rejects_other_receipt_but_accepts_confirmed_upgrade_and_deliberate_clear(setup, monkeypatch):
+  from app.database import SessionLocal
+  db, row, _ = ready_takeover(setup, monkeypatch)
+  item_key = domain.key(ITEM)
+  receipt = {"id": "one-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE}
+  domain.save_ready_attempt(db, row, item_key, receipt)
+  stale_other = {**row.outcomes_json[item_key], "ready_attempt": {**receipt, "id": "other", "state": "ready"}}
+  confirmed = {**row.outcomes_json[item_key], "ready_attempt": {**receipt, "state": "ready"},
+    "ready_audit": [*row.outcomes_json[item_key]["ready_audit"],
+      {"id": receipt["id"], "state": "ready", "head_sha": SHA}]}
+  with SessionLocal() as writer:
+    live = writer.get(models.ContributionReviewRun, row.id)
+    domain.save_ready_attempt(writer, live, item_key, {**receipt, "state": "unattributable"})
+  domain.save_effect_outcome(db, row, item_key, stale_other)
+  assert row.outcomes_json[item_key]["ready_attempt"]["state"] == "unattributable"
+  domain.save_effect_outcome(db, row, item_key, confirmed)
+  assert row.outcomes_json[item_key]["ready_attempt"]["state"] == "ready"
+  assert [a["state"] for a in row.outcomes_json[item_key]["ready_audit"]] == ["unknown", "unattributable", "ready"]
+  domain.save_effect_outcome(db, row, item_key, {"state": "reviewing"})
+  assert "ready_attempt" not in row.outcomes_json[item_key]
