@@ -167,12 +167,13 @@ def test_merge_failure_summary_keeps_untrusted_exception_generic():
   )
 
 
-def test_lost_merge_receipt_preserves_safe_diagnostic(setup, monkeypatch):
+def test_explicit_http_422_rejection_disarms_exact_merge_claim(setup, monkeypatch):
   def lose(*args):
     raise ContributionSubmitError("gh: HTTP 422: merge blocked")
   monkeypatch.setattr(domain, "perform_merge", lose)
   item = report(setup)["run"]["items"][0]
-  assert item["state"] == "merge_unknown"
+  assert item["state"] == "needs_you"
+  assert item["merge_attempted"] is False
   assert "HTTP 422" in item["summary"]
 
 
@@ -196,7 +197,7 @@ def test_temporarily_changed_head_cannot_erase_an_ambiguous_attempt(setup, monke
     raise HTTPException(409, "This head changed")
   monkeypatch.setattr(domain, "current_pull", unavailable)
   item = report(setup)["run"]["items"][0]
-  assert item["state"] == "needs_you"
+  assert item["state"] == "merge_unknown"
   assert item["merge_attempted"] is True
   monkeypatch.setattr(domain, "current_pull", lambda *args: (REPO, PULL))
   assert report(setup)["run"]["items"][0]["state"] == "merge_unknown"
@@ -287,8 +288,9 @@ def test_merge_call_rejects_unreadable_confirmation():
 
 def test_queue_call_binds_sha_and_never_jumps():
   calls = []
-  def gh(*args):
+  def gh(*args, **kwargs):
     calls.append(args)
+    assert kwargs == {"check": False}
     return SimpleNamespace(stdout=json.dumps({"data": {"enqueuePullRequest": {
       "mergeQueueEntry": {"id": "queue-1"}
     }}}))
@@ -382,8 +384,17 @@ def approved_body(request_id="chat-approved"):
     chat_approval={"context": "The owner said: review this exact PR and merge it if safe."})
 
 
+def snapshot_owning_chat(db, principal):
+  choice = routes.resolve_round_choice(db)
+  chat = db.get(models.Chat, principal.chat_id)
+  chat.provider = choice["provider"]
+  chat.agent_settings_json = {"model": choice["model"], "effort": choice.get("effort")}
+  db.commit()
+
+
 def test_explicit_chat_consent_stays_in_owning_chat_with_durable_provenance(setup, monkeypatch):
   db, _, principal = setup
+  snapshot_owning_chat(db, principal)
   monkeypatch.setattr(domain, "inspect_target", lambda *args: TARGET)
   async def forbidden(**kwargs):
     pytest.fail("Approval must not create a second review conversation")
@@ -461,6 +472,7 @@ def test_http_admission_accepts_explicit_chat_consent_but_not_an_unapproved_agen
   from fastapi import FastAPI
   from fastapi.testclient import TestClient
   db, _, principal = setup
+  snapshot_owning_chat(db, principal)
   application = FastAPI()
   application.include_router(routes.router)
   application.dependency_overrides[routes.get_db] = lambda: db
