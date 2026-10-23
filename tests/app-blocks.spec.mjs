@@ -103,14 +103,24 @@ test('a passive session drives an in-place Confirm through the real frame protoc
   const generation = Number(await log.getAttribute('data-generation'))
   expect(sessionId).toBeTruthy()
 
-  // A double-click on the action: the second click lands where Confirm
-  // appears, before it has been shown long enough to arm. No confirm is sent.
-  const centre = [box.x + box.width / 2, box.y + box.height / 2]
-  // Two pointer clicks back to back, with no wait between them, so the second
-  // is always well inside the 500 ms arming delay however slow the runner is.
-  await page.mouse.click(...centre)
-  await page.mouse.click(...centre)
+  // The click that would follow a double-click: the moment the button reads
+  // Confirm, it is disabled (not yet armed) and a click sends nothing.
+  // A page-side observer clicks in the same task Confirm appears, so runner
+  // speed can never turn this into a deliberate click after arming.
+  const drawn = block.evaluate(section => new Promise(resolve => {
+    const observer = new MutationObserver(() => {
+      const button = section.querySelector('footer .md-app-block__action')
+      if (button?.textContent !== 'Confirm') return
+      observer.disconnect()
+      const disabled = button.disabled
+      button.click()
+      resolve(disabled)
+    })
+    observer.observe(section, { subtree: true, childList: true, characterData: true })
+  }))
+  await action.click()
   const confirm = block.locator('footer .md-app-block__action')
+  expect(await drawn).toBe(true)
   await expect(confirm).toHaveText('Confirm')
   await expect(block.getByRole('button', { name: 'Not now' })).toBeVisible()
   expect((await log.textContent()).split('\n').filter(line => line.endsWith(' confirm'))).toHaveLength(0)
@@ -146,6 +156,31 @@ test('a passive session drives an in-place Confirm through the real frame protoc
 
   // The hidden document's navigation request was refused.
   expect(page.url()).not.toContain('fixture-hidden-navigation')
+})
+
+test('with the action at the bottom edge, Confirm arms only after the list end has been on screen', async ({ page, request }) => {
+  await page.setViewportSize({ width: 390, height: 700 })
+  await installFixtures(page, request)
+  const chat = await openTranscript(page, { assistant: fence({ app: 'e2e-block-session', intent: 'open:batch',
+    title: 'Ready to send', interaction: 'inline', action: { label: 'Send all', intent: 'send-batch:sel-1' } }) })
+  const block = chat.locator('.md-app-block')
+  const action = block.locator('footer .md-app-block__action')
+  await expect(action).toHaveText('Send all')
+  await action.evaluate(button => button.scrollIntoView({ block: 'end' }))
+  await action.click()
+  const confirm = block.locator('footer .md-app-block__action')
+  await expect(confirm).toHaveText('Confirm')
+  const listEnd = block.locator('.md-app-block__list-end')
+  expect(await listEnd.evaluate(node => node.getBoundingClientRect().top > window.innerHeight)).toBe(true)
+  // Long past the delay, the unseen list keeps Confirm disabled.
+  await page.waitForTimeout(1200)
+  await expect(confirm).toBeDisabled()
+  // Scroll through the list to its end, then back up to Confirm.
+  await listEnd.scrollIntoViewIfNeeded()
+  await confirm.evaluate(button => button.scrollIntoView({ block: 'end' }))
+  await expect(confirm).toBeEnabled()
+  await confirm.click()
+  await expect(block.locator('.md-app-block__summary')).toHaveText('Sent 1')
 })
 
 test('a document reload discards idle controls until the new document reports', async ({ page, request }) => {

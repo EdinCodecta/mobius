@@ -70,3 +70,4 @@
 .md-app-block__confirmation dt, .md-app-block__confirmation dd, .md-app-block__confirmation p { margin:0; font-size:13px; }
 .md-app-block__provenance { color:var(--muted); }
 .md-app-block__session-host { position:absolute; width:1px; height:1px; overflow:hidden; opacity:0; pointer-events:none; clip-path:inset(50%); }
+.md-app-block__list-end { display:block; height:1px; }

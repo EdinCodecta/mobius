@@ -820,7 +820,8 @@ then reflects the last digest the shell received: a cached app list and frame
 can run cached, admitted bytes, so a revocation takes effect once the shell
 reaches the server again. An admitted module that does not export
 `appBlockSessions = true` is never mounted as its ordinary view on this path;
-the block falls back to an explicit, visible open.
+the block falls back to an explicit, visible open. That verdict belongs to one
+applied revision; after an update the block negotiates again.
 
 Each frame document has a host-assigned generation, echoed by the frame in
 `frame-mounted` and every `app-block-state`. Negotiation, reported state
@@ -833,9 +834,12 @@ successor, and from any transcript or session canvas that is not visible (the
 hidden session canvas gets no host-request handler at all). An ordinary shell
 app keeps its background requests, such as chat status or a projects list,
 while another view is on screen. At most 3 idle session frames run per app
-(nearest by last observed position; a reader-opened static view is never torn
-down for a slot), and Confirm arms only after one continuous, visible showing
-of its exact list lasting about 500 ms; every new showing earns its own delay. The wire protocol and the confirmation contract are in
+(nearest the viewport centre, measured as the page scrolls; a reader-opened
+static view is never torn down for a slot). Confirm arms only after the end of
+its exact list (a sentinel after the last item, drawn below Confirm) has been
+on screen during the current showing and Confirm itself has then been on
+screen in a visible page for about 500 ms; every new showing starts over. The
+wire protocol and the confirmation contract are in
 `building-apps.md` "Passive block sessions".
 
 ## Adding a capability

@@ -7,29 +7,11 @@ import useAppBlockSession from '../hooks/useAppBlockSession.js'
 import { sessionSnapshot } from './appBlockSession.js'
 import { AppBlockLayout, AppCanvas, StaticAppBlock } from './AppBlockParts.jsx'
 import { usePassiveSlot } from './passiveSlots.js'
-
-/** A callback ref, so the observer follows whichever section is mounted.
- *  `distance` (from the viewport's centre) orders blocks competing for slots. */
-function useNearViewport() {
-  const [node, setNode] = useState(null)
-  const [view, setView] = useState({ near: false, distance: Infinity })
-  useEffect(() => {
-    if (!node || typeof IntersectionObserver === 'undefined') return undefined
-    const observer = new IntersectionObserver(entries => {
-      const entry = entries.at(-1)
-      const rect = entry.boundingClientRect
-      const centre = entry.rootBounds ? (entry.rootBounds.top + entry.rootBounds.bottom) / 2 : window.innerHeight / 2
-      setView({ near: entry.isIntersecting, distance: Math.round(Math.abs((rect.top + rect.bottom) / 2 - centre)) })
-    }, { rootMargin: '400px 0px' })
-    observer.observe(node)
-    return () => observer.disconnect()
-  }, [node])
-  return [setNode, view]
-}
+import { useNearViewport } from './blockViewport.js'
 
 /** Whether an element is actually on screen in a visible document: no
  *  prefetch margin. Only this time counts toward arming Confirm. */
-function useOnScreen() {
+export function useOnScreen() {
   const [node, setNode] = useState(null)
   const [intersecting, setIntersecting] = useState(false)
   const [documentVisible, setDocumentVisible] = useState(() =>
@@ -90,9 +72,9 @@ export function SessionControls({ target, state, locked, confirmArmed = false, c
 
 /** What Confirm will do, exactly as the app supplied it. The provenance note
  *  comes first: it describes the saved snapshot, not the app's list. */
-export function SessionConfirmation({ action, appName, listRef = null }) {
+export function SessionConfirmation({ action, appName, listEndRef = null }) {
   if (!action) return null
-  return <div ref={listRef} className="md-app-block__confirmation" role="group" aria-label={`Confirm with ${appName}`}>
+  return <div className="md-app-block__confirmation" role="group" aria-label={`Confirm with ${appName}`}>
     <p className="md-app-block__provenance" role="note">
       {`The saved title and details above come from the conversation. The list below comes from ${appName}.`}</p>
     {action.confirmation
@@ -101,13 +83,16 @@ export function SessionConfirmation({ action, appName, listRef = null }) {
         <dl>{item.facts.map((fact, j) => <div key={j}><dt>{fact.label}</dt><dd>{fact.value}</dd></div>)}</dl>
       </li>)}</ul></>
       : <p role="status">{action.note}</p>}
+    {/* After the last item: Confirm (drawn above) arms only once this end has
+        been on screen, so the whole list has passed through the viewport. */}
+    <span ref={listEndRef} className="md-app-block__list-end" aria-hidden="true" />
   </div>
 }
 
 /** The passive block for one parsed session state. The parser allows at most
  *  one enabled confirmation, and this is the action whose list is shown. */
 export function PassiveBlockView({ block, app, state, locked, confirmArmed = false, onEvent, onInternalNav,
-  sectionRef = null, confirmRef = null, listRef = null, children = null }) {
+  sectionRef = null, confirmRef = null, listEndRef = null, children = null }) {
   const actionState = key => state?.actions.find(action => action.key === key) || null
   const actionFor = target => target
     ? <SessionControls target={target} state={actionState(target.intent)} locked={locked}
@@ -115,7 +100,7 @@ export function PassiveBlockView({ block, app, state, locked, confirmArmed = fal
     : null
   return <AppBlockLayout block={sessionSnapshot(block, state)} app={app} onInternalNav={onInternalNav}
     actionFor={actionFor} summary={state?.summary || ''} sectionRef={sectionRef}>
-    <SessionConfirmation action={state?.actions.find(action => action.confirming)} appName={app.name} listRef={listRef} />
+    <SessionConfirmation action={state?.actions.find(action => action.confirming)} appName={app.name} listEndRef={listEndRef} />
     {state?.notice ? <p className="md-app-block__notice" role="status">{state.notice}</p> : null}
     {children}
   </AppBlockLayout>
@@ -137,12 +122,13 @@ function SessionHost({ app, session }) {
 export default function PassiveAppBlock({ block, app, onInternalNav }) {
   const [sectionRef, { near, distance }] = useNearViewport()
   const [confirmRef, confirmOnScreen] = useOnScreen()
-  const [listRef, listOnScreen] = useOnScreen()
+  const [listEndRef, listEndOnScreen] = useOnScreen()
   const [retained, setRetained] = useState(false)
   const [staticOpen, setStaticOpen] = useState(false)
   const granted = usePassiveSlot(app.id, { wanted: near && !staticOpen, retained, distance })
   const session = useAppBlockSession({ block, near: near && granted && !staticOpen,
-    confirmVisible: confirmOnScreen && listOnScreen })
+    revision: `${app.passive_block_module_digest}:${appFrameVersion(app)}`,
+    confirmVisible: confirmOnScreen, listEndVisible: listEndOnScreen })
   useEffect(() => setRetained(session.retained), [session.retained])
   if (passiveBlockMode({ supported: session.supported, near, granted, retained: session.retained, staticOpen }) === 'static') {
     return <StaticAppBlock block={block} app={app} appsLoading={false} onInternalNav={onInternalNav}
@@ -152,7 +138,7 @@ export default function PassiveAppBlock({ block, app, onInternalNav }) {
   const locked = session.awaitingAck || Boolean(state?.actions.some(action => action.busy))
   return <PassiveBlockView block={block} app={app} state={state} locked={locked} confirmArmed={session.confirmArmed}
     onEvent={session.dispatch} onInternalNav={onInternalNav} sectionRef={sectionRef}
-    confirmRef={confirmRef} listRef={listRef}>
+    confirmRef={confirmRef} listEndRef={listEndRef}>
     {session.frameMounted ? <SessionHost app={app} session={session} /> : null}
   </PassiveBlockView>
 }

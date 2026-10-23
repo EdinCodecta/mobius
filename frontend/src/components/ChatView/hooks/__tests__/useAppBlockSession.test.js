@@ -13,7 +13,7 @@ const block = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.s
   items: [{ title: 'Row', intent: 'open:b', action: { label: 'Send', intent: 'send:b' } }] }) })
 
 function mounted(near = true) {
-  const h = renderHook(props => useAppBlockSession(props), { block, near, confirmVisible: true })
+  const h = renderHook(props => useAppBlockSession(props), { block, near, confirmVisible: true, listEndVisible: true })
   const report = (fields, generation = h.result.current.generation) => h.result.current.onBlockState({
     type: 'moebius:app-block-state', sessionId: h.result.current.sessionId,
     actions: [{ key: 'send-batch:sel-1', label: 'Send all' }, { key: 'send:b', label: 'Send' }], ...fields,
@@ -228,14 +228,14 @@ for (const mode of ['repeated activation', 'A-B-A', 'reload', 'changed offscreen
         report(confirmList('A'), 2)
       } else if (mode === 'changed offscreen') {
         report({ ...confirmList('A'), retain: true })
-        h.rerender({ block, near: false, confirmVisible: false })
+        h.rerender({ block, near: false, confirmVisible: false, listEndVisible: false })
         report({ ...confirmList('Changed while unseen'), retain: true })
         mock.timers.tick(CONFIRM_ARM_MS)
-        h.rerender({ block, near: true, confirmVisible: true })
+        h.rerender({ block, near: true, confirmVisible: true, listEndVisible: true })
       } else {
-        h.rerender({ block, near: true, confirmVisible: false })
+        h.rerender({ block, near: true, confirmVisible: false, listEndVisible: false })
         mock.timers.tick(CONFIRM_ARM_MS)
-        h.rerender({ block, near: true, confirmVisible: true })
+        h.rerender({ block, near: true, confirmVisible: true, listEndVisible: true })
       }
       assert.equal(h.result.current.confirmArmed, false)
       assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), false)
@@ -281,4 +281,55 @@ test('a Confirm press spends its showing: an acknowledgement does not allow a se
     mock.timers.tick(CONFIRM_ARM_MS)
     assert.equal(h.result.current.confirmArmed, true, 'only a new showing re-arms, after its own delay')
   } finally { mock.timers.reset() }
+})
+
+test('Confirm arms only after the list end has been on screen during this showing, and Confirm is on screen', () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const h = renderHook(props => useAppBlockSession(props), { block, near: true, confirmVisible: true, listEndVisible: false })
+    const report = fields => h.result.current.onBlockState({ type: 'moebius:app-block-state',
+      sessionId: h.result.current.sessionId, ...fields }, { generation: 1 })
+    h.result.current.onBlockCapability(true, { generation: 1, reset: true })
+    // The action sits at the bottom edge: Confirm is on screen, the list below it is not.
+    report(confirmList('Twelve targets'))
+    mock.timers.tick(CONFIRM_ARM_MS * 4)
+    assert.equal(h.result.current.confirmArmed, false)
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), false)
+    // The reader scrolls the list's end into view; Confirm leaves the top.
+    h.rerender({ block, near: true, confirmVisible: false, listEndVisible: true })
+    mock.timers.tick(CONFIRM_ARM_MS)
+    assert.equal(h.result.current.confirmArmed, false, 'Confirm itself must be on screen')
+    // Back up to Confirm: the end stays seen for this showing; a fresh delay follows.
+    h.rerender({ block, near: true, confirmVisible: true, listEndVisible: false })
+    mock.timers.tick(CONFIRM_ARM_MS - 1)
+    assert.equal(h.result.current.confirmArmed, false)
+    mock.timers.tick(1)
+    assert.equal(h.result.current.confirmArmed, true)
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), true)
+  } finally { mock.timers.reset() }
+})
+
+test('an unsupported verdict belongs to one applied revision; a newer revision negotiates again', () => {
+  const h = renderHook(props => useAppBlockSession(props), { block, near: true, revision: 'r1' })
+  h.result.current.onBlockCapability(false, { generation: 1, reset: true })
+  assert.equal(h.result.current.supported, false)
+  assert.equal(h.result.current.frameMounted, false)
+  h.rerender({ block, near: true, revision: 'r1' })
+  assert.equal(h.result.current.supported, false, 'the same revision stays static')
+  h.rerender({ block, near: true, revision: 'r2' })
+  assert.equal(h.result.current.supported, null)
+  assert.equal(h.result.current.frameMounted, true, 'the new revision gets a hidden frame to negotiate')
+})
+
+test('a retained session keeps its unsupported negotiation across a revision change', () => {
+  const h = renderHook(props => useAppBlockSession(props), { block, near: true, revision: 'r1' })
+  h.result.current.onBlockCapability(true, { generation: 1, reset: true })
+  h.result.current.onBlockState({ type: 'moebius:app-block-state', sessionId: h.result.current.sessionId,
+    actions: [], retain: true, checkpoint: { id: 'c1', data: 'x' } }, { generation: 1 })
+  h.result.current.onBlockCapability(false, { generation: 2, reset: true })
+  assert.equal(h.result.current.retained, true)
+  h.rerender({ block, near: true, revision: 'r2' })
+  assert.equal(h.result.current.supported, false)
+  assert.equal(h.result.current.frameMounted, true, 'the unresolved owner keeps its frame')
+  assert.deepEqual(h.result.current.blockSession.checkpoint, { id: 'c1', data: 'x' })
 })

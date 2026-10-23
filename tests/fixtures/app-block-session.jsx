@@ -5,7 +5,9 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 export const appBlockSessions = true
 
-const CONFIRMATION = [{ title: 'fixture/repo: Change one', facts: [{ label: 'Version', value: 'abc123' }] }]
+// Twelve targets, so the list runs well below Confirm on a phone-sized screen.
+const CONFIRMATION = Array.from({ length: 12 }, (_, i) => ({
+  title: i ? `fixture/repo: Change ${i + 1}` : 'fixture/repo: Change one', facts: [{ label: 'Version', value: `abc12${i}` }] }))
 
 function Session({ blockSession }) {
   const [log, setLog] = useState([])
