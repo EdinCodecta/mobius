@@ -4,7 +4,9 @@ import {
   chatChanges,
   compactChangesSummary,
   groupChangedFiles,
+  isSourcePath,
 } from '../chatChanges.js'
+import sourcePathCases from './chatSourcePathCases.json' with { type: 'json' }
 
 function entry(id, ...paths) {
   return {
@@ -102,4 +104,12 @@ test('excerpt-only edits and the latest edit time are reported', () => {
   const changes = chatChanges([older, newer])
   assert.equal(changes.excerptCount, 1)
   assert.equal(changes.latestTs, 20)
+})
+
+
+test('Changes lists exactly the shared source-path cases marked for display', () => {
+  // The backend contribution rule reads the same table; see the fixture note.
+  for (const { path, changes } of sourcePathCases.cases) {
+    assert.equal(isSourcePath(path), changes, path)
+  }
 })

@@ -2050,6 +2050,14 @@ def _chat_edit_paths(diff: str) -> list[str]:
 
 
 def _trackable_chat_source_path(value: str) -> str:
+  """The edited path when it can make a chat a contribution source, else "".
+
+  Only contribution projects count: the platform and named (non-numeric) app
+  sources. The informational Changes panel's ``isSourcePath``
+  (frontend/src/components/ChatView/chatChanges.js) also lists Project
+  workspace edits, which are not contribution projects; do not widen this rule
+  to match it. frontend/.../__tests__/chatSourcePathCases.json pins both.
+  """
   path = value.strip().replace("\\", "/")
   if len(path) > 1024 or ".." in Path(path).parts:
     return ""

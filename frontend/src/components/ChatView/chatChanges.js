@@ -11,7 +11,11 @@ function cleanPath(value) {
 
 // Changes is a source view, not a second view of arbitrary transcript edits.
 // Project workspaces have UUID roots; installed app source has a named slug.
-function isSourcePath(value) {
+// The backend's _trackable_chat_source_path (routes/github.py) is a different
+// rule on purpose: it admits only contribution projects (platform and named
+// apps) for Contribute's source-chat discovery, so it excludes Project
+// workspaces. __tests__/chatSourcePathCases.json pins both rules side by side.
+export function isSourcePath(value) {
   const path = cleanPath(value)
   if (!path || path.split('/').some(part => part === '.' || part === '..')) return false
   return path.startsWith('/data/platform/')
