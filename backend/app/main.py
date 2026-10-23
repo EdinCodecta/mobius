@@ -80,6 +80,7 @@ from app import activity, models, tracing
 # wrapped imports in lifespan() below.
 from app.routes import (
   admin_router, agent_coordination_router, apps_router, app_services_router,
+  app_consent_router,
   app_tools_router,
   auth_router, browser_access_router,
   app_chat_router,
@@ -444,7 +445,7 @@ async def _parent_is_file_handler(_request: Request, exc: ParentIsFile):
 # but FastAPI buffers the WHOLE body for Pydantic-parsed endpoints (e.g. a
 # create with a huge jsx_source) before validation — an unbounded body there
 # could OOM the memory-tight host (Codex review round-9 #4, round-10 #5). The
-# cap sits ABOVE every legitimate route limit (storage 50 MB, uploads 20 MB) so
+# cap sits ABOVE legitimate route limits (including chat uploads at 50 MiB) so
 # it only ever stops abuse.
 _MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
 
@@ -1030,6 +1031,7 @@ app.add_middleware(_RequestErrorTelemetryMiddleware)
 app.include_router(auth_router)
 app.include_router(apps_router)
 app.include_router(app_services_router)
+app.include_router(app_consent_router)
 app.include_router(storage_router)
 app.include_router(fs_router)
 app.include_router(projects_router)

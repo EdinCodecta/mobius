@@ -3,8 +3,8 @@
 // TRUST BOUNDARY: notification rows are writable by app-scoped tokens
 // (POST /api/notifications/send), and the backend does not validate `target`,
 // so every consumer must treat it as hostile input. This parser is consumed by
-// BOTH the NotificationsView row click and Shell's warm-tap notification-click
-// handler, so the two can never drift; the push worker keeps its own
+// BOTH the NotificationsView row click and shellLaunchTargets' installed-app /
+// worker-message delivery, so they cannot drift; the push worker keeps its own
 // `_safeTarget` copy (public/sw-push.js is served unbundled and cannot import
 // this) with the same posture. Never navigate a raw target.
 //
@@ -73,7 +73,8 @@ export function parseNotificationTarget(target) {
       }
     }
     if (chat && ID_RE.test(chat)) {
-      return { view: 'chat', chatId: chat, focusQuestion: params.get('focus') === 'question' }
+      return { view: 'chat', chatId: chat, focusQuestion: params.get('focus') === 'question',
+        ...(params.get('focus') === 'question' && params.get('question') ? { questionId: params.get('question') } : {}) }
     }
     if (!app && !chat && params.has('settings')) {
       return { view: 'settings', section: settingsSectionOrNull(params.get('settings')) }

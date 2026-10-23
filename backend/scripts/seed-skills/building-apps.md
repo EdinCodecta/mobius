@@ -34,6 +34,12 @@ required by the advanced feature below. An installable app starts as a
 root-level repository package and is installed from its raw `mobius.json` URL;
 an ordinary local app stays on the quickstart path.
 
+A Store-installed app is dormant until the owner accepts what it asks for in
+one popup the first time they open it. Declare what the app needs in
+`mobius.json` as before; neither you nor the app can approve it. The rows and
+their wording are defined once by the platform (`CAPABILITIES.md`, "First-open
+consent for Store apps").
+
 ### Accepting a local chat-history scope for an installed app
 
 Editing and applying a Store-installed app's source never silently widens its
@@ -186,9 +192,8 @@ of the app's source, so it is reviewed, versioned and published with the code:
   (turning it upright first, since the orientation tag goes with the rest,
   and keeping its colour profile;
   the same works for PNG and WebP without `quality`), or remove it if
-  nothing uses it. A bare PNG `tIME` timestamp and a PNG text chunk keyed
-  exactly `Software` (the tool that wrote it) are allowed; any other text key
-  (`Author`, `Comment`, `Description`, XMP...) is not.
+  nothing uses it. A bare PNG `tIME` timestamp is allowed; any PNG text
+  chunk is not, whatever its key (`Software`, `Author`, `Comment`, XMP...).
 - Screenshots must be truthful and private: capture the app's real UI in an
   empty, demo, or fixture state, never the owner's own records, names,
   accounts, chats, or machines. Build a small demo state if the app has none.
@@ -936,12 +941,12 @@ const { chatId } = await window.mobius.chat.start({
 window.parent.postMessage({ type: 'moebius:open-chat', chatId }, '*')
 ```
 
-Use `moebius:new-chat` only for an editable draft. Do not add an `autoSend`
-field to that shell message: retained panes and navigation make a
-create-then-send handoff inherently timing-sensitive. `window.mobius.chat.start`
-is the shared first-turn primitive. It creates a visible app-owned chat, waits
-for the first message to be accepted, then returns its id for navigation. Catch
-errors and preserve the source UI so the owner can retry without losing work.
+`moebius:new-chat` always opens an editable draft; the owner's own Send is
+what approves app-chosen text, so the shell ignores any `autoSend` field.
+`window.mobius.chat.start` is the shared first-turn primitive. It creates a
+visible app-owned chat, waits for the first message to be accepted, then
+returns its id for navigation. Catch errors and preserve the source UI so the
+owner can retry without losing work.
 
 The opaque app document cannot name the shell as a target origin, so raw
 app-to-shell messages use `'*'`. For reply protocols, require

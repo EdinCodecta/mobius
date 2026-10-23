@@ -163,19 +163,24 @@ def test_side_question_uses_the_chats_latest_same_provider_session(db, chat, tmp
   assert plan.session_id == "settled-session"
 
 
-@pytest.mark.parametrize("provider", ["mobius", "codex"])
 def test_side_questions_need_a_provider_whose_fork_runs_tool_less(
-  db, chat, tmp_path, provider,
+  db, chat, tmp_path,
 ):
-  # Codex is deliberately excluded: its fork keeps the built-in shell, and a
-  # read-only sandbox still lets a prompt-injected copy read owner files.
-  _with_session(db, chat, provider=provider)
+  _with_session(db, chat, provider="mobius")
 
   with pytest.raises(side_questions.SideQuestionError) as refused:
     side_questions.plan_side_question(db, chat, "what runs?", tmp_path)
 
   assert refused.value.status_code == 422
-  assert "Claude chats for now" in refused.value.message
+  assert "Claude and Codex chats" in refused.value.message
+
+
+def test_codex_chats_ask_side_questions_from_their_own_session(db, chat, tmp_path):
+  _with_session(db, chat, provider="codex", session_id="codex-thread")
+
+  plan = side_questions.plan_side_question(db, chat, "what runs?", tmp_path)
+
+  assert (plan.provider, plan.session_id) == ("codex", "codex-thread")
 
 
 def test_side_question_model_falls_back_to_the_owners_global_picker_choice(
@@ -510,7 +515,7 @@ async def test_the_next_turn_carries_added_side_questions_once(monkeypatch, chat
   async def fake_record_run_metrics(**_kwargs):
     return None
 
-  monkeypatch.setattr(chat_mod, "get_provider", lambda _id: _Provider())
+  monkeypatch.setattr(chat_mod, "registered_provider", lambda _id: _Provider())
   monkeypatch.setattr(chat_mod, "_complete_turn", fake_complete_turn)
   monkeypatch.setattr(chat_mod, "_record_run_metrics", fake_record_run_metrics)
   monkeypatch.setattr(claude_sdk_runner, "run_claude_sdk_turn", fake_runner)

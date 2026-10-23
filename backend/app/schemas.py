@@ -452,7 +452,32 @@ class AppPreviewOut(BaseModel):
   capability_contract: dict
   capability_digest: str
   installed_contract: dict | None = None
+  # Whether the installed version ships project templates; with the contract it
+  # fixes the installed side's rows (a templates change is an access change).
+  installed_project_templates: bool = False
   capability_diff: dict
+  # What a fresh install would download; None when any declared file's size is
+  # unknown, and for update previews, which arrive as a Git transfer instead.
+  download_bytes: int | None = None
+
+  # The owner-facing rows (app_consent.py): the one source of wording that the
+  # install dialog, the first-open popup and the Store's reviews all show.
+  @computed_field
+  @property
+  def access_rows(self) -> list[dict]:
+    from app import app_consent
+
+    return app_consent.rows_for_manifest(self.manifest, self.capability_contract)
+
+  @computed_field
+  @property
+  def installed_access_rows(self) -> list[dict]:
+    from app import app_consent
+
+    return app_consent.rows_from_contract(
+      self.installed_contract,
+      project_builders=self.installed_project_templates,
+    )
 
 
 class ReconciliationReceiptOut(BaseModel):

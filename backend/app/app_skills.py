@@ -22,7 +22,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from app import data_git, fs_locks, models, settled
+from app import app_consent, data_git, fs_locks, models, settled
 from app.config import get_settings
 from app.manifest_contract import SKILL_MAX_BYTES as _CONTRACT_SKILL_MAX_BYTES
 from app.manifest_contract import skill_member_paths
@@ -74,6 +74,27 @@ async def _sync_app_skills(
   manifest: dict,
   warnings: list[str],
 ) -> None:
+  """Sync an app's skills; a dormant app's end up set aside, whatever happens.
+
+  Skills reach every agent, so they follow the owner's permission answer here,
+  at the one place every writer (install, update, apply) goes through. A
+  dormant app's new bytes are written straight to its set-aside area; the
+  cleanup below only moves aside files that were already live before this sync
+  (for example an approved version whose snapshot failed, so it was kept).
+  """
+  try:
+    await _materialize_app_skills(db, app, manifest, warnings)
+  finally:
+    if app_consent.dormant(app):
+      warnings.extend(await deactivate_app_skills(app.id))
+
+
+async def _materialize_app_skills(
+  db: Session,
+  app: "models.App",
+  manifest: dict,
+  warnings: list[str],
+) -> None:
   """Materializes manifest-declared skill files into /data/shared/skills.
 
   Post-commit best-effort phase (same contract as cron): the app row is
@@ -94,6 +115,10 @@ async def _sync_app_skills(
   skills_dir = data_dir / "shared" / "skills"
   source_dir = Path(app.source_dir)
   version = str(manifest.get("version", "unknown"))
+  # Unapproved instructions must never enter discovery, not even between a
+  # write and a later cleanup: a concurrent reader or a failed ownership write
+  # would otherwise expose them.
+  dormant = app_consent.dormant(app)
   async with fs_locks.shared_skills_lock():
     from app import skills as skills_mod
 
@@ -233,12 +258,12 @@ async def _sync_app_skills(
         continue
       rec = records.get(rel)
       owner_id = rec.get("app_id") if isinstance(rec, dict) else None
+      inactive = skills_dir / ".inactive" / str(app.id) / rel
       if (
         isinstance(rec, dict)
         and owner_id == app.id
         and rec.get("active", True) is False
       ):
-        inactive = skills_dir / ".inactive" / str(app.id) / rel
         if inactive.is_file():
           retired = (
             skills_dir / ".inactive" / str(app.id) / "retired" / rel
@@ -274,19 +299,36 @@ async def _sync_app_skills(
             warnings.append(
               f"skill {rel}: updated, no /data repo for snapshot"
             )
-      target.parent.mkdir(parents=True, exist_ok=True)
-      atomic_write(target, content)
-      # 0o664 mirrors init_skills' boot convention — group-writable so the
-      # agent can edit the skill no matter which uid materialized it.
-      os.chmod(target, 0o664)
-      records[rel] = {
+      digest = hashlib.sha256(content).hexdigest()
+      record = {
         "app_id": app.id,
         "slug": app.slug,
         "manifest_url": app.manifest_url,
-        "sha256": hashlib.sha256(content).hexdigest(),
+        "sha256": digest,
         "installed_at": datetime.now(UTC).isoformat(),
-        "active": True,
+        "active": not dormant,
       }
+      # 0o664 mirrors init_skills' boot convention — group-writable so the
+      # agent can edit the skill no matter which uid materialized it.
+      if dormant:
+        inactive.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(inactive, content)
+        os.chmod(inactive, 0o664)
+        # Any live file here was snapshotted above when it held edits; the
+        # new version replaces it, set aside until the owner approves.
+        if target.is_file():
+          target.unlink()
+          _prune_empty_skill_folder(skills_dir, rel)
+        record.update(
+          inactive_path=str(inactive.relative_to(skills_dir)),
+          inactive_sha256=digest,
+          deactivated_at=record["installed_at"],
+        )
+      else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(target, content)
+        os.chmod(target, 0o664)
+      records[rel] = record
       # Persist provenance immediately after each file lands: a crash
       # between files must never leave an installed skill without its
       # ownership record (the next install would treat it as agent-modified
@@ -365,11 +407,94 @@ async def deactivate_app_skills(app_id: int) -> list[str]:
   return warnings
 
 
+def holds_restorable_skill(db: Session, skills_dir: Path, skill_id: str) -> bool:
+  """Whether a set-aside app skill could still come back under ``skill_id``.
+
+  An inactive record exists while its app is deleted but recoverable, or after
+  a restore left the skill aside because another skill had taken the name.
+  It reserves the name only while restore could still use it: the preserved
+  bytes exist and the app row does (soft-deleted rows stay until purge). A
+  record a failed purge left behind must not block the name forever, the same
+  rule the sync phase applies to a hard-purged owner.
+  """
+  _, records = _read_app_skill_records(skills_dir)
+  for rel, rec in records.items():
+    if (
+      not isinstance(rec, dict)
+      or rec.get("active", True) is not False
+      or _app_skill_id(rel) != skill_id
+    ):
+      continue
+    app_id = rec.get("app_id")
+    preserved = skills_dir / ".inactive" / str(app_id) / rel
+    if not preserved.is_file():
+      continue
+    if db.query(models.App.id).filter(models.App.id == app_id).first():
+      return True
+  return False
+
+
+def _restore_blocker(skills_dir: Path, rel: str, installed: dict) -> str | None:
+  """Why another skill now holds this record's id, or None when it is free.
+
+  Mirrors the sync phase's collision rule: an installed skill keeps its name,
+  and one id never holds both shapes. A same-shape file without install
+  provenance is not a blocker; restore preserves it under ``conflicts/``.
+  """
+  skill_id = _app_skill_id(rel)
+  if isinstance(installed.get(skill_id), dict):
+    return f"installed skill {skill_id!r} now holds this name"
+  other_shape = skills_dir / (skill_id if "/" not in rel else f"{skill_id}.md")
+  if os.path.lexists(other_shape):
+    return f"{other_shape.name!r} now holds this name in the other shape"
+  return None
+
+
+def _restore_one(skills_dir: Path, app_id: int, rel: str, rec: dict) -> str | None:
+  """Move one preserved skill file back into place; returns any warning."""
+  inactive = skills_dir / ".inactive" / str(app_id) / rel
+  target = skills_dir / rel
+  warning = None
+  target.parent.mkdir(parents=True, exist_ok=True)
+  if target.exists():
+    if target.read_bytes() != inactive.read_bytes():
+      conflict = skills_dir / ".inactive" / str(app_id) / "conflicts" / rel
+      conflict.parent.mkdir(parents=True, exist_ok=True)
+      os.replace(target, conflict)
+      warning = f"skill {rel}: preserved a file created while app was inactive"
+    else:
+      target.unlink()
+  os.replace(inactive, target)
+  rec["active"] = True
+  rec.pop("inactive_path", None)
+  rec.pop("inactive_sha256", None)
+  rec["restored_at"] = datetime.now(UTC).isoformat()
+  return warning
+
+
 async def restore_app_skills(app_id: int) -> list[str]:
-  """Restore exact tombstoned skill bytes and their discovery records."""
+  """Restore exact tombstoned skill bytes and their discovery records.
+
+  A skill whose id another skill took meanwhile stays set aside, bytes and
+  inactive record intact, and the restore reports it instead of displacing
+  the newer skill.
+  """
+  from app import skills as skills_mod
+  from app.database import SessionLocal
+
+  # A dormant app's skills stay set aside, whoever asks (recover, consent).
+  with SessionLocal() as db:
+    row = db.get(models.App, app_id)
+    if row is not None and app_consent.dormant(row):
+      return []
   warnings: list[str] = []
   skills_dir = Path(get_settings().data_dir) / "shared" / "skills"
   async with fs_locks.shared_skills_lock():
+    # Settle a crash-interrupted direct install first so its name is decided.
+    skills_mod.reconcile_installed(skills_dir)
+    installed = skills_mod._read_sidecar(
+      skills_dir / skills_mod.INSTALLED_SKILLS_SIDECAR
+    )
     sidecar, records = _read_app_skill_records(skills_dir)
     changed = False
     for rel, rec in records.items():
@@ -382,33 +507,21 @@ async def restore_app_skills(app_id: int) -> list[str]:
       if not _is_app_skill_rel(rel):
         warnings.append(f"skill record {rel!r}: invalid path")
         continue
-      inactive = skills_dir / ".inactive" / str(app_id) / rel
-      target = skills_dir / rel
-      if not inactive.is_file():
+      if not (skills_dir / ".inactive" / str(app_id) / rel).is_file():
         warnings.append(f"skill {rel}: preserved bytes are missing")
         continue
+      blocker = _restore_blocker(skills_dir, rel, installed)
+      if blocker:
+        warnings.append(f"skill {rel}: not restored, {blocker}")
+        continue
       try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-          if target.read_bytes() != inactive.read_bytes():
-            conflict = (
-              skills_dir / ".inactive" / str(app_id) / "conflicts" / rel
-            )
-            conflict.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(target, conflict)
-            warnings.append(
-              f"skill {rel}: preserved a file created while app was inactive"
-            )
-          else:
-            target.unlink()
-        os.replace(inactive, target)
-        rec["active"] = True
-        rec.pop("inactive_path", None)
-        rec.pop("inactive_sha256", None)
-        rec["restored_at"] = datetime.now(UTC).isoformat()
-        changed = True
+        warning = _restore_one(skills_dir, app_id, rel, rec)
       except OSError as exc:
         warnings.append(f"skill {rel}: could not restore ({exc})")
+        continue
+      changed = True
+      if warning:
+        warnings.append(warning)
     if changed:
       atomic_write(
         sidecar,
