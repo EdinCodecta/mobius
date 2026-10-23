@@ -117,6 +117,26 @@ def test_proved_predispatch_stop_releases_exact_merge_claim(setup, monkeypatch):
   assert claim.released_at is not None
 
 
+def test_base_drift_after_reservation_never_dispatches_merge(setup, monkeypatch):
+  db, row, _ = setup
+  reads = 0
+
+  def moving_base(*args):
+    nonlocal reads
+    reads += 1
+    if reads == 2:
+      raise HTTPException(409, "The target branch changed.")
+
+  monkeypatch.setattr(domain, "assert_current_base", moving_base)
+  monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("drift must not dispatch"))
+  result = report(setup)["run"]["items"][0]
+  assert reads == 2
+  assert result["state"] == "needs_you" and result["merge_attempted"] is False
+  from app import models
+  claim = db.query(models.AgentWorkClaim).filter_by(work_key=domain.merge_work_key(ITEM)).one()
+  assert claim.released_at is not None
+
+
 def test_stop_after_dispatch_cannot_erase_confirmed_merge(setup, monkeypatch):
   db, row, _ = setup
 
