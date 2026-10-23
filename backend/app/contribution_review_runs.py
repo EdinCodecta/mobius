@@ -854,7 +854,6 @@ def arm_ready(db, row, target, receipt, principal):
     db.rollback()
     raise HTTPException(409, "An earlier draft readiness attempt is saved. Reconcile it read-only; do not repeat it.")
   require_public_transition_clear(db, row, target)
-  previous = (row.outcomes_json or {}).get(item_key, {})
   save_ready_attempt(db, row, item_key, receipt)
 
 
