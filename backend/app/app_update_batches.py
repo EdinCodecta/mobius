@@ -125,13 +125,14 @@ def _pending_receipt(source_dir: str, app_id: int, commit: str) -> dict | None:
 def _contains(source_dir: str, reviewed_commit: str, source_commit: str) -> bool:
   """Whether the served revision contains the reviewed commit.
 
-  A positive ancestry answer is proof on its own. A negative one is trusted
-  only on complete history (not shallow, every commit readable): across a
+  Ancestry is read from commit objects, never the commit-graph cache, whose
+  stale or corrupt parents could answer "no" falsely. A positive answer is
+  proof on its own. A negative one is trusted only on complete history (not shallow, every commit readable): across a
   shallow boundary Git can answer "no" without seeing the reviewed commit.
   On complete history, a reviewed commit Git does not have (an update never
   fetched) is not contained either. Anything else is unknown.
   """
-  contained = app_git.ref_is_ancestor(source_dir, reviewed_commit, source_commit)
+  contained = app_git.object_ancestry(source_dir, reviewed_commit, source_commit)
   if contained is True:
     return True
   if app_git.history_is_complete(source_dir, source_commit):

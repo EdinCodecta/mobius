@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import struct
 import subprocess
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -63,7 +64,7 @@ class _Receipts:
 @pytest.fixture
 def git_state(monkeypatch):
   """Fake commits (ancestry over a complete history); receipts are real files."""
-  monkeypatch.setattr(batches.app_git, "ref_is_ancestor",
+  monkeypatch.setattr(batches.app_git, "object_ancestry",
     lambda path, reviewed, accepted: reviewed == COMMIT and accepted == LANDED)
   monkeypatch.setattr(batches.app_git, "history_is_complete", lambda *args: True)
   return _Receipts()
@@ -1145,7 +1146,7 @@ async def test_a_prune_skips_a_batch_whose_save_is_in_flight(tmp_path):
 
 def _unknown_history(monkeypatch):
   """Git cannot answer: a timeout, a lock, or damaged metadata."""
-  monkeypatch.setattr(batches.app_git, "ref_is_ancestor", lambda *args: None)
+  monkeypatch.setattr(batches.app_git, "object_ancestry", lambda *args: None)
   monkeypatch.setattr(batches.app_git, "history_is_complete", lambda *args: False)
 
 
@@ -1178,7 +1179,7 @@ async def test_unreadable_settlement_state_is_never_a_failed_update(tmp_path, db
   with monkeypatch.context() as patch:
     _unknown_history(patch)
     await assert_paused()
-  monkeypatch.setattr(batches.app_git, "ref_is_ancestor",
+  monkeypatch.setattr(batches.app_git, "object_ancestry",
     lambda path, reviewed, accepted: reviewed == COMMIT and accepted == LANDED)
   _unreadable_receipt(tmp_path / "unknown")
   reboot = await assert_paused()
@@ -1204,7 +1205,7 @@ def test_a_reviewed_commit_never_fetched_proves_not_applied(tmp_path, db):
     source_dir=str(repo), source_commit=served, version="1.0")
   db.add(app)
   db.commit()
-  assert batches.app_git.ref_is_ancestor(str(repo), COMMIT, served) is None
+  assert batches.app_git.object_ancestry(str(repo), COMMIT, served) is None
   outcome = batches._settled_outcomes({app.id: COMMIT})[app.id]
   assert (outcome["status"], outcome["error_code"]) == ("failed", "update_not_applied")
 
@@ -1267,7 +1268,7 @@ def test_a_missing_history_object_is_unknown_not_not_applied(tmp_path, db):
   assert batches._settled_outcomes({app.id: reviewed})[app.id]["status"] == "updated"
 
   (repo / ".git" / "objects" / reviewed[:2] / reviewed[2:]).unlink()
-  assert batches.app_git.ref_is_ancestor(str(repo), reviewed, served) is None
+  assert batches.app_git.object_ancestry(str(repo), reviewed, served) is None
   with pytest.raises(batches.SettlementUnreadable):
     batches._settled_outcomes({app.id: reviewed})
 
@@ -1328,7 +1329,7 @@ def test_a_shallow_negative_answer_is_unknown_even_with_both_commits(tmp_path, d
     check=True)
   # An earlier preview can supply the object without deepening the tip.
   _git(repo, "fetch", "-q", "--depth", "1", "origin", reviewed)
-  assert batches.app_git.ref_is_ancestor(str(repo), reviewed, served) is False
+  assert batches.app_git.object_ancestry(str(repo), reviewed, served) is False
   app = models.App(name="Shallow", slug="shallow", jsx_source="export default 1",
     source_dir=str(repo), source_commit=served, version="1")
   db.add(app)
@@ -1347,7 +1348,7 @@ def test_an_unrelated_commit_on_complete_history_is_not_applied(tmp_path, db):
   _git(repo, "checkout", "-q", "--orphan", "other")
   _git(repo, "commit", "-q", "--allow-empty", "-m", "reviewed elsewhere")
   reviewed = _git(repo, "rev-parse", "HEAD")
-  assert batches.app_git.ref_is_ancestor(str(repo), reviewed, served) is False
+  assert batches.app_git.object_ancestry(str(repo), reviewed, served) is False
   app = models.App(name="Complete", slug="complete", jsx_source="export default 1",
     source_dir=str(repo), source_commit=served, version="1.0")
   db.add(app)
@@ -1361,7 +1362,7 @@ def test_a_file_where_the_receipt_directory_belongs_is_unknown(tmp_path, db, mon
   path.parent.parent.mkdir(parents=True)
   path.parent.write_bytes(b"corrupted receipt directory")
   assert pending_update.pending_conflict_update_receipt_present(tmp_path)
-  monkeypatch.setattr(batches.app_git, "ref_is_ancestor", lambda *_: False)
+  monkeypatch.setattr(batches.app_git, "object_ancestry", lambda *_: False)
   monkeypatch.setattr(batches.app_git, "history_is_complete", lambda *_: True)
   app = models.App(name="Receipt directory", slug="receipt-dir", jsx_source="export default 1",
     source_dir=str(tmp_path), source_commit="b" * 40, version="1")
@@ -1386,7 +1387,7 @@ def test_a_commit_graph_cannot_hide_a_missing_history_object(tmp_path, db):
     source_dir=str(repo), source_commit=served, version="1")
   db.add(app)
   db.commit()
-  assert batches.app_git.ref_is_ancestor(str(repo), reviewed, served) is None
+  assert batches.app_git.object_ancestry(str(repo), reviewed, served) is None
   assert batches.app_git.commit_object_absent(str(repo), reviewed) is True
   assert batches.app_git.history_is_complete(str(repo), served) is False
   with pytest.raises(batches.SettlementUnreadable):
@@ -1410,3 +1411,44 @@ def test_failed_git_reads_never_certify_absence(tmp_path, monkeypatch):
 
   monkeypatch.setattr(batches.app_git, "_run", broken)
   assert batches.app_git.commit_object_absent(str(tmp_path), "a" * 40) is False
+
+
+def _corrupt_cached_first_parent(repo, commit):
+  """Damage one commit's first-parent entry in the commit-graph, leaving every
+  Git object intact (checksum deliberately stale: real corruption)."""
+  path = repo / ".git" / "objects" / "info" / "commit-graph"
+  data = bytearray(path.read_bytes())
+  assert data[:6] == b"CGPH\x01\x01"
+  chunks = {
+    bytes(data[8 + i * 12:12 + i * 12]): struct.unpack_from(">Q", data, 12 + i * 12)[0]
+    for i in range(data[6])
+  }
+  pos = data.find(bytes.fromhex(commit), chunks[b"OIDL"], chunks[b"CDAT"])
+  assert pos >= 0 and (pos - chunks[b"OIDL"]) % 20 == 0
+  index = (pos - chunks[b"OIDL"]) // 20
+  struct.pack_into(">I", data, chunks[b"CDAT"] + 36 * index + 20, 0x70000000)
+  path.chmod(0o600)
+  path.write_bytes(data)
+
+
+def test_a_corrupt_cached_parent_cannot_make_a_landed_update_not_applied(tmp_path, db):
+  """The cached graph says "not an ancestor"; the real objects say it landed."""
+  repo = tmp_path / "badgraph"
+  repo.mkdir()
+  _git(repo, "init", "-q", "-b", "main")
+  _git(repo, "commit", "-q", "--allow-empty", "-m", "reviewed")
+  reviewed = _git(repo, "rev-parse", "HEAD")
+  _git(repo, "commit", "-q", "--allow-empty", "-m", "middle")
+  middle = _git(repo, "rev-parse", "HEAD")
+  _git(repo, "commit", "-q", "--allow-empty", "-m", "served")
+  served = _git(repo, "rev-parse", "HEAD")
+  _git(repo, "commit-graph", "write", "--reachable")
+  _corrupt_cached_first_parent(repo, middle)
+  assert batches.app_git.ref_is_ancestor(str(repo), reviewed, served) is False
+  assert batches.app_git.object_ancestry(str(repo), reviewed, served) is True
+  assert batches.app_git.history_is_complete(str(repo), served) is True
+  app = models.App(name="Bad graph", slug="bad-graph", jsx_source="export default 1",
+    source_dir=str(repo), source_commit=served, version="1")
+  db.add(app)
+  db.commit()
+  assert batches._settled_outcomes({app.id: reviewed})[app.id]["status"] == "updated"

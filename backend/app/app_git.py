@@ -804,11 +804,31 @@ def ref_is_ancestor(
   refs, timeout, or another execution error). Callers must not turn an unknown
   repository state into a positive conflict/resolution claim.
   """
+  return _merge_base_is_ancestor(source_dir, ancestor, descendant)
+
+
+def object_ancestry(
+  source_dir: str | Path, ancestor: str, descendant: str,
+) -> bool | None:
+  """``ref_is_ancestor`` from commit objects alone, ignoring the commit-graph.
+
+  For a verdict persisted from a negative answer: a stale or corrupt cached
+  parent can make Git answer "not an ancestor" for a commit the real objects
+  reach. Slower than the cached query, so only for that kind of proof.
+  """
+  return _merge_base_is_ancestor(
+    source_dir, ancestor, descendant, "-c", "core.commitGraph=false",
+  )
+
+
+def _merge_base_is_ancestor(
+  source_dir: str | Path, ancestor: str, descendant: str, *config: str,
+) -> bool | None:
   if not is_repo(source_dir):
     return None
   try:
     proc = _run(
-      Path(source_dir), "merge-base", "--is-ancestor",
+      Path(source_dir), *config, "merge-base", "--is-ancestor",
       ancestor, descendant, check=False,
     )
   except (OSError, subprocess.SubprocessError):
