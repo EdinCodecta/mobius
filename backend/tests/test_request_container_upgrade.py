@@ -204,7 +204,7 @@ def test_check_names_the_lost_version_of_a_locally_bumped_pin(install, capsys):
   _commit(install["platform"], "local-bump", lock="pkg==3\n")
 
   assert upgrade.main(["--check"]) == 1
-  assert "pkg: source declares ==3, target image installs ==2" in capsys.readouterr().err
+  assert "pkg: source declares ==3, target image installs 2" in capsys.readouterr().err
 
 
 def test_allow_package_loss_overrides(install):
@@ -221,12 +221,14 @@ def test_check_allows_target_whose_history_declares_served_packages(install):
   assert upgrade.main(["--check"]) == 0
 
 
-def test_target_that_drops_a_distribution_the_source_release_declares_is_refused(
+def test_target_that_drops_a_distribution_the_source_release_declares_needs_the_override(
   install, capsys,
 ):
   """History proves the source's release is older than the target, not that
-  the target still installs its packages. The unchanged source would boot on
-  an image without ``needed``, so not even the override allows it."""
+  the target still installs its packages. A dropped one may be unused by
+  then, or provided another way (the image's python-jose shim), which the
+  lock cannot show: refused by default, naming it, and the owner may accept
+  it (official 6c6a8e599 to 12ee0eb4 drops test-only httpx2)."""
   platform = install["platform"]
   release = _commit(platform, "release-with-needed", lock="pkg==1\nneeded==1\n")
   target = _commit(platform, "release-drops-needed", lock="pkg==2\n", bridge=True)
@@ -236,13 +238,78 @@ def test_target_that_drops_a_distribution_the_source_release_declares_is_refused
   upgrade.BUILD_INFO.write_text(json.dumps({"sha": release}))
 
   assert upgrade.main(["--check"]) == 1
-  assert "no longer installs Python packages" in capsys.readouterr().err
-  assert upgrade.main(["--allow-package-loss"]) == 1
-  assert "(needed)" in capsys.readouterr().err
-
+  err = capsys.readouterr().err
+  assert "no longer installs Python packages" in err and "(needed)" in err
+  assert "--allow-package-loss" in err
   assert not _request(install).exists()
+
+  assert upgrade.main(["--allow-package-loss"]) == 0
+  assert json.loads(_request(install).read_text())["expected_sha"] == target
+  # Only the container moves: the source keeps its release's declaration.
   assert _git(platform, "rev-parse", "HEAD") == release
   assert "needed==1" in (platform / "backend/requirements.lock").read_text()
+
+
+def test_an_unsatisfied_local_range_is_refused_even_with_the_official_lock_unchanged(
+  install, capsys,
+):
+  """A range is judged by what it admits, not only an exact pin: the target
+  installs pkg 2, which a local ``pkg>=3`` does not accept."""
+  local = _commit(install["platform"], "local-range", requirements="pkg>=3\n")
+
+  assert upgrade.main(["--check"]) == 1
+
+  err = capsys.readouterr().err
+  assert "pkg: source declares >=3, target image installs 2" in err
+  assert f"revert local commit {local[:7]}" in err
+
+
+@pytest.mark.parametrize("declared", ["pkg>=2\n", "pkg~=2.0\n", "pkg==2.*\n", "pkg>=1,<3\n", "pkg\n"])
+def test_a_local_declaration_the_target_version_satisfies_is_allowed(install, declared):
+  _commit(install["platform"], "local-range", requirements=declared)
+
+  assert upgrade.main(["--check"]) == 0
+
+
+def test_a_wildcard_pin_accepts_a_matching_release_version():
+  assert upgrade.package_loss(b"pkg==2.*\n", {"pkg": "==2.3"}) == []
+  assert upgrade.package_loss(b"pkg==2.*\n", {"pkg": "==3.0"}) == [
+    "pkg: source declares ==2.*, target image installs 3.0",
+  ]
+
+
+def test_a_declaration_the_check_cannot_judge_is_refused_not_passed(install, capsys):
+  _commit(install["platform"], "local-url", requirements="pkg @ https://example.invalid/pkg.whl\n")
+
+  assert upgrade.main(["--check"]) == 1
+  assert "which this check cannot verify" in capsys.readouterr().err
+
+
+_REQUIREMENT_CORPUS = (
+  b"fastapi[standard]>=0.110 ; python_version >= '3.11'  # web\n"
+  b"Some_Pkg.Name==1.2.3 \\\n    --hash=sha256:aa \\\n    --hash=sha256:bb\n"
+  b"-r other.txt\n--index-url https://example.invalid\n# comment\n\n"
+  b"wild==2.*\nranged>=1,<3\ncompat~=2.0\nbare\nurl @ https://example.invalid/u.whl\n"
+)
+
+
+def test_the_script_and_backend_requirement_judgments_agree():
+  """The script keeps a copy of the backend's parser and version judgment
+  (it runs from fetched upstream and cannot import the backend)."""
+  from app import platform_update
+
+  repo = Path(__file__).resolve().parents[2]
+  for data in (
+    _REQUIREMENT_CORPUS,
+    (repo / "backend/requirements.txt").read_bytes(),
+    (repo / "backend/requirements.lock").read_bytes(),
+  ):
+    assert upgrade.parse_requirements(data) == platform_update.declared_python_packages(data)
+  for spec in upgrade.parse_requirements(_REQUIREMENT_CORPUS).values():
+    for installed in (None, "1.0", "2.3", "3.0", "not a version"):
+      assert upgrade.unmet_declaration(spec, installed) == (
+        platform_update.unmet_declaration(spec, installed)
+      ), (spec, installed)
 
 
 def test_a_direct_requirement_the_target_keeps_as_a_dependency_is_allowed(install):
@@ -287,8 +354,8 @@ def test_check_names_release_that_declares_served_packages(install, capsys):
   assert upgrade.main(["--check", "--allow-package-loss", "--target", install["new"]]) == 1
 
   err = capsys.readouterr().err
-  assert f"use release {later[:12]}" in err
-  assert "pkg: source declares ==3, target image installs ==2" in err
+  assert f"they come from release {later[:12]}, so choose a target that includes it" in err
+  assert "pkg: source declares ==3, target image installs 2" in err
 
 
 def test_a_committed_local_package_edit_under_a_local_release_marker_is_local(install, capsys):

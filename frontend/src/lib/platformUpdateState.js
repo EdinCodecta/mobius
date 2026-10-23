@@ -4,6 +4,7 @@
  * Restart readiness and update availability are deliberately independent:
  * another reviewed release can be staged while one restart is already pending.
  */
+import { rebuildIsActive } from './containerRebuild.js'
 
 export function platformStatusFromApply(previous, result) {
   const state = result.state
@@ -131,15 +132,22 @@ const STALL_REASONS = {
 
 /**
  * The stalled view of an unfinished update, or null. The backend decides
- * whether it stalled and which actions apply; this only words it.
+ * whether it stalled and which actions apply; this only words it. A refused
+ * restart is not a pause while a container replacement is running: the new
+ * image is what closes the package gap.
  */
-export function platformUpdateStall(platform) {
-  const stalled = platform?.unfinished_update?.stalled
+export function platformUpdateStall(platform, rebuild) {
+  const pending = platform?.unfinished_update
+  const stalled = pending?.stalled
   if (!stalled) return null
+  if (stalled.reason === 'restart_blocked' && rebuildIsActive(rebuild)) return null
   const actions = new Set(stalled.actions || [])
   const packages = (platform?.restart_blocker?.packages || []).map(item => item.name)
-  const message = stalled.reason === 'restart_blocked'
-    ? `Update paused: this container cannot restart into it${packages.length ? ` (needs ${packages.join(', ')})` : ''}.`
-    : `Update paused for ${Math.max(1, Math.round(stalled.idle_hours || 0))} h: ${STALL_REASONS[stalled.reason] || 'no progress'}.`
+  const needs = packages.length ? ` (needs ${packages.join(', ')})` : ''
+  const message = stalled.reason !== 'restart_blocked'
+    ? `Update paused for ${Math.max(1, Math.round(stalled.idle_hours || 0))} h: ${STALL_REASONS[stalled.reason] || 'no progress'}.`
+    : pending.action === 'replace'
+      ? `Update paused: it needs a new container${needs}. Choose Finish update to replace this one.`
+      : `Update paused: this container cannot restart into it${needs}.`
   return { message, canResume: actions.has('resume'), canRetry: actions.has('retry') }
 }

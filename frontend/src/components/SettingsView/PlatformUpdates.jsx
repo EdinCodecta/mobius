@@ -37,7 +37,7 @@ export function PlatformUpdatesView({ update, onOpenChat, inertBoundaryRef }) {
   // A new container is running the update and its replacement is not yet
   // confirmed; nothing else may start until it is.
   const settling = platform?.unfinished_update?.stage === 'settling'
-  const stall = platformUpdateStall(platform)
+  const stall = platformUpdateStall(platform, rebuild)
   const available = platform?.available || platform?.newer_updates_available
   const unavailable = !platform || platform.status_unavailable
   const activeRebuild = rebuildIsActive(rebuild)

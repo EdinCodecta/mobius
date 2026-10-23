@@ -210,29 +210,38 @@ def _baked_package_verdict(platform_root: Path) -> tuple[bool, dict | None] | No
   return completed.returncode == 0, gap if isinstance(gap, dict) else None
 
 
-def _refuse_what_the_image_boot_refuses(platform_root: Path) -> None:
-  """Admission predicts the image's boot guard, not the served one.
+def image_package_verdict(platform_root: Path) -> tuple[bool, dict | None]:
+  """Whether this image's next boot serves ``platform_root``'s Python
+  packages, and the ``PackageGap`` it judged (None when there is none).
 
-  An image with ``check-packages`` serves a version-only package gap, so its
-  verdict decides. An older image refuses any input from a newer official
-  release, so the served strict rule stands in for it; relaxing that here
-  would admit a restart the old image's boot then refuses.
+  The one verdict restart admission and the status ``restart_blocker``
+  share, so they cannot disagree. It predicts the image's boot guard, not
+  the served one: an image with ``check-packages`` answers itself (it serves
+  a version-only gap). An older image refuses any input from a newer
+  official release, so the served gap stands in with that strict rule;
+  relaxing it here would admit a restart the old image's boot then refuses.
   """
-  from app import platform_update
-
   verdict = _baked_package_verdict(platform_root)
   if verdict is not None:
-    allowed, gap = verdict
-    if allowed:
-      return
-    reason = platform_update.describe_package_gap(gap) if gap else (
-      "this container image refuses the platform source's Python packages"
-    )
-  else:
-    reason = platform_update.release_packages_missing_from_image(platform_root)
-    if not reason:
-      return
-    gap = platform_update.python_package_gap(platform_root)
+    return verdict
+  from app import platform_update
+
+  gap = platform_update.python_package_gap(platform_root)
+  if gap is None:
+    return True, None
+  gap["blocking"] = gap["origin"] == "official_newer"
+  return not gap["blocking"], gap
+
+
+def _refuse_what_the_image_boot_refuses(platform_root: Path) -> None:
+  from app import platform_update
+
+  allowed, gap = image_package_verdict(platform_root)
+  if allowed:
+    return
+  reason = platform_update.describe_package_gap(gap) if gap else (
+    "this container image refuses the platform source's Python packages"
+  )
   raise RestartSourceInvalid(
     f"Restart stopped: {reason}",
     {"code": "image_packages_behind_source", "gap": gap},

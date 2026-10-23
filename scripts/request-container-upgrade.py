@@ -23,9 +23,9 @@ It changes nothing but the helper's inbox, and only after these checks pass:
 the target is a fetched official release that ships this bridge, descends
 from the running image, and is not older than any official Python package
 declaration of the installed source; the target image installs every package
-the installed source's release declares and every locally declared version
-(``--allow-package-loss`` accepts losing a local declaration
-knowingly); no update is prepared or parked; and the
+the installed source's release declares and satisfies every local declaration
+(``--allow-package-loss`` accepts either loss knowingly, for example a package
+the target image provides another way); no update is prepared or parked; and the
 helper is installed and idle. They hold the updater's lock while checking and
 requesting. The helper must also have certified the target's
 ``deployment/self-hosted-helper.required`` protocol, so an outdated helper is
@@ -46,7 +46,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-DATA = Path(os.environ.get("DATA_DIR", "/data"))
+try:
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
+    from packaging.version import InvalidVersion, Version
+except ImportError:  # only a transitive dependency; pip vendors the same library
+    from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
+    from pip._vendor.packaging.version import InvalidVersion, Version
+
+DATA =Path(os.environ.get("DATA_DIR", "/data"))
 PLATFORM = DATA / "platform"
 CONTROL = DATA / "mobius-rebuild"
 BUILD_INFO = Path(os.environ.get("MOBIUS_BUILD_INFO_PATH", "/app/build-info.json"))
@@ -136,8 +143,10 @@ def declared_in_history(commit: str, path: str, data: bytes) -> bool:
     return bool(declaring_commits(commit, path, data))
 
 
-# Mirrors ``platform_update.declared_python_packages``; this script runs from
-# fetched upstream on older installations, so it cannot import it.
+# Mirrors ``platform_update.declared_python_packages`` and
+# ``platform_update.unmet_declaration``; this script runs from fetched upstream
+# on older installations, so it cannot import them.
+# ``test_request_container_upgrade`` pins that the copies agree.
 _REQUIREMENT = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?")
 
 
@@ -156,17 +165,40 @@ def parse_requirements(data: bytes) -> dict[str, str]:
     return packages
 
 
+def unmet_declaration(spec: str, installed: str | None) -> str | None:
+    """How ``installed`` falls short of the declared ``spec`` (``missing``,
+    ``version`` or ``unsupported``), or None: PEP 440 semantics, and a
+    declaration this cannot judge (a URL or path reference) never passes."""
+    if installed is None:
+        return "missing"
+    try:
+        satisfied = SpecifierSet(spec).contains(Version(installed), prereleases=True)
+    except (InvalidSpecifier, InvalidVersion):
+        return "unsupported"
+    return None if satisfied else "version"
+
+
+def locked_version(spec: str) -> str:
+    """The version a lock entry installs: its exact ``==`` pin."""
+    return spec[2:] if spec.startswith("==") else spec
+
+
 def package_loss(served: bytes, installed: dict[str, str]) -> list[str]:
-    """What the target image (its ``INSTALLED_INVENTORY``) would not install
-    of what the source declares: a missing distribution, or another version
-    than an exact pin."""
+    """What the target image (its ``INSTALLED_INVENTORY``) would not satisfy
+    of what the source declares, one description per package."""
     lost = []
     for name, spec in parse_requirements(served).items():
-        pinned = spec.startswith("==") and "," not in spec
-        if name not in installed:
+        version = locked_version(installed[name]) if name in installed else None
+        kind = unmet_declaration(spec, version)
+        if kind == "missing":
             lost.append(f"{name}: source declares {spec or 'it'}, target image does not install it")
-        elif pinned and installed[name] != spec:
-            lost.append(f"{name}: source declares {spec}, target image installs {installed[name]}")
+        elif kind == "version":
+            lost.append(f"{name}: source declares {spec}, target image installs {version}")
+        elif kind == "unsupported":
+            lost.append(
+                f"{name}: source declares {spec}, which this check cannot verify "
+                f"against the target image's {installed[name]}"
+            )
     return lost
 
 
@@ -223,17 +255,22 @@ def check_target(target: str) -> str:
 def check_served_packages_survive(
     target: str, official: str, *, allow_package_loss: bool = False,
 ) -> None:
-    """Refuse a target image that would not install what the source declares.
+    """Refuse a target image that would not install what the source declares,
+    naming each package, unless the owner accepts the loss.
 
     An input declared in the target's history is an older or equal release,
-    so the newer image covers its versions, but history orders releases and
-    does not prove the target still installs each one: a distribution the
-    target's lock (what its image installs) dropped is refused outright,
-    because the unchanged source would boot without it. One declared only in newer official history needs that
-    release instead. Anything else is a local declaration, which the target
-    image would not install, losing the live install. That loss is refused
-    unless the owner accepts it, naming each package and the local commit to
-    revert.
+    so the newer image supersedes its versions, but history orders releases
+    and does not prove the target still installs each distribution: one the
+    target's lock (what its image installs) dropped may be unused by then, or
+    provided another way (the image's ``legacy_runtime/jose`` shim covers
+    python-jose), which this script cannot tell from the lock. If the source
+    still imports one, it fails the new image's startup import check and that
+    container serves its own baked platform instead, so
+    ``--allow-package-loss`` may accept the risk. An input declared
+    only in newer official history needs a target that includes that release,
+    with no override. Anything else is a local declaration the target image
+    may not satisfy, losing the live install; accepting that names the local
+    commit to revert instead.
     """
     installed = parse_requirements(show(target, INSTALLED_INVENTORY) or b"")
     for path in PYTHON_INPUTS:
@@ -243,12 +280,14 @@ def check_served_packages_survive(
             continue
         if declared_in_history(target, path, served):
             dropped = sorted(parse_requirements(served).keys() - installed.keys())
-            if dropped:
+            if dropped and not allow_package_loss:
                 raise Refused(
                     f"the target image no longer installs Python packages the "
                     f"installed source's release declares in {path} "
-                    f"({', '.join(dropped)}); install the platform update from "
-                    "Settings instead of replacing only the container"
+                    f"({', '.join(dropped)}); if the source still imports one, "
+                    "the new container serves its own baked platform instead "
+                    "of this source. Pass --allow-package-loss to replace the "
+                    "container anyway"
                 )
             continue
         lost = package_loss(served, installed)
@@ -257,7 +296,8 @@ def check_served_packages_survive(
         if releases:
             raise Refused(
                 f"the installed source declares newer Python packages than the "
-                f"target{detail}; use release {releases[0][:12]} or newer"
+                f"target{detail}: they come from release {releases[0][:12]}, "
+                "so choose a target that includes it"
             )
         if not lost or allow_package_loss:
             continue
@@ -360,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--allow-package-loss", action="store_true",
-        help="accept that the target image lacks a locally declared Python package",
+        help="accept that the target image lacks a Python package the source declares",
     )
     args = parser.parse_args(argv)
     try:

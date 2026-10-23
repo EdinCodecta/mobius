@@ -249,3 +249,19 @@ test('a stalled update names how long and why, with the backend\'s actions', () 
   assert.equal(blocked.canResume, false)
   assert.equal(blocked.canRetry, false)
 })
+
+test('a refused restart for a finish that needs a new container points at replacing it', () => {
+  const platform = {
+    restart_blocker: { packages: [{ name: 'claude-agent-sdk' }], blocking: true },
+    unfinished_update: { stage: 'finish', action: 'replace', stalled: {
+      reason: 'restart_blocked', idle_hours: 0, actions: [],
+    } },
+  }
+  assert.equal(
+    platformUpdateStall(platform).message,
+    'Update paused: it needs a new container (needs claude-agent-sdk). Choose Finish update to replace this one.',
+  )
+  // The replacement under way is the progress: nothing is paused.
+  assert.equal(platformUpdateStall(platform, { state: 'replacing' }), null)
+  assert.notEqual(platformUpdateStall(platform, { state: 'succeeded' }), null)
+})

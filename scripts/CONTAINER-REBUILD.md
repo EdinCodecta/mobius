@@ -262,10 +262,10 @@ exact release instead; `--check` only reports whether it would) after checking,
 under the updater's lock, that the target is an official release that ships this
 bridge and is newer than the running image and the source's official package
 declarations, that the target image still installs every package the source's
-release declares (one the target's lock dropped is refused outright) and every
-locally declared version (a local pin it would drop is named with the
-local commit to revert; `--allow-package-loss` accepts the loss knowingly),
-that no update is prepared
+release declares and satisfies every local declaration's version range (each
+shortfall is named, a local one with the local commit to revert;
+`--allow-package-loss` accepts the loss knowingly, for example a package the
+target image provides another way), that no update is prepared
 or parked, and that the helper is idle. The helper drains chats, replaces only
 the container, and attempts to restore the previous container if the new one is
 unhealthy. If exact restoration cannot be confirmed, the host retains the

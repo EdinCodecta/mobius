@@ -68,6 +68,13 @@ from typing import Callable, Literal, NotRequired, TypedDict
 
 from sqlalchemy.orm import Session
 
+try:
+  from packaging.specifiers import InvalidSpecifier, SpecifierSet
+  from packaging.version import InvalidVersion, Version
+except ImportError:  # only a transitive dependency; pip vendors the same library
+  from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
+  from pip._vendor.packaging.version import InvalidVersion, Version
+
 from app import (
   app_git, local_change_tests, platform_activation, removed_references, runtime_provenance,
 )
@@ -727,8 +734,19 @@ def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
 
 
 def _unmerged_paths(repo: Path = PLATFORM_REPO) -> list[str]:
-  out = _git("diff", "--name-only", "--diff-filter=U", repo=repo, check=False)
-  return [p.strip() for p in out.stdout.splitlines() if p.strip()]
+  """Paths with unmerged index entries, read without writing the index.
+
+  ``git diff`` may refresh and rewrite a stale index, and the candidate's
+  index mtime is a stall progress signal (``update_progress_signals``), so a
+  status read would reset the stall it reports.
+  """
+  out = _git("ls-files", "-u", "-z", repo=repo, check=False)
+  paths: list[str] = []
+  for entry in out.stdout.split("\0"):
+    path = entry.split("\t", 1)[1] if "\t" in entry else ""
+    if path and path not in paths:
+      paths.append(path)
+  return paths
 
 
 def _rebase_in_progress(repo: Path = PLATFORM_REPO) -> bool:
@@ -3708,7 +3726,7 @@ class PackageShortfall(TypedDict):
   name: str
   declared: str
   installed: str | None
-  kind: Literal["missing", "version"]
+  kind: Literal["missing", "version", "unsupported"]
   origin: Literal["official_newer", "local"]
 
 
@@ -3718,7 +3736,8 @@ class PackageGap(TypedDict):
   ``origin`` is ``official_newer`` when an input comes from an official
   release newer than the image, otherwise ``local``. Only ``blocking`` gaps
   refuse a boot: a distribution an official-newer input declares and this
-  image lacks entirely. A version-only gap, or one only a local input
+  image lacks entirely, or declares in a form this check cannot verify
+  (``unmet_declaration``). A version-only gap, or one only a local input
   declares, is a warning; the import-level startup check stays the hard
   gate, and ``fix`` names what closes the gap (with the local ``commit`` to
   revert when a local input also falls short).
@@ -3738,8 +3757,10 @@ _REQUIREMENT_NAME = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?"
 def declared_python_packages(data: bytes) -> dict[str, str]:
   """Package name (normalized) to version spec, for requirements or a lock.
 
-  ``scripts/request-container-upgrade.py`` keeps a copy (it runs from fetched
-  upstream on older installations and cannot import this module).
+  ``scripts/request-container-upgrade.py`` keeps a copy, with
+  ``unmet_declaration`` (it runs from fetched upstream on older installations
+  and cannot import this module); ``test_request_container_upgrade`` pins
+  that the copies agree.
   """
   packages: dict[str, str] = {}
   text = re.sub(r"\\\r?\n", " ", data.decode("utf-8", "replace"))
@@ -3752,6 +3773,24 @@ def declared_python_packages(data: bytes) -> dict[str, str]:
     spec = "".join(token for token in rest if not token.startswith("--"))
     packages[re.sub(r"[-_.]+", "-", match.group(1)).lower()] = spec
   return packages
+
+
+def unmet_declaration(
+  spec: str, installed: str | None,
+) -> Literal["missing", "version", "unsupported"] | None:
+  """How ``installed`` falls short of the declared ``spec``, or None.
+
+  ``spec`` is judged with PEP 440 semantics (ranges, ``~=``, wildcards), and
+  an empty one accepts any version. A declaration this cannot judge, such as
+  a URL or path reference, is ``unsupported``: never assumed satisfied.
+  """
+  if installed is None:
+    return "missing"
+  try:
+    satisfied = SpecifierSet(spec).contains(Version(installed), prereleases=True)
+  except (InvalidSpecifier, InvalidVersion):
+    return "unsupported"
+  return None if satisfied else "version"
 
 
 def _installed_version(name: str) -> str | None:
@@ -3827,12 +3866,11 @@ def python_package_gap(
   for _path, served, is_newer in sorted(unmet, key=lambda item: not item[2]):
     for name, spec in declared_python_packages(served).items():
       installed = _installed_version(name)
-      pinned = spec[2:] if spec.startswith("==") and "," not in spec else None
-      if name in shortfalls or (installed is not None and pinned in {None, installed}):
+      kind = unmet_declaration(spec, installed)
+      if name in shortfalls or kind is None:
         continue
       shortfalls[name] = PackageShortfall(
-        name=name, declared=spec, installed=installed,
-        kind="missing" if installed is None else "version",
+        name=name, declared=spec, installed=installed, kind=kind,
         origin="official_newer" if is_newer else "local",
       )
   official = _rev(repo, "refs/remotes/origin/main")
@@ -3861,22 +3899,24 @@ def python_package_gap(
     origin="official_newer" if newer else "local", declared_by=declared_by,
     fix=fix,
     blocking=any(
-      item["kind"] == "missing" and item["origin"] == "official_newer"
+      item["kind"] in {"missing", "unsupported"} and item["origin"] == "official_newer"
       for item in packages
     ),
   )
 
 
 def describe_package_gap(gap: PackageGap) -> str:
-  """Owner-facing sentences naming each package and what closes its part.
+  """Owner-facing sentences naming each package and what closes its part."""
+  def shortfall(item: PackageShortfall) -> str:
+    if item["kind"] == "unsupported":
+      return f"{item['name']}: source declares {item['declared']}, which this check cannot verify"
+    return f"{item['name']}: source declares {item['declared'] or 'it'}, this image " + (
+      f"has {item['installed']}" if item["installed"] else "does not have it"
+    )
 
-  A gap from an image that predates per-package ``origin`` takes the gap's.
-  """
   def detail(origin: str) -> str:
     listed = "; ".join(
-      f"{item['name']}: source declares {item['declared'] or 'it'}, this image "
-      + (f"has {item['installed']}" if item["installed"] else "does not have it")
-      for item in gap["packages"] if item.get("origin", gap["origin"]) == origin
+      shortfall(item) for item in gap["packages"] if item["origin"] == origin
     )
     return f" ({listed})" if listed else ""
 
@@ -3900,45 +3940,43 @@ def describe_package_gap(gap: PackageGap) -> str:
   return " ".join(sentences)
 
 
-def release_packages_missing_from_image(
-  repo: Path = PLATFORM_REPO, image: str | None = None,
-) -> str | None:
-  """Why an image without ``platform_boot check-packages`` refuses the
-  checkout, or None.
-
-  Those older images refuse every input from a newer official release,
-  including a version-only one, so restart admission on them predicts this
-  strict rule (``restart_util.validate_restart_source``). Running an older
-  image under newer source (historical image-only rollback) is unsupported.
-  """
-  gap = python_package_gap(repo, image)
-  if gap is None or gap["origin"] != "official_newer":
-    return None
-  return describe_package_gap(gap)
-
-
 _RESTART_BLOCKER_CACHE: dict[tuple, PackageGap | None] = {}
 
 
+def _installed_distributions_stamp() -> tuple:
+  """Changes whenever a distribution is installed, upgraded or removed: each
+  of those adds or removes a ``.dist-info`` entry in a site directory."""
+  import site
+
+  stamps = []
+  for directory in (*site.getsitepackages(), site.getusersitepackages()):
+    try:
+      stamps.append((directory, os.stat(directory).st_mtime_ns))
+    except OSError:
+      stamps.append((directory, None))
+  return tuple(stamps)
+
+
 def restart_blocker(repo: Path = PLATFORM_REPO) -> PackageGap | None:
-  """The package gap restart admission acts on, with the running image's
-  verdict as ``blocking``: an image without ``check-packages`` refuses every
-  official-newer gap. Cached per image, served inputs and fetched release,
-  because the history scan is too slow for every status poll."""
-  from app.restart_util import image_boot_checks_packages
+  """The package gap restart admission acts on: the same verdict
+  (``restart_util.image_package_verdict``), with ``blocking`` as this image's
+  boot decides it. Cached per image, served inputs, fetched release and
+  installed distributions (so a live install that closes the gap shows at
+  once), because the image's check and the history scan are too slow for
+  every status poll."""
+  from app.restart_util import image_boot_checks_packages, image_package_verdict
 
   inputs = tuple(
     hashlib.sha256(_served_bytes(repo, path) or b"").hexdigest()
     for path in _PYTHON_DEPENDENCY_INPUTS
   )
   key = (
-    str(repo), frozen_image_sha(), inputs, _rev(repo, "refs/remotes/origin/main"),
-    recorded_upstream_sha(repo), image_boot_checks_packages(),
+    str(repo), frozen_image_sha(), image_boot_checks_packages(), inputs,
+    _rev(repo, "refs/remotes/origin/main"), recorded_upstream_sha(repo),
+    _installed_distributions_stamp(),
   )
   if key not in _RESTART_BLOCKER_CACHE:
-    gap = python_package_gap(repo)
-    if gap and not key[-1]:
-      gap["blocking"] = gap["origin"] == "official_newer"
+    _allowed, gap = image_package_verdict(repo)
     _RESTART_BLOCKER_CACHE.clear()
     _RESTART_BLOCKER_CACHE[key] = gap
   return _RESTART_BLOCKER_CACHE[key]
@@ -3995,9 +4033,14 @@ def _declared_in_history(repo: Path, commit: str, path: str, data: bytes) -> boo
 
 
 def _refuse_source_newer_than_image_packages(repo: Path, image: str | None) -> None:
-  """Boot refuses only a blocking gap. A version-only one serves: the same
-  source already ran on this image, and refusing would leave the instance
-  unable to restart even to load a fix."""
+  """Boot refuses only a blocking gap; a version-only one serves.
+
+  The tradeoff: a refused ``activate`` makes the container exit ("refusing
+  to start", ``backend/scripts/entrypoint.sh``), so refusing every version
+  difference would leave an instance unable to start even to load a fix.
+  The cost is that source may now serve on versions it did not declare (an
+  image-only rollback, or a container-only upgrade to lower pins), and only
+  the candidate import probe guards that mismatch."""
   gap = python_package_gap(repo, image)
   if gap and gap["blocking"]:
     raise BootTransactionError(describe_package_gap(gap))
@@ -4919,7 +4962,9 @@ def detect_update_stall(
   flag nor that chat has changed for ``MOBIUS_UPDATE_STALL_HOURS`` (6).
   A finish stalls at once when its restart is refused (``restart_blocker``),
   since the time its record was written: the prepared update, or the
-  activation marker a marker-only finish comes from.
+  activation marker a marker-only finish comes from. It does not while a
+  container replacement bound to it is under way: that replacement is the
+  progress, and the new image is what closes the gap.
   """
   from app import models, questions
   from app.run_state import running_chat_ids
@@ -4930,6 +4975,8 @@ def detect_update_stall(
   signals = update_progress_signals(repo)
   cancel = ["cancel"] if pending["cancellable"] else []
   if pending["stage"] == "finish" and blocker and blocker["blocking"]:
+    if (read_prepared_update() or {}).get("operation"):
+      return None
     # The episode must not depend on ``now``: each supervisor pass would then
     # start, and notify, a new one.
     recorded = signals["prepared_at"] or signals["activation_marked_at"]
@@ -4948,7 +4995,10 @@ def detect_update_stall(
   chat_id = flag.get("chat_id")
   chat = (
     db.query(models.Chat.id, models.Chat.updated_at, models.Chat.pending_question_id)
-    .filter(models.Chat.id == chat_id, models.Chat.deleted_at.is_(None))
+    .filter(
+      models.Chat.id == chat_id, models.Chat.deleted_at.is_(None),
+      models.Chat.created_by_app_id.is_(None),
+    )
     .first()
   ) if chat_id else None
   if chat is not None and (
@@ -4999,13 +5049,14 @@ async def notify_update_stall_once(session_factory, repo: Path = PLATFORM_REPO) 
   """
   from app import models, push
 
-  def detect() -> StalledUpdate | None:
+  def detect() -> tuple[UnfinishedUpdate | None, StalledUpdate | None]:
     with session_factory() as db:
       pending = unfinished_update(repo)
       blocker = restart_blocker(repo) if pending and pending["stage"] == "finish" else None
-      return detect_update_stall(db, pending, blocker=blocker, repo=repo)
+      return pending, detect_update_stall(db, pending, blocker=blocker, repo=repo)
 
-  stalled = await asyncio.to_thread(detect)
+  pending, stalled = await asyncio.to_thread(detect)
+  pending_action = pending["action"] if pending else None
   if stalled is None or _read_text(STALL_NOTIFIED_PATH) == stalled["episode"]:
     return None
   notification_id = f"platform-stall-{stalled['episode']}"
@@ -5013,7 +5064,12 @@ async def notify_update_stall_once(session_factory, repo: Path = PLATFORM_REPO) 
   body = {
     "resolver_idle": "Its resolver chat stopped before finishing. Open Settings to resume, retry or cancel it.",
     "resolver_missing": "No chat is resolving it. Open Settings to resume, retry or cancel it.",
-    "restart_blocked": "Möbius cannot restart to finish it. Open Settings to see what is missing.",
+    "restart_blocked": (
+      "It needs a new container: this one lacks Python packages it declares. "
+      "Open Settings and choose Finish update to replace the container."
+      if pending_action == "replace" else
+      "Möbius cannot restart to finish it. Open Settings to see what is missing."
+    ),
   }[stalled["reason"]]
   with session_factory() as db:
     owner = db.query(models.Owner.id).first()

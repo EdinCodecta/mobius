@@ -116,7 +116,7 @@ def test_restart_source_without_selftest_gets_import_only_validation(
 _GAP = {
   "packages": [{
     "name": "claude-agent-sdk", "declared": "==0.2.165",
-    "installed": "0.2.161", "kind": "version",
+    "installed": "0.2.161", "kind": "version", "origin": "official_newer",
   }],
   "inputs": ["backend/requirements.lock"], "origin": "official_newer",
   "declared_by": "c" * 40, "fix": {"action": "replace_container", "target_sha": "c" * 40},
@@ -150,9 +150,8 @@ def test_admission_uses_baked_check_packages_when_available(monkeypatch, tmp_pat
 
   monkeypatch.setenv("MOBIUS_PLATFORM_DIR", str(tmp_path / "platform"))
   _write_probe_fixture(tmp_path / "platform", broken=False)
-  monkeypatch.setattr(
-    platform_update, "release_packages_missing_from_image", lambda *_: "strict refusal",
-  )
+  # The served gap would refuse under the strict rule.
+  monkeypatch.setattr(platform_update, "python_package_gap", lambda *_: dict(_GAP))
   _baked_image(tmp_path / "baked-ok", monkeypatch, exit_code=0, gap=_GAP)
 
   ru.validate_restart_source()
@@ -176,17 +175,14 @@ def test_admission_falls_back_to_served_strict_check_on_old_image(monkeypatch, t
 
   monkeypatch.setenv("MOBIUS_PLATFORM_DIR", str(tmp_path / "platform"))
   _write_probe_fixture(tmp_path / "platform", broken=False)
-  monkeypatch.setattr(
-    platform_update, "release_packages_missing_from_image", lambda *_: "strict refusal",
-  )
-  monkeypatch.setattr(platform_update, "python_package_gap", lambda *_: _GAP)
+  monkeypatch.setattr(platform_update, "python_package_gap", lambda *_: dict(_GAP))
   _baked_image(tmp_path / "baked-old", monkeypatch, exit_code=None)
 
   try:
     ru.validate_restart_source()
   except ru.RestartSourceInvalid as exc:
-    assert str(exc) == "Restart stopped: strict refusal"
-    assert exc.detail["gap"] == _GAP
+    assert str(exc) == f"Restart stopped: {platform_update.describe_package_gap(_GAP)}"
+    assert exc.detail["gap"] == {**_GAP, "blocking": True}
   else:
     raise AssertionError("the old image's strict rule was not predicted")
 

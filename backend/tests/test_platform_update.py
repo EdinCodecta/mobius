@@ -4433,7 +4433,7 @@ def test_hash_only_lock_update_needs_no_image_from_preview_to_boot(
   assert pu.swap_in_prepared_update(cutover=True, repo=platform) is True
   pu.settle_prepared_update_for_this_image(platform)
   assert pu.recorded_upstream_sha(platform) == target
-  assert pu.release_packages_missing_from_image(platform) is None
+  assert _official_newer_gap(platform) is None
   assert pu.image_input_drift(platform) == []
 
 
@@ -4459,8 +4459,15 @@ def test_lock_update_the_image_may_not_install_still_needs_an_image(
   # Served on the old image anyway, the release is refused and reported.
   _git(platform, "merge", "-q", "--ff-only", target)
   pu._set_upstream(platform, target)
-  assert "newer release" in pu.release_packages_missing_from_image(platform)
+  assert "newer release" in _official_newer_gap(platform)
   assert pu.image_input_drift(platform) == ["backend/requirements.lock"]
+
+
+def _official_newer_gap(repo: Path, image: str | None = None) -> str | None:
+  """What an image without ``check-packages`` refuses at boot: any gap with an
+  input from a newer official release (``restart_util.image_package_verdict``)."""
+  gap = pu.python_package_gap(repo, image)
+  return pu.describe_package_gap(gap) if gap and gap["origin"] == "official_newer" else None
 
 
 def _shallow_seed_at(tmp_path, origin, sha: str) -> Path:
@@ -4503,11 +4510,11 @@ def test_container_only_upgrade_across_a_package_release_boots_on_a_shallow_seed
   seed = _shallow_seed_at(tmp_path, origin, base)
   _image_built_from(monkeypatch, tmp_path, platform, target)
 
-  assert pu.release_packages_missing_from_image(seed, target) is None
+  assert _official_newer_gap(seed, target) is None
 
   # Without the image's recorded lineage the seed cannot order the two.
   monkeypatch.setenv("MOBIUS_IMAGE_LINEAGE_PATH", str(tmp_path / "absent"))
-  assert "newer release" in pu.release_packages_missing_from_image(seed, target)
+  assert "newer release" in _official_newer_gap(seed, target)
 
 
 def test_image_rollback_under_a_newer_package_release_is_still_refused(
@@ -4522,7 +4529,7 @@ def test_image_rollback_under_a_newer_package_release_is_still_refused(
   seed = _shallow_seed_at(tmp_path, origin, target)
   _image_built_from(monkeypatch, tmp_path, platform, base)
 
-  assert "newer release" in pu.release_packages_missing_from_image(seed, base)
+  assert "newer release" in _official_newer_gap(seed, base)
 
 
 @pytest.mark.asyncio
@@ -6428,7 +6435,7 @@ def test_package_gap_names_package_versions_and_fix_release(clone_env, monkeypat
   assert gap["origin"] == "official_newer" and gap["declared_by"] == newer
   assert gap["fix"] == {"action": "replace_container", "target_sha": newer}
   assert gap["blocking"] is False
-  reason = pu.release_packages_missing_from_image(platform)
+  reason = pu.describe_package_gap(gap)
   assert "newer release" in reason
   assert "claude-agent-sdk: source declares ==0.2.165, this image has 0.2.161" in reason
   assert f"Replace the container with release {newer[:12]}" in reason
@@ -6502,21 +6509,82 @@ def test_a_local_package_gap_names_the_local_commit_and_never_refuses(clone_env,
   assert pu.settle_prepared_update_for_this_image(platform) == "none"
 
 
-def test_status_reports_restart_blocker(clone_env, monkeypatch):
-  """Status carries the gap with the running image's verdict: an image
-  without ``check-packages`` refuses any official-newer gap at boot."""
+def test_status_reports_the_verdict_restart_admission_acts_on(clone_env, monkeypatch):
+  """Status and restart admission share ``restart_util.image_package_verdict``:
+  an image without ``check-packages`` refuses any official-newer gap, and one
+  with it answers for itself."""
   from app import restart_util
 
   origin, platform = clone_env
   _image_behind_a_release_pin(platform, origin, monkeypatch, {"claude-agent-sdk": "0.2.161"})
 
-  monkeypatch.setattr(restart_util, "image_boot_checks_packages", lambda: False)
   blocker = pu.platform_status(platform)["restart_blocker"]
   assert blocker["packages"][0]["name"] == "claude-agent-sdk"
   assert blocker["blocking"] is True
 
+  baked = {**blocker, "blocking": False}
   monkeypatch.setattr(restart_util, "image_boot_checks_packages", lambda: True)
-  assert pu.platform_status(platform)["restart_blocker"]["blocking"] is False
+  monkeypatch.setattr(restart_util, "_baked_package_verdict", lambda root: (True, baked))
+  assert pu.platform_status(platform)["restart_blocker"] == baked
+
+
+def test_restart_blocker_is_recomputed_after_a_live_install(clone_env, monkeypatch, tmp_path):
+  """The cached verdict is keyed by installed distributions, so a live
+  ``pip install`` that closes the gap shows on the next status read."""
+  import site
+
+  from app import restart_util
+
+  _origin, platform = clone_env
+  site_dir = tmp_path / "site-packages"
+  site_dir.mkdir()
+  monkeypatch.setattr(site, "getsitepackages", lambda: [str(site_dir)])
+  monkeypatch.setattr(site, "getusersitepackages", lambda: str(tmp_path / "no-user-site"))
+  verdicts = []
+  monkeypatch.setattr(
+    restart_util, "image_package_verdict",
+    lambda root: verdicts.append(root) or (True, None),
+  )
+  pu._RESTART_BLOCKER_CACHE.clear()
+
+  pu.restart_blocker(platform)
+  pu.restart_blocker(platform)
+  assert len(verdicts) == 1
+
+  (site_dir / "claude_agent_sdk-0.2.165.dist-info").mkdir()
+  os.utime(site_dir, ns=(1, site_dir.stat().st_mtime_ns + 1))
+  pu.restart_blocker(platform)
+  assert len(verdicts) == 2
+
+
+@pytest.mark.parametrize("declared,installed,kind", [
+  (">=3", "2", "version"),
+  (">=2", "2.1", None),
+  ("~=2.0", "2.9", None),
+  ("==2.*", "2.3", None),
+  ("==2.*", "3.0", "version"),
+  ("", "1", None),
+  ("==1", None, "missing"),
+  ("@https://example.invalid/pkg.whl", "1", "unsupported"),
+])
+def test_package_gap_judges_declarations_by_their_version_range(
+  clone_env, monkeypatch, declared, installed, kind,
+):
+  """A range, ``~=`` or wildcard is judged by what it admits; one this check
+  cannot judge is never assumed satisfied."""
+  _origin, platform = clone_env
+  _with_python_inputs(platform, _origin)
+  image = _served_sha(platform)
+  image_lock = (platform / "backend/requirements.lock").read_bytes()
+  _local_commit(platform, edits={"backend/requirements.lock": f"fastapi==1\npkg{declared}\n"})
+  _boot_image(image)
+  _record_image_inputs(platform, image_lock)
+  monkeypatch.setattr(pu, "_installed_version", {"fastapi": "1", "pkg": installed}.get)
+
+  gap = pu.python_package_gap(platform)
+
+  kinds = {item["name"]: item["kind"] for item in (gap or {}).get("packages", [])}
+  assert kinds.get("pkg") == kind
 
 
 def test_the_boot_protocol_can_only_advance_with_a_new_image():
@@ -8382,6 +8450,47 @@ def test_stall_detected_after_threshold_without_progress(clone_env, db):
   assert stalled["actions"] == ["resume", "retry", "cancel"]
 
 
+def test_a_detected_stall_persists_across_reads(clone_env, db):
+  """Reading which files are still unmerged must not rewrite the candidate's
+  index: its mtime is a progress signal, so a status poll would otherwise
+  clear the stall it reports and start a new episode."""
+  _origin, platform = clone_env
+  _worktree, index, then = _parked_update(platform)
+  pending = pu.unfinished_update(platform)
+  before = index.stat().st_mtime_ns
+
+  first = pu.detect_update_stall(db, pending, repo=platform)
+  second = pu.detect_update_stall(db, pending, repo=platform)
+
+  assert first and second and first["episode"] == second["episode"]
+  assert second["remaining_paths"] == ["backend/app/main.py"]
+  assert index.stat().st_mtime_ns == before
+
+
+def test_an_app_chat_bound_as_resolver_counts_as_missing(clone_env, db):
+  """Like resume, the stall reader never treats an app-created chat as the
+  update's resolver."""
+  from app import models
+  from app.chat_writer import create_chat
+
+  _origin, platform = clone_env
+  app = models.App(
+    slug="stall-resolver-app", source_dir="/tmp/mobius-tests/stall-resolver-app",
+    name="studio", description="t", jsx_source="export default () => null",
+  )
+  db.add(app)
+  db.commit()
+  _worktree, _index, then = _parked_update(platform, chat_id="app-chat")
+  db.add(create_chat(id="app-chat", title="t", messages=[], created_by_app_id=app.id))
+  db.commit()
+
+  stalled = pu.detect_update_stall(
+    db, pu.unfinished_update(platform), repo=platform, now=then + 7 * _HOURS,
+  )
+
+  assert stalled["reason"] == "resolver_missing" and stalled["resolver_chat_id"] is None
+
+
 def test_worktree_change_resets_stall(clone_env, db):
   _origin, platform = clone_env
   _worktree, index, then = _parked_update(platform)
@@ -8431,6 +8540,20 @@ def test_a_finish_whose_restart_is_refused_stalls_at_once(clone_env, db):
   assert stalled["reason"] == "restart_blocked"
   assert stalled["actions"] == ["cancel"]
   assert pu.detect_update_stall(db, pending, blocker={"blocking": False}) is None
+
+
+def test_a_refused_restart_is_not_a_stall_while_its_container_replacement_runs(
+  clone_env, db, monkeypatch,
+):
+  """A replacement bound to the update is its progress, and the new image is
+  what closes the package gap."""
+  pending = {"target_sha": "a" * 40, "stage": "finish", "action": "replace", "cancellable": False}
+  monkeypatch.setattr(pu, "read_prepared_update", lambda: {"operation": {"id": "op-1"}})
+
+  assert pu.detect_update_stall(db, pending, blocker={"blocking": True}) is None
+
+  monkeypatch.setattr(pu, "read_prepared_update", lambda: {"operation": None})
+  assert pu.detect_update_stall(db, pending, blocker={"blocking": True})["reason"] == "restart_blocked"
 
 
 def test_status_names_a_stalled_update(clone_env, db):
@@ -8523,6 +8646,9 @@ async def test_a_blocked_marker_only_finish_notifies_once_across_passes(
   monkeypatch.setattr(pu.time, "time", lambda: now + 2 * _HOURS)
   assert first and await pu.notify_update_stall_once(SessionLocal, platform) is None
   assert len(sent) == 1
+  # This finish needs a new container, so the alert points at replacing it.
+  assert pending["action"] == "replace"
+  assert "choose Finish update to replace the container" in sent[0]["body"]
 
 
 @pytest.mark.asyncio
