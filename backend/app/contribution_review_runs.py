@@ -308,6 +308,7 @@ def view(row):
 
 def brief(row):
   endpoint = run_endpoint(row) + "/outcomes"
+  frozen = row.options_json or {}
   public_note = (
     "The owner explicitly opted into one public COMMENT review per head. "
     "Report the verdict and tests through /outcomes; the server posts it, never a raw mutation. "
