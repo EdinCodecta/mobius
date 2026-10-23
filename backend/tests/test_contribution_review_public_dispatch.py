@@ -10,7 +10,7 @@ CURRENT_PULL = domain.current_pull
 ASSERT_CURRENT_BASE = domain.assert_current_base
 
 
-@pytest.mark.parametrize('field', ['head', 'base', 'base_ref'])
+@pytest.mark.parametrize('field', ['head', 'base_ref'])
 @pytest.mark.parametrize('during', ['actor', 'arm'])
 def test_target_moving_after_route_check_never_posts(setup, monkeypatch, field, during):
   db, row, _ = setup
@@ -22,8 +22,6 @@ def test_target_moving_after_route_check_never_posts(setup, monkeypatch, field, 
   def move():
     if field == 'head':
       pull['head']['sha'] = 'c' * 40
-    elif field == 'base':
-      ref['object']['sha'] = 'd' * 40
     else:
       pull['base']['ref'] = 'other'
 
@@ -59,3 +57,24 @@ def test_target_moving_after_route_check_never_posts(setup, monkeypatch, field, 
     assert armed == []
   else:
     assert receipt['marker'] == armed[0]['marker']
+
+
+def test_public_comment_on_selected_head_can_post_after_target_base_advances(setup, monkeypatch):
+  opted_in(setup)
+  posts = []
+  def read(gh, cwd, endpoint):
+    if endpoint == 'user':
+      return {'id': 42}
+    if endpoint.endswith('/pulls/7'):
+      return deepcopy(PULL)
+    if '/git/ref/heads/' in endpoint:
+      return {'object': {'sha': 'd' * 40}}
+    return deepcopy(REPO)
+  monkeypatch.setattr(domain, 'read', read)
+  monkeypatch.setattr(domain, 'current_pull', CURRENT_PULL)
+  monkeypatch.setattr(domain, 'assert_current_base', ASSERT_CURRENT_BASE)
+  monkeypatch.setattr(public, 'post_review', lambda *a: posts.append(a) or public.DispatchResult.confirmed({'id': 1}))
+  receipt = report(setup, publish=True)['run']['items'][0]['public_review']
+  assert receipt['state'] == 'posted'
+  assert len(posts) == 1
+  assert posts[0][2]['head_sha'] == ITEM['head_sha']
