@@ -592,15 +592,22 @@ def _update_plan_id(
   current_sha: str,
   target_sha: str,
   image_digest: str | None = None,
+  *,
+  evidence: str = "",
 ) -> str:
-  """Deterministic identity for the exact local tip + reviewed release pair."""
+  """Deterministic identity for the exact local tip + reviewed release pair.
+
+  ``evidence`` is ``app_git.overlay_evidence_fingerprint``: a disposition note
+  or merged-contribution witness written after Review changes what Apply
+  sets aside, so it makes the reviewed plan stale.
+  """
   if image_digest:
-    material = (
-      f"mobius-platform-update-v2\0{current_sha}\0{target_sha}\0{image_digest}"
-    ).encode()
+    material = f"mobius-platform-update-v2\0{current_sha}\0{target_sha}\0{image_digest}"
   else:
-    material = f"mobius-platform-update-v1\0{current_sha}\0{target_sha}".encode()
-  return hashlib.sha256(material).hexdigest()
+    material = f"mobius-platform-update-v1\0{current_sha}\0{target_sha}"
+  if evidence:
+    material += f"\0overlay-evidence\0{evidence}"
+  return hashlib.sha256(material.encode()).hexdigest()
 
 
 def _validate_update_plan(
@@ -618,7 +625,10 @@ def _validate_update_plan(
     raise PlatformUpdateError("update_plan_invalid")
   if image_digest is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
     raise PlatformUpdateError("update_plan_invalid")
-  if plan_id != _update_plan_id(current_sha, target_sha, image_digest):
+  if plan_id != _update_plan_id(
+    current_sha, target_sha, image_digest,
+    evidence=app_git.overlay_evidence_fingerprint(repo),
+  ):
     raise PlatformUpdateError("update_plan_invalid")
 
   local = _local_branch(repo)
@@ -2946,32 +2956,12 @@ def _final_tree_merge(repo: Path, source: str, target: str) -> app_git.MergeResu
   A local draft of a contribution the release merged in revised form is set
   aside first, so the merged version arrives instead of a draft-vs-final
   conflict. Likewise an unchanged local copy of a pull request the release
-  merged is retired (``app_git.without_retired_units``). Review, Apply and the
-  agent handoff all call this, so the conflict Review predicts is the conflict
-  Apply would park. It writes Git objects only; no ref, index or working tree
-  moves.
+  merged is retired (``app_git.without_merged_local_copies``). Review, Apply
+  and the agent handoff all call this, so the conflict Review predicts is the
+  conflict Apply would park. It writes Git objects only; no ref, index or
+  working tree moves.
   """
-  try:
-    units = app_git.overlay_units(repo, source, target)
-  except Exception:
-    log.warning("platform: could not label local units", exc_info=True)
-    units = None
-  local = source
-  if units is not None:
-    # Without unit labels an owner's choice to keep a file local is unknown,
-    # so no draft is set aside and the resolver sees the ordinary conflict.
-    local = app_git.without_superseded_drafts(repo, source, target, protected={
-      path for unit in units if unit.disposition == "owner-choice:local"
-      for path in (*unit.touched, *unit.paths)
-    })
-  retired: tuple[app_git.RetiredPath, ...] = ()
-  try:
-    if units is not None:
-      local, retired = app_git.without_retired_units(repo, local, target, units)
-  except Exception:
-    # Retirement is an optimization over the ordinary merge; without its
-    # proof every local copy simply stays for the resolver.
-    log.warning("platform: could not retire merged local copies", exc_info=True)
+  local, retired = _without_merged_local_copies(repo, source, target)
   merged = (
     app_git.merge_with_equivalent_changes(repo, local, target)
     or app_git.merge_refs(repo, local, target)
@@ -2980,6 +2970,23 @@ def _final_tree_merge(repo: Path, source: str, target: str) -> app_git.MergeResu
   if retired:
     merged.reconciliation = replace(merged.reconciliation, retired_paths=retired)
   return merged
+
+
+def _without_merged_local_copies(
+  repo: Path, source: str, target: str,
+) -> tuple[str, tuple[app_git.RetiredPath, ...]]:
+  """``source`` with merged contributions' local copies set aside, or as is.
+
+  Setting them aside is an optimization over the ordinary merge: without unit
+  labels an owner's choice to keep a file local is unknown, and without a
+  proof every local copy simply stays for the resolver.
+  """
+  try:
+    units = app_git.overlay_units(repo, source, target)
+    return app_git.without_merged_local_copies(repo, source, target, units)
+  except Exception:
+    log.warning("platform: could not set aside merged local copies", exc_info=True)
+    return source, ()
 
 
 def _apply_overlay(
@@ -4750,8 +4757,9 @@ def local_overlay_summary(
 ) -> dict | None:
   """Size of the local platform overlay against the installed release.
 
-  ``units`` lists the largest local units; ``retirable`` is what an update to
-  ``target`` would retire as merged pull requests (the same proof Apply uses).
+  ``units`` lists the largest local units; ``retirable`` counts the files an
+  update to ``target`` would set aside as merged pull requests' local copies,
+  through the planner Apply uses, and names the PRs it retires.
   None when there is no installed release to compare with.
   """
   local = _rev(repo, "HEAD")
@@ -4797,9 +4805,15 @@ def _compute_overlay_summary(
         "removed": sum(lines[path][1] for path in files),
       })
   sized.sort(key=lambda item: item["added"] + item["removed"], reverse=True)
+  set_aside: list[str] = []
   retired: tuple[app_git.RetiredPath, ...] = ()
   if target and _rev(repo, target) and not _is_ancestor(repo, target, local):
-    _tip, retired = app_git.without_retired_units(repo, local, target, units)
+    # Exactly what Apply sets aside: superseded drafts and retired copies.
+    tip, retired = _without_merged_local_copies(repo, local, target)
+    if tip != local:
+      set_aside = _git(
+        "diff", "--name-only", "-z", "--no-renames", local, tip, repo=repo,
+      ).stdout.split("\0")
   added = sum(a for a, _r in lines.values())
   removed = sum(r for _a, r in lines.values())
   return {
@@ -4807,7 +4821,8 @@ def _compute_overlay_summary(
     "files": len(lines), "added": added, "removed": removed,
     "unit_count": len(sized), "units": sized[:_OVERLAY_SUMMARY_UNITS],
     "retirable": {
-      "files": len(retired), "prs": sorted({item.pr for item in retired}),
+      "files": len([path for path in set_aside if path]),
+      "prs": sorted({item.pr for item in retired}),
     },
     "large": (
       len(lines) > _LARGE_OVERLAY_FILES or added + removed > _LARGE_OVERLAY_LINES
@@ -5019,7 +5034,10 @@ def prepared_update_preview(
   preview.update(
     state=PlatformUpdateState.ACTIVATION_NEEDED.value, actionable=True,
     operation="finish", activation=activation, incoming_activation=activation,
-    plan_id=_update_plan_id(current, record["target"], record["image_digest"]),
+    plan_id=_update_plan_id(
+      current, record["target"], record["image_digest"],
+      evidence=app_git.overlay_evidence_fingerprint(repo),
+    ),
   )
   local_report = record["local_tests"]
   if local_report is not None:
@@ -5192,7 +5210,10 @@ def _platform_update_preview_unlocked(
         state=_state_for_activation(activation).value,
         actionable=True,
         operation="finish",
-        plan_id=_update_plan_id(local_sha, target, image_digest),
+        plan_id=_update_plan_id(
+          local_sha, target, image_digest,
+          evidence=app_git.overlay_evidence_fingerprint(repo),
+        ),
         activation=activation,
       )
     return preview
@@ -5208,7 +5229,10 @@ def _platform_update_preview_unlocked(
       actionable=True, operation="update",
       current_sha=local_sha, target_sha=target,
       plan_id=(
-        _update_plan_id(local_sha, target, image_digest) if local_sha else None
+        _update_plan_id(
+          local_sha, target, image_digest,
+          evidence=app_git.overlay_evidence_fingerprint(repo),
+        ) if local_sha else None
       ),
       image_digest=image_digest,
       activation=incoming_activation,
@@ -5237,7 +5261,10 @@ def _platform_update_preview_unlocked(
     actionable=True, operation="update",
     current_sha=local_sha, target_sha=target,
     plan_id=(
-      _update_plan_id(local_sha, target, image_digest) if local_sha else None
+      _update_plan_id(
+        local_sha, target, image_digest,
+        evidence=app_git.overlay_evidence_fingerprint(repo),
+      ) if local_sha else None
     ),
     image_digest=image_digest,
     activation=incoming_activation,

@@ -911,22 +911,29 @@ def _mark_superseded_draft(
 def _record_merged_contribution(
   record: dict, repo: Path, upstream_sha: str | None,
 ) -> str | None:
-  """Hand the updater the local bytes a merged contribution started from.
+  """Hand the platform updater the exact bytes a merged contribution carried.
 
-  ``plan.source_sha`` is the live commit whose bytes were staged. The update
-  that brings this merge retires each reviewed file the live source still
-  holds unchanged, whatever form review gave the merged version.
+  ``plan.head_sha`` is the reviewed head the pull request carried. The update
+  that brings ``upstream_sha`` retires each reviewed file whose live bytes
+  are still exactly that head's, whatever form the merged version took. Only
+  the live platform's updater reads these witnesses, so app contributions
+  record none.
   """
+  platform = Path(get_settings().data_dir).resolve() / "platform"
   plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
   number = record.get("number")
   files = plan.get("files")
-  if not isinstance(number, int) or not isinstance(files, list):
+  if (
+    repo.resolve() != platform or not upstream_sha
+    or not isinstance(number, int) or not isinstance(files, list)
+  ):
     return None
   try:
     return app_git.record_merged_contribution(
-      repo, number=number, source_sha=str(plan.get("source_sha") or ""),
-      paths=files, merge_sha=upstream_sha,
-      contribution_id=str(record.get("id") or ""),
+      repo, number=number,
+      repo_slug=str(plan.get("repo") or record.get("repo") or ""),
+      head_sha=str(plan.get("head_sha") or ""), merge_sha=upstream_sha,
+      paths=files, contribution_id=str(record.get("id") or ""),
     )
   except (OSError, subprocess.SubprocessError, RuntimeError):
     log.warning("could not record a merged contribution", exc_info=True)

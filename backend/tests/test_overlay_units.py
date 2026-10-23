@@ -43,6 +43,25 @@ def _show(repo: Path, rev: str, path: str) -> str:
   return _git(repo, "show", f"{rev}:{path}") + "\n"
 
 
+def _witness(
+  repo: Path, head: str, merge: str, paths: list[str], *, number: int = 7,
+  repo_slug: str = app_git.PLATFORM_RELEASE_REPO,
+) -> str | None:
+  """Contribute's record that PR ``number``, carrying ``head``, merged as ``merge``."""
+  return app_git.record_merged_contribution(
+    repo, number=number, repo_slug=repo_slug, head_sha=head, merge_sha=merge,
+    paths=paths,
+  )
+
+
+def _pr_head(repo: Path, files: dict[str, str], start: str = "upstream") -> str:
+  """The reviewed head a PR carried: its change on the upstream it was staged on."""
+  _git(repo, "checkout", "-q", "-B", "pr-head", start)
+  head = _commit(repo, files, "Reviewed change")
+  _git(repo, "checkout", "-q", "main")
+  return head
+
+
 @pytest.fixture
 def repo(tmp_path):
   repo = tmp_path / "platform"
@@ -190,7 +209,7 @@ def test_legacy_squashes_expand_through_their_previous_sources(repo):
 
 
 def _pr_draft(repo: Path, disposition: str = "pending-pr:#7") -> tuple[str, str]:
-  draft = _commit(repo, {"greet.py": _DRAFT}, _unit_msg("Draft greet", "greet", disposition))
+  _commit(repo, {"greet.py": _DRAFT}, _unit_msg("Draft greet", "greet", disposition))
   local = _commit(repo, {"local.py": "OWNER = True\n"}, "unrelated local work")
   release = _release(repo, [
     ({"greet.py": _MERGED}, "Reviewed greeting (#7)"),
@@ -216,9 +235,7 @@ def test_retires_the_unchanged_local_copy_of_a_pr_the_release_merged(repo):
 
 def test_owner_choice_local_is_never_retired_even_when_its_pr_merged(repo):
   local, release = _pr_draft(repo, "owner-choice:local")
-  app_git.record_merged_contribution(
-    repo, number=7, source_sha=local, paths=["greet.py"],
-  )
+  assert _witness(repo, local, _git(repo, "rev-parse", f"{release}^"), ["greet.py"])
 
   result = platform_update._final_tree_merge(repo, local, release)
 
@@ -228,9 +245,9 @@ def test_owner_choice_local_is_never_retired_even_when_its_pr_merged(repo):
 
 def test_a_path_edited_after_it_was_handed_to_the_pr_stays_with_the_resolver(repo):
   draft = _commit(repo, {"greet.py": _DRAFT}, "Draft greet")
-  app_git.record_merged_contribution(repo, number=7, source_sha=draft, paths=["greet.py"])
   local = _commit(repo, {"greet.py": _DRAFT + "# local tweak\n"}, "tweak")
   release = _release(repo, [({"greet.py": _MERGED}, "Reviewed greeting (#7)")])
+  assert _witness(repo, draft, release, ["greet.py"])
 
   result = platform_update._final_tree_merge(repo, local, release)
 
@@ -265,12 +282,12 @@ def test_a_pr_already_in_the_shared_base_is_not_retired_again(repo):
 
 
 def test_merged_contribution_witness_retires_captured_bytes_until_integrated(repo):
-  draft = _commit(repo, {"greet.py": _DRAFT}, "Draft greet")  # untagged
+  _commit(repo, {"greet.py": _DRAFT}, "Draft greet")  # untagged
   local = _commit(repo, {"local.py": "OWNER = True\n"}, "unrelated local work")
-  ref = app_git.record_merged_contribution(
-    repo, number=7, source_sha=draft, paths=["greet.py", "missing.py"],
-  )
   release = _release(repo, [({"greet.py": _MERGED}, "Reviewed greeting (#7)")])
+  ref = _witness(
+    repo, _pr_head(repo, {"greet.py": _DRAFT}), release, ["greet.py", "missing.py"],
+  )
 
   result = platform_update._final_tree_merge(repo, local, release)
   assert result.status == "clean"
@@ -355,7 +372,6 @@ def test_an_unlabelled_merge_attributes_the_commits_it_imported(repo):
   units = app_git.overlay_units(repo, merge, "upstream")
   assert [(u.subject, u.paths) for u in units] == [("Draft greet", ("greet.py",))]
   assert units[0].commits == (_git(repo, "rev-parse", f"{merge}^2"),)
-
 
 
 def _shared_file_carried_by_updates(
@@ -447,9 +463,7 @@ def test_owner_choice_keeps_a_file_both_witness_types_would_replace(repo, owner_
   assert app_git.mark_draft_superseded(
     repo, contribution_id="rec-7", base_sha=tweak, head_sha=draft, upstream_sha=merge,
   )
-  assert app_git.record_merged_contribution(
-    repo, number=7, source_sha=draft, paths=["greet.py"],
-  )
+  assert _witness(repo, draft, merge, ["greet.py"])
   if owner_choice:
     marked = draft if owner_choice == "draft" else tweak
     platform_overlay.main(["--repo", str(repo), "mark", marked, "owner-choice:local"])
@@ -463,3 +477,211 @@ def test_owner_choice_keeps_a_file_both_witness_types_would_replace(repo, owner_
   assert result.reconciliation.retired_paths == ()
   assert _show(repo, result.local_oid, "greet.py") == _TWEAKED + _DRAFT
   assert result.status == "conflict" and result.conflict_paths == ["greet.py"]
+
+
+# --- Merged-contribution witnesses prove the exact bytes the PR carried ------
+
+
+@pytest.mark.parametrize("merged_as", ["reviewed", "revised"])
+def test_an_earlier_local_only_edit_in_the_contributed_file_is_kept(repo, merged_as):
+  """The PR carried only its own change; the owner's older tweak to the same
+  file was never handed over, so the file is not replaced."""
+  start = _commit(repo, {"greet.py": _HEADER + _BASE}, "header")
+  _git(repo, "branch", "-f", "upstream", start)
+  _commit(repo, {"greet.py": _TWEAKED + _BASE}, "Owner tweak")  # untagged, local-only
+  local = _commit(repo, {"greet.py": _TWEAKED + _DRAFT}, "Draft greet")
+  head = _pr_head(repo, {"greet.py": _HEADER + _DRAFT})
+  body = _DRAFT if merged_as == "reviewed" else _MERGED
+  release = _release(repo, [({"greet.py": _HEADER + body}, "Reviewed greeting (#7)")])
+  assert _witness(repo, head, release, ["greet.py"])
+
+  result = platform_update._final_tree_merge(repo, local, release)
+
+  assert result.reconciliation.retired_paths == ()
+  assert _show(repo, result.local_oid, "greet.py") == _TWEAKED + _DRAFT
+  if merged_as == "reviewed":
+    assert result.status == "clean"
+    assert _show(repo, result.merged_tree_oid, "greet.py") == _TWEAKED + _DRAFT
+  else:
+    assert result.status == "conflict" and result.conflict_paths == ["greet.py"]
+
+
+def test_a_merged_contribution_proof_survives_an_unrelated_unit_chain_update(repo):
+  draft = _commit(repo, {"greet.py": _DRAFT}, "Draft greet")  # untagged
+  local = _commit(repo, {"local.py": "OWNER = True\n"}, "unrelated local work")
+  head = _pr_head(repo, {"greet.py": _DRAFT})
+  r1 = _release(repo, [({"notes.md": "v2\n"}, "unrelated upstream work")])
+  merged = app_git.merge_refs(repo, local, r1).merged_tree_oid
+  carried = platform_update._net_overlay_commit(repo, r1, merged, local)
+  assert app_git.ref_is_ancestor(repo, local, carried) is False  # history rewritten
+  r2 = _release(repo, [({"greet.py": _MERGED}, "Reviewed greeting (#7)")], start=r1)
+  assert _witness(repo, head, r2, ["greet.py"])
+
+  result = platform_update._final_tree_merge(repo, carried, r2)
+
+  assert result.status == "clean"
+  assert _show(repo, result.merged_tree_oid, "greet.py") == _MERGED
+  assert _show(repo, result.merged_tree_oid, "local.py") == "OWNER = True\n"
+  assert [r.as_dict() for r in result.reconciliation.retired_paths] == [{
+    "path": "greet.py", "pr": 7, "unit": f"c-{draft[:8]}-draft-greet",
+    "proof": "merged-contribution",
+  }]
+
+
+@pytest.mark.parametrize("carries", [(), ("chain",)], ids=["direct", "after-chain"])
+@pytest.mark.parametrize("earlier", ["local-only", "owner-choice:local"])
+def test_a_shared_file_retires_only_when_the_pr_carried_every_local_change(
+  repo, earlier, carries,
+):
+  """Another unit's edit the reviewed head also carried was handed over with
+  it, so only an owner's choice to keep the file local stops the retirement."""
+  _commit(repo, {"greet.py": _BASE + "# owner tweak\n"},
+          _unit_msg("Owner tweak", "owner", earlier))
+  local = _commit(repo, {"greet.py": _DRAFT + "# owner tweak\n"},
+                  _unit_msg("Draft greet", "greet"))
+  head = _pr_head(repo, {"greet.py": _DRAFT + "# owner tweak\n"})
+  release = "upstream"
+  for carry in carries:
+    release = _release(repo, [({"notes.md": "v2\n"}, "unrelated")], start=release)
+    merged = app_git.merge_refs(repo, local, release).merged_tree_oid
+    local = platform_update._net_overlay_commit(repo, release, merged, local)
+  merging = _release(repo, [({"greet.py": _MERGED}, "Reviewed greeting (#7)")], start=release)
+  assert _witness(repo, head, merging, ["greet.py"])
+
+  result = platform_update._final_tree_merge(repo, local, merging)
+
+  if earlier == "owner-choice:local":
+    assert result.reconciliation.retired_paths == ()
+    assert result.status == "conflict"
+  else:
+    assert [r.proof for r in result.reconciliation.retired_paths] == ["merged-contribution"]
+    assert _show(repo, result.merged_tree_oid, "greet.py") == _MERGED
+
+
+@pytest.mark.parametrize("mismatch", ["other-repo", "other-merge"])
+def test_a_witness_retires_only_through_its_own_repo_and_merge_commit(repo, mismatch):
+  """A same-numbered PR elsewhere, or a release commit that only claims the
+  number in its title, never stands in for the recorded merge."""
+  _commit(repo, {"greet.py": _DRAFT}, "Draft greet")
+  local = _commit(repo, {"local.py": "OWNER = True\n"}, "unrelated local work")
+  head = _pr_head(repo, {"greet.py": _DRAFT})
+  release = _release(repo, [({"greet.py": _MERGED}, "Someone else's greeting (#7)")])
+  fork_merge = _pr_head(repo, {"notes.md": "fork\n"})
+  witness = _witness(
+    repo, head, release if mismatch == "other-repo" else fork_merge, ["greet.py"],
+    repo_slug="someone/mobius-fork" if mismatch == "other-repo"
+    else app_git.PLATFORM_RELEASE_REPO,
+  )
+  assert witness
+
+  result = platform_update._final_tree_merge(repo, local, release)
+
+  assert result.reconciliation.retired_paths == ()
+  assert result.status == "conflict"
+  app_git.retire_landed_equivalent_changes(repo, release)
+  remaining = _git(repo, "for-each-ref", "--format=%(refname)", witness)
+  assert remaining == ("" if mismatch == "other-repo" else witness)
+
+
+def test_a_witness_needs_a_reviewed_head_and_a_merge_commit(repo):
+  head = _pr_head(repo, {"greet.py": _DRAFT})
+  merge = _release(repo, [({"greet.py": _MERGED}, "Reviewed greeting (#7)")])
+  assert _witness(repo, head, merge, ["greet.py"])
+  assert _witness(repo, "0" * 40, merge, ["greet.py"]) is None
+  assert _witness(repo, head, "", ["greet.py"]) is None
+  assert _witness(repo, head, merge, ["greet.py"], repo_slug="not a repo") is None
+
+
+# --- Explicit dispositions on legacy squashes survive their expansion -------
+
+
+@pytest.mark.parametrize("marked", [None, "outer", "inner"])
+def test_owner_choice_noted_on_a_legacy_squash_keeps_its_files(repo, marked):
+  """A squash's own ``local-only`` trailer is only the default; a disposition
+  noted on it (directly, or on an older squash it expanded through) still
+  guards its files from retirement and from superseded-draft removal."""
+  start = _commit(repo, {"greet.py": _HEADER + _BASE}, "header")
+  _git(repo, "branch", "-f", "upstream", start)
+  base = _commit(repo, {"greet.py": _TWEAKED + _BASE}, "Owner tweak")
+  draft = _commit(repo, {"greet.py": _TWEAKED + _DRAFT},
+                  _unit_msg("Draft greet", "greet", "pending-pr:#7"))
+  r1 = _release(repo, [({"notes.md": "v2\n"}, "upstream 1")])
+  merged = app_git.merge_refs(repo, draft, r1).merged_tree_oid
+  inner = platform_update._single_overlay_commit(repo, r1, merged, draft)
+  r2 = _release(repo, [({"notes.md": "v3\n"}, "upstream 2")], start=r1)
+  merged = app_git.merge_refs(repo, inner, r2).merged_tree_oid
+  outer = platform_update._single_overlay_commit(repo, r2, merged, inner)
+  _git(repo, "reset", "-q", "--hard", outer)
+  merge = _release(
+    repo, [({"greet.py": _HEADER + _MERGED}, "Reviewed greeting (#7)")], start=r2,
+  )
+  assert app_git.mark_draft_superseded(
+    repo, contribution_id="rec-7", base_sha=base, head_sha=draft, upstream_sha=merge,
+  )
+  if marked:
+    app_git.mark_overlay_disposition(
+      repo, outer if marked == "outer" else inner, "owner-choice:local",
+    )
+
+  units = {u.slug: u for u in app_git.overlay_units(repo, outer, merge)}
+  result = platform_update._final_tree_merge(repo, outer, merge)
+
+  assert units["greet"].disposition == "pending-pr:#7"
+  if marked is None:
+    assert app_git.LEGACY_OVERLAY_UNIT not in units
+    assert result.status == "clean"
+    return
+  guard = units[app_git.LEGACY_OVERLAY_UNIT]
+  assert guard.disposition == "owner-choice:local"
+  assert "greet.py" in guard.touched and guard.paths == ()
+  assert result.reconciliation.retired_paths == ()
+  assert _show(repo, result.local_oid, "greet.py") == _TWEAKED + _DRAFT
+  assert result.status == "conflict" and result.conflict_paths == ["greet.py"]
+  # The guard is re-emitted with the chain, so later updates still honour it.
+  chained = platform_update._net_overlay_commit(
+    repo, r2, app_git.merge_refs(repo, outer, r2).merged_tree_oid, outer,
+  )
+  body = _git(repo, "log", "-1", "--format=%B", chained)
+  assert f"Mobius-Overlay-Also: {app_git.LEGACY_OVERLAY_UNIT}=owner-choice:local" in body
+
+
+# --- One planner: status counts what Apply sets aside -----------------------
+
+
+@pytest.mark.parametrize("owner_choice", [False, True])
+def test_status_counts_superseded_drafts_the_way_apply_sets_them_aside(repo, owner_choice):
+  start = _commit(repo, {"greet.py": _HEADER + _BASE}, "header")
+  _git(repo, "branch", "-f", "upstream", start)
+  tweak = _commit(repo, {"greet.py": _TWEAKED + _BASE}, "Owner tweak")
+  draft = _commit(repo, {"greet.py": _TWEAKED + _DRAFT}, "Draft greet")
+  merge = _release(repo, [({"greet.py": _HEADER + _MERGED}, "Reviewed greeting")])
+  assert app_git.mark_draft_superseded(
+    repo, contribution_id="rec-7", base_sha=tweak, head_sha=draft, upstream_sha=merge,
+  )
+  if owner_choice:
+    app_git.mark_overlay_disposition(repo, tweak, "owner-choice:local")
+
+  summary = platform_update._compute_overlay_summary(
+    repo, draft, _git(repo, "rev-parse", "upstream"), merge,
+  )
+  applied = platform_update._final_tree_merge(repo, draft, merge)
+
+  assert summary["retirable"] == {"files": 0 if owner_choice else 1, "prs": []}
+  assert (applied.local_oid == draft) is owner_choice
+
+
+def test_overlay_evidence_binds_the_reviewed_update_plan(repo):
+  local = _commit(repo, {"greet.py": _DRAFT}, "Draft greet")
+  target = _release(repo, [({"notes.md": "v2\n"}, "upstream")])
+  assert app_git.overlay_evidence_fingerprint(repo) == ""
+  reviewed = platform_update._update_plan_id(local, target)
+
+  app_git.mark_overlay_disposition(repo, local, "owner-choice:local")
+
+  evidence = app_git.overlay_evidence_fingerprint(repo)
+  assert evidence
+  assert platform_update._update_plan_id(local, target, evidence=evidence) != reviewed
+  with pytest.raises(platform_update.PlatformUpdateError, match="update_plan_invalid"):
+    platform_update._validate_update_plan(
+      repo, plan_id=reviewed, current_sha=local, target_sha=target,
+    )

@@ -8377,15 +8377,30 @@ def test_status_overlay_follows_a_newly_recorded_merge_witness(clone_env):
                         msg="Draft foo")
   _local_commit(platform, edits={"backend/app/local.py": "LOCAL = 1\n"},
                 msg="local feature")
-  _advance_origin(origin, edits={"backend/app/foo.py": _FOO_MERGED},
-                  msg="Rewrite foo (#77)")
+  merge = _advance_origin(origin, edits={"backend/app/foo.py": _FOO_MERGED},
+                          msg="Rewrite foo (#77)")
   pu._fetch(platform)
   assert pu.platform_status(platform)["local_overlay"]["retirable"]["files"] == 0
+  reviewed = pu.platform_update_preview(platform)
 
   app_git.record_merged_contribution(
-    platform, number=77, source_sha=draft, paths=["backend/app/foo.py"],
+    platform, number=77, repo_slug=app_git.PLATFORM_RELEASE_REPO,
+    head_sha=draft, merge_sha=merge, paths=["backend/app/foo.py"],
   )
 
   assert pu.platform_status(platform)["local_overlay"]["retirable"] == {
     "files": 1, "prs": [77],
   }
+  # Apply would now retire a file Review never showed, so that review is stale.
+  with pytest.raises(pu.PlatformUpdateError, match="update_plan_invalid"):
+    pu._validate_update_plan(
+      platform, plan_id=reviewed["plan_id"],
+      current_sha=reviewed["current_sha"], target_sha=reviewed["target_sha"],
+    )
+  fresh = pu.platform_update_preview(platform)
+  assert fresh["plan_id"] != reviewed["plan_id"]
+  assert [item["path"] for item in fresh["retired_paths"]] == ["backend/app/foo.py"]
+  pu._validate_update_plan(
+    platform, plan_id=fresh["plan_id"],
+    current_sha=fresh["current_sha"], target_sha=fresh["target_sha"],
+  )

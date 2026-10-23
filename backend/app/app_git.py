@@ -180,7 +180,8 @@ class ReconciliationReceipt:
   # Ancillary conflicts kept locally, dropping the incoming edit.
   kept_local_paths: tuple[str, ...] = ()
   # Local copies of merged pull requests the release replaced (see
-  # ``without_retired_units``); Review lists them before the owner applies.
+  # ``without_retired_units``); the Review preview returns them as
+  # ``retired_paths`` before the owner applies.
   retired_paths: tuple["RetiredPath", ...] = ()
 
   def as_dict(self) -> dict[str, list]:
@@ -2642,14 +2643,12 @@ def retire_landed_equivalent_changes(
           _run(repo, "update-ref", "-d", ref, check=False)
       retired += 1
   # Likewise a merged-contribution witness: once its merge is integrated it is
-  # in every shared base and can never retire anything again.
-  contributions = _merged_contributions(repo)
-  integrated = _pr_merge_commits(repo, integrated_upstream) if contributions else {}
-  for contribution in contributions:
-    if contribution.number in integrated or (
-      contribution.merge_sha
-      and ref_is_ancestor(repo, contribution.merge_sha, integrated_upstream) is True
-    ):
+  # in every shared base and can never retire anything again; nor can one for
+  # another repository.
+  for contribution in _merged_contributions(repo):
+    if not contribution.for_platform_release or ref_is_ancestor(
+      repo, contribution.merge_sha, integrated_upstream,
+    ) is True:
       proc = _run(repo, "update-ref", "-d", contribution.ref, check=False)
       retired += int(proc.returncode == 0)
   return retired
@@ -3536,17 +3535,21 @@ def overlay_message(
 # An update re-emits that delta as one commit per unit on the release
 # (``unit_chain``), so the next update still knows which change each path
 # carries and can retire a unit whose pull request merged upstream
-# (``without_retired_units``) instead of re-merging a stale local copy. A file
-# several units shaped retires only when all of them may; the chain names the
-# other contributors on the owner's commit (``Mobius-Overlay-Also``) so that
-# guard survives later updates.
+# (``without_merged_local_copies``) instead of re-merging a stale local copy.
+# No contributor marked ``owner-choice:local`` is ever retired; the chain names
+# the other contributors on the owner's commit (``Mobius-Overlay-Also``) so
+# that guard survives later updates.
 
 # Agents change a commit's disposition without rewriting history: the newest
 # ``Mobius-Disposition:`` note in this ref wins over the commit's trailer.
 OVERLAY_NOTES_REF = "refs/notes/mobius-overlay"
-# Contribute's offline witness that a pull request carrying captured local
-# bytes merged; see ``record_merged_contribution``.
+# Contribute's offline witness of the exact bytes a merged platform pull
+# request carried; see ``record_merged_contribution``.
 MERGED_CONTRIBUTION_PREFIX = "refs/mobius/merged-contributions"
+# The repository platform releases come from. A witness for a pull request in
+# any other repository (a test fork) never retires anything: its number says
+# nothing about this release.
+PLATFORM_RELEASE_REPO = "mobius-os/mobius"
 # Updaters before unit chains squashed the whole delta into this one unit and
 # named the local tip it replaced, which ``overlay_units`` follows back.
 LEGACY_OVERLAY_UNIT = "platform-local-tree"
@@ -3684,10 +3687,33 @@ def _overlay_commits(
   return commits
 
 
+# ``(commit, paths, owns)``: ``commit`` (None for unattributed legacy paths)
+# contributed to ``paths``, and owns them unless it only guards them.
+_Claim = tuple[_OverlayCommit | None, tuple[str, ...], bool]
+
+
+def _commit_claims(
+  repo: Path, commit: _OverlayCommit, paths: tuple[str, ...],
+  exclude: list[str], depth: int = 1,
+) -> list[_Claim]:
+  """The claims one walked commit makes, expanding a legacy squash."""
+  if commit.slug != LEGACY_OVERLAY_UNIT:
+    return [(commit, paths, True)]
+  claims: list[_Claim] = []
+  # The squash's own trailer is always the default ``local-only``; only a
+  # disposition someone noted on it is an explicit choice, and it keeps
+  # guarding every path the squash carried after expansion hands ownership
+  # back to the commits it replaced.
+  noted = _valid_disposition(_last_trailer(commit.note, OVERLAY_DISPOSITION_TRAILER))
+  if noted and noted != "wip":
+    claims.append((commit, paths, False))
+  return claims + _expand_legacy_squash(repo, commit, paths, exclude, depth)
+
+
 def _expand_legacy_squash(
-  repo: Path, squash: _OverlayCommit, paths: Iterable[str],
+  repo: Path, squash: _OverlayCommit, paths: tuple[str, ...],
   exclude: list[str], depth: int,
-) -> list[tuple[_OverlayCommit | None, tuple[str, ...]]]:
+) -> list[_Claim]:
   """Attribute a legacy squash's paths to the local commits it replaced.
 
   Each path is claimed, in order, by every commit that touched it in the
@@ -3697,26 +3723,19 @@ def _expand_legacy_squash(
   ``legacy-unattributed``. This only labels history: the chain built from it
   is proved to equal the merged tree.
   """
-  paths = tuple(paths)
   found = _LEGACY_SOURCE.search(squash.message)
   previous = _resolve_commit(repo, found.group(1)) if found else None
   if previous is None or depth > _LEGACY_EXPANSION_DEPTH:
-    return [(None, paths)]
+    return [(None, paths, True)]
   walked = _overlay_commits(repo, previous, exclude)
   wanted = set(paths)
   explained = {path for commit in walked for path in commit.paths}
   loose = tuple(path for path in paths if path not in explained)
-  claims: list[tuple[_OverlayCommit | None, tuple[str, ...]]] = (
-    [(None, loose)] if loose else []
-  )
+  claims: list[_Claim] = [(None, loose, True)] if loose else []
   for commit in walked:
     owned = tuple(path for path in commit.paths if path in wanted)
-    if not owned:
-      continue
-    if commit.slug == LEGACY_OVERLAY_UNIT:
-      claims.extend(_expand_legacy_squash(repo, commit, owned, exclude, depth + 1))
-    else:
-      claims.append((commit, owned))
+    if owned:
+      claims.extend(_commit_claims(repo, commit, owned, exclude, depth + 1))
   return claims
 
 
@@ -3728,25 +3747,25 @@ def overlay_units(
 
   ``paths`` partition the delta by last touch; ``touched`` lists every path a
   unit contributed to. A unit whose paths later units all took over is still
-  returned for its ``touched`` paths. The transient ``working-tree`` unit is excluded: its paths belong to no
-  unit. A legacy ``platform-local-tree`` squash is expanded back into the
-  commits it replaced, so an overlay squashed by an older updater (including
-  late edits squashed at boot by an older image) regains its unit identity.
+  returned for its ``touched`` paths. The transient ``working-tree`` unit is
+  excluded: its paths belong to no unit. A legacy ``platform-local-tree``
+  squash is expanded back into the commits it replaced, so an overlay
+  squashed by an older updater (including late edits squashed at boot by an
+  older image) regains its unit identity; a disposition noted on the squash
+  itself stays a ``platform-local-tree`` contributor over its paths.
   """
   repo = Path(source_dir)
   exclude = [upstream, *([official] if _resolve_commit(repo, official) else [])]
-  claims: list[tuple[_OverlayCommit | None, tuple[str, ...]]] = []
-  for commit in _overlay_commits(repo, local, exclude):
-    if commit.slug == LEGACY_OVERLAY_UNIT:
-      claims.extend(_expand_legacy_squash(repo, commit, commit.paths, exclude, 1))
-    else:
-      claims.append((commit, commit.paths))
+  claims = [
+    claim for commit in _overlay_commits(repo, local, exclude)
+    for claim in _commit_claims(repo, commit, commit.paths, exclude)
+  ]
   owner: dict[str, str] = {}
   groups: dict[str, list[_OverlayCommit]] = {}
   touched: dict[str, set[str]] = {}
   # Dispositions other commits recorded for a unit that shaped their paths.
   recorded: dict[str, list[str]] = {}
-  for commit, paths in claims:
+  for commit, paths, owns in claims:
     slug = commit.slug if commit else _LEGACY_UNATTRIBUTED_UNIT
     disposition = _valid_disposition(
       _last_trailer(commit.message, OVERLAY_DISPOSITION_TRAILER),
@@ -3759,7 +3778,7 @@ def overlay_units(
     if commit is not None:
       members.append(commit)
     touched.setdefault(slug, set()).update(paths)
-    for path in paths:
+    for path in paths if owns else ():
       owner[path] = slug
     for other, disposition in commit.also if commit else ():
       groups.setdefault(other, [])
@@ -3874,16 +3893,19 @@ def unit_chain(
 
 
 def overlay_evidence_fingerprint(source_dir: str | Path) -> str:
-  """Identity of the refs that change unit dispositions and retirement proofs.
+  """Identity of the refs that change what an update sets aside, or "".
 
-  Disposition notes and merged-contribution witnesses move without moving any
-  branch, so a cache of what an update would retire must key on this too.
+  Disposition notes, merged-contribution witnesses and superseded drafts move
+  without moving any branch, so the reviewed update plan and the status cache
+  key on this too. Empty when none exist.
   """
   proc = _run(
     Path(source_dir), "for-each-ref", "--format=%(refname) %(objectname)",
-    OVERLAY_NOTES_REF, MERGED_CONTRIBUTION_PREFIX, check=False,
+    OVERLAY_NOTES_REF, MERGED_CONTRIBUTION_PREFIX, _SUPERSEDED_DRAFT_PREFIX,
+    check=False,
   )
-  return hashlib.sha256(proc.stdout.encode("utf-8")).hexdigest()
+  listing = proc.stdout.strip()
+  return hashlib.sha256(listing.encode("utf-8")).hexdigest() if listing else ""
 
 
 def mark_overlay_disposition(
@@ -3909,9 +3931,10 @@ def mark_overlay_disposition(
 class RetiredPath:
   """A local copy set aside because the pull request carrying it merged.
 
-  ``proof`` is ``merged-contribution`` when Contribute captured exactly these
-  local bytes for the PR, or ``pending-pr`` when the bytes are still the ones
-  the unit marked for that PR last wrote.
+  ``proof`` is ``merged-contribution`` when the local bytes are exactly what
+  the reviewed head of the PR carried (Contribute's witness), or
+  ``pending-pr`` when they are still the ones the unit marked for that PR
+  last wrote.
   """
 
   path: str
@@ -3927,47 +3950,61 @@ class RetiredPath:
 class _MergedContribution:
   ref: str
   number: int
+  repo: str  # GitHub ``owner/name``; "" for an unreadable witness
   merge_sha: str | None
   paths: tuple[str, ...]
+
+  @property
+  def for_platform_release(self) -> bool:
+    return bool(self.merge_sha) and self.repo.lower() == PLATFORM_RELEASE_REPO
+
+
+_GITHUB_REPO_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 def record_merged_contribution(
   source_dir: str | Path,
   *,
   number: int,
-  source_sha: str,
+  repo_slug: str,
+  head_sha: str,
+  merge_sha: str,
   paths: Iterable[str],
-  merge_sha: str | None = None,
   contribution_id: str = "",
 ) -> str | None:
-  """Record that PR ``number`` merged the bytes captured from ``source_sha``.
+  """Record that PR ``number`` of ``repo_slug`` merged as ``merge_sha``.
 
-  The witness commit's tree is the captured source and its parent keeps that
-  commit reachable, so the updater can prove offline that a local file is
-  still exactly what the PR started from. ``paths`` are the reviewed files.
-  ``merge_sha`` is GitHub's merge commit when known; otherwise the updater
-  finds the release commit whose subject ends in ``(#number)``. Returns the
-  ref, or None when the captured source is unavailable.
+  ``head_sha`` is the reviewed head the PR carried; the witness commit takes
+  its tree (and keeps it reachable as its parent), so the updater can prove
+  offline that a local file still holds exactly the bytes the PR carried.
+  ``paths`` are the reviewed files. ``merge_sha`` is GitHub's merge commit;
+  it need not be fetched yet, because the updater acts only once a release
+  contains it. Returns the ref, or None when the reviewed head is not in this
+  repository or an input is invalid.
   """
   repo = Path(source_dir)
-  source = _resolve_commit(repo, source_sha) if source_sha else None
-  tree = _tree_oid(repo, source) if source else None
+  head = _resolve_commit(repo, head_sha) if head_sha else None
+  tree = _tree_oid(repo, head) if head else None
+  merge = str(merge_sha or "").strip().lower()
   files = sorted({
     p for p in paths if isinstance(p, str) and p and "\n" not in p and "\0" not in p
   })
-  if not isinstance(number, int) or number <= 0 or tree is None or not files:
+  if (
+    not isinstance(number, int) or number <= 0 or tree is None or not files
+    or not _HEX_OID.fullmatch(merge) or not _GITHUB_REPO_SLUG.fullmatch(repo_slug)
+  ):
     return None
-  merge = str(merge_sha or "").strip().lower()
   metadata = {
     "version": _EQUIVALENCE_VERSION,
     "number": number,
-    "merge_sha": merge if _HEX_OID.fullmatch(merge) else None,
-    "source_sha": source,
+    "repo": repo_slug,
+    "merge_sha": merge,
+    "head_sha": head,
     "paths": files,
     "contribution_id": str(contribution_id)[:128],
   }
   anchor = _run(
-    repo, "commit-tree", tree, "-p", source,
+    repo, "commit-tree", tree, "-p", head,
     "-m", json.dumps(metadata, sort_keys=True, separators=(",", ":")),
   ).stdout.strip()
   ref = f"{MERGED_CONTRIBUTION_PREFIX}/{number}"
@@ -3992,10 +4029,12 @@ def _merged_contributions(repo: Path) -> list[_MergedContribution]:
     number = metadata.get("number")
     merge = str(metadata.get("merge_sha") or "")
     paths = metadata.get("paths")
+    slug = metadata.get("repo")
     if not isinstance(number, int) or number <= 0 or not isinstance(paths, list):
       continue
     found.append(_MergedContribution(
-      ref=ref, number=number, merge_sha=merge if _HEX_OID.fullmatch(merge) else None,
+      ref=ref, number=number, repo=slug if isinstance(slug, str) else "",
+      merge_sha=merge if _HEX_OID.fullmatch(merge) else None,
       paths=tuple(p for p in paths if isinstance(p, str) and p),
     ))
   return found
@@ -4035,29 +4074,50 @@ def _path_entries(repo: Path, treeish: str, paths: Iterable[str]) -> dict[str, s
   return entries
 
 
+def without_merged_local_copies(
+  source_dir: str | Path, local: str, upstream: str, units: Iterable[OverlayUnit],
+) -> tuple[str, tuple[RetiredPath, ...]]:
+  """Return ``local``, or a commit on it with merged pull requests' local copies set aside.
+
+  The one retirement planner: Review, Apply, the resolver handoff and the
+  status summary all call it, so what status counts and Review returns is
+  what Apply does. Superseded drafts are set aside first
+  (``without_superseded_drafts``), never changing a path an
+  ``owner-choice:local`` unit touched; then unchanged copies of merged pull
+  requests retire (``without_retired_units``). The result descends from
+  ``local``, so everything set aside stays recoverable and merge bases hold.
+  """
+  units = list(units)
+  drafted = without_superseded_drafts(source_dir, local, upstream, protected={
+    path for unit in units if unit.disposition == "owner-choice:local"
+    for path in (*unit.touched, *unit.paths)
+  })
+  return without_retired_units(source_dir, drafted, upstream, units)
+
+
 def without_retired_units(
   source_dir: str | Path, local: str, upstream: str, units: Iterable[OverlayUnit],
 ) -> tuple[str, tuple[RetiredPath, ...]]:
   """Return ``local``, or a commit on it with merged pull requests' copies retired.
 
-  A path is retired, taking ``upstream``'s bytes, only when all hold:
-  - a merge witness for PR N is newly brought by this update (an ancestor of
+  A path is retired, taking ``upstream``'s bytes, only when one claim on it
+  holds all of:
+  - the PR's merge is newly brought by this update (an ancestor of
     ``upstream`` but not of the shared base, as for superseded drafts, so a
-    later resolver's choice to keep local is never reverted). The witness is
-    the recorded merge commit, or the first-parent release commit whose
-    subject ends in ``(#N)``;
-  - that witness changed the path, so a wrong PR number retires nothing else;
-  - the local bytes are unchanged since they were handed to PR N: equal to
-    Contribute's captured source, or to what the ``pending-pr:#N`` unit last
-    wrote;
-  - every unit that contributed to the path may retire: none is
-    ``owner-choice:local``, and each is a ``pending-pr:#M`` unit whose PR M
-    this update merges, or, under a merged-contribution proof, had all its
-    commits in the source Contribute captured. A path another unit also
-    shaped otherwise stays local and goes through the ordinary merge, since
-    replacing the whole file would drop that unit's change.
-  Local hunks the PR did not carry are set aside with the file; the result's
-  parent is ``local``, so they stay recoverable and merge bases still hold.
+    later resolver's choice to keep local is never reverted). For a
+    merged-contribution witness that is its recorded merge commit in
+    ``PLATFORM_RELEASE_REPO``; for a ``pending-pr:#N`` unit, the first-parent
+    release commit whose subject ends in ``(#N)``;
+  - that merge commit changed the path, so a wrong claim retires nothing else;
+  - the local bytes are exactly the ones handed to the PR: what its reviewed
+    head carried (merged-contribution), or what the ``pending-pr:#N`` unit
+    last wrote (pending-pr);
+  - no unit that contributed to the path is ``owner-choice:local``, and under
+    a pending-pr proof every contributor is a ``pending-pr:#M`` unit this
+    update merges, since that unit's bytes may include another unit's earlier
+    edit. The reviewed head's bytes are the PR's own, so whatever other units
+    shaped them was handed over with it.
+  The result's parent is ``local``, so the retired bytes stay recoverable.
   """
   repo = Path(source_dir)
   tip = _resolve_commit(repo, local)
@@ -4071,67 +4131,59 @@ def without_retired_units(
     for path in unit.touched or unit.paths:
       contributors.setdefault(path, []).append(unit)
   merged_prs = _pr_merge_commits(repo, f"{shared}..{upstream}")
-  # path -> (PR, witness commit, proof, tree-ish holding the handed-over bytes)
-  candidates: dict[str, tuple[int, str, str, str]] = {}
+  # path -> claims, tried in order: (PR, merge commit, proof, tree-ish holding
+  # the handed-over bytes).
+  claims: dict[str, list[tuple[int, str, str, str]]] = {}
   for contribution in _merged_contributions(repo):
-    witness = contribution.merge_sha
+    merge = contribution.merge_sha
     if not (
-      witness and ref_is_ancestor(repo, witness, upstream) is True
-      and ref_is_ancestor(repo, witness, shared) is False
+      contribution.for_platform_release
+      and ref_is_ancestor(repo, merge, upstream) is True
+      and ref_is_ancestor(repo, merge, shared) is False
     ):
-      witness = merged_prs.get(contribution.number)
-    for path in contribution.paths if witness else ():
-      candidates.setdefault(path, (
-        contribution.number, witness, "merged-contribution", contribution.ref,
-      ))
+      continue
+    for path in contribution.paths:
+      claims.setdefault(path, []).append(
+        (contribution.number, merge, "merged-contribution", contribution.ref),
+      )
   # The owning unit last wrote the local bytes, so its claim is tried first.
   for unit, paths in [
     *((u, u.paths) for u in units), *((u, u.touched) for u in units),
   ]:
-    if unit.pr is not None and unit.pr in merged_prs and unit.commits:
+    if unit.pr in merged_prs and unit.commits:
+      claim = (unit.pr, merged_prs[unit.pr], "pending-pr", unit.commits[-1])
       for path in paths:
-        candidates.setdefault(path, (
-          unit.pr, merged_prs[unit.pr], "pending-pr", unit.commits[-1],
-        ))
+        if claim not in claims.setdefault(path, []):
+          claims[path].append(claim)
 
-  def may_retire(unit: OverlayUnit, proof: str, holder: str) -> bool:
+  def may_retire(unit: OverlayUnit, proof: str) -> bool:
     if unit.disposition == "owner-choice:local":
       return False
-    if unit.pr is not None and unit.pr in merged_prs:
-      return True
-    # Contribute captured the local source: a unit wholly inside it handed
-    # its change to the PR along with the file.
-    return proof == "merged-contribution" and bool(unit.commits) and all(
-      ref_is_ancestor(repo, commit, f"{holder}^") is True for commit in unit.commits
-    )
+    return proof == "merged-contribution" or unit.pr in merged_prs
 
-  candidates = {
-    path: claim for path, claim in candidates.items()
-    if all(
-      may_retire(unit, claim[2], claim[3]) for unit in contributors.get(path, ())
-    )
-  }
-  if not candidates:
+  if not claims:
     return local, ()
-  local_entries = _path_entries(repo, tip, candidates)
-  upstream_entries = _path_entries(repo, upstream, candidates)
-  captured: dict[str, dict[str, str]] = {}
+  local_entries = _path_entries(repo, tip, claims)
+  upstream_entries = _path_entries(repo, upstream, claims)
+  held: dict[str, dict[str, str]] = {}
   changed_by: dict[str, set[str]] = {}
   retired = []
-  for path, (pr, witness, proof, holder) in sorted(candidates.items()):
-    if witness not in changed_by:
-      changed_by[witness] = endpoint_diff_paths(repo, f"{witness}^", witness) or set()
-    if holder not in captured:
-      captured[holder] = _path_entries(repo, holder, [
-        p for p, claim in candidates.items() if claim[3] == holder
-      ])
-    if (
-      path in changed_by[witness]
-      and local_entries.get(path) == captured[holder].get(path)
-      and local_entries.get(path) != upstream_entries.get(path)
-    ):
-      unit = owners.get(path)
-      retired.append(RetiredPath(path, pr, unit.slug if unit else None, proof))
+  for path, options in sorted(claims.items()):
+    if local_entries.get(path) == upstream_entries.get(path):
+      continue
+    for pr, merge, proof, holder in options:
+      if not all(may_retire(unit, proof) for unit in contributors.get(path, ())):
+        continue
+      if merge not in changed_by:
+        changed_by[merge] = endpoint_diff_paths(repo, f"{merge}^", merge) or set()
+      if holder not in held:
+        held[holder] = _path_entries(repo, holder, [
+          p for p, listed in claims.items() if any(c[3] == holder for c in listed)
+        ])
+      if path in changed_by[merge] and local_entries.get(path) == held[holder].get(path):
+        unit = owners.get(path)
+        retired.append(RetiredPath(path, pr, unit.slug if unit else None, proof))
+        break
   if not retired:
     return local, ()
   changes = {

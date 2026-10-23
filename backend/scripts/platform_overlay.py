@@ -5,7 +5,15 @@ Platform updates carry local commits as labelled units. A unit marked
 ``pending-pr:#N`` is retired automatically by the first update whose release
 merged pull request N, if its files are still the bytes the unit wrote;
 ``owner-choice:local`` is never retired. The mark is a local git note
-(``refs/notes/mobius-overlay``), never pushed.
+(``refs/notes/mobius-overlay``), never pushed, and applies to the marked
+commit's own unit.
+
+A unit whose every path a later unit took over has no commit of its own after
+an update re-emits the overlay: it survives only as a
+``Mobius-Overlay-Also: <unit>=<disposition>`` trailer on the commits it
+shaped, so it cannot be marked directly. Mark one of those commits instead;
+``owner-choice:local`` on it guards the same files, since a file retires only
+when no unit that shaped it chose to keep it local.
 
   python3 backend/scripts/platform_overlay.py mark <commit> pending-pr:#1234
   python3 backend/scripts/platform_overlay.py mark <commit> owner-choice:local
