@@ -2926,8 +2926,11 @@ def history_is_complete(source_dir: str | Path, tip: str) -> bool:
   try:
     if _is_shallow(repo):
       return False
+    # The commit-graph cache can answer parents without reading objects, so a
+    # deleted commit would still "walk". Disable it to verify real objects.
     proc = _run(
-      repo, "rev-list", "--quiet", "--end-of-options", tip,
+      repo, "-c", "core.commitGraph=false",
+      "rev-list", "--quiet", "--end-of-options", tip,
       check=False, read_only=True,
     )
   except (OSError, subprocess.SubprocessError):

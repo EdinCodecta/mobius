@@ -1369,3 +1369,44 @@ def test_a_file_where_the_receipt_directory_belongs_is_unknown(tmp_path, db, mon
   db.commit()
   with pytest.raises(batches.SettlementUnreadable):
     batches._settled_outcomes({app.id: COMMIT})
+
+
+def test_a_commit_graph_cannot_hide_a_missing_history_object(tmp_path, db):
+  """The completeness walk reads real objects, not the commit-graph cache."""
+  repo = tmp_path / "cached"
+  repo.mkdir()
+  _git(repo, "init", "-q", "-b", "main")
+  _git(repo, "commit", "-q", "--allow-empty", "-m", "reviewed")
+  reviewed = _git(repo, "rev-parse", "HEAD")
+  _git(repo, "commit", "-q", "--allow-empty", "-m", "served")
+  served = _git(repo, "rev-parse", "HEAD")
+  _git(repo, "commit-graph", "write", "--reachable")
+  (repo / ".git" / "objects" / reviewed[:2] / reviewed[2:]).unlink()
+  app = models.App(name="Cached", slug="cached", jsx_source="export default 1",
+    source_dir=str(repo), source_commit=served, version="1")
+  db.add(app)
+  db.commit()
+  assert batches.app_git.ref_is_ancestor(str(repo), reviewed, served) is None
+  assert batches.app_git.commit_object_absent(str(repo), reviewed) is True
+  assert batches.app_git.history_is_complete(str(repo), served) is False
+  with pytest.raises(batches.SettlementUnreadable):
+    batches._settled_outcomes({app.id: reviewed})
+
+
+def test_failed_git_reads_never_certify_absence(tmp_path, monkeypatch):
+  _git(tmp_path, "init", "-q")
+  original = batches.app_git._run
+
+  def timeout(path, *args, **kwargs):
+    if "rev-list" in args:
+      raise subprocess.TimeoutExpired(["git", "rev-list"], 30)
+    return original(path, *args, **kwargs)
+
+  monkeypatch.setattr(batches.app_git, "_run", timeout)
+  assert batches.app_git.history_is_complete(str(tmp_path), "a" * 40) is False
+
+  def broken(*_args, **_kwargs):
+    raise OSError("cannot execute git")
+
+  monkeypatch.setattr(batches.app_git, "_run", broken)
+  assert batches.app_git.commit_object_absent(str(tmp_path), "a" * 40) is False
