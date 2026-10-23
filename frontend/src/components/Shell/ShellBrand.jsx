@@ -1,7 +1,7 @@
 import { memo, useRef } from 'react'
 import { useLogoModeGesture } from './useLogoModeGesture.js'
+import { isEditableTarget } from './workspaceOnboarding.js'
 import {
-  isEditableTarget,
   SHELL_SHORTCUTS,
   shortcutMatches,
 } from '../../lib/keyboardShortcuts.js'
