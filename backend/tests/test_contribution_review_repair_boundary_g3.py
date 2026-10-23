@@ -137,3 +137,32 @@ def test_canonical_diff_never_runs_textconv(checkout, tmp_path):
   git(path, "config", "diff.probe.textconv", f"touch {probe}")
   diff = app_git._canonical_diff(path, initial, head, read_only=True)
   assert diff and not probe.exists()
+
+
+@pytest.mark.parametrize("drift", ["head", "stop"])
+def test_repeated_proof_drift_never_dispatches_push(checkout, monkeypatch, drift):
+  path, initial = checkout
+  validation = {"checkout": str(path), "initial_head_sha": initial,
+                "head_repo": "owner/fork", "head_repo_id": 2, "head_ref": "topic",
+                "allowed_files": ["owned.py"], "head_sha": "b" * 40,
+                "diff_sha256": "c" * 64, "base_sha": "a" * 40}
+  target = {"repo": "owner/base", "base_ref": "main", "head_sha": initial}
+  proof_count = []
+  def proof(*_args, **_kwargs):
+    proof_count.append(1)
+    return validation
+  monkeypatch.setattr(repairs, "validate_repair", proof)
+  monkeypatch.setattr(repairs, "owned_checkout", lambda *_args: path)
+  monkeypatch.setattr(repairs, "_target_base_head", lambda *_args: "a" * 40)
+  monkeypatch.setattr(repairs, "_branch_head", lambda *_args: "d" * 40 if drift == "head" and len(proof_count) > 1 else initial)
+  monkeypatch.setattr(repairs, "_git", lambda *_args, **_kwargs: pytest.fail("push after final drift"))
+  guards = []
+  def guard():
+    guards.append(1)
+    if drift == "stop" and len(proof_count) > 1:
+      raise repairs.NotDispatched("Stopped during repeated proof")
+  result = repairs.push_repair(None, path, None, target, validation, before_push=guard)
+  assert result.state == "not_dispatched"
+  assert len(proof_count) == 2
+  if drift == "stop":
+    assert len(guards) == 2
