@@ -103,7 +103,7 @@ export const persistOptions = {
 
 // Decide whether a query's cache entry is mirrored to IndexedDB.
 //
-// Top-level domains (chats, messages, theme, apps) match on the first
+// Top-level domains (chats, messages, theme, apps, app-consent) match on the first
 // key segment. The Settings view's provider/CLI-version/status queries
 // are persisted too so the panel paints from disk on open instead of
 // flashing empty details while the live probes revalidate:
@@ -120,7 +120,7 @@ const PERSISTED_FULL_KEYS = new Set([
 
 export function shouldPersistQueryKey(queryKey) {
   const head = queryKey[0]
-  if (head === 'chats' || head === 'chat-messages' || head === 'theme' || head === 'apps') {
+  if (head === 'chats' || head === 'chat-messages' || head === 'theme' || head === 'apps' || head === 'app-consent') {
     return true
   }
   return PERSISTED_FULL_KEYS.has(JSON.stringify(queryKey))

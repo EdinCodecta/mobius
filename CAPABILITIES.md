@@ -417,7 +417,16 @@ platform-maintenance skill for setup guidance. No UI or ad-hoc install capture.
 Same-app calls use `/api/apps/{app_id}/service/{path}`. An app can expose a
 reviewed service to other installed apps at `/api/services/{service_id}/{path}`
 by setting `access` to `apps`, or additionally expose anonymous calls at
-`/api/app-services/{service_id}/{path}` by setting it to `public`. `service.id`
+`/api/app-services/{service_id}/{path}` by setting it to `public`. Anonymous
+requests are counted per public service, 60 a minute by default across all its
+visitors, and one visitor may use at most a quarter of that allowance (never
+less than 60). A visitor is the network client address; Möbius does not trust
+forwarded client addresses, so behind a hosting proxy every visitor arrives as
+the same caller and shares one visitor share. A public service whose product
+needs a faster cadence may declare `service.public_requests_per_minute`, from
+60 to 600, which the owner accepts with the rest of its capability contract;
+that reviewed number is the service's ceiling. Request polling suits
+turn-based or slow-changing state; it is not a real-time transport. `service.id`
 is the stable public contract and does not change when the app's display name,
 manifest `id`, repository, or installed slug changes. These are explicit
 install-time grants and do not widen the service app token's accepted
@@ -632,6 +641,52 @@ do not expose a way to dismiss that prompt programmatically; if it later grants
 access, the provider stops the newly returned tracks without starting a
 recorder. Finish before readiness fails rather than manufacturing an empty or
 invalid video. Finish after readiness returns the useful partial recording.
+
+## First-open consent for Store apps
+
+A Store-installed app is dormant until the owner accepts what it asks for, once,
+in one all-or-nothing request shown the first time it is opened. Install only
+stages the app. Source: `backend/app/app_consent.py`.
+
+- **Declared vs accepted.** The declared side is the reviewed capability
+  contract. The accepted side is `App.accepted_consent`: the rows the owner
+  accepted (id and rank), a row-vocabulary `version`, and who, when and how
+  (`owner`, `platform` for first-boot apps, `migration` for apps that existed
+  before this shipped). Saving rows, not the contract, means rewording or
+  re-deriving rows can never turn an old answer into a new question.
+- **When it asks.** An app that asks for nothing is never asked. Otherwise it is
+  *dormant* (`app_consent.dormant`) until the owner answers: it was never
+  accepted, or its contract now asks for a row, or a
+  higher level of a row, that the accepted answer does not cover. A narrower or
+  equal request never asks. A dormant app gets no app or job token (`409
+  consent_required`), no service invocation, no system-prompt fragment and no
+  agent tools. Token validation (`deps._enforce_app_scope`) refuses a dormant
+  app, and every app, job and service credential carries the id of the
+  acceptance it was issued under, so a token from before a revoke stays dead
+  after re-accepting. Revoking never touches the app's install identity (token
+  nonce, storage generation, publications). The first acceptance starts the
+  `initialize_on_install` run that install could not; that job should be
+  idempotent, because a revoke followed by a new acceptance starts it again.
+  Install stages the rest the same way: a dormant app's shared skills are set
+  aside (inside `_sync_app_skills` and `restore_app_skills`, so install, update, apply and
+  recover all follow it; the tombstone is the one uninstall uses) and come
+  back on acceptance, scheduled runs log `skipped: waiting for owner approval`
+  instead of timing out, and an update that pauses an accepted app sends the
+  owner one notification so an app they rarely open does not stop silently.
+- **Who can answer.** `POST /api/apps/{id}/consent` takes the digest of the
+  request that was shown and accepts only a human owner session
+  (`get_current_owner_for_owner_input`): agent runs, delegated helpers, apps and
+  shared-browser guests are refused. `DELETE` makes the app dormant again.
+- **Rows come from one place.** `rows_from_contract` turns a contract into
+  rows with their wording and a platform-defined `critical` flag (an app cannot
+  mark itself harmless). The install preview returns the same `access_rows`, so
+  the install dialog and the first-open request never keep separate wording.
+  `HANDLED_DATA_KEYS` plus a test fail the build when a new contract permission
+  has no row.
+- **Not yet covered** (next steps): install-time effects (setup, schedules,
+  skills, the first-run job) still start at install; a Store update's new
+  grants still apply before the owner answers; local and agent-built apps are
+  not gated; there is no Settings screen for revoking.
 
 ## Stable error codes
 

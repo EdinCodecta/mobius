@@ -16,7 +16,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from app.manifest_contract import (
-  SERVICE_REQUEST_MAX_BYTES, accepted_service_max_bytes, accepted_service_route_limits,
+  PUBLIC_SERVICE_REQUESTS_PER_MINUTE, SERVICE_REQUEST_MAX_BYTES,
+  accepted_service_max_bytes, accepted_service_route_limits,
 )
 
 
@@ -597,6 +598,8 @@ def contract_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     aliases = list(service.get("aliases") or [])
     if aliases:
       accepted_service["aliases"] = aliases
+    if "public_requests_per_minute" in service:
+      accepted_service["public_requests_per_minute"] = service["public_requests_per_minute"]
     # Omitted when empty so services without route ceilings keep their
     # existing review digest. A sorted list, not a path-keyed object, so
     # update review compares it as one value instead of splitting slashes.
@@ -728,6 +731,8 @@ def contract_from_app_state(
       }
       if accepted_service.get("aliases"):
         service["aliases"] = list(accepted_service["aliases"])
+      if "public_requests_per_minute" in accepted_service:
+        service["public_requests_per_minute"] = accepted_service["public_requests_per_minute"]
       # Re-deriving transfer limits through manifest form could repair a
       # grant the runtime refuses (re-enabling a disabled service) or drop a
       # reviewed route ceiling (widening that route to the whole grant). Keep
@@ -898,7 +903,7 @@ def diff_contracts(
     k for k in before.keys() & after.keys()
     if before[k] != after[k] or (
       # Python equates 1, True and 1.0; only the integer is a valid ceiling.
-      k in _TRANSFER_LIMIT_PATHS and _exact_json(before[k]) != _exact_json(after[k])
+      k in _EXACT_CEILING_PATHS and _exact_json(before[k]) != _exact_json(after[k])
     )
   )
   widens = any(
@@ -949,6 +954,8 @@ _ROUTE_LIMITS_PATH = "service.route_limits"
 # The accepted service fields the runtime reads to bound every exchange.
 _TRANSFER_LIMIT_FIELDS = ("max_request_bytes", "max_response_bytes", "route_limits")
 _TRANSFER_LIMIT_PATHS = {f"service.{field}" for field in _TRANSFER_LIMIT_FIELDS}
+# Integer ceilings review compares by exact JSON, so 60 and 60.0 differ.
+_EXACT_CEILING_PATHS = _TRANSFER_LIMIT_PATHS | {"service.public_requests_per_minute"}
 
 
 def _exact_json(value: Any) -> str:
@@ -1027,6 +1034,13 @@ def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
     # A legacy accepted service without these fields had the 8 MiB default.
     old = SERVICE_REQUEST_MAX_BYTES if before is None else before
     new = SERVICE_REQUEST_MAX_BYTES if after is None else after
+    return type(old) is not int or type(new) is not int or new > old
+  if path == "service.public_requests_per_minute":
+    if not any(key.startswith("service.") for key in after_leaves):
+      return False  # Complete revocation cannot restore a request allowance.
+    # A public allowance is a reviewed ceiling; omitted means the default.
+    old = PUBLIC_SERVICE_REQUESTS_PER_MINUTE if before is None else before
+    new = PUBLIC_SERVICE_REQUESTS_PER_MINUTE if after is None else after
     return type(old) is not int or type(new) is not int or new > old
   if path == _ROUTE_LIMITS_PATH:
     if not any(key.startswith("service.") for key in after_leaves):

@@ -1879,6 +1879,7 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0093_pending_goal_dependency_indexes",
     "0094_retire_legacy_claim_notice_carriers",
     "0095_unique_live_claim_follows",
+    "0096_app_accepted_consent",
   ]
   assert second == first
 

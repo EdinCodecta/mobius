@@ -901,6 +901,276 @@ def test_http_callers_cannot_reach_the_platforms_tool_lane(client, auth, db, pat
   assert response.status_code == 404
 
 
+# --- Public request allowance --------------------------------------------------
+
+def _public_manifest(**service) -> dict:
+  return {
+    "id": "live-room", "name": "Live room", "version": "0.1.0",
+    "description": "A multiplayer room.", "entry": "index.jsx",
+    "permissions": {}, "source_files": ["service.py"],
+    "service": {"entry": "service.py", "access": "public", **service},
+  }
+
+
+def test_public_service_may_declare_a_capped_request_allowance():
+  from app.app_capabilities import contract_from_manifest
+  from app.manifest_contract import ManifestContractError, validate_manifest_contract
+
+  manifest = _public_manifest(public_requests_per_minute=480)
+  validate_manifest_contract(manifest)
+  service = contract_from_manifest(manifest)["service"]
+  assert service["public_requests_per_minute"] == 480
+  assert app_services.public_requests_per_minute(service) == 480
+  assert app_services.public_requests_per_minute({"access": "public"}) == 60
+  # An accepted value the manifest could not have produced disables the
+  # service, like malformed transfer limits, instead of being clamped.
+  for corrupt in (10, 1000, 120.0, True, "120"):
+    with pytest.raises(app_services.ServiceBoundaryError):
+      app_services.public_requests_per_minute({"public_requests_per_minute": corrupt})
+
+  for bad in (59, 601, 120.0, True, "120"):
+    with pytest.raises(ManifestContractError, match="public_requests_per_minute"):
+      validate_manifest_contract(_public_manifest(public_requests_per_minute=bad))
+  private = _public_manifest(public_requests_per_minute=120)
+  private["service"]["access"] = "self"
+  with pytest.raises(ManifestContractError, match="only to a service with `access: public`"):
+    validate_manifest_contract(private)
+
+
+@pytest.fixture
+def public_service_clock(monkeypatch):
+  from limits import strategies
+  from limits.storage import memory
+  from app.routes import app_services as routes
+
+  clock = SimpleNamespace(now=1_800_000_030.0)
+  # Freeze only the limiter's wall clock, not auth expiry or async scheduling.
+  wall_time = SimpleNamespace(time=lambda: clock.now)
+  for module in (memory, strategies, routes):
+    monkeypatch.setattr(module, "time", wall_time)
+  return clock
+
+
+@pytest.fixture
+def fresh_public_door(monkeypatch, public_service_clock):
+  from limits.storage import MemoryStorage
+  from limits.strategies import SlidingWindowCounterRateLimiter
+  from app import public_service_index
+  from app.routes import app_services as routes
+
+  monkeypatch.setattr(routes, "_public_window", SlidingWindowCounterRateLimiter(MemoryStorage()))
+  # Start from this test's database, not a snapshot an earlier test built.
+  monkeypatch.setattr(public_service_index, "_snapshot", None)
+  lookups = []
+  resolve = routes._service_app
+  monkeypatch.setattr(
+    routes, "_service_app", lambda session, slug: lookups.append(slug) or resolve(session, slug),
+  )
+  return lookups
+
+
+def test_public_door_counts_probes_of_non_public_services(client, db, fresh_public_door):
+  _service_app(db, slug="private-probe")
+  for _ in range(30):
+    assert client.get("/api/app-services/private-probe/status").status_code == 404
+    assert client.get("/api/app-services/missing-probe/status").status_code == 404
+  assert client.get("/api/app-services/private-probe/status").status_code == 429
+
+
+def _visitor_request(address):
+  from starlette.requests import Request
+  return Request({"type": "http", "client": (address, 40000), "headers": []})
+
+
+def _admitted(address, per_minute):
+  from fastapi import HTTPException
+  from app.routes import app_services as routes
+  try:
+    routes._admit_public_request(_visitor_request(address), "7", per_minute)
+  except HTTPException as refused:
+    assert refused.status_code == 429
+    return False
+  return True
+
+
+def test_one_visitor_may_spend_only_a_quarter_of_the_allowance(fresh_public_door):
+  assert all(_admitted("203.0.113.1", 600) for _ in range(150))
+  assert not _admitted("203.0.113.1", 600)
+  assert all(_admitted("203.0.113.2", 600) for _ in range(150))
+  assert not _admitted("203.0.113.2", 600)
+
+
+def test_visitor_share_never_falls_below_the_default(fresh_public_door):
+  assert all(_admitted("203.0.113.3", 120) for _ in range(60))
+  assert not _admitted("203.0.113.3", 120)
+
+
+def test_reviewed_allowance_is_the_whole_services_ceiling(fresh_public_door):
+  for visitor in range(4):
+    assert all(_admitted(f"198.51.100.{visitor}", 600) for _ in range(150))
+  assert not _admitted("198.51.100.200", 600)
+
+
+def test_public_allowance_recovers_as_the_sliding_window_ages(
+  fresh_public_door, public_service_clock,
+):
+  public_service_clock.now = 1_800_000_059.9
+  assert all(_admitted("192.0.2.1", 60) for _ in range(60))
+  assert not _admitted("192.0.2.1", 60)
+
+  # The previous minute decays gradually; crossing a boundary never grants
+  # another full burst, but can restore one request immediately.
+  public_service_clock.now += 0.2
+  assert _admitted("192.0.2.1", 60)
+  assert not _admitted("192.0.2.1", 60)
+
+  public_service_clock.now += 120
+  assert all(_admitted("192.0.2.1", 60) for _ in range(60))
+  assert not _admitted("192.0.2.1", 60)
+
+
+def test_refused_request_spends_neither_allowance(fresh_public_door):
+  for visitor in range(4):
+    assert all(_admitted(f"192.0.2.{visitor}", 600) for _ in range(150))
+  for _ in range(5):
+    assert not _admitted("192.0.2.1", 600)
+    assert not _admitted("192.0.2.99", 600)
+  from app.routes import app_services as routes
+  from limits import RateLimitItemPerMinute
+  stats = routes._public_window.get_window_stats(
+    RateLimitItemPerMinute(150), "visitor", "7", "192.0.2.99",
+  )
+  assert stats.remaining == 150
+
+
+def _set_public_allowance(db, app, per_minute):
+  contract = dict(app.capability_contract)
+  contract["service"] = {**contract["service"], "public_requests_per_minute": per_minute}
+  app.capability_contract = contract
+  db.commit()
+
+
+def test_public_door_refuses_over_limit_callers_and_probes_without_a_lookup(
+  client, auth, db, fresh_public_door,
+):
+  _service_app(db, access="public", slug="busy-service")
+  for _ in range(60):
+    assert client.get("/api/app-services/busy-service/status").status_code == 201
+  for index in range(60):
+    assert client.get(f"/api/app-services/probe-{index}/status").status_code == 404
+  assert fresh_public_door == ["busy-service"] * 60
+
+  fresh_public_door.clear()
+  for index in range(20):
+    refused = client.get("/api/app-services/busy-service/status")
+    assert refused.status_code == 429
+    assert int(refused.headers["Retry-After"]) >= 1
+    assert client.get(f"/api/app-services/late-probe-{index}/status").status_code == 429
+  assert fresh_public_door == []
+
+
+def test_public_service_applied_after_probe_exhaustion_uses_its_own_bucket(
+  client, auth, db, fresh_public_door,
+):
+  for index in range(61):
+    client.get(f"/api/app-services/probe-{index}/status")
+  assert client.get("/api/app-services/probe-x/status").status_code == 429
+
+  _service_app(db, access="public", slug="fresh-service")
+  assert client.get("/api/app-services/fresh-service/status").status_code == 201
+
+
+def test_raised_public_allowance_applies_to_the_next_request(
+  client, auth, db, fresh_public_door,
+):
+  app = _service_app(db, access="public", slug="growing-service")
+  for _ in range(60):
+    assert client.get("/api/app-services/growing-service/status").status_code == 201
+  assert client.get("/api/app-services/growing-service/status").status_code == 429
+
+  _set_public_allowance(db, app, 600)
+  assert client.get("/api/app-services/growing-service/status").status_code == 201
+
+
+def test_withdrawn_public_service_stops_resolving_at_once(
+  client, auth, db, fresh_public_door,
+):
+  app = _service_app(db, access="public", slug="closing-service")
+  assert client.get("/api/app-services/closing-service/status").status_code == 201
+
+  contract = dict(app.capability_contract)
+  contract["service"] = {**contract["service"], "access": "self"}
+  app.capability_contract = contract
+  db.commit()
+  fresh_public_door.clear()
+  assert client.get("/api/app-services/closing-service/status").status_code == 404
+  assert fresh_public_door == []
+
+
+def test_moved_alias_counts_against_its_new_service_from_the_next_request(
+  client, auth, db, fresh_public_door,
+):
+  _service_app(db, access="public", slug="spent-service", aliases=("moving",))
+  fresh = _service_app(db, access="public", slug="fresh-service")
+  for _ in range(60):
+    assert client.get("/api/app-services/moving/status").status_code == 201
+  assert client.get("/api/app-services/spent-service/status").status_code == 429
+
+  alias = db.query(models.AppServiceAlias).filter_by(service_id="moving").one()
+  alias.app_id = fresh.id
+  db.commit()
+  assert client.get("/api/app-services/moving/status").status_code == 201
+  assert client.get("/api/app-services/spent-service/status").status_code == 429
+
+
+def test_unreadable_public_service_answers_503_like_the_other_doors(
+  client, auth, db, fresh_public_door,
+):
+  _service_app(
+    db, access="public", slug="broken-limits", service_id="broken-limits",
+    route_limits=[_route_limit("GET", "actor", 1024)],
+  )
+  broken_allowance = _service_app(db, access="public", slug="broken-allowance")
+  _set_public_allowance(db, broken_allowance, 1000)
+
+  public = client.get("/api/app-services/broken-limits/status")
+  assert public.status_code == 503
+  assert public.json()["detail"] == "Accepted app service route limits are invalid."
+  shared = client.get("/api/services/broken-limits/status", headers=auth)
+  assert shared.status_code == 503
+  assert client.get("/api/app-services/broken-allowance/status").status_code == 503
+
+
+def test_only_raising_the_public_allowance_widens_review():
+  from app.app_capabilities import contract_from_manifest, diff_contracts
+
+  def contract(**service):
+    return contract_from_manifest(_public_manifest(**service))
+
+  accepted = contract(public_requests_per_minute=480)
+  assert diff_contracts(accepted, contract(public_requests_per_minute=600))["widens"] is True
+  assert diff_contracts(accepted, contract(public_requests_per_minute=120))["widens"] is False
+  assert diff_contracts(accepted, contract())["widens"] is False
+  assert diff_contracts(contract(), contract(public_requests_per_minute=61))["widens"] is True
+  # Review compares the ceiling exactly: 60.0 is not the accepted 60.
+  as_float = contract(public_requests_per_minute=60)
+  as_float["service"]["public_requests_per_minute"] = 60.0
+  assert "service.public_requests_per_minute" in diff_contracts(
+    contract(public_requests_per_minute=60), as_float,
+  )["changed"]
+
+
+def test_editing_a_local_app_keeps_its_accepted_public_allowance(client, auth, db):
+  app = _service_app(db, access="public", slug="kept-allowance")
+  _set_public_allowance(db, app, 480)
+
+  response = client.patch(f"/api/apps/{app.id}", headers=auth, json={"pinned": True})
+  assert response.status_code == 200
+  db.refresh(app)
+  assert app.capability_contract["service"]["public_requests_per_minute"] == 480
+  assert app_services.public_requests_per_minute(app.capability_contract["service"]) == 480
+
+
 def test_http_dense_container_decode_peak_includes_input_allocation(
   client, auth, db, monkeypatch,
 ):
@@ -2055,6 +2325,7 @@ async def test_service_execution_timeout_releases_request_admission(
 async def test_concurrent_http_backlog_is_bounded_before_execution_and_cleans_up(
   auth, db, monkeypatch,
 ):
+  import anyio
   import httpx
   from app.main import app as application
 
@@ -2068,6 +2339,7 @@ async def test_concurrent_http_backlog_is_bounded_before_execution_and_cleans_up
 
   monkeypatch.setattr(app_services, "_app_slots", {(app.id, "private"): BusyApp(0)})
   requests = []
+  request_scopes = []
   peaks = []
   real_reserve = app_services.ServiceExchangeAdmission._reserve
 
@@ -2077,15 +2349,25 @@ async def test_concurrent_http_backlog_is_bounded_before_execution_and_cleans_up
 
   monkeypatch.setattr(app_services.ServiceExchangeAdmission, "_reserve", measured_reserve)
   async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as http:
-    async def post():
-      return await http.post(f"/api/apps/{app.id}/service/echo", headers=auth, json={"payload": "x" * 256})
+    def start_post():
+      scope = anyio.CancelScope()
+      request_scopes.append(scope)
 
-    requests.append(asyncio.create_task(post()))
+      async def post():
+        with scope:
+          return await http.post(
+            f"/api/apps/{app.id}/service/echo", headers=auth,
+            json={"payload": "x" * 256},
+          )
+
+      return asyncio.create_task(post())
+
+    requests.append(start_post())
     try:
       await asyncio.wait_for(waiting.wait(), 3)
       budget = 3 * app_services._admitted_exchange_cost
       monkeypatch.setattr(app_services, "MAX_ADMITTED_EXCHANGE_COST", budget)
-      requests.extend(asyncio.create_task(post()) for _ in range(7))
+      requests.extend(start_post() for _ in range(7))
       # Let the real HTTP routes finish admission. Queued requests remain
       # asleep at the per-app execution semaphore, not at a new memory queue.
       for _ in range(100):
@@ -2099,10 +2381,90 @@ async def test_concurrent_http_backlog_is_bounded_before_execution_and_cleans_up
       assert max(peaks) <= budget
       assert app_services._admitted_exchange_cost <= budget
     finally:
-      for task in requests:
-        task.cancel()
+      # Raw Task.cancel() abandons synchronous authentication workers; scopes
+      # respect their shields before request sessions and test state unwind.
+      for scope in request_scopes:
+        scope.cancel()
       await asyncio.gather(*requests, return_exceptions=True)
   assert app_services._admitted_exchange_cost == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_before_start, dependency_error", [
+  (False, False), (False, True), (True, False),
+])
+async def test_http_scope_cancellation_drains_auth_before_session_cleanup(
+  monkeypatch, cancel_before_start, dependency_error,
+):
+  import threading
+  import anyio
+  import httpx
+  from fastapi import Depends, FastAPI
+  from app import database
+
+  entered = threading.Event()
+  release = threading.Event()
+  finished = threading.Event()
+  closed = threading.Event()
+  application = FastAPI()
+
+  class Session:
+    def close(self):
+      assert finished.is_set(), "session closed under its authentication worker"
+      closed.set()
+
+  monkeypatch.setattr(database, "SessionLocal", Session)
+
+  def authenticate(session=Depends(database.get_db)):
+    entered.set()
+    try:
+      assert release.wait(5)
+      if dependency_error:
+        raise RuntimeError("authentication failed")
+    finally:
+      finished.set()
+
+  @application.get("/")
+  async def endpoint(_=Depends(authenticate)):
+    await anyio.sleep_forever()
+
+  scope = anyio.CancelScope()
+  async with httpx.AsyncClient(
+    transport=httpx.ASGITransport(app=application), base_url="http://test",
+  ) as http:
+    async def get():
+      with scope:
+        await http.get("/")
+
+    task = asyncio.create_task(get())
+    try:
+      if not cancel_before_start:
+        assert await asyncio.to_thread(entered.wait, 5)
+      scope.cancel()
+      await asyncio.sleep(0)
+      if not cancel_before_start:
+        assert not task.done()
+        assert not finished.is_set()
+        assert not closed.is_set()
+    finally:
+      scope.cancel()
+      release.set()
+      outcome, = await asyncio.gather(task, return_exceptions=True)
+      if entered.is_set():
+        assert await asyncio.to_thread(finished.wait, 5)
+
+  # Cancellation can interrupt FastAPI's exception cleanup before __exit__,
+  # leaving get_db in a traceback cycle. Finalize it before checking ordering.
+  gc.collect()
+  if cancel_before_start:
+    assert not entered.is_set()
+  else:
+    assert finished.is_set() and closed.is_set()
+  if outcome is None:
+    assert scope.cancelled_caught
+  else:
+    assert dependency_error and isinstance(outcome, RuntimeError)
+    assert str(outcome) == "authentication failed"
 
 
 DENSE_RESPONSE_SERVICE = b'''import json, sys
