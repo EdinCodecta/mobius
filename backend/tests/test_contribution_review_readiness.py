@@ -914,6 +914,63 @@ def test_ready_refuses_target_drift_after_arm_without_dispatch(setup, monkeypatc
   assert claim.released_at is not None
 
 
+def test_disarmed_base_drift_can_advance_and_retry_after_fresh_review(setup, monkeypatch):
+  from app import delegations
+  new_base = "e" * 40
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  live = {"sha": BASE, "compares": []}
+  monkeypatch.setattr(domain, "base_head", lambda *a: live["sha"])
+  def assert_base(_gh, _cwd, target):
+    if live["sha"] != target["base_sha"]:
+      raise HTTPException(409, "The target branch changed.")
+  monkeypatch.setattr(domain, "assert_current_base", assert_base)
+  def read(_gh, _cwd, endpoint):
+    if "/compare/" in endpoint:
+      old, new = endpoint.rsplit("/", 1)[1].split("...")
+      live["compares"].append((old, new))
+      return {"status": "ahead", "base_commit": {"sha": old},
+        "merge_base_commit": {"sha": old}}
+    return {"id": 42}
+  monkeypatch.setattr(domain, "read", read)
+  original_arm = routes._arm_ready
+  dispatched = []
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: dispatched.append(1))
+
+  async def arm_then_base_moves(*args):
+    receipt = await original_arm(*args)
+    live["sha"] = new_base
+    return receipt
+
+  monkeypatch.setattr(routes, "_arm_ready", arm_then_base_moves)
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert error.value.status_code == 409 and not dispatched
+  db.refresh(row)
+  assert "ready_attempt" not in row.outcomes_json[domain.key(ITEM)]
+  claim = db.query(models.AgentWorkClaim).filter_by(
+    work_key=domain.ready_work_key(row.targets_json[0])).one()
+  assert claim.released_at is not None
+
+  # /reviewers observes a proved descendant and freezes a fresh review on
+  # the new effective base; /observe is for uncertain public effects instead.
+  monkeypatch.setattr(delegations, "ensure_delegation_started", lambda *a, **kw: asyncio.sleep(0, result=True))
+  reviewed = asyncio.run(routes.start_independent_reviewer(
+    1, row.id, routes.PullIdentity(**ITEM), db, principal))
+  assert reviewed["run"]["items"][0]["current_base_sha"] == new_base
+  assert live["compares"] == [(BASE, new_base)]
+  previous = row.outcomes_json[domain.key(ITEM)]
+  domain.save_outcome(db, row, domain.key(ITEM), {**previous, "independent_reviews": [
+    *previous["independent_reviews"], {"id": "fresh-base-clear", "head_sha": SHA,
+      "base_sha": new_base, "state": "all_clear", "tests_passed": True}]})
+  monkeypatch.setattr(routes, "_arm_ready", original_arm)
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: dispatched.append(1) or
+    {"id": "PR_7", "isDraft": False, "headRefOid": SHA})
+  result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(
+    reviewed_base_sha=new_base, independent_receipt_id="fresh-base-clear"), db, principal))
+  assert dispatched == [1]
+  assert result["run"]["items"][0]["ready_attempt"]["state"] == "ready"
+
+
 def test_stop_waits_for_in_flight_ready_mutation_admission(setup, monkeypatch):
   from app import chat_queue
   from app.database import SessionLocal

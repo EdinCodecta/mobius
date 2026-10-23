@@ -134,8 +134,18 @@ conversation's durable Wait; these routes do not create automatic waits.
 `named_pr_repairs_ready_and_reviewed_successors` consent. The older repair
 scope does not acquire readiness authority. After fresh independent full-diff
 review and passing checks, the parent calls `/ready` with the exact head/base,
-independent receipt, full scope and test evidence. One final preflight and the
-shared Stop admission lock precede the single public attempt.
+independent receipt, full scope and test evidence. The final preflight runs
+inside the shared Stop admission lock immediately before the single public
+attempt, so an armed reservation cannot hide head or base drift.
+
+If the target base moves before dispatch, `/ready` refuses the mutation and
+releases its exact reservation; this is not an unknown public effect. For
+scoped takeover with the same head, call `/reviewers`: it can prove that the
+new base strictly descends from the reviewed base and freeze a fresh independent
+review of that effective head/base. After its new all-clear receipt and passing
+tests, `/ready` may be tried again under the same grant. Do not reuse old-base
+evidence or relax the exact-base check. `/observe` reconciles uncertain public
+effects; it does not adopt this pre-dispatch base advance.
 
 A validated mark-ready response confirms the saved PR/head immediately; a
 later Stop, actor or rights change cannot undo that fact. If the response is
