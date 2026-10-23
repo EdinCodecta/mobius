@@ -1,5 +1,6 @@
 // A guest's theme comes from the server each time; only the owner caches it.
 import { ownerStore } from './workspaceStorage.js'
+import { inferThemeMode } from '../theme.js'
 
 /**
  * Theme application library — the SINGLE source of truth for how a
@@ -120,15 +121,36 @@ export function resolveTheme({ doc = globalThis.document, store = ownerStore() }
 }
 
 /**
+ * The hex `--bg` the document's stylesheets resolve on <html>, or null (no
+ * hex value, or no CSSOM). Unregistered custom properties compute to their
+ * authored tokens, so a hex stays hex rather than becoming rgb().
+ */
+export function cascadeBg(doc = globalThis.document) {
+  try {
+    const view = doc.defaultView || globalThis
+    const value = view.getComputedStyle(doc.documentElement).getPropertyValue('--bg').trim()
+    return HEX_RE.test(value) ? value : null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Apply a theme to the DOM and persist it:
  *   - Strip `@import url(...)` from the CSS body and re-inject the safe
  *     (http/https only) ones as `<link data-theme-font>` so fonts load
  *     reliably (a `javascript:`/`data:` URL can't become a stylesheet).
  *   - Inject the remaining CSS into a single `<style id="mobius-theme">`
  *     re-appended to the END of <head> so it wins the cascade.
- *   - Mirror bg onto body.style.background, <meta theme-color>, the
- *     inline `--bg` on <html> (beats `:root{}`, keeps the pre-paint var
- *     in lockstep), and `color-scheme`/`data-theme` from the mode.
+ *   - Background: once a theme stylesheet is applied it owns `--bg`, so the
+ *     inline `--bg` hint (pre-paint) is removed and html/body paint
+ *     `var(--bg)`; <meta theme-color> and the persisted hint take the value
+ *     the cascade resolves (`cascadeBg`) once `data-theme` is set. The `bg`
+ *     argument is only a hint, used without css or when the cascade has no
+ *     hex --bg: it can be a guess (the server reads a plain :root --bg) and
+ *     must never outrank an owner background set in an html rule, a
+ *     condition or a layer.
+ *   - `color-scheme`/`data-theme` from the mode.
  *   - Persist `mobius-theme` ({bg,mode}), the sole key shared by
  *     resolveTheme and the pre-paint IIFE.
  *
@@ -142,9 +164,7 @@ export function applyTheme(theme, { doc = globalThis.document, store = ownerStor
   // --bg parsed out of the CSS body (so a css-only apply with no bg arg still
   // resolves a mode — this preserves the old themeService._inferThemeMode
   // css-parse fallback now that the shell delegates here).
-  const mode = (theme && theme.mode)
-    || inferMode(bg)
-    || inferMode(css.match(/--bg:\s*(#[0-9a-fA-F]{3,8})/)?.[1])
+  let mode = (theme && theme.mode) || inferMode(bg)
 
   if (css) {
     doc.querySelectorAll(`link[${FONT_LINK_ATTR}]`).forEach(l => l.remove())
@@ -181,12 +201,17 @@ export function applyTheme(theme, { doc = globalThis.document, store = ownerStor
     el.textContent = cssBody
   }
 
-  if (bg && HEX_RE.test(bg)) {
-    doc.documentElement.style.background = bg
-    if (doc.body) doc.body.style.background = bg
-    const meta = doc.querySelector('meta[name="theme-color"]')
-    setMetaContent(meta, bg)
-    doc.documentElement.style.setProperty('--bg', bg)
+  const hint = bg && HEX_RE.test(bg) ? bg : null
+  let resolvedBg = hint
+  if (themeStyleEl) {
+    doc.documentElement.style.removeProperty('--bg')
+    doc.documentElement.style.background = 'var(--bg)'
+    if (doc.body) doc.body.style.background = 'var(--bg)'
+    mode = mode || inferMode(cascadeBg(doc) || hint) || inferThemeMode(css)
+  } else if (hint) {
+    doc.documentElement.style.background = hint
+    if (doc.body) doc.body.style.background = hint
+    doc.documentElement.style.setProperty('--bg', hint)
   }
 
   if (mode) {
@@ -209,6 +234,13 @@ export function applyTheme(theme, { doc = globalThis.document, store = ownerStor
     setMetaContent(colorSchemeMeta, colorSchemeMetaContent(mode))
   }
 
+  // Read the final background only now: a theme may key --bg on the
+  // data-theme attribute just set (`:root[data-theme="light"] { --bg: … }`),
+  // and reading before the switch records the previous mode's colour in
+  // theme-color and the next-boot hint.
+  if (themeStyleEl) resolvedBg = cascadeBg(doc) || hint
+  if (resolvedBg) setMetaContent(doc.querySelector('meta[name="theme-color"]'), resolvedBg)
+
   if (themeStyleEl && doc.head) {
     // Creating/updating early paint meta tags must not break the long-standing
     // cascade contract: the injected owner theme remains the final <head>
@@ -220,9 +252,9 @@ export function applyTheme(theme, { doc = globalThis.document, store = ownerStor
   // and resolveTheme.
   // Persist only from the top-level shell — opaque app frames intentionally do not share
   // this store and must not clobber the shell-owned theme key.
-  if (bg && HEX_RE.test(bg) && (typeof window === 'undefined' || window.parent === window)) {
+  if (resolvedBg && (typeof window === 'undefined' || window.parent === window)) {
     try {
-      store.setItem(STORE_KEY, JSON.stringify({ bg, mode: mode || DEFAULT_MODE }))
+      store.setItem(STORE_KEY, JSON.stringify({ bg: resolvedBg, mode: mode || DEFAULT_MODE }))
     } catch {}
   }
 }
@@ -316,7 +348,10 @@ export const PREPAINT_SRC = `(function () {
       }
       el.textContent = css;
     }
-    root.style.setProperty('--bg', bg);
+    // The bg is a pre-style HINT. Once theme css is installed the stylesheet
+    // owns --bg; an inline value would outrank an owner background set in
+    // any rule (html, a condition, a layer), so only hint without css.
+    if (!css) root.style.setProperty('--bg', bg);
     root.setAttribute('data-theme', mode);
     root.style.colorScheme = mode;
     var themeColorMeta = document.querySelector('meta[name="theme-color"]');
