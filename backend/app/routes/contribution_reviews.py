@@ -1236,9 +1236,15 @@ async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
       # the actual mutation under that same lock, not merely its reservation.
       async with chat_queue.get_transition_lock(f"review-admission:{run_id}"):
         try:
+          # The original observation can go stale while the reservation is
+          # armed. Re-read the exact head, base and readiness immediately
+          # before the public effect, then recheck authority after the await.
+          await _ready_preflight(row, target, cwd)
           _parent(db, row, principal)
         except HTTPException as exc:
           result = DispatchResult.not_dispatched(str(exc.detail))
+        except (ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
+          result = DispatchResult.not_dispatched("Readiness preflight failed before dispatch.")
         else:
           result = await _dispatch_ready(target, cwd)
       if result.state == "not_dispatched":
