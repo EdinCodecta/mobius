@@ -5,7 +5,9 @@ import {
   deploymentKindLabel,
   platformActivationLabel,
   platformStatusFromApply,
+  platformPackageWarning,
   platformStatusUnavailable,
+  platformUpdateStall,
   platformUpdateStatusLabel,
   reviewedUpdateUsesContainerRebuild,
 } from '../platformUpdateState.js'
@@ -226,4 +228,102 @@ test('routine image replacement requires complete action evidence without extern
   }
   assert.equal(reviewedUpdateUsesContainerRebuild({ activation: { level: 'image_rebuild' } }), false)
   assert.equal(reviewedUpdateUsesContainerRebuild({ activation: { level: 'image_rebuild', required_actions: ['server_restart', 'image_rebuild'] } }), true)
+})
+
+test('a stalled update names how long and why, with the backend\'s actions', () => {
+  assert.equal(platformUpdateStall({ unfinished_update: { stage: 'resolve' } }), null)
+
+  const idle = platformUpdateStall({
+    unfinished_update: { stage: 'resolve', stalled: {
+      reason: 'resolver_idle', idle_hours: 31.6, actions: ['resume', 'retry', 'cancel'],
+    } },
+  })
+  assert.deepEqual(idle, {
+    message: 'Update paused for 32 h: resolver idle.', canResume: true, canRetry: true,
+  })
+
+  const blocked = platformUpdateStall({
+    restart_blocker: { packages: [{ name: 'claude-agent-sdk' }], blocking: true },
+    unfinished_update: { stage: 'finish', stalled: { reason: 'restart_blocked', idle_hours: 0, actions: [] } },
+  })
+  assert.match(blocked.message, /cannot restart into it \(needs claude-agent-sdk\)/)
+  assert.equal(blocked.canResume, false)
+  assert.equal(blocked.canRetry, false)
+})
+
+test('a refused restart for a finish that needs a new container points at replacing it', () => {
+  const platform = {
+    restart_blocker: { packages: [{ name: 'claude-agent-sdk' }], blocking: true },
+    unfinished_update: { stage: 'finish', action: 'replace', stalled: {
+      reason: 'restart_blocked', idle_hours: 0, actions: [],
+    } },
+  }
+  assert.equal(
+    platformUpdateStall(platform).message,
+    'Update paused: it needs a new container (needs claude-agent-sdk). Choose Finish update to replace this one.',
+  )
+  // The replacement under way is the progress: nothing is paused.
+  assert.equal(platformUpdateStall(platform, { state: 'replacing' }), null)
+  assert.notEqual(platformUpdateStall(platform, { state: 'succeeded' }), null)
+})
+
+test('packages behind the source warn, naming each one and the container update that fixes it', () => {
+  const platform = {
+    restart_blocker: {
+      origin: 'official_newer', blocking: false, fix: { action: 'replace_container', target_sha: 'c'.repeat(40) },
+      packages: [
+        { name: 'aiohttp', declared: '==3.13.0', installed: '3.12.1', kind: 'version', origin: 'official_newer' },
+        { name: 'pillow', declared: '==13.0', installed: '12.3', kind: 'version', origin: 'official_newer' },
+      ],
+    },
+  }
+  const warning = platformPackageWarning(platform)
+  assert.equal(warning.title, 'Container packages are behind the platform source')
+  assert.equal(
+    warning.message,
+    'Möbius keeps running on the installed versions until the container is updated: '
+      + 'aiohttp (source declares ==3.13.0, container has 3.12.1); pillow (source declares ==13.0, container has 12.3). '
+      + 'A container update (Finish update) installs them.',
+  )
+  // Nothing to warn about without a gap, or while the replacement runs.
+  assert.equal(platformPackageWarning({ restart_blocker: null }), null)
+  assert.equal(platformPackageWarning(platform, { state: 'replacing' }), null)
+  // A stall already names a refused restart's packages.
+  assert.equal(platformPackageWarning({
+    ...platform, unfinished_update: { stage: 'finish', stalled: { reason: 'restart_blocked' } },
+  }), null)
+})
+
+test('a local package gap names the commit to revert and an unverifiable line', () => {
+  const warning = platformPackageWarning({
+    restart_blocker: {
+      origin: 'local', blocking: false, fix: { action: 'revert_local_declaration', commit: 'abcdef1234567890' },
+      packages: [
+        { name: '-e ./local-package', declared: null, installed: null, kind: 'unsupported', origin: 'local' },
+        { name: 'extra', declared: '', installed: null, kind: 'missing', origin: 'local' },
+      ],
+    },
+  })
+  assert.match(warning.message, /-e \.\/local-package \(a declaration Möbius cannot verify\)/)
+  assert.match(warning.message, /extra \(source declares any version, container does not have it\)/)
+  assert.match(warning.message, /revert local commit abcdef123456, or update the container once that change is released/)
+  const uncommitted = platformPackageWarning({
+    restart_blocker: { origin: 'local', blocking: false, fix: { commit: null },
+      packages: [{ name: 'extra', declared: '==1', installed: null, kind: 'missing', origin: 'local' }] },
+  })
+  assert.match(uncommitted.message, /revert the uncommitted edit/)
+})
+
+test('a mixed gap with an uncommitted local edit still says to revert that edit', () => {
+  const warning = platformPackageWarning({
+    restart_blocker: {
+      origin: 'official_newer', blocking: false,
+      fix: { action: 'replace_container', target_sha: 'c'.repeat(40), commit: null },
+      packages: [
+        { name: 'aiohttp', declared: '==3.13.0', installed: '3.12.1', kind: 'version', origin: 'official_newer' },
+        { name: 'extra', declared: '==1', installed: null, kind: 'missing', origin: 'local' },
+      ],
+    },
+  })
+  assert.match(warning.message, /Some come from a local change; if the new container still lacks them, revert the uncommitted edit\./)
 })
