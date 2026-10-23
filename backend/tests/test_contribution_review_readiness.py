@@ -1,6 +1,7 @@
 """Draft readiness: explicit scope, shared admission and no replay."""
 import asyncio
 import json
+import subprocess
 import threading
 from types import SimpleNamespace
 import pytest
@@ -907,11 +908,51 @@ def test_ready_refuses_target_drift_after_arm_without_dispatch(setup, monkeypatc
   assert not dispatched
   assert calls["pull"] >= (2 if drift == "head" else 1)
   assert calls["base"] >= (2 if drift == "base" else 1)
+  if drift == "base":
+    assert "start a fresh independent reviewer through /reviewers" in error.value.detail
+    assert "retry /ready with its new all-clear receipt" in error.value.detail
   db.refresh(row)
   assert "ready_attempt" not in row.outcomes_json[domain.key(ITEM)]
   claim = db.query(models.AgentWorkClaim).filter_by(
     work_key=domain.ready_work_key(row.targets_json[0])).one()
   assert claim.released_at is not None
+
+
+
+def test_ready_transient_in_lock_read_disarms_only_its_unspent_attempt(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  armed = []
+  dispatched = []
+  reads = []
+  original_arm = routes._arm_ready
+
+  async def capture_arm(*args):
+    receipt = await original_arm(*args)
+    armed.append(dict(receipt))
+    return receipt
+
+  def pull(*args):
+    reads.append(1)
+    if len(reads) == 2:
+      raise subprocess.TimeoutExpired("gh", 1)
+    return REPO, {**PULL, "draft": True}
+
+  monkeypatch.setattr(routes, "_arm_ready", capture_arm)
+  monkeypatch.setattr(domain, "current_pull", pull)
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: dispatched.append(1))
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert error.value.status_code == 409
+  assert error.value.detail == "Readiness preflight failed before dispatch."
+  assert len(reads) == 2 and len(armed) == 1 and not dispatched
+  db.refresh(row)
+  outcome = row.outcomes_json[domain.key(ITEM)]
+  assert "ready_attempt" not in outcome
+  assert outcome["ready_audit"][-1] == {
+    "id": armed[0]["id"], "head_sha": SHA, "state": "not_dispatched"}
+  claim = db.query(models.AgentWorkClaim).filter_by(
+    work_key=domain.ready_work_key(row.targets_json[0])).one()
+  assert claim.owner_chat_id == row.chat_id and claim.released_at is not None
 
 
 def test_disarmed_base_drift_can_advance_and_retry_after_fresh_review(setup, monkeypatch):

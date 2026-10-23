@@ -1261,7 +1261,12 @@ async def _ready_preflight(row, target, cwd):
   if str(actor.get("id") or "") != row.github_actor_id:
     raise HTTPException(409, "The connected GitHub actor changed. Approve a new selection.")
   repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
-  await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
+  try:
+    await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
+  except HTTPException as exc:
+    raise HTTPException(exc.status_code, f"{exc.detail} If the target base advanced, start a fresh "
+      "independent reviewer through /reviewers to record the proved base advance, then retry "
+      "/ready with its new all-clear receipt.") from exc
   checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
   blocker = reviews.readiness_blocker(target, repo, pull, checks)
   if blocker:
