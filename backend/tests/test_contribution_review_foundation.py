@@ -12,7 +12,7 @@ from app.routes import contribution_reviews as routes
 from tests.test_contribution_review_runs import ITEM, CHECKS, REPO, PULL, TARGET, setup, report
 from scripts import github_review as cli
 from scripts.github_review_selection import review_path, start_body, verify_selection
-from app.contribution_review_effects import classify_dispatch_error
+from app.contribution_review_effects import NotDispatched, classify_dispatch_error, graphql_mutation_result
 from app.contribution_errors import ContributionSubmitError
 
 
@@ -287,7 +287,6 @@ def test_definite_github_merge_rejection_is_not_unknown(setup, monkeypatch):
 
 def test_real_gh_graphql_no_data_rejection_is_definite(tmp_path, monkeypatch):
   from app import github_contribution_git as transport
-  from app.contribution_review_effects import NotDispatched
   fake_bin = tmp_path / "bin"
   fake_bin.mkdir()
   fake = fake_bin / "gh"
@@ -296,6 +295,28 @@ def test_real_gh_graphql_no_data_rejection_is_definite(tmp_path, monkeypatch):
   monkeypatch.setattr(transport, "_git_env", lambda _cwd: {"PATH": str(fake_bin) + ":/usr/bin:/bin"})
   with pytest.raises(NotDispatched):
     domain.enqueue(transport._gh, tmp_path, TARGET)
+
+
+@pytest.mark.parametrize("payload", [
+  {"errors": "garbled", "data": None},
+  {"errors": [], "data": None},
+  {"errors": [{}], "data": None},
+  {"errors": [{"message": ""}], "data": None},
+  {"errors": [{"message": "rejected"}], "data": []},
+])
+def test_malformed_graphql_response_never_certifies_no_effect(payload):
+  from types import SimpleNamespace
+  import json
+  response = SimpleNamespace(stdout=json.dumps(payload), stderr="", returncode=1)
+  with pytest.raises(ContributionSubmitError):
+    graphql_mutation_result(response)
+
+
+def test_valid_graphql_no_data_error_certifies_refusal():
+  from types import SimpleNamespace
+  response = SimpleNamespace(stdout='{"errors":[{"message":"rejected"}],"data":null}', stderr="", returncode=1)
+  with pytest.raises(NotDispatched):
+    graphql_mutation_result(response)
 
 
 @pytest.mark.parametrize("nonce_nullable", [False, True])
