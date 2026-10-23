@@ -181,3 +181,39 @@ def test_provider_refusal_releases_only_own_public_attempt_for_retry(setup, monk
   final = row.outcomes_json[domain.key(ITEM)]['public_review']
   assert final['state'] == 'posted' and final['id'] == 77
   assert final['marker'] != first['marker'] and len(calls) == 2
+
+
+def test_moved_head_keeps_reported_verdict_but_blocks_public_post(setup, monkeypatch):
+  db, row, _ = setup
+  opted_in(setup)
+  def moved(*args):
+    raise HTTPException(409, 'The selected head moved; approve a new selection.')
+  monkeypatch.setattr(domain, 'current_pull', moved)
+  monkeypatch.setattr(public, 'post_review', lambda *args: pytest.fail('stale head must not post'))
+  result = report(setup)['run']
+  item = result['items'][0]
+  assert item['state'] == 'all_clear' and item['summary'] == 'Full diff reviewed'
+  assert item['public_review']['state'] == 'not_dispatched'
+  assert 'head moved' in item['live_blocker'] and result['state'] == 'needs_you'
+
+
+def test_stop_during_account_lookup_refuses_even_account_changed_path(setup, monkeypatch):
+  from app import models
+  from app.database import SessionLocal
+  db, row, _ = setup
+  opted_in(setup)
+  def actor(*args):
+    other = SessionLocal()
+    try:
+      live = other.get(models.ContributionReviewRun, row.id)
+      domain.save_outcome(other, live, routes.REVIEW_STOP_KEY, {'state': 'requested'})
+    finally:
+      other.close()
+    return {'id': 99}
+  monkeypatch.setattr(domain, 'read', actor)
+  monkeypatch.setattr(public, 'post_review', lambda *args: pytest.fail('must not post after Stop'))
+  with pytest.raises(HTTPException) as error:
+    report(setup)
+  assert error.value.status_code == 409
+  db.refresh(row)
+  assert domain.key(ITEM) not in row.outcomes_json
