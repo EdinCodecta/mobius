@@ -37,8 +37,7 @@ def test_not_dispatched_all_clear_retries_only_recorded_evidence(setup, monkeypa
   with pytest.raises(HTTPException) as exc:
     report(setup, summary='changed evidence')
   assert exc.value.status_code == 409
-  # Publishing retries are checked at the writer-fenced admission boundary,
-  # not by a duplicate route guard.
+  # Publishing retries also preserve the recorded all-clear.
   with pytest.raises(HTTPException) as exc:
     report(setup, publish=True, summary='changed evidence')
   assert exc.value.status_code == 409
@@ -223,3 +222,35 @@ def test_stop_during_account_lookup_refuses_even_account_changed_path(setup, mon
   assert error.value.status_code == 409
   db.refresh(row)
   assert domain.key(ITEM) not in row.outcomes_json
+
+
+def test_failed_live_read_cannot_replace_refused_public_all_clear(setup, monkeypatch):
+  from copy import deepcopy
+  db, row, _ = setup
+  opted_in(setup)
+  monkeypatch.setattr(domain, 'read', lambda *a: {'id': 99})
+  report(setup, publish=True)
+  saved = deepcopy(row.outcomes_json[domain.key(ITEM)])
+  assert saved['state'] == 'all_clear'
+  assert saved['public_review']['state'] == 'not_dispatched'
+  current_pull = domain.current_pull
+  monkeypatch.setattr(domain, 'current_pull', lambda *a: (_ for _ in ()).throw(
+    HTTPException(409, 'Live PR read unavailable')))
+  calls = []
+  monkeypatch.setattr(public, 'post_review', lambda *a: calls.append(a) or public.DispatchResult.confirmed({'id': 1}))
+  changed = {'publish': True, 'state': 'needs_you', 'summary': 'Changed verdict'}
+  with pytest.raises(HTTPException) as error:
+    report(setup, **changed)
+  assert error.value.status_code == 409
+  db.refresh(row)
+  assert row.outcomes_json[domain.key(ITEM)] == saved
+  monkeypatch.setattr(domain, 'current_pull', current_pull)
+  monkeypatch.setattr(domain, 'read', lambda *a: {'id': 42})
+  with pytest.raises(HTTPException) as error:
+    report(setup, **changed)
+  assert error.value.status_code == 409
+  assert row.outcomes_json[domain.key(ITEM)] == saved
+  assert calls == []
+  report(setup, publish=True)
+  assert len(calls) == 1
+  assert row.outcomes_json[domain.key(ITEM)]['summary'] == 'Full diff reviewed'
