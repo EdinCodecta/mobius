@@ -87,7 +87,7 @@ def freeze_preview(selection, options=None, agent=None, *, allow_mark_ready=Fals
   if allow_mark_ready and selection["mode"] != "review_fix_merge":
     raise ValueError("Mark-ready permission requires review_fix_merge.")
   preview = api(review_path(selection.get("app_id"), "/review-preview"), method="POST",
-                data={"options": options, "agent": agent})
+                data={"mode": selection["mode"], "options": options, "agent": agent})
   snapshot = preview["options"]
   if not re.fullmatch(r"[0-9a-f]{64}", preview["preview_sha256"]) or not snapshot.get("model"):
     raise ValueError("The platform did not return a complete frozen prompt/model preview.")

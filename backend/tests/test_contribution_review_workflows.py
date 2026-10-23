@@ -106,7 +106,7 @@ def test_uncapped_preview_admission_and_retry_freeze_the_same_hash(setup, monkey
     db.commit()
     return True
   monkeypatch.setattr(routes, "start_programmatic_chat_turn", admit)
-  preview = routes.review_preview(1, routes.ReviewPreview(options=options), db, owner)
+  preview = routes.review_preview(1, routes.ReviewPreview(mode="review_fix_merge", options=options), db, owner)
   assert preview["options"]["max_rounds"] is None
   body = routes.StartReviews(request_id="uncapped-123", mode="review_fix_merge", items=[ITEM],
     options=options, confirmation_scope="named_pr_repairs_and_reviewed_successors",
@@ -126,8 +126,8 @@ def test_uncapped_preview_admission_and_retry_freeze_the_same_hash(setup, monkey
 @pytest.mark.parametrize("options, expected", [({}, None), ({"max_rounds": None}, None),
   ({"max_rounds": 2}, 2), ({"max_rounds": 21}, 21)])
 def test_request_round_limit_matches_resolver(options, expected):
-  body = routes.ReviewPreview(options=options)
-  assert routes._options_input(body)["max_rounds"] == expected
+  body = routes.ReviewPreview(mode="review_fix_merge", options=options)
+  assert routes._options_input(body).get("max_rounds") == expected
 
 
 @pytest.mark.parametrize("limit", [True, False, 0, -1, "5", 2.0])
@@ -213,7 +213,7 @@ def test_brief_reads_frozen_limit_without_widening_historical_grants(setup, opti
   assert row.options_json == options
 
 
-def test_legacy_default_limit_retry_keeps_frozen_hash_and_rejects_explicit_uncapping(setup, monkeypatch):
+def test_legacy_default_limit_is_not_reconstructed_from_new_omission(setup, monkeypatch):
   db, row, principal = setup
   owner = Principal(owner=principal.owner, app_id=None)
   row.options_json = {"max_rounds": 5, "input_options": {"review_prompt": "Frozen", "max_rounds": 5, "autopilot": False},
@@ -223,12 +223,14 @@ def test_legacy_default_limit_retry_keeps_frozen_hash_and_rejects_explicit_uncap
   monkeypatch.setattr(routes, "_snapshot", lambda *a: pytest.fail("old retry must not resolve current defaults"))
   body = routes.StartReviews(request_id=row.request_id, mode=row.mode, items=[ITEM],
     options={"review_prompt": "Frozen"}, preview_sha256=frozen["preview_sha256"])
-  assert asyncio.run(routes.start_reviews(1, body, db, owner))["run"]["options"] == frozen
+  with pytest.raises(HTTPException) as omitted:
+    asyncio.run(routes.start_reviews(1, body, db, owner))
+  assert omitted.value.status_code == 409
   for options in [{"review_prompt": "Frozen", "max_rounds": None}, {"review_prompt": "Frozen", "max_rounds": 21}]:
     changed = body.model_copy(update={"options": routes.ReviewOptions(**options)})
     with pytest.raises(HTTPException) as error:
       asyncio.run(routes.start_reviews(1, changed, db, owner))
-    assert error.value.status_code == 409
+    assert error.value.status_code == 422
   assert row.options_json == frozen
 
 
@@ -236,13 +238,15 @@ def test_legacy_default_limit_retry_keeps_frozen_hash_and_rejects_explicit_uncap
 def test_saved_explicit_finite_retry_keeps_hash_and_cannot_omit_or_uncap_limit(setup, monkeypatch, limit):
   db, row, principal = setup
   owner = Principal(owner=principal.owner, app_id=None)
-  row.options_json = {"max_rounds": limit, "input_options": {"max_rounds": limit, "autopilot": False},
-    "input_agent": None, "confirmation_scope": None, "preview_sha256": "d" * 64}
+  row.mode = "review_fix_merge"
+  row.options_json = {"max_rounds": limit, "input_options": {"max_rounds": limit},
+    "input_agent": None, "confirmation_scope": "named_pr_repairs_and_reviewed_successors", "preview_sha256": "d" * 64}
   db.commit()
   frozen = dict(row.options_json)
   monkeypatch.setattr(routes, "_snapshot", lambda *a: pytest.fail("frozen retry must not resolve"))
   body = routes.StartReviews(request_id=row.request_id, mode=row.mode, items=[ITEM],
-    options={"max_rounds": limit}, preview_sha256=frozen["preview_sha256"])
+    options={"max_rounds": limit}, preview_sha256=frozen["preview_sha256"],
+    confirmation_scope="named_pr_repairs_and_reviewed_successors")
   assert asyncio.run(routes.start_reviews(1, body, db, owner))["run"]["options"] == frozen
   for options in [{}, {"max_rounds": None}]:
     changed = body.model_copy(update={"options": routes.ReviewOptions(**options)})
