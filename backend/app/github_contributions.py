@@ -255,50 +255,75 @@ def _publication_never_attempted(
   ``_bound_attempt_claimed``: the ledger's claim digest matches the bound
   fields with ``submitting`` and this or the ledger's submitter.
   """
+  return all(
+    _row_never_attempted(
+      app_id, record, expected.get(str(record.get("id") or "")),
+      phase_actions=phase_actions, submitter=submitter,
+    )
+    for record in records
+  )
+
+
+def _row_never_attempted(
+  app_id: int, record: dict, confirmed: object, *,
+  phase_actions: frozenset[str], submitter: str,
+) -> bool:
+  """One row of ``_publication_never_attempted``'s table."""
+  confirmed = confirmed if isinstance(confirmed, dict) else {}
+  status = record.get("status")
+  if status == "submitting" or (
+    confirmed.get("status") in {"prepared", "submitting"}
+    and status != "prepared"
+  ):
+    return False
+  bound_attempt = _bound_attempt_claimed(record, confirmed, submitter)
+  if status in _PUBLIC_PUBLICATION_STATUSES:
+    certified = not bound_attempt and _binds_public_pr(confirmed, record)
+  elif status != "prepared":
+    certified = False
+  else:
+    certified = not _phase_push_seen(
+      record, confirmed, phase_actions, bound_attempt=bound_attempt,
+    )
+  return certified and not _attempt_artifacts_exist(
+    app_id, str(record.get("id") or ""),
+  )
+
+
+def _phase_push_seen(
+  record: dict, confirmed: dict, phase_actions: frozenset[str], *,
+  bound_attempt: bool,
+) -> bool:
+  """Whether a prepared row in this phase shows a push of its reviewed head
+  that this operation could have made. Other-phase rows are untouched."""
+  if not (
+    _claims_publication_phase(record, phase_actions)
+    or _plan_value(confirmed, "action") in phase_actions
+  ):
+    return False
+  heads = {
+    _plan_value(proposal, "head_sha").lower() for proposal in (confirmed, record)
+  } - {""}
+  pushed = str(record.get("last_submit_push_sha") or "").strip().lower()
+  return bool(pushed) and pushed in heads and (
+    "pr" in {_plan_value(record, "action"), _plan_value(confirmed, "action")}
+    or bound_attempt
+    or record.get("last_submit_stage") in _UNSETTLED_PUSH_STAGES
+  )
+
+
+def _attempt_artifacts_exist(app_id: int, record_id: str) -> bool:
+  """Any attempt or relay artifact, or failing to check, withholds."""
   from app import contribution_runtime
 
-  for record in records:
-    record_id = str(record.get("id") or "")
-    confirmed = expected.get(record_id)
-    confirmed = confirmed if isinstance(confirmed, dict) else {}
-    status = record.get("status")
-    if status == "submitting" or (
-      confirmed.get("status") in {"prepared", "submitting"}
-      and status != "prepared"
-    ):
-      return False
-    bound_attempt = _bound_attempt_claimed(record, confirmed, submitter)
-    if status in _PUBLIC_PUBLICATION_STATUSES:
-      if bound_attempt or not _binds_public_pr(confirmed, record):
-        return False
-    elif status != "prepared":
-      return False
-    elif (
-      _claims_publication_phase(record, phase_actions)
-      or _plan_value(confirmed, "action") in phase_actions
-    ):
-      heads = {
-        _plan_value(proposal, "head_sha").lower()
-        for proposal in (confirmed, record)
-      } - {""}
-      pushed = str(record.get("last_submit_push_sha") or "").strip().lower()
-      if pushed and pushed in heads and (
-        "pr" in {_plan_value(record, "action"), _plan_value(confirmed, "action")}
-        or bound_attempt
-        or record.get("last_submit_stage") in _UNSETTLED_PUSH_STAGES
-      ):
-        return False
-    try:
-      paths = (
-        contribution_runtime.personal_attempt_path(app_id, record_id),
-        contribution_runtime.relay_claim_path(app_id, record_id),
-        contribution_runtime.relay_request_path(app_id, record_id),
-      )
-      if any(path.exists() for path in paths):
-        return False
-    except (OSError, ValueError):
-      return False
-  return True
+  try:
+    return any(path.exists() for path in (
+      contribution_runtime.personal_attempt_path(app_id, record_id),
+      contribution_runtime.relay_claim_path(app_id, record_id),
+      contribution_runtime.relay_request_path(app_id, record_id),
+    ))
+  except (OSError, ValueError):
+    return True
 
 
 def confirmed_publication_records(
