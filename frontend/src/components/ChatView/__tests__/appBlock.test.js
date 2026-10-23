@@ -98,7 +98,7 @@ test('fact links use the shared policy, HTTPS without credentials only', () => {
 
 test('an app may name its expand control, bounded and optional', () => {
   assert.equal(appBlockFromToken(token({ ...base, expand_label: '  Review here  ' })).expandLabel, 'Review here')
-  assert.equal(appBlockFromToken(token({ ...base, expand_label: 'x'.repeat(90) })).expandLabel.length, 40)
+  assert.equal(appBlockFromToken(token({ ...base, expand_label: 'x'.repeat(90) })).expandLabel, '', 'over-limit falls back, never shortened')
   assert.equal(appBlockFromToken(token({ ...base, expand_label: 7 })).expandLabel, '')
 })
 
@@ -138,4 +138,35 @@ test('repeated item destinations and badge labels collapse to their first entry'
   assert.deepEqual(block.items.map(item => item.title), ['Same', 'Next'])
   assert.deepEqual(block.items[0].badges, [{ label: 'Dup', tone: 'success' }, { label: 'Other', tone: 'neutral' }])
   assert.deepEqual(block.badges.map(badge => badge.label), ['A', 'B', 'C'])
+})
+
+test('over-limit fact, badge and action text is dropped, never truncated', () => {
+  const block = appBlockFromToken(token({ ...base,
+    facts: [{ label: 'L'.repeat(81), value: 'x' }, { label: 'Value', value: 'v'.repeat(241) }, { label: 'Kept', value: 'v'.repeat(240) }],
+    badges: [{ label: 'b'.repeat(41) }, { label: 'Kept' }],
+    action: { label: 'a'.repeat(41), intent: 'send:1' } }))
+  assert.deepEqual(block.facts, [{ label: 'Kept', value: 'v'.repeat(240) }])
+  assert.deepEqual(block.badges, [{ label: 'Kept', tone: 'neutral' }])
+  assert.equal(block.action, null)
+})
+
+test('a malformed block never throws; wrong-typed fields fall back to a code block or are dropped', () => {
+  const hostile = [{ toString: null }, { toString: null, valueOf: null }, ['pages'], null, 7, true, {}, []]
+  const fields = ['app', 'intent', 'title', 'height', 'inline', 'interaction', 'expand_label', 'facts', 'badges', 'items', 'action']
+  for (const bad of hostile) {
+    for (const field of fields) {
+      const value = { ...base, [field]: bad }
+      assert.doesNotThrow(() => appBlockFromToken(token(value)), `${field}: ${JSON.stringify(bad)}`)
+      for (const nested of [
+        { facts: [{ label: bad, value: bad, href: bad }] }, { badges: [{ label: bad, tone: bad }], items: [bad] },
+        { items: [{ title: bad, intent: bad, facts: bad, badges: bad, action: bad }] }, { action: { label: bad, intent: bad } },
+      ]) assert.doesNotThrow(() => appBlockFromToken(token({ ...base, ...nested })), JSON.stringify(nested))
+    }
+    for (const required of ['app', 'intent', 'title']) {
+      assert.equal(appBlockFromToken(token({ ...base, [required]: bad })), null, `${required} ${JSON.stringify(bad)} stays code`)
+    }
+    if (typeof bad !== 'number') assert.equal(appBlockFromToken(token({ ...base, height: bad })).height, 480)
+  }
+  assert.equal(appBlockFromToken(token({ ...base, app: ['example'] })), null, 'an array app is not a slug')
+  assert.equal(appBlockFromToken(token({ ...base, height: 300 })).height, 300)
 })
