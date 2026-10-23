@@ -290,7 +290,7 @@ def test_real_gh_graphql_no_data_rejection_is_definite(tmp_path, monkeypatch):
   fake_bin = tmp_path / "bin"
   fake_bin.mkdir()
   fake = fake_bin / "gh"
-  fake.write_text("#!/bin/sh\necho '{\"errors\":[{\"message\":\"not queueable\"}],\"data\":null}'\nexit 1\n")
+  fake.write_text("#!/bin/sh\necho '{\"errors\":[{\"type\":\"UNPROCESSABLE\",\"message\":\"not queueable\"}],\"data\":null}'\nexit 1\n")
   fake.chmod(0o755)
   monkeypatch.setattr(transport, "_git_env", lambda _cwd: {"PATH": str(fake_bin) + ":/usr/bin:/bin"})
   with pytest.raises(NotDispatched):
@@ -314,9 +314,48 @@ def test_malformed_graphql_response_never_certifies_no_effect(payload):
 
 def test_valid_graphql_no_data_error_certifies_refusal():
   from types import SimpleNamespace
-  response = SimpleNamespace(stdout='{"errors":[{"message":"rejected"}],"data":null}', stderr="", returncode=1)
+  response = SimpleNamespace(stdout='{"errors":[{"type":"UNPROCESSABLE","message":"rejected"}],"data":null}', stderr="", returncode=1)
   with pytest.raises(NotDispatched):
     graphql_mutation_result(response)
+
+
+@pytest.mark.parametrize("types,stderr,expected", [
+  (["FORBIDDEN"], "", "not_dispatched"),
+  (["NOT_FOUND"], "gh: HTTP 404: missing", "not_dispatched"),
+  (["UNPROCESSABLE"], "gh: request rejected (HTTP 422)", "not_dispatched"),
+  (["FORBIDDEN"], "gh: HTTP 200: GraphQL error", "not_dispatched"),
+  ([None], "", "unknown"),
+  (["TIMEOUT"], "", "unknown"),
+  (["INTERNAL"], "gh: HTTP 503: upstream failed", "unknown"),
+  (["FORBIDDEN"], "gh: HTTP 503: upstream failed", "unknown"),
+  (["FORBIDDEN"], "gh: HTTP 408: timed out", "unknown"),
+  (["FORBIDDEN"], "gh: HTTP 429: rate limited", "unknown"),
+  (["FORBIDDEN", "INTERNAL"], "", "unknown"),
+])
+def test_graphql_no_data_requires_known_refusal_and_safe_status(types, stderr, expected):
+  from types import SimpleNamespace
+  import json
+  errors = [{"message": "GitHub message", **({"type": kind} if kind else {})} for kind in types]
+  response = SimpleNamespace(stdout=json.dumps({"errors": errors, "data": None}), stderr=stderr, returncode=1)
+  try:
+    graphql_mutation_result(response)
+  except Exception as exc:
+    assert classify_dispatch_error(exc).state == expected
+  else:
+    pytest.fail("An error response must not be treated as success")
+
+
+def test_real_gh_graphql_5xx_no_data_remains_unknown(tmp_path, monkeypatch):
+  from app import github_contribution_git as transport
+  fake_bin = tmp_path / "bin"
+  fake_bin.mkdir()
+  fake = fake_bin / "gh"
+  fake.write_text("#!/bin/sh\necho '{\"errors\":[{\"type\":\"INTERNAL\",\"message\":\"may be timeout\"}],\"data\":null}'\necho 'gh: HTTP 503: unavailable' >&2\nexit 1\n")
+  fake.chmod(0o755)
+  monkeypatch.setattr(transport, "_git_env", lambda _cwd: {"PATH": str(fake_bin) + ":/usr/bin:/bin"})
+  with pytest.raises(ContributionSubmitError) as uncertain:
+    domain.enqueue(transport._gh, tmp_path, TARGET)
+  assert classify_dispatch_error(uncertain.value).state == "unknown"
 
 
 @pytest.mark.parametrize("nonce_nullable", [False, True])
