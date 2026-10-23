@@ -2259,7 +2259,10 @@ async def contribution_source_chats(
 # ``settle_chat_changes.py`` exits 1 on any HTTP error, and an already-loaded
 # shell still has the old Changes actions. Keep this facade, with the same
 # authentication and app scope as the removed routes, until supported
-# Contribute releases no longer call it; then remove it separately.
+# Contribute releases no longer call it; then remove it separately. That
+# cleanup can also delete each Contribute install's old
+# ``/data/apps/<id>/chat-settlements/*.json`` documents: nothing reads them
+# since Changes stopped projecting settlements.
 _RETIRED_CHAT_WORK_NOTICE = (
   "Chat Changes is now informational: it lists a chat's source edits and no "
   "longer prepares, sends, stops or settles contribution work. Nothing was "

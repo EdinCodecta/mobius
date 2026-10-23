@@ -283,7 +283,8 @@ def test_source_only_activity_uses_the_derived_status_terminal_contract(
     "consumption": "unknown",
     "display_position": None,
   }
-  assert events["helper-source-fake-terminal"]["status"] == "starting"
+  # Retired source work settled without a run keeps its stored outcome.
+  assert events["helper-source-fake-terminal"]["status"] == "completed"
 
 
 def test_activity_route_requires_exact_chat_access_and_valid_cursor(
@@ -396,4 +397,31 @@ def test_unstarted_retired_source_work_settles_on_startup_repair(db):
     "helper-retired-retrying": "needs_review",
   }
   # Idempotent: a second repair pass changes nothing.
+  assert delegations.retire_unstarted_source_work(db) == 0
+
+
+def test_retired_source_work_completed_without_start_stays_settled(db):
+  """The old reconciler's no-run "completed" is history, not a working helper."""
+  from app import chat_activity, delegations
+
+  stamp = datetime(2026, 9, 9, 3, 40)
+  db.add(create_chat(id="retired-done-parent", title="Source", messages=[]))
+  _helper(
+    db,
+    suffix="retired-done",
+    parent_chat_id="retired-done-parent",
+    created_at=stamp,
+    attached_source_work_id="retired-done-work",
+    child_status=None,
+    source_work_status="completed",
+  )
+  db.commit()
+  row = db.get(models.Delegation, "helper-retired-done")
+
+  assert delegations.derived_status(db, row)[0] == "completed"
+  assert delegations.active_delegation_ids_for_app(db, row.app_id) == []
+  page = chat_activity.chat_activity_page(db, "retired-done-parent")
+  event = page["events"][0]
+  assert (event["status"], event["delegation_id"]) == ("completed", "helper-retired-done")
+  # Startup repair leaves a settled outcome alone.
   assert delegations.retire_unstarted_source_work(db) == 0
