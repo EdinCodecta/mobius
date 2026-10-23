@@ -26,16 +26,22 @@ export const appIntent = value => typeof value === 'string' && INTENT.test(value
 export const shortText = (value, max) => typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : ''
 export const appBlockHref = (app, intent) => `/shell/?${new URLSearchParams({ app, intent })}`
 
+// The first entry wins for a repeated key, so rendered rows stay distinct.
+const firstBy = key => (item, index, list) => list.findIndex(other => key(other) === key(item)) === index
+
 export function blockBadges(value) {
   return (Array.isArray(value) ? value : [])
-    .filter(badge => shortText(badge?.label, APP_BLOCK_LIMITS.badgeLabel)).slice(0, APP_BLOCK_LIMITS.badges)
+    .filter(badge => shortText(badge?.label, APP_BLOCK_LIMITS.badgeLabel))
+    .filter(firstBy(badge => shortText(badge.label, APP_BLOCK_LIMITS.badgeLabel))).slice(0, APP_BLOCK_LIMITS.badges)
     .map(badge => ({ label: shortText(badge.label, APP_BLOCK_LIMITS.badgeLabel),
       tone: BADGE_TONES.has(badge.tone) ? badge.tone : 'neutral' }))
 }
 
 function blockFacts(value, max) {
-  return (Array.isArray(value) ? value : []).slice(0, max)
+  // Filter before bounding, so an invalid fact never takes a valid one's slot.
+  return (Array.isArray(value) ? value : [])
     .filter(fact => shortText(fact?.label, APP_BLOCK_LIMITS.factLabel) && typeof fact.value === 'string')
+    .slice(0, max)
     .map(fact => {
       // An unsafe source link stays plain snapshot text.
       const href = safeSourceUrl(fact.href, { httpsOnly: true })
@@ -50,8 +56,12 @@ function blockAction(raw) {
   return label && intent ? { label, intent } : null
 }
 
+// A title is identity, so it is validated like the root title: an over-limit
+// title drops its item rather than being shortened.
+const blockTitle = value => typeof value === 'string' && value.length <= APP_BLOCK_LIMITS.title ? value.trim() : ''
+
 function blockItem(raw, app, inline) {
-  const title = shortText(raw?.title, APP_BLOCK_LIMITS.title)
+  const title = blockTitle(raw?.title)
   const intent = appIntent(raw?.intent)
   if (!title || !intent) return null
   return { title, intent, href: appBlockHref(app, intent),
@@ -67,8 +77,7 @@ export function appBlockFromToken(token) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const app = APP_SLUG.test(value.app || '') ? value.app : null
   const intent = appIntent(value.intent)
-  const title = typeof value.title === 'string' && value.title.length <= APP_BLOCK_LIMITS.title
-    ? value.title.trim() : ''
+  const title = blockTitle(value.title)
   if (!app || !intent || !title) return null
   const inline = value.inline !== false
   return {
@@ -80,7 +89,8 @@ export function appBlockFromToken(token) {
     badges: blockBadges(value.badges),
     // Invalid items and actions are dropped; they never widen another field.
     items: (Array.isArray(value.items) ? value.items : [])
-      .map(item => blockItem(item, app, inline)).filter(Boolean).slice(0, APP_BLOCK_LIMITS.items),
+      .map(item => blockItem(item, app, inline)).filter(Boolean).filter(firstBy(item => item.intent))
+      .slice(0, APP_BLOCK_LIMITS.items),
     // An action only opens the app's own view with its intent.
     action: inline ? blockAction(value.action) : null,
     expandLabel: shortText(value.expand_label, APP_BLOCK_LIMITS.expandLabel),

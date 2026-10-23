@@ -446,12 +446,18 @@ most 16384.
   `action` `{label (40), intent}`; `inline` (default `true`; `false` is a
   link-only snapshot without actions); `expand_label` (40); `height` (240-640,
   default 480). `href` is kept only for an uncredentialed `https:` URL. An
-  invalid item or action is dropped; every intent field has the same bound.
+  invalid fact, item or action is dropped, never truncated: an item title
+  follows the root rule (1-240), and invalid facts don't use up the 8 slots.
+  Every intent field has the same bound. A repeated item intent or badge
+  label keeps only its first entry.
 - Every block links to `/shell/?app=<slug>&intent=<intent>`, and each item to
   its own intent. Nothing app-owned runs until the reader clicks the expand
   control or an action; the app's ordinary view then opens in the transcript
   with that one intent. That embedded view may open a chat or an app, nothing
-  else. If the app is not installed, the block keeps its snapshot and says so.
+  else, and never restores or overwrites the app's saved place in the shell.
+  If the app is not installed, the block keeps its snapshot and says so.
+- Every block is captioned "From this conversation": its title, facts and
+  badges are the agent's words, not status the app verified.
 - To act on many records, put a short app-owned handle in the intent (for
   example `send-batch:sel-7f3a`) and resolve it in the app to the exact
   records it names. A twelve-id list does not fit the 256-character payload.

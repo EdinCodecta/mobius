@@ -32,8 +32,8 @@ export function AppLink({ href, onInternalNav, className, children }) {
 
 export function Badges({ badges }) {
   if (!badges.length) return null
-  return <span className="md-app-block__badges">{badges.map(badge =>
-    <span key={badge.label} className={`md-app-block__badge is-${badge.tone}`}>{badge.label}</span>)}</span>
+  return <span className="md-app-block__badges">{badges.map((badge, i) =>
+    <span key={i} className={`md-app-block__badge is-${badge.tone}`}>{badge.label}</span>)}</span>
 }
 
 export function Facts({ facts }) {
@@ -52,7 +52,7 @@ export function UnavailableNotice({ slug, loading }) {
 
 export function BlockItems({ items, onInternalNav, actionFor }) {
   if (!items.length) return null
-  return <ul className="md-app-block__items">{items.map(item => <li key={item.intent}>
+  return <ul className="md-app-block__items">{items.map((item, i) => <li key={i}>
     <div className="md-app-block__item-main">
       <AppLink className="md-app-block__item-title" href={item.href} onInternalNav={onInternalNav}>{item.title}</AppLink>
       <Badges badges={item.badges} />
@@ -90,6 +90,7 @@ export function AppBlockLayout({ block, app, appsLoading, onInternalNav, actionF
       <AppLink className="md-app-block__open" href={block.href} onInternalNav={onInternalNav}>
         Open{app ? ` in ${app.name}` : ''}<ChevronRight width={16} height={16} aria-hidden="true" /></AppLink>
     </header>
+    <p className="md-app-block__source">From this conversation</p>
     {summary ? <p className="md-app-block__summary" role="status">{summary}</p> : null}
     <Facts facts={block.facts} />
     <BlockItems items={block.items} onInternalNav={onInternalNav} actionFor={actionFor} />

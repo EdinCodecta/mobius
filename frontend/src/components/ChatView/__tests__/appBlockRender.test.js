@@ -78,6 +78,14 @@ test('every shape explains a missing or deleted app and offers no view', () => {
   assert.match(render(base, null), /Checking installed apps…/)
 })
 
+test('every block says its content comes from the conversation', () => {
+  for (const shape of [base, { ...base, inline: false }, { ...base, badges: [{ label: 'Approved', tone: 'success' }] }]) {
+    for (const apps of [installed, []]) {
+      assert.match(render(shape, apps), /<header>[^]*<\/header><p class="md-app-block__source">From this conversation<\/p>/)
+    }
+  }
+})
+
 test('the explicit view mounts the ordinary app canvas lazily', () => {
   const html = renderToStaticMarkup(createElement(AppBlockView, { app: installed[0], intent: 'open:1', height: 480, onHostRequest() {} }))
   assert.match(html, /class="md-app-block__view" style="height:480px"/)
