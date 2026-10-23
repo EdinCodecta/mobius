@@ -99,6 +99,10 @@ def test_legacy_uncertain_attempt_fences_only_repository_and_names_owner(setup):
   with pytest.raises(HTTPException) as error:
     reviews.require_public_transition_clear(db, row, row.targets_json[0])
   assert "legacy-grant" in str(error.value.detail) and "legacy-chat" in str(error.value.detail)
+  assert "no delayed effect" in error.value.detail
+  assert "complete the exact intended GitHub action" in error.value.detail
+  assert "observe its matching result" in error.value.detail
+  assert "do not replay" in error.value.detail
 
 
 def test_same_reviewer_delegation_cannot_replace_needs_you_from_new_run(setup, monkeypatch):
