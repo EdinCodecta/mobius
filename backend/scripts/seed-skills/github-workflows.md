@@ -112,7 +112,16 @@ their checkouts. Request preparation again if a legitimate cleanup removed it.
 
 Only `not_dispatched` releases an exact public reservation. `unknown` means
 read-only observation, never a retry. Stop revokes new actions but cannot
-erase a confirmed push. Pending checks/queues remain owned by the existing
+erase a confirmed push or clear uncertainty. If an older unresolved attempt
+blocks a new grant, open the run/chat named by the refusal and call that
+run's `/observe` endpoint. An exact matching merged PR or pushed branch tip
+can settle its receipt; where the owner completed the exact GitHub action
+manually, observe that fact before considering a new grant. A closed,
+unmerged PR or unchanged projection does not prove a push or merge was never
+applied. If exact nonapplication cannot be proved, there is currently no safe
+self-service release of that old receipt: stop and request owner-supervised
+recovery rather than resetting it or replaying the write.
+Pending checks/queues remain owned by the existing
 conversation's durable Wait; these routes do not create automatic waits.
 
 ## Draft readiness is a separate scope
