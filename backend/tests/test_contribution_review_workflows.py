@@ -1321,7 +1321,7 @@ def test_pending_later_repair_with_new_base_keeps_detail_list_and_observation_re
   listed = routes.list_reviews(1, db, owner)["runs"][0]
   observed = asyncio.run(routes.observe_review(1, row.id, db, owner))["run"]
   assert "repair_attempts" not in listed["items"][0]
-  assert listed["items"][0]["head_sha"] == head
+  assert listed["items"][0]["successor"] == {"head_sha": head, "base_sha": BASE}
   assert listed["execution_state"] == "stopped"
   for view in (detail, observed):
     expected = "push_unknown" if view is observed and state == "pushing" else state

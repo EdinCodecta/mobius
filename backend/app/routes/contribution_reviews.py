@@ -318,7 +318,8 @@ def _list_run_view(db, row, app_id):
   """Lists are navigation summaries; full evidence belongs to exact-run detail."""
   value = _run_view(db, row, context_app_id=app_id)
   fields = ("repo", "number", "head_sha", "base_ref", "base_sha", "state", "url", "title",
-            "review_chat_id", "review_run_id", "merge_sha", "queue_entry_id")
+            "review_chat_id", "review_run_id", "merge_sha", "queue_entry_id",
+            "successor", "approved_head_sha", "approved_base_sha", "current_base_sha")
   items = []
   for item in value["items"]:
     brief = {key: item[key] for key in fields if key in item}
