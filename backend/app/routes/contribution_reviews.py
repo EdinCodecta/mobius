@@ -422,6 +422,11 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
               reviews.disarm_merge(db, row, target, outcome,
                 "The review was cancelled before any merge request began.")
               raise
+            except Exception:
+              # Every failure in this block precedes the mutating GitHub call.
+              # Do not expose provider diagnostics or retain a false attempt.
+              result = DispatchResult.not_dispatched(
+                "The final target-base check was unavailable. No merge request began.")
             else:
               try:
                 if checks.get("isMergeQueueEnabled") is True:
