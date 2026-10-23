@@ -137,3 +137,4 @@ new grants on other heads. An `attempting` receipt must first surface as
 unknown; an unsafe identity read cannot retire it. Readiness never authorizes
 merge using an old review. Unknown readiness remains visible and fences new
 public actions until that conservative observation succeeds.
+For an opted-in public-review grant, `/outcomes` publishes only when the agent explicitly sends `publish: true` with a deliberate public verdict. Owner questions and blocked verification use `publish: false` (the default), remain private, and do not post. Once armed, verdict evidence is immutable. Another grant for the same PR/head cannot post while an earlier posting/unknown/posted receipt exists; open the named holding run and observe it read-only. Lists contain bounded navigation summaries; open the exact run for full evidence.

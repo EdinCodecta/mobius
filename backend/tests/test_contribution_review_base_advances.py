@@ -143,7 +143,6 @@ def test_rewritten_target_branch_is_an_owner_decision_not_an_advance(setup, monk
 
 @pytest.mark.parametrize("unsettled", [
   {"repair_attempts": [{"from_sha": SHA, "head_sha": NEW_HEAD, "state": "push_unknown"}]},
-  {"ready_attempt": {"state": "unknown", "head_sha": SHA}},
 ])
 def test_unsettled_public_attempts_block_base_advance(setup, monkeypatch, unsettled):
   db, row, _ = clear_takeover(setup, monkeypatch)

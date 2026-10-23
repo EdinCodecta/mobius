@@ -399,8 +399,17 @@ def approved_body(request_id="chat-approved"):
     chat_approval={"context": "The owner said: review this exact PR and merge it if safe."})
 
 
+def snapshot_owning_chat(db, principal):
+  choice = routes.resolve_round_choice(db)
+  chat = db.get(models.Chat, principal.chat_id)
+  chat.provider = choice["provider"]
+  chat.agent_settings_json = {"model": choice["model"], "effort": choice.get("effort")}
+  db.commit()
+
+
 def test_explicit_chat_consent_stays_in_owning_chat_with_durable_provenance(setup, monkeypatch):
   db, _, principal = setup
+  snapshot_owning_chat(db, principal)
   monkeypatch.setattr(domain, "inspect_target", lambda *args: TARGET)
   async def forbidden(**kwargs):
     pytest.fail("Approval must not create a second review conversation")
@@ -478,6 +487,7 @@ def test_http_admission_accepts_explicit_chat_consent_but_not_an_unapproved_agen
   from fastapi import FastAPI
   from fastapi.testclient import TestClient
   db, _, principal = setup
+  snapshot_owning_chat(db, principal)
   application = FastAPI()
   application.include_router(routes.router)
   application.dependency_overrides[routes.get_db] = lambda: db
@@ -829,13 +839,14 @@ def test_owner_requested_review_is_posted_once_as_a_comment_on_the_exact_head(se
     return DispatchResult.confirmed({"id": 9, "url": "https://github.com/example/project/pull/7#pullrequestreview-9"})
   monkeypatch.setattr(public, "post_review", post)
   monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("review only merged"))
-  item = report(setup)["run"]["items"][0]
+  item = report(setup, publish=True)["run"]["items"][0]
   assert item["state"] == "all_clear"
   assert item["public_review"]["state"] == "posted" and item["public_review"]["id"] == 9
-  assert item["public_review"]["evidence"]["summary"] == "Full diff reviewed"
+  assert "evidence" not in item["public_review"]
+  assert item["summary"] == "Full diff reviewed"
   assert posts[0][0] == SHA and "All clear" in posts[0][1] and "Full diff reviewed" in posts[0][1]
   with pytest.raises(HTTPException):
-    report(setup, state="needs_you", summary="A later continuation")
+    report(setup, publish=True, state="needs_you", summary="A later continuation")
   assert len(posts) == 1, "an item's review is posted at most once"
 
 
@@ -846,8 +857,8 @@ def test_lost_review_post_is_unknown_and_never_replayed(setup, monkeypatch):
     calls.append(1)
     return DispatchResult.unknown("lost response")
   monkeypatch.setattr(public, "post_review", lost)
-  assert report(setup)["run"]["items"][0]["public_review"]["state"] == "unknown"
-  report(setup)
+  assert report(setup, publish=True)["run"]["items"][0]["public_review"]["state"] == "unknown"
+  report(setup, publish=True)
   assert calls == [1]
 
 
@@ -869,7 +880,7 @@ def test_changed_github_account_skips_the_public_review(setup, monkeypatch):
   _public_review_run(setup)
   monkeypatch.setattr(domain, "read", lambda *args: {"id": 99})
   monkeypatch.setattr(public, "post_review", lambda *a: pytest.fail("posted as another account"))
-  assert report(setup)["run"]["items"][0]["public_review"]["state"] == "not_dispatched"
+  assert report(setup, publish=True)["run"]["items"][0]["public_review"]["state"] == "not_dispatched"
 
 
 def test_post_review_writes_a_comment_review_bound_to_the_head():

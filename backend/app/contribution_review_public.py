@@ -22,7 +22,7 @@ def require_same_evidence(previous, proposed):
   receipt = previous.get("public_review") or {}
   if receipt.get("state") not in {"posting", "posted", "unknown"}:
     return False
-  frozen = receipt.get("evidence") or evidence(previous)
+  frozen = evidence(previous)
   if frozen != evidence(proposed):
     raise HTTPException(409, "This public review already froze different evidence. Its verdict cannot be changed.")
   return True
@@ -68,14 +68,14 @@ def review_comment_body(outcome: dict, *, marker: str = "") -> str:
   def render(summary_text, tests_text):
     parts = [header, "", summary_text]
     if tests_text:
-      parts += ["", f"**Checks:** {tests_text}"]
+      parts += ["", f"**Verification:** {tests_text}"]
     return "\n".join(parts + ["", footer])
   body = render(summary, tests)
   if _body_units(body) <= GITHUB_REVIEW_BODY_MAX:
     return body
   available = GITHUB_REVIEW_BODY_MAX - _body_units(render("", ""))
   if tests:
-    available -= _body_units("\n\n**Checks:** ")
+    available -= _body_units("\n\n**Verification:** ")
   # Checks keep at least a quarter of the room, the summary takes the rest.
   tests_room = min(_body_units(tests), max(available - _body_units(summary), available // 4))
   return render(_clip_evidence(summary, available - tests_room), _clip_evidence(tests, tests_room))

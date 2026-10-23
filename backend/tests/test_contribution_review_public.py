@@ -21,11 +21,11 @@ def test_posted_verdict_is_immutable_and_identical_retry_reads_no_remote_state(s
   opted_in(setup)
   calls = []
   monkeypatch.setattr(public, 'post_review', lambda *a: calls.append(a) or public.DispatchResult.confirmed({'id': 3}))
-  report(setup)
+  report(setup, publish=True)
   monkeypatch.setattr(routes.reviews, 'current_pull', lambda *a: pytest.fail('identical replay is historical'))
-  report(setup)
+  report(setup, publish=True)
   with pytest.raises(HTTPException) as exc:
-    report(setup, state='needs_you', summary='Different verdict')
+    report(setup, publish=True, state='needs_you', summary='Different verdict')
   assert exc.value.status_code == 409
   assert len(calls) == 1
 
@@ -33,12 +33,12 @@ def test_posted_verdict_is_immutable_and_identical_retry_reads_no_remote_state(s
 def test_unknown_post_freezes_evidence_without_replay(setup, monkeypatch):
   row = opted_in(setup)
   monkeypatch.setattr(public, 'post_review', lambda *a: public.DispatchResult.unknown('lost response'))
-  report(setup)
+  report(setup, publish=True)
   assert row.outcomes_json['example/project#7']['public_review']['state'] == 'unknown'
   monkeypatch.setattr(public, 'post_review', lambda *a: pytest.fail('replayed'))
-  report(setup)
+  report(setup, publish=True)
   with pytest.raises(HTTPException):
-    report(setup, tests='Different evidence')
+    report(setup, publish=True, tests='Different evidence')
 
 
 def test_confirmed_public_fact_survives_stop(setup, monkeypatch):
@@ -51,7 +51,7 @@ def test_confirmed_public_fact_survives_stop(setup, monkeypatch):
     db.commit()
     return public.DispatchResult.confirmed({'id': 42})
   monkeypatch.setattr(public, 'post_review', dispatch)
-  report(setup)
+  report(setup, publish=True)
   assert row.outcomes_json['example/project#7']['public_review']['id'] == 42
 
 
@@ -68,7 +68,7 @@ def test_public_unicode_bound_preserves_verdict_checks_head_and_private_copy():
   original = {'state': 'all_clear', 'summary': '😀' * 200_000, 'tests': '✓' * 200_000, 'head_sha': 'a'*40}
   body = public.review_comment_body(original)
   assert public._body_units(body) <= 65536
-  assert 'omitted' in body and '**Checks:**' in body and 'All clear' in body
+  assert 'omitted' in body and '**Verification:**' in body and 'All clear' in body
   assert 'aaaaaaaaaaaa' in body
   assert len(original['summary']) == 200_000
 
