@@ -24,6 +24,10 @@ _MERGE_DIAGNOSTIC_SECRET = re.compile(
   r"|\bgh[pous]_[A-Za-z0-9_]+\b"
 )
 
+READY_UNKNOWN_RECOVERY = ("If you choose to mark it ready in GitHub yourself, run /observe afterward; "
+  "or push a different head and run /observe so this old receipt can become unattributable. "
+  "Do not retry readiness on this head.")
+
 
 def key(item: dict) -> str:
   return f"{item['repo'].lower()}#{item['number']}"
@@ -368,7 +372,9 @@ def view(row):
     # Readiness is a public-attempt overlay, not a replacement for saved
     # private-review evidence. Unknown must be visible and block new actions.
     if attempt.get("state") == "unknown":
-      return {**outcome, "state": "ready_unknown"}
+      summary = outcome.get("summary") or ""
+      return {**outcome, "state": "ready_unknown", "summary":
+        f"{summary}\n\n{READY_UNKNOWN_RECOVERY}" if summary else READY_UNKNOWN_RECOVERY}
     if attempt.get("state") == "unattributable":
       return {**outcome, "state": "ready_unattributable"}
     if attempt.get("state") == "attempting":

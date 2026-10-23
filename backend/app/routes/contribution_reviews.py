@@ -1145,7 +1145,7 @@ async def _confirm_ready_attempt(target, cwd) -> str | None:
   except (ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
     return "The earlier readiness attempt is uncertain; it was not repeated."
   if pull.get("draft") is not False:
-    return "The earlier readiness attempt is not confirmed; it was not repeated."
+    return f"The earlier readiness attempt is not confirmed; it was not repeated. {reviews.READY_UNKNOWN_RECOVERY}"
   return None
 
 
@@ -1190,9 +1190,13 @@ async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
     attempt = previous.get("ready_attempt")
     if attempt:
       # The mutation is unrepeatable after admission, including lost responses.
+      if attempt.get("state") == "ready" and attempt.get("head_sha") != target["head_sha"]:
+        return {"run": _run_view(db, row), "blocked":
+          "The readiness receipt is for an earlier head. This draft successor needs a new grant; the earlier action was not repeated."}
       if attempt.get("state") == "unattributable":
         return {"run": _run_view(db, row), "blocked": READY_HEAD_MOVED}
-      blocked = await _confirm_ready_attempt(target, cwd)
+      observed_target = {**target, "head_sha": attempt["head_sha"]}
+      blocked = await _confirm_ready_attempt(observed_target, cwd)
       if blocked:
         _escalate_unconfirmed_ready(db, row, item_key, previous, attempt)
         _record_unattributable_ready(db, row, item_key, attempt, blocked)
