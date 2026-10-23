@@ -110,69 +110,69 @@ def test_private_path_gate_even_if_allowed_by_pr():
     repairs._assert_path_scope({".claude/settings.json"}, {".claude/settings.json"})
 
 
-def test_push_uses_exact_sha_and_atomic_predecessor_lease(repair, monkeypatch):
+def _push_fixture(repair, monkeypatch):
   repo, target, _, snapshot = repair
   validation = {**snapshot, "head_sha": "b" * 40, "files": ["owned.py"],
-                "diff_sha256": "c" * 64}
-  monkeypatch.setattr(repairs, "validate_repair", lambda *a: validation)
+                "diff_sha256": "c" * 64, "base_sha": "a" * 40}
+  monkeypatch.setattr(repairs, "validate_repair", lambda *a, **kw: validation)
+  monkeypatch.setattr(repairs, "_target_base_head", lambda *a: "a" * 40)
+  monkeypatch.setattr(repairs, "owned_checkout", lambda *a: repo)
+  return repo, target, validation
+
+
+def test_push_uses_exact_sha_without_force(repair, monkeypatch):
+  repo, target, validation = _push_fixture(repair, monkeypatch)
   calls = []
-  monkeypatch.setattr(repairs, "_read", lambda *a: {"object": {"sha": "b" * 40 if calls else target["head_sha"]}})
+  monkeypatch.setattr(repairs, "_branch_head", lambda *a: "b" * 40 if calls else target["head_sha"])
   monkeypatch.setattr(repairs, "_git", lambda path, *args, **kwargs:
                       calls.append((path, args, kwargs)) or type("Result", (), {"returncode": 0})())
-  repairs.push_repair(None, repo, None, target, validation)
-  assert calls == [(repo, ("push", "--porcelain",
-                          f"--force-with-lease=refs/heads/topic:{target['head_sha']}", "https://github.com/owner/fork.git",
+  assert repairs.push_repair(None, repo, None, target, validation).state == "confirmed"
+  assert calls == [(repo, ("push", "--porcelain", "https://github.com/owner/fork.git",
                           f"{'b' * 40}:refs/heads/topic"), {"check": False})]
 
 
 def test_push_is_confirmed_by_branch_ref_not_pull_projection(repair, monkeypatch):
-  repo, target, _, snapshot = repair
-  validation = {**snapshot, "head_sha": "b" * 40, "files": ["owned.py"], "diff_sha256": "c" * 64}
-  monkeypatch.setattr(repairs, "validate_repair", lambda *a: validation)
+  repo, target, validation = _push_fixture(repair, monkeypatch)
   pushed = []
   reads = []
-  def read(gh, cwd, endpoint):
-    reads.append(endpoint)
-    # The branch ref moves with the push; the pulls API may still lag.
-    return {"object": {"sha": "b" * 40 if pushed else target["head_sha"]}}
-  monkeypatch.setattr(repairs, "_read", read)
+  def branch(*a):
+    reads.append("head-ref")
+    return "b" * 40 if pushed else target["head_sha"]
+  monkeypatch.setattr(repairs, "_branch_head", branch)
   monkeypatch.setattr(repairs, "_git", lambda *a, **kw: pushed.append(1) or type("Result", (), {"returncode": 0})())
-  assert repairs.push_repair(None, repo, None, target, validation)["head_sha"] == "b" * 40
-  assert reads == ["repos/owner/fork/git/ref/heads/topic"] * 2
+  result = repairs.push_repair(None, repo, None, target, validation)
+  assert result.state == "confirmed" and result.receipt["head_sha"] == "b" * 40
+  assert reads == ["head-ref", "head-ref"]
 
 
-@pytest.mark.parametrize("after_push", [None, {"object": {"sha": "d" * 40}}, ["not", "a", "ref"]])
+@pytest.mark.parametrize("after_push", [None, "d" * 40])
 def test_push_without_confirmed_branch_head_is_ambiguous(repair, monkeypatch, after_push):
-  repo, target, _, snapshot = repair
-  validation = {**snapshot, "head_sha": "b" * 40, "files": ["owned.py"], "diff_sha256": "c" * 64}
-  monkeypatch.setattr(repairs, "validate_repair", lambda *a: validation)
+  repo, target, validation = _push_fixture(repair, monkeypatch)
   pushed = []
-  def read(*a):
+  def branch(*a):
     if not pushed:
-      return {"object": {"sha": target["head_sha"]}}
+      return target["head_sha"]
     if after_push is None:
-      raise HTTPException(409, "GitHub did not return a usable repair preflight.")
+      raise HTTPException(409, "GitHub unavailable")
     return after_push
-  monkeypatch.setattr(repairs, "_read", read)
+  monkeypatch.setattr(repairs, "_branch_head", branch)
   monkeypatch.setattr(repairs, "_git", lambda *a, **kw: pushed.append(1) or type("Result", (), {"returncode": 0})())
-  with pytest.raises(HTTPException):
-    repairs.push_repair(None, repo, None, target, validation)
+  assert repairs.push_repair(None, repo, None, target, validation).state == "unknown"
   assert pushed == [1]
 
 
 def test_push_final_guard_runs_after_remote_io_before_public_write(repair, monkeypatch):
-  repo, target, _, snapshot = repair
-  validation = {**snapshot, "head_sha": "b" * 40, "files": ["owned.py"], "diff_sha256": "c" * 64}
+  repo, target, validation = _push_fixture(repair, monkeypatch)
   order = []
-  monkeypatch.setattr(repairs, "validate_repair", lambda *a: order.append("validate") or validation)
-  monkeypatch.setattr(repairs, "_read", lambda *a: order.append("remote") or {"object": {"sha": target["head_sha"]}})
+  monkeypatch.setattr(repairs, "_branch_head", lambda *a: order.append("head") or target["head_sha"])
+  monkeypatch.setattr(repairs, "_target_base_head", lambda *a: order.append("base") or "a" * 40)
   monkeypatch.setattr(repairs, "_git", lambda *a, **kw: pytest.fail("Stop must prevent push"))
   def guard():
     order.append("stop")
-    raise HTTPException(409, "Stopped")
-  with pytest.raises(HTTPException):
-    repairs.push_repair(None, repo, None, target, validation, before_push=guard)
-  assert order == ["validate", "remote", "stop"]
+    raise repairs.NotDispatched("Stopped")
+  assert repairs.push_repair(None, repo, None, target, validation,
+                             before_push=guard).state == "not_dispatched"
+  assert order == ["head", "base", "stop"]
 
 
 def test_repair_rejects_forged_ancestry_metadata(repair):
@@ -185,7 +185,7 @@ def test_repair_rejects_forged_ancestry_metadata(repair):
 def test_repair_rejects_local_transport_rewrite(repair):
   repo, target, _, snapshot = repair
   git(repo, "config", "url.https://not-github.invalid/.insteadOf", "https://github.com/")
-  with pytest.raises(HTTPException, match="unsafe Git transport"):
+  with pytest.raises(HTTPException, match="unapproved Git configuration"):
     repairs.validate_repair(None, repo, None, target, snapshot)
 
 
@@ -227,7 +227,7 @@ def test_configured_fsmonitor_is_rejected_before_server_status_probe(repair, mon
   repo, target, _, snapshot = repair
   git(repo, "config", "core.fsmonitor", "unapproved-executable")
   monkeypatch.setattr(repairs.app_git, "worktree_dirty", lambda *a: pytest.fail("must reject before git status"))
-  with pytest.raises(HTTPException, match="unsafe Git transport"):
+  with pytest.raises(HTTPException, match="unapproved Git configuration"):
     repairs.validate_repair(None, repo, None, target, snapshot)
 
 

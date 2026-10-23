@@ -26,19 +26,28 @@ advertise it.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import concurrent.futures as _cf
+import enum
 import functools
+import io
 import logging
+import tomllib
+import shlex
+import json
 import os
 import shutil
 import time
+import uuid
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from app import generated_files
+from PIL import Image
+
+from app import generated_files, settled, viewed_images
 from app.codex_sdk_contract import (
   app_server_exit_code,
   app_server_pid,
@@ -118,11 +127,176 @@ _PROCESS_GROUP_CAPTURE_POLL_SECONDS = 0.01
 # How often a running Codex helper row re-reads its child rollout for the
 # owner-facing "currently doing" line. The read is a small tail of one file.
 HELPER_PROGRESS_INTERVAL_S = 3.0
+MAX_GENERATED_IMAGE_PIXELS = 32_000_000
 
 
 def _ensure_codex_home(env: dict[str, str], data_dir: str) -> None:
   """Supply the configured-data fallback without overriding provider setup."""
   env.setdefault("CODEX_HOME", str(Path(data_dir) / "cli-auth" / "codex"))
+
+
+def _generated_png_bytes(result: str) -> tuple[bytes, dict[str, int]]:
+  """Decode a native image result, proving it is one bounded, decodable PNG.
+
+  PNG is the provider's format: Codex's image-generation extension saves each
+  result as ``.png`` and shows it as ``data:image/png;base64`` (codex-cli
+  0.162). Anything else is refused rather than stored under a wrong type.
+  Returns the bytes and their pixel size.
+  """
+  limit = generated_files.MAX_RECORDED_BYTES
+  try:
+    if len(result) > ((limit + 2) // 3) * 4:
+      raise ValueError("generated image exceeds the deliverable size limit")
+    content = base64.b64decode(result, validate=True)
+    if len(content) > limit:
+      raise ValueError("generated image exceeds the deliverable size limit")
+    with Image.open(io.BytesIO(content), formats=["PNG"]) as image:
+      # Size comes from the header; check it before decoding any pixels. An
+      # animated PNG is rejected because load() decodes only its first frame.
+      if (
+        not 0 < image.width * image.height <= MAX_GENERATED_IMAGE_PIXELS
+        or getattr(image, "n_frames", 1) != 1
+      ):
+        raise ValueError("generated image is not one bounded frame")
+      image.verify()  # Chunk checksums and a complete file, without pixels.
+    with Image.open(io.BytesIO(content), formats=["PNG"]) as image:
+      image.load()
+      size = {"width": image.width, "height": image.height}
+  except (TypeError, ValueError, OSError, SyntaxError, EOFError, Image.DecompressionBombError) as exc:
+    raise ValueError(f"generated image result is not a valid bounded PNG: {exc}") from exc
+  return content, size
+
+
+def _stage_codex_generated_image(
+  data_dir: str, chat_id: str, result: str,
+) -> tuple[str, dict[str, int]]:
+  """Write a proven PNG into the inbox; return its name and pixel size."""
+  content, size = _generated_png_bytes(result)
+  name = f"generated-image-{uuid.uuid4().hex}.png"
+  generated_files.add_inbox_file(data_dir, chat_id, name, content)
+  return name, size
+
+
+class ImageDelivery(enum.Enum):
+  """What the tool step can truthfully say once a native image completes."""
+
+  SHOWN = "shown"
+  # Staged but not yet published, and an attempt can still succeed: a commit
+  # timed out and may yet land, or the chat still has room. The turn-end
+  # settlement retries it and rewrites the step with the final outcome.
+  PENDING = "pending"
+  # Nothing to show and nothing queued: the result is not a usable PNG, or
+  # the chat has no room, in which case any staged copy is discarded.
+  NOT_ATTACHED = "not_attached"
+
+
+_IMAGE_DELIVERY_OUTPUT = {
+  ImageDelivery.SHOWN: ("Image generated.", 0),
+  ImageDelivery.PENDING: (
+    "Image generated. Attaching it has not finished yet; Möbius tries again "
+    "when this turn ends.",
+    0,
+  ),
+  ImageDelivery.NOT_ATTACHED: (
+    "The image was generated, but Möbius could not attach it.",
+    1,
+  ),
+}
+
+
+async def _image_can_still_attach(sink) -> bool:
+  """Whether an unpublished capture has a real chance before the turn ends."""
+  return sink.generated_file_commit_unresolved() or await sink.generated_file_capacity() > 0
+
+
+async def _deliver_codex_generated_image(
+  sink, data_dir: str, chat_id: str, result: str,
+  *, tool_use_id: str, staged: dict[str, dict[str, object]],
+) -> ImageDelivery:
+  """Attach a native image through the deliverable inbox.
+
+  Use the typed result bytes, never the provider's saved path inside the
+  protected credentials tree. Each staged name is recorded in ``staged`` with
+  its tool step and size, so a capture that the turn-end settlement recovers
+  still lands beside that step in a correctly sized frame.
+  """
+  name = None
+  published: set[str] = set()
+  try:
+    # Never stage bytes that cannot become an attachment. A full reading
+    # behind a timed-out commit is not final: that commit may free nothing,
+    # but it may also be the only thing in the way.
+    if not await _image_can_still_attach(sink):
+      return ImageDelivery.NOT_ATTACHED
+    name, size = await asyncio.to_thread(
+      _stage_codex_generated_image, data_dir, chat_id, result,
+    )
+    staged[name] = {"source_tool_use_id": tool_use_id, **size}
+    published = await generated_files.publish_inbox_files(
+      sink, data_dir=data_dir, chat_id=chat_id, names=[name],
+      known_attributes=staged,
+    )
+  except (OSError, ValueError):
+    log.warning("Codex generated-image capture failed chat_id=%s", chat_id, exc_info=True)
+    if name is None:
+      return ImageDelivery.NOT_ATTACHED
+  if name in published:
+    return ImageDelivery.SHOWN
+  if await _image_can_still_attach(sink):
+    return ImageDelivery.PENDING
+  # A full chat cannot take it this turn or the next: never leave it queued.
+  await asyncio.to_thread(generated_files.discard_inbox_file, data_dir, chat_id, name)
+  staged.pop(name, None)
+  return ImageDelivery.NOT_ATTACHED
+
+
+async def _settle_pending_codex_images(
+  sink, data_dir: str, chat_id: str,
+  *, staged: dict[str, dict[str, object]], pending_steps: set[str],
+) -> None:
+  """Give every step that promised a turn-end retry its final outcome.
+
+  Settle timed-out commits, retry only the pending captures, then rewrite
+  each such step: shown if its picture is now attached, otherwise discard the
+  capture and say it could not be attached. A capture whose commit is still
+  unresolved (the writer is unavailable) keeps its pending step; Finalize
+  settles that commit.
+  """
+  pending = {
+    name: attributes["source_tool_use_id"] for name, attributes in staged.items()
+    if attributes.get("source_tool_use_id") in pending_steps
+  }
+  if not pending:
+    return
+  try:
+    await sink.settle_uncertain_generated_files()
+  except Exception:
+    log.warning("generated-image commit settlement failed chat_id=%s", chat_id, exc_info=True)
+  try:
+    published = await generated_files.publish_inbox_files(
+      sink, data_dir=data_dir, chat_id=chat_id, names=list(pending),
+      known_attributes=staged,
+    )
+  except (OSError, ValueError):
+    log.warning("generated-image retry failed chat_id=%s", chat_id, exc_info=True)
+    published = set()
+  unresolved = sink.generated_file_commit_unresolved()
+  for name, tool_use_id in pending.items():
+    if name in published:
+      outcome = ImageDelivery.SHOWN
+    elif unresolved:
+      continue
+    elif await asyncio.to_thread(generated_files.discard_inbox_file, data_dir, chat_id, name):
+      outcome = ImageDelivery.NOT_ATTACHED
+    else:
+      # Only a committed publication consumes the inbox copy.
+      outcome = ImageDelivery.SHOWN
+    staged.pop(name, None)
+    content, exit_code = _IMAGE_DELIVERY_OUTPUT[outcome]
+    sink.publish({
+      "type": "tool_output", "tool_use_id": tool_use_id, "content": content,
+      "output_complete": True, "output_exit_code": exit_code,
+    })
 
 
 def _process_group_capture_delay(elapsed: float) -> float:
@@ -167,6 +341,104 @@ def _codex_config_overrides() -> list[str]:
   overrides.append("features.goals=false")
   overrides += CODEX_NATIVE_HELPERS_OFF
   return overrides
+
+
+def _codex_owner_card_hook_override() -> str:
+  """Hold saved-card/question tools at a hook until our turn interrupt is acked.
+
+  PostToolUse's continue:false substitutes tool feedback; it does not end
+  Codex's model loop. The synchronous hook instead rendezvous with the
+  run-bound card owner before Codex can start its next model request.
+  """
+  import sys
+  script = Path(__file__).resolve().parents[1] / "scripts" / "codex_owner_card_hook.py"
+  command = shlex.join([sys.executable, str(script)])
+  matcher = "^(Bash|mcp__mobius_control__.*)$"
+  return (
+    'hooks.PostToolUse=[{matcher=' + json.dumps(matcher)
+    + ',hooks=[{type="command",command=' + json.dumps(command)
+    + ',timeout=15}]}]'
+  )
+
+
+def _codex_goal_brief_hook_override() -> str:
+  """Restore the Goal brief in the same turn, right after Codex compacts.
+
+  Codex runs SessionStart hooks matching source "compact" after compaction,
+  including automatic compaction mid-turn, and gives their additionalContext
+  to the immediate continuation request. The hook adds no model call. Its
+  spill limit is off so the brief stays inline, as at turn start.
+  """
+  import sys
+  script = Path(__file__).resolve().parents[1] / "scripts" / "codex_goal_brief_hook.py"
+  command = shlex.join([sys.executable, str(script)])
+  return (
+    'hooks.SessionStart=[{matcher="^compact$",hooks=[{type="command",command='
+    + json.dumps(command) + ',timeout=15,additionalContextLimit=0}]}]'
+  )
+
+
+def _codex_platform_hook_overrides() -> list[str]:
+  """Both owner cards and delegated questions end their producing turn."""
+  return [_codex_goal_brief_hook_override(), _codex_owner_card_hook_override()]
+
+
+async def _codex_platform_hook_thread_config(
+  codex, sdk, cwd, config, hook_overrides, *, optional=(),
+):
+  """Trust only our platform hooks, for this thread, without config writes.
+
+  Codex owns the definition hash. Read it instead of duplicating its hashing
+  algorithm, and match each exact invocation-owned definition before granting
+  that hash session-scoped trust. Other discovered hooks keep their own trust.
+  Codex never runs an untrusted hook, so trust is what installs one for the
+  thread. ``hook_overrides`` must be found (owner cards end top-level turns);
+  an ``optional`` hook (the Goal brief restore) that cannot be discovered is
+  left untrusted, and the turn runs without in-turn restore.
+  """
+  try:
+    listing = await control_client(codex).request(
+      "hooks/list", {"cwds": [cwd]}, response_model=sdk["HooksListResponse"],
+    )
+  except Exception:
+    if hook_overrides:
+      raise
+    log.warning("Codex hook discovery failed; no in-turn Goal brief restore",
+                exc_info=True)
+    return config
+  # Newer SDKs wrap each hook variant in HookMetadata.root; older ones
+  # expose the command hook directly.
+  discovered = [
+    getattr(hook, "root", hook)
+    for entry in listing.data for hook in entry.hooks
+  ]
+  state = {}
+  required = set(hook_overrides)
+  for override in [*hook_overrides, *optional]:
+    ((event, groups),) = tomllib.loads(override)["hooks"].items()
+    expected = groups[0]
+    wire_event = event[0].lower() + event[1:]
+    matches = [
+      hook for hook in discovered
+      if _enum_wire_value(hook.source) == "sessionFlags"
+      and _enum_wire_value(hook.handler_type) == "command"
+      and _enum_wire_value(hook.event_name) == wire_event
+      and hook.command == expected["hooks"][0]["command"]
+      and hook.matcher == expected["matcher"]
+      and hook.timeout_sec == expected["hooks"][0]["timeout"]
+    ]
+    if len(matches) != 1:
+      if override in required:
+        raise RuntimeError(f"Codex did not discover the platform {event} hook.")
+      log.warning("Codex did not discover the platform %s hook; skipping it", event)
+      continue
+    state[matches[0].key] = {"trusted_hash": matches[0].current_hash}
+  from copy import deepcopy
+  result = deepcopy(config or {})
+  # Thread config uses CLI dotted paths; replacing the whole hooks table
+  # would erase the definitions installed by the launch flags.
+  result["hooks.state"] = state
+  return result
 
 
 def _codex_app_server_launch_args(
@@ -555,8 +827,10 @@ class ActiveCodexTurn:
     sink: Any | None = None,
     run_marker: str | None = None,
     shared_host: bool = False,
+    goal_brief_refresh: Any | None = None,
   ):
     self.chat_id = chat_id
+    self._goal_brief_refresh = goal_brief_refresh
     self.kind = RunnerKind.CODEX_SDK
     self.thread = thread
     self.turn = turn
@@ -588,6 +862,7 @@ class ActiveCodexTurn:
     # never clears the pending queue or bumps the chat generation, because the
     # chat is meant to resume from the owner's answer.
     self._owner_card_requested = False
+    self._owner_card_interrupt_task: asyncio.Task[None] | None = None
     self._finished: asyncio.Future[None] = (
       asyncio.get_running_loop().create_future()
     )
@@ -609,6 +884,24 @@ class ActiveCodexTurn:
   @property
   def interrupt_requested(self) -> bool:
     return self._interrupt_requested
+
+  async def goal_brief_after_compaction(self, thread_id: str) -> str:
+    """The fresh brief for this thread's post-compaction hook.
+
+    Codex runs the hook only after it compacts, so the call is itself the
+    compaction signal: mark the need and take it, once per compaction. If the
+    hook fails, the next turn's brief and read_goal cover it.
+    """
+    if (
+      str(getattr(self.thread, "id", "")) != thread_id
+      or self._finished.done()
+      or self._interrupt_requested
+    ):
+      raise LookupError("This Codex turn does not own that thread or is ending.")
+    if self._goal_brief_refresh is None:
+      return ""
+    self._goal_brief_refresh.mark_compacted()
+    return await self._goal_brief_refresh.take()
 
   @property
   def owner_card_requested(self) -> bool:
@@ -638,13 +931,20 @@ class ActiveCodexTurn:
     ):
       return None
     self._owner_card_requested = True
-    return self._interrupt_after_owner_card()
+    self._owner_card_interrupt_task = asyncio.create_task(self._interrupt_after_owner_card())
+    return self.wait_for_owner_card_end()
+
+  async def wait_for_owner_card_end(self) -> None:
+    """A post-tool hook also joins an interrupt the receipt already started."""
+    if self._owner_card_interrupt_task is not None:
+      await asyncio.shield(self._owner_card_interrupt_task)
 
   async def _interrupt_after_owner_card(self) -> None:
     try:
       await self.turn.interrupt()
     except Exception as exc:
       log.warning("codex owner-card interrupt raised: %s", exc)
+      raise
 
   async def interrupt(self) -> None:
     """Signals the live turn and waits for runner-side drain."""
@@ -889,6 +1189,15 @@ class ActiveCodexTurn:
     return True
 
 
+_CODEX_MISSING_SESSION_PREFIXES = ("thread not found:", "no rollout found")
+
+
+def _codex_session_missing(exc: BaseException) -> bool:
+  """True when Codex rejected a thread id because it no longer exists."""
+  message = str(getattr(exc, "message", exc))
+  return message.startswith(_CODEX_MISSING_SESSION_PREFIXES)
+
+
 async def _codex_thread_goal(client: Any, sdk: dict[str, Any], thread_id: str):
   """Read a persisted goal before thread/resume can auto-start it."""
   response = await client.request(
@@ -933,7 +1242,9 @@ def _sdk_imports() -> dict[str, Any]:
     ErrorNotification,
     FileChangePatchUpdatedNotification,
     FileChangeThreadItem,
+    ImageGenerationThreadItem,
     ImageViewThreadItem,
+    HooksListResponse,
     ItemCompletedNotification,
     ItemGuardianApprovalReviewCompletedNotification,
     ItemGuardianApprovalReviewStartedNotification,
@@ -973,6 +1284,7 @@ def _sdk_imports() -> dict[str, Any]:
     ),
     "AgentMessageDeltaNotification": AgentMessageDeltaNotification,
     "AgentMessageThreadItem": AgentMessageThreadItem,
+    "HooksListResponse": HooksListResponse,
     "ApprovalMode": ApprovalMode,
     "AsyncCodex": AsyncCodex,
     "CodexConfig": CodexConfig,
@@ -988,6 +1300,7 @@ def _sdk_imports() -> dict[str, Any]:
     "ErrorNotification": ErrorNotification,
     "FileChangePatchUpdatedNotification": FileChangePatchUpdatedNotification,
     "FileChangeThreadItem": FileChangeThreadItem,
+    "ImageGenerationThreadItem": ImageGenerationThreadItem,
     "ImageViewThreadItem": ImageViewThreadItem,
     "Personality": Personality,
     "ReasoningEffort": ReasoningEffort,
@@ -1392,6 +1705,7 @@ async def _run_codex_sdk_turn(
   data_dir: str | None = None,
   coordination_enabled: bool = True,
   helper_host_key=None,
+  goal_brief_refresh=None,
 ) -> RunnerResult:
   """Runs one Codex SDK turn and publishes Möbius-shaped events.
 
@@ -1540,6 +1854,7 @@ async def _run_codex_sdk_turn(
   config_overrides.extend(
     get_provider(provider_id, data_dir=runtime_data_dir).codex_config_overrides()
   )
+  config_overrides.extend(_codex_platform_hook_overrides())
   # Keep the app-server in its own process group for turn-end cleanup.
   launch_args = _codex_app_server_launch_args(
     codex_bin,
@@ -1566,6 +1881,8 @@ async def _run_codex_sdk_turn(
     from app import helper_hosts
     host_env, turn_env = helper_hosts.split_env(env)
     host_env[helper_hosts.HOST_MARKER_ENV] = helper_hosts.host_marker(helper_host_key.digest)
+    thread_env_links = Path(runtime_data_dir) / "run" / "codex-thread-env" / helper_host_key.digest
+    host_env[helper_hosts.THREAD_ENV_LINKS_ENV] = str(thread_env_links)
     config_kwargs["env"] = host_env
     turn_env_file = helper_hosts.TurnEnvFile(
       Path(turn_env.get("TMPDIR") or runtime_data_dir),
@@ -1601,6 +1918,11 @@ async def _run_codex_sdk_turn(
   # completed item. Retain them only for the lifetime of this turn so a Codex
   # path that omits that aggregate can still publish one authoritative result.
   command_output_deltas: dict[str, list[str]] = {}
+  completed_image_ids: set[str] = set()
+  # Inbox name -> its ImageGen step and size, for the turn-end publication.
+  staged_images: dict[str, dict[str, object]] = {}
+  # ImageGen steps that promised a turn-end retry; settlement rewrites them.
+  pending_image_steps: set[str] = set()
   helper_host = None
   codex_context = (
     sdk["AsyncCodex"](config=config) if helper_host_key is None else None
@@ -1704,6 +2026,19 @@ async def _run_codex_sdk_turn(
       # its sole joiner and shields that join before reaping the group.
       if entry_cancel is not None:
         raise entry_cancel
+      # Launch flags define every platform hook (a shared helper host is
+      # keyed without per-turn facts); this thread trusts only the ones it
+      # uses. Every turn needs its recorded-result end hook; a lazy Goal
+      # refresher also covers coordinator promotion after provider entry.
+      required_hooks = [_codex_owner_card_hook_override()]
+      brief_hooks = (
+        [_codex_goal_brief_hook_override()] if goal_brief_refresh is not None else []
+      )
+      if required_hooks or brief_hooks:
+        connector_thread_config = await _codex_platform_hook_thread_config(
+          codex, sdk, cwd, connector_thread_config, required_hooks,
+          optional=brief_hooks,
+        )
       # Keep the old request_user_input bridge on the sync CodexClient's
       # approval_handler attribute. `approval_handler` is a public
       # sync-client constructor argument as of openai-codex 0.142.5;
@@ -1765,21 +2100,21 @@ async def _run_codex_sdk_turn(
           if persisted_goal is not None:
             await goal_client.thread_goal_clear(session_id)
         except sdk["InvalidRequestError"] as exc:
-          if not str(getattr(exc, "message", exc)).startswith("thread not found:"):
+          if not _codex_session_missing(exc):
             raise
 
-      if session_id is None:
-        thread = await codex.thread_start(
-          approval_mode=approval_mode,
-          sandbox=_sandbox,
-          base_instructions=base_instructions,
-          developer_instructions="",
-          config=connector_thread_config,
-          cwd=cwd,
-          model=model,
-          personality=sdk["Personality"].none,
-        )
-      else:
+      thread_options = dict(
+        approval_mode=approval_mode,
+        sandbox=_sandbox,
+        base_instructions=base_instructions,
+        developer_instructions="",
+        config=connector_thread_config,
+        cwd=cwd,
+        model=model,
+        personality=sdk["Personality"].none,
+      )
+      thread = None
+      if session_id is not None:
         # Resume parses the thread's persisted history, which can include
         # subAgentActivity items. The SDK's generated ThreadItem union models
         # that variant natively (openai-codex rust-v0.145.0-alpha.13+), so
@@ -1787,23 +2122,31 @@ async def _run_codex_sdk_turn(
         # _resume_codex_thread wrapper caught and worked around. Möbius uses only
         # the returned handle's id + turn() (it never re-renders resumed
         # history), so a native parse is a straight pass-through here.
-        thread = await codex.thread_resume(
-          session_id,
-          approval_mode=approval_mode,
-          sandbox=_sandbox,
-          base_instructions=base_instructions,
-          developer_instructions="",
-          config=connector_thread_config,
-          cwd=cwd,
-          model=model,
-          personality=sdk["Personality"].none,
-        )
+        try:
+          thread = await codex.thread_resume(session_id, **thread_options)
+        except sdk["InvalidRequestError"] as exc:
+          # Codex rejects a thread whose rollout file is gone (cleaned up to
+          # reclaim disk, or a phantom id). That is a lost session, not a
+          # failed turn: start a fresh thread, and the id-mismatch handling
+          # below reseeds it from the chat's own transcript (or, for a
+          # delegated write run, stops for review) exactly as when Codex
+          # itself hands back a different thread.
+          if not _codex_session_missing(exc):
+            raise
+          log.warning(
+            "Codex session %s has no rollout for chat %s; starting a fresh "
+            "thread", session_id, chat_id,
+          )
+      if thread is None:
+        thread = await codex.thread_start(**thread_options)
       record_memory_checkpoint_once(
         "codex_first_thread_ready",
         chat_id=chat_id,
         resumed=session_id is not None,
       )
 
+      if turn_env_file is not None:
+        turn_env_file.link_thread(thread_env_links, str(thread.id))
       current_session_id = thread.id
       if abort_requested():
         log.info("Codex turn aborted before turn setup chat_id=%s", chat_id)
@@ -1859,6 +2202,12 @@ async def _run_codex_sdk_turn(
         "session_id": current_session_id,
       })
 
+      # Codex records each view's model-bound image in the rollout after the
+      # view item completes; bind those views once the turn has completed.
+      view_mark = await asyncio.to_thread(
+        viewed_images.TurnMark.capture, env["CODEX_HOME"], current_session_id,
+      )
+      image_view_ids: list[str] = []
       turn = await thread.turn(
         user_message,
         cwd=cwd,
@@ -1885,6 +2234,7 @@ async def _run_codex_sdk_turn(
         sink=bc,
         run_marker=base_env.get(RUN_MARKER_ENV),
         shared_host=helper_host is not None,
+        goal_brief_refresh=goal_brief_refresh,
       )
       registry.register(active_turn)
       record_memory_checkpoint_once(
@@ -2098,6 +2448,21 @@ async def _run_codex_sdk_turn(
 
         if isinstance(payload, sdk["ItemCompletedNotification"]):
           item = payload.item.root if hasattr(payload.item, "root") else payload.item
+          image_delivery_output = None
+          image_generation_cls = sdk.get("ImageGenerationThreadItem")
+          if image_generation_cls is not None and isinstance(item, image_generation_cls):
+            if item.id in completed_image_ids:
+              continue  # A repeated completion must not attach a second image.
+            completed_image_ids.add(item.id)
+            if item.status == "completed" and item.failure is None:
+              delivery = await _deliver_codex_generated_image(
+                bc, runtime_data_dir, chat_id, item.result,
+                tool_use_id=item.id, staged=staged_images,
+              )
+              if delivery is ImageDelivery.PENDING:
+                pending_image_steps.add(item.id)
+              if delivery is not ImageDelivery.SHOWN:
+                image_delivery_output = _IMAGE_DELIVERY_OUTPUT[delivery]
           if isinstance(item, sdk["ContextCompactionThreadItem"]):
             _publish_codex_context_compaction(bc, chat_id)
             continue
@@ -2119,8 +2484,12 @@ async def _run_codex_sdk_turn(
             for event in _tool_completed_events(
               item, sdk, streamed_command_output=streamed_command_output,
             ):
+              if image_delivery_output and event["type"] == "tool_output":
+                event["content"], event["output_exit_code"] = image_delivery_output
               image_view_cls = sdk.get("ImageViewThreadItem")
               if image_view_cls is not None and isinstance(item, image_view_cls):
+                if event.get("type") == "tool_end" and getattr(item, "id", None):
+                  image_view_ids.append(item.id)
                 # Bind the completed view to its bytes without retaining a
                 # copy. An empty value prevents later same-name substitution.
                 event["viewed_image_sha256"] = await asyncio.to_thread(
@@ -2228,6 +2597,17 @@ async def _run_codex_sdk_turn(
 
         if isinstance(payload, sdk["TurnCompletedNotification"]):
           completed_turn = payload.turn
+          if image_view_ids:
+            snapshots = await asyncio.to_thread(
+              viewed_images.bind_turn_views,
+              runtime_data_dir, chat_id, view_mark, image_view_ids,
+            )
+            for view_id, snapshot in snapshots.items():
+              bc.publish({
+                "type": "viewed_image",
+                "tool_use_id": view_id,
+                "viewed_image_media": snapshot,
+              })
           break
 
         if (
@@ -2334,14 +2714,27 @@ async def _run_codex_sdk_turn(
       "error": _codex_user_error(str(exc)),
     })
   finally:
-    try:
-      await generated_files.publish_inbox_files(
+    teardown = settled.Teardown(log, f"chat_id={chat_id}")
+    # A cancellation landing in any step below is deferred, so it cannot skip
+    # the reap, unregister and executor close that follow.
+    await teardown.step(
+      _settle_pending_codex_images(
+        bc, runtime_data_dir, chat_id,
+        staged=staged_images, pending_steps=pending_image_steps,
+      ),
+      "generated-image settlement",
+      level=logging.DEBUG,
+    )
+    await teardown.step(
+      generated_files.publish_inbox_files(
         bc,
         data_dir=runtime_data_dir,
         chat_id=chat_id,
-      )
-    except Exception:
-      log.debug("generated-file turn capture failed", exc_info=True)
+        known_attributes=staged_images,
+      ),
+      "generated-file capture",
+      level=logging.DEBUG,
+    )
     if helper_progress_task is not None:
       helper_progress_task.cancel()
     if task_host_open and task_host_tool_use_id is not None:
@@ -2354,7 +2747,6 @@ async def _run_codex_sdk_turn(
         "type": "tool_end",
         "tool_use_id": task_host_tool_use_id,
       })
-    deferred_cancel: asyncio.CancelledError | None = None
     if process_group_capture_stop is not None:
       process_group_capture_stop.set()
     if process_group_capture_task is not None:
@@ -2367,7 +2759,7 @@ async def _run_codex_sdk_turn(
           # A caller cancellation landed during the shielded join. Keep
           # waiting for the runner-owned task so initialization-failure cleanup
           # cannot lose the only observed PGID.
-          deferred_cancel = deferred_cancel or exc
+          teardown.defer(exc)
       try:
         captured_during_start = process_group_capture_task.result()
         if process_group_id is None:
@@ -2388,57 +2780,45 @@ async def _run_codex_sdk_turn(
     group_already_terminated = False
     if isinstance(current, ActiveCodexTurn) and current.turn is turn:
       group_already_terminated = current._force_stop_started
-      try:
-        await current.finish_steer_before_turn_end()
-      except asyncio.CancelledError as exc:
-        # A committing cut owns its durable queue row. Finish that bounded
-        # writer settlement before honoring cancellation so the wrapper's
-        # terminal Finalize cannot race it and reorder Q1/A1/Q2.
-        deferred_cancel = deferred_cancel or exc
-        await asyncio.shield(current.finish_steer_before_turn_end())
-      except Exception:
-        log.exception(
-          "Codex steer settlement failed during turn teardown chat_id=%s",
-          chat_id,
-        )
+      # A committing cut owns its durable queue row. Finish that bounded
+      # writer settlement before honoring cancellation so the wrapper's
+      # terminal Finalize cannot race it and reorder Q1/A1/Q2.
+      await teardown.step(
+        current.finish_steer_before_turn_end(), "Codex steer settlement",
+      )
       registry.unregister(chat_id, RunnerKind.CODEX_SDK)
       current.mark_finished()
-    # AsyncCodex.close() terminates only its direct Popen PID.  Reap the
-    # isolated group and every command this run started in its own session
-    # after that context exit, so a tool child cannot be re-parented to
-    # container init and consume CPU/RAM after the turn.  A
-    # worker keeps the short grace period off the FastAPI event loop; shield
-    # ensures task cancellation cannot prevent the SIGKILL backstop from
-    # running in that worker once cleanup has started.
     if helper_host is not None:
       # Unload this helper's thread (its tool servers exit with it) before
       # ending its leftover commands; the host itself stays up.
-      await asyncio.shield(helper_host.unload_thread(current_session_id))
+      await teardown.step(
+        helper_host.unload_thread(current_session_id), "helper thread unload",
+      )
       if not helper_host.alive:
         from app import helper_hosts
-        await asyncio.shield(helper_hosts.MANAGER.discard(helper_host))
+        await teardown.step(
+          helper_hosts.MANAGER.discard(helper_host), "helper host discard",
+        )
     if turn_env_file is not None:
       turn_env_file.remove()
+    # AsyncCodex.close() terminates only its direct Popen PID. Reap the
+    # isolated group and every command this run started in its own session
+    # after that context exit, so a tool child cannot be re-parented to
+    # container init and consume CPU/RAM after the turn. The worker finishes
+    # its bounded TERM/KILL sequence before any cancellation is raised, and
+    # neither a cancellation nor a failure skips the executor close.
     run_marker = base_env.get(RUN_MARKER_ENV)
     if (
       (process_group_id is not None or run_marker)
       and not group_already_terminated
     ):
-      reap_task = asyncio.create_task(asyncio.to_thread(
-        _terminate_codex_processes, process_group_id, run_marker,
-      ))
-      while not reap_task.done():
-        try:
-          await asyncio.shield(reap_task)
-        except asyncio.CancelledError as exc:
-          # shield keeps the worker alive. Defer every caller cancellation
-          # until its bounded TERM/KILL sequence has completed.
-          deferred_cancel = deferred_cancel or exc
-      reap_task.result()
+      await teardown.step(
+        asyncio.to_thread(_terminate_codex_processes, process_group_id, run_marker),
+        "process reap",
+      )
     if codex_call_executor is not None:
       codex_call_executor.close()
-    if deferred_cancel is not None:
-      raise deferred_cancel
+    teardown.finish()
 
 
 async def run_codex_sdk_turn(
@@ -2462,6 +2842,7 @@ async def run_codex_sdk_turn(
   data_dir: str | None = None,
   coordination_enabled: bool = True,
   helper_host_key=None,
+  goal_brief_refresh=None,
 ) -> RunnerResult:
   """Hold cross-process rollout ownership around one strict Codex call.
 
@@ -2498,6 +2879,7 @@ async def run_codex_sdk_turn(
       data_dir=data_dir,
       coordination_enabled=coordination_enabled,
       helper_host_key=helper_host_key,
+      goal_brief_refresh=goal_brief_refresh,
     )
   finally:
     ownership.release()

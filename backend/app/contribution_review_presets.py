@@ -41,9 +41,8 @@ MANDATORY_INSTRUCTIONS = (
   "for a private review or public action. Never alter the original selection or accept an arbitrary changed head. Never post "
   "comments or reviews, approve your own PR, push, merge, enqueue, or use raw "
   "GitHub mutations from these prompts. "
-  "Only guarded platform endpoints may publish explicitly scoped fast-forward repairs "
-  "under confirmed takeover scope. Only the guarded merge endpoint may merge "
-  "freshly independently reviewed successors after explicit owner consent and "
+  "Only the guarded merge endpoint may merge the pinned selected head after "
+  "independent review, explicit owner consent and "
   "current GitHub checks. An externally changed head, unclear receipt, "
   "unsafe change, or missing permission requires a stop and owner handoff; "
   "never retry a public action to bypass a blocker. Keep review reasoning "
@@ -100,12 +99,10 @@ def resolve_options(db, options: dict | None = None, *, choice: dict | None = No
   autopilot = options.get("autopilot", defaults["autopilot"])
   if type(autopilot) is not bool:
     raise ValueError("autopilot must be a boolean")
-  # Opt-in public review comment for Review only. Frozen only when chosen, so
-  # snapshots (and their hashes) from before this option stay unchanged.
+
   post_review = options.get("post_review", False)
   if type(post_review) is not bool:
     raise ValueError("post_review must be a boolean")
-
   choice = dict(choice) if choice is not None else contribution_autopilot.resolve_round_choice(db)
   mandatory_bytes = MANDATORY_INSTRUCTIONS.encode("utf-8")
   return {

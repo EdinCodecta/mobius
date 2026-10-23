@@ -3,13 +3,13 @@ from app import chat_writer
 from app.chat_writer import create_chat
 import asyncio
 import json
-import sys
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
-from app import contribution_review_runs as domain, models
+from app import contribution_review_runs as domain, contribution_review_public as public, models
+from app.contribution_review_effects import DispatchResult
 from app.contribution_errors import ContributionSubmitError
 from app.database import SessionLocal
 from app.deps import Principal
@@ -64,54 +64,6 @@ def report(setup, **changes):
   return asyncio.run(routes.report_outcome(1, row.id, routes.ReviewOutcome(**data), db, principal))
 
 
-def test_review_evidence_over_4000_characters_survives_reporting(setup):
-  db, row, _ = setup
-  row.mode = "review"
-  db.commit()
-  summary = "finding " * 700
-  tests = "check " * 900
-  item = report(setup, summary=summary, tests=tests)["run"]["items"][0]
-  assert item["summary"] == summary
-  assert item["tests"] == tests
-  db.refresh(row)
-  assert row.outcomes_json[domain.key(ITEM)]["summary"] == summary
-  assert row.outcomes_json[domain.key(ITEM)]["tests"] == tests
-
-
-def test_review_evidence_models_do_not_cap_prose_at_4000_characters():
-  evidence = "e" * 4001
-  assert routes.ReviewOutcome(**ITEM, state="needs_you", summary=evidence, tests=evidence).summary == evidence
-  assert routes.RepairCheckout(**ITEM, findings=evidence).findings == evidence
-  assert routes.RepairPublish(**ITEM, summary=evidence, tests=evidence, tests_passed=True).tests == evidence
-  assert routes.DraftReady(**ITEM, reviewed_base_sha=BASE, independent_receipt_id="receipt",
-    summary=evidence, scope=sorted(routes.SCOPE), tests=evidence, tests_passed=True).summary == evidence
-
-
-def test_public_review_formatter_preserves_evidence_past_60000_characters():
-  summary = "s" * 61000
-  tests = "checks completed after the long summary"
-  body = domain.review_comment_body({"state": "all_clear", "summary": summary,
-    "tests": tests, "head_sha": SHA})
-  assert summary in body
-  assert f"**Checks:** {tests}" in body
-  assert f"_Reviewed at {SHA[:12]}._" in body
-  assert len(body) > 60000
-
-
-def test_owner_requested_public_review_posts_full_long_evidence(setup, monkeypatch):
-  _public_review_run(setup)
-  posted = []
-  monkeypatch.setattr(domain, "post_review", lambda _gh, _cwd, _target, body:
-    posted.append(body) or {"id": 9, "url": "https://github.com/example/project/pull/7#pullrequestreview-9"})
-  summary = "s" * 61000
-  tests = "checks after the long summary"
-  item = report(setup, summary=summary, tests=tests)["run"]["items"][0]
-  assert item["public_review"]["state"] == "posted"
-  assert len(posted) == 1
-  assert summary in posted[0] and tests in posted[0]
-  assert f"_Reviewed at {SHA[:12]}._" in posted[0]
-
-
 def test_review_only_never_merges_even_own_pr(setup, monkeypatch):
   db, row, _ = setup
   row.mode = "review"
@@ -126,6 +78,38 @@ def test_exact_clear_head_merges_once_and_replay_is_read_only(setup, monkeypatch
   assert report(setup)["run"]["items"][0]["state"] == "merged"
   report(setup)
   assert calls == [TARGET]
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_a_cancelled_report_holds_the_transition_lock_through_the_merge(
+  setup, monkeypatch, queued,
+):
+  """The merge or enqueue thread ends under the lock before the cancel lands."""
+  from app import chat_queue
+  from tests.cancel_helpers import BlockedWorker, cancel_while_worker_blocked
+
+  db, row, principal = setup
+  monkeypatch.setattr(
+    domain, "pull_checks", lambda *args: {**CHECKS, "isMergeQueueEnabled": queued},
+  )
+  worker = BlockedWorker(
+    (lambda: {"id": "queue-1"}) if queued else (lambda: {"merged": True, "sha": "landed"}),
+  )
+  monkeypatch.setattr(domain, "enqueue" if queued else "perform_merge", worker)
+  data = {**ITEM, "state": "all_clear", "summary": "Full diff reviewed",
+          "scope": sorted(routes.SCOPE), "tests": "Focused tests passed"}
+
+  transition = chat_queue.get_transition_lock(f"review-outcome:{row.id}")
+  outcome = asyncio.run(cancel_while_worker_blocked(
+    SimpleNamespace(locked=transition._lock.locked),
+    lambda: routes.report_outcome(1, row.id, routes.ReviewOutcome(**data), db, principal),
+    worker,
+  ))
+
+  assert isinstance(outcome, asyncio.CancelledError), repr(outcome)
+  db.refresh(row)
+  # The armed attempt stays durable, so the next report reconciles, never replays.
+  assert row.outcomes_json[domain.key(ITEM)]["merge_attempted"] is True
 
 
 def test_foreign_chat_cannot_report_or_consume_grant(setup):
@@ -249,22 +233,15 @@ def test_github_blockers_stop_before_merge(changes):
 
 
 @pytest.mark.parametrize("rollup", [None, {"state": "SUCCESS"}])
-def test_merge_and_draft_readiness_agree_on_passing_or_absent_checks(rollup):
+def test_merge_accepts_passing_or_absent_checks(rollup):
   checks = {**CHECKS, "commits": {"nodes": [{"commit": {"statusCheckRollup": rollup}}]}}
   assert domain.merge_blocker(TARGET, REPO, PULL, checks) is None
-  assert domain.readiness_blocker(TARGET, REPO, {**PULL, "draft": True}, checks) is None
 
 
 @pytest.mark.parametrize("rollup", [{"state": "PENDING"}, {"state": "FAILURE"}, {}])
-def test_merge_and_draft_readiness_refuse_any_unsuccessful_rollup(rollup):
+def test_merge_refuses_any_unsuccessful_rollup(rollup):
   checks = {**CHECKS, "commits": {"nodes": [{"commit": {"statusCheckRollup": rollup}}]}}
   assert domain.merge_blocker(TARGET, REPO, PULL, checks)
-  assert domain.readiness_blocker(TARGET, REPO, {**PULL, "draft": True}, checks)
-
-
-def test_draft_readiness_still_requires_the_head_commit_check_result():
-  checks = {**CHECKS, "commits": {"nodes": []}}
-  assert domain.readiness_blocker(TARGET, REPO, {**PULL, "draft": True}, checks)
 
 
 def test_removed_permission_stops_merge():
@@ -272,7 +249,8 @@ def test_removed_permission_stops_merge():
 
 
 def test_live_target_branch_not_pull_comparison_base_binds_selection():
-  pull = {**PULL, "base": {"ref": "main", "sha": "c" * 40}}
+  pull = {**PULL, "base": {"ref": "main", "sha": "c" * 40},
+    "head": {"sha": SHA, "repo": {"id": 1, "full_name": "example/project"}, "ref": "topic"}}
   def gh(cwd, command, endpoint):
     value = REPO if endpoint == "repos/example/project" else REF if "/git/ref/" in endpoint else pull
     return SimpleNamespace(stdout=json.dumps(value))
@@ -564,6 +542,39 @@ def test_peer_owns_exact_merge_so_review_links_to_it_without_public_action(setup
   item = report(setup)["run"]["items"][0]
   assert item["state"] == "needs_you"
   assert item["review_chat_id"] == "peer-chat"
+  assert item["goal_follow_status"] == "no_open_top_level_goal"
+  assert "No new Goal follow was created" in item["summary"]
+
+
+@pytest.mark.parametrize("follow_status", ["followed", "result_owed"])
+def test_peer_claim_result_only_promises_goal_follow_when_registered(setup, monkeypatch, follow_status):
+  from app import agent_work_claims
+  db, row, principal = setup
+  monkeypatch.setattr(agent_work_claims, "claim_work", lambda *args, **kwargs: {
+    "state": "held_by_peer", "owner_chat_id": "peer-chat", "follow_status": follow_status,
+  })
+  result = domain.arm_merge(db, row, TARGET, {"head_sha": SHA}, principal)
+  assert result["goal_follow_status"] == follow_status
+  assert "Your Goal follows this claim" in result["summary"]
+
+
+@pytest.mark.parametrize("conflict", [
+  "The claim changed while following; inspect it before retrying.",
+  "Transfer would create a direct Goal dependency cycle.",
+])
+def test_claim_conflict_returns_409_without_merge_or_false_goal_follow(setup, monkeypatch, conflict):
+  from app import agent_work_claims
+  db, row, _ = setup
+  monkeypatch.setattr(agent_work_claims, "claim_work", lambda *args, **kwargs:
+    (_ for _ in ()).throw(ValueError(conflict)))
+  monkeypatch.setattr(domain, "perform_merge", lambda *args: pytest.fail("Claim conflict must not merge"))
+  with pytest.raises(HTTPException) as error:
+    report(setup)
+  assert error.value.status_code == 409
+  assert "No merge attempt was started" in error.value.detail
+  assert "no new Goal follow was created" in error.value.detail
+  db.refresh(row)
+  assert row.outcomes_json == {}
 
 
 @pytest.mark.parametrize("state", ["merging", "merge_unknown", "queued", "merged"])
@@ -813,14 +824,16 @@ def test_owner_requested_review_is_posted_once_as_a_comment_on_the_exact_head(se
     db.refresh(row)
     assert row.outcomes_json[domain.key(ITEM)]["public_review"]["state"] == "posting", "receipt before I/O"
     posts.append((target["head_sha"], body))
-    return {"id": 9, "url": "https://github.com/example/project/pull/7#pullrequestreview-9"}
-  monkeypatch.setattr(domain, "post_review", post)
+    return DispatchResult.confirmed({"id": 9, "url": "https://github.com/example/project/pull/7#pullrequestreview-9"})
+  monkeypatch.setattr(public, "post_review", post)
   monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("review only merged"))
   item = report(setup)["run"]["items"][0]
   assert item["state"] == "all_clear"
-  assert item["public_review"] == {"state": "posted", "id": 9, "url": "https://github.com/example/project/pull/7#pullrequestreview-9"}
+  assert item["public_review"]["state"] == "posted" and item["public_review"]["id"] == 9
+  assert item["public_review"]["evidence"]["summary"] == "Full diff reviewed"
   assert posts[0][0] == SHA and "All clear" in posts[0][1] and "Full diff reviewed" in posts[0][1]
-  report(setup, state="needs_you", summary="A later continuation")
+  with pytest.raises(HTTPException):
+    report(setup, state="needs_you", summary="A later continuation")
   assert len(posts) == 1, "an item's review is posted at most once"
 
 
@@ -829,8 +842,8 @@ def test_lost_review_post_is_unknown_and_never_replayed(setup, monkeypatch):
   calls = []
   def lost(*args):
     calls.append(1)
-    raise RuntimeError("lost response")
-  monkeypatch.setattr(domain, "post_review", lost)
+    return DispatchResult.unknown("lost response")
+  monkeypatch.setattr(public, "post_review", lost)
   assert report(setup)["run"]["items"][0]["public_review"]["state"] == "unknown"
   report(setup)
   assert calls == [1]
@@ -838,7 +851,7 @@ def test_lost_review_post_is_unknown_and_never_replayed(setup, monkeypatch):
 
 def test_reviews_are_private_without_the_opt_in_or_outside_review_only(setup, monkeypatch):
   db, row, _ = setup
-  monkeypatch.setattr(domain, "post_review", lambda *a: pytest.fail("posted without consent"))
+  monkeypatch.setattr(public, "post_review", lambda *a: pytest.fail("posted without consent"))
   row.mode = "review"
   db.commit()
   assert "public_review" not in report(setup)["run"]["items"][0]
@@ -853,184 +866,18 @@ def test_reviews_are_private_without_the_opt_in_or_outside_review_only(setup, mo
 def test_changed_github_account_skips_the_public_review(setup, monkeypatch):
   _public_review_run(setup)
   monkeypatch.setattr(domain, "read", lambda *args: {"id": 99})
-  monkeypatch.setattr(domain, "post_review", lambda *a: pytest.fail("posted as another account"))
-  assert report(setup)["run"]["items"][0]["public_review"]["state"] == "skipped"
+  monkeypatch.setattr(public, "post_review", lambda *a: pytest.fail("posted as another account"))
+  assert report(setup)["run"]["items"][0]["public_review"]["state"] == "not_dispatched"
 
 
 def test_post_review_writes_a_comment_review_bound_to_the_head():
   calls = []
-  def gh(_cwd, *args, input_text):
-    calls.append((args, json.loads(input_text)))
+  def gh(_cwd, *args, **kwargs):
+    calls.append((args, kwargs))
     return SimpleNamespace(stdout='{"id": 5, "html_url": "https://github.com/x"}')
-  assert domain.post_review(gh, "/tmp", TARGET, "Body") == {"id": 5, "url": "https://github.com/x"}
-  args, payload = calls[0]
+  result = public.post_review(gh, "/tmp", TARGET, "Body")
+  assert result.state == "confirmed" and result.receipt["id"] == 5
+  args, kwargs = calls[0]
+  payload = json.loads(kwargs["input_text"])
+  assert payload["event"] == "COMMENT" and payload["commit_id"] == SHA
   assert args[-2:] == ("--input", "-")
-  assert payload == {"event": "COMMENT", "commit_id": SHA, "body": "Body"}
-
-
-def test_public_review_transports_large_unicode_evidence_through_subprocess_stdin(tmp_path, monkeypatch):
-  from app import github_contribution_git as git
-
-  executable = tmp_path / "gh"
-  executable.write_text(f"#!{sys.executable}\n" + '''import json, pathlib, sys
-assert sys.argv[1:] == ["api", "--method", "POST", "repos/example/project/pulls/7/reviews", "--input", "-"]
-pathlib.Path("received.json").write_text(sys.stdin.read())
-print(json.dumps({"id": 5, "html_url": "https://github.com/example/project/pull/7#pullrequestreview-5"}))
-''')
-  executable.chmod(0o755)
-  monkeypatch.setattr(git, "_git_env", lambda _cwd: {"PATH": str(tmp_path), "LC_ALL": "C.UTF-8"})
-  body = "finding " * 25000 + '\nRésumé 🧭 "quoted" evidence'
-  assert domain.post_review(git._gh, tmp_path, TARGET, body)["id"] == 5
-  payload = json.loads((tmp_path / "received.json").read_text())
-  assert payload == {"event": "COMMENT", "commit_id": SHA, "body": body}
-
-
-QUEUE_TIME = "2026-10-07T20:13:24Z"
-REMOVED_TIME = "2026-10-07T20:18:09Z"
-
-
-def queue_timeline():
-  # Actual GraphQL shapes: removal has no entry id and beforeCommit is NOT
-  # the PR head. Neither reason nor this synthetic SHA supplies identity.
-  return {"id": TARGET["pr_id"], "headRefOid": SHA, "state": "OPEN",
-    "merged": False, "mergeQueueEntry": None, "timelineItems": {
-      "pageInfo": {"hasPreviousPage": False, "hasNextPage": False},
-      "nodes": [
-        {"__typename": "AddedToMergeQueueEvent", "id": "added-1", "createdAt": QUEUE_TIME},
-        {"__typename": "RemovedFromMergeQueueEvent", "id": "removed-1",
-         "createdAt": REMOVED_TIME, "beforeCommit": {"oid": "e" * 40},
-         "reason": "failed_checks token=PRIVATE ghp_do_not_disclose"}]}}
-
-
-def queue_graphql(monkeypatch, node):
-  """Schema fake for only the read-only fields these routes actually request."""
-  calls = []
-  def gh(cwd, *args):
-    query = next(a[len("query="):] for a in args if a.startswith("query="))
-    assert query.startswith("query(") and "mutation" not in query
-    assert f"id={TARGET['pr_id']}" in args
-    assert "timelineItems(last:100," in query
-    assert "ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT" in query
-    assert "pageInfo{hasPreviousPage hasNextPage}" in query
-    assert "... on AddedToMergeQueueEvent{id createdAt}" in query
-    assert "... on RemovedFromMergeQueueEvent{id createdAt}" in query
-    assert "beforeCommit" not in query and "reason" not in query
-    calls.append(query)
-    return SimpleNamespace(stdout=json.dumps({"data": {"node": node}}))
-  monkeypatch.setattr(routes, "_gh", gh)
-  return gh, calls
-
-
-def saved_queue_receipt(**changes):
-  return {"state": "queued", "head_sha": SHA, "merge_attempted": True,
-    "queue_entry_id": "entry-1", "queue_enqueued_at": QUEUE_TIME, **changes}
-
-
-@pytest.mark.parametrize("legacy", [False, True])
-def test_confirmed_queue_removal_uses_admission_not_synthetic_commit(monkeypatch, legacy):
-  gh, calls = queue_graphql(monkeypatch, queue_timeline())
-  previous = saved_queue_receipt()
-  if legacy:
-    previous.pop("queue_enqueued_at")
-  proof = domain.confirmed_queue_removal(gh, "/tmp", TARGET, previous)
-  assert proof == {"queue_entry_id": "entry-1", "head_sha": SHA,
-    "added_event_id": "added-1", "enqueued_at": QUEUE_TIME,
-    "removed_event_id": "removed-1", "removed_at": REMOVED_TIME}
-  assert len(calls) == 1 and "PRIVATE" not in json.dumps(proof)
-
-
-@pytest.mark.parametrize("case", ["missing_receipt", "unknown_receipt", "missing_events",
-  "incomplete", "later_page", "missing_paging", "stale", "ambiguous_legacy", "readded",
-  "readded_removed", "equal_time", "unordered", "duplicate_id", "bad_date", "wrong_pr",
-  "changed_head", "merged", "closed", "live_entry", "unknown_entry", "prior_proof_changed"])
-def test_removal_proof_fails_closed(monkeypatch, case):
-  node = queue_timeline()
-  previous = saved_queue_receipt()
-  timeline = node["timelineItems"]
-  events = timeline["nodes"]
-  later = [{**events[0], "id": "added-2", "createdAt": "2026-10-07T21:00:00Z"},
-           {**events[1], "id": "removed-2", "createdAt": "2026-10-07T21:05:00Z"}]
-  if case == "missing_receipt": previous.pop("queue_entry_id")
-  elif case == "unknown_receipt": previous["queue_receipt_unconfirmed"] = True
-  elif case == "missing_events": timeline["nodes"] = []
-  elif case == "incomplete": timeline["pageInfo"]["hasPreviousPage"] = True
-  elif case == "later_page": timeline["pageInfo"]["hasNextPage"] = True
-  elif case == "missing_paging": timeline.pop("pageInfo")
-  elif case == "stale": previous["queue_enqueued_at"] = "2026-10-07T20:00:00Z"
-  elif case == "ambiguous_legacy":
-    previous.pop("queue_enqueued_at")
-    events.extend(later)
-  elif case == "readded": events.extend(later[:1])
-  elif case == "readded_removed": events.extend(later)
-  elif case == "equal_time": events[1]["createdAt"] = QUEUE_TIME
-  elif case == "unordered": events.reverse()
-  elif case == "duplicate_id": events[1]["id"] = events[0]["id"]
-  elif case == "bad_date": events[1]["createdAt"] = "unparseable"
-  elif case == "wrong_pr": node["id"] = "PR_other"
-  elif case == "changed_head": node["headRefOid"] = "c" * 40
-  elif case == "merged": node["merged"] = True
-  elif case == "closed": node["state"] = "CLOSED"
-  elif case == "live_entry": node["mergeQueueEntry"] = {"id": "entry-2"}
-  elif case == "unknown_entry": node.pop("mergeQueueEntry")
-  elif case == "prior_proof_changed": previous["queue_removal"] = {"removed_event_id": "older"}
-  gh, _ = queue_graphql(monkeypatch, node)
-  assert domain.confirmed_queue_removal(gh, "/tmp", TARGET, previous) is None
-
-
-def test_timestamp_receipt_can_match_latest_pair_in_complete_history(monkeypatch):
-  node = queue_timeline()
-  events = node["timelineItems"]["nodes"]
-  events[:0] = [
-    {**events[0], "id": "added-older", "createdAt": "2026-10-07T19:00:00Z"},
-    {**events[1], "id": "removed-older", "createdAt": "2026-10-07T19:05:00Z"}]
-  gh, _ = queue_graphql(monkeypatch, node)
-  assert domain.confirmed_queue_removal(gh, "/tmp", TARGET, saved_queue_receipt())["added_event_id"] == "added-1"
-
-
-def test_enqueue_timestamp_is_requested_and_durably_saved(setup, monkeypatch):
-  calls = []
-  def gh(cwd, *args):
-    query = next(a for a in args if a.startswith("query="))
-    assert "mergeQueueEntry{id enqueuedAt}" in query
-    calls.append(query)
-    return SimpleNamespace(stdout=json.dumps({"data": {"enqueuePullRequest": {
-      "mergeQueueEntry": {"id": "entry-1", "enqueuedAt": QUEUE_TIME}}}}))
-  monkeypatch.setattr(routes, "_gh", gh)
-  monkeypatch.setattr(domain, "pull_checks", lambda *a: {**CHECKS, "isMergeQueueEnabled": True})
-  result = report(setup)["run"]["items"][0]
-  assert result["queue_enqueued_at"] == QUEUE_TIME and result["merge_attempted"]
-  assert len(calls) == 1
-  assert setup[1].outcomes_json[domain.key(ITEM)]["queue_enqueued_at"] == QUEUE_TIME
-
-
-def test_requeue_observation_never_overwrites_original_receipt(setup, monkeypatch):
-  db, row, _ = setup
-  domain.save_outcome(db, row, domain.key(ITEM), saved_queue_receipt())
-  monkeypatch.setattr(domain, "pull_checks", lambda *a: {**CHECKS,
-    "mergeQueueEntry": {"id": "entry-2", "enqueuedAt": "2026-10-07T21:00:00Z"}})
-  result = report(setup)["run"]["items"][0]
-  assert result["state"] == "queued" and result["queue_entry_id"] == "entry-1"
-  assert result["queue_enqueued_at"] == QUEUE_TIME
-
-
-@pytest.mark.parametrize("timestamp", [None, "bad", "2026-10-07T20:13:24"])
-def test_new_receipt_missing_valid_timestamp_cannot_use_legacy_exception(monkeypatch, timestamp):
-  previous = saved_queue_receipt(**domain.queue_receipt({"id": "entry-1", "enqueuedAt": timestamp}))
-  assert previous["queue_receipt_unconfirmed"] is True
-  gh, calls = queue_graphql(monkeypatch, queue_timeline())
-  assert domain.confirmed_queue_removal(gh, "/tmp", TARGET, previous) is None
-  assert calls == []
-
-
-def test_unknown_attempt_observed_in_queue_never_becomes_legacy_repair_receipt(setup, monkeypatch):
-  db, row, _ = setup
-  domain.save_outcome(db, row, domain.key(ITEM), {
-    "state": "merge_unknown", "head_sha": SHA, "merge_attempted": True})
-  monkeypatch.setattr(domain, "pull_checks", lambda *a: {**CHECKS,
-    "mergeQueueEntry": {"id": "entry-1", "enqueuedAt": QUEUE_TIME}})
-  queued = report(setup)["run"]["items"][0]
-  assert queued["state"] == "queued" and queued["queue_receipt_unconfirmed"] is True
-  monkeypatch.setattr(domain, "pull_checks", lambda *a: CHECKS)
-  queue_graphql(monkeypatch, queue_timeline())
-  removed = report(setup)["run"]["items"][0]
-  assert removed["state"] == "merge_unknown" and not removed.get("queue_removal")

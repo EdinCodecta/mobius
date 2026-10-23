@@ -29,6 +29,7 @@ const projectTemplatesKey = ['projects', 'templates']
 const chatsKey = ['chats']
 const chatUsageRootKey = ['chat-usage']
 const chatUsageKey = chatId => [...chatUsageRootKey, chatId]
+const chatContextSizesKey = chatId => ['chat-context-sizes', chatId]
 const chatCurrentUsageRootKey = ['chat-current-usage']
 const chatCurrentUsageKey = (chatId, provider, providerSessionId) => [
   ...chatCurrentUsageRootKey,
@@ -232,6 +233,30 @@ function useChatUsageQuery(chatId, { enabled = true } = {}) {
   })
 }
 
+async function fetchChatContextSizes(chatId, { signal } = {}) {
+  const res = await api.chats.contextSizes(chatId, { signal })
+  return jsonOrThrow(res, 'chat context sizes fetch failed:')
+}
+
+// Measured each time /context opens. A compaction can finish anywhere — this
+// composer, a resumed or automatic run, another device — and only the first
+// can invalidate this cache, so opening the panel always re-reads; the last
+// answer shows meanwhile. A compaction while a panel is open invalidates it
+// (ChatView's onCompacted).
+function chatContextSizesQueryOptions(chatId, { enabled = true } = {}) {
+  return {
+    queryKey: chatContextSizesKey(chatId),
+    queryFn: context => fetchChatContextSizes(chatId, context),
+    enabled: enabled && Boolean(chatId),
+    refetchOnMount: 'always',
+    retry: 0,
+  }
+}
+
+function useChatContextSizesQuery(chatId, options) {
+  return useQuery(chatContextSizesQueryOptions(chatId, options))
+}
+
 function useChatCurrentUsageQuery(
   chatId,
   provider,
@@ -277,10 +302,25 @@ async function fetchAppToken(appId) {
   return data.token
 }
 
-function useAppTokenQuery(appId) {
+async function fetchAppConsent(appId) {
+  const res = await api.apps.consent(appId)
+  return jsonOrThrow(res, 'app consent fetch failed:')
+}
+
+// What the app asks for, or `accepted` / `not_applicable` when nothing is needed.
+function useAppConsentQuery(appId) {
+  return useQuery({
+    queryKey: ['app-consent', appId],
+    enabled: !!appId,
+    queryFn: () => fetchAppConsent(appId),
+    staleTime: 60_000,
+  })
+}
+
+function useAppTokenQuery(appId, { enabled = true } = {}) {
   return useQuery({
     queryKey: ['app-token', appId],
-    enabled: !!appId,
+    enabled: !!appId && enabled,
     queryFn: () => fetchAppToken(appId),
     staleTime: 5 * 60_000,
     // Mounted canvases stay alive in the shell's LRU for many hours. Refresh
@@ -530,6 +570,13 @@ export const appQueries = {
   keys: {
     all: appsKey,
     token: (appId) => ['app-token', appId],
+    consent: (appId) => ['app-consent', appId],
+  },
+  consent: {
+    key: (appId) => ['app-consent', appId],
+    fetch: fetchAppConsent,
+    useQuery: useAppConsentQuery,
+    invalidate: (queryClient, appId) => queryClient.invalidateQueries({ queryKey: ['app-consent', appId] }),
   },
   list: {
     key: appsKey,
@@ -630,6 +677,7 @@ export const chatQueries = {
     messages: (chatId) => ['chat-messages', chatId],
     usage: chatUsageKey,
     currentUsage: chatCurrentUsageKey,
+    contextSizes: chatContextSizesKey,
   },
   list: {
     key: chatsKey,
@@ -651,6 +699,12 @@ export const chatQueries = {
     invalidate: (queryClient, chatId) => queryClient.invalidateQueries({
       queryKey: chatId ? chatUsageKey(chatId) : chatUsageRootKey,
     }),
+  },
+  contextSizes: {
+    key: chatContextSizesKey,
+    fetch: fetchChatContextSizes,
+    options: chatContextSizesQueryOptions,
+    useQuery: useChatContextSizesQuery,
   },
   currentUsage: {
     key: chatCurrentUsageKey,

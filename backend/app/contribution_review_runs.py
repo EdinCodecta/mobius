@@ -6,12 +6,13 @@ An ambiguous merge receipt is never retried: reconcile read-only or ask the owne
 """
 import json
 import re
-from datetime import datetime
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import HTTPException
-from sqlalchemy import update
+from sqlalchemy import String, cast, or_, update
 
 from app import agent_work_claims, models
 from app.contribution_errors import ContributionSubmitError
@@ -75,25 +76,29 @@ def inspect_target(gh, cwd: Path, item: dict, mode: str) -> dict:
     raise HTTPException(409, "A selected target branch changed. Refresh before reviewing.")
   if mode in {"review_merge", "review_fix_merge"} and not merge_permission(repo):
     raise HTTPException(403, "You cannot merge changes in this repository.")
-  repair_identity = {}
-  if mode == "review_fix_merge":
+  branch_identity = {}
+  if mode in {"review_merge", "review_fix_merge"}:
     head = pull.get("head") or {}
     head_repository = head.get("repo") or {}
     slug = head_repository.get("full_name")
     if not isinstance(slug, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug):
       raise HTTPException(409, "GitHub did not confirm the public head repository.")
-    head_repo = read(gh, cwd, f"repos/{slug}")
-    if head_repo.get("id") != head_repository.get("id") or not merge_permission(head_repo):
-      raise HTTPException(403, "Scoped takeover requires push rights on this exact head repository.")
-    if not head.get("ref"):
-      raise HTTPException(409, "GitHub did not confirm the public head branch.")
-    repair_identity = {"head_repo": head_repo["full_name"], "head_repo_id": head_repo["id"],
-                       "head_ref": head["ref"]}
+    branch = head_branch_identity({"head_repo_id": head_repository.get("id"), "head_ref": head.get("ref")})
+    if branch is None:
+      raise HTTPException(409, "GitHub did not confirm a usable public head repository and branch.")
+    branch_identity = {"head_repo": slug, "head_repo_id": branch[0], "head_ref": branch[1]}
+    # Branch exclusion is identity, not repair authority. An ordinary merge
+    # needs rights on the target repository, never push rights to a PR's fork.
+    if mode == "review_fix_merge":
+      head_repo = read(gh, cwd, f"repos/{slug}")
+      if head_repo.get("id") != branch[0] or not merge_permission(head_repo):
+        raise HTTPException(403, "Scoped takeover requires push rights on this exact head repository.")
+      branch_identity["head_repo"] = head_repo["full_name"]
   return {
-    **item, **repair_identity, "repo": repo["full_name"], "repo_id": repo["id"],
+    **item, **branch_identity, "repo": repo["full_name"], "repo_id": repo["id"],
     "pr_id": pull["node_id"], "base_ref": base_ref,
     "base_sha": item["base_sha"], "title": pull["title"],
-    "url": pull["html_url"],
+    "url": pull["html_url"], "is_draft": pull.get("draft") is True,
   }
 
 
@@ -139,9 +144,9 @@ def merge_blocker(target, repo, pull, pr) -> str | None:
 def checks_blocker(pr) -> str | None:
   """Gate on the head commit's check rollup.
 
-  GitHub reports a null rollup when the repository has no checks configured;
-  that never changes, so it is not a pending state. Any rollup that exists
-  must have succeeded.
+  A null rollup is accepted under the no-required-checks assumption; checks
+  may still register later. Fresh dispatch checks and GitHub protections remain
+  authoritative. Any rollup that exists must have succeeded.
   """
   commits = (pr.get("commits") or {}).get("nodes") or []
   if len(commits) != 1:
@@ -181,190 +186,9 @@ def enqueue(gh, cwd, target):
   return entry
 
 
-def merge_attempted(outcome):
-  return outcome.get("merge_attempted") is True or outcome.get("state") in {
-    "merging", "merge_unknown", "queued", "merged"}
-
-
-def queue_receipt(entry):
-  # Do not replace a saved admission with a later external requeue.
-  timestamp = entry.get("enqueuedAt")
-  if _queue_time(timestamp) is None:
-    # Only receipts saved before this protocol may use the legacy exception.
-    return {"queue_entry_id": entry["id"], "queue_receipt_unconfirmed": True}
-  return {"queue_entry_id": entry["id"], "queue_enqueued_at": timestamp}
-
-
-def _queue_time(value):
-  if not isinstance(value, str) or len(value) > 40:
-    return None
-  try:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo is not None else None
-  except ValueError:
-    return None
-
-
-def confirmed_queue_removal(gh, cwd, target, previous):
-  """Prove the saved admission ended, never infer it from missing entry/checks.
-
-  Queue removal events have no entry id, and beforeCommit is a synthetic
-  merge-group commit, NOT the PR head. Match the final admission by timestamp;
-  legacy receipts require a unique pair in the complete queue-event history.
-  A bounded incomplete history deliberately blocks rather than guessing.
-  """
-  if (not previous.get("queue_entry_id") or previous.get("queue_receipt_unconfirmed")
-      or previous.get("head_sha") != target["head_sha"]):
-    return None
-  query = """query($id:ID!){node(id:$id){... on PullRequest {
-    id headRefOid state merged mergeQueueEntry{id}
-    timelineItems(last:100,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){
-      pageInfo{hasPreviousPage hasNextPage} nodes{
-        __typename
-        ... on AddedToMergeQueueEvent{id createdAt}
-        ... on RemovedFromMergeQueueEvent{id createdAt}
-      }
-    }
-  }}}"""
-  try:
-    result = json.loads(gh(cwd, "api", "graphql", "-f", f"query={query}",
-      "-f", f"id={target['pr_id']}").stdout)
-    pr = (result.get("data") or {}).get("node") or {}
-    if (result.get("errors") or pr.get("id") != target["pr_id"]
-        or pr.get("headRefOid") != target["head_sha"] or pr.get("state") != "OPEN"
-        or pr.get("merged") is not False or "mergeQueueEntry" not in pr
-        or pr["mergeQueueEntry"] is not None):
-      return None
-    timeline = pr.get("timelineItems") or {}
-    page = timeline.get("pageInfo") or {}
-    events = timeline.get("nodes")
-    if (page.get("hasPreviousPage") is not False or page.get("hasNextPage") is not False
-        or not isinstance(events, list) or not 2 <= len(events) <= 100 or len(events) % 2):
-      return None
-    last_time = None
-    ids = set()
-    for index, event in enumerate(events):
-      expected = "AddedToMergeQueueEvent" if index % 2 == 0 else "RemovedFromMergeQueueEvent"
-      timestamp = _queue_time(event.get("createdAt"))
-      event_id = event.get("id")
-      if (event.get("__typename") != expected or not isinstance(event_id, str)
-          or not re.fullmatch(r"[A-Za-z0-9_+/=-]{1,256}", event_id)
-          or event_id in ids or timestamp is None
-          or (last_time is not None and timestamp <= last_time)):
-        return None
-      last_time = timestamp
-      ids.add(event_id)
-    added, removed = events[-2:]
-    enqueued_at = previous.get("queue_enqueued_at")
-    if enqueued_at is None:
-      if len(events) != 2:
-        return None
-    elif _queue_time(enqueued_at) != _queue_time(added["createdAt"]):
-      return None
-    proof = {"queue_entry_id": previous["queue_entry_id"],
-      "head_sha": target["head_sha"], "added_event_id": added["id"],
-      "enqueued_at": added["createdAt"], "removed_event_id": removed["id"],
-      "removed_at": removed["createdAt"]}
-    if previous.get("queue_removal") not in (None, proof):
-      return None
-    return proof
-  except Exception:
-    # Never expose raw provider diagnostics/reasons as review evidence.
-    return None
-
-
-def reconcile_merge(gh, cwd, target, previous, pull):
-  if pull.get("merged"):
-    return {**previous, "state": "merged", "merge_sha": pull.get("merge_commit_sha")}
-  checks = pull_checks(gh, cwd, target)
-  entry = queue_entry(checks, target)
-  if entry:
-    receipt = {} if previous.get("queue_entry_id") else {
-      "queue_entry_id": entry["id"], "queue_receipt_unconfirmed": True}
-    return {**previous, **receipt, "state": "queued"}
-  proof = confirmed_queue_removal(gh, cwd, target, previous)
-  if pull.get("state") == "open" and proof:
-    history = list(previous.get("merge_attempts", []))
-    if not any(a.get("head_sha") == target["head_sha"] for a in history):
-      # Snapshot the complete prior attempt/review before repair can replace
-      # active state or evidence. Exclude aggregate audit lists to avoid
-      # recursively copying earlier attempts at every successor.
-      snapshot = {k: v for k, v in previous.items() if k not in {
-        "steps", "merge_attempts", "repair_attempts"}}
-      history.append({**snapshot, "merge_attempted": True, "queue_removal": proof})
-    return {**previous, "merge_attempts": history,
-      "merge_attempted": True, "state": "needs_you", "queue_removal": proof,
-      "summary": "The saved queue admission was removed. Only a new repaired successor with fresh independent review may proceed; this head cannot be retried."}
-  return {**previous, "state": "merge_unknown",
-    "summary": "The exact earlier merge/queue attempt remains unclear. It was not repeated."}
-
-
-def require_repairable_merge(gh, cwd, target, previous):
-  """Revalidate immediately before checkout/public repair, not just observation."""
-  if not merge_attempted(previous):
-    return
-  repo, pull = current_pull(gh, cwd, target)
-  if not merge_permission(repo):
-    raise HTTPException(403, "Your repository write permission is no longer available.")
-  proof = confirmed_queue_removal(gh, cwd, target, previous)
-  if pull.get("state") != "open" or pull.get("merged") or not proof:
-    raise HTTPException(409, "The saved merge attempt has no confirmed queue removal. No repair may start.")
-  if previous.get("queue_removal") != proof:
-    raise HTTPException(409, "Observe the confirmed queue removal before preparing a repaired successor.")
-
-
-def confirmed_successor(previous, attempts, receipt):
-  """Keep the archived predecessor while clearing ONLY its active overlay."""
-  outcome = dict(previous)
-  if merge_attempted(previous):
-    if (not previous.get("queue_removal") or receipt["head_sha"] == previous.get("head_sha")):
-      raise HTTPException(409, "A merge attempt cannot be cleared without a newly repaired successor.")
-    fields = ("head_sha", "merge_attempted", "queue_entry_id", "queue_enqueued_at",
-              "queue_removal", "merge_sha")
-    if not any(a.get("head_sha") == previous.get("head_sha")
-        and a.get("queue_removal") == previous["queue_removal"]
-        and merge_attempted(a) for a in previous.get("merge_attempts", [])):
-      raise HTTPException(409, "The removed attempt must retain its immutable history.")
-    for field in (*fields, "queue_receipt_unconfirmed", "reviewed_base_sha", "independent_receipt_id", "scope", "tests", "tests_passed"):
-      outcome.pop(field, None)
-  return {**outcome, "repair_attempts": attempts,
-    "successor": {"head_sha": receipt["head_sha"], "base_sha": receipt["base_sha"]},
-    "head_sha": receipt["head_sha"], "state": "reviewing",
-    "summary": "Repair published; fresh independent full-diff review required."}
-
-
-def review_comment_body(outcome: dict) -> str:
-  """The public text of an owner-requested review: verdict, findings, checks."""
-  verdict = "All clear" if outcome.get("state") == "all_clear" else "Changes suggested"
-  parts = [f"**Möbius review: {verdict}**", "", (outcome.get("summary") or "").strip()]
-  if (outcome.get("tests") or "").strip():
-    parts += ["", f"**Checks:** {outcome['tests'].strip()}"]
-  parts += ["", f"_Reviewed at {str(outcome.get('head_sha') or '')[:12]}._"]
-  return "\n".join(parts)
-
-
-def post_review(gh, cwd, target, body):
-  """One COMMENT review bound to the exact reviewed head: never an approval."""
-  response = gh(
-    cwd, "api", "--method", "POST",
-    f"repos/{target['repo']}/pulls/{target['number']}/reviews",
-    "--input", "-", input_text=json.dumps({
-      "commit_id": target["head_sha"], "event": "COMMENT", "body": body,
-    }),
-  ).stdout
-  result = json.loads(response)
-  if not isinstance(result, dict) or not result.get("id"):
-    raise HTTPException(409, "GitHub did not confirm the posted review.")
-  return {"id": result["id"], "url": result.get("html_url")}
-
-
-def perform_merge(gh, cwd, target, repo):
-  method = next((method for method, setting in (
-    ("squash", "allow_squash_merge"), ("merge", "allow_merge_commit"),
-    ("rebase", "allow_rebase_merge"),
-  ) if repo.get(setting) is True), None)
-  if method is None:
-    raise HTTPException(409, "GitHub did not provide an allowed merge method.")
+def perform_merge(gh, cwd, target, repo, *, method=None):
+  # Resolve method before dispatch; a refusal here is definitely nonattempted.
+  method = method or merge_method(repo)
   response = gh(
     cwd, "api", "--method", "PUT",
     f"repos/{target['repo']}/pulls/{target['number']}/merge",
@@ -389,32 +213,61 @@ def merge_work_key(target):
   return f"github:{target['repo'].lower()}:pr:{target['number']}:{target['head_sha']}:merge"
 
 
-def draft_ready_allowed(row):
-  return (row.mode == "review_fix_merge" and
-    (row.options_json or {}).get("confirmation_scope") == "named_pr_repairs_ready_and_reviewed_successors")
+def fence_public_transition(db, row):
+  """Serialize admission, not public I/O, across distinct action work keys.
+
+  The existing owner row is a cross-process write fence shared by merge,
+  repair and readiness. Hold it through the pending-receipt check and receipt
+  commit: per-action claims alone cannot exclude an incompatible action.
+  """
+  db.execute(update(models.Owner).where(models.Owner.id == row.owner_id).values(
+    id=models.Owner.id))
 
 
-def readiness_blocker(target, repo, pull, pr):
-  if not merge_permission(repo):
-    return "Your repository write permission is no longer available."
-  if pull.get("state") != "open" or pull.get("merged") or pull.get("draft") is not True:
-    return "This exact pull request is not an open draft."
-  if pr.get("headRefOid") != target["head_sha"]:
-    return "The pull request changed during the readiness check."
-  return checks_blocker(pr)
+def head_branch_identity(target) -> tuple[int, str] | None:
+  """A usable immutable branch pair, or historical evidence we cannot match."""
+  repo_id, ref = target.get("head_repo_id"), target.get("head_ref")
+  if type(repo_id) is not int or repo_id <= 0 or not isinstance(ref, str) or not ref or ref.strip() != ref:
+    return None
+  return repo_id, ref
 
 
-def mark_ready(gh, cwd, target):
-  # GitHub's mutation has no expected-head parameter: caller must hold the
-  # credential lock and recheck the exact PR immediately before this call.
-  query = """mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft headRefOid}}}"""
-  result = json.loads(gh(cwd, "api", "graphql", "-f", f"query={query}",
-    "-f", f"id={target['pr_id']}").stdout)
-  pull = ((result.get("data") or {}).get("markPullRequestReadyForReview") or {}).get("pullRequest")
-  if (result.get("errors") or not isinstance(pull, dict) or pull.get("id") != target["pr_id"]
-      or pull.get("headRefOid") != target["head_sha"] or pull.get("isDraft") is not False):
-    raise HTTPException(409, "GitHub did not confirm readiness of the exact pull request.")
-  return pull
+def require_public_transition_clear(db, row, target):
+  """New mutations must not cross an unresolved item or head-branch attempt.
+
+  Observation and exact-action replay are handled before this boundary. Never
+  infer resolution from the PR projection, which can lag a public branch push.
+  Call again under the database fence after claim acquisition commits.
+  """
+  grants = db.query(models.ContributionReviewRun).filter_by(
+    owner_id=row.owner_id).populate_existing().all()
+  original = next(t for t in row.targets_json if key(t) == key(target))
+  current = effective_target(row, original)
+  if current["head_sha"] != target["head_sha"] or current["base_sha"] != target["base_sha"]:
+    raise HTTPException(409, "This review target changed during public admission.")
+  branch = head_branch_identity(target)
+  for grant in grants:
+    for original in grant.targets_json:
+      item = (grant.outcomes_json or {}).get(key(original), {})
+      merge_pending = (item.get("state") != "merged" and merge_attempted(item)
+        and not (grant.id == row.id and item.get("queue_removal")))
+      repair_pending = any(a.get("state") in {"pushing", "push_unknown"}
+        for a in item.get("repair_attempts", []))
+      ready = item.get("ready_attempt")
+      unresolved = merge_pending or repair_pending or (ready and ready.get("state") != "ready")
+      merged_head = item.get("state") == "merged" and item.get("head_sha") == target["head_sha"]
+      if not (unresolved or merged_head):
+        continue
+      other_branch = head_branch_identity(original)
+      same_item = key(original) == key(target)
+      same_branch = branch is not None and other_branch == branch
+      # Missing legacy identity is not evidence of disjointness. Do not fill
+      # frozen consent from live data, or assume an uncertain attempt settled.
+      unmatchable_pending = unresolved and (branch is None or other_branch is None)
+      if same_item or same_branch or unmatchable_pending:
+        raise HTTPException(409,
+          "An earlier public attempt may affect this PR or head branch. Reconcile "
+          "it read-only in its owning conversation before any new public action.")
 
 
 def arm_merge(db, row, target, outcome, principal):
@@ -425,85 +278,63 @@ def arm_merge(db, row, target, outcome, principal):
   That receipt also prevents replay after a claim was released or transferred.
   """
   work_key = merge_work_key(target)
-  claim = agent_work_claims.claim_work(db, owner_id=row.owner_id,
-    chat_id=row.chat_id, run_id=principal.run_id, work_key=work_key,
-    summary=f"Review and merge {key(target)} at {target['head_sha'][:12]}.")
+  claim = reserve_public_work(db, row, principal, work_key, f"Review and merge {key(target)} at {target['head_sha'][:12]}.", "Merge")
   if claim["state"] in {"held_by_peer", "completed"}:
+    follow_status = claim.get("follow_status", "no_goal_follow")
+    follows = follow_status in {"followed", "result_owed"}
     return {**outcome, "state": "needs_you", "review_chat_id": claim["owner_chat_id"],
-            "summary": "This exact merge already has an owning conversation. Open that conversation to follow its result."}
+            "goal_follow_status": follow_status,
+            "summary": ("This exact merge already has an owning conversation. Open that conversation. "
+                        + ("Your Goal follows this claim and will receive its result." if follows else
+                           f"No new Goal follow was created ({follow_status}); reconcile the result yourself."))}
   # Keep this write and save_outcome in one transaction. A second worker must
   # wait for the first receipt before checking other overlapping batches.
-  fenced = db.execute(update(models.AgentWorkClaim).where(
-    models.AgentWorkClaim.id == claim["id"],
-    models.AgentWorkClaim.revision == claim["revision"],
-    models.AgentWorkClaim.owner_chat_id == row.chat_id,
-    models.AgentWorkClaim.completed_at.is_(None),
-    models.AgentWorkClaim.released_at.is_(None),
-  ).values(owner_run_id=principal.run_id))
-  if fenced.rowcount != 1:
-    db.rollback()
-    raise HTTPException(409, "Merge ownership changed. No new attempt was started.")
   item_key = key(target)
-  grants = db.query(models.ContributionReviewRun).filter_by(
-    owner_id=row.owner_id).populate_existing().all()
-  previous = next((grant for grant in grants if any(
-    attempt.get("head_sha") == target["head_sha"] and merge_attempted(attempt)
-    for attempt in [
-      (grant.outcomes_json or {}).get(item_key, {}),
-      *(grant.outcomes_json or {}).get(item_key, {}).get("merge_attempts", []),
-    ])), None)
+  item = models.ContributionReviewRun.outcomes_json[item_key]
+  # Filter by PR key and either the current attempt or a historical same-head
+  # attempt. The second clause is a coarse SQL prefilter; Python proves shape.
+  candidates = db.query(models.ContributionReviewRun.id,
+      models.ContributionReviewRun.chat_id, item).filter(
+    models.ContributionReviewRun.owner_id == row.owner_id,
+    or_(item["head_sha"].as_string() == target["head_sha"],
+      cast(item["merge_attempts"], String).like(f"%{target['head_sha']}%")),
+  ).all()
+  previous = next(((grant_id, chat_id, saved) for grant_id, chat_id, saved in candidates
+    if isinstance(saved, dict) and any(
+      isinstance(attempt, dict) and attempt.get("head_sha") == target["head_sha"]
+        and merge_attempted(attempt)
+      for attempt in [saved, *(saved.get("merge_attempts") if isinstance(saved.get("merge_attempts"), list) else [])])), None)
   if previous is not None:
     # Claim acquisition commits and refreshes ORM state. Recheck this row too:
     # another worker may have armed it while this one awaited GitHub preflight.
-    result = {**previous.outcomes_json[item_key], "review_selection_id": previous.id} if previous.id == row.id and previous.outcomes_json[item_key].get("head_sha") == target["head_sha"] else {
-              **outcome, "state": "needs_you", "review_chat_id": previous.chat_id,
-              "review_selection_id": previous.id,
+    prior_id, prior_chat_id, prior_item = previous
+    result = {**prior_item, "review_selection_id": prior_id} if prior_id == row.id and prior_item.get("head_sha") == target["head_sha"] else {
+              **outcome, "state": "needs_you", "review_chat_id": prior_chat_id,
+              "review_selection_id": prior_id,
               "summary": "An earlier review already attempted this exact merge. Follow its saved result; no request was repeated."}
     db.rollback()
     return result
-  save_outcome(db, row, item_key, {**outcome, "state": "merging", "merge_attempted": True})
+  require_public_transition_clear(db, row, target)
+  # Claim acquisition may have admitted new reviewer/other-action receipts.
+  # Carry forward those current audit lists, not the preflight's older copy.
+  review_fields = ("summary", "scope", "tests", "tests_passed", "reviewed_base_sha",
+    "independent_receipt_id", "head_sha", "review_chat_id", "review_run_id")
+  armed = {**row.outcomes_json.get(item_key, {}),
+    **{k: outcome[k] for k in review_fields if k in outcome},
+    "state": "merging", "merge_attempted": True}
+  save_outcome(db, row, item_key, armed)
   return None
 
 
-def arm_ready(db, row, target, receipt, principal):
-  """Fence one readiness mutation per exact PR/head across overlapping grants."""
-  work_key = f"github:{target['repo'].lower()}:pr:{target['number']}:{target['head_sha']}:ready"
-  claim = agent_work_claims.claim_work(db, owner_id=row.owner_id,
-    chat_id=row.chat_id, run_id=principal.run_id, work_key=work_key,
-    summary=f"Mark reviewed draft {key(target)} ready at {target['head_sha'][:12]}.")
-  if claim["state"] in {"held_by_peer", "completed"}:
-    raise HTTPException(409, "This draft readiness already has an owning conversation. Follow its saved result.")
-  fenced = db.execute(update(models.AgentWorkClaim).where(
-    models.AgentWorkClaim.id == claim["id"],
-    models.AgentWorkClaim.revision == claim["revision"],
-    models.AgentWorkClaim.owner_chat_id == row.chat_id,
-    models.AgentWorkClaim.completed_at.is_(None),
-    models.AgentWorkClaim.released_at.is_(None),
-  ).values(owner_run_id=principal.run_id))
-  if fenced.rowcount != 1:
-    db.rollback()
-    raise HTTPException(409, "Draft readiness ownership changed. No public attempt started.")
-  item_key = key(target)
-  prior = db.query(models.ContributionReviewRun).filter(
-    models.ContributionReviewRun.owner_id == row.owner_id,
-    models.ContributionReviewRun.outcomes_json[item_key]["ready_attempt"]["head_sha"].as_string() == target["head_sha"],
-  ).populate_existing().first()
-  if prior is not None:
-    db.rollback()
-    raise HTTPException(409, "An earlier draft readiness attempt is saved. Reconcile it read-only; do not repeat it.")
-  db.refresh(row)
-  previous = (row.outcomes_json or {}).get(item_key, {})
-  save_outcome(db, row, item_key, {**previous, "ready_attempt": receipt})
-
-
-def save_outcome(db, row, item_key, outcome):
+def write_outcome(db, row, item_key, outcome):
+  """CAS an outcome inside the caller's admission transaction; do not commit."""
   revision = row.revision
   previous = (row.outcomes_json or {}).get(item_key, {})
-  history = list(previous.get("steps", []))
+  history = list(previous.get("steps", []))[-99:]
   # Receipts are already retained in the owning item's dedicated audit lists.
   # A small step envelope avoids recursively copying all history each time.
   history.append({k: outcome[k] for k in (
-    "state", "head_sha", "summary", "review_run_id", "merge_attempted", "merge_sha"
+    "state", "head_sha", "review_run_id", "merge_attempted", "merge_sha"
   ) if k in outcome})
   outcomes = {**row.outcomes_json, item_key: {**outcome, "steps": history}}
   changed = db.execute(update(models.ContributionReviewRun).where(
@@ -513,6 +344,10 @@ def save_outcome(db, row, item_key, outcome):
   if changed.rowcount != 1:
     db.rollback()
     raise HTTPException(409, "This review changed. Refresh before continuing.")
+
+
+def save_outcome(db, row, item_key, outcome):
+  write_outcome(db, row, item_key, outcome)
   db.commit()
   db.refresh(row)
 
@@ -543,7 +378,7 @@ def view(row):
           "options": row.options_json,
           "created_at": row.created_at.isoformat() + "Z",
           "items": [{**t, "approved_head_sha": t["head_sha"], "approved_base_sha": t["base_sha"],
-                     "work_key": merge_work_key(effective_target(row, t)), **item}
+                     "work_key": merge_work_key(effective_target(row, t)), "current_base_sha": effective_target(row,t)["base_sha"], **item}
                     for t, item in zip(row.targets_json, projected_items)]}
 
 
@@ -617,24 +452,89 @@ def run_endpoint(row):
 
 
 def effective_target(row, original):
-  """Only a confirmed server-push receipt can introduce a successor version."""
+  """The exact (head, base) version this grant may currently review and merge.
+
+  Only a confirmed server-push receipt can introduce a successor head. Only a
+  server-observed advance of the live target branch, for that same unchanged
+  head, can introduce a newer base (see ``observe_base_advance``).
+  """
   if row.mode != "review_fix_merge":
     return original
   outcome = (row.outcomes_json or {}).get(key(original), {})
+  target = _receipted_target(original, outcome)
+  advance = outcome.get("base_advance")
+  if (isinstance(advance, dict) and advance.get("head_sha") == target["head_sha"]
+      and advance.get("from_base_sha") == target["base_sha"]):
+    return {**target, "base_sha": advance["base_sha"]}
+  return target
+
+
+def _receipted_target(original, outcome):
   successor = outcome.get("successor")
   if successor is None:
     return original
   receipts = outcome.get("repair_attempts", [])
   current = original["head_sha"]
+  confirmed = None
   for receipt in receipts:
     if receipt.get("state") != "pushed":
       break
     if receipt.get("from_sha") != current:
       raise HTTPException(409, "The repair receipt chain is ambiguous. Clarify with the owner.")
     current = receipt["head_sha"]
-  if successor.get("head_sha") != current or not receipts or successor.get("base_sha") != receipts[-1].get("base_sha"):
+    confirmed = receipt
+  if successor.get("head_sha") != current or confirmed is None or successor.get("base_sha") != confirmed.get("base_sha"):
     raise HTTPException(409, "This successor has no confirmed guarded repair receipt.")
   return {**original, "head_sha": successor["head_sha"], "base_sha": successor["base_sha"]}
+
+
+def base_advance_eligible(row, previous) -> bool:
+  """Whether a moved target branch may become a newer reviewed base.
+
+  Scoped takeover only: the pinned modes bind their exact selected base. Any
+  saved public attempt (merge, uncertain push, unsettled readiness) must be
+  reconciled first; a base observation never clears or replaces a receipt.
+  """
+  attempt = previous.get("ready_attempt")
+  return (row.mode == "review_fix_merge" and not (previous.get("merge_attempted") or previous.get("state") in {"merging", "merge_unknown", "queued", "merged"})
+          and not (attempt and attempt.get("state") != "ready")
+          and not any(r.get("state") in {"pushing", "push_unknown"}
+                      for r in previous.get("repair_attempts", [])))
+
+
+def observe_base_advance(gh, cwd, row, original, previous) -> dict | None:
+  """Read the live target tip; return the outcome recording its advance, or None.
+
+  None means the base is unchanged or this item cannot advance. The advance is
+  accepted only when GitHub proves the new tip strictly descends from the
+  current reviewed base, so a rewritten target branch still needs the owner.
+  All earlier verdicts are dropped: a fresh independent review of the same
+  head against the new base is required before any merge. The caller must
+  revalidate the live head and run before persisting the returned outcome.
+  """
+  if not base_advance_eligible(row, previous):
+    return None
+  target = effective_target(row, original)
+  live = base_head(gh, cwd, target["repo"], target["base_ref"])
+  if live == target["base_sha"]:
+    return None
+  compare = read(gh, cwd, f"repos/{target['repo']}/compare/{target['base_sha']}...{live}")
+  if (not isinstance(compare, dict) or compare.get("status") != "ahead"
+      or (compare.get("base_commit") or {}).get("sha") != target["base_sha"]
+      or (compare.get("merge_base_commit") or {}).get("sha") != target["base_sha"]):
+    raise HTTPException(409, "The target branch was rewritten rather than advanced. Ask the owner how to continue.")
+  chain_start = _receipted_target(original, previous)["base_sha"]
+  prior = previous.get("base_advance") or {}
+  count = prior.get("count", 0) + 1 if prior.get("head_sha") == target["head_sha"] else 1
+  outcome = {k: v for k, v in previous.items() if k not in {
+    "reviewed_base_sha", "independent_receipt_id", "scope", "tests", "tests_passed", "next_step"}}
+  return {**outcome, "state": "reviewing", "head_sha": target["head_sha"],
+    "base_advance": {"head_sha": target["head_sha"], "from_base_sha": chain_start,
+                     "base_sha": live, "previous_base_sha": target["base_sha"],
+                     "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "count": count},
+    "next_step": {"action": "independent_review", "head_sha": target["head_sha"], "base_sha": live},
+    "summary": (f"The target branch advanced to {live[:12]}. This unchanged head needs a fresh "
+                "independent review against the new base before merge.")}
 
 
 def require_independent_clear(row, target, body):
@@ -725,10 +625,6 @@ all six scope values, tests and tests_passed. The server alone checks live base,
 checks, permissions and attempts exact normal merge/queue using its durable fence.
 POST {endpoint}/observe is read-only GitHub reconciliation of saved attempts;
 it can run after Stop but never starts agents or repeats a push/merge.
-A confirmed removed queue admission retains its immutable attempt history.
-Only after observation proves removal may /repair-checkout prepare a NEW
-successor; /repairs rechecks that proof before publication. Never retry the
-removed head, even under another grant. Unknown or active attempts stay blocked.
 For pending checks or a queue use the EXISTING durable Wait capability, not a
 transient poll process or second queue. Observation cannot start a stopped run.
 Keep every step in this one owning chat and expose concrete blockers to the owner.
@@ -744,22 +640,13 @@ def arm_repair(db, row, target, previous, receipt, principal):
   authorize a second push after an ambiguous public outcome.
   """
   work_key = f"github:{target['head_repo'].lower()}:branch:{target['head_ref']}:{target['head_sha']}:repair"
-  claim = agent_work_claims.claim_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
-    run_id=principal.run_id, work_key=work_key, summary=f"Scoped repair of {key(target)} at {target['head_sha'][:12]}.")
+  claim = reserve_public_work(db, row, principal, work_key, f"Scoped repair of {key(target)} at {target['head_sha'][:12]}.", "Repair")
   if claim["state"] in {"held_by_peer", "completed"}:
     db.refresh(row)
     summary = "This predecessor repair already belongs to another saved work outcome. Follow its owning chat."
     save_outcome(db, row, key(target), {**row.outcomes_json.get(key(target), {}),
       "state": "needs_you", "summary": summary, "review_chat_id": claim["owner_chat_id"]})
     return summary
-  fenced = db.execute(update(models.AgentWorkClaim).where(
-    models.AgentWorkClaim.id == claim["id"], models.AgentWorkClaim.revision == claim["revision"],
-    models.AgentWorkClaim.owner_chat_id == row.chat_id,
-    models.AgentWorkClaim.completed_at.is_(None), models.AgentWorkClaim.released_at.is_(None),
-  ).values(owner_run_id=principal.run_id))
-  if fenced.rowcount != 1:
-    db.rollback()
-    raise HTTPException(409, "Repair ownership changed. No public attempt started.")
   grants = db.query(models.ContributionReviewRun).filter_by(owner_id=row.owner_id).populate_existing().all()
   for grant in grants:
     for item in (grant.outcomes_json or {}).values():
@@ -773,10 +660,7 @@ def arm_repair(db, row, target, previous, receipt, principal):
             "state": "needs_you", "summary": summary, "review_chat_id": owner_chat_id,
             "review_selection_id": selection_id})
           return summary
-  db.refresh(row)
-  if effective_target(row, next(t for t in row.targets_json if key(t) == key(target)))["head_sha"] != target["head_sha"]:
-    db.rollback()
-    raise HTTPException(409, "This predecessor changed while reserving the repair.")
+  require_public_transition_clear(db, row, target)
   previous = row.outcomes_json.get(key(target), {})
   save_outcome(db, row, key(target), {**previous, "state": "pushing",
     "repair_attempts": [*previous.get("repair_attempts", []), {**receipt, "work_key": work_key}]})
@@ -815,3 +699,329 @@ repo, number, head_sha, reviewed_base_sha, state all_clear or needs_you, summary
 all six scope values, tests and tests_passed boolean. Failed or unclear tests
 must not be all_clear. Return findings to the owning parent conversation.
 """.strip()
+
+
+def confirmed_successor(previous, attempts, receipt):
+  """Keep the archived predecessor while clearing ONLY its active overlay."""
+  outcome = dict(previous)
+  if merge_attempted(previous):
+    if (not previous.get("queue_removal") or receipt["head_sha"] == previous.get("head_sha")):
+      raise HTTPException(409, "A merge attempt cannot be cleared without a newly repaired successor.")
+    fields = ("head_sha", "merge_attempted", "queue_entry_id", "queue_enqueued_at",
+              "queue_removal", "merge_sha")
+    if not any(a.get("head_sha") == previous.get("head_sha")
+        and a.get("queue_removal") == previous["queue_removal"]
+        and merge_attempted(a) for a in previous.get("merge_attempts", [])):
+      raise HTTPException(409, "The removed attempt must retain its immutable history.")
+    for field in (*fields, "queue_receipt_unconfirmed", "reviewed_base_sha", "independent_receipt_id", "scope", "tests", "tests_passed"):
+      outcome.pop(field, None)
+  for field in ("base_advance", "checkout", "reviewed_base_sha", "independent_receipt_id", "scope", "tests", "tests_passed", "next_step"):
+    outcome.pop(field, None)
+  return {**outcome, "repair_attempts": attempts,
+    "successor": {"head_sha": receipt["head_sha"], "base_sha": receipt["base_sha"]},
+    "head_sha": receipt["head_sha"], "state": "reviewing",
+    "summary": "Repair published; fresh independent full-diff review required."}
+
+
+def merge_method(repo):
+  method = next((method for method, setting in (
+    ("squash", "allow_squash_merge"), ("merge", "allow_merge_commit"),
+    ("rebase", "allow_rebase_merge"),
+  ) if repo.get(setting) is True), None)
+  if method is None:
+    raise HTTPException(409, "GitHub did not provide an allowed merge method.")
+  return method
+
+
+def disarm_merge(db, row, target, outcome, reason):
+  """Release only this run's definitely unspent merge reservation."""
+  current = (row.outcomes_json or {}).get(key(target), {})
+  if current.get("state") != "merging" or current.get("review_selection_id", row.id) != row.id:
+    raise HTTPException(409, "The merge reservation changed; it cannot be released.")
+  save_outcome(db, row, key(target), {**outcome, "state": "needs_you",
+    "summary": reason, "merge_attempted": False})
+  agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
+    work_key=merge_work_key(target), outcome=reason, release=True)
+
+
+def save_effect_outcome(db, row, item_key, outcome):
+  """Persist a remote fact despite concurrent Stop without losing its revocation.
+
+  This is a CAS merge of one target slot, not a public retry. Read-only
+  observation can race the dispatcher; never downgrade its confirmed merge.
+  """
+  for _ in range(4):
+    db.refresh(row)
+    current = (row.outcomes_json or {}).get(item_key, {})
+    if current.get("state") == "merged" and outcome.get("state") != "merged":
+      return
+    revision = row.revision
+    values = {**row.outcomes_json, item_key: outcome}
+    changed = db.execute(update(models.ContributionReviewRun).where(
+      models.ContributionReviewRun.id == row.id,
+      models.ContributionReviewRun.revision == revision,
+    ).values(outcomes_json=values, revision=revision + 1))
+    if changed.rowcount == 1:
+      db.commit()
+      db.refresh(row)
+      return
+    db.rollback()
+  raise HTTPException(409, "The remote result could not be recorded after concurrent changes; observe this run.")
+
+
+def draft_ready_allowed(row):
+  return (row.mode == "review_fix_merge" and
+    (row.options_json or {}).get("confirmation_scope") == "named_pr_repairs_ready_and_reviewed_successors")
+
+
+def readiness_blocker(target, repo, pull, pr):
+  if not merge_permission(repo):
+    return "Your repository write permission is no longer available."
+  if pull.get("state") != "open" or pull.get("merged") or pull.get("draft") is not True:
+    return "This exact pull request is not an open draft."
+  if pr.get("headRefOid") != target["head_sha"]:
+    return "The pull request changed during the readiness check."
+  return checks_blocker(pr)
+
+
+def mark_ready(gh, cwd, target):
+  # GitHub's mutation has no expected-head parameter: caller must hold the
+  # credential lock and recheck the exact PR immediately before this call.
+  query = """mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft headRefOid}}}"""
+  result = json.loads(gh(cwd, "api", "graphql", "-f", f"query={query}",
+    "-f", f"id={target['pr_id']}").stdout)
+  pull = ((result.get("data") or {}).get("markPullRequestReadyForReview") or {}).get("pullRequest")
+  if (result.get("errors") or not isinstance(pull, dict) or pull.get("id") != target["pr_id"]
+      or pull.get("headRefOid") != target["head_sha"] or pull.get("isDraft") is not False):
+    raise HTTPException(409, "GitHub did not confirm readiness of the exact pull request.")
+  return pull
+
+
+def reserve_public_work(db, row, principal, work_key, summary, action):
+  """Claim an exact effect and fence its receipt against overlapping grants."""
+  claim = agent_work_claims.claim_work(db, owner_id=row.owner_id,
+    chat_id=row.chat_id, run_id=principal.run_id, work_key=work_key,
+    summary=summary)
+  if claim["state"] in {"held_by_peer", "completed"}:
+    return claim
+  # The owner-row write fence and the outcome save remain one transaction.
+  fence_public_transition(db, row)
+  fenced = db.execute(update(models.AgentWorkClaim).where(
+    models.AgentWorkClaim.id == claim["id"],
+    models.AgentWorkClaim.revision == claim["revision"],
+    models.AgentWorkClaim.owner_chat_id == row.chat_id,
+    models.AgentWorkClaim.completed_at.is_(None),
+    models.AgentWorkClaim.released_at.is_(None),
+  ).values(owner_run_id=principal.run_id))
+  if fenced.rowcount != 1:
+    db.rollback()
+    raise HTTPException(409, f"{action} ownership changed. No public attempt started.")
+  return claim
+
+
+def ready_work_key(target):
+  return f"github:{target['repo'].lower()}:pr:{target['number']}:{target['head_sha']}:ready"
+
+
+def arm_ready(db, row, target, receipt, principal):
+  """Fence one readiness mutation per exact PR/head across overlapping grants."""
+  work_key = ready_work_key(target)
+  claim = reserve_public_work(db, row, principal, work_key,
+    f"Mark reviewed draft {key(target)} ready at {target['head_sha'][:12]}.", "Draft readiness")
+  if claim["state"] in {"held_by_peer", "completed"}:
+    raise HTTPException(409, "This draft readiness already has an owning conversation. Follow its saved result.")
+  item_key = key(target)
+  prior = db.query(models.ContributionReviewRun).filter(
+    models.ContributionReviewRun.owner_id == row.owner_id,
+    models.ContributionReviewRun.outcomes_json[item_key]["ready_attempt"]["head_sha"].as_string() == target["head_sha"],
+  ).populate_existing().first()
+  if prior is not None:
+    db.rollback()
+    raise HTTPException(409, "An earlier draft readiness attempt is saved. Reconcile it read-only; do not repeat it.")
+  require_public_transition_clear(db, row, target)
+  previous = (row.outcomes_json or {}).get(item_key, {})
+  save_ready_attempt(db, row, item_key, receipt)
+
+
+def save_ready_attempt(db, row, item_key, receipt):
+  """Keep the admission and each observed transition as immutable audit entries."""
+  previous = (row.outcomes_json or {}).get(item_key, {})
+  audit = list(previous.get("ready_audit") or [])
+  event = {"id": receipt.get("id"), "state": receipt["state"],
+    "head_sha": receipt["head_sha"]}
+  if not audit or audit[-1] != event:
+    audit.append(event)
+  save = save_outcome if receipt["state"] == "attempting" else save_effect_outcome
+  save(db, row, item_key, {**previous, "ready_attempt": dict(receipt), "ready_audit": audit})
+
+
+def disarm_ready(db, row, target, receipt_id):
+  """Release only the exact still-unspent readiness reservation."""
+  db.rollback()
+  db.refresh(row)
+  item_key = key(target)
+  previous = (row.outcomes_json or {}).get(item_key, {})
+  attempt = previous.get("ready_attempt") or {}
+  if (attempt.get("state") != "attempting" or attempt.get("id") != receipt_id
+      or attempt.get("head_sha") != target["head_sha"]):
+    raise HTTPException(409, "The readiness reservation changed; it cannot be released.")
+  audit = [*(previous.get("ready_audit") or []),
+    {"id": receipt_id, "state": "not_dispatched", "head_sha": target["head_sha"]}]
+  save_outcome(db, row, item_key, {**{k: v for k, v in previous.items() if k != "ready_attempt"},
+    "ready_audit": audit})
+  agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
+    work_key=ready_work_key(target), outcome="Draft readiness was not attempted.", release=True)
+
+
+def merge_attempted(outcome):
+  return outcome.get("merge_attempted") is True or outcome.get("state") in {
+    "merging", "merge_unknown", "queued", "merged"}
+
+
+def queue_receipt(entry):
+  # Do not replace a saved admission with a later external requeue.
+  timestamp = entry.get("enqueuedAt")
+  if _queue_time(timestamp) is None:
+    # Only receipts saved before this protocol may use the legacy exception.
+    return {"queue_entry_id": entry["id"], "queue_receipt_unconfirmed": True}
+  return {"queue_entry_id": entry["id"], "queue_enqueued_at": timestamp}
+
+
+def _queue_time(value):
+  if not isinstance(value, str) or len(value) > 40:
+    return None
+  try:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo is not None else None
+  except ValueError:
+    return None
+
+
+def confirmed_queue_removal(gh, cwd, target, previous):
+  """Prove the saved admission ended, never infer it from missing entry/checks.
+
+  Queue removal events have no entry id, and beforeCommit is a synthetic
+  merge-group commit, NOT the PR head. Match the saved unique admission by timestamp;
+  legacy receipts require a unique pair in the complete queue-event history.
+  A bounded incomplete history deliberately blocks rather than guessing.
+  """
+  if (not previous.get("queue_entry_id") or previous.get("queue_receipt_unconfirmed")
+      or previous.get("head_sha") != target["head_sha"]):
+    return None
+  query = """query($id:ID!){node(id:$id){... on PullRequest {
+    id headRefOid state merged mergeQueueEntry{id}
+    timelineItems(last:100,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){
+      pageInfo{hasPreviousPage hasNextPage} nodes{
+        __typename
+        ... on AddedToMergeQueueEvent{id createdAt}
+        ... on RemovedFromMergeQueueEvent{id createdAt}
+      }
+    }
+  }}}"""
+  try:
+    result = json.loads(gh(cwd, "api", "graphql", "-f", f"query={query}",
+      "-f", f"id={target['pr_id']}").stdout)
+    if not isinstance(result, dict):
+      return None
+    data = result.get("data")
+    if not isinstance(data, dict):
+      return None
+    pr = data.get("node")
+    if not isinstance(pr, dict):
+      return None
+    if (result.get("errors") or pr.get("id") != target["pr_id"]
+        or pr.get("headRefOid") != target["head_sha"] or pr.get("state") != "OPEN"
+        or pr.get("merged") is not False or "mergeQueueEntry" not in pr
+        or pr["mergeQueueEntry"] is not None):
+      return None
+    timeline = pr.get("timelineItems")
+    if not isinstance(timeline, dict):
+      return None
+    page = timeline.get("pageInfo")
+    if not isinstance(page, dict):
+      return None
+    events = timeline.get("nodes")
+    if (page.get("hasPreviousPage") is not False or page.get("hasNextPage") is not False
+        or not isinstance(events, list) or not 2 <= len(events) <= 100 or len(events) % 2):
+      return None
+    last_time = None
+    ids = set()
+    for index, event in enumerate(events):
+      expected = "AddedToMergeQueueEvent" if index % 2 == 0 else "RemovedFromMergeQueueEvent"
+      if not isinstance(event, dict):
+        return None
+      timestamp = _queue_time(event.get("createdAt"))
+      event_id = event.get("id")
+      if (event.get("__typename") != expected or not isinstance(event_id, str)
+          or not re.fullmatch(r"[A-Za-z0-9_+/=-]{1,256}", event_id)
+          or event_id in ids or timestamp is None
+          or (last_time is not None and timestamp < last_time)):
+        return None
+      last_time = timestamp
+      ids.add(event_id)
+    enqueued_at = previous.get("queue_enqueued_at")
+    if enqueued_at is None:
+      # A legacy receipt has no admission timestamp: one complete cycle only.
+      if len(events) != 2:
+        return None
+      pair = 0
+    else:
+      admission = _queue_time(enqueued_at)
+      if admission is None:
+        return None
+      matching = [i for i in range(0, len(events), 2)
+        if _queue_time(events[i]["createdAt"]) == admission]
+      if len(matching) != 1:
+        return None
+      pair = matching[0]
+    added, removed = events[pair:pair + 2]
+    proof = {"queue_entry_id": previous["queue_entry_id"],
+      "head_sha": target["head_sha"], "added_event_id": added["id"],
+      "enqueued_at": added["createdAt"], "removed_event_id": removed["id"],
+      "removed_at": removed["createdAt"]}
+    if previous.get("queue_removal") not in (None, proof):
+      return None
+    return proof
+  except (subprocess.CalledProcessError, OSError, json.JSONDecodeError, ContributionSubmitError):
+    # Provider/transport failure is unknown; never expose raw diagnostics.
+    return None
+
+
+def reconcile_merge(gh, cwd, target, previous, pull):
+  if pull.get("merged"):
+    return {**previous, "state": "merged", "merge_sha": pull.get("merge_commit_sha")}
+  checks = pull_checks(gh, cwd, target)
+  entry = queue_entry(checks, target)
+  if entry:
+    receipt = {} if previous.get("queue_entry_id") else {
+      "queue_entry_id": entry["id"], "queue_receipt_unconfirmed": True}
+    return {**previous, **receipt, "state": "queued"}
+  proof = confirmed_queue_removal(gh, cwd, target, previous)
+  if pull.get("state") == "open" and proof:
+    history = list(previous.get("merge_attempts", []))
+    if not any(a.get("head_sha") == target["head_sha"] for a in history):
+      # Snapshot the complete prior attempt/review before repair can replace
+      # active state or evidence. Exclude aggregate audit lists to avoid
+      # recursively copying earlier attempts at every successor.
+      snapshot = {k: v for k, v in previous.items() if k not in {
+        "steps", "merge_attempts", "repair_attempts", "independent_reviews", "reviewer_steps", "ready_audit", "checkout"}}
+      history.append({**snapshot, "merge_attempted": True, "queue_removal": proof})
+    return {**previous, "merge_attempts": history,
+      "merge_attempted": True, "state": "needs_you", "queue_removal": proof,
+      "summary": "The saved queue admission was removed. Only a new repaired successor with fresh independent review may proceed; this head cannot be retried."}
+  return {**previous, "state": "merge_unknown",
+    "summary": "The exact earlier merge/queue attempt remains unclear. It was not repeated."}
+
+
+def require_repairable_merge(gh, cwd, target, previous):
+  """Revalidate immediately before checkout/public repair, not just observation."""
+  if not merge_attempted(previous):
+    return
+  repo, pull = current_pull(gh, cwd, target)
+  if not merge_permission(repo):
+    raise HTTPException(403, "Your repository write permission is no longer available.")
+  proof = confirmed_queue_removal(gh, cwd, target, previous)
+  if pull.get("state") != "open" or pull.get("merged") or not proof:
+    raise HTTPException(409, "The saved merge attempt has no confirmed queue removal. No repair may start.")
+  if previous.get("queue_removal") != proof:
+    raise HTTPException(409, "Observe the confirmed queue removal before preparing a repaired successor.")

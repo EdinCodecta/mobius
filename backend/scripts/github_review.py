@@ -18,16 +18,14 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+if __package__:
+  from scripts.github_review_selection import IDENTITY_FIELDS, start_body, frozen_options, verify_selection, review_path
+else:
+  from github_review_selection import IDENTITY_FIELDS, start_body, frozen_options, verify_selection, review_path
 
-IDENTITY_FIELDS = ("repo", "number", "head_sha", "base_ref", "base_sha")
+
 SELECTION_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 PR_REFERENCE = re.compile(r"^(?:https://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:#|/pull/)([1-9][0-9]*)/?$")
-OPTION_FIELDS = ("review_prompt", "fix_prompt", "merge_prompt", "max_rounds", "autopilot")
-# The platform freezes post_review only when chosen, so older snapshots keep
-# their hash; it is carried only when present.
-OPTIONAL_OPTION_FIELDS = ("post_review",)
-TAKEOVER_SCOPE = "named_pr_repairs_and_reviewed_successors"
-DRAFT_TAKEOVER_SCOPE = "named_pr_repairs_ready_and_reviewed_successors"
 
 
 def api(path, *, method="GET", data=None, headers=None):
@@ -62,16 +60,17 @@ def inspect_pr(reference):
   base = gh_api(f"repos/{canonical_repo}/git/ref/heads/{quote(base_ref, safe='')}")
   return {"repo": canonical_repo.lower(), "number": number,
     "head_sha": pull["head"]["sha"], "base_ref": base_ref,
-    "base_sha": base["object"]["sha"], "is_draft": pull.get("draft") is True, "title": pull["title"], "url": pull["html_url"]}
+    "base_sha": base["object"]["sha"], "title": pull["title"], "url": pull["html_url"]}
 
 
-def prepare_selection(references, mode, chat_id):
+def prepare_selection(references, mode, chat_id, app_id=None):
   if not 1 <= len(references) <= 20:
     raise ValueError("Select between 1 and 20 pull requests.")
   items = sorted((inspect_pr(ref) for ref in references), key=lambda item: (item["repo"], item["number"]))
   if len({(item["repo"], item["number"]) for item in items}) != len(items):
     raise ValueError("Select each pull request only once.")
   identity = {"mode": mode, "source_chat_id": chat_id,
+              **({"app_id": app_id} if app_id is not None else {}),
               "items": [{key: item[key] for key in IDENTITY_FIELDS} for item in items]}
   digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
   return {**identity, "request_id": "selection-" + digest, "items": items,
@@ -79,74 +78,29 @@ def prepare_selection(references, mode, chat_id):
           "created_at": datetime.now(timezone.utc).isoformat()}
 
 
-def start_body(selection):
-  if selection["mode"] == "review_fix_merge" and not selection.get("preview_sha256"):
-    raise ValueError("Scoped takeover requires a frozen prompt/model preview. Prepare a new selection.")
-  return {"request_id": selection["request_id"], "mode": selection["mode"],
-          "source_chat_id": selection["source_chat_id"],
-          **{key: selection[key] for key in ("options", "agent", "preview_sha256", "confirmation_scope") if key in selection},
-          "items": [{key: item[key] for key in IDENTITY_FIELDS} for item in selection["items"]]}
-
-
-def frozen_options(snapshot):
-  options = {key: snapshot[key] for key in OPTION_FIELDS}
-  return {**options, **{key: snapshot[key] for key in OPTIONAL_OPTION_FIELDS if key in snapshot}}
-
-
-def freeze_preview(selection, options=None, agent=None, *, allow_mark_ready=False, post_review=False):
+def freeze_preview(selection, options=None, agent=None, *, allow_mark_ready=False):
   """Save resolved prompts/model before consent; later start never re-resolves silently."""
   if allow_mark_ready and selection["mode"] != "review_fix_merge":
     raise ValueError("Mark-ready permission requires review_fix_merge.")
-  if post_review:
-    if selection["mode"] != "review":
-      raise ValueError("Posting the review on GitHub is available for review mode only.")
-    options = {**(options or {}), "post_review": True}
-  if selection["mode"] == "review_fix_merge" and any(item.get("is_draft") for item in selection["items"]) and not allow_mark_ready:
-    raise ValueError("Draft takeover needs --allow-mark-ready and explicit consent to mark ready after review and checks.")
-  preview = api("/api/github/review-preview", method="POST",
+  preview = api(review_path(selection.get("app_id"), "/review-preview"), method="POST",
                 data={"options": options, "agent": agent})
   snapshot = preview["options"]
   if not re.fullmatch(r"[0-9a-f]{64}", preview["preview_sha256"]) or not snapshot.get("model"):
     raise ValueError("The platform did not return a complete frozen prompt/model preview.")
-  if post_review and snapshot.get("post_review") is not True:
-    raise ValueError("The platform did not freeze the GitHub review posting choice.")
-  frozen = {**selection, "options": frozen_options(snapshot),
+  scope = "named_pr_repairs_and_reviewed_successors" if selection["mode"] == "review_fix_merge" else None
+  if allow_mark_ready:
+    scope = "named_pr_repairs_ready_and_reviewed_successors"
+  frozen = {**selection, **({"confirmation_scope": scope} if scope else {}), "options": frozen_options(snapshot),
     "agent": {"provider": snapshot["provider"], "model": snapshot["model"],
               "effort": snapshot.get("reasoning_effort")},
     "preview_sha256": preview["preview_sha256"], "resolved_snapshot": snapshot}
-  if selection["mode"] == "review_fix_merge":
-    frozen["confirmation_scope"] = DRAFT_TAKEOVER_SCOPE if allow_mark_ready else TAKEOVER_SCOPE
   identity = start_body(frozen)
   identity.pop("request_id")
+  if selection.get("app_id") is not None:
+    identity["app_id"] = selection["app_id"]
   frozen["request_id"] = "selection-" + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
   verify_selection(frozen)
   return frozen
-
-
-def verify_selection(selection):
-  """Reject edited saved input before interpreting consent for it."""
-  if selection.get("mode") not in ("review", "review_merge", "review_fix_merge"):
-    raise ValueError("Invalid saved selection mode.")
-  if selection.get("preview_sha256"):
-    snapshot = selection["resolved_snapshot"]
-    digest = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
-    expected_agent = {"provider": snapshot["provider"], "model": snapshot["model"],
-                      "effort": snapshot.get("reasoning_effort")}
-    if (digest != selection["preview_sha256"]
-        or selection["options"] != frozen_options(snapshot)
-        or selection["agent"] != expected_agent):
-      raise ValueError("The frozen preview changed. Prepare and present a fresh selection.")
-    identity = start_body(selection)
-    identity.pop("request_id")
-  else:
-    if any(key in selection for key in ("options", "agent", "confirmation_scope", "resolved_snapshot")):
-      raise ValueError("Legacy selections cannot acquire options or model settings without a fresh frozen preview.")
-    identity = {"mode": selection["mode"], "source_chat_id": selection["source_chat_id"],
-                "items": [{key: item[key] for key in IDENTITY_FIELDS} for item in selection["items"]]}
-  expected_id = "selection-" + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
-  if selection["request_id"] != expected_id:
-    raise ValueError("The saved selection identity changed. Prepare a fresh selection.")
-  start_body(selection)
 
 
 def read_object(path):
@@ -180,8 +134,8 @@ def load_preview(path, chat_id):
 def main(argv=None):
   parser = argparse.ArgumentParser(description=__doc__)
   commands = parser.add_subparsers(dest="command", required=True)
-  commands.add_parser("presets", help="Read editable defaults and mandatory platform instructions")
-  commands.add_parser("list", help="Read app-independent runs")
+  presets_command = commands.add_parser("presets", help="Read editable defaults and mandatory platform instructions")
+  list_command = commands.add_parser("list", help="Read review runs")
   show = commands.add_parser("show", help="Read one core run")
   show.add_argument("run_id")
   observe = commands.add_parser("observe", help="Reconcile an existing public receipt read-only; never retry it")
@@ -189,8 +143,7 @@ def main(argv=None):
   preview = commands.add_parser("preview", help="Inspect named PRs and freeze prompts/model without starting work")
   preview.add_argument("prs", nargs="+")
   preview.add_argument("--mode", choices=("review", "review_merge", "review_fix_merge"), default="review")
-  preview.add_argument("--allow-mark-ready", action="store_true", help="Include draft mark-ready permission after review/checks in this new takeover preview")
-  preview.add_argument("--post-review", action="store_true", help="Review mode only: post the verdict as a GitHub review comment when the run finishes")
+  preview.add_argument("--allow-mark-ready", action="store_true", help="Explicitly authorize draft readiness after independent review and passing checks")
   preview.add_argument("--options", help="JSON file with the five editable fields")
   preview.add_argument("--agent", help="JSON file: provider/model/effort")
   preview.add_argument("--output", required=True, help="New private JSON preview path; never overwrites")
@@ -198,29 +151,35 @@ def main(argv=None):
   start.add_argument("--preview", required=True)
   start.add_argument("--approved-in-chat", action="store_true")
   start.add_argument("--approval-context", required=True)
+  for command in (presets_command, list_command, show, observe, preview, start):
+    command.add_argument("--app-id", type=int, help="Optional Contribute app context; core remains the default")
   args = parser.parse_args(argv)
+  if args.app_id is not None and args.app_id < 1:
+    parser.error("--app-id must be a positive integer")
   if args.command == "start" and (not args.approved_in_chat or not args.approval_context.strip()):
     parser.error("Starting requires explicit --approved-in-chat and a truthful --approval-context.")
   if args.command == "presets":
-    result = api("/api/github/review-presets")
+    result = api(review_path(args.app_id, "/review-presets"))
   elif args.command == "list":
-    result = api("/api/github/review-runs")
+    result = api(review_path(args.app_id, "/review-runs"))
   elif args.command in ("show", "observe"):
     if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", args.run_id):
       raise ValueError("Invalid run identity.")
-    path = "/api/github/review-runs/" + args.run_id
+    path = review_path(args.app_id, "/review-runs/" + args.run_id)
     result = api(path + "/observe", method="POST", data={}) if args.command == "observe" else api(path)
   elif args.command == "preview":
-    selection = freeze_preview(prepare_selection(args.prs, args.mode, os.environ["CHAT_ID"]),
+    selection = freeze_preview(prepare_selection(args.prs, args.mode, os.environ["CHAT_ID"], args.app_id),
       read_object(args.options) if args.options else None, read_object(args.agent) if args.agent else None, allow_mark_ready=args.allow_mark_ready,
-      post_review=args.post_review)
+      )
     save_preview(args.output, selection)
     result = {"selection": selection, "preview_file": args.output, "approved": False}
   else:
     selection = load_preview(args.preview, os.environ["CHAT_ID"])
+    if selection.get("app_id") != args.app_id:
+      raise ValueError("The saved preview belongs to another app/core context.")
     body = {**start_body(selection), "chat_approval": {"context": args.approval_context.strip()}}
     try:
-      result = {**api("/api/github/review-runs", method="POST", data=body), "approved": True}
+      result = {**api(review_path(args.app_id, "/review-runs"), method="POST", data=body), "approved": True}
     except HTTPError as error:
       if error.code != 409:
         raise

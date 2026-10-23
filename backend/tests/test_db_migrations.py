@@ -29,75 +29,14 @@ PREVIOUS_RELEASE_SCHEMA = (
 )
 
 
-def test_core_review_run_upgrade_preserves_rows_and_request_idempotency(tmp_path):
-  eng = create_engine(f"sqlite:///{tmp_path / 'review-runs.db'}")
-  models.Base.metadata.create_all(eng)
-  with eng.begin() as conn:
-    # Simulate the shipped table; create_all never alters an existing table.
-    conn.execute(text("DROP TABLE contribution_review_runs"))
-    conn.execute(text("""
-      CREATE TABLE contribution_review_runs (
-        id VARCHAR(64) PRIMARY KEY,
-        app_id INTEGER NOT NULL REFERENCES apps(id),
-        owner_id INTEGER NOT NULL REFERENCES owner(id),
-        request_id VARCHAR(64) NOT NULL,
-        mode VARCHAR(24) NOT NULL,
-        github_actor_id VARCHAR(64) NOT NULL,
-        app_nonce VARCHAR(64) NOT NULL,
-        targets_json JSON NOT NULL,
-        outcomes_json JSON NOT NULL,
-        chat_id VARCHAR(64) NOT NULL REFERENCES chats(id),
-        revision INTEGER NOT NULL,
-        created_at DATETIME,
-        UNIQUE (app_id, request_id)
-      )
-    """))
-    conn.execute(text("CREATE INDEX ix_contribution_review_runs_app_id "
-                      "ON contribution_review_runs (app_id)"))
-    conn.execute(text("""
-      INSERT INTO contribution_review_runs
-        (id, app_id, owner_id, request_id, mode, github_actor_id,
-         app_nonce, targets_json, outcomes_json, chat_id, revision)
-      VALUES ('old', 1, 1, 'same-request', 'review', 'actor', 'nonce',
-              '[]', '{}', 'chat', 0)
-    """))
+def _create_schema_with_historical_goal_snapshots(eng):
+  """Supply the retired columns when simulating an already-migrated release.
 
-  migrations._allow_core_contribution_review_runs(eng)
-  migrations._allow_core_contribution_review_runs(eng)
-  columns = {c["name"]: c for c in inspect(eng).get_columns("contribution_review_runs")}
-  assert columns["app_id"]["nullable"]
-  assert columns["app_nonce"]["nullable"]
-  assert columns["options_json"]["nullable"]
-  with eng.begin() as conn:
-    assert conn.execute(text(
-      "SELECT app_id, app_nonce, options_json FROM contribution_review_runs "
-      "WHERE id = 'old'"
-    )).one() == (1, "nonce", None)
-    conn.execute(text("""
-      INSERT INTO contribution_review_runs
-        (id, app_id, owner_id, request_id, mode, github_actor_id,
-         app_nonce, options_json, targets_json, outcomes_json, chat_id, revision)
-      VALUES ('core', NULL, 1, 'same-request', 'review', 'actor',
-              NULL, '{"prompt":"frozen"}', '[]', '{}', 'chat', 0)
-    """))
-  with pytest.raises(IntegrityError):
-    with eng.begin() as conn:
-      conn.execute(text("""
-        INSERT INTO contribution_review_runs
-          (id, app_id, owner_id, request_id, mode, github_actor_id,
-           app_nonce, targets_json, outcomes_json, chat_id, revision)
-        VALUES ('duplicate-core', NULL, 1, 'same-request', 'review', 'actor',
-                NULL, '[]', '{}', 'chat', 0)
-      """))
-  with pytest.raises(IntegrityError):
-    with eng.begin() as conn:
-      conn.execute(text("""
-        INSERT INTO contribution_review_runs
-          (id, app_id, owner_id, request_id, mode, github_actor_id,
-           app_nonce, targets_json, outcomes_json, chat_id, revision)
-        VALUES ('duplicate-app', 1, 1, 'same-request', 'review', 'actor',
-                'nonce', '[]', '{}', 'chat', 0)
-      """))
+  Current ORM metadata omits run-owned plans. A historical migration test must
+  still create those columns before claiming their migration was applied.
+  """
+  models.Base.metadata.create_all(eng)
+  migrations._add_chat_run_goal_plan(eng)
 
 
 def test_legacy_helper_interruption_column_upgrades_idempotently(tmp_path):
@@ -168,6 +107,14 @@ def test_previous_release_database_upgrades_to_current_orm(tmp_path):
   assert [row["version"] for row in first_history] == [
     version for version, _migration in migrations._SCHEMA_MIGRATIONS
   ]
+  assert "0090_goal_dependencies" in {row["version"] for row in first_history}
+  assert "acquisition_id" in {c["name"] for c in inspect(eng).get_columns("agent_work_claims")}
+  assert "admitted_dependency_results_json" in {
+    c["name"] for c in inspect(eng).get_columns("chat_runs")
+  }
+  assert "goal_dependencies" in inspect(eng).get_table_names()
+  assert "0091_saved_decision_cards" in {row["version"] for row in first_history}
+  assert "saved_decision_cards" in inspect(eng).get_table_names()
 
 
 @pytest.mark.parametrize("start", ["fresh", "schema_0013"])
@@ -188,11 +135,11 @@ def test_transcript_rows_run_after_the_chat_note_migrations(tmp_path, monkeypatc
   eng = create_engine(f"sqlite:///{db_path}")
   models.Base.metadata.create_all(bind=eng)
   versions = [version for version, _migration in migrations._SCHEMA_MIGRATIONS]
-  assert versions[-4:] == [
+  transcript_migration = versions.index("0087_transcript_rows")
+  assert versions[transcript_migration - 2:transcript_migration + 1] == [
     "0083_swap_chat_note_sections", "0086_drop_chat_note_backup", "0087_transcript_rows",
-    "0088_core_contribution_review_runs",
   ]
-  monkeypatch.setattr(migrations, "_SCHEMA_MIGRATIONS", migrations._SCHEMA_MIGRATIONS[:-2])
+  monkeypatch.setattr(migrations, "_SCHEMA_MIGRATIONS", migrations._SCHEMA_MIGRATIONS[:transcript_migration])
   run_migrations(eng)  # The previous release's ledger.
   monkeypatch.undo()
   monkeypatch.setenv("DATA_DIR", str(tmp_path))
@@ -544,7 +491,7 @@ def test_chat_wait_condition_owner_migration_is_additive_and_idempotent(tmp_path
 
 def test_chat_wait_condition_owner_migration_adds_nullable_column(tmp_path):
   eng = create_engine(f"sqlite:///{tmp_path / 'wait-condition-owner.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   with eng.begin() as conn:
     conn.execute(text("ALTER TABLE chat_waits DROP COLUMN condition_owner"))
     conn.execute(text(
@@ -1923,7 +1870,17 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0083_swap_chat_note_sections",
     "0086_drop_chat_note_backup",
     "0087_transcript_rows",
-    "0088_core_contribution_review_runs",
+    "0088_chat_compaction_drafts",
+    "0086_goal_execution_identity",
+    "0089_wait_result_receipts",
+    "0090_goal_dependencies",
+    "0091_saved_decision_cards",
+    "0092_transfer_notice_revision",
+    "0093_pending_goal_dependency_indexes",
+    "0094_retire_legacy_claim_notice_carriers",
+    "0095_unique_live_claim_follows",
+    "0096_app_accepted_consent",
+    "0097_core_contribution_review_runs",
   ]
   assert second == first
 
@@ -2726,7 +2683,7 @@ def test_legacy_chat_models_pin_only_established_unselected_chats(
   }))
   monkeypatch.setenv("DATA_DIR", str(data_dir))
   eng = create_engine(f"sqlite:///{tmp_path / 'legacy-chat-models.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   established = [
     {"role": "user", "content": "hello"},
     {"role": "assistant", "content": "hi"},
@@ -3438,7 +3395,7 @@ def test_goal_plan_migration_adds_snapshot_and_revision_to_existing_runs(
   tmp_path,
 ):
   eng = create_engine(f"sqlite:///{tmp_path / 'goal-plan.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   with eng.begin() as conn:
     conn.execute(text("ALTER TABLE chat_runs DROP COLUMN goal_plan_json"))
     conn.execute(text("ALTER TABLE chat_runs DROP COLUMN goal_plan_revision"))
@@ -3469,14 +3426,13 @@ def test_goal_identity_migration_preserves_distinct_historical_roots_and_index(
   tmp_path,
 ):
   eng = create_engine(f"sqlite:///{tmp_path / 'goal-identity.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   with Session(eng) as session:
     session.add(create_chat(id="goal-chat", title="Goal", messages=[]))
     session.add_all([
       models.ChatRun(
         id="planned", root_run_id="planned", chat_id="goal-chat",
         status="interrupted", provider="codex", goal_objective="Ship",
-        goal_plan_json={"version": 1, "tasks": []},
         started_at=datetime(2026, 8, 18, 10),
       ),
       models.ChatRun(
@@ -3487,6 +3443,8 @@ def test_goal_identity_migration_preserves_distinct_historical_roots_and_index(
     ])
     session.commit()
   with eng.begin() as conn:
+    conn.execute(text("UPDATE chat_runs SET goal_plan_json = :plan WHERE id = 'planned'"),
+                 {"plan": json.dumps({"version": 1, "tasks": []})})
     conn.execute(text("DROP INDEX ix_chat_runs_goal_id"))
     conn.execute(text("ALTER TABLE chat_runs DROP COLUMN goal_id"))
     conn.execute(text(
@@ -3512,7 +3470,7 @@ def test_goal_identity_migration_preserves_distinct_historical_roots_and_index(
 
 def test_goal_identity_index_repair_preserves_recorded_0015_data(tmp_path):
   eng = create_engine(f"sqlite:///{tmp_path / 'goal-index-repair.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   with Session(eng) as session:
     session.add(create_chat(id="goal-chat", title="Goal", messages=[]))
     session.add(models.ChatRun(
@@ -3554,7 +3512,7 @@ def test_goal_identity_index_repair_preserves_recorded_0015_data(tmp_path):
 
 def test_agent_coordination_migration_copies_legacy_project_mail_once(tmp_path):
   eng = create_engine(f"sqlite:///{tmp_path / 'agent-coordination.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   with Session(eng) as session:
     session.add(models.Project(
       id="project-1", name="Project", project_type="blank",
@@ -3627,7 +3585,7 @@ def test_agent_coordination_migration_copies_legacy_project_mail_once(tmp_path):
 
 def test_goal_dismissal_migration_adds_nullable_chat_pointer(tmp_path):
   eng = create_engine(f"sqlite:///{tmp_path / 'goal-dismissal.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   with eng.begin() as conn:
     conn.execute(text("ALTER TABLE chats DROP COLUMN dismissed_goal_id"))
     conn.execute(text(
@@ -3652,7 +3610,7 @@ def test_goal_dismissal_migration_adds_nullable_chat_pointer(tmp_path):
 
 def test_project_color_migration_adds_nullable_column_once(tmp_path):
   eng = create_engine(f"sqlite:///{tmp_path / 'project-color.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   with eng.begin() as conn:
     conn.execute(text("ALTER TABLE projects DROP COLUMN color"))
     conn.execute(text(
@@ -3687,7 +3645,7 @@ def test_active_chat_model_migrations_pin_lazy_drafts_and_scoped_rows(
   }))
   monkeypatch.setenv("DATA_DIR", str(data_dir))
   eng = create_engine(f"sqlite:///{tmp_path / 'active-models.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   transcript = [
     {"role": "user", "content": "review"},
     {"role": "assistant", "content": "done"},
@@ -3873,7 +3831,7 @@ def test_active_chat_model_migration_never_reassigns_queued_provider_state(
   }))
   monkeypatch.setenv("DATA_DIR", str(data_dir))
   eng = create_engine(f"sqlite:///{tmp_path / 'queued-chat.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   with Session(eng) as session:
     session.add(models.Owner(
       username="owner", hashed_password="hash", provider="codex",
@@ -3925,7 +3883,7 @@ def test_active_chat_model_migration_honors_unknown_picker_model_provider_pair(
   }))
   monkeypatch.setenv("DATA_DIR", str(data_dir))
   eng = create_engine(f"sqlite:///{tmp_path / 'unknown-model.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   with Session(eng) as session:
     session.add(models.Owner(
       username="owner", hashed_password="hash", provider="claude",
@@ -3963,7 +3921,7 @@ def test_post_explicit_model_repair_pins_all_later_gaps_without_provider_handoff
   }))
   monkeypatch.setenv("DATA_DIR", str(data_dir))
   eng = create_engine(f"sqlite:///{tmp_path / 'post-explicit-model-gaps.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   with Session(eng) as session:
     session.add(models.Owner(
       username="owner", hashed_password="hash", provider="codex",
@@ -4078,7 +4036,7 @@ def test_post_explicit_model_repair_preserves_only_genuine_first_install_chat(
   (data_dir / "shared" / "agent-settings.json").write_text("{}")
   monkeypatch.setenv("DATA_DIR", str(data_dir))
   eng = create_engine(f"sqlite:///{tmp_path / 'post-explicit-model-first-chat.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   with Session(eng) as session:
     session.add(models.Owner(
       username="owner", hashed_password="hash", provider="claude",
@@ -4133,7 +4091,7 @@ def test_failed_migration_is_not_recorded_and_can_retry(tmp_path, monkeypatch):
 
 def test_result_incorporation_migration_preserves_unknown_history(tmp_path):
   eng = create_engine(f"sqlite:///{tmp_path / 'result-incorporation.db'}")
-  models.Base.metadata.create_all(eng)
+  _create_schema_with_historical_goal_snapshots(eng)
   with Session(eng) as session:
     app = models.App(
       slug="incorporation-migration", source_dir="/tmp/incorporation",
@@ -4822,38 +4780,6 @@ def test_delegation_goal_task_keeps_existing_name_links(tmp_path):
       "SELECT id, goal_task_id FROM delegations"
     )).all())
   assert links == {"old": "audit", "new": None}
-
-
-def test_core_review_run_postgres_upgrade_statements_are_idempotent(monkeypatch):
-  import sqlalchemy
-  columns = {
-    "app_id": {"name": "app_id", "nullable": False},
-    "app_nonce": {"name": "app_nonce", "nullable": False},
-  }
-  statements = []
-  class Connection:
-    def __enter__(self):
-      return self
-    def __exit__(self, *args):
-      return False
-    def execute(self, value):
-      sql = str(value)
-      statements.append(sql)
-      if "ALTER COLUMN app_id DROP NOT NULL" in sql:
-        columns["app_id"]["nullable"] = True
-      elif "ALTER COLUMN app_nonce DROP NOT NULL" in sql:
-        columns["app_nonce"]["nullable"] = True
-      elif "ADD COLUMN options_json" in sql:
-        columns["options_json"] = {"name": "options_json", "nullable": True}
-  engine = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"), begin=lambda: Connection())
-  inspector = SimpleNamespace(get_table_names=lambda: ["contribution_review_runs"],
-    get_columns=lambda _: list(columns.values()))
-  monkeypatch.setattr(sqlalchemy, "inspect", lambda _: inspector)
-  migrations._allow_core_contribution_review_runs(engine)
-  migrations._allow_core_contribution_review_runs(engine)
-  assert sum("DROP NOT NULL" in s for s in statements) == 2
-  assert sum("ADD COLUMN options_json" in s for s in statements) == 1
-  assert statements[-1] == "CREATE UNIQUE INDEX IF NOT EXISTS uq_contribution_review_runs_core_request ON contribution_review_runs (owner_id, request_id) WHERE app_id IS NULL"
 
 
 def test_retired_write_journal_tables_are_dropped_idempotently(tmp_path):

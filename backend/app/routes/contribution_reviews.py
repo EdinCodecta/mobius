@@ -12,8 +12,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app import chat_queue, chat_writer, contribution_review_runs as reviews, models, providers, transcript_rows
+from app import chat_queue, chat_writer, contribution_review_runs as reviews, models, providers, transcript_rows, settled
 from app import contribution_review_presets as presets
+from app import contribution_review_public as public
+from app import contribution_review_repair_actions as repair_actions
+from app import contribution_review_merge_actions as merge_actions
+from app.contribution_review_public import EVIDENCE_MAX_CHARS
+from app.contribution_errors import ContributionSubmitError
+from app.contribution_review_effects import DispatchResult, NotDispatched
 from app.chat_start import start_programmatic_chat_turn
 from app.chat_visibility import coerce_agent_settings
 from app.config import get_settings
@@ -28,8 +34,9 @@ from app.github_connection import _github_connection_transaction
 router = APIRouter(tags=["contribution-reviews"])
 APP_PREFIX = "/api/github/contributions"
 SCOPE = {"correctness", "maintainability", "simplicity", "tests", "security_privacy", "technical_debt"}
-REVIEW_CAPABILITIES = {"draft_takeover": True, "post_review": True}
+REVIEW_CAPABILITIES = {"post_review": True, "review_fix_merge": True, "draft_takeover": True}
 TAKEOVER_SCOPES = {"named_pr_repairs_and_reviewed_successors", "named_pr_repairs_ready_and_reviewed_successors"}
+REVIEW_STOP_KEY = "_review_stop"
 
 
 class PullIdentity(BaseModel):
@@ -87,9 +94,9 @@ class StartReviews(BaseModel):
 
 class ReviewOutcome(PullIdentity):
   state: Literal["all_clear", "needs_you"]
-  summary: str = Field(min_length=1)
+  summary: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
   scope: list[str] = Field(default_factory=list, max_length=6)
-  tests: str = ""
+  tests: str = Field(default="", max_length=EVIDENCE_MAX_CHARS)
   tests_passed: bool | None = None
   reviewed_base_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
   independent_receipt_id: str | None = Field(default=None, max_length=64)
@@ -108,6 +115,9 @@ def _row(db, app_id, run_id, principal):
 def _assert_execution_live(db, row, principal):
   # Recheck after awaited remote preflight; Stop, uninstall and permission
   # revocation must still win before this exact public attempt is armed.
+  db.refresh(row)
+  if _review_stop_requested(row):
+    raise HTTPException(409, "This review was stopped. No new action was started.")
   active = db.query(models.ChatRun.id).filter_by(
     id=principal.run_id, chat_id=row.chat_id, status="running",
   ).first()
@@ -240,16 +250,18 @@ async def start_reviews(app_id: int | None, body: StartReviews,
       if body.preview_sha256 and body.preview_sha256 != _fingerprint(snapshot):
         raise HTTPException(409, "The resolved prompts or model changed. Preview and confirm again.")
       cwd = Path(get_settings().data_dir) / "platform"
-      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
+      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub observation; no mutation)
       if not actor.get("id"):
         raise HTTPException(409, "Connect GitHub before starting this review.")
-      targets = [await asyncio.to_thread(reviews.inspect_target, _gh, cwd, item, body.mode)
+      targets = [await asyncio.to_thread(reviews.inspect_target, _gh, cwd, item, body.mode)  # unsettled: read-only (GitHub observation; no mutation)
                  for item in selection]
+      if body.mode == "review_fix_merge" and any(t.get("is_draft") for t in targets) and body.confirmation_scope != "named_pr_repairs_ready_and_reviewed_successors":
+        raise HTTPException(422, "Draft takeover requires explicit permission to mark ready after fresh review and checks.")
       if body.mode == "review_fix_merge":
         for target in targets:
-          target["allowed_files"] = await asyncio.to_thread(reviews.repair_file_scope, _gh, cwd, target)
-          await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
-          await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
+          target["allowed_files"] = await asyncio.to_thread(reviews.repair_file_scope, _gh, cwd, target)  # unsettled: read-only (GitHub observation; no mutation)
+          await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation; no mutation)
+          await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)  # unsettled: read-only (GitHub observation; no mutation)
       # Consent in chat stays in that chat. An app selection without a source
       # conversation still receives its own durable review conversation.
       approval = _chat_approval(db, body, principal)
@@ -335,16 +347,18 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     if target is None or target["head_sha"] != body.head_sha:
       raise HTTPException(409, "This head was not in the approved selection.")
     previous = row.outcomes_json.get(item_key, {})
-    attempted = reviews.merge_attempted(previous)
-    if previous.get("state") == "merged":
+    if public.require_same_evidence(previous, body.model_dump()):
+      return {"run": _run_view(db, row)}
+    attempted = previous.get("merge_attempted") is True or previous.get("state") in {"merging", "merge_unknown", "queued", "merged"}
+    if previous.get("state") == "merged" or (row.mode == "review" and previous.get("state") == "all_clear"):
       return {"run": _run_view(db, row)}
     cwd = Path(get_settings().data_dir) / "platform"
     try:
-      repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
+      repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
     except HTTPException as exc:
       # A changed/unavailable PR must not erase the durable attempt receipt.
       # If that same head returns later, it is still reconciliation, not retry.
-      reviews.save_outcome(db, row, item_key, {**previous, "state": "needs_you", "summary": str(exc.detail),
+      reviews.save_effect_outcome(db, row, item_key, {**previous, "state": "needs_you", "summary": str(exc.detail),
         "head_sha": target["head_sha"], "merge_attempted": attempted})
       return {"run": _run_view(db, row)}
     outcome = {**previous, "state": body.state, "summary": body.summary, "scope": body.scope,
@@ -353,109 +367,75 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
                "head_sha": body.head_sha,
                "review_chat_id": row.chat_id, "review_run_id": principal.run_id}
     if attempted:
-      outcome = await asyncio.to_thread(reviews.reconcile_merge, _gh, cwd, target, previous, pull)
-      _parent(db, row, principal)
-      reviews.save_outcome(db, row, item_key, outcome)
+      outcome = await asyncio.to_thread(reviews.reconcile_merge, _gh, cwd, target, previous, pull)  # unsettled: read-only (GitHub merge and queue proof)
+      reviews.save_effect_outcome(db, row, item_key, outcome)
       return {"run": _run_view(db, row)}
     if body.state == "all_clear" and (set(body.scope) != SCOPE or not body.tests.strip() or body.tests_passed is False):
       raise HTTPException(422, "Record the complete review scope and test evidence before all clear.")
-    if body.state == "all_clear":
+    if body.state == "all_clear" and row.mode == "review_fix_merge":
       try:
-        await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
+        await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)  # unsettled: read-only (GitHub base proof)
       except HTTPException as exc:
-        if row.mode == "review_merge":
-          raise
+        try:
+          if await _record_base_advance(db, row, original, previous, principal, cwd):
+            return {"run": _run_view(db, row)}
+        except HTTPException as observation_error:
+          _parent(db, row, principal)
+          exc = observation_error
         reviews.save_outcome(db, row, item_key, {**previous, "state": "needs_you",
           "head_sha": target["head_sha"], "summary": str(exc.detail)})
         return {"run": _run_view(db, row)}
       _parent(db, row, principal)
-      if row.mode == "review_fix_merge":
-        reviews.require_independent_clear(row, target, body)
+      reviews.require_independent_clear(row, target, body)
+    # A private review remains true of its pinned base after that base moves.
+    # Only an actual merge candidate requires current-base proof.
     if body.state == "all_clear" and row.mode in {"review_merge", "review_fix_merge"}:
-      ready_attempt = previous.get("ready_attempt")
-      if ready_attempt and ready_attempt.get("state") != "ready":
-        raise HTTPException(409, "The draft readiness attempt is uncertain. Reconcile it read-only before merge.")
-      if pull.get("merged"):
-        outcome.update(state="merged", merge_sha=pull.get("merge_commit_sha"))
-        reviews.save_outcome(db, row, item_key, outcome)
-        return {"run": _run_view(db, row)}
-      checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)
-      existing_entry = reviews.queue_entry(checks, target)
-      if existing_entry:
-        await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-        _parent(db, row, principal)
-        outcome.update(state="queued", **reviews.queue_receipt(existing_entry))
-        reviews.save_outcome(db, row, item_key, outcome)
-        return {"run": _run_view(db, row)}
-      blocker = reviews.merge_blocker(target, repo, pull, checks)
-      if blocker:
-        outcome.update(state="needs_you", summary=blocker)
-      else:
-        # Hold the existing credential mutation lock from actor recheck through
-        # public I/O: reconnecting another account cannot spend this grant.
-        async with _github_connection_transaction():
-          actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
-          if str(actor.get("id") or "") != row.github_actor_id:
-            outcome.update(state="needs_you", summary="The connected GitHub account changed. Approve a new review selection.")
-          else:
-            await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-            _parent(db, row, principal)
-            # Persist before network I/O. A crash or lost response cannot
-            # authorize replay. CAS also fences other server processes.
-            owned_elsewhere = reviews.arm_merge(db, row, target, outcome, principal)
-            if owned_elsewhere:
-              if owned_elsewhere.get("review_selection_id") != row.id:
-                reviews.save_outcome(db, row, item_key, owned_elsewhere)
-              else:
-                db.refresh(row)
-              return {"run": _run_view(db, row)}
-            outcome["merge_attempted"] = True
-            try:
-              _parent(db, row, principal)
-              if checks.get("isMergeQueueEnabled") is True:
-                receipt = await asyncio.to_thread(reviews.enqueue, _gh, cwd, target)
-                outcome.update(state="queued", **reviews.queue_receipt(receipt))
-              else:
-                receipt = await asyncio.to_thread(reviews.perform_merge, _gh, cwd, target, repo)
-                if receipt.get("merged") is not True:
-                  raise HTTPException(409, "GitHub did not confirm a merge.")
-                outcome.update(state="merged", merge_sha=receipt.get("sha"))
-              _assert_execution_live(db, row, principal)
-            except Exception as exc:
-              outcome.update(
-                state="merge_unknown",
-                summary=reviews.merge_failure_summary(exc),
-              )
+      _require_ready_attempt_resolved(previous)
+      await merge_actions.merge_reviewed_target(db, row, target, outcome, repo, pull, principal,
+        gh=_gh, cwd=cwd, authorize=lambda: _parent(db, row, principal))
+      return {"run": _run_view(db, row)}
     if (row.mode == "review" and (row.options_json or {}).get("post_review") is True
-        and outcome.get("state") in {"all_clear", "needs_you"} and not previous.get("public_review")):
+        and outcome.get("state") in {"all_clear", "needs_you"}
+        and (previous.get("public_review") or {}).get("state") not in {"posting", "posted", "unknown"}):
       outcome = await _post_public_review(db, row, item_key, target, outcome, principal, cwd)
-    if not outcome.get("merge_attempted"):
+    if not outcome.get("merge_attempted") and not outcome.get("public_review"):
       _parent(db, row, principal)
-    reviews.save_outcome(db, row, item_key, outcome)
+    if outcome.get("merge_attempted") or outcome.get("public_review"):
+      reviews.save_effect_outcome(db, row, item_key, outcome)
+    else:
+      reviews.save_outcome(db, row, item_key, outcome)
     return {"run": _run_view(db, row)}
 
 
 async def _post_public_review(db, row, item_key, target, outcome, principal, cwd):
-  """Post the recorded verdict once, as a GitHub comment review on the exact head.
-
-  The owner chose this at launch (frozen `post_review`). The server, not the
-  agent, performs the write, under the same connected-account guard as merges.
-  The receipt is saved before network I/O, so a lost response is reported as
-  unknown and never posted twice.
-  """
+  """Freeze evidence before dispatch; only certified non-dispatch permits retry."""
+  # Format before reserving: a known local rejection is not an uncertain send.
+  body = public.review_comment_body(outcome)
   async with _github_connection_transaction():
-    actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
+    actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub actor lookup)
     if str(actor.get("id") or "") != row.github_actor_id:
-      return {**outcome, "public_review": {"state": "skipped",
-        "summary": "The connected GitHub account changed, so the review was not posted."}}
-    _parent(db, row, principal)
-    reviews.save_outcome(db, row, item_key, {**outcome, "public_review": {"state": "posting"}})
+      return {**outcome, "public_review": {"state": "not_dispatched",
+        "summary": "The connected GitHub account changed; no review was posted."}}
+    frozen = public.evidence(outcome)
+    async with chat_queue.get_transition_lock(f"review-admission:{row.id}"):
+      _parent(db, row, principal)
+      reviews.save_outcome(db, row, item_key, {**outcome,
+        "public_review": {"state": "posting", "evidence": frozen}})
+    # There is no await between the final authority check and settled dispatch.
     try:
-      receipt = await asyncio.to_thread(reviews.post_review, _gh, cwd, target, reviews.review_comment_body(outcome))
-      return {**outcome, "public_review": {"state": "posted", **receipt}}
-    except Exception:
-      return {**outcome, "public_review": {"state": "unknown",
-        "summary": "GitHub did not confirm the posted review. Check the PR before posting it again."}}
+      _parent(db, row, principal)
+    except HTTPException as exc:
+      return {**outcome, "public_review": {"state": "not_dispatched", "summary": str(exc.detail)}}
+    result = await settled.run_settled(public.post_review, _gh, cwd, target, body)
+    receipt = {"state": {"confirmed": "posted", "unknown": "unknown",
+                         "not_dispatched": "not_dispatched"}[result.state]}
+    if result.state != "not_dispatched":
+      receipt["evidence"] = frozen
+    if result.receipt:
+      receipt.update(result.receipt)
+    if result.reason:
+      receipt["summary"] = result.reason
+    return {**outcome, "public_review": receipt}
 
 
 class ReviewPreview(BaseModel):
@@ -509,7 +489,7 @@ def _run_view(db, row, *, context_app_id=None):
   value["stop_semantics"] = "revokes_future_actions; an already-admitted public action may finish"
   frozen = row.options_json or {}
   actual = coerce_agent_settings(chat.agent_settings_json) if chat else {}
-  if frozen.get("model") and (not chat or chat.provider != frozen["provider"] or actual.get("model") != frozen["model"] or actual.get("effort") != frozen.get("reasoning_effort")):
+  if value["state"] != "complete" and frozen.get("model") and (not chat or chat.provider != frozen["provider"] or actual.get("model") != frozen["model"] or actual.get("effort") != frozen.get("reasoning_effort")):
     value.update(state="needs_you", summary="The owning chat model choice no longer matches this frozen workflow.")
   last = db.query(models.ChatRun).filter_by(chat_id=row.chat_id).order_by(
     models.ChatRun.started_at.desc()).first()
@@ -525,12 +505,19 @@ def _run_view(db, row, *, context_app_id=None):
       else "The review conversation stopped. Open it to continue the remaining work."))
   elif last:
     value["execution_state"] = last.status
+  if value["state"] != "complete" and _review_stop_requested(row):
+    value.update(state="needs_you", execution_state="stopped",
+                 summary="This review was stopped. No new evidence or public action is admitted.")
   return value
+
+
+def _review_stop_requested(row):
+  return (row.outcomes_json or {}).get(REVIEW_STOP_KEY, {}).get("state") == "requested"
 
 
 def _parent(db, row, principal):
   if principal.delegation_id is not None or principal.chat_id != row.chat_id:
-    raise HTTPException(403, "Only this review's owning conversation may repair or merge.")
+    raise HTTPException(403, "Only this review's owning conversation may report an outcome or merge.")
   _assert_execution_live(db, row, principal)
   frozen = row.options_json or {}
   if frozen.get("model"):
@@ -540,353 +527,6 @@ def _parent(db, row, principal):
       raise HTTPException(409, "The owning conversation's model choice changed. This frozen workflow cannot continue under a different choice.")
 
 
-def _target(row, body):
-  original = next((t for t in row.targets_json if reviews.key(t) == reviews.key(body.model_dump())), None)
-  target = reviews.effective_target(row, original) if original else None
-  if target is None or target["head_sha"] != body.head_sha:
-    raise HTTPException(409, "This head has no approved selection or guarded successor receipt.")
-  return target
-
-
-def _assert_independent_reviewer(row, child, target):
-  # Trusted execution is the current delegation contract. Read-only is this
-  # server-created task's instruction, not a retired execution permission mode.
-  if child.scope != "write":
-    raise HTTPException(403, "Legacy read-mode reviewers cannot supply new evidence. Approve a fresh review.")
-  if child.parent_chat_id != row.chat_id:
-    raise HTTPException(403, "This independent reviewer belongs to a different owning conversation.")
-  previous = row.outcomes_json.get(reviews.key(target), {})
-  step = next((s for s in previous.get("reviewer_steps", [])
-    if s.get("delegation_id") == child.id and s.get("head_sha") == target["head_sha"]
-    and s.get("base_sha") == target["base_sha"]), None)
-  if step is None:
-    raise HTTPException(403, "Only the server-registered independent reviewer for this exact head and base may record evidence.")
-  frozen = row.options_json or {}
-  expected_prompt = hashlib.sha256(reviews.independent_brief(row, target).encode("utf-8")).hexdigest()
-  if (child.prompt_sha256 != expected_prompt or child.provider != frozen.get("provider")
-      or child.model != frozen.get("model") or child.effort != frozen.get("reasoning_effort")
-      or any(step.get(k) != getattr(child, k) for k in ("prompt_sha256", "provider", "model", "effort"))):
-    raise HTTPException(409, "This child does not match the run-frozen independent review prompt and model.")
-
-
-@router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/independent-reviews",
-             dependencies=[Depends(reject_cross_site)])
-async def independent_review(app_id: int | None, run_id: str, body: ReviewOutcome,
-                             db: Session = Depends(get_db),
-                             principal: Principal = Depends(get_agent_run_principal)):
-  row = _row(db, app_id, run_id, principal)
-  child = db.query(models.Delegation).filter_by(id=principal.delegation_id,
-    parent_chat_id=row.chat_id, child_chat_id=principal.chat_id).first() if principal.delegation_id else None
-  if child is None or child.cancelled_at is not None:
-    raise HTTPException(403, "A separate server-created independent reviewer must record this evidence.")
-  async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
-    db.refresh(row)
-    target = _target(row, body)
-    _assert_independent_reviewer(row, child, target)
-    if body.reviewed_base_sha != target["base_sha"]:
-      raise HTTPException(409, "Review evidence must name the exact target base.")
-    if body.state == "all_clear" and (set(body.scope) != SCOPE or body.tests_passed is not True or not body.tests.strip()):
-      raise HTTPException(422, "Independent all-clear requires full-diff scope and passing test evidence.")
-    cwd = Path(get_settings().data_dir) / "platform"
-    await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
-    await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-    _assert_app_current(db, row.app_id, row.app_nonce)
-    db.refresh(child)
-    if child.cancelled_at is not None:
-      raise HTTPException(409, "This independent reviewer was cancelled during preflight.")
-    if child.child_chat_id != principal.chat_id:
-      raise HTTPException(409, "The independent reviewer conversation changed during preflight.")
-    db.refresh(row)
-    _assert_independent_reviewer(row, child, _target(row, body))
-    active = db.query(models.ChatRun).filter_by(id=principal.run_id,
-      chat_id=principal.chat_id, status="running").first()
-    parent_live = db.query(models.ChatRun.id).filter_by(chat_id=row.chat_id, status="running").first()
-    if not active or not parent_live:
-      raise HTTPException(409, "Review execution stopped. No new evidence admitted.")
-    previous = row.outcomes_json.get(reviews.key(target), {})
-    receipts = list(previous.get("independent_reviews", []))
-    # Retries of one child execution cannot manufacture fresh review rounds.
-    existing = next((r for r in receipts if r["review_run_id"] == principal.run_id), None)
-    receipt = {"id": str(uuid.uuid4()), "head_sha": body.head_sha,
-      "base_sha": body.reviewed_base_sha, "state": body.state, "summary": body.summary,
-      "scope": body.scope, "tests": body.tests, "tests_passed": body.tests_passed,
-      "review_chat_id": principal.chat_id, "review_run_id": principal.run_id,
-      "delegation_id": child.id}
-    if existing:
-      if any(existing[k] != receipt[k] for k in receipt if k != "id"):
-        raise HTTPException(409, "This independent review execution already recorded different evidence.")
-      return {"independent_receipt_id": existing["id"], "run": _run_view(db, row)}
-    receipts.append(receipt)
-    reviews.save_outcome(db, row, reviews.key(target), {**previous,
-      "state": previous.get("state", "reviewing"), "independent_reviews": receipts})
-    return {"independent_receipt_id": receipt["id"], "run": _run_view(db, row)}
-
-
-class RepairCheckout(PullIdentity):
-  findings: str = Field(min_length=1)
-
-
-class RepairPublish(PullIdentity):
-  summary: str = Field(min_length=1)
-  tests: str = Field(min_length=1)
-  tests_passed: bool
-
-
-def _repair_allowed(row):
-  if row.mode != "review_fix_merge" or (row.options_json or {}).get("confirmation_scope") not in TAKEOVER_SCOPES:
-    raise HTTPException(403, "This mode does not authorize public repairs. Confirm scoped takeover separately.")
-
-
-def _require_ready_attempt_resolved(previous):
-  attempt = previous.get("ready_attempt")
-  if attempt and attempt.get("state") != "ready":
-    raise HTTPException(409, "The draft readiness attempt is uncertain. Reconcile it read-only before any new public action.")
-
-
-class DraftReady(PullIdentity):
-  reviewed_base_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
-  independent_receipt_id: str = Field(min_length=1, max_length=64)
-  summary: str = Field(min_length=1)
-  scope: list[str] = Field(min_length=6, max_length=6)
-  tests: str = Field(min_length=1)
-  tests_passed: bool
-
-
-@router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/ready",
-             dependencies=[Depends(reject_cross_site)])
-async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
-                           db: Session = Depends(get_db),
-                           principal: Principal = Depends(get_agent_run_principal)):
-  row = _row(db, app_id, run_id, principal)
-  if not reviews.draft_ready_allowed(row):
-    raise HTTPException(403, "This frozen grant does not authorize marking a draft ready for review.")
-  _parent(db, row, principal)
-  async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
-    db.refresh(row)
-    target = _target(row, body)
-    item_key = reviews.key(target)
-    previous = (row.outcomes_json or {}).get(item_key, {})
-    cwd = Path(get_settings().data_dir) / "platform"
-    attempt = previous.get("ready_attempt")
-    if attempt:
-      # The mutation is unrepeatable after admission, including lost responses.
-      try:
-        live_repo, live = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
-      except Exception:
-        return {"run": _run_view(db, row), "blocked": "The earlier readiness attempt is uncertain; it was not repeated."}
-      if live.get("state") == "open" and live.get("draft") is False:
-        if not reviews.merge_permission(live_repo):
-          return {"run": _run_view(db, row), "blocked": "The earlier readiness attempt is visible, but write permission changed; no action was repeated."}
-        actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
-        if str(actor.get("id") or "") != row.github_actor_id:
-          return {"run": _run_view(db, row), "blocked": "The earlier readiness attempt is visible, but the GitHub actor changed; no action was repeated."}
-        try:
-          await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-        except HTTPException:
-          return {"run": _run_view(db, row), "blocked": "The target base changed; exact readiness evidence cannot be confirmed."}
-        if attempt.get("state") != "ready":
-          reviews.save_outcome(db, row, item_key, {**previous,
-            "ready_attempt": {**attempt, "state": "ready"}})
-        return {"run": _run_view(db, row)}
-      return {"run": _run_view(db, row), "blocked": "The earlier readiness attempt is not confirmed; it was not repeated."}
-    if body.tests_passed is not True or set(body.scope) != SCOPE or not body.tests.strip():
-      raise HTTPException(422, "Fresh full-rubric review and passing tests are required before draft readiness.")
-    reviews.require_independent_clear(row, target, body)
-    async with _github_connection_transaction():
-      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
-      if str(actor.get("id") or "") != row.github_actor_id:
-        raise HTTPException(409, "The connected GitHub actor changed. Approve a new selection.")
-      repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
-      await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-      checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)
-      blocker = reviews.readiness_blocker(target, repo, pull, checks)
-      if blocker:
-        raise HTTPException(409, blocker)
-      _parent(db, row, principal)
-      # GitHub has no expected-head argument for this mutation. Minimize the
-      # race by re-reading identity, base, rights and checks after preflight.
-      repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
-      await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-      checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)
-      blocker = reviews.readiness_blocker(target, repo, pull, checks)
-      if blocker:
-        raise HTTPException(409, blocker)
-      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
-      if str(actor.get("id") or "") != row.github_actor_id:
-        raise HTTPException(409, "The connected GitHub actor changed during preflight.")
-      _parent(db, row, principal)
-      receipt = {"id": str(uuid.uuid4()), "state": "attempting",
-        "head_sha": target["head_sha"], "base_sha": target["base_sha"],
-        "independent_receipt_id": body.independent_receipt_id,
-        "review_run_id": principal.run_id, "summary": body.summary,
-        "tests": body.tests, "tests_passed": True, "scope": body.scope}
-      reviews.arm_ready(db, row, target, receipt, principal)
-      try:
-        _parent(db, row, principal)
-        await asyncio.to_thread(reviews.mark_ready, _gh, cwd, target)
-        # The GraphQL response confirms the PR/head but not the target base.
-        # A second live read keeps a post-mutation base drift uncertain.
-        confirmed_repo, confirmed = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
-        await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-        if (not reviews.merge_permission(confirmed_repo) or confirmed.get("state") != "open"
-            or confirmed.get("draft") is not False):
-          raise HTTPException(409, "GitHub did not confirm the exact draft is ready.")
-        actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
-        if str(actor.get("id") or "") != row.github_actor_id:
-          raise HTTPException(409, "The connected GitHub actor changed after the readiness attempt.")
-        _parent(db, row, principal)
-      except Exception:
-        receipt["state"] = "unknown"
-      else:
-        receipt["state"] = "ready"
-      db.refresh(row)
-      previous = row.outcomes_json[item_key]
-      reviews.save_outcome(db, row, item_key, {**previous, "ready_attempt": receipt})
-    return {"run": _run_view(db, row), **({"blocked": "The readiness response is uncertain; observe read-only before proceeding."} if receipt["state"] == "unknown" else {})}
-
-
-@router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/repair-checkout",
-             dependencies=[Depends(reject_cross_site)])
-async def repair_checkout(app_id: int | None, run_id: str, body: RepairCheckout,
-                          db: Session = Depends(get_db),
-                          principal: Principal = Depends(get_agent_run_principal)):
-  from app import contribution_review_repairs as repairs
-  row = _row(db, app_id, run_id, principal)
-  _repair_allowed(row)
-  _parent(db, row, principal)
-  async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
-    db.refresh(row)
-    target = _target(row, body)
-    previous = row.outcomes_json.get(reviews.key(target), {})
-    _require_ready_attempt_resolved(previous)
-    attempts = previous.get("repair_attempts", [])
-    if any(r.get("state") in {"pushing", "push_unknown"} for r in attempts):
-      raise HTTPException(409, "An earlier push has an unclear public outcome. Reconcile it; do not prepare another repair.")
-    reviews.require_repair_round_available(row, attempts)
-    cwd = Path(get_settings().data_dir) / "platform"
-    async with _github_connection_transaction():
-      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
-      if str(actor.get("id") or "") != row.github_actor_id:
-        raise HTTPException(409, "The connected GitHub actor changed. Approve a new selection.")
-      await asyncio.to_thread(reviews.require_repairable_merge, _gh, cwd, target, previous)
-      _parent(db, row, principal)
-      if previous.get("checkout") and previous["checkout"].get("initial_head_sha") == target["head_sha"]:
-        return {"checkout": previous["checkout"], "run": _run_view(db, row)}
-      # Scope was frozen during admission, never supplied by an editing agent.
-      allowed = target.get("allowed_files")
-      if not allowed:
-        raise HTTPException(409, "This grant has no frozen repair file scope. Approve a fresh selection.")
-      try:
-        checkout = await asyncio.to_thread(repairs.prepare_checkout, _gh, cwd, row, target, allowed)
-      except HTTPException as exc:
-        reviews.save_outcome(db, row, reviews.key(target), {**previous, "state": "needs_you", "summary": str(exc.detail)})
-        raise
-      _parent(db, row, principal)
-    reviews.save_outcome(db, row, reviews.key(target), {**previous, "state": "repairing",
-      "checkout": checkout, "findings": body.findings, "head_sha": target["head_sha"]})
-    return {"checkout": checkout, "run": _run_view(db, row)}
-
-
-@router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/repairs",
-             dependencies=[Depends(reject_cross_site)])
-async def publish_repair(app_id: int | None, run_id: str, body: RepairPublish,
-                         db: Session = Depends(get_db),
-                         principal: Principal = Depends(get_agent_run_principal)):
-  from app import contribution_review_repairs as repairs
-  row = _row(db, app_id, run_id, principal)
-  _repair_allowed(row)
-  _parent(db, row, principal)
-  async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
-    db.refresh(row)
-    original = next((t for t in row.targets_json if reviews.key(t) == reviews.key(body.model_dump())), None)
-    if original is None:
-      raise HTTPException(409, "This PR is not named in the takeover grant.")
-    previous = row.outcomes_json.get(reviews.key(original), {})
-    attempts = list(previous.get("repair_attempts", []))
-    pending = next((r for r in attempts if r.get("from_sha") == body.head_sha), None)
-    cwd = Path(get_settings().data_dir) / "platform"
-    if pending:
-      # Read-only reconciliation, including after a lost push response. Never
-      # re-push even if the server process died after persisting the attempt.
-      if pending["state"] == "pushed":
-        return {"run": _run_view(db, row)}
-      candidate = {**original, "head_sha": pending["head_sha"], "base_sha": pending["base_sha"]}
-      try:
-        await asyncio.to_thread(reviews.current_pull, _gh, cwd, candidate)
-      except Exception:
-        return {"run": _run_view(db, row), "blocked": "The earlier push is not confirmed. It was not repeated."}
-      _parent(db, row, principal)
-      attempts = [{**r, "state": "pushed"} if r is pending else r for r in attempts]
-      reviews.save_outcome(db, row, reviews.key(original),
-        reviews.confirmed_successor(previous, attempts, pending))
-      return {"run": _run_view(db, row)}
-    _require_ready_attempt_resolved(previous)
-    target = _target(row, body)
-    if body.tests_passed is not True:
-      raise HTTPException(422, "Failed or unknown tests block public repair publication.")
-    if not body.summary.strip() or not body.tests.strip():
-      raise HTTPException(422, "Concrete repair and test evidence are required.")
-    checkout = previous.get("checkout")
-    if not checkout or checkout.get("initial_head_sha") != target["head_sha"]:
-      raise HTTPException(409, "Prepare this exact head in its dedicated server checkout first.")
-    reviews.require_repair_round_available(row, attempts)
-    async with _github_connection_transaction():
-      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
-      if str(actor.get("id") or "") != row.github_actor_id:
-        raise HTTPException(409, "The connected GitHub actor changed. No push started.")
-      await asyncio.to_thread(reviews.require_repairable_merge, _gh, cwd, target, previous)
-      current_base = await asyncio.to_thread(reviews.base_head, _gh, cwd, target["repo"], target["base_ref"])
-      try:
-        validation = await asyncio.to_thread(repairs.validate_repair, _gh, cwd, row, target,
-                                             checkout, target["allowed_files"])
-      except HTTPException as exc:
-        reviews.save_outcome(db, row, reviews.key(target), {**previous, "state": "needs_you", "summary": str(exc.detail)})
-        raise
-      if await asyncio.to_thread(reviews.base_head, _gh, cwd, target["repo"], target["base_ref"]) != current_base:
-        raise HTTPException(409, "The target base moved during repair validation. Test the new combined result first.")
-      if (validation["head_sha"] == target["head_sha"] or any(
-          attempt.get("head_sha") == validation["head_sha"]
-          for attempt in previous.get("merge_attempts", []))):
-        raise HTTPException(409, "A repair must introduce a new, never-attempted head.")
-      validation["base_sha"] = current_base
-      _parent(db, row, principal)
-      receipt = {**validation, "id": str(uuid.uuid4()), "state": "pushing",
-        "from_sha": target["head_sha"], "summary": body.summary, "tests": body.tests,
-        "tests_passed": True, "author_chat_id": principal.chat_id, "author_run_id": principal.run_id}
-      owned = reviews.arm_repair(db, row, target, previous, receipt, principal)
-      if owned:
-        return {"run": _run_view(db, row), "blocked": owned}
-      db.refresh(row)
-      previous = row.outcomes_json[reviews.key(target)]
-      attempts = list(previous["repair_attempts"])
-      try:
-        # Stop and nonce rechecked after claim acquisition commits too.
-        _parent(db, row, principal)
-        loop = asyncio.get_running_loop()
-        async def final_push_guard():
-          _parent(db, row, principal)
-          await asyncio.to_thread(reviews.require_repairable_merge, _gh, cwd, target, previous)
-          _parent(db, row, principal)
-        def before_push():
-          asyncio.run_coroutine_threadsafe(final_push_guard(), loop).result()
-        # push_repair confirms the new head from the branch ref. Re-reading the
-        # PR here would race GitHub's asynchronous PR head update.
-        await asyncio.to_thread(repairs.push_repair, _gh, cwd, row, target, validation,
-                                before_push=before_push)
-        _parent(db, row, principal)
-      except Exception:
-        attempts[-1] = {**attempts[-1], "state": "push_unknown"}
-        reviews.save_outcome(db, row, reviews.key(target), {**previous,
-          "repair_attempts": attempts, "state": "needs_you",
-          "summary": "The public push outcome is not confirmed. Reconcile it without repeating the push."})
-      else:
-        attempts[-1] = {**attempts[-1], "state": "pushed"}
-        reviews.save_outcome(db, row, reviews.key(target),
-          reviews.confirmed_successor(previous, attempts, validation))
-    return {"run": _run_view(db, row)}
-
-
-# Core workflows deliberately use no app identity and no app-install capability.
 @router.post("/api/github/review-runs", dependencies=[Depends(reject_cross_site), Depends(require_nondelegated_owner_or_app_control)])
 async def core_start_reviews(body: StartReviews, db: Session = Depends(get_db), principal: Principal = Depends(get_principal)):
   return await start_reviews(None, body, db, principal)
@@ -920,26 +560,6 @@ async def core_report_outcome(run_id: str, body: ReviewOutcome, db: Session = De
   return await report_outcome(None, run_id, body, db, principal)
 
 
-@router.post("/api/github/review-runs/{run_id}/independent-reviews", dependencies=[Depends(reject_cross_site)])
-async def core_independent_review(run_id: str, body: ReviewOutcome, db: Session = Depends(get_db), principal: Principal = Depends(get_agent_run_principal)):
-  return await independent_review(None, run_id, body, db, principal)
-
-
-@router.post("/api/github/review-runs/{run_id}/repair-checkout", dependencies=[Depends(reject_cross_site)])
-async def core_repair_checkout(run_id: str, body: RepairCheckout, db: Session = Depends(get_db), principal: Principal = Depends(get_agent_run_principal)):
-  return await repair_checkout(None, run_id, body, db, principal)
-
-
-@router.post("/api/github/review-runs/{run_id}/repairs", dependencies=[Depends(reject_cross_site)])
-async def core_publish_repair(run_id: str, body: RepairPublish, db: Session = Depends(get_db), principal: Principal = Depends(get_agent_run_principal)):
-  return await publish_repair(None, run_id, body, db, principal)
-
-
-@router.post("/api/github/review-runs/{run_id}/ready", dependencies=[Depends(reject_cross_site)])
-async def core_mark_draft_ready(run_id: str, body: DraftReady, db: Session = Depends(get_db), principal: Principal = Depends(get_agent_run_principal)):
-  return await mark_draft_ready(None, run_id, body, db, principal)
-
-
 @router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/stop",
              dependencies=[Depends(reject_cross_site), Depends(require_nondelegated_owner_or_app_control)])
 async def stop_review(app_id: int | None, run_id: str, db: Session = Depends(get_db),
@@ -960,16 +580,346 @@ async def stop_review(app_id: int | None, run_id: str, db: Session = Depends(get
   # Goal holds accept only these actors; anything else reads as an unexplained interruption.
   actor = ("owner" if is_owner_input_principal(principal)
            else "agent" if principal.run_id is not None else "unknown")
-  stopped, _ = await stop_chat_for(row.chat_id, db=db, actor=actor,
-                                   actor_id=principal.run_id or principal.chat_id)
+  # Persist the run-level revocation before awaiting either the parent Stop or
+  # child cancellation. A completed parent has no running root to mark stopped,
+  # and child cancellation may wait or time out without latching cancelled_at.
+  async with chat_queue.get_transition_lock(f"review-admission:{run_id}"):
+    db.refresh(row)
+    if not _review_stop_requested(row):
+      reviews.save_outcome(db, row, REVIEW_STOP_KEY, {"state": "requested", "actor": actor})
+  parent_stopped, _ = await stop_chat_for(row.chat_id, db=db, actor=actor,
+                                          actor_id=principal.run_id or principal.chat_id)
+  from app.delegations import ACTIVE_DELEGATION_STATUSES, derived_status
+  from app.routes.delegations import cancel_active_for_parent
+  await cancel_active_for_parent(db, row.chat_id)
+  remaining = db.query(models.Delegation).filter(
+    models.Delegation.parent_chat_id == row.chat_id,
+    models.Delegation.cancelled_at.is_(None),
+  ).all()
+  children_stopped = not any(derived_status(db, child, load_result=False)[0]
+                             in ACTIVE_DELEGATION_STATUSES for child in remaining)
+  if parent_stopped and children_stopped:
+    # The outcome lock waits for any already admitted dispatcher. Only then
+    # can a stopped editor's path be classified as abandoned; uncertain push
+    # evidence stays available indefinitely for read-only reconciliation.
+    async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
+      db.refresh(row)
+      await repair_actions.abandon_checkouts(row)
   db.refresh(row)
-  return {"stopped": stopped, "run": _run_view(db, row)}
+  return {"stopped": parent_stopped and children_stopped, "run": _run_view(db, row)}
 
 
 @router.post("/api/github/review-runs/{run_id}/stop",
              dependencies=[Depends(reject_cross_site), Depends(require_nondelegated_owner_or_app_control)])
 async def core_stop_review(run_id: str, db: Session = Depends(get_db), principal: Principal = Depends(get_principal)):
   return await stop_review(None, run_id, db, principal)
+
+
+@router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/observe",
+             dependencies=[Depends(reject_cross_site)])
+async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(get_db),
+                          principal: Principal = Depends(get_principal)):
+  """Read-only GitHub reconciliation: never starts agents or public actions.
+
+  The existing durable Wait owner may call this after resumption. It also
+  settles lost receipts while a chat is stopped without reviving that chat.
+  """
+  row = _row(db, app_id, run_id, principal)
+  cwd = Path(get_settings().data_dir) / "platform"
+  async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
+    db.refresh(row)
+    for original in row.targets_json:
+      previous = row.outcomes_json.get(reviews.key(original), {})
+      if not previous or (row.mode == "review" and previous.get("state") == "all_clear"):
+        continue
+      target = reviews.effective_target(row, original)
+      pending = next((a for a in previous.get("repair_attempts", [])
+                      if a.get("state") in {"pushing", "push_unknown"}), None)
+      if pending:
+        if not await repair_actions.reconcile_push(db, row, original, previous, pending, gh=_gh, cwd=cwd):
+          continue
+        previous = row.outcomes_json[reviews.key(original)]
+      target = reviews.effective_target(row, original)
+      attempt = previous.get("ready_attempt")
+      if attempt and attempt.get("state") in {"attempting", "unknown"}:
+        blocked = await _confirm_ready_attempt(row, target, cwd)
+        if blocked:
+          _escalate_unconfirmed_ready(db, row, reviews.key(original), previous, attempt)
+          continue
+        reviews.save_ready_attempt(db, row, reviews.key(original), {**attempt, "state": "ready"})
+        previous = row.outcomes_json[reviews.key(original)]
+      attempted = previous.get("merge_attempted") is True or previous.get("state") in {"merging", "merge_unknown", "queued", "merged"}
+      try:
+        _repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
+        if attempted:
+          outcome = await asyncio.to_thread(reviews.reconcile_merge, _gh, cwd, target, previous, pull)  # unsettled: read-only (GitHub queue history)
+        elif previous.get("state") == "all_clear":
+          continue
+        else:
+          continue
+      except HTTPException as exc:
+        outcome = {**previous, "state": "needs_you", "summary": str(exc.detail), "merge_attempted": attempted}
+      if outcome != previous:
+        reviews.save_effect_outcome(db, row, reviews.key(original), outcome)
+    return {"run": _run_view(db, row)}
+
+
+@router.post("/api/github/review-runs/{run_id}/observe", dependencies=[Depends(reject_cross_site)])
+async def core_observe_review(run_id: str, db: Session = Depends(get_db), principal: Principal = Depends(get_principal)):
+  return await observe_review(None, run_id, db, principal)
+
+
+def _target(row, body):
+  original = next((t for t in row.targets_json if reviews.key(t) == reviews.key(body.model_dump())), None)
+  target = reviews.effective_target(row, original) if original else None
+  if target is None or target["head_sha"] != body.head_sha:
+    raise HTTPException(409, "This head has no approved selection or guarded successor receipt.")
+  return target
+
+
+def _assert_independent_reviewer(row, child, target):
+  # Trusted execution is the current delegation contract. Read-only is this
+  # server-created task's instruction, not a retired execution permission mode.
+  if child.scope != "write":
+    raise HTTPException(403, "Legacy read-mode reviewers cannot supply new evidence. Approve a fresh review.")
+  if child.parent_chat_id != row.chat_id:
+    raise HTTPException(403, "This independent reviewer belongs to a different owning conversation.")
+  previous = row.outcomes_json.get(reviews.key(target), {})
+  step = next((s for s in previous.get("reviewer_steps", [])
+    if s.get("delegation_id") == child.id and s.get("head_sha") == target["head_sha"]
+    and s.get("base_sha") == target["base_sha"]), None)
+  if step is None:
+    raise HTTPException(403, "Only the server-registered independent reviewer for this exact head and base may record evidence.")
+  frozen = row.options_json or {}
+  expected_prompt = hashlib.sha256(reviews.independent_brief(row, target).encode("utf-8")).hexdigest()
+  if (child.prompt_sha256 != expected_prompt or child.provider != frozen.get("provider")
+      or child.model != frozen.get("model") or child.effort != frozen.get("reasoning_effort")
+      or any(step.get(k) != getattr(child, k) for k in ("prompt_sha256", "provider", "model", "effort"))):
+    raise HTTPException(409, "This child does not match the run-frozen independent review prompt and model.")
+
+
+def _reviewer_root_allows_evidence(db, child):
+  """A durable reviewer belongs to its spawning work, not today's parent turn."""
+  root_id = child.parent_root_run_id
+  goal = db.query(models.ChatGoal).populate_existing().filter_by(id=root_id).first()
+  if goal is not None:
+    return (goal.chat_id == child.parent_chat_id and goal.status == "open"
+      and db.query(models.ChatRun.id).filter_by(
+        chat_id=child.parent_chat_id, goal_id=root_id).first() is not None)
+  root = db.query(models.ChatRun).populate_existing().filter_by(
+    id=root_id, chat_id=child.parent_chat_id).first()
+  if root is None:
+    return False
+  # A successful parent turn may finish while its child is still working.
+  # Stop, including a stopped physical continuation of this root, revokes it.
+  stopped = db.query(models.ChatRun.id).filter(
+    models.ChatRun.chat_id == child.parent_chat_id,
+    or_(models.ChatRun.id == root_id, models.ChatRun.root_run_id == root_id),
+    models.ChatRun.status == "stopped",
+  ).first()
+  return stopped is None
+
+
+@router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/independent-reviews",
+             dependencies=[Depends(reject_cross_site)])
+async def independent_review(app_id: int | None, run_id: str, body: ReviewOutcome,
+                             db: Session = Depends(get_db),
+                             principal: Principal = Depends(get_agent_run_principal)):
+  row = _row(db, app_id, run_id, principal)
+  child = db.query(models.Delegation).filter_by(id=principal.delegation_id,
+    parent_chat_id=row.chat_id, child_chat_id=principal.chat_id).first() if principal.delegation_id else None
+  if child is None or child.cancelled_at is not None:
+    raise HTTPException(403, "A separate server-created independent reviewer must record this evidence.")
+  async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
+    db.refresh(row)
+    if _review_stop_requested(row):
+      raise HTTPException(409, "This review was stopped. No new evidence admitted.")
+    target = _target(row, body)
+    _assert_independent_reviewer(row, child, target)
+    if body.reviewed_base_sha != target["base_sha"]:
+      raise HTTPException(409, "Review evidence must name the exact target base.")
+    if body.state == "all_clear" and (set(body.scope) != SCOPE or body.tests_passed is not True or not body.tests.strip()):
+      raise HTTPException(422, "Independent all-clear requires full-diff scope and passing test evidence.")
+    cwd = Path(get_settings().data_dir) / "platform"
+    await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation; no mutation)
+    await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)  # unsettled: read-only (GitHub observation; no mutation)
+    # Serialize the final admission with Stop, not the remote preflight. A
+    # reviewer can finish after a successful parent turn, but not after Stop.
+    async with chat_queue.get_transition_lock(row.chat_id):
+      _assert_app_current(db, row.app_id, row.app_nonce)
+      db.refresh(child)
+      if child.cancelled_at is not None:
+        raise HTTPException(409, "This independent reviewer was cancelled during preflight.")
+      if child.child_chat_id != principal.chat_id:
+        raise HTTPException(409, "The independent reviewer conversation changed during preflight.")
+      db.refresh(row)
+      if _review_stop_requested(row):
+        raise HTTPException(409, "This review was stopped during preflight. No new evidence admitted.")
+      _assert_independent_reviewer(row, child, _target(row, body))
+      active = db.query(models.ChatRun.id).filter_by(id=principal.run_id,
+        chat_id=principal.chat_id, status="running").first()
+      if not active or not _reviewer_root_allows_evidence(db, child):
+        raise HTTPException(409, "Review execution stopped. No new evidence admitted.")
+      previous = row.outcomes_json.get(reviews.key(target), {})
+      receipts = list(previous.get("independent_reviews", []))
+      # Retries of one child execution cannot manufacture fresh review rounds.
+      existing = next((r for r in receipts if r["review_run_id"] == principal.run_id), None)
+      receipt = {"id": str(uuid.uuid4()), "head_sha": body.head_sha,
+        "base_sha": body.reviewed_base_sha, "state": body.state, "summary": body.summary,
+        "scope": body.scope, "tests": body.tests, "tests_passed": body.tests_passed,
+        "review_chat_id": principal.chat_id, "review_run_id": principal.run_id,
+        "delegation_id": child.id}
+      if existing:
+        if any(existing[k] != receipt[k] for k in receipt if k != "id"):
+          raise HTTPException(409, "This independent review execution already recorded different evidence.")
+        return {"independent_receipt_id": existing["id"], "run": _run_view(db, row)}
+      receipts.append(receipt)
+      reviews.save_outcome(db, row, reviews.key(target), {**previous,
+        "state": previous.get("state", "reviewing"), "independent_reviews": receipts})
+      return {"independent_receipt_id": receipt["id"], "run": _run_view(db, row)}
+
+
+class RepairCheckout(PullIdentity):
+  findings: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
+
+
+class RepairPublish(PullIdentity):
+  summary: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
+  tests: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
+  tests_passed: bool
+
+
+def _repair_allowed(row):
+  if row.mode != "review_fix_merge" or (row.options_json or {}).get("confirmation_scope") not in TAKEOVER_SCOPES:
+    raise HTTPException(403, "This mode does not authorize public repairs. Confirm scoped takeover separately.")
+
+
+@router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/repair-checkout",
+             dependencies=[Depends(reject_cross_site)])
+async def repair_checkout(app_id: int | None, run_id: str, body: RepairCheckout,
+                          db: Session = Depends(get_db),
+                          principal: Principal = Depends(get_agent_run_principal)):
+  from app import contribution_review_repairs as repairs
+  row = _row(db, app_id, run_id, principal)
+  _repair_allowed(row)
+  _parent(db, row, principal)
+  async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
+    db.refresh(row)
+    target = _target(row, body)
+    previous = row.outcomes_json.get(reviews.key(target), {})
+    _require_ready_attempt_resolved(previous)
+    attempts = previous.get("repair_attempts", [])
+    if any(r.get("state") in {"pushing", "push_unknown"} for r in attempts):
+      raise HTTPException(409, "An earlier push has an unclear public outcome. Reconcile it; do not prepare another repair.")
+    reviews.require_public_transition_clear(db, row, target)
+    reviews.require_repair_round_available(row, attempts)
+    cwd = Path(get_settings().data_dir) / "platform"
+    async with _github_connection_transaction():
+      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub observation; no mutation)
+      if str(actor.get("id") or "") != row.github_actor_id:
+        raise HTTPException(409, "The connected GitHub actor changed. Approve a new selection.")
+      await asyncio.to_thread(reviews.require_repairable_merge, _gh, cwd, target, previous)  # unsettled: read-only (exact saved queue removal)
+      _parent(db, row, principal)
+      if (previous.get("checkout") and previous["checkout"].get("initial_head_sha") == target["head_sha"]
+          and repairs.checkout_present(previous["checkout"].get("checkout"))):
+        checkout = {**previous["checkout"], "target_base_sha": await settled.run_settled(
+          repairs.fetch_target_base, _gh, cwd, Path(previous["checkout"]["checkout"]), target)}
+        _parent(db, row, principal)
+        reviews.save_outcome(db, row, reviews.key(target), {**previous, "checkout": checkout})
+        return {"checkout": checkout, "run": _run_view(db, row)}
+      # Scope was frozen during admission, never supplied by an editing agent.
+      allowed = target.get("allowed_files")
+      if not allowed:
+        raise HTTPException(409, "This grant has no frozen repair file scope. Approve a fresh selection.")
+      try:
+        checkout = await settled.run_settled(repairs.prepare_checkout, _gh, cwd, row, target, allowed)
+      except HTTPException as exc:
+        reviews.save_outcome(db, row, reviews.key(target), {**previous, "state": "needs_you", "summary": str(exc.detail)})
+        raise
+      try:
+        _parent(db, row, principal)
+      except HTTPException:
+        # This newly created path has never owned a public receipt.
+        await settled.run_settled(repairs.discard_checkout, checkout.get("checkout"))
+        raise
+    reviews.save_outcome(db, row, reviews.key(target), {**previous, "state": "repairing",
+      "checkout": checkout, "findings": body.findings, "head_sha": target["head_sha"]})
+    return {"checkout": checkout, "run": _run_view(db, row)}
+
+
+@router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/repairs",
+             dependencies=[Depends(reject_cross_site)])
+async def publish_repair(app_id: int | None, run_id: str, body: RepairPublish,
+                         db: Session = Depends(get_db),
+                         principal: Principal = Depends(get_agent_run_principal)):
+  from app import contribution_review_repairs as repairs
+  row = _row(db, app_id, run_id, principal)
+  _repair_allowed(row)
+  _parent(db, row, principal)
+  async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
+    db.refresh(row)
+    original = next((t for t in row.targets_json if reviews.key(t) == reviews.key(body.model_dump())), None)
+    if original is None:
+      raise HTTPException(409, "This PR is not named in the takeover grant.")
+    previous = row.outcomes_json.get(reviews.key(original), {})
+    attempts = list(previous.get("repair_attempts", []))
+    pending = next((r for r in attempts if r.get("from_sha") == body.head_sha), None)
+    cwd = Path(get_settings().data_dir) / "platform"
+    if pending:
+      confirmed = await repair_actions.reconcile_push(db, row, original, previous, pending, gh=_gh, cwd=cwd)
+      return {"run": _run_view(db, row), **({} if confirmed else {
+        "blocked": "The earlier push is not confirmed. It was not repeated."})}
+    _require_ready_attempt_resolved(previous)
+    target = _target(row, body)
+    if body.tests_passed is not True:
+      raise HTTPException(422, "Failed or unknown tests block public repair publication.")
+    if not body.summary.strip() or not body.tests.strip():
+      raise HTTPException(422, "Concrete repair and test evidence are required.")
+    checkout = previous.get("checkout")
+    if not checkout or checkout.get("initial_head_sha") != target["head_sha"]:
+      raise HTTPException(409, "Prepare this exact head in its dedicated server checkout first.")
+    reviews.require_repair_round_available(row, attempts)
+    async with _github_connection_transaction():
+      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub observation; no mutation)
+      if str(actor.get("id") or "") != row.github_actor_id:
+        raise HTTPException(409, "The connected GitHub actor changed. No push started.")
+      await asyncio.to_thread(reviews.require_repairable_merge, _gh, cwd, target, previous)  # unsettled: read-only (exact saved queue removal)
+      _parent(db, row, principal)
+      current_base = await asyncio.to_thread(reviews.base_head, _gh, cwd, target["repo"], target["base_ref"])  # unsettled: read-only (GitHub observation; no mutation)
+      try:
+        validation = await settled.run_settled(repairs.validate_repair, _gh, cwd, row, target,
+                                             checkout, target["allowed_files"], base_sha=current_base)
+      except HTTPException as exc:
+        reviews.save_outcome(db, row, reviews.key(target), {**previous, "state": "needs_you", "summary": str(exc.detail)})
+        raise
+      if await asyncio.to_thread(reviews.base_head, _gh, cwd, target["repo"], target["base_ref"]) != current_base:  # unsettled: read-only (GitHub observation; no mutation)
+        raise HTTPException(409, "The target base moved during repair validation. Test the new combined result first.")
+      if previous.get("queue_removal") and validation["head_sha"] == target["head_sha"]:
+        raise HTTPException(409, "A removed queue head cannot be retried. Prepare a new repaired successor.")
+      validation["base_sha"] = current_base
+      receipt = {**validation, "id": str(uuid.uuid4()), "state": "pushing",
+        "from_sha": target["head_sha"], "summary": body.summary, "tests": body.tests,
+        "tests_passed": True, "author_chat_id": principal.chat_id, "author_run_id": principal.run_id}
+      owned = await repair_actions.publish_attempt(db, row, target, validation, receipt, principal,
+        gh=_gh, cwd=cwd, authorize=lambda: _parent(db, row, principal))
+      if owned:
+        return {"run": _run_view(db, row), "blocked": owned}
+    return {"run": _run_view(db, row)}
+
+
+@router.post("/api/github/review-runs/{run_id}/independent-reviews", dependencies=[Depends(reject_cross_site)])
+async def core_independent_review(run_id: str, body: ReviewOutcome, db: Session = Depends(get_db), principal: Principal = Depends(get_agent_run_principal)):
+  return await independent_review(None, run_id, body, db, principal)
+
+
+@router.post("/api/github/review-runs/{run_id}/repair-checkout", dependencies=[Depends(reject_cross_site)])
+async def core_repair_checkout(run_id: str, body: RepairCheckout, db: Session = Depends(get_db), principal: Principal = Depends(get_agent_run_principal)):
+  return await repair_checkout(None, run_id, body, db, principal)
+
+
+@router.post("/api/github/review-runs/{run_id}/repairs", dependencies=[Depends(reject_cross_site)])
+async def core_publish_repair(run_id: str, body: RepairPublish, db: Session = Depends(get_db), principal: Principal = Depends(get_agent_run_principal)):
+  return await publish_repair(None, run_id, body, db, principal)
 
 
 @router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/reviewers",
@@ -982,6 +932,13 @@ async def start_independent_reviewer(app_id: int | None, run_id: str, body: Pull
   row = _row(db, app_id, run_id, principal)
   _parent(db, row, principal)
   async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
+    db.refresh(row)
+    original = next((t for t in row.targets_json if reviews.key(t) == reviews.key(body.model_dump())), None)
+    if (original is not None and row.mode == "review_fix_merge"
+        and reviews.effective_target(row, original)["head_sha"] == body.head_sha):
+      cwd = Path(get_settings().data_dir) / "platform"
+      await _record_base_advance(db, row, original,
+        (row.outcomes_json or {}).get(reviews.key(original), {}), principal, cwd)
     async with AsyncExitStack() as admission:
       if app_id is not None:
         await admission.enter_async_context(chat_queue.get_transition_lock(f"app-lifecycle:{app_id}"))
@@ -1000,22 +957,29 @@ async def start_independent_reviewer(app_id: int | None, run_id: str, body: Pull
         # Never revive a stopped child when observing a saved step, even across
         # parent turns with a fresh logical root id.
         _assert_independent_reviewer(row, existing, target)
+        if not db.query(models.ChatRun.id).filter_by(chat_id=existing.child_chat_id).first():
+          await ensure_delegation_started(db, existing, start_turn=start_programmatic_chat_turn)
+          _parent(db, row, principal)
         return {"delegation": serialize_delegation(db, existing), "run": _run_view(db, row)}
       root_id = parent_root_run_id(db, row.chat_id, require_active=True)
       if not root_id:
         raise HTTPException(409, "The owning review stopped before reviewer admission.")
+      parent_run = db.get(models.ChatRun, principal.run_id)
       intent = DelegationIntent(app_id=app_id, parent_chat_id=row.chat_id,
-        parent_root_run_id=root_id, task_key=task_key, prompt=prompt,
+        parent_root_run_id=root_id, goal_id=parent_run.goal_id,
+        task_key=task_key, prompt=prompt,
         provider=frozen["provider"], model=frozen["model"], effort=frozen.get("reasoning_effort"),
         cwd=str(Path(get_settings().data_dir)), notify_parent_on_complete=True)
-      child, _ = create_or_attach_delegation(db, intent)
+      def register_reviewer(admitted):
+        reviews.write_outcome(db, row, reviews.key(target), {**previous,
+          "state": "reviewing", "head_sha": target["head_sha"],
+          "reviewer_steps": [*previous.get("reviewer_steps", []), {
+            "delegation_id": admitted.id, "head_sha": target["head_sha"], "base_sha": target["base_sha"],
+            "prompt_sha256": admitted.prompt_sha256, "provider": admitted.provider, "model": admitted.model,
+            "effort": admitted.effort}]})
+      child, _ = create_or_attach_delegation(db, intent, admit_child=register_reviewer)
       db.refresh(row)
-      reviews.save_outcome(db, row, reviews.key(target), {**previous,
-        "state": "reviewing", "head_sha": target["head_sha"],
-        "reviewer_steps": [*previous.get("reviewer_steps", []), {
-          "delegation_id": child.id, "head_sha": target["head_sha"], "base_sha": target["base_sha"],
-          "prompt_sha256": child.prompt_sha256, "provider": child.provider, "model": child.model,
-          "effort": child.effort}]})
+      _assert_independent_reviewer(row, child, target)
       _parent(db, row, principal)
       await ensure_delegation_started(db, child, prompt, start_turn=start_programmatic_chat_turn)
       _parent(db, row, principal)
@@ -1027,75 +991,149 @@ async def core_start_independent_reviewer(run_id: str, body: PullIdentity, db: S
   return await start_independent_reviewer(None, run_id, body, db, principal)
 
 
-@router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/observe",
-             dependencies=[Depends(reject_cross_site)])
-async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(get_db),
-                          principal: Principal = Depends(get_principal)):
-  """Read-only GitHub reconciliation: never starts agents or public actions.
+async def _record_base_advance(db, row, original, previous, principal, cwd) -> bool:
+  """Observe and persist a target-branch advance; False when none applies."""
+  advanced = await asyncio.to_thread(reviews.observe_base_advance, _gh, cwd, row, original, previous)  # unsettled: read-only (GitHub API reads)
+  if advanced is None:
+    return False
+  _save_base_advance(db, row, original, previous, advanced, principal)
+  return True
 
-  The existing durable Wait owner may call this after resumption. It also
-  settles lost receipts while a chat is stopped without reviving that chat.
+
+def _save_base_advance(db, row, original, previous, advanced, principal):
+  """Persist an observed advance only for the still-live owning run.
+
+  Callers hold this run's review-outcome lock. The live run, app nonce and
+  frozen model are rechecked after GitHub I/O, so Stop or revocation wins and
+  is never converted into an ordinary blocked item.
   """
+  _parent(db, row, principal)
+  db.refresh(row)
+  if (row.outcomes_json or {}).get(reviews.key(original), {}) != previous:
+    raise HTTPException(409, "This review changed. Refresh before continuing.")
+  reviews.save_outcome(db, row, reviews.key(original), advanced)
+
+
+def _require_ready_attempt_resolved(previous):
+  attempt = previous.get("ready_attempt")
+  if attempt and attempt.get("state") != "ready":
+    raise HTTPException(409, "The draft readiness attempt is uncertain. Reconcile it read-only before any new public action.")
+
+
+async def _confirm_ready_attempt(row, target, cwd) -> str | None:
+  """Read-only check that an earlier readiness attempt is visibly complete.
+
+  Returns None when confirmed, otherwise why it is not. Never mutates GitHub.
+  """
+  try:
+    live_repo, live = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
+  except (HTTPException, ContributionSubmitError, OSError, json.JSONDecodeError):
+    return "The earlier readiness attempt is uncertain; it was not repeated."
+  if live.get("state") != "open" or live.get("draft") is not False:
+    return "The earlier readiness attempt is not confirmed; it was not repeated."
+  if not reviews.merge_permission(live_repo):
+    return "The earlier readiness attempt is visible, but write permission changed; no action was repeated."
+  try:
+    actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub observation)
+  except (HTTPException, ContributionSubmitError, OSError, json.JSONDecodeError):
+    return "The earlier readiness attempt is visible, but the GitHub actor could not be confirmed; no action was repeated."
+  if str(actor.get("id") or "") != row.github_actor_id:
+    return "The earlier readiness attempt is visible, but the GitHub actor changed; no action was repeated."
+  return None
+
+
+def _escalate_unconfirmed_ready(db, row, item_key, previous, attempt):
+  # A leftover "attempting" receipt (crash or lost response) that cannot be
+  # confirmed must surface to the owner instead of silently blocking.
+  if attempt.get("state") == "attempting":
+    reviews.save_ready_attempt(db, row, item_key, {**attempt, "state": "unknown"})
+
+
+class DraftReady(PullIdentity):
+  reviewed_base_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+  independent_receipt_id: str = Field(min_length=1, max_length=64)
+  summary: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
+  scope: list[str] = Field(min_length=6, max_length=6)
+  tests: str = Field(min_length=1, max_length=EVIDENCE_MAX_CHARS)
+  tests_passed: bool
+
+
+@router.post(APP_PREFIX + "/{app_id}/review-runs/{run_id}/ready",
+             dependencies=[Depends(reject_cross_site)])
+async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
+                           db: Session = Depends(get_db),
+                           principal: Principal = Depends(get_agent_run_principal)):
   row = _row(db, app_id, run_id, principal)
-  cwd = Path(get_settings().data_dir) / "platform"
+  if not reviews.draft_ready_allowed(row):
+    raise HTTPException(403, "This frozen grant does not authorize marking a draft ready for review.")
+  _parent(db, row, principal)
   async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
     db.refresh(row)
-    for original in row.targets_json:
-      previous = row.outcomes_json.get(reviews.key(original), {})
-      if not previous:
-        continue
-      ready_attempt = previous.get("ready_attempt")
-      if ready_attempt and ready_attempt.get("state") != "ready":
-        target = reviews.effective_target(row, original)
+    target = _target(row, body)
+    item_key = reviews.key(target)
+    previous = (row.outcomes_json or {}).get(item_key, {})
+    cwd = Path(get_settings().data_dir) / "platform"
+    attempt = previous.get("ready_attempt")
+    if attempt:
+      # The mutation is unrepeatable after admission, including lost responses.
+      blocked = await _confirm_ready_attempt(row, target, cwd)
+      if blocked:
+        _escalate_unconfirmed_ready(db, row, item_key, previous, attempt)
+        return {"run": _run_view(db, row), "blocked": blocked}
+      if attempt.get("state") != "ready":
+        reviews.save_ready_attempt(db, row, item_key, {**attempt, "state": "ready"})
+      return {"run": _run_view(db, row)}
+    if body.tests_passed is not True or set(body.scope) != SCOPE or not body.tests.strip():
+      raise HTTPException(422, "Fresh full-rubric review and passing tests are required before draft readiness.")
+    reviews.require_independent_clear(row, target, body)
+    async with _github_connection_transaction():
+      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub observation)
+      if str(actor.get("id") or "") != row.github_actor_id:
+        raise HTTPException(409, "The connected GitHub actor changed. Approve a new selection.")
+      repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
+      await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
+      checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
+      blocker = reviews.readiness_blocker(target, repo, pull, checks)
+      if blocker:
+        raise HTTPException(409, blocker)
+      # Stop admission and the final arm share a lock with the parent lifecycle.
+      async with chat_queue.get_transition_lock(f"review-admission:{run_id}"):
+        _parent(db, row, principal)
+        receipt = {"id": str(uuid.uuid4()), "state": "attempting",
+          "head_sha": target["head_sha"], "base_sha": target["base_sha"],
+          "independent_receipt_id": body.independent_receipt_id,
+          "review_run_id": principal.run_id, "summary": body.summary,
+          "tests": body.tests, "tests_passed": True, "scope": body.scope}
+        reviews.arm_ready(db, row, target, receipt, principal)
         try:
-          live_repo, live = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
+          _parent(db, row, principal)
         except Exception:
-          live = None
-        if (live and reviews.merge_permission(live_repo) and live.get("state") == "open"
-            and live.get("draft") is False):
-          try:
-            await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-          except HTTPException:
-            pass
-          else:
-            actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")
-            if str(actor.get("id") or "") == row.github_actor_id:
-              _assert_app_current(db, row.app_id, row.app_nonce)
-              reviews.save_outcome(db, row, reviews.key(original), {**previous,
-                "ready_attempt": {**ready_attempt, "state": "ready"}})
-              previous = row.outcomes_json[reviews.key(original)]
-      attempts = list(previous.get("repair_attempts", []))
-      pending = next((a for a in attempts if a.get("state") in {"pushing", "push_unknown"}), None)
-      if pending:
-        candidate = {**original, "head_sha": pending["head_sha"], "base_sha": pending["base_sha"]}
-        try:
-          await asyncio.to_thread(reviews.current_pull, _gh, cwd, candidate)
-        except Exception:
-          continue
-        _assert_app_current(db, row.app_id, row.app_nonce)
-        attempts = [{**a, "state": "pushed"} if a is pending else a for a in attempts]
-        reviews.save_outcome(db, row, reviews.key(original),
-          reviews.confirmed_successor(previous, attempts, pending))
-        previous = row.outcomes_json[reviews.key(original)]
-      target = reviews.effective_target(row, original)
-      attempted = reviews.merge_attempted(previous)
-      try:
-        _repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)
-        if attempted:
-          outcome = await asyncio.to_thread(reviews.reconcile_merge, _gh, cwd, target, previous, pull)
-        elif previous.get("state") == "all_clear":
-          await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)
-          continue
-        else:
-          continue
-      except HTTPException as exc:
-        outcome = {**previous, "state": "needs_you", "summary": str(exc.detail), "merge_attempted": attempted}
-      _assert_app_current(db, row.app_id, row.app_nonce)
-      if outcome != previous:
-        reviews.save_outcome(db, row, reviews.key(original), outcome)
-    return {"run": _run_view(db, row)}
+          # Stop, uninstall or model drift before the mutation: nothing public
+          # happened, so drop the receipt and claim instead of recording unknown.
+          reviews.disarm_ready(db, row, target, receipt["id"])
+          raise
+      result = await _dispatch_ready(row, target, cwd)
+      if result.state == "not_dispatched":
+        reviews.disarm_ready(db, row, target, receipt["id"])
+        raise HTTPException(409, "Readiness was refused before dispatch; no public attempt started.")
+      receipt["state"] = "ready" if result.state == "confirmed" else "unknown"
+      db.refresh(row)
+      reviews.save_ready_attempt(db, row, item_key, receipt)
+    return {"run": _run_view(db, row), **({"blocked": "The readiness response is uncertain; observe read-only before proceeding."} if receipt["state"] == "unknown" else {})}
 
 
-@router.post("/api/github/review-runs/{run_id}/observe", dependencies=[Depends(reject_cross_site)])
-async def core_observe_review(run_id: str, db: Session = Depends(get_db), principal: Principal = Depends(get_principal)):
-  return await observe_review(None, run_id, db, principal)
+@router.post("/api/github/review-runs/{run_id}/ready", dependencies=[Depends(reject_cross_site)])
+async def core_mark_draft_ready(run_id: str, body: DraftReady, db: Session = Depends(get_db), principal: Principal = Depends(get_agent_run_principal)):
+  return await mark_draft_ready(None, run_id, body, db, principal)
+
+
+async def _dispatch_ready(row, target, cwd):
+  """One settled mutation; read-only confirmation never depends on the old base."""
+  try:
+    mutation = await settled.run_settled(reviews.mark_ready, _gh, cwd, target)
+  except NotDispatched as exc:
+    return DispatchResult.not_dispatched(str(exc))
+  except Exception:
+    return DispatchResult.unknown("The readiness response is uncertain.")
+  blocked = await _confirm_ready_attempt(row, target, cwd)
+  return DispatchResult.unknown(blocked) if blocked else DispatchResult.confirmed(mutation)
