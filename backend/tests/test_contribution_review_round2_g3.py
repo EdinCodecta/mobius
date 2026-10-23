@@ -12,7 +12,7 @@ from app import models
 from app.chat_writer import create_chat
 from app.deps import Principal
 from app.routes import contribution_reviews as routes
-from tests.test_contribution_review_runs import setup, ITEM, SHA, BASE
+from tests.test_contribution_review_runs import setup, ITEM, SHA, BASE, TARGET, report
 from tests.test_contribution_review_workflows import configure_repair, publish_body, takeover, register_reviewer
 
 
@@ -173,6 +173,57 @@ def test_frozen_and_live_scopes_use_one_file_reader(monkeypatch):
     calls.append(target["number"]) or {"current.py", "before.py"})
   assert reviews.repair_file_scope(None, None, ITEM) == ["before.py", "current.py"]
   assert calls == [ITEM["number"]]
+
+
+def test_failed_base_observation_does_not_erase_new_receipt(setup, monkeypatch):
+  db, row, principal = takeover(setup, monkeypatch)
+  def moved(*_args):
+    raise HTTPException(409, "The target base moved")
+  def failed_observation(*_args):
+    current = row.outcomes_json.get(reviews.key(ITEM), {})
+    reviews.save_outcome(db, row, reviews.key(ITEM), {**current,
+      "repair_attempts": [{"id": "new-public-receipt", "state": "push_unknown"}]})
+    raise HTTPException(409, "GitHub compare was unreadable")
+  monkeypatch.setattr(reviews, "assert_current_base", moved)
+  monkeypatch.setattr(reviews, "observe_base_advance", failed_observation)
+  with pytest.raises(HTTPException) as error:
+    report(setup, tests_passed=True, reviewed_base_sha=BASE)
+  assert error.value.status_code == 409
+  assert row.outcomes_json[reviews.key(ITEM)]["repair_attempts"][0]["id"] == "new-public-receipt"
+
+
+def test_canonical_cli_finite_repair_preview_start_retry_and_limit(setup, monkeypatch):
+  from scripts import github_review as cli
+  db, _row, principal = setup
+  owner = Principal(owner=principal.owner, app_id=None)
+  monkeypatch.setattr(cli, "inspect_pr", lambda *_args: TARGET)
+  monkeypatch.setattr(routes, "resolve_round_choice", lambda *_args:
+    {"provider": "codex", "model": "gpt-5", "effort": "xhigh"})
+  monkeypatch.setattr(routes.providers, "snapshot_chat_agent_settings", lambda *_args, **_kwargs:
+    {"model": "gpt-5", "effort": "xhigh"})
+  monkeypatch.setattr(reviews, "inspect_target", lambda *_args: {**TARGET,
+    "head_repo": "example/project", "head_repo_id": 1, "head_ref": "topic"})
+  monkeypatch.setattr(reviews, "repair_file_scope", lambda *_args: ["owned.py"])
+  async def admitted(**kwargs):
+    db.add(models.ChatRun(id="round2-cli-run", chat_id=kwargs["chat_id"], status="stopped"))
+    db.commit()
+    return True
+  monkeypatch.setattr(routes, "start_programmatic_chat_turn", admitted)
+  monkeypatch.setattr(cli, "api", lambda _path, **kwargs: routes.review_preview(1,
+    routes.ReviewPreview(**kwargs["data"]), db, owner))
+  selection = cli.prepare_selection(["example/project#7"], "review_fix_merge", None, 1)
+  frozen = cli.freeze_preview(selection, {"fix_prompt": "Fix precisely", "max_rounds": 2})
+  assert frozen["options"]["fix_prompt"] == "Fix precisely"
+  assert frozen["options"]["max_rounds"] == 2
+  body = routes.StartReviews(**cli.start_body(frozen))
+  first = asyncio.run(routes.start_reviews(1, body, db, owner))
+  assert first["run"]["options"]["max_rounds"] == 2
+  assert first["run"]["options"]["fix_prompt"] == "Fix precisely"
+  second = asyncio.run(routes.start_reviews(1, body, db, owner))
+  assert second["run"]["id"] == first["run"]["id"]
+  with pytest.raises(HTTPException):
+    reviews.require_repair_round_available(db.get(models.ContributionReviewRun,
+      first["run"]["id"]), [{"state": "pushed"}] * 2)
 
 
 @pytest.mark.parametrize("mode,options", [

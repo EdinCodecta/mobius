@@ -85,7 +85,7 @@ def prepare_selection(references, mode, chat_id, app_id=None):
 def freeze_preview(selection, options=None, agent=None):
   """Save resolved prompts/model before consent; later start never re-resolves silently."""
   preview = api(review_path(selection.get("app_id"), "/review-preview"), method="POST",
-                data={"options": options, "agent": agent})
+                data={"mode": selection["mode"], "options": options, "agent": agent})
   snapshot = preview["options"]
   if not re.fullmatch(r"[0-9a-f]{64}", preview["preview_sha256"]) or not snapshot.get("model"):
     raise ValueError("The platform did not return a complete frozen prompt/model preview.")

@@ -151,13 +151,18 @@ def _options_input(body):
   if body.options is None:
     return None
   options = body.options.model_dump(exclude_none=True, exclude_unset=True)
-  if options.get("fix_prompt") not in (None, presets.FIX_PROMPT):
-    raise HTTPException(422, "fix_prompt is not supported by this review-only workflow")
-  if options.get("max_rounds") is not None:
-    raise HTTPException(422, "max_rounds is not supported by this review-only workflow")
+  mode = getattr(body, "mode", "review")
+  if mode != "review_fix_merge" and ("fix_prompt" in body.options.model_fields_set
+                                     or "max_rounds" in body.options.model_fields_set):
+    raise HTTPException(422, "fix_prompt and max_rounds are not supported outside review_fix_merge mode")
   if options.get("autopilot") is True:
     raise HTTPException(422, "autopilot is not supported by this review-only workflow")
   selected = {key: options[key] for key in presets.PROMPT_KEYS if key in options}
+  if mode == "review_fix_merge":
+    if "fix_prompt" in options:
+      selected["fix_prompt"] = options["fix_prompt"]
+    if "max_rounds" in body.options.model_fields_set:
+      selected["max_rounds"] = body.options.max_rounds
   if options.get("post_review") is True:
     selected["post_review"] = True
   return selected
@@ -188,7 +193,8 @@ def _snapshot(db, body, principal):
     else:
       raise HTTPException(409, "The owning chat is unavailable. No review was started.")
   try:
-    return presets.resolve_options(db, _options_input(body), choice=choice)
+    return presets.resolve_options(db, _options_input(body), choice=choice,
+                                   mode=getattr(body, "mode", "review"))
   except ValueError as exc:
     raise HTTPException(422, str(exc)) from exc
 
@@ -471,6 +477,9 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
         except HTTPException as observation_error:
           _parent(db, row, principal)
           exc = observation_error
+        db.refresh(row)
+        if (row.outcomes_json or {}).get(item_key, {}) != previous:
+          raise HTTPException(409, "This review changed during base observation. Refresh before continuing.")
         reviews.save_outcome(db, row, item_key, {**previous, "state": "needs_you",
           "head_sha": target["head_sha"], "summary": str(exc.detail)})
         return {"run": _run_view(db, row)}
@@ -497,6 +506,7 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
 
 
 class ReviewPreview(BaseModel):
+  mode: Literal["review", "review_merge", "review_fix_merge"] = "review"
   agent: ReviewAgentChoice | None = None
   options: ReviewOptions | None = None
 

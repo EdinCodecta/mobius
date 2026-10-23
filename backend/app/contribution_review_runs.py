@@ -400,6 +400,8 @@ def brief(row):
     "public comment review on that exact head. Write the summary for the PR "
     "author: concrete findings with file references. Keep any question meant "
     "only for the owner in this conversation, not in the summary. "
+    "Explicitly send publish:true only for the deliberate public verdict; "
+    "publish:false is the private default for owner questions and blocked verification. "
     "Evidence freezes once dispatch is armed; identical retry is read-only.\n"
     if frozen.get("post_review") is True else ""
   )
