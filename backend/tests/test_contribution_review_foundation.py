@@ -67,6 +67,8 @@ def test_private_all_clear_survives_moved_base(setup, monkeypatch):
   db.commit()
   monkeypatch.setattr(domain, "assert_current_base", lambda *a: pytest.fail("private history must not check live base"))
   assert report(setup)["run"]["items"][0]["state"] == "all_clear"
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "PR moved")))
+  assert report(setup)["run"]["items"][0]["state"] == "all_clear"
   assert asyncio.run(routes.observe_review(1, row.id, db, Principal(owner=row_owner(db, row), app_id=None)))["run"]["items"][0]["state"] == "all_clear"
 
 
