@@ -1,6 +1,6 @@
 /* Commands on a folder Chrome or Edge remembers, through its File System Access handle. */
 import {
-  BIN_FOLDER_NAME, FolderError, joinPath, numberedName, pathSegments,
+  BIN_FOLDER_NAME, FolderError, isInBin, joinPath, numberedName, pathSegments,
 } from './folderPaths.js'
 import {
   DEFAULT_IMAGE_EDGE, MAX_READ_BYTES, base64ToBytes, fileInfo, pageOf, readFileSlice, shrinkImage, sortEntries,
@@ -101,33 +101,85 @@ async function image(root, command) {
   return shrinkImage(await entry.handle.getFile(), joinPath(segments), command.maxEdge || DEFAULT_IMAGE_EDGE)
 }
 
+/**
+ * A path an agent may change. Reading is allowed everywhere, but the bin
+ * belongs to the owner, and hidden names (.git/hooks, .vscode/tasks.json,
+ * .envrc) hold settings other programs run later.
+ */
+function editableSegments(path) {
+  const segments = pathSegments(path)
+  if (isInBin(segments)) {
+    throw new FolderError(
+      'in_bin',
+      `The ${BIN_FOLDER_NAME} is the owner's: agents cannot add, change or take files there. Ask the owner to restore a file.`,
+    )
+  }
+  if (segments.some(name => name.startsWith('.'))) {
+    throw new FolderError(
+      'hidden_name',
+      `"${joinPath(segments)}" has a hidden name (starting with a dot). Agents can read these but not change them, because other programs run or trust them. Ask the owner to make this change.`,
+    )
+  }
+  return segments
+}
+
+/** The existing file at `name`, or null; a folder there is the wrong kind. */
+async function existingFile(parent, name, path) {
+  try {
+    return await parent.getFileHandle(name)
+  } catch (error) {
+    if (error?.name === 'NotFoundError') return null
+    if (error?.name === 'TypeMismatchError') throw new FolderError('wrong_kind', `"${path}" is a folder.`)
+    throw error
+  }
+}
+
+/** Stream `file` into a new `targetName`; a failed copy leaves nothing behind. */
+async function copyFile(file, targetParent, targetName) {
+  const copy = await targetParent.getFileHandle(targetName, { create: true })
+  try {
+    await file.stream().pipeTo(await copy.createWritable())
+  } catch (error) {
+    await targetParent.removeEntry(targetName).catch(() => {})
+    throw error
+  }
+}
+
+async function binFolderOf(root) {
+  return root.getDirectoryHandle(BIN_FOLDER_NAME, { create: true })
+}
+
 async function write(root, command) {
-  const segments = pathSegments(command.path)
+  const segments = editableSegments(command.path)
+  const path = joinPath(segments)
   const parent = await directoryAt(root, segments.slice(0, -1))
   const name = segments.at(-1)
-  const existed = await exists(parent, name)
-  if (existed && !command.overwrite) {
-    throw new FolderError('exists', `"${joinPath(segments)}" already exists. Use --overwrite to replace it.`)
+  const old = await existingFile(parent, name, path)
+  if (old && !command.overwrite) {
+    throw new FolderError('exists', `"${path}" already exists. Use --overwrite to replace it.`)
   }
   const bytes = command.encoding === 'base64'
     ? base64ToBytes(command.content)
     : new TextEncoder().encode(command.content)
   if (bytes.length > MAX_WRITE_BYTES) throw new FolderError('too_large', 'Write at most 4 MB at a time.')
+  // Replacing keeps the old version: a copy goes to the bin before anything
+  // is written, and the original stays in place until the new one is saved.
+  let binned = null
+  if (old) {
+    const bin = await binFolderOf(root)
+    const binName = await freeBinName(bin, name)
+    await copyFile(await old.getFile(), bin, binName)
+    binned = `${BIN_FOLDER_NAME}/${binName}`
+  }
   const writable = await (await parent.getFileHandle(name, { create: true })).createWritable()
   await writable.write(bytes)
   await writable.close()
-  return { path: joinPath(segments), size: bytes.length, created: !existed }
+  return { path, size: bytes.length, created: !old, ...(binned && { binned }) }
 }
 
 async function copyThenRemove(source, targetParent, targetName) {
   const original = await source.handle.getFile()
-  const copy = await targetParent.getFileHandle(targetName, { create: true })
-  try {
-    await original.stream().pipeTo(await copy.createWritable())
-  } catch (error) {
-    await targetParent.removeEntry(targetName).catch(() => {})
-    throw error
-  }
+  await copyFile(original, targetParent, targetName)
   // Only an unchanged original of a completed copy is removed. If something
   // changed it during the copy, removing it would lose that newer version.
   const current = await source.handle.getFile()
@@ -137,7 +189,17 @@ async function copyThenRemove(source, targetParent, targetName) {
       `"${source.name}" changed while it was moved. The copy is at the new place and the original was kept.`,
     )
   }
-  await source.parent.removeEntry(source.name)
+  try {
+    await source.parent.removeEntry(source.name)
+  } catch (error) {
+    // Typically a file another program holds open on Windows. Say plainly
+    // that both now exist, rather than a bare "locked".
+    const reason = asFolderError(error, source.name).message
+    throw new FolderError(
+      'original_kept',
+      `The copy is at the new place, but "${source.name}" could not be removed, so both exist now. ${reason}`,
+    )
+  }
 }
 
 async function moveFile(source, targetParent, targetName) {
@@ -153,8 +215,8 @@ async function moveFile(source, targetParent, targetName) {
   await copyThenRemove(source, targetParent, targetName)
 }
 
-async function fileEntry(root, path) {
-  const entry = await entryAt(root, pathSegments(path))
+async function fileEntry(root, segments) {
+  const entry = await entryAt(root, segments)
   if (entry.kind === 'folder') {
     throw new FolderError(
       'folder_move_unsupported',
@@ -165,18 +227,19 @@ async function fileEntry(root, path) {
 }
 
 async function move(root, command) {
-  const source = await fileEntry(root, command.path)
-  const target = pathSegments(command.to)
+  const from = editableSegments(command.path)
+  const target = editableSegments(command.to)
+  const source = await fileEntry(root, from)
   const targetParent = await directoryAt(root, target.slice(0, -1))
   if (await exists(targetParent, target.at(-1))) {
     throw new FolderError('exists', `"${joinPath(target)}" already exists. Choose another name.`)
   }
   await moveFile(source, targetParent, target.at(-1))
-  return { path: pathSegments(command.path).join('/'), to: joinPath(target) }
+  return { path: joinPath(from), to: joinPath(target) }
 }
 
 async function mkdir(root, command) {
-  const segments = pathSegments(command.path)
+  const segments = editableSegments(command.path)
   const parent = await directoryAt(root, segments.slice(0, -1))
   const existed = await exists(parent, segments.at(-1))
   await parent.getDirectoryHandle(segments.at(-1), { create: true })
@@ -193,12 +256,12 @@ async function freeBinName(bin, name) {
 }
 
 async function bin(root, command) {
-  const segments = pathSegments(command.path)
-  if (segments[0] === BIN_FOLDER_NAME) {
+  if (isInBin(pathSegments(command.path))) {
     throw new FolderError('already_in_bin', 'This file is already in the Möbius bin. Only the owner empties it.')
   }
-  const source = await fileEntry(root, command.path)
-  const binFolder = await root.getDirectoryHandle(BIN_FOLDER_NAME, { create: true })
+  const segments = editableSegments(command.path)
+  const source = await fileEntry(root, segments)
+  const binFolder = await binFolderOf(root)
   const name = await freeBinName(binFolder, source.name)
   await moveFile(source, binFolder, name)
   return { path: joinPath(segments), to: `${BIN_FOLDER_NAME}/${name}` }

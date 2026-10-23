@@ -239,11 +239,36 @@
 }
 
 /* The activity pill reuses the screen-control pill; keep long folder names on one line. */
-.shared-folder-activity__text {
+.shared-folder-activity__label {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  line-height: 1.2;
+}
+
+.shared-folder-activity__text,
+.shared-folder-activity__device {
   max-width: 46vw;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Another device is where the work happens: say which, quietly. */
+.shared-folder-activity__device {
+  font-size: 10.5px;
+  font-weight: 560;
+  color: var(--muted);
+}
+
+.shared-folders__other .provider-row__main {
+  justify-content: space-between;
+}
+
+.shared-folders__other .shared-folders__other-pause {
+  flex-shrink: 0;
+  align-self: center;
 }
 
 /* Touch screens: every control here is at least 44px tall. */

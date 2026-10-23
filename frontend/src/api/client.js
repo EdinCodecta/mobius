@@ -1669,6 +1669,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+    // Stop on every device at once; no ids means every shared folder.
+    pause: (folderIds = null) => apiFetch('/shared-folders/pause', {
+      method: 'POST',
+      body: JSON.stringify(folderIds ? { folderIds } : {}),
+    }),
   },
   events: {
     // `keepalive` lets the report sent as the page hides outlive the page

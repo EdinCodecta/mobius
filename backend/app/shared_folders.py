@@ -3,8 +3,10 @@
 The browser keeps the folder permission and does every file operation. This
 module only remembers which live shell system-stream subscription reported
 which folders, forwards one command to that exact subscription, and waits for
-its answer. It never reads or stores file contents, and it forgets everything
-on restart: a shell re-reports its folders whenever its stream reconnects.
+its answer. It also tells every owner shell what agents are working in, and
+holds a Stop from any device until the browser holding the folder confirms
+it. It never reads or stores file contents, and it forgets everything on
+restart: a shell re-reports its folders whenever its stream reconnects.
 
 Every method runs on the event loop that owns the system broadcast (the routes
 are ``async``), and no mutation awaits, so the maps need no lock.
@@ -31,6 +33,8 @@ LIVENESS_POLL_SECONDS = 2.0
 MAX_PENDING_PER_STREAM = 16
 MAX_REMEMBERED_DEVICES = 32
 COMMAND_EVENT_TYPE = "shared_folder_command"
+ACTIVITY_EVENT_TYPE = "shared_folder_activity"
+PAUSE_EVENT_TYPE = "shared_folder_pause"
 
 # Folder states that are not ready, mapped to the stable code and the
 # owner-actionable message an agent relays.
@@ -48,6 +52,10 @@ _UNREADY = {
     "The owner paused this folder. Ask them to resume it in Settings → Shared folders.",
   ),
 }
+
+_CHANGE_MAY_HAVE_HAPPENED = (
+  "The change may still have happened: check with `folders info` or `folders ls` before trying it again."
+)
 
 
 @dataclass(frozen=True)
@@ -73,6 +81,8 @@ class DeviceReport:
 class _PendingCommand:
   subscription_id: str
   future: asyncio.Future
+  folder: SharedFolder
+  device: DeviceReport
 
 
 def failure(code: str, message: str) -> dict[str, Any]:
@@ -91,6 +101,9 @@ class SharedFolderRegistry:
     self._deliver = deliver
     self._reports: dict[str, DeviceReport] = {}
     self._pending: dict[str, _PendingCommand] = {}
+    # Folders the owner stopped from some device whose own browser has not yet
+    # confirmed the pause. Refused here meanwhile, on every device.
+    self._stopped: set[str] = set()
 
   def report(self, report: DeviceReport) -> bool:
     """Record a live stream's folders; False when that stream is gone."""
@@ -99,20 +112,39 @@ class SharedFolderRegistry:
     current = self._reports.get(report.subscription_id)
     if current is None or report.sequence > current.sequence:
       self._reports[report.subscription_id] = report
+      # The holding browser now keeps the pause itself, so the owner resumes
+      # it there; one that missed the Stop (closed then) is told again.
+      held = {folder.id for folder in report.folders}
+      self._stopped -= {folder.id for folder in report.folders if folder.state == "paused"}
+      missed = sorted(self._stopped & held)
+      if missed:
+        self._deliver(report.subscription_id, {"type": PAUSE_EVENT_TYPE, "folderIds": missed})
     self._prune()
     return True
+
+  def pause(self, folder_ids: list[str] | None = None) -> list[str]:
+    """Stop folders on every device at once: refuse here, and tell their browsers."""
+    known = {folder.id for _, folder in self._best_folders()}
+    chosen = known if folder_ids is None else known & set(folder_ids)
+    self._stopped |= chosen
+    if chosen:
+      event = {"type": PAUSE_EVENT_TYPE, "folderIds": sorted(chosen)}
+      for subscription_id in self._owner_streams():
+        self._deliver(subscription_id, event)
+    return sorted(chosen)
 
   def folders(self) -> list[dict[str, Any]]:
     """Every remembered folder, one entry per folder, with liveness."""
     listed = []
     for report, folder in self._best_folders():
       online = self._is_live(report.subscription_id)
+      state = "paused" if folder.id in self._stopped else folder.state
       listed.append({
         "id": folder.id,
         "name": folder.name,
         "mode": folder.mode,
         "access": folder.access,
-        "state": folder.state if online else "offline",
+        "state": state if online else "offline",
         "device": {"id": report.device_id, "label": report.device_label},
         "online": online,
       })
@@ -124,6 +156,8 @@ class SharedFolderRegistry:
     if isinstance(target, dict):
       return target
     report, folder = target
+    if folder.id in self._stopped:
+      return failure(*_UNREADY["paused"])
     refusal = _refusal(folder, command["op"])
     if refusal is not None:
       return refusal
@@ -131,15 +165,21 @@ class SharedFolderRegistry:
       return failure("busy", "The browser is still working on earlier commands. Try again shortly.")
     command_id = secrets.token_urlsafe(12)
     future = asyncio.get_running_loop().create_future()
-    self._pending[command_id] = _PendingCommand(report.subscription_id, future)
+    self._pending[command_id] = _PendingCommand(report.subscription_id, future, folder, report)
     event = {"type": COMMAND_EVENT_TYPE, "commandId": command_id, "folderId": folder.id, **command}
     if not self._deliver(report.subscription_id, event):
       self._pending.pop(command_id, None)
       return _offline(report)
+    self._announce_activity()
     try:
-      return await self._await_answer(command_id, report)
+      outcome = await self._await_answer(command_id, report)
     finally:
       self._pending.pop(command_id, None)
+      self._announce_activity()
+    if command["op"] in EDIT_OPERATIONS and outcome.get("code") in ("timeout", "offline"):
+      # The browser may still finish a change it already started.
+      outcome = {**outcome, "error": f"{outcome['error']} {_CHANGE_MAY_HAVE_HAPPENED}"}
+    return outcome
 
   def answer(self, subscription_id: str, command_id: str, outcome: dict[str, Any]) -> bool:
     """Settle a pending command, only from the stream it was sent to."""
@@ -193,6 +233,29 @@ class SharedFolderRegistry:
           best[folder.id] = (rank, report, folder)
     ordered = sorted(best.values(), key=lambda item: item[0], reverse=True)
     return [(report, folder) for _, report, folder in ordered]
+
+  def _owner_streams(self) -> list[str]:
+    """Live shells that reported folders: only the owner's own browsers do."""
+    return [sid for sid in self._reports if self._is_live(sid)]
+
+  def _announce_activity(self) -> None:
+    """Show every owner tab, on every device, what agents are working in now.
+
+    Sent to the reporting shells only, never broadcast: a guest's shell on
+    the same system stream must not learn the owner's folder names.
+    """
+    working = list(self._pending.values())
+    latest = working[-1] if working else None
+    event: dict[str, Any] = {"type": ACTIVITY_EVENT_TYPE, "commands": len(working)}
+    if latest is not None:
+      event |= {
+        "folderId": latest.folder.id,
+        "folderName": latest.folder.name,
+        "deviceId": latest.device.device_id,
+        "deviceLabel": latest.device.device_label,
+      }
+    for subscription_id in self._owner_streams():
+      self._deliver(subscription_id, event)
 
   def _pending_for(self, subscription_id: str) -> int:
     return sum(1 for pending in self._pending.values() if pending.subscription_id == subscription_id)

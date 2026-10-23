@@ -8,13 +8,17 @@ import {
 } from './hostState.js'
 
 export const SHARED_FOLDER_COMMAND_EVENT = 'shared_folder_command'
+export const SHARED_FOLDER_ACTIVITY_EVENT = 'shared_folder_activity'
+export const SHARED_FOLDER_PAUSE_EVENT = 'shared_folder_pause'
 const CHANNEL_NAME = 'mobius-shared-folders'
 const EDIT_OPERATIONS = new Set(['write', 'move', 'mkdir', 'bin'])
 const ACTIVITY_VISIBLE_MS = 6000
+// The server answers or gives up on every command within 30 s, and says so.
+// A pill whose "done" was lost with a dropped connection clears after this.
+const ACTIVITY_STALE_MS = 45_000
 
 let channel = null
 let activityTimer = null
-let commandsInFlight = 0
 
 /** Start once per page. Safe to call again; later calls do nothing. */
 export async function startSharedFolderHost() {
@@ -41,6 +45,9 @@ export async function startSharedFolderHost() {
 export async function setSharedFolderSubscription(subscriptionId) {
   const store = hostStore()
   store.subscriptionId = subscriptionId || null
+  // Activity arrives on the stream; a new stream starts with none shown.
+  clearTimeout(activityTimer)
+  if (store.state.activity) publish({ activity: null })
   if (!store.subscriptionId) return
   // A restart that added the feature arrives as a new stream: look again.
   if (store.state.status === 'restart') await checkServer()
@@ -136,12 +143,12 @@ export async function handleSharedFolderCommand(event) {
   const store = hostStore()
   const subscriptionId = store.subscriptionId
   if (!event?.commandId || !subscriptionId) return
-  const record = store.records.get(event.folderId)
-  const shown = Boolean(record) && folderState(record) === 'ready'
-  if (shown) showActivity(record, event)
   let answer
   try {
     const result = await runCommand(event)
+    // Stop or Remove while a read ran: its contents never leave the device.
+    // A finished change has happened, so it is reported as it is.
+    if (!EDIT_OPERATIONS.has(event.op)) allowedFolder(event.folderId, false)
     answer = { ok: true, result }
   } catch (error) {
     const known = error instanceof FolderError
@@ -151,8 +158,6 @@ export async function handleSharedFolderCommand(event) {
       error: String(error?.message || error).slice(0, 1000),
     }
     if (known && error.code === 'needs_permission') void refreshPermissions()
-  } finally {
-    if (shown) settleActivity()
   }
   await api.sharedFolders.respond({ subscriptionId, commandId: event.commandId, ...answer }).catch(() => {})
 }
@@ -196,15 +201,23 @@ function notReadyMessage(state) {
   return messages[state] || 'This folder is not ready.'
 }
 
-/** The pill and its Stop stay while any command runs, then a few seconds more. */
-function showActivity(record, event) {
-  commandsInFlight += 1
+/**
+ * What agents are working in, on any of the owner's devices, as the server
+ * reports it. The pill and its Stop stay while any command runs, then a few
+ * seconds more.
+ */
+export function showSharedFolderActivity(event) {
   clearTimeout(activityTimer)
-  publish({ activity: { folderId: record.id, folderName: record.name, op: event.op, path: event.path, at: Date.now() } })
-}
-
-function settleActivity() {
-  commandsInFlight -= 1
-  if (commandsInFlight > 0) return
-  activityTimer = setTimeout(() => publish({ activity: null }), ACTIVITY_VISIBLE_MS)
+  if (!(event?.commands > 0)) {
+    activityTimer = setTimeout(() => publish({ activity: null }), ACTIVITY_VISIBLE_MS)
+    return
+  }
+  publish({
+    activity: {
+      folderId: event.folderId,
+      folderName: event.folderName,
+      deviceLabel: event.deviceId === deviceId() ? null : event.deviceLabel,
+    },
+  })
+  activityTimer = setTimeout(() => publish({ activity: null }), ACTIVITY_STALE_MS)
 }

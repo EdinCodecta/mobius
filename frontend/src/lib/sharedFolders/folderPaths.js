@@ -34,6 +34,14 @@ export function pathSegments(path, { allowRoot = false } = {}) {
   return segments
 }
 
+// macOS and Windows ignore letter case, and macOS stores "ö" as two code points.
+const comparableName = name => name.normalize('NFC').toLowerCase()
+
+/** The Möbius bin, or anything inside it, however the name is spelled. */
+export function isInBin(segments) {
+  return segments.length > 0 && comparableName(segments[0]) === comparableName(BIN_FOLDER_NAME)
+}
+
 export function joinPath(segments) {
   return segments.join('/')
 }

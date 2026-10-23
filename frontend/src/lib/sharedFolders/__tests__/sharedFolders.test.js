@@ -100,6 +100,56 @@ test('write creates files and refuses to replace one unless asked', async () => 
   await failsWith(folder.run({ op: 'write', path: 'missing/todo.txt', content: 'x' }), 'not_found')
 })
 
+test('replacing a file keeps its old version in the Möbius bin', async () => {
+  const root = new FakeDirectoryHandle('Notes')
+  root.addFile('todo.txt', 'milk')
+  const folder = createHandleFolder(root)
+  const first = await folder.run({ op: 'write', path: 'todo.txt', content: 'eggs', overwrite: true })
+  assert.deepEqual([first.created, first.binned], [false, `${BIN_FOLDER_NAME}/todo.txt`])
+  const second = await folder.run({ op: 'write', path: 'todo.txt', content: 'bread', overwrite: true })
+  assert.equal(second.binned, `${BIN_FOLDER_NAME}/todo (2).txt`)
+  assert.equal(await fileText(root, 'todo.txt'), 'bread')
+  assert.equal(await fileText(root, BIN_FOLDER_NAME, 'todo.txt'), 'milk')
+  assert.equal(await fileText(root, BIN_FOLDER_NAME, 'todo (2).txt'), 'eggs')
+  assert.equal((await folder.run({ op: 'write', path: 'new.txt', content: 'x' })).binned, undefined)
+})
+
+test('no change reaches into the Möbius bin, however its name is spelled', async () => {
+  const root = new FakeDirectoryHandle('Downloads')
+  root.addFolder(BIN_FOLDER_NAME).addFile('old.txt', 'binned')
+  root.addFile('a.txt', 'a')
+  const folder = createHandleFolder(root)
+  // macOS stores "ö" as "o" plus a combining mark, and ignores letter case.
+  for (const bin of [BIN_FOLDER_NAME, 'möbius BIN', 'Mo\u0308bius bin']) {
+    await failsWith(folder.run({ op: 'write', path: `${bin}/old.txt`, content: 'x', overwrite: true }), 'in_bin')
+    await failsWith(folder.run({ op: 'write', path: `${bin}/new.txt`, content: 'x' }), 'in_bin')
+    await failsWith(folder.run({ op: 'move', path: `${bin}/old.txt`, to: 'back.txt' }), 'in_bin')
+    await failsWith(folder.run({ op: 'move', path: 'a.txt', to: `${bin}/a.txt` }), 'in_bin')
+    await failsWith(folder.run({ op: 'mkdir', path: `${bin}/sub` }), 'in_bin')
+    await failsWith(folder.run({ op: 'bin', path: `${bin}/old.txt` }), 'already_in_bin')
+  }
+  assert.equal((await folder.run({ op: 'read', path: `${BIN_FOLDER_NAME}/old.txt` })).text, 'binned')
+  assert.deepEqual([...root.children.get(BIN_FOLDER_NAME).children.keys()], ['old.txt'])
+  assert.equal(await fileText(root, 'a.txt'), 'a')
+})
+
+test('hidden names can be read but never changed', async () => {
+  const root = new FakeDirectoryHandle('Project')
+  root.addFolder('.git').addFolder('hooks')
+  root.addFile('.env', 'KEY=1')
+  root.addFile('notes.txt', 'n')
+  const folder = createHandleFolder(root)
+  await failsWith(folder.run({ op: 'write', path: '.git/hooks/pre-commit', content: 'curl evil' }), 'hidden_name')
+  await failsWith(folder.run({ op: 'write', path: '.env', content: 'KEY=2', overwrite: true }), 'hidden_name')
+  await failsWith(folder.run({ op: 'mkdir', path: '.vscode' }), 'hidden_name')
+  await failsWith(folder.run({ op: 'move', path: 'notes.txt', to: '.envrc' }), 'hidden_name')
+  await failsWith(folder.run({ op: 'move', path: '.env', to: 'env.txt' }), 'hidden_name')
+  await failsWith(folder.run({ op: 'bin', path: '.env' }), 'hidden_name')
+  assert.equal((await folder.run({ op: 'read', path: '.env' })).text, 'KEY=1')
+  assert.deepEqual([...root.children.keys()].sort(), ['.env', '.git', 'notes.txt'])
+  assert.deepEqual([...root.children.get('.git').children.get('hooks').children.keys()], [])
+})
+
 test('move renames a file and refuses to overwrite or move whole folders', async () => {
   const root = new FakeDirectoryHandle('Downloads')
   root.addFile('scan.pdf', 'pdf')
@@ -138,6 +188,24 @@ test('a copy-and-remove move keeps an original that changed during the copy', as
   )
   assert.equal(root.children.has('notes.txt'), true)
   assert.equal(await fileText(root, 'kept.txt'), 'version one')
+})
+
+test('a copied file whose original cannot be removed says that both exist', async () => {
+  const root = new FakeDirectoryHandle('Downloads', { withMove: false })
+  root.addFile('locked.docx', 'report')
+  const removeEntry = root.removeEntry.bind(root)
+  root.removeEntry = async name => {
+    if (name !== 'locked.docx') return removeEntry(name)
+    const error = new Error('in use')
+    error.name = 'NoModificationAllowedError'
+    throw error
+  }
+  const folder = createHandleFolder(root)
+  await failsWith(folder.run({ op: 'move', path: 'locked.docx', to: 'report.docx' }), 'original_kept')
+  assert.equal(await fileText(root, 'report.docx'), 'report')
+  assert.equal(await fileText(root, 'locked.docx'), 'report')
+  await failsWith(folder.run({ op: 'bin', path: 'locked.docx' }), 'original_kept')
+  assert.equal(await fileText(root, BIN_FOLDER_NAME, 'locked.docx'), 'report')
 })
 
 test('bin moves a file into the Möbius bin, never deleting it', async () => {

@@ -15,7 +15,7 @@ const MODES = [
   {
     mode: 'edit',
     title: 'Read & edit',
-    detail: 'Agents can also save, rename and move files. They never delete: unwanted files go to a “Möbius bin” folder.',
+    detail: 'Agents can also save, rename and move files. They never delete: unwanted and replaced files go to a “Möbius bin” folder. Hidden files, like .git or .env, stay read-only.',
   },
 ]
 

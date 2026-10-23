@@ -8,7 +8,10 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from sqlalchemy.orm import Session
 
+from app import models
+from app.database import get_db
 from app.deps import (
   Principal,
   _owner_principal_or_403,
@@ -51,10 +54,24 @@ def browser_owner(principal: Principal = Depends(get_principal)) -> Principal:
   return principal
 
 
-def folder_reader(principal: Principal = Depends(get_principal)) -> Principal:
-  """The owner's browser or one of the owner's chat agents."""
+def _live_owner_chat(principal: Principal, db: Session) -> None:
+  # Only the owner's own chats, which the owner can watch and Stop. A chat or
+  # turn an app started (News, Reflection, scheduled jobs, an app's chat
+  # panel) runs unattended and reads untrusted content, so it gets no folder.
+  chat = db.get(models.Chat, principal.chat_id) if principal.chat_id else None
+  run = db.get(models.ChatRun, principal.run_id) if principal.run_id else None
+  if chat is None or run is None or chat.created_by_app_id is not None or run.initiated_by_app_id is not None:
+    raise HTTPException(
+      403, "Shared folders are only for the owner's own chats, not background or scheduled runs.",
+    )
+
+
+def folder_reader(principal: Principal = Depends(get_principal), db: Session = Depends(get_db)) -> Principal:
+  """The owner's browser or one of the owner's live chat agents."""
   _owner_principal_or_403(principal)
   _installation_owner(principal)
+  if principal.chat_id or principal.run_id:
+    _live_owner_chat(principal, db)
   return principal
 
 
@@ -80,6 +97,12 @@ def normalized_path(path: str, *, allow_root: bool) -> str:
     if segment in ("", ".", "..") or _UNSAFE_SEGMENT.search(segment):
       raise ValueError("path must be plain folder and file names inside the shared folder")
   return "/".join(segments)
+
+
+def _content_bytes(content: str, encoding: str | None) -> int:
+  if encoding == "base64":
+    return len(content) * 3 // 4 - len(content) + len(content.rstrip("="))
+  return len(content.encode("utf-8", errors="surrogatepass"))
 
 
 class FolderBody(BaseModel):
@@ -118,7 +141,11 @@ _OPTIONAL_FIELDS = frozenset().union(*_ALLOWED_FIELDS.values())
 
 
 class FolderCommandBody(BaseModel):
-  """Closed command vocabulary; nothing here can run code on the device."""
+  """Closed command vocabulary: files are read and written, never run.
+
+  A written file can still be run later by other programs (a Git hook, an
+  editor task), so the browser refuses changes to hidden names and the bin.
+  """
 
   model_config = ConfigDict(extra="forbid")
 
@@ -146,8 +173,12 @@ class FolderCommandBody(BaseModel):
       if self.to is None:
         raise ValueError("move requires a destination path")
       self.to = normalized_path(self.to, allow_root=False)
-    if self.op == "write" and self.content is None:
-      raise ValueError("write requires content")
+    if self.op == "write":
+      if self.content is None:
+        raise ValueError("write requires content")
+      # Measure bytes, not characters: 4 MB of letters can be 16 MB of UTF-8.
+      if _content_bytes(self.content, self.encoding) > MAX_WRITE_BYTES:
+        raise ValueError("write at most 4 MB at a time")
     return self
 
   def wire(self) -> dict[str, Any]:
@@ -194,6 +225,25 @@ async def report_device_folders(
   )
   if not registry.report(report):
     raise HTTPException(404, "System stream not found.")
+
+
+class PauseBody(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  folderIds: list[Identifier] | None = Field(default=None, max_length=MAX_LIST_LIMIT)
+
+
+@router.post("/pause", dependencies=[Depends(reject_cross_site)])
+async def pause_shared_folders(
+  body: PauseBody,
+  _: Principal = Depends(browser_owner),
+) -> dict[str, list[str]]:
+  """Stop from any of the owner's devices: every device refuses at once.
+
+  The browsers holding the folders are told to pause them for good; the
+  owner resumes a folder in Settings on the device that shares it.
+  """
+  return {"paused": registry.pause(body.folderIds)}
 
 
 @router.post("/responses", dependencies=[Depends(reject_cross_site)])

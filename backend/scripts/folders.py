@@ -19,6 +19,7 @@ from pathlib import Path
 from agent_api import agent_credentials, agent_request
 
 SHOW_LIMIT_BYTES = 4 * 1024 * 1024
+WRITE_LIMIT_BYTES = 4 * 1024 * 1024
 # Temporary copies are for one look each: keep only the newest few, briefly,
 # so even a 100-photo job never holds more than a few MB on Möbius. The hourly
 # scratch sweep expires the last ones on the same clock; keep the two values
@@ -180,22 +181,40 @@ def _scratch_dir() -> Path:
 def write_file(client: Folders, args: argparse.Namespace) -> None:
   folder, inner = client.resolve(args.target, args.folder)
   if args.text is not None:
+    data = args.text.encode()
     command = {"op": "write", "path": inner, "content": args.text}
   else:
-    data = Path(args.from_file).read_bytes() if args.from_file else sys.stdin.buffer.read()
+    # stdin only when asked for with "-": an agent's shell has no input, and
+    # reading it by default would save an empty file.
+    data = sys.stdin.buffer.read() if args.from_file == "-" else Path(args.from_file).read_bytes()
     command = {"op": "write", "path": inner, "content": base64.b64encode(data).decode(), "encoding": "base64"}
+  if not data and not args.allow_empty:
+    raise SystemExit("Nothing to write: the content is empty. Add --allow-empty if an empty file is intended.")
+  if len(data) > WRITE_LIMIT_BYTES:
+    raise SystemExit(f"Write at most {_size(WRITE_LIMIT_BYTES)} at a time.")
   if args.overwrite:
     command["overwrite"] = True
   result = client.run(folder, command)
-  print(f'{"Created" if result.get("created") else "Replaced"} {folder["name"]}/{result["path"]} ({_size(result["size"])}).')
+  if not result.get("created"):
+    kept = f' The old version is in {folder["name"]}/{result["binned"]}.' if result.get("binned") else ""
+    print(f'Replaced {folder["name"]}/{result["path"]} ({_size(result["size"])}).{kept}')
+    return
+  print(f'Created {folder["name"]}/{result["path"]} ({_size(result["size"])}).')
 
 
 def move_file(client: Folders, args: argparse.Namespace) -> None:
   folder, inner = client.resolve(args.target, args.folder)
   destination = args.destination.strip("/")
-  prefix = f'{folder["name"]}/'
-  if destination.startswith(prefix):
-    destination = destination[len(prefix):]
+  if not args.folder:
+    # Both paths start with the folder's name, so a move can't silently
+    # land somewhere else; moving between shared folders is not possible.
+    name, _, destination = destination.partition("/")
+    same = name == folder["id"] or name.casefold() == folder["name"].casefold()
+    if not same or not destination:
+      raise SystemExit(
+        f'Moves stay inside one shared folder. Start the new path with "{folder["name"]}/", '
+        f'for example "{folder["name"]}/Sorted/{Path(inner).name}".'
+      )
   result = client.run(folder, {"op": "move", "path": inner, "to": destination})
   print(f'Moved {result["path"]} → {result["to"]} in {folder["name"]}.')
 
@@ -235,12 +254,13 @@ def _parser() -> argparse.ArgumentParser:
   read.add_argument("--base64", action="store_true")
   target("show", show_file, "a temporary copy of an image (shrunk on the device) or PDF, to look at")
   write = target("write", write_file, "save a file (Read & edit folders)")
-  source = write.add_mutually_exclusive_group()
+  source = write.add_mutually_exclusive_group(required=True)
   source.add_argument("--text")
-  source.add_argument("--from-file")
-  write.add_argument("--overwrite", action="store_true")
+  source.add_argument("--from-file", metavar="PATH", help='a local file, or "-" for standard input')
+  write.add_argument("--overwrite", action="store_true", help="replace an existing file; its old version goes to the bin")
+  write.add_argument("--allow-empty", action="store_true", help="save an empty file on purpose")
   move = target("move", move_file, "rename or move a file (Read & edit folders)")
-  move.add_argument("destination", help="new path inside the same folder")
+  move.add_argument("destination", help="new path, starting with the same folder's name")
   target("mkdir", make_folder, "create a folder (Read & edit folders)")
   target("bin", bin_file, "move a file to the Möbius bin; nothing is ever deleted")
   return parser

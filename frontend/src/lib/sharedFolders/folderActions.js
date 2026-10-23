@@ -1,4 +1,5 @@
 /* What the owner does in Settings → Shared folders: add, pick again, reconnect, pause, remove. */
+import { api } from '../../api/client.js'
 import { createHandleFolder } from './handleFolder.js'
 import { createSnapshotFolder } from './snapshotFolder.js'
 import {
@@ -100,12 +101,28 @@ export async function setFolderPaused(id, paused) {
   return done
 }
 
-/** The Stop button: pause every folder this browser shares. */
-export async function pauseAllFolders() {
+/** Pause every folder this browser shares, or only the ones named. */
+export async function pauseAllFolders(ids = null) {
   for (const record of [...hostStore().records.values()]) {
-    if (!record.paused) await setFolderPaused(record.id, true)
+    if (!record.paused && (!ids || ids.includes(record.id))) await setFolderPaused(record.id, true)
   }
   return done
+}
+
+/**
+ * The Stop button, on any device: the server refuses every shared folder at
+ * once and tells the browsers holding them. This browser pauses its own
+ * right away too, so Stop works here even if the server can't be reached.
+ */
+export async function stopEverywhere() {
+  await Promise.allSettled([pauseAllFolders(), api.sharedFolders.pause()])
+  return done
+}
+
+/** Another device tapped Stop: keep the pause here, where the folder lives. */
+export async function applyRemotePause(event) {
+  const ids = Array.isArray(event?.folderIds) ? event.folderIds : []
+  if (ids.length) await pauseAllFolders(ids)
 }
 
 /** Stop sharing a folder. The folder and its files stay on the device. */

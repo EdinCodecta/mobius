@@ -1,8 +1,12 @@
 """Folders the owner shares from a browser: relay, safety, and access contracts."""
 
 import asyncio
+import base64
+import importlib.util
+import io
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -137,6 +141,33 @@ async def test_unanswered_command_times_out_and_is_forgotten(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", sorted(shared_folders.EDIT_OPERATIONS))
+async def test_a_change_without_an_answer_may_still_have_happened(monkeypatch, operation):
+  monkeypatch.setattr(shared_folders, "COMMAND_TIMEOUT_SECONDS", 0.05)
+  monkeypatch.setattr(shared_folders, "LIVENESS_POLL_SECONDS", 0.02)
+  streams = _FakeStreams("s1")
+  registry = streams.registry()
+  registry.report(_report())
+  timed_out = await registry.issue("f1", {"op": operation, "path": "a.txt"})
+  assert timed_out["code"] == "timeout" and "may still have happened" in timed_out["error"]
+  waiting = asyncio.create_task(registry.issue("f1", {"op": operation, "path": "a.txt"}))
+  await asyncio.sleep(0.01)
+  streams.live.clear()
+  closed = await waiting
+  assert closed["code"] == "offline" and "may still have happened" in closed["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_read_without_an_answer_is_simply_not_done(monkeypatch):
+  monkeypatch.setattr(shared_folders, "COMMAND_TIMEOUT_SECONDS", 0.05)
+  monkeypatch.setattr(shared_folders, "LIVENESS_POLL_SECONDS", 0.02)
+  streams = _FakeStreams("s1")
+  registry = streams.registry()
+  registry.report(_report())
+  assert "may still have happened" not in (await registry.issue("f1", {"op": "read", "path": "a.txt"}))["error"]
+
+
+@pytest.mark.asyncio
 async def test_busy_browser_refuses_more_than_the_pending_limit(monkeypatch):
   monkeypatch.setattr(shared_folders, "MAX_PENDING_PER_STREAM", 1)
   streams = _FakeStreams("s1")
@@ -162,6 +193,80 @@ async def test_folder_picked_in_one_tab_is_served_by_that_tab_not_a_newer_one():
   assert subscription_id == "picker-tab"
   registry.answer("picker-tab", event["commandId"], {"ok": True, "result": {}})
   assert (await waiting)["ok"] is True
+
+
+def _sent_of(streams, kind):
+  return [(sid, event) for sid, event in streams.sent if event["type"] == kind]
+
+
+@pytest.mark.asyncio
+async def test_stop_on_any_device_refuses_everywhere_until_the_holder_confirms():
+  streams = _FakeStreams("laptop-tab", "phone-tab")
+  registry = streams.registry()
+  registry.report(_report("laptop-tab", device="laptop", folders=[_folder("f1")]))
+  registry.report(_report("phone-tab", device="phone", folders=[]))
+  # The owner taps Stop on the phone, which shares nothing itself.
+  assert registry.pause() == ["f1"]
+  told = _sent_of(streams, "shared_folder_pause")
+  assert sorted(sid for sid, _ in told) == ["laptop-tab", "phone-tab"]
+  assert told[0][1]["folderIds"] == ["f1"]
+  streams.sent.clear()
+  refused = await registry.issue("f1", {"op": "read", "path": "a.txt"})
+  assert refused["code"] == "paused"
+  assert _sent_of(streams, "shared_folder_command") == []
+  assert registry.folders()[0]["state"] == "paused"
+  # The laptop pauses the folder itself; resuming there shares it again.
+  registry.report(_report("laptop-tab", device="laptop", sequence=2, folders=[_folder("f1", state="paused")]))
+  registry.report(_report("laptop-tab", device="laptop", sequence=3, folders=[_folder("f1")]))
+  waiting = asyncio.create_task(registry.issue("f1", {"op": "read", "path": "a.txt"}))
+  _, event = await _next_event(streams)
+  assert event["type"] == "shared_folder_command"
+  registry.answer("laptop-tab", event["commandId"], {"ok": True, "result": {}})
+  assert (await waiting)["ok"] is True
+
+
+def test_a_browser_closed_during_stop_is_told_again_when_it_returns():
+  streams = _FakeStreams("old-tab")
+  registry = streams.registry()
+  registry.report(_report("old-tab", folders=[_folder("f1")]))
+  streams.live.clear()
+  registry.pause()
+  assert streams.sent == []
+  streams.live.add("new-tab")
+  registry.report(_report("new-tab", at=time.time() + 1, folders=[_folder("f1")]))
+  assert streams.sent == [("new-tab", {"type": "shared_folder_pause", "folderIds": ["f1"]})]
+
+
+def test_stop_can_name_folders_and_ignores_unknown_ones():
+  streams = _FakeStreams("s1")
+  registry = streams.registry()
+  registry.report(_report(folders=[_folder("f1"), _folder("f2", name="Photos")]))
+  assert registry.pause(["f2", "nope"]) == ["f2"]
+  assert {f["id"]: f["state"] for f in registry.folders()} == {"f1": "ready", "f2": "paused"}
+
+
+@pytest.mark.asyncio
+async def test_activity_reaches_every_owner_tab_and_no_other_stream():
+  # "guest-tab" is live on the system stream but never reported folders.
+  streams = _FakeStreams("laptop-tab", "phone-tab", "guest-tab")
+  registry = streams.registry()
+  registry.report(_report("laptop-tab", device="laptop", folders=[_folder("f1")]))
+  registry.report(_report("phone-tab", device="phone", folders=[]))
+  waiting = asyncio.create_task(registry.issue("f1", {"op": "write", "path": "a.txt", "content": "x"}))
+  _, command = await _next_event(streams)
+  started = _sent_of(streams, "shared_folder_activity")
+  assert sorted(sid for sid, _ in started) == ["laptop-tab", "phone-tab"]
+  assert started[0][1] == {
+    "type": "shared_folder_activity", "commands": 1,
+    "folderId": "f1", "folderName": "Downloads", "deviceId": "laptop", "deviceLabel": "Chrome on laptop",
+  }
+  streams.sent.clear()
+  registry.answer("laptop-tab", command["commandId"], {"ok": True, "result": {}})
+  await waiting
+  assert sorted((sid, e["commands"]) for sid, e in _sent_of(streams, "shared_folder_activity")) == [
+    ("laptop-tab", 0), ("phone-tab", 0),
+  ]
+  assert all(sid != "guest-tab" for sid, _ in streams.sent)
 
 
 def test_delayed_older_report_cannot_overwrite_a_newer_one():
@@ -232,6 +337,18 @@ def test_command_accepts_only_its_own_fields_and_safe_paths(body):
     FolderCommandBody(**body)
 
 
+def test_write_size_is_measured_in_bytes_for_text_and_base64():
+  limit = 4 * 1024 * 1024
+  assert FolderCommandBody(op="write", path="a.txt", content="a" * limit)
+  # Two bytes per letter: under the character cap, over the byte limit.
+  with pytest.raises(ValidationError, match="4 MB"):
+    FolderCommandBody(op="write", path="a.txt", content="ж" * (limit // 2 + 1))
+  exact = base64.b64encode(b"x" * limit).decode()
+  assert FolderCommandBody(op="write", path="a.bin", content=exact, encoding="base64")
+  with pytest.raises(ValidationError):
+    FolderCommandBody(op="write", path="a.bin", content=base64.b64encode(b"x" * (limit + 1)).decode(), encoding="base64")
+
+
 def test_image_command_is_a_read_that_carries_only_its_size_limit():
   body = FolderCommandBody(op="image", path="Photos/IMG_1.HEIC", maxEdge=2576)
   assert body.wire() == {"op": "image", "path": "Photos/IMG_1.HEIC", "maxEdge": 2576}
@@ -258,8 +375,18 @@ def test_move_command_normalizes_both_paths():
 # Routes: who may report, answer, list and command.
 
 
-def _agent(chat_id="chat-1", **kwargs):
-  return {"Authorization": "Bearer " + auth_module.create_agent_token(chat_id, "test", 0, **kwargs)}
+def _agent(chat_id="chat-1", *, chat_app_id=None, run_app_id=None, **kwargs):
+  """A running agent turn in `chat_id`; app ids mark an app-started chat or turn."""
+  from app import models
+  from app.database import SessionLocal
+  run_id = f"run-{chat_id}"
+  with SessionLocal() as db:
+    if db.get(models.Chat, chat_id) is None:
+      db.add(models.Chat(id=chat_id, legacy_messages=[], created_by_app_id=chat_app_id))
+    if db.get(models.ChatRun, run_id) is None:
+      db.add(models.ChatRun(id=run_id, chat_id=chat_id, status="running", initiated_by_app_id=run_app_id))
+    db.commit()
+  return {"Authorization": "Bearer " + auth_module.create_agent_token(chat_id, "test", 0, run_id=run_id, **kwargs)}
 
 
 _REPORT = {
@@ -278,6 +405,7 @@ def live_stream():
   broadcast.unsubscribe(subscription)
   shared_folders.registry._reports.clear()
   shared_folders.registry._pending.clear()
+  shared_folders.registry._stopped.clear()
 
 
 def test_only_the_owner_browser_can_report_folders(client, auth, live_stream):
@@ -320,6 +448,30 @@ def test_mini_app_tokens_never_reach_shared_folders(client, auth, db):
   assert client.post(
     "/api/shared-folders/f1/commands", headers=app_headers, json={"op": "list"},
   ).status_code == 403
+
+
+def test_only_the_owners_own_live_chats_reach_shared_folders(client, auth, live_stream):
+  from test_app_fixtures import create_local_app
+  client.put(f"/api/shared-folders/devices/{live_stream.id}", headers=auth, json=_REPORT)
+  news = create_local_app(client, auth, name="News")["id"]
+  unattended = {
+    "app-started chat": _agent("news-digest", chat_app_id=news, run_app_id=news),
+    "app-started turn in an owner chat": _agent("owner-chat", run_app_id=news),
+    "agent token without a run": {
+      "Authorization": "Bearer " + auth_module.create_agent_token("chat-1", "test", 0),
+    },
+  }
+  for label, headers in unattended.items():
+    assert client.get("/api/shared-folders", headers=headers).status_code == 403, label
+    command = client.post("/api/shared-folders/f1/commands", headers=headers, json={"op": "list"})
+    assert command.status_code == 403, label
+    assert "background or scheduled" in command.json()["detail"], label
+  delivered = []
+  while not live_stream.empty():
+    delivered.append(live_stream.get_nowait()["type"])
+  assert "shared_folder_command" not in delivered
+  listed = client.get("/api/shared-folders", headers=_agent("my-chat"))
+  assert listed.status_code == 200 and listed.json()["folders"][0]["id"] == "f1"
 
 
 def test_agent_command_round_trips_through_the_owner_browser(client, auth, live_stream):
@@ -393,6 +545,15 @@ def test_agent_sees_refusals_as_ordinary_results(client, auth, live_stream):
   assert response.json()["code"] == "read_only"
 
 
+def test_only_the_owner_browser_can_stop_shared_folders(client, auth, live_stream):
+  client.put(f"/api/shared-folders/devices/{live_stream.id}", headers=auth, json=_REPORT)
+  assert client.post("/api/shared-folders/pause", headers=_agent(), json={}).status_code == 403
+  stopped = client.post("/api/shared-folders/pause", headers=auth, json={})
+  assert stopped.status_code == 200 and stopped.json() == {"paused": ["f1"]}
+  refused = client.post("/api/shared-folders/f1/commands", headers=_agent(), json={"op": "list"})
+  assert refused.json()["code"] == "paused"
+
+
 def test_agent_cannot_answer_for_the_browser(client, auth, live_stream):
   response = client.post("/api/shared-folders/responses", headers=_agent(), json={
     "subscriptionId": live_stream.id, "commandId": "x", "ok": True,
@@ -408,3 +569,53 @@ def _await_stream_event(subscription, timeout=5.0):
     except asyncio.QueueEmpty:
       time.sleep(0.01)
   raise AssertionError("the browser stream received no command")
+
+
+# ---------------------------------------------------------------------------
+# The agent's `folders` command.
+
+_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+
+
+@pytest.fixture
+def folders_cli(monkeypatch):
+  """The command with a fake connection that records what it would send."""
+  monkeypatch.syspath_prepend(str(_SCRIPTS))
+  spec = importlib.util.spec_from_file_location("folders_cli_under_test", _SCRIPTS / "folders.py")
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  client = module.Folders.__new__(module.Folders)
+  client._listing = [{"id": "f1", "name": "Downloads", "mode": "edit", "access": "remembered", "state": "ready"}]
+  client.sent = []
+  client.run = lambda folder, command: client.sent.append(command) or {
+    "path": command["path"], "to": command.get("to"), "size": 0, "created": True,
+  }
+
+  def run(*argv, stdin=b""):
+    monkeypatch.setattr("sys.stdin", io.TextIOWrapper(io.BytesIO(stdin)))
+    args = module._parser().parse_args(list(argv))
+    args.run(client, args)
+    return client.sent
+
+  return run
+
+
+def test_write_never_reads_input_unless_asked_and_refuses_empty_content(folders_cli):
+  with pytest.raises(SystemExit):
+    folders_cli("write", "Downloads/a.txt")
+  with pytest.raises(SystemExit, match="empty"):
+    folders_cli("write", "Downloads/a.txt", "--overwrite", "--from-file", "-")
+  with pytest.raises(SystemExit, match="empty"):
+    folders_cli("write", "Downloads/a.txt", "--text", "")
+  assert folders_cli("write", "Downloads/a.txt", "--from-file", "-", stdin=b"hi")[-1]["content"] == "aGk="
+  assert folders_cli("write", "Downloads/b.txt", "--text", "", "--allow-empty")[-1]["content"] == ""
+
+
+def test_move_stays_inside_the_folder_named_by_both_paths(folders_cli):
+  sent = folders_cli("move", "Downloads/IMG_1.jpg", "Downloads/Photos/2026-10-01.jpg")
+  assert sent[-1] == {"op": "move", "path": "IMG_1.jpg", "to": "Photos/2026-10-01.jpg"}
+  assert folders_cli("move", "Downloads/IMG_1.jpg", "downloads/a.jpg")[-1]["to"] == "a.jpg"
+  for destination in ("Photos/2026-10-01.jpg", "Downloads", "Downloads/"):
+    with pytest.raises(SystemExit, match="inside one shared folder"):
+      folders_cli("move", "Downloads/IMG_1.jpg", destination)
+  assert folders_cli("move", "IMG_1.jpg", "Photos/a.jpg", "--folder", "f1")[-1]["to"] == "Photos/a.jpg"
