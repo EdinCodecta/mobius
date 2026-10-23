@@ -445,9 +445,14 @@ most 16384.
   up to 12 `items` `{title, intent, facts? (up to 4), badges?, action?}`;
   `action` `{label (40), intent}`; `inline` (default `true`; `false` is a
   link-only snapshot without actions); `expand_label` (40); `height` (240-640,
-  default 480). `href` is kept only for an uncredentialed `https:` URL. An
-  invalid fact, item or action is dropped, never truncated: an item title
-  follows the root rule (1-240), and invalid facts don't use up the 8 slots.
+  default 480; a non-number is ignored). `href` is kept only for an
+  uncredentialed `https:` URL. Text is validated, never truncated: a field
+  over its limit (in parentheses) is invalid, so its fact, badge, item or
+  action is dropped and an over-limit `expand_label` falls back to the default.
+  An item title follows the root rule (1-240), and invalid facts don't use up
+  the 8 slots. A field of the wrong JSON type (an object, array or null where
+  a string or number belongs) is invalid the same way and never breaks the
+  reply.
   Every intent field has the same bound. A repeated item intent or badge
   label keeps only its first entry.
 - Every block links to `/shell/?app=<slug>&intent=<intent>`, and each item to

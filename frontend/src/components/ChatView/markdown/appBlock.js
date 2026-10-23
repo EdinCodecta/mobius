@@ -24,6 +24,10 @@ export const BADGE_TONES = new Set(['success', 'attention', 'danger', 'accent', 
 
 export const appIntent = value => typeof value === 'string' && INTENT.test(value) ? value : null
 export const shortText = (value, max) => typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : ''
+// A block's own text fields are validated, never shortened: a value over its
+// limit is invalid, so its badge, fact or action is dropped (an over-limit
+// expand_label falls back to the default label).
+export const boundedText = (value, max) => typeof value === 'string' && value.trim() && value.length <= max ? value.trim() : ''
 export const appBlockHref = (app, intent) => `/shell/?${new URLSearchParams({ app, intent })}`
 
 // The first entry wins for a repeated key, so rendered rows stay distinct.
@@ -31,34 +35,35 @@ const firstBy = key => (item, index, list) => list.findIndex(other => key(other)
 
 export function blockBadges(value) {
   return (Array.isArray(value) ? value : [])
-    .filter(badge => shortText(badge?.label, APP_BLOCK_LIMITS.badgeLabel))
-    .filter(firstBy(badge => shortText(badge.label, APP_BLOCK_LIMITS.badgeLabel))).slice(0, APP_BLOCK_LIMITS.badges)
-    .map(badge => ({ label: shortText(badge.label, APP_BLOCK_LIMITS.badgeLabel),
+    .filter(badge => boundedText(badge?.label, APP_BLOCK_LIMITS.badgeLabel))
+    .filter(firstBy(badge => boundedText(badge.label, APP_BLOCK_LIMITS.badgeLabel))).slice(0, APP_BLOCK_LIMITS.badges)
+    .map(badge => ({ label: boundedText(badge.label, APP_BLOCK_LIMITS.badgeLabel),
       tone: BADGE_TONES.has(badge.tone) ? badge.tone : 'neutral' }))
 }
 
 function blockFacts(value, max) {
   // Filter before bounding, so an invalid fact never takes a valid one's slot.
+  // An over-limit label or value drops its fact; it is never truncated.
   return (Array.isArray(value) ? value : [])
-    .filter(fact => shortText(fact?.label, APP_BLOCK_LIMITS.factLabel) && typeof fact.value === 'string')
+    .filter(fact => boundedText(fact?.label, APP_BLOCK_LIMITS.factLabel)
+      && typeof fact.value === 'string' && fact.value.length <= APP_BLOCK_LIMITS.factValue)
     .slice(0, max)
     .map(fact => {
       // An unsafe source link stays plain snapshot text.
       const href = safeSourceUrl(fact.href, { httpsOnly: true })
-      return { label: shortText(fact.label, APP_BLOCK_LIMITS.factLabel),
-        value: fact.value.slice(0, APP_BLOCK_LIMITS.factValue), ...(href ? { href } : {}) }
+      return { label: boundedText(fact.label, APP_BLOCK_LIMITS.factLabel), value: fact.value, ...(href ? { href } : {}) }
     })
 }
 
 function blockAction(raw) {
-  const label = shortText(raw?.label, APP_BLOCK_LIMITS.actionLabel)
+  const label = boundedText(raw?.label, APP_BLOCK_LIMITS.actionLabel)
   const intent = appIntent(raw?.intent)
   return label && intent ? { label, intent } : null
 }
 
 // A title is identity, so it is validated like the root title: an over-limit
 // title drops its item rather than being shortened.
-const blockTitle = value => typeof value === 'string' && value.length <= APP_BLOCK_LIMITS.title ? value.trim() : ''
+const blockTitle = value => boundedText(value, APP_BLOCK_LIMITS.title)
 
 function blockItem(raw, app, inline) {
   const title = blockTitle(raw?.title)
@@ -75,7 +80,9 @@ export function appBlockFromToken(token) {
   let value
   try { value = JSON.parse(token.text) } catch { return null }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-  const app = APP_SLUG.test(value.app || '') ? value.app : null
+  // Type-check before any regex or number coercion: a JSON object such as
+  // {"toString": null} would otherwise throw during render.
+  const app = typeof value.app === 'string' && APP_SLUG.test(value.app) ? value.app : null
   const intent = appIntent(value.intent)
   const title = blockTitle(value.title)
   if (!app || !intent || !title) return null
@@ -90,8 +97,9 @@ export function appBlockFromToken(token) {
       .slice(0, APP_BLOCK_LIMITS.items),
     // An action only opens the app's own view with its intent.
     action: inline ? blockAction(value.action) : null,
-    expandLabel: shortText(value.expand_label, APP_BLOCK_LIMITS.expandLabel),
-    height: Math.max(240, Math.min(640, Number(value.height) || 480)),
+    expandLabel: boundedText(value.expand_label, APP_BLOCK_LIMITS.expandLabel),
+    height: typeof value.height === 'number' && Number.isFinite(value.height)
+      ? Math.max(240, Math.min(640, value.height)) : 480,
   }
 }
 
