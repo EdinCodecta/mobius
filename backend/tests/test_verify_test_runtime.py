@@ -266,17 +266,70 @@ def test_node_runtime_satisfies_the_pinned_agent_browser_engine():
   for package in ("jq", "ripgrep", "sqlite3", "unzip"):
     assert re.search(rf"\b{package}\b", apt_layer)
   # The image-owned agent-browser config registers nothing a workspace could
-  # extend: empty on amd64, and only the image's own Chromium on arm64.
+  # extend: it names only a browser the image itself installed.
   config_layer = dockerfile[
     dockerfile.index("RUN install -d -m 0755 /app"):
     dockerfile.index("chmod 0644 /app/agent-browser-config.json")
   ]
   assert "printf '{\"executablePath\": \"/usr/bin/chromium\"}\\n';" in config_layer
-  assert "printf '{}\\n';" in config_layer
   assert "fi > /app/agent-browser-config.json" in config_layer
   assert "node:24-trixie-slim sh -c" in preship
   assert "node:22" not in dockerfile
   assert "node:22" not in preship
+
+
+def test_amd64_agents_default_to_the_headless_shell_matching_full_chrome():
+  """A 1 GB container cannot start full Chrome; the lean shell must be default.
+
+  Full Chrome stays installed for full-browser features. Both come from the
+  same pinned Chrome for Testing version, and only full Chrome sits where
+  agent-browser's own `chrome-*` discovery looks.
+  """
+  dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+  shell = "/browsers/headless-shell/chrome-headless-shell"
+  browser_layer = dockerfile[
+    dockerfile.index("ARG CHROME_VERSION="):
+    dockerfile.index("# Only Liberation fonts are installed")
+  ]
+  assert 'mv /tmp/cft/chrome-linux64 "${browsers}/chrome-${CHROME_VERSION}"' in browser_layer
+  assert 'mv /tmp/cft/chrome-headless-shell-linux64 "${browsers}/headless-shell"' in browser_layer
+  assert f'"${{browsers}}/headless-shell/chrome-headless-shell" --version' in browser_layer
+  assert "chown -R mobius:mobius /opt/agent-browser" in browser_layer
+
+  config_layer = dockerfile[
+    dockerfile.index("RUN install -d -m 0755 /app"):
+    dockerfile.index("chmod 0644 /app/agent-browser-config.json")
+  ]
+  assert (
+    f"printf '{{\"executablePath\": \"/opt/agent-browser{shell}\"}}\\n';"
+  ) in config_layer
+  assert "printf '{}\\n';" not in config_layer
+
+
+def test_chrome_for_testing_downloads_are_pinned_and_sha256_verified():
+  """Chrome for Testing publishes no checksums, so the image pins its own.
+
+  An unpinned `agent-browser install` took whatever Stable was current at
+  build time and trusted it on TLS alone (mobius-os/mobius#1849).
+  """
+  dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+  assert not re.search(r"^\s*agent-browser install\b", dockerfile, re.MULTILINE)
+  assert re.search(r"^ARG CHROME_VERSION=\d+\.\d+\.\d+\.\d+$", dockerfile, re.MULTILINE)
+  for argument in ("CHROME_SHA256", "CHROME_HEADLESS_SHELL_SHA256"):
+    assert re.search(rf"^ARG {argument}=[0-9a-f]{{64}}$", dockerfile, re.MULTILINE)
+  browser_layer = dockerfile[
+    dockerfile.index("ARG CHROME_VERSION="):
+    dockerfile.index("# Only Liberation fonts are installed")
+  ]
+  assert (
+    'base="https://storage.googleapis.com/chrome-for-testing-public/'
+    '${CHROME_VERSION}/linux64"'
+  ) in browser_layer
+  assert '"$CHROME_SHA256" /tmp/chrome.zip' in browser_layer
+  assert '"$CHROME_HEADLESS_SHELL_SHA256" /tmp/headless-shell.zip' in browser_layer
+  assert "| sha256sum -c -; \\" in browser_layer
+  # Verification happens before either archive is unpacked.
+  assert browser_layer.index("sha256sum -c -") < browser_layer.index("unzip")
 
 
 def test_tectonic_release_is_verified_for_supported_image_architectures():
@@ -744,7 +797,8 @@ def test_manual_and_pull_request_runs_cover_suites_and_main_image():
   ).exists()
   test_triggers = test_workflow.split("\npermissions:\n", 1)[0]
   image_triggers = image_workflow.split("\npermissions:\n", 1)[0]
-  # The backend check spans its checks, test shards, and combining gate.
+  # The backend check spans its checks, test shards, the all-unconverted
+  # boundary suites, and the combining gate.
   backend = test_workflow.split("\n  backend-checks:\n", 1)[1].split(
     "\n  frontend-unit:\n", 1,
   )[0]
@@ -756,7 +810,9 @@ def test_manual_and_pull_request_runs_cover_suites_and_main_image():
   backend_env = (
     ROOT / ".github" / "actions" / "backend-env" / "action.yml"
   ).read_text(encoding="utf-8")
-  assert backend.count("uses: ./.github/actions/backend-env") == 2
+  assert backend.count("uses: ./.github/actions/backend-env") == 3
+  assert "MOBIUS_TEST_ALL_UNCONVERTED: '1'" in backend
+  assert "needs: [backend-checks, backend-tests, backend-all-unconverted]" in backend
   assert "openai-codex==$(sed -n 's/^ARG CODEX_SDK_VERSION=//p' Dockerfile)" in backend_env
   for job in (backend, e2e):
     assert "github.event_name == 'pull_request'" not in job

@@ -1,3 +1,4 @@
+import DrawerStatusMarker from './DrawerStatusMarker.jsx'
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useQueryClient } from '@tanstack/react-query'
@@ -77,6 +78,7 @@ import {
 import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.js'
 import { writeClipboardText } from '../../runtime/clipboard.js'
 import { drawerNameMaxLength, saveDrawerRename } from './drawerRename.js'
+import { drawerRowUnread } from './appBadge.js'
 import './Drawer.css'
 
 const LIST_TABS = ['recents', 'archived']
@@ -1696,6 +1698,7 @@ const DrawerRow = memo(function DrawerRow({
   const label = kind === 'chat' ? item.title : item.name
   const projectChip = recentsProjectChip(kind, item)
   const pinned = !!item.pinned_at
+  const { badgeLabel, attentionDot } = drawerRowUnread(kind, item, attention)
   const waiting = kind === 'chat' && item.handoff?.kind === 'automatic'
   const recovery = kind === 'chat' && item.handoff?.kind === 'recovery'
   const onHold = kind === 'chat' && item.handoff?.kind === 'on_hold'
@@ -2041,7 +2044,7 @@ const DrawerRow = memo(function DrawerRow({
     )
   }
 
-  function beginPinnedReorder({ pointerId, start, moveEvent }) {
+  function beginPinnedReorder({ pointerId, start, moveEvent, releaseHeldTouchPan }) {
     if (!pinned || !moveEvent) return false
     // Finish any still-settling previous drag before this gesture can measure;
     // lingering transforms from the old preview would poison the new geometry.
@@ -2087,6 +2090,7 @@ const DrawerRow = memo(function DrawerRow({
     function removeListeners() {
       if (listenersOff) return
       listenersOff = true
+      releaseHeldTouchPan?.()
       window.removeEventListener('pointermove', onMove, true)
       window.removeEventListener('pointerup', onUp, true)
       window.removeEventListener('pointercancel', onCancel, true)
@@ -2310,63 +2314,15 @@ const DrawerRow = memo(function DrawerRow({
         {/* Status dot. Sits before the text so the user's eye
             picks it up alongside the label rather than at the row's
             edge (where the pin lives). aria-label exposes the state. */}
-        {ownerRequired ? (
-          <span
-            className="drawer__attention-diamond drawer__owner-input-dot"
-            role="img"
-            aria-label="Your input is needed"
-            title="Your input is needed"
-          />
-        ) : streaming ? (
-          <span
-            className="drawer__streaming-dot"
-            aria-label="Currently streaming"
-            title="Currently streaming"
-          />
-        ) : waiting ? (
-          <span
-            className="drawer__waiting-icon"
-            role="img"
-            aria-label="Waiting to resume"
-            title="Waiting to resume"
-          >
-            <Pause width={8} height={8} aria-hidden="true" />
+        <DrawerStatusMarker {...{ ownerRequired, streaming, waiting, onHold, recovery,
+          recoveryLabel, failed, building, attentionDot }} holdReason={item.handoff?.hold_reason} />
+        <span className={`drawer__item-text${badgeLabel ? ' drawer__item-text--unread' : ''}`}>{label}</span>
+        {badgeLabel && (
+          // The app's own unread count (see appBadge.js).
+          <span className="drawer__badge" role="img" aria-label={`${badgeLabel} unread`}>
+            {badgeLabel}
           </span>
-        ) : onHold ? (
-          <span className="drawer__waiting-icon" role="img" aria-label="On hold — continue when ready"
-            title={item.handoff?.hold_reason || 'On hold — continue when ready'}>
-            <Pause width={8} height={8} aria-hidden="true" />
-          </span>
-        ) : recovery ? (
-          <span
-            className="drawer__recovery-icon"
-            role="img"
-            aria-label={recoveryLabel}
-            title={recoveryLabel}
-          ><Pause width={8} height={8} aria-hidden="true" /></span>
-        ) : failed ? (
-          <span
-            className="drawer__failure-dot"
-            role="img"
-            aria-label="Latest run failed"
-            title="Latest run failed"
-          />
-        ) : building ? (
-          <span
-            className="drawer__streaming-dot"
-            role="img"
-            aria-label="Building"
-            title="Building…"
-          />
-        ) : attention ? (
-          <span
-            className="drawer__attention-dot"
-            role="img"
-            aria-label="New activity"
-            title="New activity"
-          />
-        ) : null}
-        <span className="drawer__item-text">{label}</span>
+        )}
       </button>
       {projectChip && (
         // A sibling of the row button (never nested — a button inside a button is

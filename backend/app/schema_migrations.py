@@ -1452,6 +1452,54 @@ def _add_app_connect_manage(eng) -> None:
     ))
 
 
+def _add_app_accepted_consent(eng) -> None:
+  """Add the first-open consent record and grandfather every installed app.
+
+  Existing apps keep exactly what they hold today: their current contract
+  becomes their accepted copy, marked as coming from this migration, so an
+  upgrade never asks anything about an app the owner already runs.
+  """
+  import json
+  from sqlalchemy import inspect as sa_inspect, text
+
+  columns = {
+    column["name"] for column in sa_inspect(eng).get_columns("apps")
+  }
+  if "accepted_consent" not in columns:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE apps ADD COLUMN accepted_consent JSON"))
+  columns |= {"accepted_consent"}
+  if "capability_contract" not in columns:
+    return
+  templates_column = (
+    "project_templates_json" if "project_templates_json" in columns else "NULL"
+  )
+  now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+  with eng.begin() as conn:
+    rows = conn.execute(text(
+      f"SELECT id, capability_contract, {templates_column} FROM apps "
+      "WHERE accepted_consent IS NULL AND capability_contract IS NOT NULL"
+    )).fetchall()
+    for app_id, contract, templates in rows:
+      try:
+        parsed = json.loads(contract) if isinstance(contract, str) else contract
+      except ValueError:
+        continue
+      if not isinstance(parsed, dict):
+        continue
+      record = {
+        "contract": parsed,
+        "project_builders": bool(templates) and templates not in ("null", "[]", "{}"),
+        "digest": None,
+        "at": now,
+        "via": "migration",
+      }
+      conn.execute(
+        text("UPDATE apps SET accepted_consent = :record WHERE id = :id"),
+        {"record": json.dumps(record), "id": app_id},
+      )
+
+
 def _add_owner_auth_mode(eng) -> None:
   """Add the durable owner login mode (models.Owner.auth_mode).
 
@@ -6321,11 +6369,527 @@ def _repair_transcript_derived_rows(eng) -> None:
         f"DELETE FROM {table} WHERE chat_id NOT IN (SELECT id FROM chats)"
       )
     conn.exec_driver_sql("DELETE FROM chat_search_entries WHERE seq = -1")
+    # 0087's own title rebuild, kept as a copy: the ledger hashes 0087's code
+    # and everything it references, so the two cannot share one definition.
+    # Rebuilding in this transaction keeps the DELETE and the INSERT atomic.
     conn.exec_driver_sql(
       "INSERT INTO chat_search_entries (chat_id, seq, text) "
       f"SELECT id, -1, trim(title, {whitespace}) FROM chats "
       f"WHERE coalesce(trim(title, {whitespace}), '') <> ''"
     )
+
+
+def _goal_execution_identity(eng) -> None:
+  """Atomically snapshot legacy schema and ownership under the writer lock."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  with eng.connect() as conn:
+    sqlite = eng.dialect.name == "sqlite"
+    foreign_keys = None
+    try:
+      if sqlite:
+        # SQLite's deferred BEGIN does not protect SELECTs or schema DDL.
+        # Disable FK enforcement before BEGIN for the lossless table rebuild;
+        # every schema read, copy and ownership write then shares one lock.
+        foreign_keys = conn.exec_driver_sql("PRAGMA foreign_keys").scalar()
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        conn.commit()
+        conn.exec_driver_sql("BEGIN IMMEDIATE")
+      else:
+        conn.begin()
+      inspector = sa_inspect(conn)
+      tables = set(inspector.get_table_names())
+      if not {"chat_goals", "delegations"}.issubset(tables):
+        conn.rollback()
+        return
+      for table, name in (("chat_goals", "completion_run_id"), ("delegations", "goal_id")):
+        if name not in {column["name"] for column in inspector.get_columns(table)}:
+          conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} VARCHAR(64) NULL"))
+
+      if sqlite:
+        # Preserve every historical column, row, explicit index and trigger.
+        original = conn.exec_driver_sql(
+          "SELECT sql FROM sqlite_master WHERE type='table' AND name='delegations'"
+        ).scalar()
+        changed, count = re.subn(
+          r",?\s*CONSTRAINT\s+uq_delegations_parent_root_task\s+UNIQUE\s*"
+          r"\(\s*parent_root_run_id\s*,\s*task_key\s*\)",
+          "", original, count=1, flags=re.IGNORECASE,
+        )
+        if count:
+          objects = conn.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE tbl_name='delegations' "
+            "AND type IN ('index','trigger') AND sql IS NOT NULL"
+          ).scalars().all()
+          columns = ", ".join(
+            '"' + row[1].replace('"', '""') + '"'
+            for row in conn.exec_driver_sql("PRAGMA table_info(delegations)")
+          )
+          changed, renamed = re.subn(
+            r'^(CREATE\s+TABLE\s+)("?delegations"?)',
+            r'\1delegations__0086', changed, count=1, flags=re.IGNORECASE,
+          )
+          if renamed != 1:
+            raise RuntimeError("Cannot identify delegations table declaration")
+          conn.exec_driver_sql(changed)
+          conn.exec_driver_sql(
+            f"INSERT INTO delegations__0086 ({columns}) SELECT {columns} FROM delegations"
+          )
+          conn.exec_driver_sql("DROP TABLE delegations")
+          conn.exec_driver_sql("ALTER TABLE delegations__0086 RENAME TO delegations")
+          for sql in objects:
+            conn.exec_driver_sql(sql)
+      else:
+        conn.execute(text(
+          "ALTER TABLE delegations DROP CONSTRAINT IF EXISTS uq_delegations_parent_root_task"
+        ))
+
+      conn.execute(text("CREATE TABLE IF NOT EXISTS goal_identity_0086_snapshot ("
+                        "record_kind VARCHAR(16), delegation_id VARCHAR(64), "
+                        "goal_id VARCHAR(64), PRIMARY KEY (record_kind, delegation_id))"))
+      first_snapshot = conn.execute(text(
+        "SELECT 1 FROM goal_identity_0086_snapshot "
+        "WHERE record_kind='migration' AND delegation_id='0086'"
+      )).first() is None
+      if first_snapshot:
+        goals = [dict(row) for row in conn.execute(text(
+          "SELECT id, chat_id, status FROM chat_goals"
+        )).mappings()]
+        runs = [dict(row) for row in conn.execute(text(
+          "SELECT id, root_run_id, chat_id, goal_id FROM chat_runs"
+        )).mappings()]
+        rows = [dict(row) for row in conn.execute(text(
+          "SELECT id, parent_chat_id, parent_root_run_id, child_chat_id, "
+          "app_id, source_work_id, goal_id FROM delegations"
+        )).mappings()]
+        goals_by_chat = {}
+        for goal in goals:
+          goals_by_chat.setdefault(goal["chat_id"], set()).add(goal["id"])
+        runs_by_chat_root = {}
+        for run in runs:
+          chat, goal_id = run["chat_id"], run["goal_id"]
+          if goal_id and goal_id in goals_by_chat.get(chat, ()):
+            for root in {run["root_run_id"], run["id"]}:
+              runs_by_chat_root.setdefault((chat, root), set()).add(goal_id)
+        owned = {row["id"]: row["goal_id"] for row in rows if row["goal_id"]}
+        # Exact same-chat historical root=Goal ID is authoritative. Otherwise a
+        # root's runs must establish precisely one Goal in that parent chat.
+        from collections import deque
+
+        eligible = {row["id"]: row for row in rows
+                    if not row["app_id"] and not row["source_work_id"]}
+        by_child_chat = {}
+        for row in eligible.values():
+          by_child_chat.setdefault(row["child_chat_id"], []).append(row["id"])
+        children = {id_: [] for id_ in eligible}
+        remaining_parents = {}
+        for id_, row in eligible.items():
+          parents = by_child_chat.get(row["parent_chat_id"], ())
+          remaining_parents[id_] = len(parents)
+          for parent in parents:
+            children[parent].append(id_)
+        ready = deque(id_ for id_, count in remaining_parents.items() if count == 0)
+        parent_goals = {id_: set() for id_ in eligible}
+        inferred = []
+        while ready:
+          id_ = ready.popleft()
+          row = eligible[id_]
+          chat, root = row["parent_chat_id"], row["parent_root_run_id"]
+          parents = parent_goals[id_]
+          direct = {root} if root in goals_by_chat.get(chat, ()) else set()
+          candidates = direct or runs_by_chat_root.get((chat, root), set()) or parents
+          if not row["goal_id"] and len(candidates) == 1 and (
+              not parents or candidates == parents):
+            goal_id = next(iter(candidates))
+            owned[id_] = goal_id
+            inferred.append({"id": id_, "goal": goal_id})
+          for child in children[id_]:
+            if id_ in owned:
+              parent_goals[child].add(owned[id_])
+            remaining_parents[child] -= 1
+            if remaining_parents[child] == 0:
+              ready.append(child)
+        # Unprocessed nodes are cycles or descend from cycles, so their
+        # ancestry cannot establish ownership. Snapshot every row regardless.
+        # Stage the inferred map in one statement, not one UPDATE per helper.
+        # The staging primary key keeps each ownership lookup indexed.
+        if inferred:
+          conn.execute(text("CREATE TEMPORARY TABLE goal_identity_0086_inferred ("
+                            "id VARCHAR(64) PRIMARY KEY, goal_id VARCHAR(64))"))
+          projection = ("SELECT key, value FROM json_each(:ownership)" if sqlite else
+                        "SELECT key, value FROM jsonb_each_text(CAST(:ownership AS jsonb))")
+          conn.execute(text("INSERT INTO goal_identity_0086_inferred (id, goal_id) " + projection),
+                       {"ownership": json.dumps({row["id"]: row["goal"] for row in inferred})})
+          conn.execute(text(
+            "UPDATE delegations SET goal_id=(SELECT i.goal_id "
+            "FROM goal_identity_0086_inferred i WHERE i.id=delegations.id) "
+            "WHERE goal_id IS NULL AND id IN (SELECT id FROM goal_identity_0086_inferred)"
+          ))
+          conn.execute(text("DROP TABLE goal_identity_0086_inferred"))
+        # NULL records are completed examination, never future inference work.
+        conn.execute(text(
+          "INSERT INTO goal_identity_0086_snapshot (record_kind, delegation_id, goal_id) "
+          "SELECT 'delegation', id, goal_id FROM delegations"
+        ))
+        if "chat_waits" in tables:
+          conn.execute(text(
+            "UPDATE chat_waits SET goal_id=COALESCE(goal_id, "
+            "(SELECT r.goal_id FROM chat_runs r WHERE r.id=chat_waits.created_by_run_id "
+            "AND r.chat_id=chat_waits.chat_id)), "
+            "root_run_id=(SELECT COALESCE(r.root_run_id,r.id) FROM chat_runs r "
+            "WHERE r.id=chat_waits.created_by_run_id AND r.chat_id=chat_waits.chat_id) "
+            "WHERE root_run_id IS NULL AND created_by_run_id IS NOT NULL "
+            "AND kind IN ('command','timer','github_checks')"
+          ))
+        conn.execute(text(
+          # UPDATE FROM probes the Goal primary key once per grouped run;
+          # a correlated CTE lookup can scan every completion for each Goal.
+          "UPDATE chat_goals SET completion_run_id=c.run FROM "
+          "(SELECT goal_id, chat_id, MIN(id) AS run FROM chat_runs "
+          "WHERE goal_id IS NOT NULL GROUP BY goal_id, chat_id HAVING COUNT(*)=1) c "
+          "WHERE chat_goals.id=c.goal_id AND chat_goals.chat_id=c.chat_id "
+          "AND chat_goals.completion_run_id IS NULL "
+          "AND chat_goals.status IN ('completed','cannot_complete','cancelled')"
+        ))
+        # The marker and every schema/backfill write commit together.
+        conn.execute(text(
+          "INSERT INTO goal_identity_0086_snapshot (record_kind, delegation_id, goal_id) "
+          "VALUES ('migration', '0086', NULL)"
+        ))
+      else:
+        # Retry does no Python full-data reads/indexing under the writer lock.
+        # New runtime rows retain their saved ownership, including NULL.
+        conn.execute(text(
+          "INSERT INTO goal_identity_0086_snapshot (record_kind, delegation_id, goal_id) "
+          "SELECT 'delegation', d.id, d.goal_id FROM delegations d WHERE NOT EXISTS "
+          "(SELECT 1 FROM goal_identity_0086_snapshot s "
+          "WHERE s.record_kind='delegation' AND s.delegation_id=d.id)"
+        ))
+      for statement in (
+        "CREATE INDEX IF NOT EXISTS ix_chat_goals_completion_run_id "
+        "ON chat_goals (completion_run_id)",
+        "CREATE INDEX IF NOT EXISTS ix_delegations_goal_id ON delegations (goal_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_delegations_goal_root_task "
+        "ON delegations (parent_root_run_id, goal_id, task_key) WHERE goal_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_delegations_no_goal_root_task "
+        "ON delegations (parent_root_run_id, task_key) WHERE goal_id IS NULL",
+      ):
+        conn.execute(text(statement))
+      conn.commit()
+    except BaseException:
+      conn.rollback()
+      raise
+    finally:
+      if foreign_keys is not None:
+        conn.exec_driver_sql(f"PRAGMA foreign_keys={int(foreign_keys)}")
+        conn.commit()
+def _add_chat_compaction_drafts(eng) -> None:
+  """Keep explicit recovery progress separate from the live chat and session."""
+  with eng.begin() as conn:
+    conn.exec_driver_sql("""
+      CREATE TABLE IF NOT EXISTS chat_compaction_drafts (
+        id VARCHAR(64) PRIMARY KEY,
+        chat_id VARCHAR(64) NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        state JSON NOT NULL,
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL
+      )
+    """)
+    conn.exec_driver_sql(
+      "CREATE INDEX IF NOT EXISTS ix_chat_compaction_drafts_chat_id "
+      "ON chat_compaction_drafts(chat_id)"
+    )
+
+
+def _add_wait_result_receipts(eng) -> None:
+  """Separate receipt from retirement without inventing old receiving runs."""
+  from sqlalchemy import inspect, text
+
+  inspector = inspect(eng)
+  tables = set(inspector.get_table_names())
+  with eng.begin() as conn:
+    # Minimal historical databases may not have either table yet. Production
+    # create_all owns missing tables; this migration upgrades existing ones.
+    if "chat_runs" in tables:
+      columns = {column["name"] for column in inspector.get_columns("chat_runs")}
+      for name, sql_type in (
+        ("admitted_wait_results_json", "JSON"),
+        ("owner_superseded_by_run_id", "VARCHAR(64)"),
+      ):
+        if name not in columns:
+          conn.execute(text(f"ALTER TABLE chat_runs ADD COLUMN {name} {sql_type}"))
+    if "chat_waits" in tables:
+      columns = {column["name"] for column in inspector.get_columns("chat_waits")}
+      for name, sql_type in (
+        ("result_disposition", "VARCHAR(32)"),
+        ("result_disposed_at", "TIMESTAMP"),
+        ("received_run_id", "VARCHAR(64)"),
+      ):
+        if name not in columns:
+          conn.execute(text(f"ALTER TABLE chat_waits ADD COLUMN {name} {sql_type}"))
+      # A timestamp previously meant either provider success, scheduling, or
+      # Goal retirement. Preserve that uncertainty and suppress historic wakes.
+      conn.execute(text("UPDATE chat_waits SET result_disposition='legacy_consumed', "
+                        "result_disposed_at=resume_delivered_at "
+                        "WHERE result_disposition IS NULL AND resume_delivered_at IS NOT NULL"))
+      conn.execute(text("UPDATE chat_waits SET result_disposition='withdrawn', "
+                        "result_disposed_at=cancelled_at "
+                        "WHERE result_disposition IS NULL AND status='cancelled'"))
+
+
+def _add_goal_dependencies(eng) -> None:
+  """Create native Goal follows without converting legacy interest history.
+
+  AgentWorkInterest has no durable acquisition or receiving-run identity.
+  Even a persisted ``running`` source may be interrupted by startup recovery,
+  so old interests must never become newly owed results during upgrade.
+  """
+  from sqlalchemy import inspect, text
+
+  inspector = inspect(eng)
+  tables = set(inspector.get_table_names())
+  with eng.begin() as conn:
+    if "chat_runs" in tables and "admitted_dependency_results_json" not in {
+      col["name"] for col in inspector.get_columns("chat_runs")
+    }:
+      conn.execute(text("ALTER TABLE chat_runs ADD COLUMN admitted_dependency_results_json JSON"))
+    if "agent_work_claims" in tables:
+      columns = {col["name"] for col in inspector.get_columns("agent_work_claims")}
+      if "acquisition_id" not in columns:
+        conn.execute(text("ALTER TABLE agent_work_claims ADD COLUMN acquisition_id VARCHAR(64)"))
+      for (claim_id,) in conn.execute(text(
+        "SELECT id FROM agent_work_claims WHERE acquisition_id IS NULL"
+      )):
+        conn.execute(text(
+          "UPDATE agent_work_claims SET acquisition_id=:acquisition_id "
+          "WHERE id=:id AND acquisition_id IS NULL"
+        ), {"id": claim_id, "acquisition_id": uuid.uuid4().hex})
+      conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_work_claims_acquisition_id "
+                        "ON agent_work_claims (acquisition_id)"))
+
+    conn.execute(text("""
+      CREATE TABLE IF NOT EXISTS goal_dependencies (
+        id VARCHAR(64) PRIMARY KEY,
+        waiting_goal_id VARCHAR(64) NOT NULL,
+        waiting_chat_id VARCHAR(64) NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        created_by_run_id VARCHAR(64), task_id VARCHAR(64),
+        target_kind VARCHAR(32) NOT NULL, target_key VARCHAR(160) NOT NULL,
+        target_claim_id VARCHAR(64), target_acquisition_id VARCHAR(64),
+        target_chat_id VARCHAR(64), target_question_id VARCHAR(64),
+        outcome_json JSON, resolved_at TIMESTAMP,
+        result_disposition VARCHAR(32), result_disposed_at TIMESTAMP,
+        received_run_id VARCHAR(64), withdrawn_at TIMESTAMP,
+        owner_suppressed_at TIMESTAMP, created_at TIMESTAMP NOT NULL,
+        CONSTRAINT uq_goal_dependency_target UNIQUE (waiting_goal_id, target_key)
+      )
+    """))
+    # create_all may have supplied the table already; repair partially created
+    # draft schemas without changing any existing follow or legacy interest.
+    if "goal_dependencies" in tables and "owner_suppressed_at" not in {
+      col["name"] for col in inspector.get_columns("goal_dependencies")
+    }:
+      conn.execute(text(
+        "ALTER TABLE goal_dependencies ADD COLUMN owner_suppressed_at TIMESTAMP"
+      ))
+    for name, columns in (
+      ("ix_goal_dependencies_waiting_goal_id", "waiting_goal_id"),
+      ("ix_goal_dependencies_waiting_chat_id", "waiting_chat_id"),
+      ("ix_goal_dependencies_target_claim_id", "target_claim_id"),
+      ("ix_goal_dependencies_owed", "waiting_goal_id, resolved_at, result_disposition"),
+      ("ix_goal_dependencies_source", "target_kind, target_acquisition_id, resolved_at"),
+    ):
+      conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON goal_dependencies ({columns})"))
+
+
+def _add_saved_decision_cards(eng) -> None:
+  """Schema only: no ambiguous old cancellation or historical wakes invented."""
+  from sqlalchemy import text
+  with eng.begin() as conn:
+    conn.execute(text("""
+      CREATE TABLE IF NOT EXISTS saved_decision_cards (
+        chat_id VARCHAR(64) NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        question_id VARCHAR(64) NOT NULL,
+        source_goal_id VARCHAR(64), family VARCHAR(16) NOT NULL,
+        summary TEXT NOT NULL, outcome_json JSON, resolved_at TIMESTAMP,
+        PRIMARY KEY (chat_id, question_id)
+      )
+    """))
+
+
+def _add_transfer_notice_revision(eng) -> None:
+  """Transfer identity must survive later completion/release revisions."""
+  from sqlalchemy import inspect, text
+  inspector = inspect(eng)
+  if "agent_work_claims" not in inspector.get_table_names():
+    return
+  has_revision = "transfer_notice_revision" in {
+    column["name"] for column in inspector.get_columns("agent_work_claims")
+  }
+  with eng.begin() as conn:
+    if not has_revision:
+      conn.execute(text("ALTER TABLE agent_work_claims ADD COLUMN transfer_notice_revision INTEGER"))
+    # SQLite may retain the column after an interrupted backfill. Retry from
+    # data state, preserving event identities already captured by this migration
+    # or runtime transfers even when the claim revision has since advanced.
+    # An open pending transfer has a known event revision. Do not guess one
+    # from older settled rows whose later revisions erased that distinction.
+    conn.execute(text(
+      "UPDATE agent_work_claims SET transfer_notice_revision=revision "
+      "WHERE transfer_notice_revision IS NULL AND previous_owner_chat_id IS NOT NULL "
+      "AND completed_at IS NULL AND released_at IS NULL "
+      "AND notification_revision < revision"
+    ))
+
+
+def _index_pending_goal_dependencies(eng) -> None:
+  """Seek live claim sources and owed results without scanning follow history."""
+  from sqlalchemy import text
+  with eng.begin() as conn:
+    conn.execute(text(
+      "CREATE INDEX IF NOT EXISTS ix_goal_dependencies_pending_claims "
+      "ON goal_dependencies (id) WHERE target_kind='claim_acquisition' "
+      "AND resolved_at IS NULL AND result_disposition IS NULL "
+      "AND withdrawn_at IS NULL AND owner_suppressed_at IS NULL"
+    ))
+    conn.execute(text(
+      "CREATE INDEX IF NOT EXISTS ix_goal_dependencies_pending_delivery "
+      "ON goal_dependencies (waiting_chat_id, id) WHERE resolved_at IS NOT NULL "
+      "AND result_disposition IS NULL AND withdrawn_at IS NULL "
+      "AND owner_suppressed_at IS NULL"
+    ))
+
+
+def _retire_legacy_claim_notice_carriers(eng) -> None:
+  """One-time retirement of proven terminal claim wakes, not peer receipts.
+
+  A transfer can share the claim-notice kind, so only the current terminal
+  revision is authoritative. Repeated execution is safe if ledger recording
+  was interrupted after this transaction committed.
+  """
+  from sqlalchemy import JSON, bindparam, inspect, text
+
+  # Partial historical schemas without these sources cannot hold old carriers.
+  if not {"agent_work_claims", "agent_coordination_messages", "chats"} <= set(
+      inspect(eng).get_table_names()):
+    return
+
+  with eng.begin() as conn:
+    terminal = conn.execute(text(
+      "SELECT n.id, n.to_chat_id, n.send_id, n.delivery, c.revision "
+      "FROM agent_coordination_messages n JOIN agent_work_claims c "
+      "ON n.from_run_id = ('work-claim:' || c.id) "
+      "WHERE c.completed_at IS NOT NULL OR c.released_at IS NOT NULL"
+    )).mappings().all()
+    terminal_ids = set()
+    chat_ids = set()
+    for notice in terminal:
+      if notice["send_id"] != f"revision:{notice['revision']}":
+        continue
+      terminal_ids.add(notice["id"])
+      if notice["to_chat_id"]:
+        chat_ids.add(notice["to_chat_id"])
+      if notice["delivery"] == "interrupt":
+        conn.execute(text(
+          "UPDATE agent_coordination_messages SET delivery='next_turn' "
+          "WHERE id=:id AND delivery='interrupt'"
+        ), {"id": notice["id"]})
+
+    # The saved note stays readable on the next authorized turn. Only its
+    # stale wake reservation is removed; peer cursors are never advanced.
+    update_pending = text(
+      "UPDATE chats SET pending_messages=:pending WHERE id=:chat_id"
+    ).bindparams(bindparam("pending", type_=JSON))
+    for chat_id in chat_ids:
+      pending = conn.execute(text(
+        "SELECT pending_messages FROM chats WHERE id=:chat_id"
+      ), {"chat_id": chat_id}).scalar_one_or_none()
+      if isinstance(pending, str):
+        pending = json.loads(pending)
+      if not isinstance(pending, list) or not pending:
+        continue
+      saved = {row["id"]: row for row in conn.execute(text(
+        "SELECT id, to_chat_id, delivery FROM agent_coordination_messages "
+        "WHERE to_chat_id=:chat_id"
+      ), {"chat_id": chat_id}).mappings()}
+
+      def obsolete(message):
+        if not isinstance(message, dict) or not (
+          message.get("kind") == "peer_message" and message.get("hidden") is True
+          and isinstance(message.get("peer_message_through"), dict)
+        ):
+          return False
+        content = message.get("content")
+        if not isinstance(content, str):
+          return False
+        _, marker, tail = content.partition("<agent_coordination>")
+        if not marker:
+          return False
+        encoded, close, _ = tail.partition("</agent_coordination>")
+        if not close:
+          return False
+        try:
+          data = json.loads(encoded)
+          entries = data["messages"]
+        except (ValueError, TypeError, KeyError):
+          return False
+        if not isinstance(entries, list) or not entries or data.get("self_chat_id") != chat_id:
+          return False
+        ids = [item.get("id") for item in entries if isinstance(item, dict)]
+        if len(ids) != len(entries) or any(not isinstance(value, str) for value in ids):
+          return False
+        if ids[-1] != message["peer_message_through"].get("id"):
+          return False
+        retired = False
+        for identity in ids:
+          note = saved.get(identity)
+          if note is None or note["to_chat_id"] != chat_id:
+            return False
+          if identity in terminal_ids:
+            retired = True
+          elif note["delivery"] == "interrupt":
+            return False
+        return retired
+
+      kept = [message for message in pending if not obsolete(message)]
+      if len(kept) != len(pending):
+        conn.execute(update_pending, {"chat_id": chat_id, "pending": kept})
+
+
+def _enforce_unique_live_claim_follows(eng) -> None:
+  """A Goal may have one live subscription to each claim acquisition."""
+  from sqlalchemy import inspect, text
+
+  if "goal_dependencies" not in inspect(eng).get_table_names():
+    return
+  live = ("target_kind = 'claim_acquisition' "
+          "AND result_disposition IS NULL AND withdrawn_at IS NULL")
+  with eng.begin() as conn:
+    # Before this index only the owner fence prevented a second live follow
+    # of one acquisition, so an owner database may already hold duplicates.
+    # Keep one per Goal (an owed result first, then the newest) and withdraw
+    # the rest exactly as Stop following would; never fail the upgrade.
+    groups = conn.execute(text(
+      "SELECT waiting_goal_id, target_acquisition_id FROM goal_dependencies "
+      f"WHERE {live} GROUP BY waiting_goal_id, target_acquisition_id "
+      "HAVING count(*) > 1"
+    )).all()
+    for goal_id, acquisition_id in groups:
+      rows = conn.execute(text(
+        "SELECT id FROM goal_dependencies "
+        f"WHERE {live} AND waiting_goal_id = :goal AND target_acquisition_id = :acq "
+        "ORDER BY CASE WHEN resolved_at IS NULL THEN 1 ELSE 0 END, created_at DESC, id DESC"
+      ), {"goal": goal_id, "acq": acquisition_id}).scalars().all()
+      for row_id in rows[1:]:
+        conn.execute(text(
+          "UPDATE goal_dependencies SET withdrawn_at = CURRENT_TIMESTAMP, "
+          "result_disposition = 'withdrawn' WHERE id = :id"
+        ), {"id": row_id})
+    conn.execute(text(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_goal_dependencies_live_claim_acquisition "
+      "ON goal_dependencies (waiting_goal_id, target_acquisition_id) "
+      "WHERE target_kind = 'claim_acquisition' "
+      "AND result_disposition IS NULL AND withdrawn_at IS NULL"
+    ))
 
 
 _SCHEMA_MIGRATIONS = (
@@ -6434,6 +6998,18 @@ _SCHEMA_MIGRATIONS = (
   ("0083_swap_chat_note_sections", _swap_chat_note_sections),
   ("0086_drop_chat_note_backup", _drop_chat_note_backup),
   ("0087_transcript_rows", _add_transcript_rows),
+  ("0088_chat_compaction_drafts", _add_chat_compaction_drafts),
+  # Released to instances under this id; kept unique and appended after
+  # main's ledger so it runs once wherever it has not run.
+  ("0086_goal_execution_identity", _goal_execution_identity),
+  ("0089_wait_result_receipts", _add_wait_result_receipts),
+  ("0090_goal_dependencies", _add_goal_dependencies),
+  ("0091_saved_decision_cards", _add_saved_decision_cards),
+  ("0092_transfer_notice_revision", _add_transfer_notice_revision),
+  ("0093_pending_goal_dependency_indexes", _index_pending_goal_dependencies),
+  ("0094_retire_legacy_claim_notice_carriers", _retire_legacy_claim_notice_carriers),
+  ("0095_unique_live_claim_follows", _enforce_unique_live_claim_follows),
+  ("0096_app_accepted_consent", _add_app_accepted_consent),
 )
 
 

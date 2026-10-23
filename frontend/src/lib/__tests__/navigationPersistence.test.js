@@ -48,6 +48,17 @@ test('deep links preserve slug, numeric identity, and intent', () => {
   }), { view: 'chat', chatId: 'chat-1', intent: null, focusQuestion: true })
 })
 
+test('a /shell/?settings deep link opens Settings at a known section only', () => {
+  assert.deepEqual(parseShellDeepLink({ pathname: '/shell/', search: '?settings=github' }),
+    { view: 'settings', section: 'github' })
+  assert.deepEqual(parseShellDeepLink({ pathname: '/shell/', search: '?settings' }),
+    { view: 'settings' })
+  assert.deepEqual(parseShellDeepLink({ pathname: '/shell/', search: '?settings=evil' }),
+    { view: 'settings' })
+  assert.equal(parseShellDeepLink({ pathname: '/shell/', search: '?chat=c&settings=github' }).view,
+    'chat')
+})
+
 test('legacy path deep links translate /app, /chat, and /settings', () => {
   // The backend serves the shell for these bare paths (agent-screenshot.sh
   // documents /app/<id>; the AI-provider OAuth callback redirects to /settings),
@@ -133,4 +144,9 @@ test('active navigation mirrors cold state without retaining a stale app', () =>
     activeView: 'chat', activeChatId: 'chat-2', activeAppId: null,
   })
   assert.equal(store.values.has('moebius_active_app'), false)
+})
+
+test('decision link retains the exact question identity, not just current input focus', () => {
+  assert.deepEqual(parseShellDeepLink({ pathname: '/shell/', search: '?chat=source&focus=question&question=saved-card' }),
+    { view: 'chat', chatId: 'source', intent: null, focusQuestion: true, questionId: 'saved-card' })
 })

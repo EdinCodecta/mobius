@@ -33,6 +33,7 @@ import {
   enrichMessageSource,
 } from './messageSources.js'
 import { toolBlockFailed } from './toolResultFormat.js'
+import { VIEWED_SNAPSHOT_NAME } from './toolImageResult.js'
 
 // Tool names whose tool events describe an AskUserQuestion-style
 // call: Claude's AskUserQuestion and Codex's request_user_input.
@@ -578,6 +579,11 @@ export function attachToolOutput(prev, content, event = null) {
   if (typeof event?.owner_card_question_id === 'string') {
     block.owner_card_question_id = event.owner_card_question_id
   }
+  // A screenshot step names the chat-media picture it saved, so opening it
+  // live never downloads the full stored result.
+  if (typeof event?.saved_image === 'string') {
+    block.saved_image = event.saved_image
+  }
   if (event?.output_exit_code != null) {
     block.output_exit_code = event.output_exit_code
   }
@@ -591,8 +597,10 @@ export function attachToolOutput(prev, content, event = null) {
 
 /**
  * Applies a `generated_file` event to one provider-neutral turn block.
- * Deliverables render after the answer, so coupling them to a guessed tool
- * identity adds failure modes without changing the visible result.
+ * Deliverables render after the answer and are never tied to a guessed tool.
+ * A native picture is the exception the server states outright: it carries
+ * the step that produced it and its decoded size (events.py keeps the same
+ * fields), so it shows beside that step in a frame sized before it loads.
  */
 export function attachGeneratedFile(prev, event) {
   const name = event?.name
@@ -604,6 +612,13 @@ export function attachGeneratedFile(prev, event) {
     previewable: event.previewable === true,
   }
   if (typeof event.sha256 === 'string') entry.sha256 = event.sha256
+  if (typeof event.source_tool_use_id === 'string' && event.source_tool_use_id) {
+    entry.source_tool_use_id = event.source_tool_use_id
+  }
+  if ([event.width, event.height].every(side => Number.isInteger(side) && side > 0)) {
+    entry.width = event.width
+    entry.height = event.height
+  }
   const i = prev.findLastIndex(it => it.type === 'generated_files')
   if (i < 0) return [...prev, { type: 'generated_files', files: [entry] }]
   const block = prev[i]
@@ -611,6 +626,26 @@ export function attachGeneratedFile(prev, event) {
   if (existing.some(f => f.name === name)) return prev  // idempotent
   const updated = [...prev]
   updated[i] = { ...block, files: [...existing, entry] }
+  return updated
+}
+
+/**
+ * Applies a `viewed_image` event: the chat snapshot of exactly the image a
+ * finished ViewImage sent to the model. Codex records that image only after
+ * the view completes, so the runner binds it when the turn ends. Exact id
+ * only, so a snapshot can never land on a different view; idempotent under
+ * catch-up replay.
+ */
+export function attachViewedImage(prev, event) {
+  const name = event?.viewed_image_media
+  const toolUseId = event?.tool_use_id
+  if (!toolUseId || typeof name !== 'string' || !VIEWED_SNAPSHOT_NAME.test(name)) return prev
+  const i = prev.findLastIndex(
+    it => it.type === 'tool' && it.tool === 'ViewImage' && it.tool_use_id === toolUseId,
+  )
+  if (i < 0 || prev[i].viewed_image_media === name) return prev
+  const updated = [...prev]
+  updated[i] = { ...prev[i], viewed_image_media: name }
   return updated
 }
 
