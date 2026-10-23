@@ -911,6 +911,73 @@ def test_status_connected_never_echoes_token(client, auth):
   assert secret not in json.dumps(body)
 
 
+def test_status_advertises_the_server_owned_publication_approval_fields(
+  client, auth, owner_token,
+):
+  """Status names exactly the fields the publication digest binds."""
+  expected = list(github_contributions.PUBLICATION_APPROVAL_FIELDS)
+  assert expected == [
+    key for key in github_contributions._PERSONAL_PUBLIC_INPUT_FIELDS
+    if key not in ("status", "submitter")
+  ]
+  app_id, app_token = _app_token(client, owner_token, github_connect=True)
+  for headers in (auth, {"Authorization": f"Bearer {app_token}"}):
+    for connected in (False, True):
+      if connected:
+        _write_token(login="octocat")
+      response = client.get("/api/github/status", headers=headers)
+      assert response.status_code == 200, response.text
+      assert response.json()["frozen_publication_binding"] == {
+        "record_fields": expected,
+      }
+
+
+def test_publication_approval_digest_binds_exactly_the_advertised_fields():
+  record = {
+    "id": "digest", "type": "pr", "status": "prepared", "repo": "o/r",
+    "branch": "fix/x", "title": "T", "url": None, "number": None,
+    "head_repository": None, "publication_stage": None,
+    "submission_mode": None, "submitter": None,
+    "plan": {
+      "action": "pr", "repo": "o/r", "branch": "fix/x", "base_sha": "b" * 40,
+      "head_sha": "a" * 40, "diff_sha256": "d" * 64, "title": "T",
+      "body_draft": "Body", "labels": ["bug"],
+      "stack": {"id": "s", "parent_record_id": "p", "base_branch": "main"},
+    },
+    "quality_review": _all_clear_review("a" * 40),
+    "updated_at": "2026-10-01T00:00:00Z",
+    "chat_ids": ["c"],
+  }
+  digest = github_contributions.publication_approval_sha256
+  fields = github_contributions.PUBLICATION_APPROVAL_FIELDS
+  baseline = digest(record)
+  # A client that keeps only the advertised fields produces the same binding.
+  assert digest({key: record[key] for key in fields}) == baseline
+  # Lifecycle and transient fields never change the approved proposal.
+  for key, value in (
+    ("status", "submitting"), ("submitter", "contribute-button"),
+    ("updated_at", "2026-10-02T00:00:00Z"), ("chat_ids", []),
+    ("last_submit_error", "settled"), ("submit_started_at", "now"),
+  ):
+    assert digest({**record, key: value}) == baseline, key
+  # Every advertised field, and each nested publication input, is bound.
+  for key in fields:
+    assert digest({**record, key: "changed"}) != baseline, key
+  for key, value in (
+    ("head_sha", "e" * 40), ("diff_sha256", "f" * 64), ("base_sha", "9" * 40),
+    ("body_draft", "Other"), ("labels", []), ("repo", "o/other"),
+    ("stack", {"id": "s", "parent_record_id": "q", "base_branch": "main"}),
+  ):
+    changed = {**record, "plan": {**record["plan"], key: value}}
+    assert digest(changed) != baseline, key
+  assert digest({
+    **record, "quality_review": {**record["quality_review"], "state": "blocked"},
+  }) != baseline
+  # Missing or malformed confirmations never match a real proposal.
+  assert digest(None) != baseline
+  assert digest({}) != baseline
+
+
 def test_source_status_is_fetch_free_and_available_to_owner(client, auth):
   r = client.get("/api/github/source-status", headers=auth)
   assert r.status_code == 200, r.text
@@ -5586,6 +5653,38 @@ def test_review_status_releases_db_before_git_inspection(
   assert observed == [baseline]
 
 
+def test_review_status_reads_the_ledger_window_off_the_event_loop(
+  client, owner_token, monkeypatch,
+):
+  """A large ledger scan must not block unrelated requests on the loop."""
+  import asyncio
+  _write_token(login="octocat", user_id=42)
+  app_id, app_token = _app_token(
+    client, owner_token, github_access=True,
+  )
+  _prepared_real_review(app_id, "review-thread")
+  threads = []
+  original = github_routes._recent_contribution_record_paths
+
+  def paths(contribution_dir, **kwargs):
+    try:
+      asyncio.get_running_loop()
+      threads.append(True)
+    except RuntimeError:
+      threads.append(False)
+    return original(contribution_dir, **kwargs)
+
+  monkeypatch.setattr(github_routes, "_recent_contribution_record_paths", paths)
+  response = client.get(
+    f"/api/github/contributions/{app_id}/review-status",
+    headers={"Authorization": f"Bearer {app_token}"},
+  )
+
+  assert response.status_code == 200, response.text
+  assert threads == [False]
+  assert "review-thread" in response.text
+
+
 def test_repository_head_query_batches_distinct_targets_with_variables():
   query, variables, aliases = github_routes._build_repository_heads_query([
     "mobius-os/mobius",
@@ -5935,6 +6034,209 @@ def test_review_status_accepts_reviewed_updates_for_an_existing_pr_stack(
   # PR updates remain available only through the dedicated Update PR route.
   with pytest.raises(ContributionSubmitError):
     github_routes._validate_stack_records([parent, child])
+
+
+def test_addressed_review_status_ignores_unrelated_git_and_preserves_publication(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat", user_id=42)
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  _repo, target, _diff = _prepared_real_review(app_id, "addressed-target")
+  _prepared_real_review(app_id, "unrelated-heavy")
+  contribution_dir = github_routes._contributions_dir(app_id)
+  before = {path.name: path.read_bytes() for path in contribution_dir.iterdir()}
+  seen = []
+  original = github_routes._inspect_prepared_review_locked
+  original_read = github_routes._read_record_tolerant
+
+  def read(path):
+    assert path.stem != "unrelated-heavy"
+    return original_read(path)
+
+  async def inspect(record, diff_path, state):
+    seen.append(record["id"])
+    return await original(record, diff_path, state)
+
+  async def heads(_token, _query, _variables):
+    return {"repo0": {"defaultBranchRef": {
+      "name": "main", "target": {"oid": target["plan"]["base_sha"]},
+    }}}
+
+  monkeypatch.setattr(github_routes, "_inspect_prepared_review_locked", inspect)
+  monkeypatch.setattr(github_routes, "_read_record_tolerant", read)
+  monkeypatch.setattr(github_routes, "_github_graphql_json", heads)
+  response = client.get(
+    f"/api/github/contributions/{app_id}/review-status",
+    params={"record_id": "addressed-target"},
+    headers={"Authorization": f"Bearer {app_token}"},
+  )
+  assert response.status_code == 200, response.text
+  assert seen == ["addressed-target"]
+  assert [row["id"] for row in response.json()["records"]] == seen
+  assert response.json()["records"][0]["publication"]["state"] == "ready"
+  assert before == {path.name: path.read_bytes() for path in contribution_dir.iterdir()}
+
+
+def test_addressed_review_status_checks_complete_stack_not_partial(
+  client, owner_token, monkeypatch,
+):
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  stack_id = "addressed-stack"
+  root_id, child_id = "addressed-root", "addressed-child"
+  root_branch = f"stack/{stack_id}/01-root"
+  child_branch = f"stack/{stack_id}/02-child"
+  root = {
+    "id": root_id, "type": "pr", "status": "prepared",
+    "repo": "mobius-os/mobius", "branch": root_branch,
+    "plan": {"action": "pr", "repo": "mobius-os/mobius",
+      "repo_path": "/unused", "branch": root_branch,
+      "base_sha": "a" * 40, "head_sha": "b" * 40,
+      "stack": {"id": stack_id, "position": 1, "total": 2,
+        "parent_record_id": "", "base_branch": "main"}},
+  }
+  child = {
+    "id": child_id, "type": "pr", "status": "prepared",
+    "repo": "mobius-os/mobius", "branch": child_branch,
+    "plan": {"action": "pr", "repo": "mobius-os/mobius",
+      "repo_path": "/unused", "branch": child_branch,
+      "base_sha": "b" * 40, "head_sha": "c" * 40,
+      "stack": {"id": stack_id, "position": 2, "total": 2,
+        "parent_record_id": root_id, "base_branch": root_branch}},
+  }
+  _write_contribution(app_id, root_id, root)
+  _write_contribution(app_id, child_id, child)
+  seen = []
+
+  async def inspect(record, *_args):
+    seen.append(record["id"])
+    return {"id": record["id"], "state": "ready", "code": "ready"}
+
+  monkeypatch.setattr(github_routes, "_inspect_prepared_review_locked", inspect)
+  url = f"/api/github/contributions/{app_id}/review-status"
+  headers = {"Authorization": f"Bearer {app_token}"}
+  response = client.get(url, params={"record_id": child_id}, headers=headers)
+  assert response.status_code == 200, response.text
+  assert response.json()["ready"] == 1
+  assert seen == [child_id]
+  # A linked but drifted parent invalidates the addressed child, even though
+  # the parent was not requested and must not undergo expensive git checks.
+  root["plan"]["head_sha"] = "d" * 40
+  _write_contribution(app_id, root_id, root)
+  response = client.get(url, params={"record_id": child_id}, headers=headers)
+  assert response.json()["records"][0]["code"] == "invalid_stack"
+  assert seen == [child_id]
+  (github_routes._contributions_dir(app_id) / f"{root_id}.json").unlink()
+  response = client.get(url, params={"record_id": child_id}, headers=headers)
+  assert response.json()["records"][0]["code"] == "invalid_stack"
+  assert seen == [child_id]
+
+
+def test_addressed_stack_status_parses_only_rows_naming_the_stack(
+  client, owner_token, monkeypatch,
+):
+  """The stack scan under the storage lock skips unrelated rows unparsed."""
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  stack_id = "scan-stack"
+
+  def layer(record_id, position, parent, head):
+    branch = f"stack/{stack_id}/0{position}-{record_id}"
+    return {
+      "id": record_id, "type": "pr", "status": "prepared",
+      "repo": "mobius-os/mobius", "branch": branch,
+      "plan": {"action": "pr", "repo": "mobius-os/mobius",
+        "repo_path": "/unused", "branch": branch,
+        "base_sha": parent[1], "head_sha": head,
+        "stack": {"id": stack_id, "position": position, "total": 2,
+          "parent_record_id": parent[0],
+          "base_branch": parent[2]}},
+    }
+
+  root = layer("scan-root", 1, ("", "a" * 40, "main"), "b" * 40)
+  child = layer("scan-child", 2, ("scan-root", "b" * 40, root["branch"]), "c" * 40)
+  _write_contribution(app_id, "scan-root", root)
+  _write_contribution(app_id, "scan-child", child)
+  for index in range(5):
+    _write_contribution(app_id, f"unrelated-{index}", {
+      "id": f"unrelated-{index}", "type": "pr", "status": "draft",
+      "plan": {"stack": {"id": "other-stack"}},
+    })
+  parsed = []
+  original = github_routes._record_from_bytes
+
+  def record_from_bytes(raw):
+    record = original(raw)
+    parsed.append((record or {}).get("id"))
+    return record
+
+  async def inspect(record, *_args):
+    return {"id": record["id"], "state": "ready", "code": "ready"}
+
+  monkeypatch.setattr(github_routes, "_record_from_bytes", record_from_bytes)
+  monkeypatch.setattr(github_routes, "_inspect_prepared_review_locked", inspect)
+  response = client.get(
+    f"/api/github/contributions/{app_id}/review-status",
+    params={"record_id": "scan-child"},
+    headers={"Authorization": f"Bearer {app_token}"},
+  )
+  assert response.status_code == 200, response.text
+  assert response.json()["ready"] == 1
+  assert parsed == ["scan-root"]
+
+
+def test_addressed_review_status_reads_a_record_outside_the_recent_window(
+  client, owner_token, monkeypatch,
+):
+  """An old addressed card is checked even when the recent window omits it."""
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_id = "addressed-old"
+  _write_contribution(app_id, record_id, {
+    "id": record_id, "type": "pr", "status": "prepared",
+    "repo": "mobius-os/mobius", "branch": "fix/old",
+    "plan": {"action": "pr", "repo": "mobius-os/mobius",
+      "repo_path": "/unused", "branch": "fix/old",
+      "base_sha": "a" * 40, "head_sha": "b" * 40},
+  })
+  seen = []
+
+  async def inspect(record, *_args):
+    seen.append(record["id"])
+    return {"id": record["id"], "state": "ready", "code": "ready"}
+
+  monkeypatch.setattr(github_routes, "_inspect_prepared_review_locked", inspect)
+  # The global snapshot reads only the newest rows; this one fell out of it.
+  monkeypatch.setattr(
+    github_routes, "_recent_contribution_record_paths",
+    lambda *_args, **_kwargs: [],
+  )
+  url = f"/api/github/contributions/{app_id}/review-status"
+  headers = {"Authorization": f"Bearer {app_token}"}
+
+  window = client.get(url, headers=headers)
+  assert window.status_code == 200, window.text
+  assert window.json()["records"] == []
+  assert "addressed_record_ids" not in window.json()
+
+  addressed = client.get(
+    url, params=[("record_id", record_id), ("record_id", record_id)],
+    headers=headers,
+  )
+  assert addressed.status_code == 200, addressed.text
+  assert addressed.json()["addressed_record_ids"] == [record_id]
+  assert [row["id"] for row in addressed.json()["records"]] == [record_id]
+  assert seen == [record_id]
+
+
+def test_addressed_review_status_keeps_app_authorization(
+  client, owner_token,
+):
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  other_id, _other_token = _app_token(client, owner_token, github_access=True)
+  response = client.get(
+    f"/api/github/contributions/{other_id}/review-status",
+    params={"record_id": "any-record"},
+    headers={"Authorization": f"Bearer {app_token}"},
+  )
+  assert response.status_code in (401, 403)
 
 
 def test_review_status_filters_hidden_journals_before_record_cap(
@@ -15096,3 +15398,683 @@ def test_publication_handoff_requires_the_canonical_manifest_spelling(
   assert identity.repo_slug == "mobius-os/app-notes"
   assert identity.manifest_id == "notes"
   assert identity.target_app_id == 7
+
+
+# --- frozen publication approval -----------------------------------------
+
+
+def _frozen(record: dict) -> dict:
+  return json.loads(json.dumps(record))
+
+
+def _record_file(app_id: int, record_id: str) -> Path:
+  return github_routes._record_paths(app_id, record_id)[0]
+
+
+def _record_bytes(app_id: int, record_ids: list[str]) -> list[bytes]:
+  return [_record_file(app_id, record_id).read_bytes() for record_id in record_ids]
+
+
+def _rewrite_record(app_id: int, record_id: str, change) -> dict:
+  path = _record_file(app_id, record_id)
+  record = json.loads(path.read_text())
+  change(record)
+  atomic_write(path, json.dumps(record))
+  return record
+
+
+def _attempt_paths_exist(app_id: int, record_ids: list[str]) -> list[bool]:
+  return [
+    github_routes.contribution_runtime.personal_attempt_path(
+      app_id, record_id,
+    ).exists()
+    for record_id in record_ids
+  ]
+
+
+def _forbid_publication_work(monkeypatch) -> list[str]:
+  """Record any step past the claim; an approval refusal must reach none."""
+  calls: list[str] = []
+  for name in (
+    "_submit_prepared_pr", "_preflight_prepared_stack",
+    "_autopilot_live_target", "_assert_personal_publication_source",
+  ):
+    monkeypatch.setattr(
+      github_routes, name,
+      lambda *_args, _name=name, **_kwargs: calls.append(_name),
+    )
+  return calls
+
+
+def _assert_approval_changed(response, *, changed: list[str], not_attempted: bool):
+  assert response.status_code == 409, response.text
+  detail = response.json()["detail"]
+  assert detail["code"] == "approval_changed"
+  assert detail["changed_record_ids"] == changed
+  assert detail["not_attempted"] is not_attempted
+  return detail
+
+
+def _prepared_standalone_pr(app_id: int, record_id: str) -> dict:
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
+  (repo / ".git").mkdir(parents=True, exist_ok=True)
+  head = "a" * 40
+  diff_text = f"diff --git a/{record_id} b/{record_id}\n+reviewed\n"
+  record = {
+    "id": record_id,
+    "type": "pr",
+    "repo": "mobius-os/app-demo",
+    "status": "prepared",
+    "title": "Polish demo",
+    "branch": "fix/demo-polish",
+    "updated_at": "2026-10-01T00:00:00Z",
+    "plan": {
+      "action": "pr",
+      "repo": "mobius-os/app-demo",
+      "repo_path": str(repo),
+      "title": "Polish demo",
+      "body_draft": "Reviewed body.",
+      "branch": "fix/demo-polish",
+      "base_sha": "b" * 40,
+      "head_sha": head,
+      "diff_sha256": hashlib.sha256(diff_text.encode()).hexdigest(),
+    },
+    "quality_review": _all_clear_review(head),
+  }
+  _write_contribution(app_id, record_id, record, diff_text)
+  return record
+
+
+def test_submit_refuses_a_restaged_head_and_diff_before_any_write(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_id = "frozen-restaged"
+  confirmed = _frozen(_prepared_standalone_pr(app_id, record_id))
+  # A server-valid all-clear proposal, but not the one the owner confirmed.
+  restaged_head = "e" * 40
+
+  def restage(record):
+    record["plan"]["head_sha"] = restaged_head
+    record["plan"]["diff_sha256"] = "f" * 64
+    record["quality_review"] = _all_clear_review(restaged_head)
+
+  _rewrite_record(app_id, record_id, restage)
+  before = _record_bytes(app_id, [record_id])
+  calls = _forbid_publication_work(monkeypatch)
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record_id}/submit",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"publication_stage": "ready", "expected_record": confirmed},
+  )
+
+  detail = _assert_approval_changed(
+    response, changed=[record_id], not_attempted=True,
+  )
+  assert detail["record"]["plan"]["head_sha"] == restaged_head
+  assert calls == []
+  assert _record_bytes(app_id, [record_id]) == before
+  assert _attempt_paths_exist(app_id, [record_id]) == [False]
+
+
+def test_submit_refuses_a_restage_that_won_the_storage_lock_first(
+  client, owner_token, monkeypatch,
+):
+  """The confirmation is compared after the lock wait, not before it."""
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_id = "frozen-restaged-during-wait"
+  confirmed = _frozen(_prepared_standalone_pr(app_id, record_id))
+  real_lock = github_routes.fs_locks.app_storage_lock
+  restaged_head = "e" * 40
+
+  def restage(record):
+    record["plan"]["head_sha"] = restaged_head
+    record["plan"]["diff_sha256"] = "f" * 64
+    record["quality_review"] = _all_clear_review(restaged_head)
+
+  @asynccontextmanager
+  async def restage_then_lock(locked_app_id):
+    # Another writer held the lock while this request waited and restaged
+    # the record; this request acquires the lock only afterwards.
+    _rewrite_record(app_id, record_id, restage)
+    async with real_lock(locked_app_id):
+      yield
+
+  monkeypatch.setattr(
+    github_routes.fs_locks, "app_storage_lock", restage_then_lock,
+  )
+  calls = _forbid_publication_work(monkeypatch)
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record_id}/submit",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"publication_stage": "ready", "expected_record": confirmed},
+  )
+
+  detail = _assert_approval_changed(
+    response, changed=[record_id], not_attempted=True,
+  )
+  assert detail["record"]["plan"]["head_sha"] == restaged_head
+  assert calls == []
+  assert _attempt_paths_exist(app_id, [record_id]) == [False]
+
+
+@pytest.mark.parametrize("change", [
+  "title", "body", "labels", "base", "target", "head_repository", "review",
+])
+def test_update_existing_refuses_unchanged_head_with_changed_proposal(
+  client, owner_token, monkeypatch, change,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_id = f"frozen-update-{change}"
+  confirmed = _frozen(_prepared_existing_pr_update(app_id, record_id))
+
+  def mutate(record):
+    plan = record["plan"]
+    if change == "title":
+      plan["title"] = "A different public title"
+    elif change == "body":
+      plan["body_draft"] += "\n\nAn unconfirmed paragraph."
+    elif change == "labels":
+      plan["labels"] = ["unconfirmed"]
+    elif change == "base":
+      plan["base_sha"] = "9" * 40
+    elif change == "target":
+      record["number"] = 59
+      record["url"] = "https://github.com/mobius-os/app-demo/pull/59"
+    elif change == "head_repository":
+      record["head_repository"] = "someone-else/app-demo"
+    else:
+      record["quality_review"]["notes"] = "A later review the owner never saw."
+
+  _rewrite_record(app_id, record_id, mutate)
+  before = _record_bytes(app_id, [record_id])
+  calls = _forbid_publication_work(monkeypatch)
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record_id}/update-existing",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"expected_record": confirmed},
+  )
+
+  _assert_approval_changed(response, changed=[record_id], not_attempted=True)
+  assert calls == []
+  assert _record_bytes(app_id, [record_id]) == before
+  assert _attempt_paths_exist(app_id, [record_id]) == [False]
+
+
+def test_submit_publishes_the_confirmed_proposal_despite_transient_ledger_fields(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_id = "frozen-transient"
+  confirmed = _frozen(_prepared_standalone_pr(app_id, record_id))
+
+  def unrelated_writes(record):
+    record["updated_at"] = "2026-10-02T00:00:00Z"
+    record["chat_ids"] = ["source-chat"]
+    record["last_submit_error"] = "An earlier settled refusal."
+
+  _rewrite_record(app_id, record_id, unrelated_writes)
+  monkeypatch.setattr(
+    github_routes, "_assert_personal_publication_source", lambda *_args: "exact",
+  )
+  monkeypatch.setattr(github_routes, "_equivalence_source_repo", lambda _r: None)
+  monkeypatch.setattr(
+    github_routes, "_record_pending_equivalence_locked",
+    lambda *_args, **_kwargs: None,
+  )
+  sent = []
+
+  def submit(record, _diff, **kwargs):
+    sent.append((record["plan"]["head_sha"], kwargs["publication_stage"]))
+    return (
+      "https://github.com/mobius-os/app-demo/pull/12", 12,
+      {"publication_stage": kwargs["publication_stage"]},
+    )
+
+  monkeypatch.setattr(github_routes, "_submit_prepared_pr", submit)
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record_id}/submit",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"publication_stage": "ready", "expected_record": confirmed},
+  )
+
+  assert response.status_code == 200, response.text
+  assert sent == [("a" * 40, "ready")]
+  assert response.json()["record"]["status"] == "open"
+
+
+def test_submit_rejects_a_confirmation_for_another_record(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_id = "frozen-wrong-id"
+  confirmed = _frozen(_prepared_standalone_pr(app_id, record_id))
+  confirmed["id"] = "another-record"
+  before = _record_bytes(app_id, [record_id])
+  calls = _forbid_publication_work(monkeypatch)
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record_id}/submit",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"expected_record": confirmed},
+  )
+
+  assert response.status_code == 400, response.text
+  assert calls == []
+  assert _record_bytes(app_id, [record_id]) == before
+
+
+def _prepared_new_stack(app_id: int, stack_id: str) -> tuple[list[str], list[dict]]:
+  record_ids = [f"{stack_id}-01", f"{stack_id}-02"]
+  parent_head = "a" * 40
+  specs = [
+    (record_ids[0], 1, "main", "", "b" * 40, parent_head, "01-parent"),
+    (
+      record_ids[1], 2, f"stack/{stack_id}/01-parent", record_ids[0],
+      parent_head, "c" * 40, "02-child",
+    ),
+  ]
+  records = []
+  for record_id, position, base_branch, parent_id, base_sha, head_sha, suffix in specs:
+    repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
+    (repo / ".git").mkdir(parents=True, exist_ok=True)
+    diff_text = f"diff --git a/{suffix} b/{suffix}\n+reviewed\n"
+    record = {
+      "id": record_id,
+      "type": "pr",
+      "repo": "mobius-os/mobius",
+      "status": "prepared",
+      "title": f"Layer {position}",
+      "branch": f"stack/{stack_id}/{suffix}",
+      "plan": {
+        "action": "pr",
+        "repo": "mobius-os/mobius",
+        "title": f"Layer {position}",
+        "body_draft": f"Reviewed layer {position}.",
+        "branch": f"stack/{stack_id}/{suffix}",
+        "repo_path": str(repo),
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "diff_sha256": hashlib.sha256(diff_text.encode()).hexdigest(),
+        "stack": {
+          "id": stack_id,
+          "position": position,
+          "total": 2,
+          "parent_record_id": parent_id,
+          "base_branch": base_branch,
+        },
+      },
+      "quality_review": _all_clear_review(head_sha),
+    }
+    _write_contribution(app_id, record_id, record, diff_text)
+    records.append(record)
+  return record_ids, records
+
+
+def test_submit_stack_refuses_a_changed_later_layer_without_partial_write(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_ids, records = _prepared_new_stack(app_id, "frozen-later")
+  confirmed = [_frozen(record) for record in records]
+
+  def change_child_text(record):
+    record["plan"]["body_draft"] = "A child description the owner never saw."
+
+  _rewrite_record(app_id, record_ids[1], change_child_text)
+  before = _record_bytes(app_id, record_ids)
+  calls = _forbid_publication_work(monkeypatch)
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/submit-stack",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={
+      "record_ids": record_ids, "publication_stage": "ready",
+      "expected_records": confirmed,
+    },
+  )
+
+  detail = _assert_approval_changed(
+    response, changed=[record_ids[1]], not_attempted=True,
+  )
+  assert [record["id"] for record in detail["records"]] == record_ids
+  assert calls == []
+  assert _record_bytes(app_id, record_ids) == before
+  assert _attempt_paths_exist(app_id, record_ids) == [False, False]
+
+
+def test_submit_stack_refuses_relinked_parent_with_unchanged_heads(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  stack_id = "frozen-relink"
+  record_ids, records = _prepared_new_stack(app_id, stack_id)
+  confirmed = [_frozen(record) for record in records]
+  renamed = f"stack/{stack_id}/01-renamed-parent"
+
+  def rename_parent(record):
+    record["branch"] = record["plan"]["branch"] = renamed
+
+  def follow_parent(record):
+    record["plan"]["stack"]["base_branch"] = renamed
+
+  # The chain stays structurally valid and every reviewed head is unchanged.
+  _rewrite_record(app_id, record_ids[0], rename_parent)
+  _rewrite_record(app_id, record_ids[1], follow_parent)
+  before = _record_bytes(app_id, record_ids)
+  calls = _forbid_publication_work(monkeypatch)
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/submit-stack",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"record_ids": record_ids, "expected_records": confirmed},
+  )
+
+  _assert_approval_changed(response, changed=record_ids, not_attempted=True)
+  assert calls == []
+  assert _record_bytes(app_id, record_ids) == before
+  assert _attempt_paths_exist(app_id, record_ids) == [False, False]
+
+
+def test_submit_stack_claim_rechecks_every_layer_before_its_first_write(
+  client, owner_token, monkeypatch,
+):
+  """A writer racing past the read-only check still cannot get a parent claimed."""
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_ids, records = _prepared_new_stack(app_id, "frozen-race")
+  confirmed = [_frozen(record) for record in records]
+  parent_before = _record_bytes(app_id, record_ids[:1])
+  original_cleanup = github_routes._cleanup_durable_complete_attempt
+  raced = []
+
+  def cleanup_then_race(path, *, app_id, record_id):
+    if not raced:
+      raced.append(record_id)
+      _rewrite_record(
+        app_id, record_ids[1],
+        lambda record: record["plan"].update({"title": "Raced title"}),
+      )
+    return original_cleanup(path, app_id=app_id, record_id=record_id)
+
+  monkeypatch.setattr(
+    github_routes, "_cleanup_durable_complete_attempt", cleanup_then_race,
+  )
+  calls = _forbid_publication_work(monkeypatch)
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/submit-stack",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"record_ids": record_ids, "expected_records": confirmed},
+  )
+
+  assert raced == [record_ids[0]]
+  _assert_approval_changed(response, changed=[record_ids[1]], not_attempted=True)
+  assert calls == []
+  assert _record_bytes(app_id, record_ids[:1]) == parent_before
+  assert _attempt_paths_exist(app_id, record_ids) == [False, False]
+
+
+def test_submit_stack_requires_one_confirmed_record_per_requested_layer(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_ids, records = _prepared_new_stack(app_id, "frozen-incomplete")
+  before = _record_bytes(app_id, record_ids)
+  calls = _forbid_publication_work(monkeypatch)
+
+  for expected in (
+    [_frozen(records[0])],
+    [_frozen(records[0]), _frozen(records[0])],
+  ):
+    response = client.post(
+      f"/api/github/contributions/{app_id}/submit-stack",
+      headers={"Authorization": f"Bearer {app_token}"},
+      json={"record_ids": record_ids, "expected_records": expected},
+    )
+    assert response.status_code == 400, response.text
+
+  oversized = [f"frozen-oversized-{index}" for index in range(13)]
+  response = client.post(
+    f"/api/github/contributions/{app_id}/submit-stack",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={
+      "record_ids": oversized,
+      "expected_records": [{"id": record_id} for record_id in oversized],
+    },
+  )
+  assert response.status_code == 400, response.text
+  assert calls == []
+  assert _record_bytes(app_id, record_ids) == before
+
+
+def test_submit_stack_publishes_matching_confirmed_chain(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  _allow_synthetic_source_provenance(monkeypatch)
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_ids, records = _prepared_new_stack(app_id, "frozen-match")
+  confirmed = [_frozen(record) for record in records]
+  monkeypatch.setattr(
+    github_routes, "_preflight_prepared_stack", lambda _rows, **_kwargs: None,
+  )
+  sent = []
+
+  def submit(record, _diff, *, direct_base_branch=None, **_kwargs):
+    sent.append(record["id"])
+    number = 80 + len(sent)
+    return (
+      f"https://github.com/mobius-os/mobius/pull/{number}", number,
+      {"last_submit_base_branch": direct_base_branch},
+    )
+
+  monkeypatch.setattr(github_routes, "_submit_prepared_pr", submit)
+  response = client.post(
+    f"/api/github/contributions/{app_id}/submit-stack",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"record_ids": record_ids, "expected_records": confirmed},
+  )
+
+  assert response.status_code == 200, response.text
+  assert sent == record_ids
+
+
+def test_update_stack_refuses_a_changed_child_target_before_any_claim(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_ids, records = _prepared_existing_pr_update_stack(app_id)
+  confirmed = [_frozen(record) for record in records]
+
+  def retarget(record):
+    record["number"] = 60
+    record["url"] = "https://github.com/mobius-os/app-demo/pull/60"
+
+  _rewrite_record(app_id, record_ids[1], retarget)
+  before = _record_bytes(app_id, record_ids)
+  calls = _forbid_publication_work(monkeypatch)
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/update-stack",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"record_ids": record_ids, "expected_records": confirmed},
+  )
+
+  _assert_approval_changed(response, changed=[record_ids[1]], not_attempted=True)
+  assert calls == []
+  assert _record_bytes(app_id, record_ids) == before
+  assert _attempt_paths_exist(app_id, record_ids) == [False, False]
+
+
+def _submitting_with_ambiguous_receipt(app_id: int, record_id: str) -> tuple[dict, dict]:
+  """A claimed publication whose earlier public outcome is still unknown."""
+  head = "a" * 40
+  repo = Path(get_settings().data_dir) / "contrib" / record_id / "repo"
+  (repo / ".git").mkdir(parents=True)
+  prepared = {
+    "id": record_id, "type": "pr", "status": "prepared",
+    "repo": "mobius-os/app-demo", "branch": "fix/restart",
+    "quality_review": _all_clear_review(head),
+    "plan": {
+      "action": "pr", "repo": "mobius-os/app-demo",
+      "repo_path": str(repo), "branch": "fix/restart",
+      "base_sha": "b" * 40, "head_sha": head,
+      "diff_sha256": "c" * 64, "title": "Restart safe",
+      "body_draft": "Exact body",
+    },
+  }
+  record = {**_frozen(prepared), "status": "submitting", "submitter": "contribute-button"}
+  record["personal_submit_input_sha256"] = (
+    github_contributions._personal_publication_input_sha256(record)
+  )
+  _write_contribution(app_id, record_id, record, "reviewed")
+  owner = github_routes._PersonalAttemptOwner(
+    app_id=app_id, record_id=record_id,
+    record_path=_record_file(app_id, record_id), claimed=record,
+    action_input={
+      "action": "submit", "publication_stage": "draft", "autopilot": False,
+    },
+  )
+  owner.event("pr_ambiguous", {
+    "action": "reconcile_pr", "head_sha": head,
+    "head_repository": "octocat/app-demo", "branch": "fix/restart",
+  }, {"last_submit_stage": "pushed", "last_submit_push_sha": head})
+  return prepared, record
+
+
+def test_unknown_publication_is_never_certified_unsent_on_mismatch(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, _ = _app_token(client, owner_token, github_access=True)
+  record_id = "frozen-unknown"
+  prepared, _record = _submitting_with_ambiguous_receipt(app_id, record_id)
+  stale = _frozen(prepared)
+  stale["plan"]["body_draft"] = "An older description."
+  receipt_path = github_routes.contribution_runtime.personal_attempt_path(
+    app_id, record_id,
+  )
+  before = (_record_bytes(app_id, [record_id]), receipt_path.read_bytes())
+  calls = _forbid_publication_work(monkeypatch)
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record_id}/submit",
+    headers={"Authorization": f"Bearer {owner_token}"},
+    json={"expected_record": stale},
+  )
+
+  _assert_approval_changed(response, changed=[record_id], not_attempted=False)
+  assert calls == []
+  assert (_record_bytes(app_id, [record_id]), receipt_path.read_bytes()) == before
+
+
+def test_unknown_publication_resumes_under_its_confirmed_proposal(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, _ = _app_token(client, owner_token, github_access=True)
+  record_id = "frozen-resume"
+  prepared, _record = _submitting_with_ambiguous_receipt(app_id, record_id)
+  monkeypatch.setattr(
+    github_routes, "_assert_personal_publication_source", lambda *_args: "exact",
+  )
+  monkeypatch.setattr(github_routes, "_equivalence_source_repo", lambda _r: None)
+  monkeypatch.setattr(
+    github_routes, "_record_pending_equivalence_locked",
+    lambda *_args, **_kwargs: None,
+  )
+  phases = []
+
+  def reconcile(_recovered, _diff, **kwargs):
+    phases.append(kwargs["prior_attempt_phase"])
+    return "https://github.com/mobius-os/app-demo/pull/91", 91, {}
+
+  monkeypatch.setattr(github_routes, "_submit_prepared_pr", reconcile)
+  # The owner confirmed the prepared card; the claim only changed lifecycle.
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record_id}/submit",
+    headers={"Authorization": f"Bearer {owner_token}"},
+    json={"expected_record": prepared},
+  )
+
+  assert response.status_code == 200, response.text
+  assert phases == ["pr_ambiguous"]
+  assert response.json()["record"]["number"] == 91
+
+
+def test_already_published_confirmation_is_not_certified_unsent(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat")
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_id = "frozen-published"
+  confirmed = _frozen(_prepared_standalone_pr(app_id, record_id))
+
+  def published(record):
+    record.update({
+      "status": "open", "publication_stage": "ready",
+      "url": "https://github.com/mobius-os/app-demo/pull/14", "number": 14,
+      "last_submit_push_sha": record["plan"]["head_sha"],
+    })
+
+  _rewrite_record(app_id, record_id, published)
+  before = _record_bytes(app_id, [record_id])
+  calls = _forbid_publication_work(monkeypatch)
+
+  response = client.post(
+    f"/api/github/contributions/{app_id}/{record_id}/submit",
+    headers={"Authorization": f"Bearer {app_token}"},
+    json={"expected_record": confirmed},
+  )
+
+  detail = _assert_approval_changed(
+    response, changed=[record_id], not_attempted=False,
+  )
+  assert detail["record"]["status"] == "open"
+  assert calls == []
+  assert _record_bytes(app_id, [record_id]) == before
+
+
+def test_single_claim_rechecks_the_confirmed_proposal_before_writing(
+  client, owner_token,
+):
+  """The route's read-only check is repeated on the exact record claimed."""
+  app_id, _ = _app_token(client, owner_token, github_access=True)
+  record_id = "frozen-claim-recheck"
+  confirmed = _frozen(_prepared_standalone_pr(app_id, record_id))
+  _rewrite_record(
+    app_id, record_id,
+    lambda record: record["plan"].update({"title": "Raced title"}),
+  )
+  before = _record_bytes(app_id, [record_id])
+  armed = []
+  from app.database import SessionLocal
+  db = SessionLocal()
+  try:
+    with pytest.raises(HTTPException) as raised:
+      github_contributions._claim_record(
+        app_id=app_id, record_id=record_id, db=db,
+        expected_nonce=db.get(models.App, app_id).token_nonce,
+        before_claim_write=lambda *args: armed.append(args),
+        confirmed={record_id: confirmed},
+      )
+  finally:
+    db.close()
+  assert raised.value.status_code == 409
+  assert raised.value.detail["code"] == "approval_changed"
+  assert raised.value.detail["not_attempted"] is True
+  assert armed == []
+  assert _record_bytes(app_id, [record_id]) == before
