@@ -13,7 +13,7 @@ const block = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.s
   items: [{ title: 'Row', intent: 'open:b', action: { label: 'Send', intent: 'send:b' } }] }) })
 
 function mounted(near = true) {
-  const h = renderHook(props => useAppBlockSession(props), { block, near })
+  const h = renderHook(props => useAppBlockSession(props), { block, near, confirmVisible: true })
   const report = (fields, generation = h.result.current.generation) => h.result.current.onBlockState({
     type: 'moebius:app-block-state', sessionId: h.result.current.sessionId,
     actions: [{ key: 'send-batch:sel-1', label: 'Send all' }, { key: 'send:b', label: 'Send' }], ...fields,
@@ -197,5 +197,66 @@ test('replacing the confirmation contents re-arms Confirm', () => {
     mock.timers.tick(1)
     assert.equal(h.result.current.confirmArmed, true)
     assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), true)
+  } finally { mock.timers.reset() }
+})
+
+// Arming belongs to one continuous visible showing. Each sequence first arms
+// list A, then shows it again some other way: a fresh 500 ms is required.
+for (const mode of ['repeated activation', 'A-B-A', 'reload', 'changed offscreen', 'document hidden']) {
+  test(`a previously armed list must earn a fresh visible delay: ${mode}`, () => {
+    mock.timers.enable({ apis: ['setTimeout'] })
+    try {
+      const { h, capability, report } = mounted()
+      capability(true, 1)
+      report(confirmList('A'))
+      mock.timers.tick(CONFIRM_ARM_MS)
+      assert.equal(h.result.current.confirmArmed, true)
+      if (mode === 'repeated activation') {
+        // Not now, then a double-click on the action that returns the same list.
+        assert.equal(h.result.current.dispatch('send-batch:sel-1', 'cancel'), true)
+        report({ ackNonce: h.result.current.event.nonce })
+        assert.equal(h.result.current.dispatch('send-batch:sel-1', 'activate'), true)
+        report({ ...confirmList('A'), ackNonce: h.result.current.event.nonce })
+        mock.timers.tick(40)
+      } else if (mode === 'A-B-A') {
+        report(confirmList('B'))
+        mock.timers.tick(40)
+        report(confirmList('A'))
+      } else if (mode === 'reload') {
+        capability(null, 2)
+        capability(true, 2, false)
+        report(confirmList('A'), 2)
+      } else if (mode === 'changed offscreen') {
+        report({ ...confirmList('A'), retain: true })
+        h.rerender({ block, near: false, confirmVisible: false })
+        report({ ...confirmList('Changed while unseen'), retain: true })
+        mock.timers.tick(CONFIRM_ARM_MS)
+        h.rerender({ block, near: true, confirmVisible: true })
+      } else {
+        h.rerender({ block, near: true, confirmVisible: false })
+        mock.timers.tick(CONFIRM_ARM_MS)
+        h.rerender({ block, near: true, confirmVisible: true })
+      }
+      assert.equal(h.result.current.confirmArmed, false)
+      assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), false)
+      assert.equal(h.result.current.event?.event === 'confirm', false, 'no confirm reached the app')
+      mock.timers.tick(CONFIRM_ARM_MS)
+      assert.equal(h.result.current.confirmArmed, true, 'the current showing arms after its own delay')
+      assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), true)
+    } finally { mock.timers.reset() }
+  })
+}
+
+test('a report that swaps the list disarms before the next render', () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const { h, capability, report } = mounted()
+    capability(true, 1)
+    report(confirmList('A'))
+    mock.timers.tick(CONFIRM_ARM_MS)
+    const { dispatch, onBlockState, sessionId } = h.result.current
+    // Call the callbacks captured before the swap re-renders.
+    onBlockState({ type: 'moebius:app-block-state', sessionId, ...confirmList('B') }, { generation: 1 })
+    assert.equal(dispatch('send-batch:sel-1', 'confirm'), false)
   } finally { mock.timers.reset() }
 })

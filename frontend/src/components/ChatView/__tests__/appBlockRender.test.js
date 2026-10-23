@@ -6,7 +6,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import AppBlock from '../markdown/AppBlock.jsx'
 import { AppBlockView } from '../markdown/AppBlockParts.jsx'
-import { PassiveBlockView, SessionConfirmation, SessionControls } from '../markdown/PassiveAppBlock.jsx'
+import { PassiveBlockView, SessionConfirmation, SessionControls, passiveBlockMode } from '../markdown/PassiveAppBlock.jsx'
 import { sessionState } from '../markdown/appBlockSession.js'
 import { appBlockFromToken } from '../markdown/appBlock.js'
 import { appQueries } from '../../../hooks/queries.js'
@@ -189,4 +189,13 @@ test('several confirming actions are ambiguous: no Confirm is enabled and no lis
     assert.doesNotMatch(html, /Target A|Target B/)
     assert.match(html, /More than one is asking for confirmation at once/)
   }
+})
+
+test('a static view the reader opened stays until the reader closes it, even when a slot frees', () => {
+  const base = { supported: true, near: true, retained: false }
+  assert.equal(passiveBlockMode({ ...base, granted: false, staticOpen: false }), 'static')
+  assert.equal(passiveBlockMode({ ...base, granted: true, staticOpen: true }), 'static', 'a freed slot keeps the open view')
+  assert.equal(passiveBlockMode({ ...base, granted: true, staticOpen: false }), 'passive', 'closing it may go passive again')
+  assert.equal(passiveBlockMode({ ...base, supported: false, granted: true, staticOpen: false }), 'static')
+  assert.equal(passiveBlockMode({ ...base, granted: false, staticOpen: true, retained: true }), 'passive', 'an unresolved owner keeps its session')
 })

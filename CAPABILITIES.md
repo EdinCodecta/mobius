@@ -832,8 +832,10 @@ update until it releases. AppCanvas refuses host requests from a buffered
 successor, and from any transcript or session canvas that is not visible (the
 hidden session canvas gets no host-request handler at all). An ordinary shell
 app keeps its background requests, such as chat status or a projects list,
-while another view is on screen. At most 3 idle session frames run per app,
-and Confirm arms only after its exact list has been shown for about 500 ms. The wire protocol and the confirmation contract are in
+while another view is on screen. At most 3 idle session frames run per app
+(nearest by last observed position; a reader-opened static view is never torn
+down for a slot), and Confirm arms only after one continuous, visible showing
+of its exact list lasting about 500 ms; every new showing earns its own delay. The wire protocol and the confirmation contract are in
 `building-apps.md` "Passive block sessions".
 
 ## Adding a capability

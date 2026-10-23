@@ -106,8 +106,9 @@ test('a passive session drives an in-place Confirm through the real frame protoc
   // A double-click on the action: the second click lands where Confirm
   // appears, before it has been shown long enough to arm. No confirm is sent.
   const centre = [box.x + box.width / 2, box.y + box.height / 2]
+  // Two pointer clicks back to back, with no wait between them, so the second
+  // is always well inside the 500 ms arming delay however slow the runner is.
   await page.mouse.click(...centre)
-  await expect(block.locator('footer .md-app-block__action')).toHaveText('Confirm')
   await page.mouse.click(...centre)
   const confirm = block.locator('footer .md-app-block__action')
   await expect(confirm).toHaveText('Confirm')

@@ -1,7 +1,7 @@
 /* App block parts. A static block is a conversation-authored snapshot with
    links into the app; nothing app-owned runs until the reader explicitly
    opens the embedded view. */
-import { lazy, Suspense, useCallback, useMemo, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react'
 import { ChevronDown, ChevronRight } from '@openai/apps-sdk-ui/components/Icon'
 import { appFrameVersion } from '../../../lib/appVersion.js'
 import { sharedBrowserShellHref } from '../../../lib/sharedBrowserWorkspace.js'
@@ -100,8 +100,11 @@ export function AppBlockLayout({ block, app, appsLoading, onInternalNav, actionF
   </section>
 }
 
-export function StaticAppBlock({ block, app, appsLoading, onInternalNav, sectionRef = null }) {
+export function StaticAppBlock({ block, app, appsLoading, onInternalNav, sectionRef = null, onOpenChange = null }) {
   const [viewIntent, setViewIntent] = useState(null)
+  // A passive host keeps this block static while the reader has a view open.
+  const open = viewIntent !== null
+  useEffect(() => { onOpenChange?.(open) }, [onOpenChange, open])
   const navigate = useTranscriptNavigation(onInternalNav)
   const onHostRequest = useCallback((_, request) => transcriptHostRequest(request, { navigate }), [navigate])
   const openable = block.inline && app

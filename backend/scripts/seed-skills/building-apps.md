@@ -479,8 +479,10 @@ Otherwise the block is static. While the block is near the viewport the host
 runs a hidden, inert instance of the app; it cannot navigate, open chats or
 apps, or use other host requests, and it never reads or writes the app's saved
 shell place. At most 3 idle hidden instances run per app (the blocks nearest
-the viewport); further blocks stay static with an explicit open, and an
-instance that reports `retain` always keeps its frame. Module startup and
+the viewport by their last observed position); further blocks stay static with
+an explicit open, and an instance that reports `retain` always keeps its frame.
+A view the reader opened in a static block stays open until they close it,
+even if a slot frees up. Module startup and
 session hydration must be read-only. The host draws every control; the app
 reports state.
 
@@ -554,10 +556,13 @@ conversation. It never shortens the list: a missing, empty, oversized or
 malformed `confirmation` keeps Confirm disabled and shows "Open the app to
 review this action. Its full current identity is unavailable here." Confirm
 replaces the action's button in place, with "Not now" beside it. It stays
-disabled until that exact confirmation (the action and its list) has been on
-screen for about 500 ms, and replacing the list starts that delay again, so a
-double-click on the action, or a list swapped just before a click, never
-sends `confirm`. Treat
+disabled until that exact confirmation (the action and its list) has been
+continuously on screen, with both the Confirm button and the list in the
+viewport of a visible page, for about 500 ms. Each showing earns its own delay:
+it ends when the list changes or disappears, after "Not now", on reload, or
+when the block goes offscreen or the page is hidden. So a double-click on the
+action, a list swapped just before a click, or a list that changed offscreen
+never sends `confirm`. Treat
 `confirm` as a request: check it again in the app before acting, and report
 `busy` and then the result.
 
