@@ -4,9 +4,9 @@ The original review target is never rewritten.  A repair is a successor with
 its own checkout and review; callers must persist that successor and obtain a
 fresh all-clear before asking the ordinary merge gate to act on it.
 
-Checkouts are disposable: the confirmed push is the durable result. A checkout
-is removed only after confirmed push or explicit abandonment; age alone never
-proves that an active edit or ambiguous attempt is safe to delete.
+Checkouts are disposable: the confirmed push is the durable result. Receipt-
+aware garbage collection keeps active editors and uncertain public effects,
+deletes terminal receipts, and gives crash orphans and dormant edits grace.
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ from app.github_contribution_contract import COAUTHOR_TRAILER, coauthor_trailer_
 from app.github_contribution_git import _git_env, _run_cmd, _validate_branch, _validate_repo_slug
 
 
-def _git(repo: Path, *args: str, check: bool = True):
-  """Run server Git without inherited config, object redirects or prompts."""
+def _repair_git_env(repo: Path) -> dict[str, str]:
+  """One sanitized environment for every server proof in a repair checkout."""
   env = _git_env(repo)
   for key in tuple(env):
     if key.startswith("GIT_CONFIG_") or key in {
@@ -44,6 +44,12 @@ def _git(repo: Path, *args: str, check: bool = True):
   env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
              GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0",
              GIT_ASKPASS="/bin/false", SSH_ASKPASS="/bin/false")
+  return env
+
+
+def _git(repo: Path, *args: str, check: bool = True):
+  """Run server Git without inherited config, object redirects or prompts."""
+  env = _repair_git_env(repo)
   # Global config is ignored, including the owner's configured credential
   # helper. Supply the one fixed GitHub helper for network operations only.
   auth = ["-c", "credential.helper=!gh auth git-credential"] if args[:1] in {("fetch",), ("push",)} else []
@@ -161,9 +167,10 @@ def _checkout_root() -> Path:
   return root
 
 
-# Agents commit, fetch and inspect through Git, which touches these markers.
-# Editing files alone does not, so the idle window is deliberately generous.
-STALE_CHECKOUT_SECONDS = 7 * 24 * 3600
+# Orphans can be half-built checkouts between mkdtemp and receipt save. A
+# stopped/terminal receipt is explicit evidence; unreferenced paths need grace.
+ORPHAN_GRACE_SECONDS = 3600
+STALE_EDIT_SECONDS = 7 * 24 * 3600
 _ACTIVITY_MARKERS = ("", ".git", ".git/index", ".git/HEAD", ".git/FETCH_HEAD", ".git/logs/HEAD")
 
 
@@ -172,7 +179,11 @@ def _repair_dir(raw_path: object) -> Path | None:
   if not isinstance(raw_path, (str, Path)):
     return None
   path = Path(raw_path)
-  if (not path.is_absolute() or path != path.resolve() or path.parent != _checkout_root()
+  try:
+    resolved = path.resolve()
+  except (OSError, RuntimeError):
+    return None
+  if (not path.is_absolute() or path != resolved or path.parent != _checkout_root()
       or not path.name.startswith("repair-") or path.is_symlink() or not path.is_dir()):
     return None
   return path
@@ -203,19 +214,26 @@ def _last_activity(path: Path) -> float:
   return max(times, default=0.0)
 
 
-def sweep_stale_checkouts(*, abandoned_paths: set[str], now: float | None = None) -> None:
-  """GC only receipt-owned paths explicitly classified as abandoned.
+def sweep_stale_checkouts(*, protected_paths: set[str], terminal_paths: set[str],
+                          dormant_paths: set[str], now: float | None = None) -> None:
+  """Delete only terminal receipts and aged orphans/dormant edits.
 
-  Age cannot establish abandonment: long edits and uncertain pushes may be
-  old. The caller must omit every active or ambiguous receipt.
+  The DB owner supplies a complete protected set, including every unresolved
+  public effect and active editor. Filesystem age is never proof for those.
   """
   root = _checkout_root()
-  abandoned = {str(path) for path in abandoned_paths}
-  cutoff = (time.time() if now is None else now) - STALE_CHECKOUT_SECONDS
-  for raw_path in abandoned:
-    entry = _repair_dir(raw_path)
-    if (entry is not None
-        and _last_activity(entry) < cutoff):
+  protected = {str(path) for path in protected_paths}
+  terminal = {str(path) for path in terminal_paths}
+  dormant = {str(path) for path in dormant_paths}
+  current = time.time() if now is None else now
+  for candidate in root.iterdir():
+    entry = _repair_dir(candidate)
+    if entry is None or str(entry) in protected:
+      continue
+    age = current - _last_activity(entry)
+    if (str(entry) in terminal or
+        (str(entry) in dormant and age >= STALE_EDIT_SECONDS) or
+        (str(entry) not in dormant and age >= ORPHAN_GRACE_SECONDS)):
       try:
         shutil.rmtree(entry)
       except FileNotFoundError:
@@ -313,7 +331,8 @@ def _assert_git_metadata(path: Path) -> None:
   """
   git_dir = path / ".git"
   forbidden = ("shallow", "info/grafts", "commondir", "config.worktree",
-               "objects/info/alternates", "objects/info/http-alternates", "info/attributes")
+               "objects/info/alternates", "objects/info/http-alternates",
+               "objects/info/commit-graph", "objects/info/commit-graphs", "info/attributes")
   if any((git_dir / name).exists() or (git_dir / name).is_symlink() for name in forbidden):
     _fail("The dedicated checkout has altered or incomplete Git ancestry metadata.")
   # Ref/object subtrees are agent-writable. A top-level check misses links in
@@ -382,7 +401,8 @@ def validate_repair(gh, cwd: Path, row, target: dict, checkout: dict,
   path_diff = _git(path, "diff", "--name-only", "--no-renames", "-z",
                    f"{initial}..{head}", check=False)
   paths = {name for name in path_diff.stdout.split("\x00") if name} if path_diff.returncode == 0 else None
-  diff = app_git._canonical_diff(path, initial, head, read_only=True)
+  diff = app_git._canonical_diff(path, initial, head, read_only=True,
+                                 env=_repair_git_env(path))
   if paths is None or diff is None or not diff:
     _fail("Git could not derive a nonempty repair diff.")
   base = _present_commit(path, base_sha) if base_sha is not None else None
@@ -496,11 +516,29 @@ def push_repair(gh, cwd: Path, row, target: dict, validation: dict, *, before_pu
   except Exception:
     return DispatchResult.unknown("The repair push result is unknown; reconcile the exact remote head.")
   try:
-    if _branch_head(gh, cwd, slug, branch) == fresh["head_sha"]:
+    remote_head = _branch_head(gh, cwd, slug, branch)
+    if remote_head == fresh["head_sha"]:
       return DispatchResult.confirmed(fresh)
+    if (result.returncode != 0 and remote_head == target["head_sha"]
+        and _exact_ref_rejected(getattr(result, "stdout", ""), fresh["head_sha"], branch)):
+      # Git completed and named only this ref as rejected; the exact old tip
+      # still exists. This proves no branch update, unlike timeout or EOF.
+      return DispatchResult.not_dispatched("GitHub rejected the exact repair ref; no branch update was applied.")
   except Exception:
     pass
   return DispatchResult.unknown("The repair push was not confirmed; reconcile the exact remote head.")
+
+
+def _exact_ref_rejected(porcelain: str, head: str, branch: str) -> bool:
+  """Accept only Git's complete rejection record for our sole pushed ref."""
+  if not isinstance(porcelain, str):
+    return False
+  exact = f"{head}:refs/heads/{branch}"
+  records = [line.split("\t") for line in porcelain.splitlines() if line.startswith("!")]
+  return (len(records) == 1 and len(records[0]) == 3
+          and records[0][0] == "!" and records[0][1] == exact
+          and (records[0][2].startswith("[rejected]")
+               or records[0][2].startswith("[remote rejected]")))
 
 
 def _target_base_head(gh, cwd: Path, target: dict) -> str:
