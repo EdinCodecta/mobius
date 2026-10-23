@@ -329,8 +329,10 @@ def list_reviews(app_id: int | None, db: Session = Depends(get_db),
 
 
 def _list_run_view(db, row, app_id):
-  """Lists are navigation summaries; full evidence belongs to exact-run detail."""
+  """Keep owning clients compatible; bound only privacy-projected navigation."""
   value = _run_view(db, row, context_app_id=app_id)
+  if app_id is None or row.app_id == app_id:
+    return value
   fields = ("repo", "number", "head_sha", "base_ref", "base_sha", "state", "url", "title",
             "review_chat_id", "review_run_id", "merge_sha", "queue_entry_id",
             "successor", "approved_head_sha", "approved_base_sha", "current_base_sha")
@@ -338,7 +340,12 @@ def _list_run_view(db, row, app_id):
   for item in value["items"]:
     brief = {key: item[key] for key in fields if key in item}
     if item.get("summary"):
-      brief["summary"] = item["summary"][:240]
+      summary = item["summary"]
+      if len(summary) > 240:
+        omission = "… open this run for the full findings"
+        brief.update(summary=summary[:240-len(omission)] + omission, summary_truncated=True)
+      else:
+        brief["summary"] = summary
     if item.get("public_review"):
       receipt = item["public_review"]
       brief["public_review"] = {key: receipt[key] for key in ("state", "url", "id") if key in receipt}

@@ -139,14 +139,56 @@ def test_public_receipt_does_not_duplicate_frozen_evidence(setup, monkeypatch):
     report(setup, publish=True, summary='Changed finding')
 
 
-def test_list_does_not_return_full_evidence_but_detail_keeps_it(setup):
+@pytest.mark.parametrize("context_app,row_app,caller_app", [(1, 1, 1), (None, None, None), (1, 1, None)])
+def test_owned_list_preserves_full_findings_and_prompt_snapshot(setup, context_app, row_app, caller_app):
   db, row, principal = setup
-  opted_in(setup)
-  domain.save_outcome(db, row, domain.key(ITEM), {'state': 'needs_you', 'summary': 's'*200000, 'tests': 't'*200000})
-  item = routes.list_reviews(1, db, principal)['runs'][0]['items'][0]
-  assert len(item.get('summary', '')) <= 240 and 'tests' not in item
-  detail = routes.get_review(1, row.id, db, principal)['run']['items'][0]
-  assert detail['summary'] == 's'*200000 and detail['tests'] == 't'*200000
+  row.app_id = row_app
+  row.options_json = {"review_prompt": "Exact frozen prompt", "merge_prompt": "Exact merge prompt"}
+  db.commit()
+  domain.save_outcome(db, row, domain.key(ITEM), {"state": "needs_you",
+    "summary": "s"*200000, "tests": "t"*200000})
+  caller = principal if caller_app else Principal(owner=principal.owner, app_id=None)
+  listed = routes.list_reviews(context_app, db, caller)["runs"][0]
+  assert listed["items"][0]["summary"] == "s"*200000
+  assert listed["items"][0]["tests"] == "t"*200000
+  assert listed["options"]["review_prompt"] == "Exact frozen prompt"
+  assert "summary_truncated" not in listed["items"][0]
+
+
+def test_foreign_list_still_excludes_private_findings_and_prompts(setup):
+  db, row, principal = setup
+  row.app_id = None
+  row.options_json = {"review_prompt": "PRIVATE PROMPT"}
+  db.commit()
+  domain.save_outcome(db, row, domain.key(ITEM), {"state": "needs_you", "summary": "PRIVATE FINDINGS"})
+  listed = routes.list_reviews(1, db, principal)["runs"][0]
+  assert listed["details_in_owning_chat"] is True
+  assert "PRIVATE" not in str(listed) and "options" not in listed
+
+
+def test_bounded_foreign_navigation_summary_has_explicit_omission(setup, monkeypatch):
+  db, row, _ = setup
+  row.app_id = None
+  # The upstream privacy projection owns disclosure; this layer bounds only
+  # already-approved navigation text, never reaches into private outcomes.
+  monkeypatch.setattr(routes, "_run_view", lambda *a, **k: {
+    "items": [{"summary": "Public navigation text " * 40, "state": "needs_you"}]})
+  item = routes._list_run_view(db, row, 1)["items"][0]
+  assert len(item["summary"]) <= 240
+  assert item["summary"].endswith("… open this run for the full findings")
+  assert item["summary_truncated"] is True
+
+
+@pytest.mark.parametrize("error", [HTTPException(409, "revoked"), RuntimeError("authorization unavailable")])
+def test_authorization_refusal_rolls_back_public_owner_fence(setup, error):
+  from app import contribution_review_public_actions as actions
+  db, row, _ = setup
+  def authorize():
+    assert db.in_transaction()
+    raise error
+  with pytest.raises(type(error)):
+    actions.arm_public_review(db, row, domain.key(ITEM), TARGET, {}, "marker", authorize)
+  assert not db.in_transaction()
 
 
 def test_public_instructions_and_label_are_unambiguous():
