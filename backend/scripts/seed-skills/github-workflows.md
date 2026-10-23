@@ -37,10 +37,12 @@ preflight; do not demand a duplicate approval click. Changed head/base,
 model, prompt or scope needs a new preview and, when consent was pinned to the
 old version, a fresh decision.
 
-An optional Contribute adapter passes `--app-id N` to each CLI command. The
-saved selection binds that app context into its request identity; `start`
-requires the same flag. This is app presentation and authorization, not a
-second workflow implementation. Without the flag, the run is core-owned.
+An optional Contribute adapter imports the CLI's `api`, `prepare_selection`,
+`freeze_preview`, `verify_selection`, `start_body`, and `review_path` functions
+in-process. The CLI also accepts `--app-id N` for direct invocation. The saved
+selection binds that app context into its request identity; starting requires
+the same context. This is app presentation and authorization, not a second
+workflow implementation. Without an app context, the run is core-owned.
 
 ```bash
 python3 "$SCRIPTS_DIR/github_review.py" start \
