@@ -11,7 +11,11 @@ from app.github_connection import _github_connection_transaction
 def arm_public_review(db, row, item_key, target, outcome, marker, authorize):
   """Fence one exact public review per owner/PR/head across app and core grants."""
   fence_owner(db, row.owner_id)
-  authorize()  # Refreshes the owning grant after the database writer fence.
+  try:
+    authorize()  # Refreshes the owning grant after the database writer fence.
+  except Exception:
+    db.rollback()
+    raise
   current = (row.outcomes_json or {}).get(item_key, {})
   try:
     already_armed = public.require_same_evidence(current, outcome)
