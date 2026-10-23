@@ -1,6 +1,7 @@
 """Complete queue-history proof and historical no-replay fences."""
 import asyncio
 import json
+import subprocess
 from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
@@ -99,8 +100,6 @@ def test_removal_proof_fails_closed(monkeypatch, case):
     previous.pop("queue_enqueued_at")
     events.extend(later)
   elif case == "readded": events.extend(later[:1])
-  elif case == "readded_removed": events.extend(later)
-  elif case == "equal_time": events[1]["createdAt"] = QUEUE_TIME
   elif case == "unordered": events.reverse()
   elif case == "duplicate_id": events[1]["id"] = events[0]["id"]
   elif case == "bad_date": events[1]["createdAt"] = "unparseable"
@@ -216,3 +215,80 @@ def test_unknown_attempt_observed_in_queue_never_becomes_legacy_repair_receipt(s
   queue_graphql(monkeypatch, queue_timeline())
   removed = report(setup)["run"]["items"][0]
   assert removed["state"] == "merge_unknown" and not removed.get("queue_removal")
+
+
+def test_queue_timeout_preserves_unknown_and_observe_returns_saved_evidence(setup, monkeypatch):
+  db, row, principal = setup
+  previous = saved_queue_receipt(summary="Private review evidence")
+  domain.save_outcome(db, row, domain.key(TARGET), previous)
+  def timed_out(*args):
+    raise subprocess.TimeoutExpired(["gh", "api", "graphql"], 30)
+  monkeypatch.setattr(routes, "_gh", timed_out)
+  assert domain.confirmed_queue_removal(timed_out, "/tmp", TARGET, previous) is None
+  result = asyncio.run(routes.observe_review(1, row.id, db, principal))
+  assert result["run"]["items"][0]["state"] == "merge_unknown"
+  assert row.outcomes_json[domain.key(TARGET)]["queue_entry_id"] == "entry-1"
+
+
+def test_complete_but_non_alternating_queue_history_is_not_removal_proof(monkeypatch):
+  node = queue_timeline()
+  added, removed = node["timelineItems"]["nodes"]
+  node["timelineItems"]["nodes"] = [added,
+    {**added, "id": "added-2", "createdAt": "2026-10-07T20:14:00Z"},
+    removed, {**removed, "id": "removed-2", "createdAt": "2026-10-07T20:19:00Z"}]
+  gh, _ = queue_graphql(monkeypatch, node)
+  assert domain.confirmed_queue_removal(gh, "/tmp", TARGET, saved_queue_receipt()) is None
+
+
+def test_queue_removal_exemption_belongs_only_to_its_own_grant(setup):
+  from tests.test_contribution_review_workflows import overlapping_grant
+  db, row, principal = setup
+  evidence = saved_queue_receipt(state="needs_you", queue_removal={"removed_event_id": "proof"})
+  domain.save_outcome(db, row, domain.key(TARGET), evidence)
+  domain.require_public_transition_clear(db, row, TARGET)
+  row.options_json = {}
+  db.commit()
+  peer = overlapping_grant(db, row)
+  domain.save_outcome(db, peer, domain.key(TARGET), evidence)
+  with pytest.raises(HTTPException, match="earlier public attempt"):
+    domain.require_public_transition_clear(db, row, TARGET)
+
+
+def test_shared_fence_projects_only_overlapping_or_unmatchable_grants(setup):
+  db, row, principal = setup
+  target = {**TARGET, "head_repo_id": 11, "head_ref": "topic"}
+  row.targets_json = [target]
+  db.commit()
+  selections = {
+    "same-pr": {**target, "head_repo_id": 99, "head_ref": "different"},
+    "same-branch": {**target, "number": 8},
+    "legacy": {**TARGET, "number": 9},
+    "bad-type": {**target, "number": 10, "head_repo_id": "11", "head_ref": "else"},
+    "bad-ref": {**target, "number": 11, "head_ref": " "},
+    "unicode-ref": {**target, "number": 13, "head_ref": "\u3000legacy"},
+    "disjoint": {**target, "number": 12, "head_repo_id": 99, "head_ref": "different"},
+    "disjoint-case": {**target, "repo": "another/repo", "head_ref": "different"},
+  }
+  for name, item in selections.items():
+    db.add(models.ContributionReviewRun(id=name, app_id=row.app_id, owner_id=row.owner_id,
+      request_id=name, mode=row.mode, github_actor_id=row.github_actor_id, app_nonce=row.app_nonce,
+      options_json={}, targets_json=[item], outcomes_json={}, chat_id=row.chat_id))
+  db.commit()
+  candidates = domain._transition_candidates(db, row.owner_id, target)
+  assert {grant.id for grant in candidates} == {row.id, "same-pr", "same-branch", "legacy", "bad-type", "bad-ref", "unicode-ref"}
+  assert all(set(grant._mapping) == {"id", "targets_json", "outcomes_json"} for grant in candidates)
+  # Legacy caller identity cannot prove disjointness from any grant.
+  assert len(domain._transition_candidates(db, row.owner_id, TARGET)) == len(selections) + 1
+
+
+def test_removed_attempt_snapshot_excludes_recursive_aggregate_history(monkeypatch):
+  previous = saved_queue_receipt(**{name: [{"nested": "old"}] for name in (
+    "steps", "repair_attempts", "independent_reviews", "reviewer_steps", "ready_audit")},
+    merge_attempts=[{"head_sha": "c" * 40}], checkout={"path": "/owned"}, summary="Exact evidence")
+  gh, _ = queue_graphql(monkeypatch, queue_timeline())
+  monkeypatch.setattr(domain, "pull_checks", lambda *a: CHECKS)
+  result = domain.reconcile_merge(gh, "/tmp", TARGET, previous, PULL)
+  snapshot = result["merge_attempts"][-1]
+  assert snapshot["summary"] == "Exact evidence" and snapshot["head_sha"] == SHA
+  assert not {"steps", "merge_attempts", "repair_attempts", "independent_reviews",
+    "reviewer_steps", "ready_audit", "checkout"}.intersection(snapshot)

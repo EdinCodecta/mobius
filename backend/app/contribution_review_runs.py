@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import HTTPException
-from sqlalchemy import String, cast, or_, update
+from sqlalchemy import String, and_, cast, func, not_, or_, select, update
 
 from app import agent_work_claims, models
 from app.contribution_errors import ContributionSubmitError
@@ -237,6 +237,36 @@ def head_branch_identity(target) -> tuple[int, str] | None:
   return repo_id, ref
 
 
+def _transition_candidates(db, owner_id, target):
+  """Project only possibly overlapping grants; retain unmatchable legacy rows.
+
+  Consent is an immutable JSON array. Correlated json_each keeps disjoint
+  well-formed branches out of Python without assuming legacy rows are safe.
+  The Python fence below remains authoritative for receipt state and identity.
+  """
+  run = models.ContributionReviewRun
+  frozen = func.json_each(run.targets_json).table_valued("value").alias("frozen_target")
+  value = frozen.c.value
+  repo = func.json_extract(value, "$.repo")
+  number = func.json_extract(value, "$.number")
+  repo_id = func.json_extract(value, "$.head_repo_id")
+  ref = func.json_extract(value, "$.head_ref")
+  usable = func.coalesce(and_(
+    func.json_type(value, "$.head_repo_id") == "integer", repo_id > 0,
+    func.json_type(value, "$.head_ref") == "text", func.length(ref) > 0,
+    # Match Python str.strip for legacy identity classification, not just SQL spaces.
+    func.trim(ref, "\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
+      "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+      "\u2028\u2029\u202f\u205f\u3000") == ref), False)
+  branch = head_branch_identity(target)
+  query = db.query(run.id, run.targets_json, run.outcomes_json).filter(run.owner_id == owner_id)
+  if branch is not None:
+    overlap = or_(and_(func.lower(repo) == target["repo"].lower(), number == target["number"]),
+      and_(repo_id == branch[0], ref == branch[1]), not_(usable))
+    query = query.filter(select(1).select_from(frozen).where(overlap).correlate(run).exists())
+  return query.all()
+
+
 def require_public_transition_clear(db, row, target):
   """New mutations must not cross an unresolved item or head-branch attempt.
 
@@ -244,8 +274,10 @@ def require_public_transition_clear(db, row, target):
   infer resolution from the PR projection, which can lag a public branch push.
   Call again under the database fence after claim acquisition commits.
   """
-  grants = db.query(models.ContributionReviewRun).filter_by(
-    owner_id=row.owner_id).populate_existing().all()
+  grants = _transition_candidates(db, row.owner_id, target)
+  # Projection does not refresh the ORM identity map. Re-read the owning row
+  # explicitly so receipts admitted during claim commit are not overwritten.
+  db.refresh(row)
   original = next(t for t in row.targets_json if key(t) == key(target))
   current = effective_target(row, original)
   if current["head_sha"] != target["head_sha"] or current["base_sha"] != target["base_sha"]:
@@ -932,6 +964,35 @@ def _queue_time(value):
     return None
 
 
+def _ordered_queue_events(timeline):
+  """Accept complete alternating queue cycles, including equal-time events."""
+  if not isinstance(timeline, dict):
+    return None
+  page = timeline.get("pageInfo")
+  if not isinstance(page, dict):
+    return None
+  events = timeline.get("nodes")
+  if (page.get("hasPreviousPage") is not False or page.get("hasNextPage") is not False
+      or not isinstance(events, list) or not 2 <= len(events) <= 100 or len(events) % 2):
+    return None
+  last_time = None
+  ids = set()
+  for index, event in enumerate(events):
+    expected = "AddedToMergeQueueEvent" if index % 2 == 0 else "RemovedFromMergeQueueEvent"
+    if not isinstance(event, dict):
+      return None
+    timestamp = _queue_time(event.get("createdAt"))
+    event_id = event.get("id")
+    if (event.get("__typename") != expected or not isinstance(event_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9_+/=-]{1,256}", event_id)
+        or event_id in ids or timestamp is None
+        or (last_time is not None and timestamp < last_time)):
+      return None
+    last_time = timestamp
+    ids.add(event_id)
+  return events
+
+
 def confirmed_queue_removal(gh, cwd, target, previous):
   """Prove the saved admission ended, never infer it from missing entry/checks.
 
@@ -969,31 +1030,9 @@ def confirmed_queue_removal(gh, cwd, target, previous):
         or pr.get("merged") is not False or "mergeQueueEntry" not in pr
         or pr["mergeQueueEntry"] is not None):
       return None
-    timeline = pr.get("timelineItems")
-    if not isinstance(timeline, dict):
+    events = _ordered_queue_events(pr.get("timelineItems"))
+    if events is None:
       return None
-    page = timeline.get("pageInfo")
-    if not isinstance(page, dict):
-      return None
-    events = timeline.get("nodes")
-    if (page.get("hasPreviousPage") is not False or page.get("hasNextPage") is not False
-        or not isinstance(events, list) or not 2 <= len(events) <= 100 or len(events) % 2):
-      return None
-    last_time = None
-    ids = set()
-    for index, event in enumerate(events):
-      expected = "AddedToMergeQueueEvent" if index % 2 == 0 else "RemovedFromMergeQueueEvent"
-      if not isinstance(event, dict):
-        return None
-      timestamp = _queue_time(event.get("createdAt"))
-      event_id = event.get("id")
-      if (event.get("__typename") != expected or not isinstance(event_id, str)
-          or not re.fullmatch(r"[A-Za-z0-9_+/=-]{1,256}", event_id)
-          or event_id in ids or timestamp is None
-          or (last_time is not None and timestamp < last_time)):
-        return None
-      last_time = timestamp
-      ids.add(event_id)
     enqueued_at = previous.get("queue_enqueued_at")
     if enqueued_at is None:
       # A legacy receipt has no admission timestamp: one complete cycle only.
@@ -1017,7 +1056,7 @@ def confirmed_queue_removal(gh, cwd, target, previous):
     if previous.get("queue_removal") not in (None, proof):
       return None
     return proof
-  except (subprocess.CalledProcessError, OSError, json.JSONDecodeError, ContributionSubmitError):
+  except (subprocess.SubprocessError, OSError, json.JSONDecodeError, ContributionSubmitError):
     # Provider/transport failure is unknown; never expose raw diagnostics.
     return None
 
