@@ -13,7 +13,8 @@ from sqlalchemy.orm import Session
 
 from app import chat_queue, chat_writer, contribution_review_runs as reviews, models, providers, transcript_rows
 from app import contribution_review_presets as presets
-from app import contribution_review_public as public, settled
+from app import contribution_review_public as public
+from app.contribution_review_public_actions import post_public_review
 from app.contribution_review_public import EVIDENCE_MAX_CHARS
 from app import contribution_review_merge_actions as merge_actions
 from app.chat_start import start_programmatic_chat_turn
@@ -330,8 +331,13 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     if public.require_same_evidence(previous, body.model_dump()):
       return {"run": _run_view(db, row)}
     attempted = previous.get("merge_attempted") is True or previous.get("state") in {"merging", "merge_unknown", "queued", "merged"}
-    if previous.get("state") == "merged" or (row.mode == "review" and previous.get("state") == "all_clear"):
+    if previous.get("state") == "merged":
       return {"run": _run_view(db, row)}
+    if row.mode == "review" and previous.get("state") == "all_clear":
+      if not (row.options_json or {}).get("post_review"):
+        return {"run": _run_view(db, row)}
+      if public.evidence(previous) != public.evidence(body.model_dump()):
+        raise HTTPException(409, "Retry the public review with its recorded evidence unchanged.")
     if body.state == "all_clear" and (set(body.scope) != SCOPE or not body.tests.strip() or body.tests_passed is False):
       raise HTTPException(422, "Record the complete review scope and test evidence before all clear.")
     if row.mode == "review" and not attempted and not (row.options_json or {}).get("post_review"):
@@ -382,7 +388,8 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     if (row.mode == "review" and (row.options_json or {}).get("post_review") is True
         and outcome.get("state") in {"all_clear", "needs_you"}
         and (previous.get("public_review") or {}).get("state") not in {"posting", "posted", "unknown"}):
-      outcome = await _post_public_review(db, row, item_key, target, outcome, principal, cwd)
+      outcome = await post_public_review(db, row, item_key, target, outcome, principal, cwd,
+        gh=_gh, authorize=lambda: _parent(db, row, principal))
     if not outcome.get("merge_attempted") and not outcome.get("public_review"):
       _parent(db, row, principal)
     if outcome.get("merge_attempted") or outcome.get("public_review"):
@@ -390,37 +397,6 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     else:
       reviews.save_outcome(db, row, item_key, outcome)
     return {"run": _run_view(db, row)}
-
-
-async def _post_public_review(db, row, item_key, target, outcome, principal, cwd):
-  """Freeze evidence before dispatch; only certified non-dispatch permits retry."""
-  # Format before reserving: a known local rejection is not an uncertain send.
-  body = public.review_comment_body(outcome)
-  async with _github_connection_transaction():
-    actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub actor lookup)
-    if str(actor.get("id") or "") != row.github_actor_id:
-      return {**outcome, "public_review": {"state": "not_dispatched",
-        "summary": "The connected GitHub account changed; no review was posted."}}
-    frozen = public.evidence(outcome)
-    async with chat_queue.get_transition_lock(f"review-admission:{row.id}"):
-      _parent(db, row, principal)
-      reviews.save_outcome(db, row, item_key, {**outcome,
-        "public_review": {"state": "posting", "evidence": frozen}})
-    # There is no await between the final authority check and settled dispatch.
-    try:
-      _parent(db, row, principal)
-    except HTTPException as exc:
-      return {**outcome, "public_review": {"state": "not_dispatched", "summary": str(exc.detail)}}
-    result = await settled.run_settled(public.post_review, _gh, cwd, target, body)
-    receipt = {"state": {"confirmed": "posted", "unknown": "unknown",
-                         "not_dispatched": "not_dispatched"}[result.state]}
-    if result.state != "not_dispatched":
-      receipt["evidence"] = frozen
-    if result.receipt:
-      receipt.update(result.receipt)
-    if result.reason:
-      receipt["summary"] = result.reason
-    return {**outcome, "public_review": receipt}
 
 
 class ReviewPreview(BaseModel):
@@ -618,6 +594,11 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
     db.refresh(row)
     for original in row.targets_json:
       previous = row.outcomes_json.get(reviews.key(original), {})
+      receipt = previous.get("public_review") or {}
+      if receipt.get("state") in {"posting", "unknown"}:
+        observed = await asyncio.to_thread(public.reconcile_review, _gh, cwd, original, receipt, row.github_actor_id)  # unsettled: read-only (public review receipt observation)
+        reviews.save_effect_outcome(db, row, reviews.key(original), {**previous, "public_review": observed})
+        continue
       attempted = previous.get("merge_attempted") is True or previous.get("state") in {"merging", "merge_unknown", "queued", "merged"}
       if not attempted:
         continue

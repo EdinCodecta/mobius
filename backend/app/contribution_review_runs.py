@@ -302,6 +302,14 @@ def save_effect_outcome(db, row, item_key, outcome):
     current = (row.outcomes_json or {}).get(item_key, {})
     if current.get("state") == "merged" and outcome.get("state") != "merged":
       return
+    public_receipt = current.get("public_review") or {}
+    if public_receipt.get("state") == "posted":
+      # A stale read-only observer cannot downgrade a confirmed public fact.
+      return
+    if (public_receipt.get("state") in {"posting", "unknown"}
+        and public_receipt.get("marker") != (outcome.get("public_review") or {}).get("marker")):
+      # Only the dispatcher/observer of this exact attempt can settle it.
+      return
     revision = row.revision
     values = {**row.outcomes_json, item_key: outcome}
     changed = db.execute(update(models.ContributionReviewRun).where(
@@ -323,6 +331,8 @@ def view(row):
            else "complete" if all(s in {"all_clear", "merged"} for s in states)
            else "queued" if all(s in {"queued", "merged", "all_clear"} for s in states)
            else "reviewing")
+  if any((outcomes.get(key(t), {}).get("public_review") or {}).get("state") in {"posting", "unknown"} for t in row.targets_json):
+    state = "needs_you"
   return {"id": row.id, "request_id": row.request_id, "mode": row.mode,
           "chat_id": row.chat_id, "source_chat_id": row.chat_id, "app_id": row.app_id,
           "options": row.options_json, "state": state,
