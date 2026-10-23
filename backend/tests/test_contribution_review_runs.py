@@ -303,8 +303,9 @@ def test_merge_call_rejects_unreadable_confirmation():
 
 def test_queue_call_binds_sha_and_never_jumps():
   calls = []
-  def gh(*args):
+  def gh(*args, **kwargs):
     calls.append(args)
+    assert kwargs == {"check": False}
     return SimpleNamespace(stdout=json.dumps({"data": {"enqueuePullRequest": {
       "mergeQueueEntry": {"id": "queue-1"}
     }}}))

@@ -358,11 +358,13 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     if row.mode == "review" and not attempted and not (row.options_json or {}).get("post_review"):
       # Private findings are facts about the selected head, not the live PR.
       # A moved or temporarily unreadable PR must not replace their evidence.
-      reviews.save_outcome(db, row, item_key, {**previous, "state": body.state,
-        "summary": body.summary, "scope": body.scope, "tests": body.tests,
-        "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
-        "head_sha": body.head_sha, "review_chat_id": row.chat_id,
-        "review_run_id": principal.run_id})
+      async with chat_queue.get_transition_lock(f"review-admission:{run_id}"):
+        _parent(db, row, principal)
+        reviews.save_outcome(db, row, item_key, {**previous, "state": body.state,
+          "summary": body.summary, "scope": body.scope, "tests": body.tests,
+          "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
+          "head_sha": body.head_sha, "review_chat_id": row.chat_id,
+          "review_run_id": principal.run_id})
       return {"run": _run_view(db, row)}
     cwd = Path(get_settings().data_dir) / "platform"
     try:
@@ -370,7 +372,10 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     except HTTPException as exc:
       # A failed live read cannot rewrite private evidence or a public receipt.
       if not attempted:
-        reviews.save_outcome(db, row, item_key, {**previous, "state": "needs_you",
+        _parent(db, row, principal)
+        posting = row.mode == "review" and (row.options_json or {}).get("post_review") is True
+        reviews.save_outcome(db, row, item_key, {**previous, "state": body.state if posting else "needs_you",
+          **({"public_review": {"state": "not_dispatched", "summary": str(exc.detail)}} if posting else {}),
           "summary": body.summary, "scope": body.scope, "tests": body.tests,
           "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
           "head_sha": body.head_sha, "review_chat_id": row.chat_id,
@@ -504,10 +509,16 @@ def _run_view(db, row, *, context_app_id=None):
   if context_app_id is not None and row.app_id is None:
     # Read-through is navigation only. Another app's GitHub capability does
     # not grant access to core prompts, approval words or private findings.
-    value = {key: value[key] for key in ("id", "chat_id", "state", "execution_state") if key in value} | {
-      "app_id": None, "can_stop": False,
-      "items": [{key: item[key] for key in ("repo", "number", "head_sha", "state") if key in item}
-                for item in value["items"]],
+    items = []
+    for item in value["items"]:
+      public = item.get("public_review") or {}
+      projected = {key: item[key] for key in ("repo", "number", "head_sha", "base_ref", "base_sha", "state") if key in item}
+      if public:
+        projected["public_review"] = {key: public[key] for key in ("state", "url") if key in public}
+      items.append(projected)
+    value = {key: value[key] for key in ("id", "chat_id", "state", "execution_state", "mode", "created_at") if key in value} | {
+      "app_id": None, "can_stop": False, "post_review": bool((row.options_json or {}).get("post_review")),
+      "details_in_owning_chat": True, "items": items,
     }
   return value
 
@@ -625,6 +636,13 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
   The existing durable Wait owner may call this after resumption. It also
   settles lost receipts while a chat is stopped without reviving that chat.
   """
+  if app_id is not None:
+    _authorize_context(db, app_id, principal)
+    foreign_core = db.query(models.ContributionReviewRun.id).filter_by(
+      id=run_id, app_id=None, owner_id=principal.owner.id).first()
+    if foreign_core:
+      raise HTTPException(403, {"code": "details_in_owning_chat",
+        "message": "Open the owning conversation to observe this core review run."})
   row = _row(db, app_id, run_id, principal)
   cwd = Path(get_settings().data_dir) / "platform"
   async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):

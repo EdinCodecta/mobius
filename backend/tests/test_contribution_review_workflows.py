@@ -900,11 +900,14 @@ def test_app_can_read_owned_core_history_without_borrowing_mutation_authority(se
   owner = Principal(owner=principal.owner, app_id=None)
   assert routes.core_get_review(row.id, db, owner)["run"]["can_stop"] is True
   for action in [lambda: routes._row(db, 1, row.id, app_principal),
-                 lambda: asyncio.run(routes.stop_review(1, row.id, db, app_principal)),
-                 lambda: asyncio.run(routes.observe_review(1, row.id, db, app_principal))]:
+                 lambda: asyncio.run(routes.stop_review(1, row.id, db, app_principal))]:
     with pytest.raises(HTTPException) as error:
       action()
     assert error.value.status_code == 404
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.observe_review(1, row.id, db, app_principal))
+  assert error.value.status_code == 403
+  assert error.value.detail["code"] == "details_in_owning_chat"
 
 
 def test_review_stop_from_its_own_chat_refuses_instead_of_ending_the_callers_turn(setup, monkeypatch):
