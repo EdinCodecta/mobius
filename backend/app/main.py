@@ -108,6 +108,7 @@ from app.routes import (
   published_router,
   connect_router,
   keys_router,
+  app_secrets_compat_router,
   projects_router,
   project_copies_router,
   shared_apps_router,
@@ -1064,6 +1065,7 @@ app.include_router(public_apps_router)
 app.include_router(local_services_router)
 app.include_router(connect_router)
 app.include_router(keys_router)
+app.include_router(app_secrets_compat_router)
 app.include_router(browser_access_router)
 app.include_router(client_error_router)
 app.include_router(client_signal_router)

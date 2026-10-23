@@ -6,8 +6,10 @@ HTTPS, so these tests exercise the whole path an app's request takes.
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import json
+import zlib
 import shutil
 import sys
 import tempfile
@@ -42,9 +44,17 @@ class _Echo(BaseHTTPRequestHandler):
       "path": self.path, "headers": dict(self.headers),
       "body": self.rfile.read(length).decode() if length else "",
     }).encode()
+    # Sites may compress even when asked for identity encoding.
+    encoding = {"/v1/gzip": "gzip", "/v1/deflate": "deflate", "/v1/brotli": "br"}.get(self.path)
+    if encoding == "gzip":
+      body = gzip.compress(body)
+    elif encoding == "deflate":
+      body = zlib.compress(body)
     self.send_response(200)
     self.send_header("Content-Type", "text/html")
     self.send_header("Set-Cookie", "tracker=1")
+    if encoding:
+      self.send_header("Content-Encoding", encoding)
     self.send_header("Content-Length", str(len(body)))
     self.end_headers()
     self.wfile.write(body)
@@ -234,3 +244,88 @@ def test_forgetting_an_app_needs_no_vault_when_nothing_was_ever_stored(monkeypat
   monkeypatch.setattr(key_vault, "vault_socket", lambda: tmp_path / "missing.sock")
   with pytest.raises(key_vault.VaultUnavailable):
     asyncio.run(key_vault.forget_app(7))
+
+
+@pytest.mark.parametrize("path", ["/v1/gzip", "/v1/deflate"])
+def test_a_compressed_echo_never_carries_the_key_to_the_app(client, auth, db, vault, path):
+  weather = _app(db, "weather")
+  vault.put_key("echoed", {"value": DUMMY, "inject": ASK["inject"],
+                           "grants": {"apps": [weather.id], "agents": False, "sites": [SITE]}})
+  used = client.get(f"/api/keys/use/echoed/api.example.com{path}", headers=_app_auth(db, weather))
+  assert used.status_code == 200
+  assert DUMMY not in used.text and DUMMY.encode() not in used.content
+  assert json.loads(used.content)["headers"]["Authorization"] == "Bearer [redacted by key vault]"
+  assert "content-encoding" not in used.headers
+
+
+def test_an_encoding_the_vault_cannot_read_is_refused(client, auth, db, vault):
+  weather = _app(db, "weather")
+  vault.put_key("echoed", {"value": DUMMY, "inject": ASK["inject"],
+                           "grants": {"apps": [weather.id], "agents": False, "sites": [SITE]}})
+  refused = client.get("/api/keys/use/echoed/api.example.com/v1/brotli", headers=_app_auth(db, weather))
+  assert refused.status_code == 502 and refused.headers["X-Vault-Denied"] == "1"
+  assert DUMMY not in refused.text
+
+
+# -- the retired per-app secret store ------------------------------------------
+
+def _legacy_secret(app_id, name, value):
+  from app.config import get_settings
+  folder = Path(get_settings().data_dir) / "app-secrets" / str(app_id)
+  folder.mkdir(parents=True, exist_ok=True)
+  (folder / name).write_bytes(key_vault._legacy_fernet().encrypt(value.encode()))
+
+
+def test_saved_app_secrets_move_into_the_vault_once(client, auth, db, vault):
+  import asyncio
+  first, second = _app(db, "first"), _app(db, "second")
+  _legacy_secret(first.id, "api_key", "first-secret")
+  _legacy_secret(second.id, "api_key", "second-secret")   # same name, another app
+  _legacy_secret(second.id, "bot.token", "x")              # dotted and short
+  _legacy_secret(999, "api_key", "orphan-secret")          # a purged app's id
+  live = {first.id, second.id}
+
+  moved = asyncio.run(key_vault.import_legacy_app_secrets(live))
+  assert moved == {
+    f"{first.id}/api_key": "api_key",
+    f"{second.id}/api_key": f"app{second.id}-api_key",
+    f"{second.id}/bot.token": "bot-token",
+  }
+  keys = {k["name"]: k for k in vault.list_keys()}
+  assert keys["api_key"]["grants"]["apps"] == [first.id]
+  assert keys[f"app{second.id}-api_key"]["grants"]["apps"] == [second.id]
+  assert vault.reveal(f"app{second.id}-api_key", ("owner", "")) == "second-secret"
+  # Model providers and the adapter find each app's own value by its old name.
+  assert key_vault.reveal_for_app_platform_use(second.id, "api_key") == "second-secret"
+  assert key_vault.reveal_for_app_platform_use(first.id, "api_key") == "first-secret"
+  assert key_vault.reveal_for_app_platform_use(999, "api_key") is None
+
+  # A key the owner deletes afterwards is never brought back.
+  vault.revoke_key("api_key")
+  assert asyncio.run(key_vault.import_legacy_app_secrets(live)) == {}
+  assert "api_key" not in {k["name"] for k in vault.list_keys()}
+
+
+def test_the_deprecated_secret_routes_use_the_vault(client, auth, db, vault):
+  weather = _app(db, "weather")
+  app_auth = _app_auth(db, weather)
+  path = f"/api/apps/{weather.id}/secrets/provider-key"
+  assert client.head(path, headers=app_auth).status_code == 404
+  saved = client.put(path, headers=app_auth, json={"value": "saved-by-app"})
+  assert saved.status_code == 204 and saved.headers["Deprecation"] == "true"
+  assert client.head(path, headers=app_auth).status_code == 204
+  # No app token reads a value back; the owner and agents still can.
+  assert client.get(path, headers=app_auth).status_code == 403
+  assert client.get(path, headers=_agent_auth(db)).text == "saved-by-app"
+  [record] = vault.list_keys()
+  assert record["name"] == "provider-key" and record["grants"]["apps"] == [weather.id]
+  assert record["grants"]["sites"] == []   # borrowing waits for the owner's sites
+  # Another app cannot touch it.
+  other = _app(db, "other")
+  assert client.head(path, headers=_app_auth(db, other)).status_code == 403
+  # Deleting a shared key only withdraws this app's grant.
+  vault.put_key("provider-key", {"inject": record["inject"],
+                                 "grants": {**record["grants"], "apps": [weather.id, other.id]}})
+  assert client.delete(path, headers=app_auth).status_code == 204
+  assert [k["grants"]["apps"] for k in vault.list_keys()] == [[other.id]]
+  assert client.head(path, headers=app_auth).status_code == 404

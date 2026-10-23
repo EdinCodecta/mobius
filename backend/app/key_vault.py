@@ -15,9 +15,14 @@ platform a small client for it.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
 import logging
 import os
+import re
 import sys
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -128,13 +133,51 @@ async def vault_use(
     raise VaultUnavailable("The key vault is not running.") from exc
 
 
-def app_may_use(app_id: int, name: str) -> bool:
-  """Whether ``name`` exists and the owner granted it to ``app_id``."""
+# -- an app's own key names --------------------------------------------------
+#
+# Before the vault, each app had its own secret namespace, so two apps could
+# both save "api_key". Vault names are shared: an app's name maps to the plain
+# name when that is free, otherwise to an app-scoped one.
+
+_VAULT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+
+def _vault_safe(name: str) -> str:
+  cleaned = re.sub(r"[^A-Za-z0-9_-]", "-", name)
+  if not cleaned[:1].isalpha():
+    cleaned = f"k{cleaned}"
+  return cleaned[:64]
+
+
+def app_key_names(app_id: int, name: str) -> tuple[str, str]:
+  """The plain and the app-scoped vault names for an app's ``name``."""
+  plain = _vault_safe(name)
+  return plain, f"app{int(app_id)}-{plain}"[:64]
+
+
+def granted_key_in(keys: list[dict], app_id: int, name: str) -> str | None:
+  for candidate in app_key_names(app_id, name):
+    if any(k["name"] == candidate and app_id in k["grants"]["apps"] for k in keys):
+      return candidate
+  return None
+
+
+def granted_key_sync(app_id: int, name: str) -> str | None:
+  """The vault key an app's ``name`` refers to, if the owner granted it."""
   try:
     keys = vault_call_sync("GET", "/keys")["keys"]
   except (VaultUnavailable, VaultRefused):
-    return False
-  return any(k["name"] == name and app_id in k["grants"]["apps"] for k in keys)
+    return None
+  return granted_key_in(keys, app_id, name)
+
+
+async def granted_key(app_id: int, name: str) -> str | None:
+  return granted_key_in((await vault_call("GET", "/keys"))["keys"], app_id, name)
+
+
+def app_may_use(app_id: int, name: str) -> bool:
+  """Whether the owner granted ``app_id`` the key its ``name`` refers to."""
+  return granted_key_sync(app_id, name) is not None
 
 
 def reveal_for_app_platform_use(app_id: int, name: str) -> str | None:
@@ -144,14 +187,110 @@ def reveal_for_app_platform_use(app_id: int, name: str) -> str | None:
   example to launch a model runtime an app declared. The app's grant still
   decides, and the vault logs the read as ``platform:app-<id>``.
   """
-  if not app_may_use(app_id, name):
+  key = granted_key_sync(app_id, name)
+  if key is None:
     return None
   try:
     return vault_call_sync(
-      "GET", f"/keys/{name}/value", caller=f"platform:app-{app_id}",
+      "GET", f"/keys/{key}/value", caller=f"platform:app-{app_id}",
     )["value"]
   except (VaultUnavailable, VaultRefused):
     return None
+
+
+async def store_app_key(app_id: int, name: str, value: str) -> str:
+  """Save ``value`` as the key an app's ``name`` refers to; return its name.
+
+  An existing key granted to the app is replaced. A new key is granted to the
+  app and its owner's agents, sent as a bearer token, with no sites yet: the
+  owner adds those before the app can borrow it.
+  """
+  keys = (await vault_call("GET", "/keys"))["keys"]
+  existing = granted_key_in(keys, app_id, name)
+  if existing is not None:
+    record = next(k for k in keys if k["name"] == existing)
+    await vault_call("PUT", f"/keys/{existing}", {
+      "value": value, "inject": record["inject"], "grants": record["grants"],
+    })
+    return existing
+  taken = {k["name"] for k in keys}
+  plain, scoped = app_key_names(app_id, name)
+  target = plain if plain not in taken else scoped
+  await vault_call("PUT", f"/keys/{target}", {
+    "value": value,
+    "inject": {"type": "header", "name": "Authorization", "prefix": "Bearer "},
+    "grants": {"apps": [int(app_id)], "agents": True, "sites": []},
+  })
+  return target
+
+
+# -- one-time import of the retired per-app secret store ----------------------
+
+_LEGACY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_IMPORT_LEDGER = ".vault-import.json"
+
+
+def _legacy_fernet():
+  from cryptography.fernet import Fernet
+  material = f"mobius-app-secret-v1:{get_settings().secret_key}".encode()
+  return Fernet(base64.urlsafe_b64encode(hashlib.sha256(material).digest()))
+
+
+def _write_ledger(path: Path, ledger: dict) -> None:
+  fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+  try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as handle:
+      json.dump(ledger, handle, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+  except BaseException:
+    try:
+      os.unlink(tmp)
+    except FileNotFoundError:
+      pass
+    raise
+
+
+async def import_legacy_app_secrets(live_app_ids: set[int]) -> dict:
+  """Move ``/data/app-secrets/<app>/<name>`` values into the vault, once each.
+
+  Each value becomes the key its app's name refers to (``store_app_key``), so
+  model providers and the deprecated secrets adapter keep finding it. A ledger
+  next to the old files records what moved, so a key the owner later deletes
+  is never re-imported; unreadable values are retried on the next start. The
+  old ciphertext stays in place for one release as a fallback copy.
+  """
+  root = Path(get_settings().data_dir) / "app-secrets"
+  if not root.is_dir():
+    return {}
+  ledger_path = root / _IMPORT_LEDGER
+  try:
+    ledger = json.loads(ledger_path.read_text())
+  except (FileNotFoundError, ValueError):
+    ledger = {}
+  fernet = _legacy_fernet()
+  moved = {}
+  for app_dir in sorted(root.iterdir()):
+    if not app_dir.is_dir() or not app_dir.name.isdigit():
+      continue
+    app_id = int(app_dir.name)
+    if app_id not in live_app_ids:
+      continue  # a purged app's id may be reused: never grant it onward
+    for secret in sorted(app_dir.iterdir()):
+      entry = f"{app_id}/{secret.name}"
+      if entry in ledger or not secret.is_file() or not _LEGACY_NAME_RE.fullmatch(secret.name):
+        continue
+      try:
+        value = fernet.decrypt(secret.read_bytes()).decode()
+        ledger[entry] = await store_app_key(app_id, secret.name, value)
+      except Exception as exc:  # unreadable or refused: retried on the next start
+        log.warning("key vault: could not import secret %s: %s", entry, type(exc).__name__)
+        continue
+      moved[entry] = ledger[entry]
+      _write_ledger(ledger_path, ledger)
+  if moved:
+    log.info("key vault: imported %d app secret(s) into the vault", len(moved))
+  return moved
 
 
 async def forget_app(app_id: int) -> None:
@@ -166,15 +305,38 @@ async def forget_app(app_id: int) -> None:
   await vault_call("DELETE", f"/apps/{int(app_id)}")
 
 
+async def _import_when_ready() -> None:
+  """Run the one-time legacy import once the vault answers."""
+  for _ in range(60):
+    try:
+      await vault_call("GET", "/health")
+      break
+    except VaultUnavailable:
+      await asyncio.sleep(1)
+  else:
+    log.warning("key vault did not start; legacy app secrets stay where they are")
+    return
+  from app import models
+  from app.database import SessionLocal
+  with SessionLocal() as db:
+    live = {row.id for row in db.query(models.App.id).all()}
+  try:
+    await import_legacy_app_secrets(live)
+  except Exception:
+    log.exception("key vault: legacy app-secret import failed; it is retried on the next start")
+
+
 async def supervise_key_vault() -> None:
   """Keep the vault process running for this server's lifetime.
 
   The vault exits on its own when this server's pid stops being its parent,
-  so a crashed server never leaves an orphan holding the socket.
+  so a crashed server never leaves an orphan holding the socket. Once per
+  server start, values from the retired per-app secret store are imported.
   """
   if not VAULT_PROGRAM.is_file():
     log.warning("key vault program missing at %s; Keys stay unavailable", VAULT_PROGRAM)
     return
+  importer = asyncio.create_task(_import_when_ready())
   failures = 0
   log_dir = Path(get_settings().data_dir) / "logs"
   log_dir.mkdir(parents=True, exist_ok=True)
@@ -192,6 +354,7 @@ async def supervise_key_vault() -> None:
     try:
       code = await process.wait()
     except asyncio.CancelledError:
+      importer.cancel()
       await _stop(process)
       raise
     if asyncio.get_running_loop().time() - started >= _HEALTHY_RUN_SECS:

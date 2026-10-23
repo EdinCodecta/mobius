@@ -676,8 +676,8 @@ def validate_manifest_contract(manifest) -> None:
           or url.query or url.fragment or url.params):
         _fail("Manifest `model_provider.base_url` must be an HTTPS API base URL without credentials or query.")
       secret_name = model_provider["secret_name"]
-      if not isinstance(secret_name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", secret_name):
-        _fail("Manifest `model_provider.secret_name` must name the vault key the app asks for (letters, digits, - or _).")
+      if not isinstance(secret_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", secret_name):
+        _fail("Manifest `model_provider.secret_name` must name the key the app asks for.")
     entries = model_provider["models"]
     if not isinstance(entries, list) or not 1 <= len(entries) <= 32:
       _fail("Manifest `model_provider.models` must contain 1–32 models.")

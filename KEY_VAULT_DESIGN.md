@@ -70,10 +70,22 @@ provider names its vault key in `model_provider.secret_name`; the platform
 reads that key at turn launch while the owner's grant to the app stands
 (logged as `platform:app-<id>`).
 
-Open before merge: an importer that moves existing
-`/data/app-secrets/<id>/<name>` values into the vault, granted to their app,
-with no sites until the owner adds them. Without it, installations that saved
-app secrets lose access to them.
+**Upgrade.** Once per server start, after the vault answers, values in
+`/data/app-secrets/<id>/<name>` move into the vault (`import_legacy_app_secrets`):
+each becomes a key granted to its own app and the owner's agents, sent as a
+bearer token, with no sites until the owner adds them. Each app's old name
+maps to the plain vault name when free, otherwise to `app<id>-<name>`; model
+providers and the adapter below resolve names the same way. A ledger
+(`.vault-import.json`) next to the old files means a key the owner deletes is
+never re-imported, unreadable values are retried, and a purged app's leftover
+values are skipped because its id may be reused. The old ciphertext stays in
+place for one release.
+
+**Transition.** For one release, `/api/apps/{id}/secrets/{name}`
+(`routes/app_secrets_compat.py`, marked `Deprecation: true`) answers from the
+vault: apps may still save, check and delete their own values, and the owner
+and agents may read them, but no app token reads a value back (services and
+jobs included); they borrow it through `/api/keys/use`.
 
 ## Future work: sandbox for app server code
 

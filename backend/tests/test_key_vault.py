@@ -253,7 +253,7 @@ def test_redaction_covers_common_echo_encodings():
 
 
 @pytest.mark.parametrize("body, message", [
-  ({"value": "short", "inject": HEADER_SLOT}, "at least"),
+  ({"value": "   ", "inject": HEADER_SLOT}, "can't be empty"),
   ({"value": DUMMY, "inject": {"type": "header", "name": "Host"}}, "can't carry"),
   ({"value": DUMMY, "inject": {"type": "cookie", "name": "k"}}, "header or a query"),
   ({"value": DUMMY, "inject": HEADER_SLOT,
@@ -409,3 +409,17 @@ def test_a_purged_app_loses_every_grant_and_request(vault):
   assert [r["app"] for r in vault.list_requests()] == [9]
   with pytest.raises(kv.VaultError, match="may not use"):
     vault.authorize("echo", ("app", str(WEATHER)), "GET", "echo.example.com", "/anything/x")
+
+
+def test_decoding_is_bounded_and_strips_the_encoding(monkeypatch):
+  import gzip as _gzip
+  headers, body = kv.decoded_body([("Content-Encoding", "gzip"), ("X-A", "1")], _gzip.compress(b"hello"))
+  assert body == b"hello" and headers == [("X-A", "1")]
+  assert kv.decoded_body([("Content-Encoding", "identity")], b"x") == ([], b"x")
+  monkeypatch.setattr(kv, "MAX_RESPONSE_BYTES", 1000)
+  with pytest.raises(kv.VaultError, match="too large"):
+    kv.decoded_body([("Content-Encoding", "gzip")], _gzip.compress(b"a" * 5000))
+  with pytest.raises(kv.VaultError, match="unsupported"):
+    kv.decoded_body([("Content-Encoding", "gzip, br")], b"")
+  with pytest.raises(kv.VaultError, match="could not be decompressed"):
+    kv.decoded_body([("Content-Encoding", "gzip")], b"not gzip")

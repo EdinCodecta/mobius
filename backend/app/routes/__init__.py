@@ -105,6 +105,7 @@ platform_router = _load("platform")
 published_router = _load("published")
 connect_router = _load("connect")
 keys_router = _load("keys")
+app_secrets_compat_router = _load("app_secrets_compat")
 browser_access_router = _load("browser_access")
 projects_router = _load("projects")
 project_copies_router = _load("project_copies")
@@ -163,6 +164,7 @@ __all__ = [
   "published_router",
   "connect_router",
   "keys_router",
+  "app_secrets_compat_router",
   "browser_access_router",
   "projects_router",
   "project_copies_router",

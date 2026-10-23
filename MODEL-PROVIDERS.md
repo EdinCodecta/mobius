@@ -19,10 +19,11 @@ Responses with tool calls; merely offering Chat Completions is insufficient.
 The app owns its setup UI and connection instructions; its key lives in the
 owner's key vault. The app asks for the key named by `secret_name`
 (`POST /api/keys/requests`) and the owner enters and approves it in
-**Settings › Keys**; it is not a manifest value, never passes through the app
-or a chat prompt, and `secret_name` follows vault key names (a letter, then
-letters, digits, `-` or `_`). The models are available while the owner's grant
-to the app stands. At turn launch the platform reads the key for the inference
+**Settings › Keys**; it is not a manifest value and never passes through the
+app or a chat prompt. A name that is not a valid vault name (for example one
+with a dot) maps to one (`api.key` → `api-key`), and when another app already
+uses that name the key is scoped to the app (`app<id>-api-key`). The models
+are available while the owner's grant to the app stands. At turn launch the platform reads the key for the inference
 transport (logged as `platform:app-<id>`) and excludes that environment
 variable from Codex shell tools. The provider app's endpoint receives the
 conversation and tool requests, so installing and connecting one is a

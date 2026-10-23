@@ -46,6 +46,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import zlib
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -61,7 +62,7 @@ HOST_RE = re.compile(
 )
 TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}$")
 METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
-MIN_VALUE_LENGTH = 8
+MIN_VALUE_LENGTH = 1
 MAX_VALUE_LENGTH = 8192
 MAX_KEYS = 200
 MAX_SITES = 50
@@ -111,7 +112,7 @@ def validate_value(value) -> str:
     raise VaultError(400, "The key value must be text.")
   value = value.strip()
   if len(value) < MIN_VALUE_LENGTH:
-    raise VaultError(400, f"The key value must be at least {MIN_VALUE_LENGTH} characters.")
+    raise VaultError(400, "The key value can't be empty.")
   if len(value) > MAX_VALUE_LENGTH:
     raise VaultError(400, "The key value is too long.")
   if any(ch in value for ch in "\r\n\x00"):
@@ -315,6 +316,38 @@ def secret_forms(value: str) -> list[bytes]:
     base64.urlsafe_b64encode(value.encode()).decode().rstrip("="),
   }
   return sorted((f.encode() for f in forms if f), key=len, reverse=True)
+
+
+def decoded_body(headers: list[tuple[str, str]], payload: bytes) -> tuple[list[tuple[str, str]], bytes]:
+  """The response as plain bytes, so redaction sees what the caller will see.
+
+  The vault asks for identity encoding, but a site may compress anyway, and a
+  compressed echo of the key would slip past redaction only to be inflated by
+  the caller. gzip and deflate are decoded here (bounded like any response);
+  any other encoding is refused rather than forwarded.
+  """
+  encodings = [
+    token.strip().lower()
+    for name, value in headers if name.lower() == "content-encoding"
+    for token in value.split(",") if token.strip()
+  ]
+  encodings = [token for token in encodings if token != "identity"]
+  plain = [(name, value) for name, value in headers if name.lower() != "content-encoding"]
+  if not encodings:
+    return plain, payload
+  if len(encodings) > 1 or encodings[0] not in ("gzip", "x-gzip", "deflate"):
+    raise VaultError(502, f"The site answered with an unsupported encoding ({', '.join(encodings)}).")
+  # wbits 47 accepts gzip or zlib framing; raw deflate needs -15.
+  for wbits in ((47,) if encodings[0] != "deflate" else (15, -15)):
+    inflater = zlib.decompressobj(wbits)
+    try:
+      body = inflater.decompress(payload, MAX_RESPONSE_BYTES + 1)
+    except zlib.error:
+      continue
+    if len(body) > MAX_RESPONSE_BYTES or inflater.unconsumed_tail:
+      raise VaultError(502, "The response is too large for the key vault.")
+    return plain, body
+  raise VaultError(502, "The site sent a response that could not be decompressed.")
 
 
 def redact(data: bytes, forms: list[bytes]) -> bytes:
@@ -934,7 +967,8 @@ class VaultHandler(BaseHTTPRequestHandler):
         payload = response.read(MAX_RESPONSE_BYTES + 1)
         if len(payload) > MAX_RESPONSE_BYTES:
           raise VaultError(502, "The response is too large for the key vault.")
-        return response.status, response.reason, response.getheaders(), payload
+        headers, payload = decoded_body(response.getheaders(), payload)
+        return response.status, response.reason, headers, payload
       finally:
         connection.close()
     except VaultError:

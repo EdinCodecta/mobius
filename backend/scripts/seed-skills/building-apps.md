@@ -487,6 +487,8 @@ A service or job does the same with its `APP_TOKEN` against `$API_BASE_URL`. The
 
 An agent setting an app up saves a key the owner provides through a sealed card (`python3 /data/platform/backend/scripts/store-key.py NAME --site HOST:METHODS:PATHS` as the consumer) and tests it by borrowing it the same way (`mapi /api/keys/use/NAME/<host>/<path>`). Read the value (`GET /api/keys/<name>/value`) only when a tool needs the raw key, and never print it: command output stays in the chat log. Approving an app's request stays the owner's decision in Settings; an agent replacing an existing key notifies the owner.
 
+The old `/api/apps/{id}/secrets/{name}` routes still answer for one release, deprecated, on top of the vault: an app can save, check and delete its own values there, but nothing reads one back with an app token. Move to the handshake above.
+
 ### Concurrent writers — compare-and-swap, not last-write-wins
 
 `set()` is last-write-wins: the last PUT clips whatever landed between your read and your write. That silently drops edits on any file **several writers touch** — the agent (a chat turn) + cron + the open UI all appending to one `topics.txt`, `index.json`, or a per-day log. When more than one writer shares a mutable file, compare-and-swap instead:
