@@ -814,12 +814,16 @@ capability; it is the content address of the applied compiled bundle. It is
 computed once per (runtime revision, bundle) pair, never from the editable
 manifest, and a missing runtime cache is reported as unadmitted rather than
 rebuilt during serialization. The frame verifies the transferred module bytes
-against that SHA-256 before evaluation and fails closed, including offline or
-without WebCrypto. An admitted module that does not export
+against that SHA-256 before evaluation; without a digest or WebCrypto it does
+not run the module. That integrity check also applies offline, but admission
+then reflects the last digest the shell received: a cached app list and frame
+can run cached, admitted bytes, so a revocation takes effect once the shell
+reaches the server again. An admitted module that does not export
 `appBlockSessions = true` is never mounted as its ordinary view on this path;
 the block falls back to an explicit, visible open.
 
-Each frame document has a host-assigned generation. Negotiation, reported state
+Each frame document has a host-assigned generation, echoed by the frame in
+`frame-mounted` and every `app-block-state`. Negotiation, reported state
 and owner events are bound to it; a reload or version promotion resets idle
 controls, and an idle session released offscreen keeps nothing. A document that
 reports `retain` (an unacknowledged event, a confirmation, an operation in

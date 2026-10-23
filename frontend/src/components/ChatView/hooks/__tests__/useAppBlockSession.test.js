@@ -5,6 +5,7 @@ import test from 'node:test'
 import { renderHook } from './react-hook-shim.mjs'
 import useAppBlockSession from '../useAppBlockSession.js'
 import { appBlockFromToken } from '../../markdown/appBlock.js'
+import { createBlockDocuments, forwardBlockState } from '../../../AppCanvas/appBlockSessionHost.js'
 
 const block = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.stringify({
   app: 'example', intent: 'open:a', title: 'Fix', interaction: 'inline',
@@ -118,4 +119,35 @@ test('an unsupported revision unmounts the hidden frame and stays static', () =>
   h.rerender({ block, near: true })
   assert.equal(h.result.current.supported, false, 'scrolling does not remount an unsupported session')
   assert.equal(h.result.current.frameMounted, false)
+})
+
+test('through the AppCanvas route, an old document cannot resurrect Confirm after a same-iframe reload', () => {
+  const { h, capability } = mounted()
+  const documents = createBlockDocuments()
+  const deliver = message => forwardBlockState({ message: { type: 'moebius:app-block-state',
+    sessionId: h.result.current.sessionId, ...message }, session: h.result.current.blockSession,
+  document: documents.get('v1'), isLive: true, onState: h.result.current.onBlockState })
+  const confirming = { actions: [{ key: 'send:b', confirming: true, confirmation: [{ title: 'Old target', facts: [] }] }] }
+  const old = documents.load('v1')
+  documents.mounted('v1', { supportsAppBlocks: true, blockGeneration: old.generation })
+  capability(true, old.generation)
+  assert.equal(deliver({ generation: old.generation, ...confirming }), true)
+  h.result.current.dispatch('send:b', 'cancel')
+  const cancel = h.result.current.event
+  deliver({ generation: old.generation, actions: [{ key: 'send:b', label: 'Send' }], ackNonce: cancel.nonce })
+  assert.equal(h.result.current.state.actions[0].confirming, false)
+
+  // Reload: same window, new document. Its predecessor's queued reports follow.
+  const next = documents.load('v1')
+  capability(null, next.generation)
+  assert.equal(documents.mounted('v1', { supportsAppBlocks: true, blockGeneration: old.generation }), null,
+    'the old mount report does not negotiate for the new document')
+  documents.mounted('v1', { supportsAppBlocks: true, blockGeneration: next.generation })
+  capability(true, next.generation, false)
+  for (const generation of [old.generation, undefined, next.generation + 1]) {
+    assert.equal(deliver({ generation, ...confirming, ackNonce: cancel.nonce }), false)
+  }
+  assert.equal(h.result.current.state, null, 'no old Confirm and no old acknowledgement')
+  assert.equal(deliver({ generation: next.generation, actions: [{ key: 'send:b', label: 'Send' }] }), true)
+  assert.equal(h.result.current.state.actions[0].confirming, false)
 })

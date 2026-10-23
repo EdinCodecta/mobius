@@ -255,6 +255,7 @@ test('the app block-session handle mirrors the init envelope and stamps its own 
   on.api.setState({ actions: [{ key: 'run:1', busy: true }], type: 'forged', sessionId: 'other' })
   assert.equal(on.parent.posted[0].message.type, 'moebius:app-block-state')
   assert.equal(on.parent.posted[0].message.sessionId, 's')
+  assert.equal(on.parent.posted[0].message.generation, 4, 'the handle stamps its own document generation')
   assert.equal(on.parent.posted[0].origin, 'https://mobius.test')
   assert.equal(on.makeApi({ sessionId: 's' }), null, 'an envelope without a generation is not a session')
 })

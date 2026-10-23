@@ -14,6 +14,7 @@ export const SESSION_LIMITS = Object.freeze({
 const SESSION_TONES = new Set(['neutral', 'success', 'attention', 'danger'])
 const RECOVERY_ERROR = 'This app session needs recovery. Open the app to check the result before trying again.'
 export const INCOMPLETE_CONFIRMATION = 'Open the app to review this action. Its full current identity is unavailable here.'
+export const AMBIGUOUS_CONFIRMATION = 'Open the app to review these actions. More than one is asking for confirmation at once.'
 
 const checkpointId = value => typeof value === 'string' && value.length >= 1 && value.length <= SESSION_LIMITS.checkpointId
 const tone = value => SESSION_TONES.has(value) ? value : 'neutral'
@@ -44,7 +45,8 @@ export function confirmationOf(value) {
 }
 
 function sessionAction(raw) {
-  const confirming = raw.confirming === true
+  // A hidden control cannot be the one the owner confirms.
+  const confirming = raw.confirming === true && raw.hidden !== true
   const confirmation = confirming ? confirmationOf(raw.confirmation) : null
   const incomplete = confirming && !confirmation
   return {
@@ -72,6 +74,14 @@ export function sessionState(message, sessionId, keys) {
     if (!raw || !keys.has(raw.key) || seen.has(raw.key)) continue
     seen.add(raw.key)
     actions.push(sessionAction(raw))
+  }
+  // One confirmation at a time: the host shows one app-sourced list beside
+  // one Confirm. Several confirming actions are ambiguous, so none can confirm.
+  if (actions.filter(action => action.confirming).length > 1) {
+    for (const action of actions) {
+      if (!action.confirming) continue
+      Object.assign(action, { confirmation: null, disabled: true, note: AMBIGUOUS_CONFIRMATION })
+    }
   }
   return {
     actions, notice: shortText(message.notice, SESSION_LIMITS.notice), summary: shortText(message.summary, SESSION_LIMITS.summary),

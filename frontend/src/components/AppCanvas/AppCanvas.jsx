@@ -52,7 +52,7 @@ import {
 } from './appFrameProtocol.js'
 import { useManagedAppFrameForwarding } from '../../hooks/useManagedAppEvents.js'
 import {
-  acceptsBlockState, blockEventDelivery, blockSessionEnvelope, createBlockDocuments, hostRequestAllowed,
+  blockEventDelivery, blockSessionEnvelope, createBlockDocuments, forwardBlockState, hostRequestAllowed,
 } from './appBlockSessionHost.js'
 import { writeClipboardText } from '../../runtime/clipboard.js'
 import { finishAppFileExport } from '../../lib/appFileExport.js'
@@ -236,9 +236,9 @@ function AppFileExportDialog({ appName, themeColor, request, onCancel, onConfirm
 //   6b. moebius:app-block-init / app-block-action / app-block-state
 //      Optional transcript block session (building-apps.md "Passive block
 //      sessions"). frame-init carries the `blockSession` envelope stamped with
-//      the document generation; state is accepted only from the live document
-//      whose frame-mounted reported support; each owner event is posted once,
-//      to the generation it was dispatched for. It grants no app authority.
+//      the document generation; frame-mounted (`blockGeneration`) and every
+//      app-block-state must name that exact generation, or they are dropped;
+//      each owner event is posted once, to the generation it was dispatched for. It grants no app authority.
 //
 //   7. moebius:capability-*                                bidirectional
 //      One versioned session protocol for every host-mediated browser feature.
@@ -966,11 +966,9 @@ const AppCanvas = forwardRef(function AppCanvas({
       if (srcVersion == null) return   // not one of our frames (stale/unknown)
 
       if (msg.type === 'moebius:app-block-state') {
-        const blockDocument = blockDocumentsRef.current.get(srcVersion)
-        if (acceptsBlockState({ message: msg, session: blockSessionRef.current, document: blockDocument,
-          isLive: srcVersion === liveVersionRef.current })) {
-          onBlockStateRef.current?.(msg, { generation: blockDocument.generation })
-        }
+        forwardBlockState({ message: msg, session: blockSessionRef.current,
+          document: blockDocumentsRef.current.get(srcVersion), isLive: srcVersion === liveVersionRef.current,
+          onState: onBlockStateRef.current })
         return
       }
 
@@ -998,9 +996,11 @@ const AppCanvas = forwardRef(function AppCanvas({
       // frame-mounted: the reducer routes it — promotion if it's the incoming
       // frame, first-load settle if it's the live frame, ignored if stale.
       if (msg.type === 'moebius:frame-mounted' && String(msg.appId) === String(appId)) {
+        // A session canvas trusts only the report of the document it loaded last.
+        if (blockSessionRef.current && !blockDocumentsRef.current.mounted(srcVersion, msg)) return
         const nav = frameNavRef.current.get(srcVersion)
         if (nav) nav.mounted = true
-        if (blockDocumentsRef.current.mounted(srcVersion, msg.supportsAppBlocks) && blockSessionRef.current) {
+        if (blockSessionRef.current) {
           setBlockDocumentRevision(value => value + 1)
           if (srcVersion === liveVersionRef.current) publishBlockCapability(srcVersion)
           // The outgoing document may still own an active or unknown

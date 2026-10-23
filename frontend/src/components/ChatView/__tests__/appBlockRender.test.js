@@ -6,7 +6,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import AppBlock from '../markdown/AppBlock.jsx'
 import { AppBlockView } from '../markdown/AppBlockParts.jsx'
-import { SessionConfirmation, SessionControls } from '../markdown/PassiveAppBlock.jsx'
+import { PassiveBlockView, SessionConfirmation, SessionControls } from '../markdown/PassiveAppBlock.jsx'
+import { sessionState } from '../markdown/appBlockSession.js'
 import { appBlockFromToken } from '../markdown/appBlock.js'
 import { appQueries } from '../../../hooks/queries.js'
 
@@ -133,9 +134,44 @@ test('the confirmation lists exactly the app-supplied items and marks conversati
   assert.match(html, /Example will act on:/)
   assert.equal((html.match(/<li>/g) || []).length, 2)
   assert.match(html, /owner\/repo → main/)
-  assert.match(html, /The title and details above come from the conversation, not from Example\./)
+  assert.match(html, /The saved title and details above come from the conversation\. The list below comes from Example\.[^]*will act on:/,
+    'the provenance note precedes, and so does not disclaim, the app list')
   const incomplete = renderToStaticMarkup(createElement(SessionConfirmation, { appName: 'Example',
     action: live({ confirming: true, disabled: true, note: 'Open the app to review this action. Its full current identity is unavailable here.' }) }))
   assert.match(incomplete, /Its full current identity is unavailable here/)
   assert.doesNotMatch(incomplete, /<li>/)
+})
+
+function passiveView(actions) {
+  const block = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.stringify({ ...base, interaction: 'inline',
+    action: { label: 'Send all', intent: 'send-batch:sel-1' },
+    items: [{ title: 'Row A', intent: 'open:a', action: { label: 'Send A', intent: 'send:a' } },
+      { title: 'Row B', intent: 'open:b', action: { label: 'Send B', intent: 'send:b' } }] }) })
+  const state = sessionState({ type: 'moebius:app-block-state', sessionId: 's', actions },
+    's', new Set(['send-batch:sel-1', 'send:a', 'send:b']))
+  return renderToStaticMarkup(createElement(PassiveBlockView, { block, app: admitted[0], state, locked: false, onEvent() {} }))
+}
+const target = title => ({ confirming: true, confirmation: [{ title, facts: [{ label: 'Version', value: title }] }] })
+const enabledConfirms = html => (html.match(/class="md-app-block__action">Confirm</g) || []).length
+
+test('the one confirming action shows its own app list beside the only enabled Confirm', () => {
+  const html = passiveView([{ key: 'send-batch:sel-1', label: 'Send all' }, { key: 'send:a', ...target('Target A') }, { key: 'send:b', label: 'Send B' }])
+  assert.equal(enabledConfirms(html), 1)
+  assert.match(html, /Target A/)
+})
+
+test('several confirming actions are ambiguous: no Confirm is enabled and no list is shown', () => {
+  for (const first of [target('Target A'), { confirming: true, confirmation: [] }, { ...target('Target A'), hidden: true }]) {
+    const html = passiveView([{ key: 'send:a', ...first }, { key: 'send:b', ...target('Target B') }])
+    if (first.hidden) {
+      // A hidden control cannot confirm, so the visible second one is the only confirmation.
+      assert.equal(enabledConfirms(html), 1)
+      assert.match(html, /Target B/)
+      assert.doesNotMatch(html, /Target A/)
+      continue
+    }
+    assert.equal(enabledConfirms(html), 0)
+    assert.doesNotMatch(html, /Target A|Target B/)
+    assert.match(html, /More than one is asking for confirmation at once/)
+  }
 })

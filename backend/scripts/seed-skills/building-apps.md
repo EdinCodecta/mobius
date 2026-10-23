@@ -490,8 +490,14 @@ A message for another session or document `generation`, or for a module without
 the export, is stopped before any app listener sees it. A reload or app update
 starts a new generation; the previous document's controls are discarded.
 
-Report state with `setState(state)` or by posting
-`{type:'moebius:app-block-state', sessionId, ...state}` to the parent:
+Report state with `setState(state)`, which stamps `type`, `sessionId` and
+`generation` for you, or by posting
+`{type:'moebius:app-block-state', sessionId, generation, ...state}` to the
+parent yourself. `generation` must be the number from this document's
+`blockSession` (the same value every `app-block-init` carries). A reload keeps
+the frame's window, so the host cannot tell documents apart by sender: it drops
+any report with a missing, older or newer generation, acknowledgements
+included.
 
 - `actions`: up to 24 `{key, label?, disabled?, busy?, hidden?, confirming?,
   confirmation?, note?, tone?, status?, statusTone?, links?, badges?}`, one
@@ -519,7 +525,10 @@ Report state with `setState(state)` or by posting
 **Confirmation contract.** To ask for Confirm, report the action with
 `confirming: true` and `confirmation`: the complete, current list of what
 Confirm will do, `[{title, facts: [{label, value}]}]` with 1-256 items, at most
-8 facts each and every text 1-512 characters. Describe the exact targets and
+8 facts each and every text 1-512 characters. Only one action may be
+confirming at a time, and a `hidden` action never is: if two or more report
+`confirming: true`, the host enables no Confirm, shows no list, and asks the
+reader to open the app. Describe the exact targets and
 versions your app will act on now, from your own data, not the block's saved
 snapshot. The host shows every item, hides the block's saved badges unless you
 supply `badges`, and says the saved title and details come from the

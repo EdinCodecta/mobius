@@ -55,20 +55,35 @@ export function SessionControls({ target, state, locked, onEvent }) {
   </div>
 }
 
-/** What Confirm will do, exactly as the app supplied it, and which text on
- *  the block came from the conversation instead. */
+/** What Confirm will do, exactly as the app supplied it. The provenance note
+ *  comes first: it describes the saved snapshot, not the app's list. */
 export function SessionConfirmation({ action, appName }) {
   if (!action) return null
   return <div className="md-app-block__confirmation" role="group" aria-label={`Confirm with ${appName}`}>
+    <p className="md-app-block__provenance" role="note">
+      {`The saved title and details above come from the conversation. The list below comes from ${appName}.`}</p>
     {action.confirmation
       ? <><strong>{appName} will act on:</strong><ul>{action.confirmation.map((item, i) => <li key={i}>
         <span>{item.title}</span>
         <dl>{item.facts.map((fact, j) => <div key={j}><dt>{fact.label}</dt><dd>{fact.value}</dd></div>)}</dl>
       </li>)}</ul></>
       : <p role="status">{action.note}</p>}
-    <p className="md-app-block__provenance" role="note">
-      {`The title and details above come from the conversation, not from ${appName}.`}</p>
   </div>
+}
+
+/** The passive block for one parsed session state. The parser allows at most
+ *  one enabled confirmation, and this is the action whose list is shown. */
+export function PassiveBlockView({ block, app, state, locked, onEvent, onInternalNav, sectionRef = null, children = null }) {
+  const actionState = key => state?.actions.find(action => action.key === key) || null
+  const actionFor = target => target
+    ? <SessionControls target={target} state={actionState(target.intent)} locked={locked} onEvent={onEvent} />
+    : null
+  return <AppBlockLayout block={sessionSnapshot(block, state)} app={app} onInternalNav={onInternalNav}
+    actionFor={actionFor} summary={state?.summary || ''} sectionRef={sectionRef}>
+    <SessionConfirmation action={state?.actions.find(action => action.confirming)} appName={app.name} />
+    {state?.notice ? <p className="md-app-block__notice" role="status">{state.notice}</p> : null}
+    {children}
+  </AppBlockLayout>
 }
 
 function SessionHost({ app, session, onHostRequest }) {
@@ -94,15 +109,9 @@ export default function PassiveAppBlock({ block, app, onInternalNav }) {
     return <StaticAppBlock block={block} app={app} appsLoading={false} onInternalNav={onInternalNav} sectionRef={sectionRef} />
   }
   const { state } = session
-  const actionState = key => state?.actions.find(action => action.key === key) || null
   const locked = session.awaitingAck || Boolean(state?.actions.some(action => action.busy))
-  const actionFor = target => target
-    ? <SessionControls target={target} state={actionState(target.intent)} locked={locked} onEvent={session.dispatch} />
-    : null
-  return <AppBlockLayout block={sessionSnapshot(block, state)} app={app} onInternalNav={onInternalNav}
-    actionFor={actionFor} summary={state?.summary || ''} sectionRef={sectionRef}>
-    <SessionConfirmation action={state?.actions.find(action => action.confirming)} appName={app.name} />
-    {state?.notice ? <p className="md-app-block__notice" role="status">{state.notice}</p> : null}
+  return <PassiveBlockView block={block} app={app} state={state} locked={locked} onEvent={session.dispatch}
+    onInternalNav={onInternalNav} sectionRef={sectionRef}>
     {session.frameMounted ? <SessionHost app={app} session={session} onHostRequest={onHostRequest} /> : null}
-  </AppBlockLayout>
+  </PassiveBlockView>
 }

@@ -113,7 +113,7 @@ test('a passive session drives an in-place Confirm through the real frame protoc
   expect(Math.round(confirmBox.height)).toBe(Math.round(box.height))
   expect(Math.abs(confirmBox.x + confirmBox.width - (box.x + box.width))).toBeLessThan(2)
   await expect(block.locator('.md-app-block__confirmation')).toContainText('fixture/repo: Change one')
-  await expect(block.locator('.md-app-block__confirmation')).toContainText('come from the conversation, not from Block Session')
+  await expect(block.locator('.md-app-block__confirmation')).toContainText('The list below comes from Block Session')
   await expect(block.locator('.md-app-block__badge')).toHaveCount(0)
 
   // Foreign or stale-generation messages never reach the app's own listener.
@@ -146,9 +146,13 @@ test('a document reload discards idle controls until the new document reports', 
     title: 'Reload me', interaction: 'inline', action: { label: 'Send', intent: 'send:one' } }) })
   const block = chat.locator('.md-app-block')
   await expect(block.locator('footer .md-app-block__action')).toHaveText('Send')
+  // An idle Confirm belongs to its document; a reload must not carry it over.
+  await block.locator('footer .md-app-block__action').click()
+  await expect(block.locator('footer .md-app-block__action')).toHaveText('Confirm')
   const frame = await sessionFrame(page)
   const before = Number(await frame.locator('#block-log').getAttribute('data-generation'))
   await frame.evaluate(() => location.reload())
+  await expect(block.getByRole('button', { name: 'Confirm' })).toHaveCount(0)
   const next = await sessionFrame(page)
   await expect.poll(async () => Number(await next.locator('#block-log').getAttribute('data-generation').catch(() => before)))
     .toBeGreaterThan(before)

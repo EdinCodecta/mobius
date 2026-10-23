@@ -13,9 +13,16 @@ test('every frame load is a new, never-reused document generation', () => {
   const remounted = createBlockDocuments().load('v1')
   assert.ok(remounted.generation > successor.generation, 'a remounted canvas never reuses a generation')
   assert.equal(documents.get('v1'), reload)
-  assert.equal(documents.mounted('v1', 'yes').supported, false, 'only an explicit true is support')
-  assert.equal(documents.mounted('v2', true).supported, true)
-  assert.equal(documents.mounted('gone', true), null)
+  const mount = (document, supportsAppBlocks) => ({ supportsAppBlocks, blockGeneration: document.generation })
+  assert.equal(documents.mounted('v1', mount(reload, 'yes')).supported, false, 'only an explicit true is support')
+  assert.equal(documents.mounted('v2', mount(successor, true)).supported, true)
+  assert.equal(documents.mounted('gone', mount(successor, true)), null)
+  // A same-iframe reload keeps the window: the old document's queued report
+  // (or one naming no or a future generation) never sets the new support.
+  for (const blockGeneration of [first.generation, undefined, null, reload.generation + 100]) {
+    assert.equal(documents.mounted('v1', { supportsAppBlocks: true, blockGeneration }), null)
+  }
+  assert.equal(documents.get('v1').supported, false)
   documents.delete('v2')
   assert.equal(documents.get('v2'), null)
 })
@@ -31,11 +38,15 @@ test('the init envelope carries the session and its document generation, nothing
 test('state is accepted only from the live supporting document for this session', () => {
   const session = { sessionId: 's' }
   const document = { generation: 2, supported: true }
-  const message = { sessionId: 's' }
+  const message = { sessionId: 's', generation: 2 }
   assert.equal(acceptsBlockState({ message, session, document, isLive: true }), true)
+  for (const generation of [undefined, 1, 3, '2']) {
+    assert.equal(acceptsBlockState({ message: { ...message, generation }, session, document, isLive: true }), false,
+      `generation ${generation} is not this document`)
+  }
   assert.equal(acceptsBlockState({ message, session, document, isLive: false }), false)
   assert.equal(acceptsBlockState({ message, session, document: { generation: 2, supported: null }, isLive: true }), false)
-  assert.equal(acceptsBlockState({ message: { sessionId: 'other' }, session, document, isLive: true }), false)
+  assert.equal(acceptsBlockState({ message: { sessionId: 'other', generation: 2 }, session, document, isLive: true }), false)
   assert.equal(acceptsBlockState({ message, session: null, document, isLive: true }), false)
 })
 

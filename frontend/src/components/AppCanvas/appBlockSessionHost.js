@@ -17,11 +17,14 @@ export function createBlockDocuments() {
       documents.set(version, document)
       return document
     },
-    /** The document's own frame-mounted report. */
-    mounted(version, supported) {
+    /** A frame-mounted report counts only if it names this exact document
+     *  generation: a reload keeps the iframe's window, so the sender alone
+     *  cannot tell an old document's queued report from its successor's. */
+    mounted(version, message) {
       const document = documents.get(version)
-      if (document) document.supported = supported === true
-      return document || null
+      if (!document || message?.blockGeneration !== document.generation) return null
+      document.supported = message.supportsAppBlocks === true
+      return document
     },
     get(version) { return documents.get(version) || null },
     delete(version) { documents.delete(version) },
@@ -36,10 +39,20 @@ export function blockSessionEnvelope(session, generation) {
     recoveryError: session.recoveryError ?? null }
 }
 
-/** Whether app-reported state from `document` may reach the block host. */
+/** Whether app-reported state may reach the block host: it must come from
+ *  the live supporting document and name that document's exact generation.
+ *  Missing, older and future generations are dropped, never relabelled. */
 export function acceptsBlockState({ message, session, document, isLive }) {
   return Boolean(isLive && session && document?.supported === true
-    && message?.sessionId === session.sessionId)
+    && message?.sessionId === session.sessionId && message.generation === document.generation)
+}
+
+/** AppCanvas's app-block-state route: forward only an accepted report, with
+ *  the generation the frame itself named. */
+export function forwardBlockState({ message, session, document, isLive, onState }) {
+  if (!acceptsBlockState({ message, session, document, isLive })) return false
+  onState?.(message, { generation: message.generation })
+  return true
 }
 
 /** The owner event to post to the live document, once per nonce. */

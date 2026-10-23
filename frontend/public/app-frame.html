@@ -655,7 +655,9 @@
     //      generation, actions, checkpoint, retain, recoveryError}. Only a
     //      server-admitted revision whose bytes match _FRAME_PASSIVE_BLOCK_DIGEST
     //      and whose module exports `appBlockSessions = true` mounts; it gets
-    //      props.blockSession. frame-mounted reports supportsAppBlocks. Parent
+    //      props.blockSession. frame-mounted reports supportsAppBlocks and the
+    //      document's blockGeneration; app-block-state must carry the same
+    //      generation (setState stamps it). Parent
     //      app-block-init/app-block-action messages reach app listeners only for
     //      this exact session and document generation; any other is stopped
     //      here, before app code can see it.
@@ -1151,7 +1153,8 @@
         },
         setState(state) {
           window.parent.postMessage(
-            Object.assign({}, state, { type: 'moebius:app-block-state', sessionId: session.sessionId }),
+            Object.assign({}, state, { type: 'moebius:app-block-state', sessionId: session.sessionId,
+              generation: session.generation }),
             window.location.origin
           );
         },
@@ -1287,7 +1290,8 @@
       if (!node || window.__frameMounted) return;
       window.__frameMounted = true;
       window.parent.postMessage(
-        { type: 'moebius:frame-mounted', appId: _FRAME_APP_ID, supportsAppBlocks },
+        { type: 'moebius:frame-mounted', appId: _FRAME_APP_ID, supportsAppBlocks,
+          blockGeneration: currentBlockSession ? currentBlockSession.generation : null },
         window.location.origin
       );
     }

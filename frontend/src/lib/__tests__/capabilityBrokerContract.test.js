@@ -47,11 +47,13 @@ function frameMountSignal(version, queue, supportsAppBlocks = false) {
     'createElement',
     '_FRAME_APP_ID',
     'supportsAppBlocks',
+    'currentBlockSession',
     `${extractFunction(frame, 'signalFrameMounted')}\n`
       + `${extractFunction(frame, 'MountSignal')}\n`
       + 'return MountSignal',
   )
-  return { source, mount: factory(frameWindow, createElement, '42', supportsAppBlocks) }
+  return { source, mount: factory(frameWindow, createElement, '42', supportsAppBlocks,
+    supportsAppBlocks ? { generation: 7 } : null) }
 }
 
 test('speech startup watchdog tracks progress and ends when model loading completes', () => {
@@ -147,6 +149,7 @@ test('a committed module reports whether it supports transcript block sessions',
     assert.equal(queue.length, 1)
     assert.equal(queue[0].message.type, 'moebius:frame-mounted')
     assert.equal(queue[0].message.supportsAppBlocks, supported)
+    assert.equal(queue[0].message.blockGeneration, supported ? 7 : null, 'the report names its own document')
   }
 })
 

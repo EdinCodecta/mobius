@@ -14,7 +14,9 @@ function Session({ blockSession }) {
     const publish = () => {
       const state = owner.current
       window.parent.postMessage({
-        type: 'moebius:app-block-state', sessionId: blockSession.sessionId, ackNonce: state.ack,
+        // Every report names this document's generation; the host drops others.
+        type: 'moebius:app-block-state', sessionId: blockSession.sessionId, generation: blockSession.generation,
+        ackNonce: state.ack,
         retain: Boolean(state.confirming), summary: `Sent ${state.sent}`,
         actions: blockSession.actions.map(action => ({
           key: action.key, label: action.label, status: state.sent ? 'Sent' : 'Ready',
