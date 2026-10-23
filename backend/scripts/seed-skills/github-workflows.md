@@ -121,6 +121,10 @@ unmerged PR or unchanged projection does not prove a push or merge was never
 applied. If exact nonapplication cannot be proved, there is currently no safe
 self-service release of that old receipt: stop and request owner-supervised
 recovery rather than resetting it or replaying the write.
+For an unidentified legacy fork head, the repository-scoped fence cannot
+identify the same fork branch across different base repositories; do not
+interpret an unrelated-repository admission as proof that old uncertainty
+is settled.
 Pending checks/queues remain owned by the existing
 conversation's durable Wait; these routes do not create automatic waits.
 For an opted-in public-review grant, `/outcomes` publishes only when the agent explicitly sends `publish: true` with a deliberate public verdict. Owner questions and blocked verification use `publish: false` (the default), remain private, and do not post. Once armed, verdict evidence is immutable. Another grant for the same PR/head cannot post while an earlier posting/unknown/posted receipt exists; open the named holding run and observe it read-only. Lists retain full findings and frozen prompts for the owning app or owner. Foreign rows remain privacy-minimized; any bounded navigation summary explicitly marks omitted text.

@@ -902,7 +902,10 @@ async def repair_checkout(app_id: int | None, run_id: str, body: RepairCheckout,
   _parent(db, row, principal)
   async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
     db.refresh(row)
-    await settled.run_settled(repair_actions.sweep_checkout_receipts_once)
+    try:
+      await settled.run_settled(repair_actions.sweep_checkout_receipts_once)
+    except Exception:
+      _log.exception("repair checkout GC failed before checkout preparation for review run %s", run_id)
     target = _target(row, body)
     previous = row.outcomes_json.get(reviews.key(target), {})
     if previous.get("merge_attempted") or previous.get("state") in {"merged", "queued", "merge_unknown"}:
