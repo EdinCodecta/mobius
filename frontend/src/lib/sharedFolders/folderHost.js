@@ -141,7 +141,7 @@ export async function handleSharedFolderCommand(event) {
   if (shown) showActivity(record, event)
   let answer
   try {
-    const result = await runCommand(record, event)
+    const result = await runCommand(event)
     answer = { ok: true, result }
   } catch (error) {
     const known = error instanceof FolderError
@@ -157,23 +157,34 @@ export async function handleSharedFolderCommand(event) {
   await api.sharedFolders.respond({ subscriptionId, commandId: event.commandId, ...answer }).catch(() => {})
 }
 
-async function runCommand(record, event) {
-  if (!record) throw new FolderError('not_found', 'This folder is no longer shared from this browser.')
-  const state = folderState(record)
-  if (state !== 'ready') throw new FolderError(state, notReadyMessage(state))
-  const editing = EDIT_OPERATIONS.has(event.op)
-  if (editing && (record.mode !== 'edit' || record.access !== 'remembered')) {
-    throw new FolderError('read_only', 'This folder is shared as Read only.')
-  }
+async function runCommand(event) {
   const command = { ...event }
   delete command.type
   delete command.commandId
   delete command.folderId
-  const folder = hostStore().access.get(record.id)
-  if (!editing) return folder.run(command)
+  if (!EDIT_OPERATIONS.has(event.op)) return allowedFolder(event.folderId, false).run(command)
   // A change checks its destination, then writes it. One change at a time per
   // folder, across this browser's tabs, so two can never claim the same name.
-  return navigator.locks.request(`mobius-shared-folder:${record.id}`, () => folder.run(command))
+  // The owner can pause, remove or narrow the folder while a change waits, so
+  // its rights are checked once it holds the lock. The callback is async so a
+  // refusal rejects its promise: Node 24 keeps a lock whose callback throws.
+  return navigator.locks.request(
+    `mobius-shared-folder:${event.folderId}`,
+    async () => allowedFolder(event.folderId, true).run(command),
+  )
+}
+
+/** The folder's access as it stands now, or the reason it is refused. */
+function allowedFolder(folderId, editing) {
+  const store = hostStore()
+  const record = store.records.get(folderId)
+  if (!record) throw new FolderError('not_found', 'This folder is no longer shared from this browser.')
+  const state = folderState(record)
+  if (state !== 'ready') throw new FolderError(state, notReadyMessage(state))
+  if (editing && (record.mode !== 'edit' || record.access !== 'remembered')) {
+    throw new FolderError('read_only', 'This folder is shared as Read only.')
+  }
+  return store.access.get(record.id)
 }
 
 function notReadyMessage(state) {

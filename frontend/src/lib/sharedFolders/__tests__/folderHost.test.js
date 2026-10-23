@@ -69,6 +69,31 @@ test('two changes at the same moment cannot both claim one new name', async () =
   assert.equal(await fileText(root, 'new.txt'), 'first')
 })
 
+const withdrawals = {
+  paused: store => { store.records.get('edit').paused = true },
+  not_found: store => { store.records.delete('edit'); store.access.delete('edit') },
+  read_only: store => { store.records.get('edit').mode = 'read' },
+}
+
+for (const [code, withdraw] of Object.entries(withdrawals)) {
+  test(`a change waiting its turn is refused if the owner withdraws rights meanwhile (${code})`, async () => {
+    const root = new FakeDirectoryHandle('Downloads')
+    editFolder(root)
+    let releaseLock
+    const holding = new Promise(resolve => { releaseLock = resolve })
+    let lockHeld
+    const held = new Promise(resolve => { lockHeld = resolve })
+    const earlier = navigator.locks.request('mobius-shared-folder:edit', () => { lockHeld(); return holding })
+    await held
+    const waiting = handleSharedFolderCommand(command('edit', 'write', { path: 'late.txt', content: 'late' }))
+    withdraw(hostStore())
+    releaseLock()
+    await Promise.all([earlier, waiting])
+    assert.deepEqual([answers[0].ok, answers[0].code], [false, code])
+    assert.equal(root.children.has('late.txt'), false)
+  })
+}
+
 test('binning two same-named files at once keeps both in the bin', async () => {
   const root = new FakeDirectoryHandle('Downloads')
   root.addFolder('a').addFile('x.txt', 'from a')

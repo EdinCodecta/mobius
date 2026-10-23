@@ -20,7 +20,9 @@ from agent_api import agent_credentials, agent_request
 
 SHOW_LIMIT_BYTES = 4 * 1024 * 1024
 # Temporary copies are for one look each: keep only the newest few, briefly,
-# so even a 100-photo job never holds more than a few MB on Möbius.
+# so even a 100-photo job never holds more than a few MB on Möbius. The hourly
+# scratch sweep expires the last ones on the same clock; keep the two values
+# equal (app/agent_scratch.py SHARED_FOLDER_COPY_SECONDS).
 SHOW_KEEP_COPIES = 3
 SHOW_KEEP_SECONDS = 10 * 60
 IMAGE_MAX_EDGE = 2576
