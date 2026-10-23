@@ -1,6 +1,7 @@
 """Confirmed queue removal permits only a newly reviewed repair successor."""
 import asyncio
 import json
+import subprocess
 from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
@@ -81,6 +82,20 @@ def test_confirmed_removal_observation_permits_checkout_not_same_head_retry(setu
   assert result["checkout"]["initial_head_sha"] == SHA and prepared == [1]
   assert row.outcomes_json[domain.key(ITEM)]["merge_attempted"] is True
   assert row.outcomes_json[domain.key(ITEM)]["merge_attempts"] == history
+
+
+def test_transient_queue_history_failure_does_not_erase_saved_removal_proof(setup, monkeypatch):
+  db, row, principal, _ = removed_takeover(setup, monkeypatch)
+  proven = observe_removed(db, row, principal)
+  assert proven["state"] == "needs_you" and proven["queue_removal"]
+  saved = dict(row.outcomes_json[domain.key(ITEM)])
+  def timed_out(*args):
+    raise subprocess.TimeoutExpired(["gh", "api", "graphql"], 30)
+  monkeypatch.setattr(routes, "_gh", timed_out)
+  observed = observe_removed(db, row, principal)
+  assert observed["state"] == "needs_you"
+  assert observed["queue_removal"] == proven["queue_removal"]
+  assert row.outcomes_json[domain.key(ITEM)] == saved
 
 
 @pytest.mark.parametrize("case", ["unknown", "missing", "ambiguous", "stale", "readded",

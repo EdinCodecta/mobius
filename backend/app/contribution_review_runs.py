@@ -1022,7 +1022,10 @@ def _ordered_queue_events(timeline):
   return events
 
 
-def confirmed_queue_removal(gh, cwd, target, previous):
+_QUEUE_PROOF_UNAVAILABLE = object()
+
+
+def confirmed_queue_removal(gh, cwd, target, previous, *, unavailable_marker=None):
   """Prove the saved admission ended, never infer it from missing entry/checks.
 
   Queue removal events have no entry id, and beforeCommit is a synthetic
@@ -1087,7 +1090,7 @@ def confirmed_queue_removal(gh, cwd, target, previous):
     return proof
   except (subprocess.SubprocessError, OSError, json.JSONDecodeError, ContributionSubmitError):
     # Provider/transport failure is unknown; never expose raw diagnostics.
-    return None
+    return unavailable_marker
 
 
 def reconcile_merge(gh, cwd, target, previous, pull):
@@ -1099,7 +1102,14 @@ def reconcile_merge(gh, cwd, target, previous, pull):
     receipt = {} if previous.get("queue_entry_id") else {
       "queue_entry_id": entry["id"], "queue_receipt_unconfirmed": True}
     return {**previous, **receipt, "state": "queued"}
-  proof = confirmed_queue_removal(gh, cwd, target, previous)
+  proof = confirmed_queue_removal(gh, cwd, target, previous,
+    unavailable_marker=_QUEUE_PROOF_UNAVAILABLE)
+  if proof is _QUEUE_PROOF_UNAVAILABLE:
+    # A failed observation cannot retract an already persisted removal fact.
+    # Action boundaries still revalidate it and fail closed on unavailable reads.
+    return previous if previous.get("queue_removal") else {**previous,
+      "state": "merge_unknown", "summary":
+      "The exact earlier merge/queue attempt remains unclear. It was not repeated."}
   if pull.get("state") == "open" and proof:
     history = list(previous.get("merge_attempts", []))
     if not any(a.get("head_sha") == target["head_sha"] for a in history):
