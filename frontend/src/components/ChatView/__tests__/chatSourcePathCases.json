@@ -1,0 +1,19 @@
+{
+  "//": "Shared cases for two deliberately different source-path rules. chatChanges.js isSourcePath decides which recorded edits the read-only Changes panel lists (platform, named apps and Project workspaces). backend/app/routes/github.py _trackable_chat_source_path decides which edits make a chat a contribution source for Contribute (platform and named apps only; Project workspaces are not contribution projects). Both suites assert every case, so changing either rule means updating this table on purpose.",
+  "cases": [
+    {"path": "/data/platform/backend/app/main.py", "changes": true, "contribution": true},
+    {"path": "\\data\\platform\\frontend\\src\\a.js", "changes": true, "contribution": true},
+    {"path": "/data/apps/garden/index.jsx", "changes": true, "contribution": true},
+    {"path": "/data/apps/a1/index.jsx", "changes": true, "contribution": true},
+    {"path": "/data/projects/0f8fad5b-d9cb-469f-a165-70867728950e/src/app.js", "changes": true, "contribution": false},
+    {"path": "/data/projects/not-a-uuid/src/app.js", "changes": false, "contribution": false},
+    {"path": "/data/apps/42/storage.json", "changes": false, "contribution": false},
+    {"path": "/data/apps/garden", "changes": false, "contribution": false},
+    {"path": "/data/platform/../.secret-key", "changes": false, "contribution": false},
+    {"path": "/data/.secret-key", "changes": false, "contribution": false},
+    {"path": "/data/memory/notes.md", "changes": false, "contribution": false},
+    {"path": "/data/cli-auth/claude/credentials.json", "changes": false, "contribution": false},
+    {"path": "/tmp/scratch.py", "changes": false, "contribution": false},
+    {"path": "", "changes": false, "contribution": false}
+  ]
+}

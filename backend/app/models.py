@@ -544,8 +544,8 @@ class Delegation(Base):
   physical execution state remains authoritative in ``ChatRun``. This row
   stores the immutable intent/policy needed to attach retries, constrain the
   SDK runner, and relate the child back to its parent logical run. Ordinary
-  status is derived from the child run; source-attached work adds only the
-  narrow pre-run accepted/needs-review state needed for deferred startup.
+  status is derived from the child run; retired source-attached work rows
+  keep only their stored pre-run outcome.
   """
 
   __tablename__ = "delegations"
@@ -619,21 +619,16 @@ class Delegation(Base):
   # (The retired parent_woken_at/result_incorporated_at timestamp columns stay
   # in the table unmapped because a baked fallback platform may still map them.)
   incorporated_run_id = Column(String(64), nullable=True, default=None)
-  # A source-attached job (currently contribution preparation) belongs to the
-  # owner-facing source chat without fabricating a ChatRun there. The stable
-  # work id makes retries attach; the explicit intent supports a small durable
-  # projection without parsing task keys. ``source_work_active_chat_id`` is a
-  # nullable unique lease: terminal reconciliation clears it, so at most one
-  # source-attached worker can reserve a chat across concurrent requests.
+  # Retired: source-attached contribution preparation jobs, started from the
+  # chat Changes panel, belonged to the source chat without a ChatRun there.
+  # Nothing creates them any more; the columns stay mapped so stored history
+  # keeps its status projection, stays out of generic startup and parent-wake
+  # paths, and still names its project roots for source-chat discovery.
   source_work_id = Column(String(64), nullable=True, unique=True, index=True)
   source_work_intent = Column(String(32), nullable=True, default=None)
   source_work_context_app_id = Column(
     Integer, ForeignKey("apps.id"), nullable=True, index=True
   )
-  # Source work can be accepted while its owner chat is still changing. This
-  # compact server-derived envelope is revalidated once the source settles;
-  # only the pre-start ``accepted``/``retrying``/``needs_review`` override
-  # lives here.
   source_work_envelope = Column(JSON, nullable=True, default=None)
   source_work_status = Column(String(32), nullable=True, default=None)
   source_work_result = Column(Text, nullable=True, default=None)
@@ -2214,18 +2209,27 @@ class ContributionReviewRun(Base):
   """
   __tablename__ = "contribution_review_runs"
   id = Column(String(64), primary_key=True)
-  app_id = Column(Integer, ForeignKey("apps.id"), nullable=False, index=True)
+  app_id = Column(Integer, ForeignKey("apps.id"), nullable=True, index=True)
   owner_id = Column(Integer, ForeignKey("owner.id"), nullable=False)
   request_id = Column(String(64), nullable=False)
   mode = Column(String(24), nullable=False)
   github_actor_id = Column(String(64), nullable=False)
-  app_nonce = Column(String(64), nullable=False)
+  app_nonce = Column(String(64), nullable=True)
+  options_json = Column(JSON, nullable=True)
   targets_json = Column(JSON, nullable=False)
   outcomes_json = Column(JSON, nullable=False, default=dict)
   chat_id = Column(String(64), ForeignKey("chats.id"), nullable=False)
   revision = Column(Integer, nullable=False, default=0)
   created_at = Column(DateTime, default=lambda: now_naive_utc())
-  __table_args__ = (UniqueConstraint("app_id", "request_id"),)
+  __table_args__ = (
+    UniqueConstraint("app_id", "request_id"),
+    Index(
+      "uq_contribution_review_runs_core_request",
+      "owner_id", "request_id", unique=True,
+      sqlite_where=text("app_id IS NULL"),
+      postgresql_where=text("app_id IS NULL"),
+    ),
+  )
 
 
 class ProjectSourceCopy(Base):
