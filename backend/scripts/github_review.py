@@ -3,12 +3,17 @@
 
 GitHub is connected in Settings. The platform owns grants, reviewers, receipts
 and public actions; this client neither installs an app nor creates a queue.
+
+Thin app adapters import api, prepare_selection(references, mode, chat_id,
+app_id=None), freeze_preview(selection, options=None, agent=None), and the
+re-exported verify_selection, start_body and review_path helpers. A saved
+selection binds app_id into its identity; the adapter must not reimplement
+preview hashing, selection inspection or admission.
 """
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import hashlib
 import json
 import os
 import re
@@ -19,9 +24,9 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 if __package__:
-  from scripts.github_review_selection import IDENTITY_FIELDS, start_body, frozen_options, verify_selection, review_path
+  from scripts.github_review_selection import IDENTITY_FIELDS, start_body, frozen_options, verify_selection, review_path, selection_request_id
 else:
-  from github_review_selection import IDENTITY_FIELDS, start_body, frozen_options, verify_selection, review_path
+  from github_review_selection import IDENTITY_FIELDS, start_body, frozen_options, verify_selection, review_path, selection_request_id
 
 
 SELECTION_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -72,8 +77,7 @@ def prepare_selection(references, mode, chat_id, app_id=None):
   identity = {"mode": mode, "source_chat_id": chat_id,
               **({"app_id": app_id} if app_id is not None else {}),
               "items": [{key: item[key] for key in IDENTITY_FIELDS} for item in items]}
-  digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
-  return {**identity, "request_id": "selection-" + digest, "items": items,
+  return {**identity, "request_id": selection_request_id(identity), "items": items,
           "title": items[0]["title"] if len(items) == 1 else f"Review {len(items)} pull requests",
           "created_at": datetime.now(timezone.utc).isoformat()}
 
@@ -94,11 +98,7 @@ def freeze_preview(selection, options=None, agent=None, *, allow_mark_ready=Fals
     "agent": {"provider": snapshot["provider"], "model": snapshot["model"],
               "effort": snapshot.get("reasoning_effort")},
     "preview_sha256": preview["preview_sha256"], "resolved_snapshot": snapshot}
-  identity = start_body(frozen)
-  identity.pop("request_id")
-  if selection.get("app_id") is not None:
-    identity["app_id"] = selection["app_id"]
-  frozen["request_id"] = "selection-" + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
+  frozen["request_id"] = selection_request_id(frozen)
   verify_selection(frozen)
   return frozen
 

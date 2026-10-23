@@ -15,6 +15,7 @@ from sqlalchemy import or_, update
 
 from app import agent_work_claims, models
 from app.contribution_errors import ContributionSubmitError
+from app.contribution_review_effects import NotDispatched
 from app.terminal_output import readable_output
 
 
@@ -180,14 +181,19 @@ def enqueue(gh, cwd, target):
   result = json.loads(gh(cwd, "api", "graphql", "-f", f"query={query}",
     "-f", f"id={target['pr_id']}", "-f", f"head={target['head_sha']}").stdout)
   entry = ((result.get("data") or {}).get("enqueuePullRequest") or {}).get("mergeQueueEntry")
+  if result.get("errors") and not result.get("data"):
+    raise NotDispatched("GitHub rejected the merge-queue request without applying it.")
   if result.get("errors") or not isinstance(entry, dict) or not entry.get("id"):
     raise HTTPException(409, "GitHub did not confirm this exact pull request in the merge queue.")
   return entry
 
 
-def perform_merge(gh, cwd, target, repo, *, method=None):
+def perform_merge(gh, cwd, target, repo, method=None):
   # Resolve method before dispatch; a refusal here is definitely nonattempted.
-  method = method or merge_method(repo)
+  try:
+    method = method or merge_method(repo)
+  except HTTPException as exc:
+    raise NotDispatched(str(exc.detail)) from exc
   response = gh(
     cwd, "api", "--method", "PUT",
     f"repos/{target['repo']}/pulls/{target['number']}/merge",
@@ -364,6 +370,8 @@ def view(row):
            else "pushing" if any(s == "pushing" for s in states)
            else "repairing" if any(s == "repairing" for s in states)
            else "reviewing")
+  if any((outcomes.get(key(t), {}).get("public_review") or {}).get("state") in {"posting", "unknown"} for t in row.targets_json):
+    state = "needs_you"
   return {"id": row.id, "request_id": row.request_id, "mode": row.mode,
           "chat_id": row.chat_id, "source_chat_id": row.chat_id, "app_id": row.app_id, "state": state,
           "options": row.options_json,
@@ -715,11 +723,28 @@ def merge_method(repo):
 
 def disarm_merge(db, row, target, outcome, reason):
   """Release only this run's definitely unspent merge reservation."""
-  current = (row.outcomes_json or {}).get(key(target), {})
-  if current.get("state") != "merging" or current.get("review_selection_id", row.id) != row.id:
-    raise HTTPException(409, "The merge reservation changed; it cannot be released.")
-  save_outcome(db, row, key(target), {**outcome, "state": "needs_you",
-    "summary": reason, "merge_attempted": False})
+  item_key = key(target)
+  for _ in range(4):
+    db.refresh(row)
+    current = (row.outcomes_json or {}).get(item_key, {})
+    if (current.get("state") != "merging"
+        or current.get("review_selection_id", row.id) != row.id
+        or current.get("head_sha") != target["head_sha"]):
+      raise HTTPException(409, "The merge reservation changed; it cannot be released.")
+    revision = row.revision
+    values = {**row.outcomes_json, item_key: {**current, "state": "needs_you",
+      "summary": reason, "merge_attempted": False}}
+    changed = db.execute(update(models.ContributionReviewRun).where(
+      models.ContributionReviewRun.id == row.id,
+      models.ContributionReviewRun.revision == revision,
+    ).values(outcomes_json=values, revision=revision + 1))
+    if changed.rowcount == 1:
+      db.commit()
+      db.refresh(row)
+      break
+    db.rollback()
+  else:
+    raise HTTPException(409, "The merge reservation changed; observe this run.")
   agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
     work_key=merge_work_key(target), outcome=reason, release=True)
 
@@ -734,6 +759,14 @@ def save_effect_outcome(db, row, item_key, outcome):
     db.refresh(row)
     current = (row.outcomes_json or {}).get(item_key, {})
     if current.get("state") == "merged" and outcome.get("state") != "merged":
+      return
+    public_receipt = current.get("public_review") or {}
+    if public_receipt.get("state") == "posted":
+      # A stale read-only observer cannot downgrade a confirmed public fact.
+      return
+    if (public_receipt.get("state") in {"posting", "unknown"}
+        and public_receipt.get("marker") != (outcome.get("public_review") or {}).get("marker")):
+      # Only the dispatcher/observer of this exact attempt can settle it.
       return
     revision = row.revision
     values = {**row.outcomes_json, item_key: outcome}
