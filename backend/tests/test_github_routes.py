@@ -6036,6 +6036,157 @@ def test_review_status_accepts_reviewed_updates_for_an_existing_pr_stack(
     github_routes._validate_stack_records([parent, child])
 
 
+def test_addressed_review_status_ignores_unrelated_git_and_preserves_publication(
+  client, owner_token, monkeypatch,
+):
+  _write_token(login="octocat", user_id=42)
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  _repo, target, _diff = _prepared_real_review(app_id, "addressed-target")
+  _prepared_real_review(app_id, "unrelated-heavy")
+  contribution_dir = github_routes._contributions_dir(app_id)
+  before = {path.name: path.read_bytes() for path in contribution_dir.iterdir()}
+  seen = []
+  original = github_routes._inspect_prepared_review_locked
+  original_read = github_routes._read_record_tolerant
+
+  def read(path):
+    assert path.stem != "unrelated-heavy"
+    return original_read(path)
+
+  async def inspect(record, diff_path, state):
+    seen.append(record["id"])
+    return await original(record, diff_path, state)
+
+  async def heads(_token, _query, _variables):
+    return {"repo0": {"defaultBranchRef": {
+      "name": "main", "target": {"oid": target["plan"]["base_sha"]},
+    }}}
+
+  monkeypatch.setattr(github_routes, "_inspect_prepared_review_locked", inspect)
+  monkeypatch.setattr(github_routes, "_read_record_tolerant", read)
+  monkeypatch.setattr(github_routes, "_github_graphql_json", heads)
+  response = client.get(
+    f"/api/github/contributions/{app_id}/review-status",
+    params={"record_id": "addressed-target"},
+    headers={"Authorization": f"Bearer {app_token}"},
+  )
+  assert response.status_code == 200, response.text
+  assert seen == ["addressed-target"]
+  assert [row["id"] for row in response.json()["records"]] == seen
+  assert response.json()["records"][0]["publication"]["state"] == "ready"
+  assert before == {path.name: path.read_bytes() for path in contribution_dir.iterdir()}
+
+
+def test_addressed_review_status_checks_complete_stack_not_partial(
+  client, owner_token, monkeypatch,
+):
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  stack_id = "addressed-stack"
+  root_id, child_id = "addressed-root", "addressed-child"
+  root_branch = f"stack/{stack_id}/01-root"
+  child_branch = f"stack/{stack_id}/02-child"
+  root = {
+    "id": root_id, "type": "pr", "status": "prepared",
+    "repo": "mobius-os/mobius", "branch": root_branch,
+    "plan": {"action": "pr", "repo": "mobius-os/mobius",
+      "repo_path": "/unused", "branch": root_branch,
+      "base_sha": "a" * 40, "head_sha": "b" * 40,
+      "stack": {"id": stack_id, "position": 1, "total": 2,
+        "parent_record_id": "", "base_branch": "main"}},
+  }
+  child = {
+    "id": child_id, "type": "pr", "status": "prepared",
+    "repo": "mobius-os/mobius", "branch": child_branch,
+    "plan": {"action": "pr", "repo": "mobius-os/mobius",
+      "repo_path": "/unused", "branch": child_branch,
+      "base_sha": "b" * 40, "head_sha": "c" * 40,
+      "stack": {"id": stack_id, "position": 2, "total": 2,
+        "parent_record_id": root_id, "base_branch": root_branch}},
+  }
+  _write_contribution(app_id, root_id, root)
+  _write_contribution(app_id, child_id, child)
+  seen = []
+
+  async def inspect(record, *_args):
+    seen.append(record["id"])
+    return {"id": record["id"], "state": "ready", "code": "ready"}
+
+  monkeypatch.setattr(github_routes, "_inspect_prepared_review_locked", inspect)
+  url = f"/api/github/contributions/{app_id}/review-status"
+  headers = {"Authorization": f"Bearer {app_token}"}
+  response = client.get(url, params={"record_id": child_id}, headers=headers)
+  assert response.status_code == 200, response.text
+  assert response.json()["ready"] == 1
+  assert seen == [child_id]
+  # A linked but drifted parent invalidates the addressed child, even though
+  # the parent was not requested and must not undergo expensive git checks.
+  root["plan"]["head_sha"] = "d" * 40
+  _write_contribution(app_id, root_id, root)
+  response = client.get(url, params={"record_id": child_id}, headers=headers)
+  assert response.json()["records"][0]["code"] == "invalid_stack"
+  assert seen == [child_id]
+  (github_routes._contributions_dir(app_id) / f"{root_id}.json").unlink()
+  response = client.get(url, params={"record_id": child_id}, headers=headers)
+  assert response.json()["records"][0]["code"] == "invalid_stack"
+  assert seen == [child_id]
+
+
+def test_addressed_review_status_reads_a_record_outside_the_recent_window(
+  client, owner_token, monkeypatch,
+):
+  """An old addressed card is checked even when the recent window omits it."""
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  record_id = "addressed-old"
+  _write_contribution(app_id, record_id, {
+    "id": record_id, "type": "pr", "status": "prepared",
+    "repo": "mobius-os/mobius", "branch": "fix/old",
+    "plan": {"action": "pr", "repo": "mobius-os/mobius",
+      "repo_path": "/unused", "branch": "fix/old",
+      "base_sha": "a" * 40, "head_sha": "b" * 40},
+  })
+  seen = []
+
+  async def inspect(record, *_args):
+    seen.append(record["id"])
+    return {"id": record["id"], "state": "ready", "code": "ready"}
+
+  monkeypatch.setattr(github_routes, "_inspect_prepared_review_locked", inspect)
+  # The global snapshot reads only the newest rows; this one fell out of it.
+  monkeypatch.setattr(
+    github_routes, "_recent_contribution_record_paths",
+    lambda *_args, **_kwargs: [],
+  )
+  url = f"/api/github/contributions/{app_id}/review-status"
+  headers = {"Authorization": f"Bearer {app_token}"}
+
+  window = client.get(url, headers=headers)
+  assert window.status_code == 200, window.text
+  assert window.json()["records"] == []
+  assert "addressed_record_ids" not in window.json()
+
+  addressed = client.get(
+    url, params=[("record_id", record_id), ("record_id", record_id)],
+    headers=headers,
+  )
+  assert addressed.status_code == 200, addressed.text
+  assert addressed.json()["addressed_record_ids"] == [record_id]
+  assert [row["id"] for row in addressed.json()["records"]] == [record_id]
+  assert seen == [record_id]
+
+
+def test_addressed_review_status_keeps_app_authorization(
+  client, owner_token,
+):
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  other_id, _other_token = _app_token(client, owner_token, github_access=True)
+  response = client.get(
+    f"/api/github/contributions/{other_id}/review-status",
+    params={"record_id": "any-record"},
+    headers={"Authorization": f"Bearer {app_token}"},
+  )
+  assert response.status_code in (401, 403)
+
+
 def test_review_status_filters_hidden_journals_before_record_cap(
   client, owner_token, monkeypatch,
 ):

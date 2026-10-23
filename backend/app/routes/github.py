@@ -37,7 +37,7 @@ from typing import Literal
 from urllib.parse import quote
 from weakref import WeakValueDictionary
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -1137,6 +1137,44 @@ def _read_recent_contribution_records(contribution_dir: Path) -> list[dict]:
   return records
 
 
+def _read_addressed_contribution_records(
+  app_id: int, contribution_dir: Path, record_ids: list[str],
+) -> list[dict]:
+  """Read requested rows directly, plus every ledger row in their stacks.
+
+  A standalone card needs no workspace scan. A stack does: its parent links,
+  total, and merged/public layers must be validated as a complete unit even
+  when only one prepared layer is being displayed.
+  """
+  addressed = []
+  for record_id in dict.fromkeys(record_ids):
+    path, _ = _record_paths(app_id, record_id)
+    record = _read_record_tolerant(path)
+    if record is not None and record.get("id") == record_id:
+      addressed.append(record)
+  stack_ids = {
+    str(((record.get("plan") or {}).get("stack") or {}).get("id") or "")
+    for record in addressed
+    if isinstance(record.get("plan"), dict)
+    and isinstance((record.get("plan") or {}).get("stack"), dict)
+  } - {""}
+  if not stack_ids:
+    return addressed
+  records = list(addressed)
+  seen = {record["id"] for record in addressed}
+  for path in contribution_dir.glob("*.json"):
+    if path.name.startswith(".") or path.stem in seen:
+      continue
+    record = _read_record_tolerant(path)
+    if not isinstance(record, dict) or record.get("id") != path.stem:
+      continue
+    plan = record.get("plan")
+    stack = plan.get("stack") if isinstance(plan, dict) else None
+    if isinstance(stack, dict) and str(stack.get("id") or "") in stack_ids:
+      records.append(record)
+  return records
+
+
 def _publication_status(
   record: dict,
   expected_head: str,
@@ -1375,6 +1413,7 @@ async def _inspect_prepared_review_locked(
 async def contribution_review_status(
   request: Request,
   app_id: int,
+  record_ids: list[str] | None = Query(default=None, alias="record_id"),
   db: Session = Depends(get_db),
   principal: Principal = Depends(get_principal),
 ):
@@ -1385,9 +1424,17 @@ async def contribution_review_status(
   validates stack shape as one unit, then takes the same per-repository locks
   used by submit while comparing each prepared branch and stored diff. Only
   after every local lock and DB lease is released does it make one read-only,
-  de-duplicated GitHub request for current default-branch heads.
+  de-duplicated GitHub request for current default-branch heads. Repeated
+  ``record_id`` query fields scope the returned checks to those cards, while
+  their complete linked-stack ledger context remains in the snapshot.
   """
   _validate_submit_app(app_id, principal, db)
+  if record_ids is not None:
+    if len(record_ids) > 50:
+      raise HTTPException(status_code=400, detail="Too many contribution ids.")
+    # Validate before touching the filesystem; retain the normal path contract.
+    for value in record_ids:
+      _record_paths(app_id, value)
   # Authorization is complete. Ledger and git inspection may queue behind app
   # or source locks, so do not reserve a pooled connection while waiting.
   db.close()
@@ -1396,9 +1443,15 @@ async def contribution_review_status(
     # Thousands of stat/read calls must not run on the event loop: under I/O
     # pressure they stalled unrelated requests (e.g. /github/status) long
     # enough for clients to time out. The storage lock still spans the read.
-    records = await asyncio.to_thread(  # unsettled: read-only (contribution ledger window)
-      _read_recent_contribution_records, contribution_dir,
-    )
+    if record_ids is None:
+      records = await asyncio.to_thread(  # unsettled: read-only (contribution ledger window)
+        _read_recent_contribution_records, contribution_dir,
+      )
+    else:
+      records = await asyncio.to_thread(  # unsettled: read-only (addressed ledger rows and their stacks)
+        _read_addressed_contribution_records,
+        app_id, contribution_dir, record_ids,
+      )
 
   # Include malformed/legacy PR rows as well: the inspector below owns the
   # invalid-plan verdict, and silently omitting one would strand its review
@@ -1409,6 +1462,7 @@ async def contribution_review_status(
     record for record in records
     if record.get("status") == "prepared"
     and record.get("type") in (None, "pr")
+    and (record_ids is None or record.get("id") in record_ids)
   ]
   # The credential metadata is a file-backed resource shared by every review;
   # snapshot it once instead of reopening it for each prepared stack layer.
@@ -1509,7 +1563,14 @@ async def contribution_review_status(
       repo_nodes=repo_nodes,
     )
 
+  addressed = (
+    {} if record_ids is None
+    # Echoed so a client can tell this server scoped the snapshot to the
+    # requested cards; an older server ignores record_id and omits this.
+    else {"addressed_record_ids": list(dict.fromkeys(record_ids))}
+  )
   return {
+    **addressed,
     "generated_at": _now_iso(),
     "records": results,
     "ready": sum(item["state"] == "ready" for item in results),
