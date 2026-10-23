@@ -3,13 +3,14 @@ import asyncio
 import subprocess
 import threading
 import logging
-from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from app import agent_work_claims, contribution_review_repair_actions as actions
 from app import contribution_review_repairs as repairs, contribution_review_runs as domain, models
@@ -19,6 +20,7 @@ from app.contribution_review_effects import DispatchResult
 from app.deps import Principal
 from app.routes import contribution_reviews as routes
 from app.runtime_supervisors import RuntimeSupervisors
+from app.database import SessionLocal
 from tests.test_contribution_review_runs import setup, ITEM
 from tests.test_contribution_review_workflows import (BASE, NEW, SHA, checkout_body,
   configure_repair, publish_body, takeover)
@@ -128,11 +130,25 @@ def test_cancelled_but_still_running_child_protects_parent_checkout(setup, monke
 
 def test_boot_and_periodic_checkout_gc_uses_durable_receipts(setup, monkeypatch):
   db, row, _ = setup
-  monkeypatch.setattr(actions, "SessionLocal", lambda: nullcontext(db))
-  scopes = []
-  monkeypatch.setattr(repairs, "sweep_stale_checkouts", lambda **scope: scopes.append(scope))
+  steps = []
+  def quarantine(**scope):
+    assert "protected_paths" in scope
+    with SessionLocal() as contender:
+      contender.connection().exec_driver_sql("PRAGMA busy_timeout=1")
+      with pytest.raises(OperationalError):
+        contender.execute(text("UPDATE chat_runs SET status=status WHERE id=:run_id"),
+          {"run_id": "physical-run"})
+    steps.append("renamed-under-fence")
+  def delete():
+    with SessionLocal() as contender:
+      contender.execute(text("UPDATE chat_runs SET status=status WHERE id=:run_id"),
+        {"run_id": "physical-run"})
+      contender.commit()
+    steps.append("deleted-after-commit")
+  monkeypatch.setattr(repairs, "quarantine_stale_checkouts", quarantine)
+  monkeypatch.setattr(repairs, "delete_quarantined_checkouts", delete)
   actions.sweep_checkout_receipts_once()
-  assert len(scopes) == 1 and "protected_paths" in scopes[0]
+  assert steps == ["renamed-under-fence", "deleted-after-commit"]
   visited = threading.Event()
   monkeypatch.setattr(actions, "sweep_checkout_receipts_once", visited.set)
   supervisors = RuntimeSupervisors(settings=SimpleNamespace(data_dir="/tmp"),
@@ -145,6 +161,43 @@ def test_boot_and_periodic_checkout_gc_uses_durable_receipts(setup, monkeypatch)
     finally:
       task.cancel()
       await asyncio.gather(task, return_exceptions=True)
+  asyncio.run(exercise())
+
+
+def test_crashed_quarantine_is_reaped_without_touching_live_receipts(monkeypatch, tmp_path):
+  monkeypatch.setattr(repairs, "_checkout_root", lambda: tmp_path)
+  retired = tmp_path / "repair-retired"
+  retired.mkdir()
+  (retired / "data").write_text("finished")
+  live = tmp_path / "repair-live"
+  live.mkdir()
+  renamed = repairs.quarantine_stale_checkouts(protected_paths={str(live)},
+    terminal_paths={str(retired)}, dormant_paths=set(), now=10**12)
+  assert len(renamed) == 1 and not retired.exists() and renamed[0].exists()
+  # Simulate a crash after the DB fence commits but before recursive deletion.
+  repairs.delete_quarantined_checkouts()
+  assert not renamed[0].exists() and live.exists()
+
+
+def test_periodic_gc_cancellation_waits_for_quarantine_and_delete(monkeypatch):
+  entered = threading.Event()
+  release = threading.Event()
+  def slow_gc():
+    entered.set()
+    assert release.wait(3)
+  monkeypatch.setattr(actions, "sweep_checkout_receipts_once", slow_gc)
+  supervisors = RuntimeSupervisors(settings=SimpleNamespace(data_dir="/tmp"),
+    logger=logging.getLogger("test.repair-gc-cancel"), restart_authorization=None,
+    restart_fallback_chats=[])
+  async def exercise():
+    task = asyncio.create_task(supervisors._repair_checkout_gc_loop())
+    assert await asyncio.to_thread(entered.wait, 3)
+    task.cancel()
+    await asyncio.sleep(0.01)
+    assert not task.done()
+    release.set()
+    result = await asyncio.gather(task, return_exceptions=True)
+    assert isinstance(result[0], asyncio.CancelledError)
   asyncio.run(exercise())
 
 
@@ -177,9 +230,16 @@ def test_timeout_observation_is_unknown_and_never_replays_push(setup, monkeypatc
 def test_stop_runs_receipt_aware_sweep(setup, monkeypatch):
   db, row, principal = setup
   calls = []
-  monkeypatch.setattr(repairs, "sweep_stale_checkouts", lambda **scope: calls.append(scope))
+  monkeypatch.setattr(actions, "sweep_checkout_receipts_once", lambda: calls.append(1))
   asyncio.run(routes.stop_review(1, row.id, db, Principal(owner=principal.owner, app_id=None)))
-  assert len(calls) == 1 and "protected_paths" in calls[0]
+  assert calls == [1]
+
+
+def test_checkout_preparation_runs_writer_fenced_gc(setup, monkeypatch):
+  calls = []
+  monkeypatch.setattr(actions, "sweep_checkout_receipts_once", lambda: calls.append(1))
+  configure_repair(setup, monkeypatch)
+  assert calls == [1]
 
 
 def test_stop_admission_lock_blocks_repair_arm(setup, monkeypatch):

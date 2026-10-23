@@ -576,7 +576,6 @@ async def core_report_outcome(run_id: str, body: ReviewOutcome, db: Session = De
              dependencies=[Depends(reject_cross_site), Depends(require_nondelegated_owner_or_app_control)])
 async def stop_review(app_id: int | None, run_id: str, db: Session = Depends(get_db),
                       principal: Principal = Depends(get_principal)):
-  from app import contribution_review_repairs as repairs
   from app.chat import stop_chat_for
   row = _row(db, app_id, run_id, principal)
   # An app may stop only the dedicated app-created review chat, never the
@@ -616,8 +615,7 @@ async def stop_review(app_id: int | None, run_id: str, db: Session = Depends(get
   # collect what was still active at this boundary.
   async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
     db.refresh(row)
-    await settled.run_settled(repairs.sweep_stale_checkouts,
-      **repair_actions.checkout_gc_scope(db))
+    await settled.run_settled(repair_actions.sweep_checkout_receipts_once)
   db.refresh(row)
   return {"stopped": parent_stopped and children_stopped, "run": _run_view(db, row)}
 
@@ -826,8 +824,7 @@ async def repair_checkout(app_id: int | None, run_id: str, body: RepairCheckout,
   _parent(db, row, principal)
   async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
     db.refresh(row)
-    await settled.run_settled(repairs.sweep_stale_checkouts,
-      **repair_actions.checkout_gc_scope(db))
+    await settled.run_settled(repair_actions.sweep_checkout_receipts_once)
     target = _target(row, body)
     previous = row.outcomes_json.get(reviews.key(target), {})
     if previous.get("merge_attempted") or previous.get("state") in {"merged", "queued", "merge_unknown"}:

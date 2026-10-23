@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
@@ -216,17 +217,29 @@ def _last_activity(path: Path) -> float:
 
 def sweep_stale_checkouts(*, protected_paths: set[str], terminal_paths: set[str],
                           dormant_paths: set[str], now: float | None = None) -> None:
-  """Delete only terminal receipts and aged orphans/dormant edits.
+  """Filesystem test helper; production uses the writer-fenced quarantine."""
+  delete_quarantined_checkouts(quarantine_stale_checkouts(
+    protected_paths=protected_paths, terminal_paths=terminal_paths,
+    dormant_paths=dormant_paths, now=now))
+
+
+def quarantine_stale_checkouts(*, protected_paths: set[str], terminal_paths: set[str],
+                               dormant_paths: set[str], now: float | None = None) -> list[Path]:
+  """Rename eligible paths atomically while the caller holds a DB writer fence.
 
   The DB owner supplies a complete protected set, including every unresolved
-  public effect and active editor. Filesystem age is never proof for those.
+  public effect and active editor. Only same-filesystem renames occur under the
+  fence; recursive deletion runs after it is released.
   """
   root = _checkout_root()
   protected = {str(path) for path in protected_paths}
   terminal = {str(path) for path in terminal_paths}
   dormant = {str(path) for path in dormant_paths}
   current = time.time() if now is None else now
+  quarantined = []
   for candidate in root.iterdir():
+    if candidate.name.startswith("repair-gc-"):
+      continue
     entry = _repair_dir(candidate)
     if entry is None or str(entry) in protected:
       continue
@@ -234,10 +247,27 @@ def sweep_stale_checkouts(*, protected_paths: set[str], terminal_paths: set[str]
     if (str(entry) in terminal or
         (str(entry) in dormant and age >= STALE_EDIT_SECONDS) or
         (str(entry) not in dormant and age >= ORPHAN_GRACE_SECONDS)):
+      destination = root / f"repair-gc-{uuid.uuid4().hex}"
       try:
-        shutil.rmtree(entry)
+        entry.rename(destination)
       except FileNotFoundError:
-        pass
+        continue
+      quarantined.append(destination)
+  return quarantined
+
+
+def delete_quarantined_checkouts(paths: list[Path] | None = None) -> None:
+  """Delete renamed checkouts, including a prior process's crash leftovers."""
+  root = _checkout_root()
+  candidates = list(root.iterdir()) if paths is None else paths
+  for candidate in candidates:
+    if (candidate.parent != root or not candidate.name.startswith("repair-gc-")
+        or candidate.is_symlink() or not candidate.is_dir()):
+      continue
+    try:
+      shutil.rmtree(candidate)
+    except FileNotFoundError:
+      pass
 
 
 def prepare_checkout(gh, cwd: Path, row, target: dict, allowed_files: list[str]) -> dict:

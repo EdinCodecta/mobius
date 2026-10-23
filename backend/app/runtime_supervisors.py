@@ -173,10 +173,11 @@ class RuntimeSupervisors:
   async def _repair_checkout_gc_loop(self) -> None:
     """Collect retired repair checkouts at boot and hourly without a review Wait."""
     from app.contribution_review_repair_actions import sweep_checkout_receipts_once
+    from app.settled import run_settled
 
     while True:
       try:
-        await asyncio.to_thread(sweep_checkout_receipts_once)
+        await run_settled(sweep_checkout_receipts_once)
       except asyncio.CancelledError:
         raise
       except Exception as exc:

@@ -7,6 +7,7 @@ import asyncio
 import subprocess
 
 from fastapi import HTTPException
+from sqlalchemy import text
 
 from app.database import SessionLocal
 from app import agent_work_claims, chat_queue, contribution_review_runs as reviews, models, settled
@@ -55,9 +56,28 @@ def checkout_gc_scope(db) -> dict[str, set[str]]:
 
 
 def sweep_checkout_receipts_once() -> None:
-  """Boot/periodic pass; no chat or public GitHub effect is started."""
+  """Fence writers through classification and rename, not slow deletion.
+
+  Admission/ChatRun/Delegation writes cannot change checkout ownership while
+  a candidate is selected and atomically quarantined. After commit, any new
+  admission sees a missing old path and must reprepare it.
+  """
   with SessionLocal() as db:
-    repairs.sweep_stale_checkouts(**checkout_gc_scope(db))
+    dialect = db.get_bind().dialect.name
+    if dialect == "sqlite":
+      # The first statement is a harmless owner-row write. SQLite holds its
+      # single-writer reservation until commit, including classification and
+      # same-filesystem rename. No recursive delete runs in that transaction.
+      db.execute(text("UPDATE contribution_review_runs SET revision=revision "
+                      "WHERE id=(SELECT id FROM contribution_review_runs LIMIT 1)"))
+    elif dialect == "postgresql":
+      db.execute(text("LOCK TABLE chat_runs, delegations, contribution_review_runs "
+                      "IN SHARE ROW EXCLUSIVE MODE"))
+    else:
+      raise RuntimeError("Repair checkout GC requires a writer-fenced database.")
+    repairs.quarantine_stale_checkouts(**checkout_gc_scope(db))
+    db.commit()
+  repairs.delete_quarantined_checkouts()
 
 
 async def dispatch_repair(row, target, validation, *, gh, cwd, authorize):
