@@ -85,7 +85,8 @@ def freeze_preview(selection, options=None, agent=None):
   snapshot = preview["options"]
   if not re.fullmatch(r"[0-9a-f]{64}", preview["preview_sha256"]) or not snapshot.get("model"):
     raise ValueError("The platform did not return a complete frozen prompt/model preview.")
-  frozen = {**selection, "options": frozen_options(snapshot),
+  scope = "named_pr_repairs_and_reviewed_successors" if selection["mode"] == "review_fix_merge" else None
+  frozen = {**selection, **({"confirmation_scope": scope} if scope else {}), "options": frozen_options(snapshot),
     "agent": {"provider": snapshot["provider"], "model": snapshot["model"],
               "effort": snapshot.get("reasoning_effort")},
     "preview_sha256": preview["preview_sha256"], "resolved_snapshot": snapshot}
@@ -137,7 +138,7 @@ def main(argv=None):
   observe.add_argument("run_id")
   preview = commands.add_parser("preview", help="Inspect named PRs and freeze prompts/model without starting work")
   preview.add_argument("prs", nargs="+")
-  preview.add_argument("--mode", choices=("review", "review_merge"), default="review")
+  preview.add_argument("--mode", choices=("review", "review_merge", "review_fix_merge"), default="review")
   preview.add_argument("--options", help="JSON file with the five editable fields")
   preview.add_argument("--agent", help="JSON file: provider/model/effort")
   preview.add_argument("--output", required=True, help="New private JSON preview path; never overwrites")

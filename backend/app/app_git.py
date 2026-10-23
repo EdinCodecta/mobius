@@ -912,7 +912,7 @@ def _canonical_diff(
     proc = subprocess.run(
       [
         "git", "-c", "core.quotePath=false", "-C", str(repo),
-        "diff", "--no-ext-diff", "--no-color", "--binary", "--full-index",
+        "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--full-index",
         "--src-prefix=a/", "--dst-prefix=b/", f"{base_sha}..{head_sha}",
       ],
       capture_output=True, timeout=_GIT_TIMEOUT, check=False,

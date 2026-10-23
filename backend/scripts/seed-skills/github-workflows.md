@@ -8,7 +8,7 @@ GitHub is connected through Möbius Settings. The core endpoints at
 `/api/github/review-runs` do not depend on Contribute. The optional app can
 read core runs, but cannot spend their public grant. This version supports
 private `review`, explicitly opted-in public COMMENT reviews, and pinned
-`review_merge`: it has no repair/push mode. Do not use an app-specific CLI to reimplement selection.
+`review_merge`, and explicitly scoped `review_fix_merge` takeover. Do not use an app-specific CLI to reimplement selection.
 
 ## Authority
 
@@ -81,3 +81,30 @@ receipt. Transport uncertainty never permits another post.
 Private evidence fields accept up to 200,000 characters each. The public copy
 is bounded conservatively to 65,536 UTF-16 units with explicit omission
 markers; the full accepted private evidence is retained.
+
+## Scoped repair and independently reviewed successors
+
+Use `preview --mode review_fix_merge` only when the owning chat explicitly
+authorizes repairing the named PR and merging freshly reviewed successors.
+The saved selection binds `named_pr_repairs_and_reviewed_successors` scope.
+Read the run's returned brief. The parent alone calls `/repair-checkout` and
+`/repairs`; independent reviewers are admitted through `/reviewers`, inherit
+the parent's Goal, and report exact head/base evidence through
+`/independent-reviews`. A repair author cannot supply their independent review.
+
+Edit only the server-provided checkout and frozen file scope. Ordinary
+fast-forward commits and one merge of the fetched `refs/mobius/target-base`
+are supported; never rebase or force-push. A moved target base requires fresh
+independent review of the new combined result, not reuse of old evidence.
+
+The dedicated checkout protects cooperative agents from accidental scope
+drift and unsafe Git metadata; it is not a sandbox against a hostile actor
+with host access. Git config is allowlisted, redirections and attributes are
+rejected, and server diffs disable textconv. A confirmed push discards the
+checkout. Stop discards only unspent abandoned edits; uncertain receipts keep
+their checkouts. Request preparation again if a legitimate cleanup removed it.
+
+Only `not_dispatched` releases an exact public reservation. `unknown` means
+read-only observation, never a retry. Stop revokes new actions but cannot
+erase a confirmed push. Pending checks/queues remain owned by the existing
+conversation's durable Wait; these routes do not create automatic waits.
