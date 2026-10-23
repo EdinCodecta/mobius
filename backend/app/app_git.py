@@ -2911,6 +2911,31 @@ def import_staged(source_dir: str | Path, staged: Staged) -> str:
   return staged.sha
 
 
+def complete_history_contains(
+  source_dir: str | Path, commit: str, tip: str,
+) -> bool | None:
+  """Whether ``commit`` is in ``tip``'s history, proven by walking all of it.
+
+  For a ``commit`` object Git does not have (an update never fetched), where
+  ``merge-base --is-ancestor`` cannot answer. ``None`` unless every commit
+  reachable from ``tip`` is present: a shallow repository, a missing commit
+  object, or a failed walk is not proof of absence.
+  """
+  repo = Path(source_dir)
+  wanted = str(commit or "").lower()
+  if not _HEX_OID.fullmatch(wanted) or not is_repo(repo):
+    return None
+  try:
+    if _is_shallow(repo):
+      return None
+    proc = _run(repo, "rev-list", tip, "--", check=False, read_only=True)
+  except (OSError, subprocess.SubprocessError):
+    return None
+  if proc.returncode != 0:
+    return None
+  return wanted in proc.stdout.split()
+
+
 def present_commit(source_dir: str | Path, ref: str) -> str | None:
   """``ref`` when it is a full commit id already present with full history."""
   repo = Path(source_dir)

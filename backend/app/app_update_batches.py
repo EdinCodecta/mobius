@@ -23,7 +23,6 @@ from datetime import UTC, datetime, timedelta
 import json
 import logging
 from pathlib import Path
-import subprocess
 import time
 from uuid import UUID
 
@@ -119,29 +118,25 @@ def _pending_receipt(source_dir: str, app_id: int, commit: str) -> dict | None:
     return pending_update.checked_pending_conflict_update_receipt(
       source_dir, app_id=app_id, upstream_commit=commit,
     )
-  except OSError as exc:
+  except pending_update.PendingReceiptUnreadable as exc:
     raise SettlementUnreadable(f"pending update receipt of app {app_id}") from exc
 
 
 def _contains(source_dir: str, reviewed_commit: str, source_commit: str) -> bool:
   """Whether the served revision contains the reviewed commit.
 
-  Git answers only for commits it has: a served revision present with its
-  full history and without the reviewed commit cannot contain it (an update
-  that never fetched). Anything else Git cannot answer is unknown.
+  Proven by Git's ancestry check, or, for a reviewed commit Git cannot
+  resolve (an update never fetched), by walking the served revision's
+  complete history. Missing objects or partial history are unknown.
   """
   contained = app_git.ref_is_ancestor(source_dir, reviewed_commit, source_commit)
-  if contained is not None:
-    return contained
-  try:
-    if (
-      app_git.present_commit(source_dir, source_commit)
-      and app_git.present_commit(source_dir, reviewed_commit) is None
-    ):
-      return False
-  except (OSError, subprocess.SubprocessError) as exc:
-    raise SettlementUnreadable(f"history of {source_dir}") from exc
-  raise SettlementUnreadable(f"history of {source_dir}")
+  if contained is None:
+    contained = app_git.complete_history_contains(
+      source_dir, reviewed_commit, source_commit,
+    )
+  if contained is None:
+    raise SettlementUnreadable(f"history of {source_dir}")
+  return contained
 
 
 def _reviewed_commit_landed(

@@ -1145,7 +1145,7 @@ async def test_a_prune_skips_a_batch_whose_save_is_in_flight(tmp_path):
 def _unknown_history(monkeypatch):
   """Git cannot answer: a timeout, a lock, or damaged metadata."""
   monkeypatch.setattr(batches.app_git, "ref_is_ancestor", lambda *args: None)
-  monkeypatch.setattr(batches.app_git, "present_commit", lambda path, ref: None)
+  monkeypatch.setattr(batches.app_git, "complete_history_contains", lambda *args: None)
 
 
 def _unreadable_receipt(source_dir):
@@ -1240,3 +1240,73 @@ async def test_unreadable_state_keeps_saved_results_and_unfinished_entries(
   await owner.stop()
   saved = json.loads((owner.root / f"{running_key}.json").read_text())
   assert saved["entries"][0]["status"] == "applying"  # boot settles it
+
+
+def _git(repo, *args):
+  return subprocess.run(
+    ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+    check=True, capture_output=True, text=True,
+  ).stdout.strip()
+
+
+def test_a_missing_history_object_is_unknown_not_not_applied(tmp_path, db):
+  """A served tip that resolves is not complete history: a missing reviewed
+  ancestor must not become a terminal "not applied"."""
+  repo = tmp_path / "damaged"
+  repo.mkdir()
+  _git(repo, "init", "-q", "-b", "main")
+  _git(repo, "commit", "-q", "--allow-empty", "-m", "reviewed")
+  reviewed = _git(repo, "rev-parse", "HEAD")
+  _git(repo, "commit", "-q", "--allow-empty", "-m", "served")
+  served = _git(repo, "rev-parse", "HEAD")
+  app = models.App(name="Damaged", slug="damaged", jsx_source="export default 1",
+    source_dir=str(repo), source_commit=served, version="1")
+  db.add(app)
+  db.commit()
+  assert batches._settled_outcomes({app.id: reviewed})[app.id]["status"] == "updated"
+
+  (repo / ".git" / "objects" / reviewed[:2] / reviewed[2:]).unlink()
+  assert batches.app_git.ref_is_ancestor(str(repo), reviewed, served) is None
+  with pytest.raises(batches.SettlementUnreadable):
+    batches._settled_outcomes({app.id: reviewed})
+
+
+def test_a_shallow_served_history_is_unknown(tmp_path, db):
+  origin = tmp_path / "origin"
+  origin.mkdir()
+  _git(origin, "init", "-q", "-b", "main")
+  for message in ("one", "two"):
+    _git(origin, "commit", "-q", "--allow-empty", "-m", message)
+  shallow = tmp_path / "shallow"
+  subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{origin}", str(shallow)],
+    check=True)
+  served = _git(shallow, "rev-parse", "HEAD")
+  assert batches.app_git.complete_history_contains(str(shallow), COMMIT, served) is None
+  with pytest.raises(batches.SettlementUnreadable):
+    batches._contains(str(shallow), COMMIT, served)
+
+
+@pytest.mark.parametrize("content", [
+  b'{"schema":4,',  # truncated write
+  b"\xff\xfe",  # not UTF-8
+  b"[]",  # not an object
+  json.dumps({"schema": 4, "app_id": 1, "upstream_commit": COMMIT}).encode(),
+])
+def test_an_invalid_existing_receipt_is_unknown_not_absent(tmp_path, content):
+  path = pending_update.pending_update_receipt_file(tmp_path)
+  path.parent.mkdir(parents=True)
+  path.write_bytes(content)
+  with pytest.raises(batches.SettlementUnreadable):
+    batches._pending_receipt(str(tmp_path), 1, COMMIT)
+  # Existing readers keep their contract: anything unusable reads as none.
+  assert pending_update.read_pending_conflict_update_receipt(
+    tmp_path, app_id=1, upstream_commit=COMMIT,
+  ) is None
+
+
+def test_a_receipt_for_another_update_or_none_is_proven_absent(tmp_path):
+  assert batches._pending_receipt(str(tmp_path), 1, COMMIT) is None
+  path = pending_update.pending_update_receipt_file(tmp_path)
+  path.parent.mkdir(parents=True)
+  path.write_text(json.dumps({"schema": 4, "app_id": 1, "upstream_commit": "b" * 40}))
+  assert batches._pending_receipt(str(tmp_path), 1, COMMIT) is None
