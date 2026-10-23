@@ -50,17 +50,18 @@ def _assert_public_target(gh, cwd, target):
   _, pull = reviews.current_pull(gh, cwd, target)
   if pull.get("state") != "open" or pull.get("merged"):
     raise HTTPException(409, "The selected pull request is no longer open.")
-  reviews.assert_current_base(gh, cwd, target)
+  # COMMENT evidence remains historical when this branch advances; only its
+  # name and the selected PR head must still match, not today's base SHA.
 
 
 async def _public_target_refusal(gh, cwd, target):
   """Read failures before the mutation prove non-dispatch, never uncertainty."""
   try:
-    await asyncio.to_thread(_assert_public_target, gh, cwd, target)  # unsettled: read-only (exact PR head/base proof)
+    await asyncio.to_thread(_assert_public_target, gh, cwd, target)  # unsettled: read-only (exact PR head/branch proof)
   except HTTPException as exc:
-    return f"Public review head/base preflight refused: {exc.detail} No review was posted."
+    return f"Public review head/branch preflight refused: {exc.detail} No review was posted."
   except (ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
-    return "The selected PR head/base could not be confirmed. No review was posted."
+    return "The selected PR head/branch could not be confirmed. No review was posted."
   return None
 
 
