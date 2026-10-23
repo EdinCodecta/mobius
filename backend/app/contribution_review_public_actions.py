@@ -1,9 +1,12 @@
 """Public review admission, dispatch, and its immutable evidence receipt."""
 import asyncio
+import json
+import subprocess
 import uuid
 from fastapi import HTTPException
 from app import chat_queue, settled, models, contribution_review_runs as reviews
 from app.decision_cards import fence_owner
+from app.contribution_errors import ContributionSubmitError
 from app import contribution_review_public as public
 from app.github_connection import _github_connection_transaction
 
@@ -43,6 +46,24 @@ def arm_public_review(db, row, item_key, target, outcome, marker, authorize):
   return None
 
 
+def _assert_public_target(gh, cwd, target):
+  _, pull = reviews.current_pull(gh, cwd, target)
+  if pull.get("state") != "open" or pull.get("merged"):
+    raise HTTPException(409, "The selected pull request is no longer open.")
+  reviews.assert_current_base(gh, cwd, target)
+
+
+async def _public_target_refusal(gh, cwd, target):
+  """Read failures before the mutation prove non-dispatch, never uncertainty."""
+  try:
+    await asyncio.to_thread(_assert_public_target, gh, cwd, target)  # unsettled: read-only (exact PR head/base proof)
+  except HTTPException as exc:
+    return f"Public review head/base preflight refused: {exc.detail} No review was posted."
+  except (ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
+    return "The selected PR head/base could not be confirmed. No review was posted."
+  return None
+
+
 async def post_public_review(db, row, item_key, target, outcome, principal, cwd, *, gh, authorize):
   """Freeze evidence before dispatch; only certified non-dispatch permits retry."""
   # Format before reserving: a known local rejection is not an uncertain send.
@@ -55,9 +76,18 @@ async def post_public_review(db, row, item_key, target, outcome, principal, cwd,
       return {**outcome, "public_review": {"state": "not_dispatched",
         "summary": "The connected GitHub account changed; no review was posted."}}
     async with chat_queue.get_transition_lock(f"review-admission:{row.id}"):
+      # The route's proof predates connection/admission waits and actor lookup.
+      refusal = await _public_target_refusal(gh, cwd, target)
+      if refusal:
+        return {**outcome, "public_review": {"state": "not_dispatched", "marker": marker, "summary": refusal}}
       existing = arm_public_review(db, row, item_key, target, outcome, marker, authorize)
       if existing is not None:
         return existing
+      # Reservation can itself wait for the DB writer. Re-prove before dispatch;
+      # save_effect_outcome settles only this marker, never another attempt.
+      refusal = await _public_target_refusal(gh, cwd, target)
+      if refusal:
+        return {**outcome, "public_review": {"state": "not_dispatched", "marker": marker, "summary": refusal}}
     # There is no await between the final authority check and settled dispatch.
     try:
       authorize()
