@@ -679,7 +679,7 @@ def test_mark_ready_parses_real_gh_graphql_exit_one_no_data_as_not_dispatched():
   calls = []
   def gh(_cwd, *args, check=True):
     calls.append((args, check))
-    return SimpleNamespace(returncode=1, stdout=json.dumps({"errors": [{"message": "forbidden"}]}),
+    return SimpleNamespace(returncode=1, stdout=json.dumps({"errors": [{"type": "FORBIDDEN", "message": "forbidden"}]}),
       stderr="gh: GraphQL request failed")
   with pytest.raises(NotDispatched):
     domain.mark_ready(gh, "/tmp", TARGET)
@@ -717,7 +717,7 @@ def test_ready_graphql_no_data_disarms_exact_claim(setup, monkeypatch):
   def gh(_cwd, *args, check=True):
     assert check is False
     calls.append(1)
-    return SimpleNamespace(returncode=1, stdout=json.dumps({"errors": [{"message": "not allowed"}]}),
+    return SimpleNamespace(returncode=1, stdout=json.dumps({"errors": [{"type": "FORBIDDEN", "message": "not allowed"}]}),
       stderr="gh: GraphQL error")
   monkeypatch.setattr(routes, "_gh", gh)
   with pytest.raises(HTTPException) as error:
@@ -754,12 +754,13 @@ def test_programming_error_in_ready_dispatch_is_not_silenced(setup, monkeypatch)
     asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
 
 
-def test_malformed_graphql_error_shape_is_unknown_not_dispatched(setup, monkeypatch):
+@pytest.mark.parametrize("errors", ["forbidden", [{"message": "not allowed"}], [{"type": "INTERNAL", "message": "timeout"}]])
+def test_malformed_graphql_error_shape_is_unknown_not_dispatched(setup, monkeypatch, errors):
   db, row, principal = ready_takeover(setup, monkeypatch)
   calls = []
   def gh(_cwd, *args, check=True):
     calls.append(1)
-    return SimpleNamespace(returncode=1, stdout=json.dumps({"errors": "forbidden"}), stderr="gh error")
+    return SimpleNamespace(returncode=1, stdout=json.dumps({"errors": errors}), stderr="gh error")
   monkeypatch.setattr(routes, "_gh", gh)
   first = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
   assert first["run"]["items"][0]["ready_attempt"]["state"] == "unknown"
@@ -784,7 +785,7 @@ def test_readiness_timeout_keeps_unknown_receipt_without_replay(setup, monkeypat
 def test_real_ready_gh_exit_one_preserves_structured_refusal(tmp_path, monkeypatch):
   from app import github_contribution_git as transport
   fake = tmp_path / 'gh'
-  fake.write_text('#!/bin/sh\necho \'{"errors":[{"message":"not allowed"}],"data":null}\'\nexit 1\n')
+  fake.write_text('#!/bin/sh\necho \'{"errors":[{"type":"FORBIDDEN","message":"not allowed"}],"data":null}\'\nexit 1\n')
   fake.chmod(0o755)
   monkeypatch.setattr(transport, '_git_env', lambda cwd: {'PATH': str(tmp_path)+':/usr/bin:/bin'})
   with pytest.raises(NotDispatched):
