@@ -74,8 +74,16 @@ def graphql_mutation_result(response) -> dict:
     raise
   if not isinstance(result, dict):
     raise ContributionSubmitError("GitHub returned an unexpected GraphQL response.", code="merge_response_invalid_shape")
-  if result.get("errors") and not result.get("data"):
-    raise NotDispatched("GitHub rejected the GraphQL mutation without applying it.")
+  if "data" in result and result["data"] is not None and not isinstance(result["data"], dict):
+    raise ContributionSubmitError("GitHub returned malformed GraphQL data.", code="graphql_response_invalid_shape")
+  if "errors" in result:
+    errors = result["errors"]
+    if (not isinstance(errors, list) or not errors
+        or not all(isinstance(item, dict) and isinstance(item.get("message"), str)
+                   and item["message"].strip() for item in errors)):
+      raise ContributionSubmitError("GitHub returned malformed GraphQL errors.", code="graphql_response_invalid_shape")
+    if "data" not in result or result["data"] is None:
+      raise NotDispatched("GitHub rejected the GraphQL mutation without applying it.")
   if getattr(response, "returncode", 0):
     raise ContributionSubmitError((getattr(response, "stderr", "") or "GitHub GraphQL request failed.")[:600])
   return result
