@@ -117,7 +117,11 @@ def test_proved_predispatch_stop_releases_exact_merge_claim(setup, monkeypatch):
   assert claim.released_at is not None
 
 
-def test_base_drift_after_reservation_never_dispatches_merge(setup, monkeypatch):
+@pytest.mark.parametrize("failure", [
+  HTTPException(409, "The target branch changed."),
+  OSError("Final provider read failed"),
+])
+def test_base_drift_after_reservation_never_dispatches_merge(setup, monkeypatch, failure):
   db, row, _ = setup
   reads = 0
 
@@ -125,7 +129,7 @@ def test_base_drift_after_reservation_never_dispatches_merge(setup, monkeypatch)
     nonlocal reads
     reads += 1
     if reads == 2:
-      raise HTTPException(409, "The target branch changed.")
+      raise failure
 
   monkeypatch.setattr(domain, "assert_current_base", moving_base)
   monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("drift must not dispatch"))
