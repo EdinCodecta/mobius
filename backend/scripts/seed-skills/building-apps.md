@@ -954,7 +954,11 @@ send({ event: 'close' })                            // playback ended
 
 The page still reads as hidden while such playback continues. Documents the
 app embeds in its own child iframes are separate pages: forward the visibility
-to them yourself.
+to them yourself. For the same reason, `<audio>`/`<video>` inside an open
+shadow root isn't reached — the frame's scan doesn't cross shadow boundaries
+and `play` events don't escape them — so pause shadow-DOM media yourself from
+`onVisibilityChange` as well. Plain (light-DOM) elements and `new Audio()` are
+handled for you.
 
 ---
 
