@@ -232,16 +232,28 @@ def _publication_never_attempted(
   digest-bound fields. Its lifecycle fields (status, journal) are untrusted
   and may only withhold certification, never grant it.
 
-  - Any submitting row or attempt artifact is unknown or resumable.
-  - A public row is context only when the confirmation already bound its
-    exact public PR (url and number) and no claim of this exact operation
-    produced it; its own settled push is then publication proof.
-  - A row this operation claims (by ledger or bound action) must show no push
-    of its reviewed head: always for a new PR, whose branch only this proposal
-    could have published; for an existing-PR update, when the push is still
-    unsettled or follows a claim of this exact operation. An update whose
-    already-public head predates its claim is not this phase's write.
-  - Deferred and other-phase prepared rows are untouched by this operation.
+  Every row must certify; the first that withholds makes the answer False.
+  Checked in order, per row (ledger row x confirmation for that id):
+
+  | Ledger row                        | Condition                               | Row      |
+  |-----------------------------------|-----------------------------------------|----------|
+  | ``submitting``                    | any                                     | withhold |
+  | not ``prepared``                  | confirmation says prepared/submitting   | withhold |
+  | public (draft/open/landing/merged)| this operation's claim produced it      | withhold |
+  | public                            | confirmation lacks its url + number     | withhold |
+  | public                            | confirmation bound that exact PR        | certify* |
+  | any other non-prepared status     | any                                     | withhold |
+  | prepared, in this phase (by       | pushed sha = a reviewed head, and: new  | withhold |
+  | ledger or confirmed action)       | PR, or this operation's claim, or push  |          |
+  |                                   | still unsettled                         |          |
+  | prepared, in this phase           | otherwise (no push, or an update whose  | certify* |
+  |                                   | public head predates its claim)         |          |
+  | prepared, other/deferred phase    | any                                     | certify* |
+
+  * and only if no attempt/relay artifact exists for the row (an artifact,
+  or failing to check one, withholds). "This operation's claim" is
+  ``_bound_attempt_claimed``: the ledger's claim digest matches the bound
+  fields with ``submitting`` and this or the ledger's submitter.
   """
   from app import contribution_runtime
 

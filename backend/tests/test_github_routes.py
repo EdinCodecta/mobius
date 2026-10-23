@@ -6131,6 +6131,58 @@ def test_addressed_review_status_checks_complete_stack_not_partial(
   assert seen == [child_id]
 
 
+def test_addressed_stack_status_parses_only_rows_naming_the_stack(
+  client, owner_token, monkeypatch,
+):
+  """The stack scan under the storage lock skips unrelated rows unparsed."""
+  app_id, app_token = _app_token(client, owner_token, github_access=True)
+  stack_id = "scan-stack"
+
+  def layer(record_id, position, parent, head):
+    branch = f"stack/{stack_id}/0{position}-{record_id}"
+    return {
+      "id": record_id, "type": "pr", "status": "prepared",
+      "repo": "mobius-os/mobius", "branch": branch,
+      "plan": {"action": "pr", "repo": "mobius-os/mobius",
+        "repo_path": "/unused", "branch": branch,
+        "base_sha": parent[1], "head_sha": head,
+        "stack": {"id": stack_id, "position": position, "total": 2,
+          "parent_record_id": parent[0],
+          "base_branch": parent[2]}},
+    }
+
+  root = layer("scan-root", 1, ("", "a" * 40, "main"), "b" * 40)
+  child = layer("scan-child", 2, ("scan-root", "b" * 40, root["branch"]), "c" * 40)
+  _write_contribution(app_id, "scan-root", root)
+  _write_contribution(app_id, "scan-child", child)
+  for index in range(5):
+    _write_contribution(app_id, f"unrelated-{index}", {
+      "id": f"unrelated-{index}", "type": "pr", "status": "draft",
+      "plan": {"stack": {"id": "other-stack"}},
+    })
+  parsed = []
+  original = github_routes._record_from_bytes
+
+  def record_from_bytes(raw):
+    record = original(raw)
+    parsed.append((record or {}).get("id"))
+    return record
+
+  async def inspect(record, *_args):
+    return {"id": record["id"], "state": "ready", "code": "ready"}
+
+  monkeypatch.setattr(github_routes, "_record_from_bytes", record_from_bytes)
+  monkeypatch.setattr(github_routes, "_inspect_prepared_review_locked", inspect)
+  response = client.get(
+    f"/api/github/contributions/{app_id}/review-status",
+    params={"record_id": "scan-child"},
+    headers={"Authorization": f"Bearer {app_token}"},
+  )
+  assert response.status_code == 200, response.text
+  assert response.json()["ready"] == 1
+  assert parsed == ["scan-root"]
+
+
 def test_addressed_review_status_reads_a_record_outside_the_recent_window(
   client, owner_token, monkeypatch,
 ):

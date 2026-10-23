@@ -83,6 +83,8 @@ from app.delegations import (
 from app.github_checks import (
   _contributions_dir,
   _read_record_tolerant,
+  _read_record_bytes,
+  _record_from_bytes,
   _is_failing,
   _pr_ref,
   _active_pr_records,
@@ -1137,6 +1139,9 @@ def _read_recent_contribution_records(contribution_dir: Path) -> list[dict]:
   return records
 
 
+_LITERAL_JSON_ID = re.compile(r"[A-Za-z0-9._-]+")
+
+
 def _read_addressed_contribution_records(
   app_id: int, contribution_dir: Path, record_ids: list[str],
 ) -> list[dict]:
@@ -1162,10 +1167,23 @@ def _read_addressed_contribution_records(
     return addressed
   records = list(addressed)
   seen = {record["id"] for record in addressed}
+  # This scan holds the storage lock that publication waits on. A row of one
+  # of these stacks must contain its id verbatim (JSON escapes none of these
+  # characters), so parse only those rows instead of the whole ledger.
+  needles = (
+    [stack_id.encode() for stack_id in stack_ids]
+    if all(_LITERAL_JSON_ID.fullmatch(stack_id) for stack_id in stack_ids)
+    else None
+  )
   for path in contribution_dir.glob("*.json"):
     if path.name.startswith(".") or path.stem in seen:
       continue
-    record = _read_record_tolerant(path)
+    raw = _read_record_bytes(path)
+    if raw is None or (
+      needles is not None and not any(needle in raw for needle in needles)
+    ):
+      continue
+    record = _record_from_bytes(raw)
     if not isinstance(record, dict) or record.get("id") != path.stem:
       continue
     plan = record.get("plan")
