@@ -23,11 +23,24 @@ def _git(repo: Path, *args: str) -> str:
   ).stdout.strip()
 
 
+# The release images' base: what ``target_environment`` reads the Python
+# version from.
+_DOCKERFILE = "FROM python:3.12-slim-trixie AS python-runtime\nFROM python-runtime\n"
+# Marker values of an image built from ``_DOCKERFILE`` on this host.
+_ENVIRONMENT = {
+  **{name: value for name, value in upgrade.default_environment().items()
+     if name not in {"python_full_version", "implementation_version"}},
+  "python_version": "3.12",
+}
+
+
 def _commit(
   repo: Path, name: str, lock: str | None = None, *, bridge: bool = False,
-  requirements: str | None = None,
+  requirements: str | None = None, dockerfile: str | None = None,
 ) -> str:
   (repo / name).write_text(name + "\n")
+  if dockerfile is not None:
+    (repo / "Dockerfile").write_text(dockerfile)
   for path, content in (("requirements.lock", lock), ("requirements.txt", requirements)):
     if content is not None:
       (repo / "backend").mkdir(exist_ok=True)
@@ -49,7 +62,7 @@ def install(tmp_path, monkeypatch):
   platform = data / "platform"
   platform.mkdir(parents=True)
   _git(platform, "init", "-q", "-b", "main")
-  old = _commit(platform, "old-release", lock="pkg==1\n")
+  old = _commit(platform, "old-release", lock="pkg==1\n", dockerfile=_DOCKERFILE)
   new = _commit(platform, "new-release", lock="pkg==2\n", bridge=True)
   _git(platform, "reset", "-q", "--hard", old)
   _git(platform, "branch", "-f", "upstream", old)
@@ -272,8 +285,8 @@ def test_a_local_declaration_the_target_version_satisfies_is_allowed(install, de
 
 
 def test_a_wildcard_pin_accepts_a_matching_release_version():
-  assert upgrade.package_loss(b"pkg==2.*\n", {"pkg": "==2.3"}) == []
-  assert upgrade.package_loss(b"pkg==2.*\n", {"pkg": "==3.0"}) == [
+  assert upgrade.package_loss(b"pkg==2.*\n", {"pkg": "==2.3"}, _ENVIRONMENT) == []
+  assert upgrade.package_loss(b"pkg==2.*\n", {"pkg": "==3.0"}, _ENVIRONMENT) == [
     "pkg: source declares ==2.*, target image installs 3.0",
   ]
 
@@ -298,12 +311,41 @@ def test_every_declaration_of_a_package_must_hold(install, capsys, declared, joi
   assert f"pkg: source declares {joined}, target image installs 2" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("declared", [
+  # Mutually exclusive pins: only the target's own (3.12) applies.
+  "pkg==1 ; python_version < '3.12'\npkg==2 ; python_version >= '3.12'\n",
+  # Declared only for another platform: nothing the target must install.
+  "pkg\nelsewhere==1 ; sys_platform == 'no-such-platform'\n",
+])
+def test_a_declaration_for_another_environment_constrains_nothing(install, declared):
+  _commit(install["platform"], "local-markers", requirements=declared)
+
+  assert upgrade.main(["--check"]) == 0
+
+
+def test_a_marker_the_target_environment_cannot_decide_is_unverifiable(install, capsys):
+  """Without a single ``python:X.Y`` base in the target's Dockerfile, its
+  Python version is unknown: a version marker is reported, not guessed."""
+  platform = install["platform"]
+  _git(platform, "checkout", "-q", install["new"])
+  later = _commit(platform, "later-release", dockerfile="FROM debian:trixie\n", bridge=True)
+  _git(platform, "checkout", "-q", "main")
+  _git(platform, "update-ref", "refs/remotes/origin/main", later)
+  assert "python_version" not in upgrade.target_environment(later)
+  assert upgrade.target_environment(install["new"])["python_version"] == "3.12"
+  line = "pkg==2 ; python_version >= '3.12'"
+  _commit(platform, "local-marker", requirements=f"{line}\n")
+
+  assert upgrade.main(["--check"]) == 1
+  assert f"{line}: a declaration this check cannot verify" in capsys.readouterr().err
+
+
 def test_repeated_and_differently_spelled_names_join_into_one_spec():
   from app import platform_update
 
   data = b"Some_Pkg>=3\nsome-pkg<4\nsome.pkg\nother==1\n"
   expected = {"some-pkg": ">=3,<4", "other": "==1"}
-  assert upgrade.parse_requirements(data) == expected
+  assert upgrade.parse_requirements(data, _ENVIRONMENT) == expected
   assert platform_update.declared_python_packages(data) == expected
   assert platform_update.unmet_declaration(">=3,<4", "2.0") == "version"
   assert platform_update.unmet_declaration(">=3,<4", "3.5") is None
@@ -323,7 +365,7 @@ def test_a_dependency_line_naming_no_package_is_unsupported_not_ignored(
   from app import platform_update
 
   data = f"{line}\n--index-url https://example.invalid\n--hash=sha256:aa\n# note\n".encode()
-  assert upgrade.parse_requirements(data) == {line: None}
+  assert upgrade.parse_requirements(data, _ENVIRONMENT) == {line: None}
   assert platform_update.declared_python_packages(data) == {line: None}
   assert upgrade.unmet_declaration(None, None) == "unsupported"
   assert platform_update.unmet_declaration(None, "1.0") == "unsupported"
@@ -341,6 +383,9 @@ _REQUIREMENT_CORPUS = (
   b"Some_Pkg.Name==1.2.3 \\\n    --hash=sha256:aa \\\n    --hash=sha256:bb\n"
   b"-r other.txt\n--index-url https://example.invalid\n# comment\n\n"
   b"wild==2.*\nranged>=1,<3\ncompat~=2.0\nbare\nurl @ https://example.invalid/u.whl\n"
+  b"split==1 ; python_version < '3.12'\nsplit==2 ; python_version >= '3.12'\n"
+  b"elsewhere==1 ; sys_platform == 'no-such-platform'\n"
+  b"exact ==1 ; python_full_version == '3.12.1'\n"
 )
 
 
@@ -355,9 +400,15 @@ def test_the_script_and_backend_requirement_judgments_agree():
     (repo / "backend/requirements.txt").read_bytes(),
     (repo / "backend/requirements.lock").read_bytes(),
   ):
-    assert upgrade.parse_requirements(data) == platform_update.declared_python_packages(data)
-  assert upgrade.parse_requirements(_REQUIREMENT_CORPUS)["-r other.txt"] is None
-  for spec in upgrade.parse_requirements(_REQUIREMENT_CORPUS).values():
+    for environment in (_ENVIRONMENT, {**_ENVIRONMENT, "python_version": "3.13"}):
+      assert upgrade.parse_requirements(data, environment) == (
+        platform_update.declared_python_packages(data, environment)
+      )
+  parsed = upgrade.parse_requirements(_REQUIREMENT_CORPUS, _ENVIRONMENT)
+  assert parsed["-r other.txt"] is None
+  assert parsed["split"] == "==2" and "elsewhere" not in parsed
+  assert parsed["exact ==1 ; python_full_version == '3.12.1'"] is None
+  for spec in parsed.values():
     for installed in (None, "1.0", "2.3", "3.0", "not a version"):
       assert upgrade.unmet_declaration(spec, installed) == (
         platform_update.unmet_declaration(spec, installed)

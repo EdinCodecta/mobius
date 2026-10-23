@@ -47,9 +47,17 @@ import sys
 from pathlib import Path
 
 try:
+    from packaging.markers import (
+        InvalidMarker, Marker, UndefinedComparison, UndefinedEnvironmentName,
+        default_environment,
+    )
     from packaging.specifiers import InvalidSpecifier, SpecifierSet
     from packaging.version import InvalidVersion, Version
 except ImportError:  # only a transitive dependency; pip vendors the same library
+    from pip._vendor.packaging.markers import (
+        InvalidMarker, Marker, UndefinedComparison, UndefinedEnvironmentName,
+        default_environment,
+    )
     from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
     from pip._vendor.packaging.version import InvalidVersion, Version
 
@@ -143,22 +151,68 @@ def declared_in_history(commit: str, path: str, data: bytes) -> bool:
     return bool(declaring_commits(commit, path, data))
 
 
-# Mirrors ``platform_update.declared_python_packages`` and
+# Mirrors ``platform_update.marker_applies``,
+# ``platform_update.declared_python_packages`` and
 # ``platform_update.unmet_declaration``; this script runs from fetched upstream
 # on older installations, so it cannot import them.
 # ``test_request_container_upgrade`` pins that the copies agree.
 _REQUIREMENT = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?")
 _DEPENDENCY_OPTION = re.compile(r"-[erc]|--(?:editable|requirement|constraint)\b")
 _ARCHIVE_SUFFIXES = (".whl", ".zip", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")
+_BASE_PYTHON = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(?:\S+/)?python:(\d+\.\d+)\b", re.M | re.I)
 
 
-def parse_requirements(data: bytes) -> dict[str, str | None]:
-    """Package name to version spec for a requirements file or pip lock.
+def target_environment(target: str) -> dict[str, str]:
+    """The environment-marker values of ``target``'s image, as far as they
+    can be established without running it.
 
-    Repeated declarations of a name join into one spec; a line declaring a
+    This script runs inside the Möbius container, and the helper replaces it
+    on the same host with an official image built from the same Dockerfile
+    lineage (the official CPython image on Linux), so the host and
+    implementation values (``sys_platform``, ``platform_machine``,
+    ``implementation_name`` and the like) are this interpreter's. What a
+    release can change is its Python version: ``python_version`` comes from
+    the target Dockerfile's ``python:X.Y`` base image, and is left out when
+    that is not a single tag. Finer values that tag does not fix
+    (``python_full_version``, ``implementation_version``) are left out too, so
+    a declaration whose marker needs one is reported unverifiable instead of
+    judged against a guessed version.
+    """
+    environment = dict(default_environment())
+    for name in ("python_version", "python_full_version", "implementation_version"):
+        environment.pop(name, None)
+    versions = set(_BASE_PYTHON.findall((show(target, "Dockerfile") or b"").decode("utf-8", "replace")))
+    if len(versions) == 1:
+        environment["python_version"] = versions.pop()
+    return environment
+
+
+def marker_applies(marker: str, environment: dict[str, str]) -> bool | None:
+    """Whether a declaration's environment ``marker`` holds in ``environment``,
+    or None when it cannot be judged there: malformed, or naming a value
+    ``environment`` does not establish (never filled in from this interpreter)."""
+    try:
+        parsed = Marker(marker)
+    except InvalidMarker:
+        return None
+    names = set(re.findall(r"\w+", re.sub(r"'[^']*'|\"[^\"]*\"", "", str(parsed))))
+    if not names - {"and", "or", "not", "in"} <= environment.keys():
+        return None
+    try:
+        return parsed.evaluate(dict(environment))
+    except (UndefinedComparison, UndefinedEnvironmentName):
+        return None
+
+
+def parse_requirements(data: bytes, environment: dict[str, str]) -> dict[str, str | None]:
+    """Package name to version spec for a requirements file or pip lock, in
+    the image whose marker values are ``environment`` (``target_environment``).
+
+    Only declarations whose environment marker holds there count; repeated
+    applicable declarations of a name join into one spec. A line declaring a
     dependency this cannot name or judge (``-e``, ``-r``, ``-c``, a path,
-    archive or URL) maps its own text to None. Only comments and pure
-    options are ignored.
+    archive or URL, or a marker ``environment`` cannot decide) maps its own
+    text to None. Only comments and pure options are ignored.
     """
     packages: dict[str, str | None] = {}
     text = re.sub(r"\\\r?\n", " ", data.decode("utf-8", "replace"))
@@ -173,8 +227,16 @@ def parse_requirements(data: bytes) -> dict[str, str | None]:
         ):
             packages[line] = None
             continue
-        rest = line[match.end():].split(";", 1)[0].split()
-        spec = "".join(token for token in rest if not token.startswith("--"))
+        requirement, _, marker = line[match.end():].partition(";")
+        # Options such as ``--hash`` follow the marker on a lock entry.
+        marker = re.split(r"(?:^|\s)-", marker, maxsplit=1)[0].strip()
+        applies = marker_applies(marker, environment) if marker else True
+        if applies is None:
+            packages[line] = None
+            continue
+        if not applies:
+            continue
+        spec = "".join(token for token in requirement.split() if not token.startswith("--"))
         name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
         packages[name] = ",".join(part for part in (packages.get(name), spec) if part)
     return packages
@@ -200,11 +262,14 @@ def locked_version(spec: str) -> str:
     return spec[2:] if spec.startswith("==") else spec
 
 
-def package_loss(served: bytes, installed: dict[str, str]) -> list[str]:
-    """What the target image (its ``INSTALLED_INVENTORY``) would not satisfy
-    of what the source declares, one description per package."""
+def package_loss(
+    served: bytes, installed: dict[str, str], environment: dict[str, str],
+) -> list[str]:
+    """What the target image (its ``INSTALLED_INVENTORY``, marker values
+    ``environment``) would not satisfy of what the source declares, one
+    description per package."""
     lost = []
-    for name, spec in parse_requirements(served).items():
+    for name, spec in parse_requirements(served, environment).items():
         pinned = installed.get(name) if spec is not None else None
         version = locked_version(pinned) if pinned is not None else None
         kind = unmet_declaration(spec, version)
@@ -292,7 +357,8 @@ def check_served_packages_survive(
     may not satisfy, losing the live install; accepting that names the local
     commit to revert instead.
     """
-    installed = parse_requirements(show(target, INSTALLED_INVENTORY) or b"")
+    environment = target_environment(target)
+    installed = parse_requirements(show(target, INSTALLED_INVENTORY) or b"", environment)
     for path in PYTHON_INPUTS:
         try:
             served = (PLATFORM / path).read_bytes()
@@ -301,7 +367,7 @@ def check_served_packages_survive(
         if declared_in_history(target, path, served):
             # A line naming no distribution is unverifiable, so it counts too.
             dropped = sorted(
-                name for name, spec in parse_requirements(served).items()
+                name for name, spec in parse_requirements(served, environment).items()
                 if spec is None or name not in installed
             )
             if dropped and not allow_package_loss:
@@ -314,7 +380,7 @@ def check_served_packages_survive(
                     "container anyway"
                 )
             continue
-        lost = package_loss(served, installed)
+        lost = package_loss(served, installed, environment)
         detail = f" ({'; '.join(lost)})" if lost else ""
         releases = declaring_commits(official, path, served)
         if releases:

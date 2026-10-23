@@ -69,9 +69,15 @@ from typing import Callable, Literal, NotRequired, TypedDict
 from sqlalchemy.orm import Session
 
 try:
+  from packaging.markers import (
+    InvalidMarker, Marker, UndefinedComparison, UndefinedEnvironmentName, default_environment,
+  )
   from packaging.specifiers import InvalidSpecifier, SpecifierSet
   from packaging.version import InvalidVersion, Version
 except ImportError:  # only a transitive dependency; pip vendors the same library
+  from pip._vendor.packaging.markers import (
+    InvalidMarker, Marker, UndefinedComparison, UndefinedEnvironmentName, default_environment,
+  )
   from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
   from pip._vendor.packaging.version import InvalidVersion, Version
 
@@ -3763,21 +3769,46 @@ _DEPENDENCY_OPTION = re.compile(r"-[erc]|--(?:editable|requirement|constraint)\b
 _ARCHIVE_SUFFIXES = (".whl", ".zip", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")
 
 
-def declared_python_packages(data: bytes) -> dict[str, str | None]:
+def marker_applies(marker: str, environment: dict[str, str]) -> bool | None:
+  """Whether a declaration's environment ``marker`` holds in ``environment``,
+  or None when it cannot be judged there: malformed, or naming a value
+  ``environment`` does not establish (never filled in from this interpreter)."""
+  try:
+    parsed = Marker(marker)
+  except InvalidMarker:
+    return None
+  names = set(re.findall(r"\w+", re.sub(r"'[^']*'|\"[^\"]*\"", "", str(parsed))))
+  if not names - {"and", "or", "not", "in"} <= environment.keys():
+    return None
+  try:
+    return parsed.evaluate(dict(environment))
+  except (UndefinedComparison, UndefinedEnvironmentName):
+    return None
+
+
+def declared_python_packages(
+  data: bytes, environment: dict[str, str] | None = None,
+) -> dict[str, str | None]:
   """Package name (normalized) to version spec, for requirements or a lock.
 
-  Every declaration of a name counts: repeated ones join into one spec
+  Only declarations whose environment marker holds in ``environment`` count
+  (by default this interpreter's, which is the image's own): one excluded
+  there declares nothing, so ``pkg==1; python_version < "3.12"`` beside
+  ``pkg==2; python_version >= "3.12"`` gives the single applicable pin. Every
+  applicable declaration of a name counts: repeated ones join into one spec
   (``pkg>=3`` and ``Pkg<4`` give ``>=3,<4``), so a later line cannot drop an
   earlier constraint. A line that declares a dependency this cannot name or
-  judge (``-e``, ``-r``, ``-c``, a bare path, archive or URL) maps its own
-  text to None, which ``unmet_declaration`` reports as ``unsupported``; only
-  comments and pure options are ignored.
+  judge (``-e``, ``-r``, ``-c``, a bare path, archive or URL, or a marker
+  ``environment`` cannot decide) maps its own text to None, which
+  ``unmet_declaration`` reports as ``unsupported``; only comments and pure
+  options are ignored.
 
   ``scripts/request-container-upgrade.py`` keeps a copy, with
-  ``unmet_declaration`` (it runs from fetched upstream on older installations
-  and cannot import this module); ``test_request_container_upgrade`` pins
-  that the copies agree.
+  ``marker_applies`` and ``unmet_declaration`` (it runs from fetched upstream
+  on older installations and cannot import this module);
+  ``test_request_container_upgrade`` pins that the copies agree.
   """
+  environment = dict(default_environment()) if environment is None else environment
   packages: dict[str, str | None] = {}
   text = re.sub(r"\\\r?\n", " ", data.decode("utf-8", "replace"))
   for logical in text.splitlines():
@@ -3791,8 +3822,16 @@ def declared_python_packages(data: bytes) -> dict[str, str | None]:
     ):
       packages[line] = None
       continue
-    rest = line[match.end():].split(";", 1)[0].split()
-    spec = "".join(token for token in rest if not token.startswith("--"))
+    requirement, _, marker = line[match.end():].partition(";")
+    # Options such as ``--hash`` follow the marker on a lock entry.
+    marker = re.split(r"(?:^|\s)-", marker, maxsplit=1)[0].strip()
+    applies = marker_applies(marker, environment) if marker else True
+    if applies is None:
+      packages[line] = None
+      continue
+    if not applies:
+      continue
+    spec = "".join(token for token in requirement.split() if not token.startswith("--"))
     name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
     packages[name] = ",".join(part for part in (packages.get(name), spec) if part)
   return packages

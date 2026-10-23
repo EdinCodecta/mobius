@@ -28,6 +28,7 @@ import select
 import signal
 import subprocess
 import stat
+import sys
 import textwrap
 import threading
 import time
@@ -6645,6 +6646,32 @@ def test_package_gap_holds_every_declaration_and_reports_unnamed_ones(
   reason = pu.describe_package_gap(gap)
   assert "-e ./local-package: a declaration this check cannot verify" in reason
   assert "pkg: source declares >=3,<4, this image has 2" in reason
+
+
+def test_package_gap_counts_only_declarations_for_this_interpreter(clone_env, monkeypatch):
+  """A marker excluding this interpreter declares nothing here: split pins
+  give the applicable one alone, and a package declared only for another
+  platform is not missing."""
+  _origin, platform = clone_env
+  _with_python_inputs(platform, _origin)
+  image = _served_sha(platform)
+  image_lock = (platform / "backend/requirements.lock").read_bytes()
+  here = f"{sys.version_info.major}.{sys.version_info.minor}"
+  _local_commit(platform, edits={"backend/requirements.lock": (
+    f"fastapi==1\npkg==1 ; python_version < '{here}'\n"
+    f"pkg==2 ; python_version >= '{here}' --hash=sha256:aa\n"
+    "elsewhere==1 ; sys_platform == 'no-such-platform'\n"
+    "repeated>=1\nrepeated<3 ; os_name == 'posix' or os_name != 'posix'\n"
+  )})
+  _boot_image(image)
+  _record_image_inputs(platform, image_lock)
+  monkeypatch.setattr(pu, "_installed_version", {"fastapi": "1", "pkg": "2", "repeated": "3"}.get)
+
+  gap = pu.python_package_gap(platform)
+
+  assert [(item["name"], item["declared"], item["kind"]) for item in gap["packages"]] == [
+    ("repeated", ">=1,<3", "version"),
+  ]
 
 
 def test_an_uncommitted_local_gap_says_to_revert_the_edit():
