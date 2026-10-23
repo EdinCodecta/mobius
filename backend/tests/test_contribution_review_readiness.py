@@ -233,12 +233,14 @@ def test_ready_attempt_projection_keeps_private_review_evidence(setup, monkeypat
   assert row.outcomes_json[domain.key(ITEM)]["state"] == "reviewing"
 
 
-@pytest.mark.parametrize("changed", ["actor", "model", "rights"])
-def test_post_mutation_identity_or_rights_drift_is_unknown_not_replayed(setup, monkeypatch, changed):
+@pytest.mark.parametrize("changed", ["actor", "model", "rights", "head", "stop"])
+def test_confirmed_mutation_response_is_final_despite_later_drift(setup, monkeypatch, changed):
   db, row, principal = ready_takeover(setup, monkeypatch)
   stage = {"ready": False}
   calls = []
   def pull(*a):
+    if changed == "head" and stage["ready"]:
+      raise HTTPException(409, "The selected head moved")
     repo = {**REPO, "permissions": {"push": False}} if changed == "rights" and stage["ready"] else REPO
     return repo, {**PULL, "draft": not stage["ready"]}
   def actor(*a):
@@ -248,21 +250,52 @@ def test_post_mutation_identity_or_rights_drift_is_unknown_not_replayed(setup, m
     calls.append(1)
     if changed == "model":
       db.get(models.Chat, row.chat_id).agent_settings_json = {"model": "another-model", "effort": "xhigh"}
-      db.commit()
+    elif changed == "stop":
+      db.get(models.ChatRun, principal.run_id).status = "stopped"
+    db.commit()
     return {"id": "PR_7", "isDraft": False, "headRefOid": SHA}
   monkeypatch.setattr(domain, "current_pull", pull)
   monkeypatch.setattr(domain, "read", actor)
   monkeypatch.setattr(domain, "mark_ready", mutate)
   result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-  expected = "ready" if changed == "model" else "unknown"
-  assert result["run"]["items"][0]["ready_attempt"]["state"] == expected
-  if changed == "model":
-    # Reconciliation is read-only, even when a changed model cannot call the
-    # owning mutation endpoint again.
-    assert calls == [1]
-  else:
-    retry = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
-    assert retry["blocked"] and calls == [1]
+  assert result["run"]["items"][0]["ready_attempt"]["state"] == "ready"
+  assert calls == [1]
+
+
+@pytest.mark.parametrize("changed", ["actor", "rights"])
+def test_lost_ready_response_confirms_same_head_without_current_authority(setup, monkeypatch, changed):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  previous = row.outcomes_json[domain.key(ITEM)]
+  domain.save_outcome(db, row, domain.key(ITEM), {**previous,
+    "ready_attempt": {"id": "old-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE}})
+  repo = {**REPO, "permissions": {"push": False}} if changed == "rights" else REPO
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (repo, {**PULL, "draft": False}))
+  if changed == "actor":
+    monkeypatch.setattr(domain, "read", lambda *a: (_ for _ in ()).throw(OSError("actor changed")))
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("never replay"))
+  observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]
+  assert observed["items"][0]["ready_attempt"]["state"] == "ready"
+
+
+def test_moved_head_without_attributable_ready_event_stays_unknown(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  previous = row.outcomes_json[domain.key(ITEM)]
+  domain.save_outcome(db, row, domain.key(ITEM), {**previous,
+    "ready_attempt": {"id": "old-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE}})
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "head moved")))
+  def read(_gh, _cwd, path):
+    if path == f"repos/{ITEM['repo']}":
+      return REPO
+    if path == f"repos/{ITEM['repo']}/pulls/{ITEM['number']}":
+      return {**PULL, "head": {"sha": NEW}, "draft": False}
+    pytest.fail("No actor read is needed")
+  monkeypatch.setattr(domain, "read", read)
+  observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]
+  assert observed["items"][0]["ready_attempt"]["state"] == "unknown"
+  reason = asyncio.run(routes._confirm_ready_attempt(row.targets_json[0], "/tmp"))
+  assert "ready event" in reason
+
+
 
 
 @pytest.mark.parametrize("invalid", [
@@ -391,7 +424,7 @@ def test_leftover_attempting_readiness_escalates_on_ready_retry(setup, monkeypat
   assert result["run"]["items"][0]["ready_attempt"]["state"] == "unknown"
 
 
-def test_observe_actor_read_failure_leaves_readiness_unchanged(setup, monkeypatch):
+def test_observe_actor_read_failure_does_not_erase_same_head_ready_fact(setup, monkeypatch):
   db, row, principal = ready_takeover(setup, monkeypatch)
   prior = row.outcomes_json[domain.key(ITEM)]
   domain.save_outcome(db, row, domain.key(ITEM), {**prior,
@@ -401,7 +434,7 @@ def test_observe_actor_read_failure_leaves_readiness_unchanged(setup, monkeypatc
     raise OSError("gh unavailable")
   monkeypatch.setattr(domain, "read", broken)
   observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]
-  assert observed["items"][0]["ready_attempt"]["state"] == "unknown"
+  assert observed["items"][0]["ready_attempt"]["state"] == "ready"
 
 
 @pytest.mark.parametrize("state", ["pushing", "push_unknown"])
@@ -694,3 +727,66 @@ def test_real_ready_gh_exit_one_preserves_structured_refusal(tmp_path, monkeypat
   monkeypatch.setattr(transport, '_git_env', lambda cwd: {'PATH': str(tmp_path)+':/usr/bin:/bin'})
   with pytest.raises(NotDispatched):
     domain.mark_ready(transport._gh, tmp_path, TARGET)
+
+
+def test_stop_admission_lock_prevents_ready_arm_after_preflight(setup, monkeypatch):
+  from app import chat_queue
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  armed = []
+  monkeypatch.setattr(domain, "arm_ready", lambda *a: armed.append(1))
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("no mutation after Stop"))
+
+  async def race():
+    loop = asyncio.get_running_loop()
+    preflight = asyncio.Event()
+    def checks(*a):
+      loop.call_soon_threadsafe(preflight.set)
+      return CHECKS
+    monkeypatch.setattr(domain, "pull_checks", checks)
+    async with chat_queue.get_transition_lock(f"review-admission:{row.id}"):
+      task = asyncio.create_task(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+      await asyncio.wait_for(preflight.wait(), 5)
+      await asyncio.sleep(0.05)
+      assert not task.done() and not armed
+      domain.save_outcome(db, row, routes.REVIEW_STOP_KEY, {"state": "requested", "actor": "owner"})
+    with pytest.raises(HTTPException) as error:
+      await task
+    assert error.value.status_code == 409
+  asyncio.run(race())
+  db.refresh(row)
+  assert not armed and "ready_attempt" not in row.outcomes_json[domain.key(ITEM)]
+
+
+def test_start_refuses_draft_takeover_without_ready_scope(setup, monkeypatch):
+  db, _, principal = setup
+  owner = Principal(owner=principal.owner, app_id=None)
+  monkeypatch.setattr(routes, "resolve_round_choice", lambda *a: {"provider": "codex", "model": "gpt-5", "effort": "xhigh"})
+  monkeypatch.setattr(domain, "inspect_target", lambda *a: {**TARGET, "is_draft": True})
+  monkeypatch.setattr(domain, "repair_file_scope", lambda *a: pytest.fail("draft guard did not refuse before repair scope read"))
+  async def no_start(**kwargs):
+    pytest.fail("draft without ready scope admitted")
+  monkeypatch.setattr(routes, "start_programmatic_chat_turn", no_start)
+  preview = routes.review_preview(1, routes.ReviewPreview(), db, owner)
+  body = routes.StartReviews(request_id="draft-without-ready", mode="review_fix_merge", items=[ITEM],
+    confirmation_scope="named_pr_repairs_and_reviewed_successors",
+    preview_sha256=preview["preview_sha256"])
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.start_reviews(1, body, db, owner))
+  assert error.value.status_code == 422
+
+
+def test_lost_ready_response_confirms_same_head_after_base_ref_moves(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  prior = row.outcomes_json[domain.key(ITEM)]
+  domain.save_outcome(db, row, domain.key(ITEM), {**prior,
+    "ready_attempt": {"id": "old-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE}})
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "base ref moved")))
+  def read(_gh, _cwd, path):
+    if path == f"repos/{ITEM['repo']}":
+      return {**REPO, "permissions": {"push": False}}
+    if path == f"repos/{ITEM['repo']}/pulls/{ITEM['number']}":
+      return {**PULL, "base": {"ref": "release", "sha": NEW}, "draft": False}
+    pytest.fail("No actor read is needed to confirm an old ready effect")
+  monkeypatch.setattr(domain, "read", read)
+  observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]
+  assert observed["items"][0]["ready_attempt"]["state"] == "ready"

@@ -124,11 +124,15 @@ review and passing checks, the parent calls `/ready` with the exact head/base,
 independent receipt, full scope and test evidence. One final preflight and the
 shared Stop admission lock precede the single public attempt.
 
-`/observe` can confirm the same PR/head is no longer a draft even if its base
-advanced. That readiness fact does not authorize merge using an old review.
-An uncertain readiness attempt remains visible, fences repair and merge, and
-is never repeated. A stranded attempting receipt becomes unknown when
-read-only observation cannot confirm it.
+A validated mark-ready response confirms the saved PR/head immediately; a
+later Stop, actor or rights change cannot undo that fact. If the response is
+lost, `/observe` may confirm the exact PR/head is non-draft, independently of
+the old base and current actor or rights. A moved head stays unknown: GitHub's
+`ReadyForReviewEvent` has no head SHA, so its timeline entry alone cannot
+attribute readiness to the reviewed head. Do not replay the mutation or claim
+that a later non-draft head proves this attempt. Readiness does not authorize
+merge using an old review. Unknown readiness remains visible and fences new
+public actions; an abandoned attempting receipt escalates to unknown.
 
 ## Recover a confirmed queue removal
 

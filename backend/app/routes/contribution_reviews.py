@@ -662,7 +662,7 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
       target = reviews.effective_target(row, original)
       attempt = previous.get("ready_attempt")
       if attempt and attempt.get("state") in {"attempting", "unknown"}:
-        blocked = await _confirm_ready_attempt(row, target, cwd)
+        blocked = await _confirm_ready_attempt(target, cwd)
         if blocked:
           _escalate_unconfirmed_ready(db, row, reviews.key(original), previous, attempt)
           continue
@@ -1038,25 +1038,31 @@ def _require_ready_attempt_resolved(previous):
     raise HTTPException(409, "The draft readiness attempt is uncertain. Reconcile it read-only before any new public action.")
 
 
-async def _confirm_ready_attempt(row, target, cwd) -> str | None:
-  """Read-only check that an earlier readiness attempt is visibly complete.
+async def _confirm_ready_attempt(target, cwd) -> str | None:
+  """Observe only PR identity, the saved head and non-draft state.
 
-  Returns None when confirmed, otherwise why it is not. Never mutates GitHub.
+  A ReadyForReviewEvent has no head SHA, so a moved head cannot prove that the
+  event belongs to this attempt. Never use today's actor or rights to judge a
+  past GitHub effect.
   """
   try:
-    live_repo, live = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
-  except (HTTPException, ContributionSubmitError, OSError, json.JSONDecodeError):
+    _repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
+  except HTTPException:
+    try:
+      repo = await asyncio.to_thread(reviews.read, _gh, cwd, f"repos/{target['repo']}")  # unsettled: read-only (GitHub observation)
+      pull = await asyncio.to_thread(reviews.read, _gh, cwd, f"repos/{target['repo']}/pulls/{target['number']}")  # unsettled: read-only (GitHub observation)
+    except (HTTPException, ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
+      return "The earlier readiness attempt is uncertain; it was not repeated."
+    if (not isinstance(repo, dict) or not isinstance(pull, dict)
+        or repo.get("id") != target["repo_id"] or pull.get("node_id") != target["pr_id"]):
+      return "The earlier readiness attempt cannot be tied to this pull request; it was not repeated."
+    head = pull.get("head")
+    if not isinstance(head, dict) or head.get("sha") != target["head_sha"]:
+      return "The head changed; GitHub's ready event cannot identify the reviewed head. No action was repeated."
+  except (ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
     return "The earlier readiness attempt is uncertain; it was not repeated."
-  if live.get("state") != "open" or live.get("draft") is not False:
+  if pull.get("draft") is not False:
     return "The earlier readiness attempt is not confirmed; it was not repeated."
-  if not reviews.merge_permission(live_repo):
-    return "The earlier readiness attempt is visible, but write permission changed; no action was repeated."
-  try:
-    actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub observation)
-  except (HTTPException, ContributionSubmitError, OSError, json.JSONDecodeError):
-    return "The earlier readiness attempt is visible, but the GitHub actor could not be confirmed; no action was repeated."
-  if str(actor.get("id") or "") != row.github_actor_id:
-    return "The earlier readiness attempt is visible, but the GitHub actor changed; no action was repeated."
   return None
 
 
@@ -1094,7 +1100,7 @@ async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
     attempt = previous.get("ready_attempt")
     if attempt:
       # The mutation is unrepeatable after admission, including lost responses.
-      blocked = await _confirm_ready_attempt(row, target, cwd)
+      blocked = await _confirm_ready_attempt(target, cwd)
       if blocked:
         _escalate_unconfirmed_ready(db, row, item_key, previous, attempt)
         return {"run": _run_view(db, row), "blocked": blocked}
@@ -1105,32 +1111,9 @@ async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
       raise HTTPException(422, "Fresh full-rubric review and passing tests are required before draft readiness.")
     reviews.require_independent_clear(row, target, body)
     async with _github_connection_transaction():
-      actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub observation)
-      if str(actor.get("id") or "") != row.github_actor_id:
-        raise HTTPException(409, "The connected GitHub actor changed. Approve a new selection.")
-      repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
-      await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
-      checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
-      blocker = reviews.readiness_blocker(target, repo, pull, checks)
-      if blocker:
-        raise HTTPException(409, blocker)
-      # Stop admission and the final arm share a lock with the parent lifecycle.
-      async with chat_queue.get_transition_lock(f"review-admission:{run_id}"):
-        _parent(db, row, principal)
-        receipt = {"id": str(uuid.uuid4()), "state": "attempting",
-          "head_sha": target["head_sha"], "base_sha": target["base_sha"],
-          "independent_receipt_id": body.independent_receipt_id,
-          "review_run_id": principal.run_id, "summary": body.summary,
-          "tests": body.tests, "tests_passed": True, "scope": body.scope}
-        reviews.arm_ready(db, row, target, receipt, principal)
-        try:
-          _parent(db, row, principal)
-        except Exception:
-          # Stop, uninstall or model drift before the mutation: nothing public
-          # happened, so drop the receipt and claim instead of recording unknown.
-          reviews.disarm_ready(db, row, target, receipt["id"])
-          raise
-      result = await _dispatch_ready(row, target, cwd)
+      await _ready_preflight(row, target, cwd)
+      receipt = await _arm_ready(db, row, principal, target, body)
+      result = await _dispatch_ready(target, cwd)
       if result.state == "not_dispatched":
         reviews.disarm_ready(db, row, target, receipt["id"])
         raise HTTPException(409, result.reason or "Readiness was refused without applying a public effect.")
@@ -1140,16 +1123,47 @@ async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
     return {"run": _run_view(db, row), **({"blocked": "The readiness response is uncertain; observe read-only before proceeding."} if receipt["state"] == "unknown" else {})}
 
 
+async def _ready_preflight(row, target, cwd):
+  actor = await asyncio.to_thread(reviews.read, _gh, cwd, "user")  # unsettled: read-only (GitHub observation)
+  if str(actor.get("id") or "") != row.github_actor_id:
+    raise HTTPException(409, "The connected GitHub actor changed. Approve a new selection.")
+  repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
+  await asyncio.to_thread(reviews.assert_current_base, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
+  checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
+  blocker = reviews.readiness_blocker(target, repo, pull, checks)
+  if blocker:
+    raise HTTPException(409, blocker)
+
+
+async def _arm_ready(db, row, principal, target, body):
+  # Stop uses this same lock before recording its revocation.
+  async with chat_queue.get_transition_lock(f"review-admission:{row.id}"):
+    _parent(db, row, principal)
+    receipt = {"id": str(uuid.uuid4()), "state": "attempting",
+      "head_sha": target["head_sha"], "base_sha": target["base_sha"],
+      "independent_receipt_id": body.independent_receipt_id,
+      "review_run_id": principal.run_id, "summary": body.summary,
+      "tests": body.tests, "tests_passed": True, "scope": body.scope}
+    reviews.arm_ready(db, row, target, receipt, principal)
+    try:
+      _parent(db, row, principal)
+    except Exception:
+      reviews.disarm_ready(db, row, target, receipt["id"])
+      raise
+    return receipt
+
+
 @router.post("/api/github/review-runs/{run_id}/ready", dependencies=[Depends(reject_cross_site)])
 async def core_mark_draft_ready(run_id: str, body: DraftReady, db: Session = Depends(get_db), principal: Principal = Depends(get_agent_run_principal)):
   return await mark_draft_ready(None, run_id, body, db, principal)
 
 
-async def _dispatch_ready(row, target, cwd):
-  """One settled mutation; read-only confirmation never depends on the old base."""
+async def _dispatch_ready(target, cwd):
+  """One settled mutation with a response that directly proves its effect."""
   try:
     mutation = await settled.run_settled(reviews.mark_ready, _gh, cwd, target)
   except (NotDispatched, ContributionSubmitError, HTTPException, subprocess.SubprocessError, OSError, json.JSONDecodeError) as exc:
     return classify_dispatch_error(exc)
-  blocked = await _confirm_ready_attempt(row, target, cwd)
-  return DispatchResult.unknown(blocked) if blocked else DispatchResult.confirmed(mutation)
+  # The GraphQL response already binds PR id, reviewed head and non-draft.
+  # A later observation can see a new head, actor or rights and cannot revoke it.
+  return DispatchResult.confirmed(mutation)
