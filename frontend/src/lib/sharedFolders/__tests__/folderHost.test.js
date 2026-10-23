@@ -1,9 +1,9 @@
-import { test, beforeEach } from 'node:test'
+import { test, beforeEach, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import { handleSharedFolderCommand } from '../folderHost.js'
 import { createHandleFolder } from '../handleFolder.js'
 import { hostStore } from '../hostState.js'
-import { FakeDirectoryHandle } from './fakeDirectory.js'
+import { FakeDirectoryHandle, fileText } from './fakeDirectory.js'
 
 let answers = []
 
@@ -53,4 +53,48 @@ test('a paused folder refuses every command until the owner resumes it', async (
 test('a folder this browser no longer shares answers not found', async () => {
   await handleSharedFolderCommand(command('gone', 'list', { path: '' }))
   assert.deepEqual([answers[0].ok, answers[0].code], [false, 'not_found'])
+})
+
+function editFolder(root) {
+  hostStore().access.set('edit', createHandleFolder(root))
+}
+
+test('two changes at the same moment cannot both claim one new name', async () => {
+  const root = new FakeDirectoryHandle('Downloads')
+  editFolder(root)
+  await Promise.all(['first', 'second'].map(text => handleSharedFolderCommand(
+    command('edit', 'write', { commandId: `c-${text}`, path: 'new.txt', content: text }),
+  )))
+  assert.deepEqual(answers.map(answer => answer.ok ? 'ok' : answer.code).sort(), ['exists', 'ok'])
+  assert.equal(await fileText(root, 'new.txt'), 'first')
+})
+
+test('binning two same-named files at once keeps both in the bin', async () => {
+  const root = new FakeDirectoryHandle('Downloads')
+  root.addFolder('a').addFile('x.txt', 'from a')
+  root.addFolder('b').addFile('x.txt', 'from b')
+  editFolder(root)
+  await Promise.all(['a', 'b'].map(folder => handleSharedFolderCommand(
+    command('edit', 'bin', { commandId: `c-bin-${folder}`, path: `${folder}/x.txt` }),
+  )))
+  const bin = root.children.get('Möbius bin')
+  assert.deepEqual([...bin.children.keys()].sort(), ['x (2).txt', 'x.txt'])
+})
+
+test('the activity pill stays while a command runs and leaves a few seconds after', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    let finish
+    hostStore().access.set('edit', { run: () => new Promise(resolve => { finish = resolve }) })
+    const running = handleSharedFolderCommand(command('edit', 'move', { to: 'b.txt' }))
+    mock.timers.tick(60_000)
+    assert.equal(hostStore().state.activity?.op, 'move')
+    finish({ path: 'a.txt', to: 'b.txt' })
+    await running
+    assert.equal(hostStore().state.activity?.op, 'move')
+    mock.timers.tick(6_000)
+    assert.equal(hostStore().state.activity, null)
+  } finally {
+    mock.timers.reset()
+  }
 })

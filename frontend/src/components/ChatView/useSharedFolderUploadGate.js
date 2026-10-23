@@ -1,6 +1,6 @@
 /* Hold a big chat upload until the owner chooses: share the folder, or upload anyway. */
 import { useCallback, useEffect, useState } from 'react'
-import { shouldSuggestSharedFolder, uploadTotals } from '../../lib/sharedFolders/uploadSuggestion.js'
+import { holdUpload } from '../../lib/sharedFolders/uploadSuggestion.js'
 
 export default function useSharedFolderUploadGate({ chatId, addFiles, appendToComposer }) {
   const [pending, setPending] = useState(null)
@@ -9,10 +9,11 @@ export default function useSharedFolderUploadGate({ chatId, addFiles, appendToCo
   // Nothing is sent before the owner chooses, so sharing really saves the space.
   const gatedAddFiles = useCallback((fileList) => {
     const files = [...(fileList || [])]
-    if (!shouldSuggestSharedFolder(files)) return addFiles(files)
-    setPending({ files, ...uploadTotals(files) })
+    const held = holdUpload(pending, files)
+    if (!held) return addFiles(files)
+    setPending(held)
     return Promise.resolve()
-  }, [addFiles])
+  }, [addFiles, pending])
 
   const uploadAnyway = useCallback(() => {
     const files = pending?.files || []

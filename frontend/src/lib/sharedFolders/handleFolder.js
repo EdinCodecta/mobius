@@ -120,14 +120,23 @@ async function write(root, command) {
 }
 
 async function copyThenRemove(source, targetParent, targetName) {
+  const original = await source.handle.getFile()
   const copy = await targetParent.getFileHandle(targetName, { create: true })
   try {
-    await (await source.handle.getFile()).stream().pipeTo(await copy.createWritable())
+    await original.stream().pipeTo(await copy.createWritable())
   } catch (error) {
     await targetParent.removeEntry(targetName).catch(() => {})
     throw error
   }
-  // Only the original of a completed copy is removed: this finishes a move.
+  // Only an unchanged original of a completed copy is removed. If something
+  // changed it during the copy, removing it would lose that newer version.
+  const current = await source.handle.getFile()
+  if (current.lastModified !== original.lastModified || current.size !== original.size) {
+    throw new FolderError(
+      'changed_during_move',
+      `"${source.name}" changed while it was moved. The copy is at the new place and the original was kept.`,
+    )
+  }
   await source.parent.removeEntry(source.name)
 }
 

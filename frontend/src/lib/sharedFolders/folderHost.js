@@ -14,6 +14,7 @@ const ACTIVITY_VISIBLE_MS = 6000
 
 let channel = null
 let activityTimer = null
+let commandsInFlight = 0
 
 /** Start once per page. Safe to call again; later calls do nothing. */
 export async function startSharedFolderHost() {
@@ -136,7 +137,8 @@ export async function handleSharedFolderCommand(event) {
   const subscriptionId = store.subscriptionId
   if (!event?.commandId || !subscriptionId) return
   const record = store.records.get(event.folderId)
-  if (record && folderState(record) === 'ready') showActivity(record, event)
+  const shown = Boolean(record) && folderState(record) === 'ready'
+  if (shown) showActivity(record, event)
   let answer
   try {
     const result = await runCommand(record, event)
@@ -149,6 +151,8 @@ export async function handleSharedFolderCommand(event) {
       error: String(error?.message || error).slice(0, 1000),
     }
     if (known && error.code === 'needs_permission') void refreshPermissions()
+  } finally {
+    if (shown) settleActivity()
   }
   await api.sharedFolders.respond({ subscriptionId, commandId: event.commandId, ...answer }).catch(() => {})
 }
@@ -165,7 +169,11 @@ async function runCommand(record, event) {
   delete command.type
   delete command.commandId
   delete command.folderId
-  return hostStore().access.get(record.id).run(command)
+  const folder = hostStore().access.get(record.id)
+  if (!editing) return folder.run(command)
+  // A change checks its destination, then writes it. One change at a time per
+  // folder, across this browser's tabs, so two can never claim the same name.
+  return navigator.locks.request(`mobius-shared-folder:${record.id}`, () => folder.run(command))
 }
 
 function notReadyMessage(state) {
@@ -177,8 +185,15 @@ function notReadyMessage(state) {
   return messages[state] || 'This folder is not ready.'
 }
 
+/** The pill and its Stop stay while any command runs, then a few seconds more. */
 function showActivity(record, event) {
-  publish({ activity: { folderId: record.id, folderName: record.name, op: event.op, path: event.path, at: Date.now() } })
+  commandsInFlight += 1
   clearTimeout(activityTimer)
+  publish({ activity: { folderId: record.id, folderName: record.name, op: event.op, path: event.path, at: Date.now() } })
+}
+
+function settleActivity() {
+  commandsInFlight -= 1
+  if (commandsInFlight > 0) return
   activityTimer = setTimeout(() => publish({ activity: null }), ACTIVITY_VISIBLE_MS)
 }

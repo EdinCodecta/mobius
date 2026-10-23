@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { shouldSuggestSharedFolder } from '../uploadSuggestion.js'
+import { holdUpload, shouldSuggestSharedFolder } from '../uploadSuggestion.js'
 
 const ready = { status: 'ready', canRemember: true, canPickForVisit: true }
 const files = (count, size = 1000) => Array.from({ length: count }, () => ({ size }))
@@ -28,4 +28,14 @@ test('the phone app keeps its normal upload until it can share folders', () => {
   } finally {
     delete globalThis.MobiusNative
   }
+})
+
+test('files added while the choice is open join the held upload instead of replacing it', () => {
+  assert.equal(holdUpload(null, files(2), ready), null)
+  const first = holdUpload(null, files(6), ready)
+  assert.deepEqual([first.count, first.bytes], [6, 6000])
+  const second = holdUpload(first, files(7), ready)
+  assert.deepEqual([second.count, second.bytes], [13, 13000])
+  const small = holdUpload(second, files(1), ready)
+  assert.equal(small.count, 14)
 })

@@ -121,6 +121,25 @@ test('move falls back to copy then remove when the browser cannot move local fil
   assert.equal(root.children.has('big.mov'), false)
 })
 
+test('a copy-and-remove move keeps an original that changed during the copy', async () => {
+  const root = new FakeDirectoryHandle('Downloads', { withMove: false })
+  const source = root.addFile('notes.txt', 'version one')
+  const readFile = source.getFile.bind(source)
+  let reads = 0
+  // Another app saves the file after the copy has read it.
+  source.getFile = async () => {
+    reads += 1
+    if (reads === 2) source.modified += 1
+    return readFile()
+  }
+  await failsWith(
+    createHandleFolder(root).run({ op: 'move', path: 'notes.txt', to: 'kept.txt' }),
+    'changed_during_move',
+  )
+  assert.equal(root.children.has('notes.txt'), true)
+  assert.equal(await fileText(root, 'kept.txt'), 'version one')
+})
+
 test('bin moves a file into the Möbius bin, never deleting it', async () => {
   const root = new FakeDirectoryHandle('Downloads')
   root.addFile('old.txt', 'first')

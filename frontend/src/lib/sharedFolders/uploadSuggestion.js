@@ -18,3 +18,13 @@ export function shouldSuggestSharedFolder(files, state = hostStore().state) {
   if (globalThis.MobiusNative) return false
   return Boolean(state.canRemember || state.canPickForVisit)
 }
+
+/**
+ * The upload to hold until the owner chooses, or null when it can go now.
+ * Files added while a choice is open join the held upload, so none are lost.
+ */
+export function holdUpload(held, files, state = hostStore().state) {
+  if (!held && !shouldSuggestSharedFolder(files, state)) return null
+  const all = [...(held?.files || []), ...files]
+  return { files: all, ...uploadTotals(all) }
+}
