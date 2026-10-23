@@ -6919,6 +6919,8 @@ def _allow_core_contribution_review_runs(eng) -> None:
       ).fetchone()[0]
       changed = original
       for name, width in (("app_id", "INTEGER"), ("app_nonce", "VARCHAR(64)")):
+        if columns[name]["nullable"]:
+          continue
         changed, count = re.subn(
           rf'("{name}"|\b{name}\b)(\s+{re.escape(width)})\s+NOT\s+NULL',
           r'\1\2', changed, count=1, flags=re.IGNORECASE,
