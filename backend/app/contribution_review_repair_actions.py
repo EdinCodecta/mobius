@@ -4,9 +4,12 @@ The route supplies one live-authority callback. This executor owns the persisted
 attempt and exact non-dispatch release; confirmed facts survive revoked authority.
 """
 import asyncio
+import subprocess
 
 from fastapi import HTTPException
+from sqlalchemy import text
 
+from app.database import SessionLocal
 from app import agent_work_claims, chat_queue, contribution_review_runs as reviews, models, settled
 from app import contribution_review_repairs as repairs
 from app.contribution_errors import ContributionSubmitError
@@ -22,8 +25,7 @@ def checkout_gc_scope(db) -> dict[str, set[str]]:
   active_chats = {chat_id for (chat_id,) in db.query(models.ChatRun.chat_id).filter(
     models.ChatRun.status.in_(models.NONTERMINAL_RUN_STATUSES)).all()}
   active_parents = {parent for (parent,) in db.query(models.Delegation.parent_chat_id).filter(
-    models.Delegation.child_chat_id.in_(active_chats),
-    models.Delegation.cancelled_at.is_(None)).all()} if active_chats else set()
+    models.Delegation.child_chat_id.in_(active_chats)).all()} if active_chats else set()
   protected: set[str] = set()
   terminal: set[str] = set()
   dormant: set[str] = set()
@@ -51,6 +53,31 @@ def checkout_gc_scope(db) -> dict[str, set[str]]:
         terminal.add(path)
   return {"protected_paths": protected, "terminal_paths": terminal,
           "dormant_paths": dormant}
+
+
+def sweep_checkout_receipts_once() -> None:
+  """Fence writers through classification and rename, not slow deletion.
+
+  Admission/ChatRun/Delegation writes cannot change checkout ownership while
+  a candidate is selected and atomically quarantined. After commit, any new
+  admission sees a missing old path and must reprepare it.
+  """
+  with SessionLocal() as db:
+    dialect = db.get_bind().dialect.name
+    if dialect == "sqlite":
+      # The first statement is a harmless owner-row write. SQLite holds its
+      # single-writer reservation until commit, including classification and
+      # same-filesystem rename. No recursive delete runs in that transaction.
+      db.execute(text("UPDATE contribution_review_runs SET revision=revision "
+                      "WHERE id=(SELECT id FROM contribution_review_runs LIMIT 1)"))
+    elif dialect == "postgresql":
+      db.execute(text("LOCK TABLE chat_runs, delegations, contribution_review_runs "
+                      "IN SHARE ROW EXCLUSIVE MODE"))
+    else:
+      raise RuntimeError("Repair checkout GC requires a writer-fenced database.")
+    repairs.quarantine_stale_checkouts(**checkout_gc_scope(db))
+    db.commit()
+  repairs.delete_quarantined_checkouts()
 
 
 async def dispatch_repair(row, target, validation, *, gh, cwd, authorize):
@@ -117,7 +144,7 @@ async def reconcile_push(db, row, original, previous, pending, *, gh, cwd):
   candidate = {**original, "head_sha": pending["head_sha"], "base_sha": pending["base_sha"]}
   try:
     await asyncio.to_thread(reviews.current_pull, gh, cwd, candidate)
-  except (HTTPException, ContributionSubmitError, OSError, ValueError):
+  except (HTTPException, ContributionSubmitError, OSError, ValueError, subprocess.SubprocessError):
     return False
   attempts = [{**r, "state": "pushed"} if r is pending else r
               for r in previous.get("repair_attempts", [])]
