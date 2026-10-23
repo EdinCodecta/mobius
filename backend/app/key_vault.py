@@ -143,24 +143,6 @@ async def vault_use(
 # created that way can be written through the deprecated secret routes: a key
 # the owner merely lets the app borrow is never the app's to replace.
 
-def _vault_safe(name: str) -> str:
-  cleaned = re.sub(r"[^A-Za-z0-9_-]", "-", name)
-  if not cleaned[:1].isalpha():
-    cleaned = f"k{cleaned}"
-  return cleaned[:64]
-
-
-def _candidate_names(app_id: int, name: str):
-  """Vault names to try for a new app-owned key, most readable first."""
-  plain = _vault_safe(name)
-  yield plain
-  scoped = f"app{int(app_id)}-{plain}"
-  yield scoped[:64]
-  for n in range(2, 100):
-    suffix = f"-{n}"
-    yield scoped[:64 - len(suffix)] + suffix
-
-
 def owned_key_in(keys: list[dict], app_id: int, name: str) -> dict | None:
   """The key ``app_id`` created for its own secret ``name`` and still holds.
 
@@ -223,32 +205,11 @@ def reveal_for_app_platform_use(app_id: int, name: str) -> str | None:
 async def store_app_key(app_id: int, name: str, value: str) -> str:
   """Save ``value`` as ``app_id``'s own secret ``name``; return the vault name.
 
-  The app's existing key for that name is replaced, keeping the owner's
-  choices for it. Otherwise a new key is created at the first free name,
-  atomically, granted to the app and the owner's agents, sent as a bearer
-  token, with no sites until the owner adds them.
+  The vault finds or creates the key by its origin in one locked step
+  (``Vault.save_owned``), keeping the owner's choices for an existing key.
   """
-  keys = (await vault_call("GET", "/keys"))["keys"]
-  owned = owned_key_in(keys, app_id, name)
-  if owned is not None:
-    await vault_call("PUT", f"/keys/{owned['name']}", {
-      "value": value, "inject": owned["inject"], "grants": owned["grants"],
-    })
-    return owned["name"]
-  for candidate in _candidate_names(app_id, name):
-    try:
-      await vault_call("PUT", f"/keys/{candidate}", {
-        "value": value,
-        "inject": {"type": "header", "name": "Authorization", "prefix": "Bearer "},
-        "grants": {"apps": [int(app_id)], "agents": True, "sites": []},
-        "origin": {"app": int(app_id), "name": name},
-        "create_only": True,
-      })
-      return candidate
-    except VaultRefused as exc:
-      if exc.status != 409:
-        raise
-  raise VaultRefused(409, f"No free vault name for {name}.")
+  saved = await vault_call("POST", "/owned", {"app": int(app_id), "name": name, "value": value})
+  return saved["name"]
 
 
 # -- one-time import of the retired per-app secret store ----------------------

@@ -181,6 +181,20 @@ def validate_origin(raw) -> dict:
   return {"app": app_id, "name": name}
 
 
+def owned_name_candidates(app_id: int, secret_name: str):
+  """Vault names to try for a new app-owned key, most readable first."""
+  plain = re.sub(r"[^A-Za-z0-9_-]", "-", secret_name)
+  if not plain[:1].isalpha():
+    plain = f"k{plain}"
+  plain = plain[:64]
+  yield plain
+  scoped = f"app{int(app_id)}-{plain}"
+  yield scoped[:64]
+  for n in range(2, 100):
+    suffix = f"-{n}"
+    yield scoped[:64 - len(suffix)] + suffix
+
+
 def validate_grants(raw) -> dict:
   if raw is None:
     raw = {}
@@ -574,6 +588,35 @@ class Vault:
     self.log_usage(name, "owner", "-", "-", "-", "added" if existing is None else "updated")
     return {"name": name, "created": existing is None}
 
+  def save_owned(self, app_id: int, secret_name: str, value: str) -> dict:
+    """Save an app's own secret by its origin, in one locked step.
+
+    The key ``app_id`` created for ``secret_name`` and still holds is
+    replaced; otherwise a new key is created at the first free name (plain,
+    then app-scoped, then numbered), granted to the app and the owner's
+    agents, sent as a bearer token, with no sites yet. Doing both under the
+    vault's lock means simultaneous saves can never leave two keys for one
+    app secret.
+    """
+    origin = validate_origin({"app": app_id, "name": secret_name})
+    value = validate_value(value)
+    with self._lock:
+      for name, record in self._records.items():
+        if record.get("origin") == origin and app_id in record["grants"]["apps"]:
+          self.put_key(name, {"value": value, "inject": record["inject"], "grants": record["grants"]})
+          return {"name": name, "created": False}
+      for name in owned_name_candidates(app_id, secret_name):
+        if name not in self._records:
+          self.put_key(name, {
+            "value": value,
+            "inject": {"type": "header", "name": "Authorization", "prefix": "Bearer "},
+            "grants": {"apps": [app_id], "agents": True, "sites": []},
+            "origin": origin,
+            "create_only": True,
+          })
+          return {"name": name, "created": True}
+    raise VaultError(409, f"No free vault name for {secret_name}.")
+
   def revoke_key(self, name: str) -> bool:
     validate_name(name)
     with self._lock:
@@ -891,6 +934,11 @@ class VaultHandler(BaseHTTPRequestHandler):
       self._send_json(200, vault.approve_request(parts[1], self._json_body()))
     elif method == "POST" and len(parts) == 3 and parts[0] == "requests" and parts[2] == "deny":
       self._send_json(200, vault.deny_request(parts[1]))
+    elif method == "POST" and parts == ["owned"]:
+      body = self._json_body()
+      if not isinstance(body.get("app"), int) or not isinstance(body.get("name"), str):
+        raise VaultError(400, "Name the app id and its secret name.")
+      self._send_json(200, vault.save_owned(body["app"], body["name"], body.get("value")))
     elif method == "DELETE" and len(parts) == 2 and parts[0] == "apps" and parts[1].isdigit():
       self._send_json(200, vault.forget_app(int(parts[1])))
     elif method == "DELETE" and len(parts) == 2 and parts[0] == "requests":

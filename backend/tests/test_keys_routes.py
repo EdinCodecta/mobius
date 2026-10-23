@@ -368,3 +368,20 @@ def test_distinct_old_names_stay_distinct_keys(client, auth, db, vault):
                       (long_a, "long-a-value"), (long_b, "long-b-value")):
     assert key_vault.reveal_for_app_platform_use(app.id, name) == value
   assert vault.reveal(long_a, ("owner", "")) == DUMMY    # the occupied names were untouched
+
+
+def test_simultaneous_saves_leave_one_key_per_app_secret(client, auth, db, vault):
+  import asyncio
+  app = _app(db, "racer")
+
+  async def save_all():
+    return await asyncio.gather(*(
+      key_vault.store_app_key(app.id, "provider-key", f"value-{n}") for n in range(8)
+    ))
+
+  names = asyncio.run(save_all())
+  owned = [k for k in vault.list_keys() if k["origin"] == {"app": app.id, "name": "provider-key"}]
+  assert len(owned) == 1 and set(names) == {owned[0]["name"]}
+  winner = vault.reveal(owned[0]["name"], ("owner", ""))
+  assert winner in {f"value-{n}" for n in range(8)}
+  assert key_vault.reveal_for_app_platform_use(app.id, "provider-key") == winner

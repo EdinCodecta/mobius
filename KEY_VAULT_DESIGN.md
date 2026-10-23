@@ -74,10 +74,11 @@ reads that key at turn launch while the owner's grant to the app stands
 `/data/app-secrets/<id>/<name>` move into the vault (`import_legacy_app_secrets`):
 each becomes a key granted to its own app and the owner's agents, sent as a
 bearer token, with no sites until the owner adds them. Each key records its
-origin (the app and its exact old name), set once at creation, and is created
-atomically at the first free name (`api.key` → `api-key`, then
-`app<id>-api-key`, then numbered), so distinct old names never merge and no
-existing key is overwritten. Model providers and the adapter below find a
+origin (the app and its exact old name), set once at creation. The vault
+finds or creates that key in one locked step (`Vault.save_owned`), at the
+first free name (`api.key` → `api-key`, then `app<id>-api-key`, then
+numbered), so distinct old names never merge, simultaneous saves never leave
+two keys for one secret, and no existing key is overwritten. Model providers and the adapter below find a
 secret by that origin, not by its vault name. A ledger
 (`.vault-import.json`) next to the old files means a key the owner deletes is
 never re-imported, unreadable values are retried, and a purged app's leftover

@@ -435,3 +435,19 @@ def test_create_only_refuses_an_occupied_name_and_origin_is_set_once(vault):
                          "origin": {"app": 8, "name": "stolen"}})
   [mine] = [k for k in vault.list_keys() if k["name"] == "mine"]
   assert mine["origin"] == {"app": 7, "name": "api.key"}
+
+
+def test_save_owned_finds_or_creates_by_origin_under_one_lock(vault):
+  results = []
+  threads = [
+    threading.Thread(target=lambda n=n: results.append(vault.save_owned(9, "api.key", f"v{n}")))
+    for n in range(12)
+  ]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+  assert {r["name"] for r in results} == {"api-key"}
+  assert sum(r["created"] for r in results) == 1
+  owned = [k for k in vault.list_keys() if k["origin"] == {"app": 9, "name": "api.key"}]
+  assert [k["name"] for k in owned] == ["api-key"]
