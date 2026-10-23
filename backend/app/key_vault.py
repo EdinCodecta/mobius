@@ -251,6 +251,32 @@ def _write_ledger(path: Path, ledger: dict) -> None:
     raise
 
 
+def _legacy_root() -> Path:
+  return Path(get_settings().data_dir) / "app-secrets"
+
+
+def _read_ledger(root: Path) -> dict:
+  try:
+    return json.loads((root / _IMPORT_LEDGER).read_text())
+  except (FileNotFoundError, ValueError):
+    return {}
+
+
+def _pending_legacy_secrets(root: Path, ledger: dict) -> list[tuple[int, Path]]:
+  """Saved values not yet moved, as (app id, file); cheap, no vault needed."""
+  if not root.is_dir():
+    return []
+  pending = []
+  for app_dir in sorted(root.iterdir()):
+    if not app_dir.is_dir() or not app_dir.name.isdigit():
+      continue
+    for secret in sorted(app_dir.iterdir()):
+      if (secret.is_file() and _LEGACY_NAME_RE.fullmatch(secret.name)
+          and f"{app_dir.name}/{secret.name}" not in ledger):
+        pending.append((int(app_dir.name), secret))
+  return pending
+
+
 async def import_legacy_app_secrets(live_app_ids: set[int]) -> dict:
   """Move ``/data/app-secrets/<app>/<name>`` values into the vault, once each.
 
@@ -260,34 +286,25 @@ async def import_legacy_app_secrets(live_app_ids: set[int]) -> dict:
   is never re-imported; unreadable values are retried on the next start. The
   old ciphertext stays in place for one release as a fallback copy.
   """
-  root = Path(get_settings().data_dir) / "app-secrets"
-  if not root.is_dir():
+  root = _legacy_root()
+  ledger = _read_ledger(root)
+  pending = _pending_legacy_secrets(root, ledger)
+  if not pending:
     return {}
-  ledger_path = root / _IMPORT_LEDGER
-  try:
-    ledger = json.loads(ledger_path.read_text())
-  except (FileNotFoundError, ValueError):
-    ledger = {}
   fernet = _legacy_fernet()
   moved = {}
-  for app_dir in sorted(root.iterdir()):
-    if not app_dir.is_dir() or not app_dir.name.isdigit():
-      continue
-    app_id = int(app_dir.name)
+  for app_id, secret in pending:
     if app_id not in live_app_ids:
       continue  # a purged app's id may be reused: never grant it onward
-    for secret in sorted(app_dir.iterdir()):
-      entry = f"{app_id}/{secret.name}"
-      if entry in ledger or not secret.is_file() or not _LEGACY_NAME_RE.fullmatch(secret.name):
-        continue
-      try:
-        value = fernet.decrypt(secret.read_bytes()).decode()
-        ledger[entry] = await store_app_key(app_id, secret.name, value)
-      except Exception as exc:  # unreadable or refused: retried on the next start
-        log.warning("key vault: could not import secret %s: %s", entry, type(exc).__name__)
-        continue
-      moved[entry] = ledger[entry]
-      _write_ledger(ledger_path, ledger)
+    entry = f"{app_id}/{secret.name}"
+    try:
+      value = fernet.decrypt(secret.read_bytes()).decode()
+      ledger[entry] = await store_app_key(app_id, secret.name, value)
+    except Exception as exc:  # unreadable or refused: retried on the next start
+      log.warning("key vault: could not import secret %s: %s", entry, type(exc).__name__)
+      continue
+    moved[entry] = ledger[entry]
+    _write_ledger(root / _IMPORT_LEDGER, ledger)
   if moved:
     log.info("key vault: imported %d app secret(s) into the vault", len(moved))
   return moved
@@ -306,7 +323,14 @@ async def forget_app(app_id: int) -> None:
 
 
 async def _import_when_ready() -> None:
-  """Run the one-time legacy import once the vault answers."""
+  """Run the one-time legacy import once the vault answers.
+
+  Installations with nothing left to move (the usual case) never wait on the
+  vault or touch it.
+  """
+  root = _legacy_root()
+  if not _pending_legacy_secrets(root, _read_ledger(root)):
+    return
   for _ in range(60):
     try:
       await vault_call("GET", "/health")
