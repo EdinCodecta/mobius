@@ -483,9 +483,9 @@
       // here because this is a template literal — the evaluated string carries
       // single backslashes (see applyTheme.prepaint.test.js byte-equality).
       css = css.replace(
-        /@import\s+(?:url\(\s*(?:"([^"]*)"|'([^']*)'|([^"'()\s]+))\s*\)|"([^"]*)"|'([^']*)')\s*;[^\S\n]*\n?/g,
+        /@import\s+(?:url\(\s*(?:"([^"]*)"|'([^']*)'|((?:[^"'()\s\\]|\\[\s\S])+))\s*\)|"([^"]*)"|'([^']*)')\s*;[^\S\n]*\n?/g,
         function (m, u1, u2, u3, q1, q2) {
-          fontUrls.push(u1 !== undefined ? u1 : u2 !== undefined ? u2 : u3 !== undefined ? u3 : q1 !== undefined ? q1 : q2);
+          fontUrls.push(u1 !== undefined ? u1 : u2 !== undefined ? u2 : u3 !== undefined ? u3.replace(/\\([^0-9a-fA-F\n])/g, '$1') : q1 !== undefined ? q1 : q2);
           return '';
         }
       );
@@ -1592,9 +1592,9 @@
         // by a syntax the quoted-url-only regex didn't see — same broadened
         // pattern as applyTheme.js + the pre-paint IIFE.
         css = css.replace(
-          /@import\s+(?:url\(\s*(?:"([^"]*)"|'([^']*)'|([^"'()\s]+))\s*\)|"([^"]*)"|'([^']*)')\s*;[^\S\n]*\n?/g,
+          /@import\s+(?:url\(\s*(?:"([^"]*)"|'([^']*)'|((?:[^"'()\s\\]|\\[\s\S])+))\s*\)|"([^"]*)"|'([^']*)')\s*;[^\S\n]*\n?/g,
           function (m, u1, u2, u3, q1, q2) {
-            fontUrls.push(u1 !== undefined ? u1 : u2 !== undefined ? u2 : u3 !== undefined ? u3 : q1 !== undefined ? q1 : q2);
+            fontUrls.push(u1 !== undefined ? u1 : u2 !== undefined ? u2 : u3 !== undefined ? u3.replace(/\\([^0-9a-fA-F\n])/g, '$1') : q1 !== undefined ? q1 : q2);
             return '';
           }
         );

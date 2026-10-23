@@ -133,6 +133,17 @@ for (const surface of ['shell', 'frame']) {
       }
     })
 
+    test('an escaped ) in a bare import URL keeps the import whole and the owner root', async ({ page }) => {
+      await open(page, pages[surface])
+      const css = withThemeDefaults('@import url(https://example.test/a\\);b.css);\n:root { --accent: #00ffff; }')
+      await applyIn[surface](page, css, '#0d0d0d', 'dark')
+      const state = await rootState(page, CORE_VARS)
+      expect(state.links).toEqual(['https://example.test/a);b.css'])
+      expect(state.styleText).not.toContain('b.css')
+      expect(state.vars['--accent']).toBe('#00ffff')
+      expectEveryCoreVarResolves(state)
+    })
+
     test('an html-rule background wins over a dark hint and leaves no inline --bg', async ({ page }) => {
       await open(page, pages[surface])
       const css = withThemeDefaults('html { --bg: #ffffff; --text: #111111; }')

@@ -646,8 +646,12 @@ def _lex_theme_css(css: str) -> tuple[str, str, bool]:
     ch = css[i]
     url = _URL_OPEN_RE.match(css, i) if ch in "uU" else None
     if url:
-      j = css.find(")", url.end())
-      if j < 0:
+      # An unquoted url() ends at its first UNESCAPED `)`: `url(a\);b)` is one
+      # token, so its `;` must never read as structure.
+      j = url.end()
+      while j < n and css[j] != ")":
+        j += 2 if css[j] == "\\" else 1
+      if j >= n:
         ok, j = False, n
       text.append(css[i:j])
       mask.append(css[i:url.end()] + "x" * (j - url.end()))

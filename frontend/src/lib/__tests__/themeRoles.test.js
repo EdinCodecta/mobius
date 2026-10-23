@@ -24,6 +24,7 @@ import {
   LIGHT_ROLES,
   contrastRatio,
   inferThemeMode,
+  parseThemeMeta,
   scanRootDeclarations,
   themeRoleVars,
   withThemeDefaults,
@@ -142,6 +143,18 @@ test('only plain top-level :root rules feed derivation, read past quotes and url
   `)
   assert.deepEqual(root, { '--a': '3', '--b': '2', '--q': '"}"', '--u': 'url(x}y)' })
   assert.equal(scanRootDeclarations(':root { --x: "never closed; }'), null)
+})
+
+test('the root editor keeps a winning !important declaration and its importance', () => {
+  const meta = parseThemeMeta(':root { --accent: #00ffff !important; --accent: #ff0000; --bg: #0d0d0d; --bg: #111111; }\n')
+  assert.equal(meta.colors['--accent'], '#00ffff !important')
+  assert.equal(meta.colors['--bg'], '#111111', 'without importance the last declaration still wins')
+})
+
+test('the root editor reads an escaped ) in a url() value as one value', () => {
+  const meta = parseThemeMeta(':root { --img: url(a\\);b); --accent: #00ffff; }\n')
+  assert.equal(meta.colors['--img'], 'url(a\\);b)')
+  assert.equal(meta.colors['--accent'], '#00ffff')
 })
 
 test('mode comes from the winning :root --bg, never from a comment or string', () => {

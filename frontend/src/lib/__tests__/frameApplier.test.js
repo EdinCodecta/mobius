@@ -316,3 +316,15 @@ test('frame: owner rules win over generated and static defaults, initially and l
   assert.ok(contrastRatio(root['--accent-text'], root['--surface-2']) >= 4.5)
   assert.equal(root['--surface-2'], '#e8e6e2', 'the light default, not the static dark one')
 })
+
+test('frame: an escaped ) in a bare import URL is stripped whole and the owner root still wins', () => {
+  const dom = makeFrameDom()
+  const applyTheme = loadLiveApplyTheme(dom)
+  applyTheme(served('an escaped ) in an unquoted import URL'), '#0d0d0d')
+  assert.deepEqual(dom.fontLinks.map((l) => l.href), ['https://example.test/a);b.css'])
+  const style = dom.styleNodes.get('mobius-theme').textContent
+  assert.equal(style.includes('b.css'), false)
+  const root = frameRoot(dom, 'dark')
+  assert.equal(root['--accent'], '#00ffff')
+  assert.ok(root['--accent-fill'] && root['--surface'])
+})

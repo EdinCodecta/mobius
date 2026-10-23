@@ -147,6 +147,7 @@ const SURFACE_KEYS = ['--bg', '--surface', '--surface-2']
 // table themeCssCases.json pins both.
 
 const URL_OPEN_RE = /url\(\s*(?=[^\s"'])/iy
+const IMPORTANT_RE = /!\s*important$/i
 
 // The comment-blanked text plus a same-length mask in which string and
 // unquoted url() contents and escaped characters are neutralised, so
@@ -163,8 +164,11 @@ function lexThemeCss(css) {
     const url = (ch === 'u' || ch === 'U') ? URL_OPEN_RE.exec(css) : null
     if (url) {
       const open = i + url[0].length
-      let j = css.indexOf(')', open)
-      if (j < 0) { ok = false; j = css.length }
+      // An unquoted url() ends at its first UNESCAPED `)`: `url(a\);b)` is one
+      // token, so its `;` must never read as structure.
+      let j = open
+      while (j < css.length && css[j] !== ')') j += css[j] === '\\' ? 2 : 1
+      if (j >= css.length) { ok = false; j = css.length }
       text += css.slice(i, j)
       mask += css.slice(i, open) + 'x'.repeat(j - open)
       i = j
@@ -232,8 +236,8 @@ export function scanRootDeclarations(css) {
     if (!m) return
     const name = m[1]
     let value = m[2].trim()
-    const isImportant = /!\s*important$/i.test(value)
-    if (isImportant) value = value.replace(/!\s*important$/i, '').trim()
+    const isImportant = IMPORTANT_RE.test(value)
+    if (isImportant) value = value.replace(IMPORTANT_RE, '').trim()
     if (important.has(name) && !isImportant) return
     if (isImportant) important.add(name)
     root[name] = value
@@ -573,14 +577,20 @@ function matchingBrace(mask, open) {
   return -1
 }
 
-// `name: value` pairs directly inside one rule body (nested rules skipped).
+// The winning `name: value` pair per name directly inside one rule body
+// (nested rules skipped): the last declaration wins, except that an
+// !important one beats later normal ones. The value keeps its `!important`,
+// so rebuilding the rule preserves the owner's importance.
 function ruleDeclarations(text, mask, from, to) {
   const out = {}
   let depth = 0
   let segment = from
   const record = (decl) => {
     const m = /^\s*(-?-?[A-Za-z_][\w-]*)\s*:([\s\S]*)$/.exec(decl)
-    if (m) out[m[1]] = m[2].trim()
+    if (!m) return
+    const value = m[2].trim()
+    if (IMPORTANT_RE.test(out[m[1]] ?? '') && !IMPORTANT_RE.test(value)) return
+    out[m[1]] = value
   }
   for (let i = from; i < to; i++) {
     const ch = mask[i]

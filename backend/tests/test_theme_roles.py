@@ -251,6 +251,17 @@ def test_owner_prelude_statements_survive_byte_for_byte():
     assert CORE_VARS <= set(_vars(block)), case["name"]
 
 
+@pytest.mark.parametrize("url", [r"https://example.test/a\);b.css", r"https://example.test/a\"b;c.css"])
+def test_an_escape_inside_an_unquoted_import_url_is_not_structure(url):
+  statement = f"@import url({url});"
+  out = _ensure_core_vars(f"{statement}\n:root {{ --accent: #00ffff; }}\n")
+  # The import stays whole, the complete block follows it, and the owner wins.
+  assert out.startswith(f"@layer {theme.DEFAULTS_LAYER};\n{statement}/* {theme.INJECTED_DEFAULTS_MARKER}")
+  resolved = _resolve_root(out)
+  assert CORE_VARS <= set(resolved)
+  assert resolved["--accent"] == "#00ffff"
+
+
 def test_a_fake_declaration_inside_a_string_suppresses_nothing():
   css = ':root {\n  --bg: #0d0d0d;\n  --note: " --text: #ffffff; --accent: red;";\n}\n'
   resolved = _resolve_root(_ensure_core_vars(css))

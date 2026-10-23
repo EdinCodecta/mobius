@@ -173,13 +173,14 @@ export function applyTheme(theme, { doc = globalThis.document, store = ownerStor
     // Cover all four CSS @import spellings: url('X')/url("X") (quoted),
     // url(X) (bare, unquoted), and "X"/'X' (no url()). The old regex only
     // saw quoted url(), so a bare or no-url() import slipped past the http(s)
-    // allowlist unmatched. The url group excludes ) and whitespace; the
-    // bare-quoted group runs to its closing quote. A single trailing `;` is
+    // allowlist unmatched. The bare url group runs to the first unescaped
+    // `)` (a CSS escape such as `\)` stays inside the URL and is unescaped);
+    // the quoted groups run to their closing quote. A single trailing `;` is
     // required, so an @import-looking substring inside a quoted value (e.g.
     // a `content:` string) isn't matched as a real rule.
     const cssBody = css.replace(
-      /@import\s+(?:url\(\s*(?:"([^"]*)"|'([^']*)'|([^"'()\s]+))\s*\)|"([^"]*)"|'([^']*)')\s*;[^\S\n]*\n?/g,
-      (m, u1, u2, u3, q1, q2) => { imports.push(u1 ?? u2 ?? u3 ?? q1 ?? q2); return '' }
+      /@import\s+(?:url\(\s*(?:"([^"]*)"|'([^']*)'|((?:[^"'()\s\\]|\\[\s\S])+))\s*\)|"([^"]*)"|'([^']*)')\s*;[^\S\n]*\n?/g,
+      (m, u1, u2, u3, q1, q2) => { imports.push(u1 ?? u2 ?? u3?.replace(/\\([^0-9a-fA-F\n])/g, '$1') ?? q1 ?? q2); return '' }
     )
     imports.filter(url => /^https?:\/\//i.test(url)).forEach(url => {
       const link = doc.createElement('link')
@@ -325,9 +326,9 @@ export const PREPAINT_SRC = `(function () {
       // here because this is a template literal — the evaluated string carries
       // single backslashes (see applyTheme.prepaint.test.js byte-equality).
       css = css.replace(
-        /@import\\s+(?:url\\(\\s*(?:"([^"]*)"|'([^']*)'|([^"'()\\s]+))\\s*\\)|"([^"]*)"|'([^']*)')\\s*;[^\\S\\n]*\\n?/g,
+        /@import\\s+(?:url\\(\\s*(?:"([^"]*)"|'([^']*)'|((?:[^"'()\\s\\\\]|\\\\[\\s\\S])+))\\s*\\)|"([^"]*)"|'([^']*)')\\s*;[^\\S\\n]*\\n?/g,
         function (m, u1, u2, u3, q1, q2) {
-          fontUrls.push(u1 !== undefined ? u1 : u2 !== undefined ? u2 : u3 !== undefined ? u3 : q1 !== undefined ? q1 : q2);
+          fontUrls.push(u1 !== undefined ? u1 : u2 !== undefined ? u2 : u3 !== undefined ? u3.replace(/\\\\([^0-9a-fA-F\\n])/g, '$1') : q1 !== undefined ? q1 : q2);
           return '';
         }
       );

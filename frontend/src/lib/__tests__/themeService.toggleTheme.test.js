@@ -821,3 +821,11 @@ test('REGRESSION — CSS the lexer cannot follow is kept verbatim rather than ed
   const { persisted } = await toggleOnce(css, 'dark')
   assert.ok(persisted.includes(css.trim()), `owner CSS is preserved byte for byte:\n${persisted}`)
 })
+
+test('REGRESSION — a winning !important root declaration survives a toggle with its importance', async () => {
+  const css = ':root { --bg: #0d0d0d; --accent: #00ffff !important; --accent: #ff0000; }\n'
+  const { persisted } = await toggleOnce(css, 'dark')
+  assert.ok(persisted.includes('--accent: #00ffff !important;'), `the important accent is kept:\n${persisted}`)
+  assert.equal(persisted.includes('#ff0000'), false, 'the overridden normal declaration is not resurrected')
+  assert.equal(scanRootDeclarations(persisted)['--accent'], '#00ffff')
+})

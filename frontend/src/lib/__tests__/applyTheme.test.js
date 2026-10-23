@@ -440,6 +440,25 @@ for (const prefix of [
   })
 }
 
+function assertEscapedImportApplied() {
+  assert.deepEqual(dom.fontLinks.map((l) => l.href), ['https://example.test/a);b.css'])
+  const style = dom.styleNodes.get('mobius-theme').textContent
+  assert.equal(style.includes('@import'), false)
+  assert.equal(style.includes('b.css'), false, 'no fragment of the URL is left as CSS')
+  assert.equal(generatedVars(style).length, CORE_VAR_COUNT)
+  assert.ok(style.endsWith(':root { --accent: #00ffff; }\n'))
+}
+
+test('applyTheme strips a bare import URL with an escaped ) whole and keeps the defaults', () => {
+  applyTheme({ css: served('an escaped ) in an unquoted import URL'), bg: '#0d0d0d' }, ctx())
+  assertEscapedImportApplied()
+})
+
+test('the pre-paint script strips the same escaped import whole', () => {
+  runPrepaint({ css: served('an escaped ) in an unquoted import URL'), bg: '#0d0d0d', mode: 'dark' })
+  assertEscapedImportApplied()
+})
+
 test('pre-paint with theme css leaves --bg to the stylesheet', () => {
   // An html-rule background: the server's bg hint is the generated dark one.
   runPrepaint({ css: served('an html rule outranks'), bg: '#0d0d0d', mode: 'light' })
