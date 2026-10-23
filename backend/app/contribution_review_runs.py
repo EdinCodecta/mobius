@@ -16,7 +16,7 @@ from sqlalchemy import String, cast, or_, update
 
 from app import agent_work_claims, models
 from app.contribution_errors import ContributionSubmitError
-from app.contribution_review_effects import NotDispatched
+from app.contribution_review_effects import NotDispatched, graphql_mutation_result
 from app.terminal_output import readable_output
 
 
@@ -179,11 +179,10 @@ def enqueue(gh, cwd, target):
   query = """mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{
     pullRequestId:$id,expectedHeadOid:$head,jump:false
   }){mergeQueueEntry{id enqueuedAt}}}"""
-  result = json.loads(gh(cwd, "api", "graphql", "-f", f"query={query}",
-    "-f", f"id={target['pr_id']}", "-f", f"head={target['head_sha']}").stdout)
+  response = gh(cwd, "api", "graphql", "-f", f"query={query}",
+    "-f", f"id={target['pr_id']}", "-f", f"head={target['head_sha']}", check=False)
+  result = graphql_mutation_result(response)
   entry = ((result.get("data") or {}).get("enqueuePullRequest") or {}).get("mergeQueueEntry")
-  if result.get("errors") and not result.get("data"):
-    raise NotDispatched("GitHub rejected the merge-queue request without applying it.")
   if result.get("errors") or not isinstance(entry, dict) or not entry.get("id"):
     raise HTTPException(409, "GitHub did not confirm this exact pull request in the merge queue.")
   return entry
@@ -379,7 +378,7 @@ def view(row):
            else "pushing" if any(s == "pushing" for s in states)
            else "repairing" if any(s == "repairing" for s in states)
            else "reviewing")
-  if any((outcomes.get(key(t), {}).get("public_review") or {}).get("state") in {"posting", "unknown"} for t in row.targets_json):
+  if any((outcomes.get(key(t), {}).get("public_review") or {}).get("state") in {"posting", "unknown", "not_dispatched"} for t in row.targets_json):
     state = "needs_you"
   return {"id": row.id, "request_id": row.request_id, "mode": row.mode,
           "chat_id": row.chat_id, "source_chat_id": row.chat_id, "app_id": row.app_id, "state": state,
@@ -741,7 +740,7 @@ def merge_method(repo):
   return method
 
 
-def disarm_merge(db, row, target, outcome, reason):
+def disarm_merge(db, row, target, reason):
   """Release only this run's definitely unspent merge reservation."""
   item_key = key(target)
   for _ in range(4):
@@ -821,9 +820,12 @@ def mark_ready(gh, cwd, target):
   # GitHub's mutation has no expected-head parameter: caller must hold the
   # credential lock and recheck the exact PR immediately before this call.
   query = """mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft headRefOid}}}"""
-  result = json.loads(gh(cwd, "api", "graphql", "-f", f"query={query}",
-    "-f", f"id={target['pr_id']}").stdout)
-  pull = ((result.get("data") or {}).get("markPullRequestReadyForReview") or {}).get("pullRequest")
+  response = gh(cwd, "api", "graphql", "-f", f"query={query}",
+    "-f", f"id={target['pr_id']}", check=False)
+  result = graphql_mutation_result(response)
+  data = result.get("data")
+  mutation = data.get("markPullRequestReadyForReview") if isinstance(data, dict) else None
+  pull = mutation.get("pullRequest") if isinstance(mutation, dict) else None
   if (result.get("errors") or not isinstance(pull, dict) or pull.get("id") != target["pr_id"]
       or pull.get("headRefOid") != target["head_sha"] or pull.get("isDraft") is not False):
     raise HTTPException(409, "GitHub did not confirm readiness of the exact pull request.")

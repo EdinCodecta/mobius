@@ -81,12 +81,14 @@ def test_new_draft_scope_admits_open_draft_without_widening_old_request_id(setup
 
 def test_mark_ready_uses_github_documented_graphql_mutation_and_validates_exact_head():
   calls = []
-  def gh(_cwd, *args):
+  def gh(_cwd, *args, check=True):
+    assert check is False
     calls.append(args)
     return SimpleNamespace(stdout='{"data":{"markPullRequestReadyForReview":{"pullRequest":{"id":"PR_7","isDraft":false,"headRefOid":"' + SHA + '"}}}}')
   assert domain.mark_ready(gh, "/tmp", TARGET)["isDraft"] is False
   assert "markPullRequestReadyForReview" in " ".join(calls[0])
-  def changed(_cwd, *args):
+  def changed(_cwd, *args, check=True):
+    assert check is False
     return SimpleNamespace(stdout='{"data":{"markPullRequestReadyForReview":{"pullRequest":{"id":"PR_7","isDraft":false,"headRefOid":"' + NEW + '"}}}}')
   with pytest.raises(HTTPException):
     domain.mark_ready(changed, "/tmp", TARGET)
@@ -130,7 +132,7 @@ def test_uncertain_draft_readiness_never_replays_and_observe_reconciles(setup, m
   calls = []
   def lost(*args):
     calls.append(1)
-    raise RuntimeError("lost response")
+    raise OSError("lost response")
   monkeypatch.setattr(domain, "mark_ready", lost)
   result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
   assert result["run"]["items"][0]["ready_attempt"]["state"] == "unknown"
@@ -576,3 +578,119 @@ def test_changed_readiness_receipt_cannot_release_a_claim(setup, monkeypatch):
   with pytest.raises(HTTPException):
     domain.disarm_ready(db, row, ITEM, 'my-receipt')
   assert row.outcomes_json[domain.key(ITEM)]['ready_attempt']['state'] == 'unknown'
+
+
+def test_mark_ready_parses_real_gh_graphql_exit_one_no_data_as_not_dispatched():
+  calls = []
+  def gh(_cwd, *args, check=True):
+    calls.append((args, check))
+    return SimpleNamespace(returncode=1, stdout=json.dumps({"errors": [{"message": "forbidden"}]}),
+      stderr="gh: GraphQL request failed")
+  with pytest.raises(NotDispatched):
+    domain.mark_ready(gh, "/tmp", TARGET)
+  assert len(calls) == 1 and calls[0][1] is False
+
+
+@pytest.mark.parametrize("status", [403, 503])
+def test_ready_provider_http_refusal_classifies_receipt_or_release(setup, monkeypatch, status):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  calls = []
+  def gh(_cwd, *args, check=True):
+    assert check is False
+    calls.append(1)
+    return SimpleNamespace(returncode=1, stdout="not-json",
+      stderr=f"gh: HTTP {status}: provider refusal")
+  monkeypatch.setattr(routes, "_gh", gh)
+  if status == 403:
+    with pytest.raises(HTTPException) as error:
+      asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+    assert error.value.status_code == 409
+    db.refresh(row)
+    assert "ready_attempt" not in row.outcomes_json[domain.key(ITEM)]
+    claim = db.query(models.AgentWorkClaim).filter_by(work_key=domain.ready_work_key(row.targets_json[0])).one()
+    assert claim.released_at is not None
+  else:
+    first = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+    assert first["run"]["items"][0]["ready_attempt"]["state"] == "unknown"
+    second = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+    assert second["blocked"] and calls == [1]
+
+
+def test_ready_graphql_no_data_disarms_exact_claim(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  calls = []
+  def gh(_cwd, *args, check=True):
+    assert check is False
+    calls.append(1)
+    return SimpleNamespace(returncode=1, stdout=json.dumps({"errors": [{"message": "not allowed"}]}),
+      stderr="gh: GraphQL error")
+  monkeypatch.setattr(routes, "_gh", gh)
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert error.value.status_code == 409
+  db.refresh(row)
+  assert "ready_attempt" not in row.outcomes_json[domain.key(ITEM)]
+  claim = db.query(models.AgentWorkClaim).filter_by(work_key=domain.ready_work_key(row.targets_json[0])).one()
+  assert claim.released_at is not None
+  assert calls == [1]
+
+
+def test_confirmed_ready_effect_survives_stop_after_dispatch(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  stage = {"ready": False}
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (REPO, {**PULL, "draft": not stage["ready"]}))
+  def mutate(*args):
+    stage["ready"] = True
+    db.get(models.ChatRun, principal.run_id).status = "stopped"
+    db.commit()
+    return {"id": "PR_7", "isDraft": False, "headRefOid": SHA}
+  monkeypatch.setattr(domain, "mark_ready", mutate)
+  result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert result["run"]["items"][0]["ready_attempt"]["state"] == "ready"
+  assert asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]["items"][0]["ready_attempt"]["state"] == "ready"
+
+
+def test_programming_error_in_ready_dispatch_is_not_silenced(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  def broken(*args):
+    raise RuntimeError("implementation bug")
+  monkeypatch.setattr(domain, "mark_ready", broken)
+  with pytest.raises(RuntimeError, match="implementation bug"):
+    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+
+
+def test_malformed_graphql_error_shape_is_unknown_not_dispatched(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  calls = []
+  def gh(_cwd, *args, check=True):
+    calls.append(1)
+    return SimpleNamespace(returncode=1, stdout=json.dumps({"errors": "forbidden"}), stderr="gh error")
+  monkeypatch.setattr(routes, "_gh", gh)
+  first = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert first["run"]["items"][0]["ready_attempt"]["state"] == "unknown"
+  retry = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert retry["blocked"] and calls == [1]
+
+
+def test_readiness_timeout_keeps_unknown_receipt_without_replay(setup, monkeypatch):
+  import subprocess
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  calls = []
+  def timeout(*args):
+    calls.append(1)
+    raise subprocess.TimeoutExpired(['gh', 'api', 'graphql'], 30)
+  monkeypatch.setattr(domain, 'mark_ready', timeout)
+  first = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert first['run']['items'][0]['ready_attempt']['state'] == 'unknown'
+  retry = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  assert retry['blocked'] and calls == [1]
+
+
+def test_real_ready_gh_exit_one_preserves_structured_refusal(tmp_path, monkeypatch):
+  from app import github_contribution_git as transport
+  fake = tmp_path / 'gh'
+  fake.write_text('#!/bin/sh\necho \'{"errors":[{"message":"not allowed"}],"data":null}\'\nexit 1\n')
+  fake.chmod(0o755)
+  monkeypatch.setattr(transport, '_git_env', lambda cwd: {'PATH': str(tmp_path)+':/usr/bin:/bin'})
+  with pytest.raises(NotDispatched):
+    domain.mark_ready(transport._gh, tmp_path, TARGET)

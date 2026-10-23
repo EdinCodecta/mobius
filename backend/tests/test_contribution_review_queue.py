@@ -170,7 +170,8 @@ def test_timestamp_receipt_can_match_latest_pair_in_complete_history(monkeypatch
 
 def test_enqueue_timestamp_is_requested_and_durably_saved(setup, monkeypatch):
   calls = []
-  def gh(cwd, *args):
+  def gh(cwd, *args, check=True):
+    assert check is False
     query = next(a for a in args if a.startswith("query="))
     assert "mergeQueueEntry{id enqueuedAt}" in query
     calls.append(query)

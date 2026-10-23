@@ -12,7 +12,7 @@ from app.routes import contribution_reviews as routes
 from tests.test_contribution_review_runs import ITEM, CHECKS, REPO, PULL, TARGET, setup, report
 from scripts import github_review as cli
 from scripts.github_review_selection import review_path, start_body, verify_selection
-from app.contribution_review_effects import classify_dispatch_error
+from app.contribution_review_effects import NotDispatched, classify_dispatch_error, graphql_mutation_result
 from app.contribution_errors import ContributionSubmitError
 
 
@@ -62,12 +62,26 @@ def test_core_admission_is_null_app_and_app_context_is_read_only(setup, monkeypa
   row = db.get(models.ContributionReviewRun, created["id"])
   assert row.app_id is None and row.app_nonce is None
   assert created["app_id"] is None
+  row.options_json = {**row.options_json, "post_review": True}
+  db.commit()
+  domain.save_outcome(db, row, domain.key(ITEM), {"state": "all_clear", "summary": "private finding",
+    "tests": "secret tests", "public_review": {"state": "posted", "url": "https://github.com/review/1", "marker": "private marker"}})
   assert any(item["id"] == row.id for item in routes.list_reviews(1, db, principal)["runs"])
   app = Principal(owner=principal.owner, app_id=1)
   projected = next(item for item in routes.list_reviews(1, db, app)["runs"] if item["id"] == row.id)
-  assert set(projected) <= {"id", "chat_id", "state", "execution_state", "app_id", "can_stop", "items"}
-  assert all(set(item) <= {"repo", "number", "head_sha", "state"} for item in projected["items"])
+  assert set(projected) <= {"id", "chat_id", "state", "execution_state", "app_id", "can_stop", "items",
+                            "mode", "created_at", "post_review", "details_in_owning_chat"}
+  assert projected["details_in_owning_chat"] is True and projected["post_review"] is True
+  assert projected["mode"] == "review" and projected["created_at"]
+  assert all(set(item) <= {"repo", "number", "head_sha", "base_ref", "base_sha", "state", "public_review"} for item in projected["items"])
+  assert projected["items"][0]["base_ref"] == ITEM["base_ref"]
+  assert projected["items"][0]["public_review"] == {"state": "posted", "url": "https://github.com/review/1"}
+  assert "private finding" not in str(projected) and "secret tests" not in str(projected)
   assert routes.get_review(1, row.id, db, app)["brief"] is None
+  with pytest.raises(HTTPException) as observe_denied:
+    asyncio.run(routes.observe_review(1, row.id, db, app))
+  assert observe_denied.value.status_code == 403
+  assert observe_denied.value.detail["code"] == "details_in_owning_chat"
   with pytest.raises(HTTPException) as denied_core:
     routes.core_list_reviews(db, app)
   assert denied_core.value.status_code == 403
@@ -104,6 +118,28 @@ def test_private_finding_records_even_after_head_moved(setup, monkeypatch):
   db.commit()
   monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "PR moved")))
   assert report(setup, state="needs_you", summary="Private finding: race in X")["run"]["items"][0]["summary"] == "Private finding: race in X"
+
+
+def test_private_report_waiting_for_outcome_lock_cannot_pass_stop(setup):
+  from app import chat_queue
+  db, row, principal = setup
+  row.mode = "review"
+  db.commit()
+  body = routes.ReviewOutcome(**ITEM, state="needs_you", summary="Private finding",
+    scope=["tests"], tests="Reviewed")
+
+  async def race():
+    async with chat_queue.get_transition_lock(f"review-outcome:{row.id}"):
+      pending = asyncio.create_task(routes.report_outcome(1, row.id, body, db, principal))
+      await asyncio.sleep(0)
+      domain.save_outcome(db, row, routes.REVIEW_STOP_KEY, {"state": "requested"})
+    with pytest.raises(HTTPException) as refused:
+      await pending
+    assert refused.value.status_code == 409
+
+  asyncio.run(race())
+  db.refresh(row)
+  assert domain.key(ITEM) not in row.outcomes_json
 
 
 def test_completed_run_view_keeps_fact_when_chat_model_later_changes(setup):
@@ -233,6 +269,9 @@ def test_definite_refusal_racing_stop_disarms_exact_reservation(setup, monkeypat
   ("gh: HTTP 408: timeout", 409, "unknown"),
   ("gh: HTTP 429: rate limited", 409, "unknown"),
   ("gh: HTTP 503: server error", 409, "unknown"),
+  ("gh: Pull Request is not mergeable (HTTP 405)", 409, "not_dispatched"),
+  ("gh: rejected user body says HTTP 405: but response was not parsed", 409, "unknown"),
+  ("Untrusted quote: (HTTP 405)", 409, "unknown"),
   ("transport failed", 409, "unknown"),
 ])
 def test_dispatch_classifier_requires_proved_rejection(message, status, expected):
@@ -246,12 +285,45 @@ def test_definite_github_merge_rejection_is_not_unknown(setup, monkeypatch):
   assert item["state"] == "needs_you" and item["merge_attempted"] is False
 
 
+def test_real_gh_graphql_no_data_rejection_is_definite(tmp_path, monkeypatch):
+  from app import github_contribution_git as transport
+  fake_bin = tmp_path / "bin"
+  fake_bin.mkdir()
+  fake = fake_bin / "gh"
+  fake.write_text("#!/bin/sh\necho '{\"errors\":[{\"message\":\"not queueable\"}],\"data\":null}'\nexit 1\n")
+  fake.chmod(0o755)
+  monkeypatch.setattr(transport, "_git_env", lambda _cwd: {"PATH": str(fake_bin) + ":/usr/bin:/bin"})
+  with pytest.raises(NotDispatched):
+    domain.enqueue(transport._gh, tmp_path, TARGET)
+
+
+@pytest.mark.parametrize("payload", [
+  {"errors": "garbled", "data": None},
+  {"errors": [], "data": None},
+  {"errors": [{}], "data": None},
+  {"errors": [{"message": ""}], "data": None},
+  {"errors": [{"message": "rejected"}], "data": []},
+])
+def test_malformed_graphql_response_never_certifies_no_effect(payload):
+  from types import SimpleNamespace
+  import json
+  response = SimpleNamespace(stdout=json.dumps(payload), stderr="", returncode=1)
+  with pytest.raises(ContributionSubmitError):
+    graphql_mutation_result(response)
+
+
+def test_valid_graphql_no_data_error_certifies_refusal():
+  from types import SimpleNamespace
+  response = SimpleNamespace(stdout='{"errors":[{"message":"rejected"}],"data":null}', stderr="", returncode=1)
+  with pytest.raises(NotDispatched):
+    graphql_mutation_result(response)
+
+
 @pytest.mark.parametrize("nonce_nullable", [False, True])
-def test_core_migration_adopts_prior_0079_variant_without_rewriting_it(tmp_path, nonce_nullable):
+def test_core_migration_upgrades_legacy_strict_table_shape(tmp_path, nonce_nullable):
   eng = create_engine(f"sqlite:///{tmp_path / 'old-review.db'}")
   with eng.begin() as conn:
     conn.execute(text("CREATE TABLE schema_migrations (version VARCHAR(128) PRIMARY KEY, applied_at TIMESTAMP)"))
-    conn.execute(text("INSERT INTO schema_migrations VALUES ('0079_core_contribution_review_runs', CURRENT_TIMESTAMP)"))
     nullable = "" if nonce_nullable else " NOT NULL"
     conn.execute(text("CREATE TABLE contribution_review_runs (id VARCHAR(64) PRIMARY KEY, app_id INTEGER NOT NULL, app_nonce VARCHAR(64)" + nullable + ", request_id VARCHAR(64), owner_id INTEGER)"))
     conn.execute(text("INSERT INTO contribution_review_runs VALUES ('old-run', 2, 'old-nonce', 'old-request', 1)"))
@@ -262,7 +334,7 @@ def test_core_migration_adopts_prior_0079_variant_without_rewriting_it(tmp_path,
   assert "options_json" in cols
   with eng.connect() as conn:
     assert conn.execute(text("SELECT id, app_id, app_nonce FROM contribution_review_runs")).one() == ("old-run", 2, "old-nonce")
-    assert conn.execute(text("SELECT version FROM schema_migrations")).scalar_one() == "0079_core_contribution_review_runs"
+    assert conn.execute(text("SELECT count(*) FROM schema_migrations")).scalar_one() == 0
 
 
 def test_canonical_cli_freezes_takeover_scope_in_request_identity(monkeypatch):
