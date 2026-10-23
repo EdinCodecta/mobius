@@ -114,4 +114,4 @@ async def revoke_consent(
   await deactivate_app_skills(app.id)
   activity.log_event("app_consent", app_id=app.id, slug=app.slug, action="revoked")
   get_system_broadcast().publish({"type": "app_updated", "appId": str(app.id)})
-  return {"status": "required", "app_id": app.id}
+  return {"status": app_consent.status(app), "app_id": app.id}
