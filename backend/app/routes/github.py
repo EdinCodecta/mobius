@@ -156,6 +156,8 @@ from app.github_contributions import (
   publication_handoff_spec,
   _cleanup_terminal_staging_checkout,
   _claim_record,
+  _assert_publication_approval,
+  confirmed_publication_records,
   _stack_meta,
   _validate_stack_records,
   _claim_stack_records,
@@ -781,6 +783,9 @@ _PREPARED_PR_ACTIONS = frozenset(("pr", "pr_update"))
 class ContributionStackSubmitRequest(BaseModel):
   record_ids: list[str]
   publication_stage: Literal["draft", "ready"] = "draft"
+  # The frozen records the owner confirmed, one per record id, including the
+  # chain's public and deferred context. Omitted only by legacy callers.
+  expected_records: list[dict] | None = None
 
 
 class ContributionSubmitBody(BaseModel):
@@ -799,6 +804,9 @@ class ContributionSubmitBody(BaseModel):
   # A ready PR requests review immediately; draft remains the compatibility
   # default for callers that have not yet added that explicit approval copy.
   publication_stage: Literal["draft", "ready"] = "draft"
+  # The frozen record the owner confirmed. Publication refuses any changed
+  # proposal before its first write; omitted only by legacy callers.
+  expected_record: dict | None = None
 
 
 class ContributionUpdateBody(BaseModel):
@@ -806,6 +814,42 @@ class ContributionUpdateBody(BaseModel):
   # chat review needs the same narrow provenance as first publication.
   submitter: Literal["contribute-update-button", "chat-review-card"] = (
     "contribute-update-button"
+  )
+  expected_record: dict | None = None
+
+
+def _assert_confirmed_publication(
+  db: Session,
+  *,
+  app_id: int,
+  expected_nonce: str | None,
+  record_ids: list[str],
+  confirmed: dict[str, dict] | None,
+  stack: bool,
+  phase_actions: frozenset[str],
+  submitter: str,
+) -> None:
+  """Read-only approval check before any cleanup, resume, claim or write.
+
+  ``phase_actions`` and ``submitter`` are exactly the values the caller's
+  claim uses, so a refusal certifies the same write phase it would claim.
+  """
+  if confirmed is None:
+    return
+  if stack and not 2 <= len(record_ids) <= 12:
+    raise HTTPException(
+      status_code=400,
+      detail="Choose one complete PR stack of 2 to 12 unique records.",
+    )
+  _recheck_submit_app(db, app_id, expected_nonce)
+  db.close()
+  records = [
+    _read_record(_record_paths(app_id, record_id)[0])
+    for record_id in record_ids
+  ]
+  _assert_publication_approval(
+    app_id=app_id, records=records, expected=confirmed, stack=stack,
+    phase_actions=phase_actions, submitter=submitter,
   )
 
 
@@ -3474,10 +3518,21 @@ async def submit_contribution(
   own storage after the same server-side freshness checks pass.
   """
   expected_nonce = _validate_submit_app(app_id, principal, db)
+  confirmed = confirmed_publication_records(
+    [record_id],
+    [body.expected_record]
+    if body is not None and body.expected_record is not None else None,
+  )
   # Never wait for the storage lock while retaining the authorization query's
   # connection. The nonce is rechecked inside the lock before the claim.
+  submitter = body.submitter if body is not None else "contribute-button"
   db.close()
   async with fs_locks.app_storage_lock(app_id):
+    _assert_confirmed_publication(
+      db, app_id=app_id, expected_nonce=expected_nonce,
+      record_ids=[record_id], confirmed=confirmed, stack=False,
+      phase_actions=frozenset({"pr"}), submitter=submitter,
+    )
     action_input = {
       "action": "submit",
       "publication_stage": (
@@ -3503,9 +3558,10 @@ async def submit_contribution(
       record_id=record_id,
       db=db,
       expected_nonce=expected_nonce,
-      submitter=body.submitter if body is not None else "contribute-button",
+      submitter=submitter,
       allow_personal_resume=allow_resume,
       before_claim_write=own_claim,
+      confirmed=confirmed,
     )
     attempt_owner = attempt_owners[record_id]
     publication_record = attempt_owner.recovery_record(claimed)
@@ -3923,8 +3979,21 @@ async def update_existing_contribution(
       status_code=409,
       detail="Autopilot is already updating this pull request. Try again when it finishes.",
     )
+  confirmed = confirmed_publication_records(
+    [record_id],
+    [body.expected_record]
+    if body is not None and body.expected_record is not None else None,
+  )
+  submitter = (
+    body.submitter if body is not None else "contribute-update-button"
+  )
   db.close()
   async with fs_locks.app_storage_lock(app_id):
+    _assert_confirmed_publication(
+      db, app_id=app_id, expected_nonce=expected_nonce,
+      record_ids=[record_id], confirmed=confirmed, stack=False,
+      phase_actions=frozenset({"pr_update"}), submitter=submitter,
+    )
     action_input = {"action": "update_existing"}
     if body is not None and body.submitter == "chat-review-card":
       action_input["submitter"] = body.submitter
@@ -3942,12 +4011,11 @@ async def update_existing_contribution(
       record_id=record_id,
       db=db,
       expected_nonce=expected_nonce,
-      submitter=(
-        body.submitter if body is not None else "contribute-update-button"
-      ),
+      submitter=submitter,
       expected_action="pr_update",
       allow_personal_resume=allow_resume,
       before_claim_write=own_claim,
+      confirmed=confirmed,
     )
     attempt_owner = attempt_owners[record_id]
     publication_record = attempt_owner.recovery_record(claimed)
@@ -4410,8 +4478,18 @@ async def update_contribution_stack(
           "Try again when it finishes."
         ),
       )
+  confirmed = confirmed_publication_records(
+    body.record_ids, body.expected_records,
+  )
+  phase_actions = frozenset({"pr_update"})
+  submitter = "contribute-stack-update-button"
   db.close()
   async with fs_locks.app_storage_lock(app_id):
+    _assert_confirmed_publication(
+      db, app_id=app_id, expected_nonce=expected_nonce,
+      record_ids=body.record_ids, confirmed=confirmed, stack=True,
+      phase_actions=phase_actions, submitter=submitter,
+    )
     action_input = {"action": "update_stack", "record_ids": body.record_ids}
     for cleanup_id in body.record_ids:
       cleanup_path, _ = _record_paths(app_id, cleanup_id)
@@ -4435,11 +4513,12 @@ async def update_contribution_stack(
       # validated but never claimed; every private layer must still be an
       # explicitly reviewed `pr_update`.
       allowed_actions=_PREPARED_PR_ACTIONS,
-      prepared_actions=frozenset({"pr_update"}),
+      prepared_actions=phase_actions,
       deferred_prepared_actions=frozenset({"pr"}),
-      submitter="contribute-stack-update-button",
+      submitter=submitter,
       already_detail="Every PR in this stack already has the reviewed update.",
       before_claim_write=own_stack_claim,
+      confirmed=confirmed,
     )
     for row in rows:
       if row["record"].get("status") == "submitting":
@@ -4721,8 +4800,18 @@ async def submit_contribution_stack(
   deliberately limited to connected owners with upstream push permission.
   """
   expected_nonce = _validate_submit_app(app_id, principal, db)
+  confirmed = confirmed_publication_records(
+    body.record_ids, body.expected_records,
+  )
+  phase_actions = frozenset({"pr"})
+  submitter = "contribute-stack-button"
   db.close()
   async with fs_locks.app_storage_lock(app_id):
+    _assert_confirmed_publication(
+      db, app_id=app_id, expected_nonce=expected_nonce,
+      record_ids=body.record_ids, confirmed=confirmed, stack=True,
+      phase_actions=phase_actions, submitter=submitter,
+    )
     action_input = {
       "action": "submit_stack", "record_ids": body.record_ids,
       "publication_stage": body.publication_stage,
@@ -4746,8 +4835,10 @@ async def submit_contribution_stack(
       db=db,
       expected_nonce=expected_nonce,
       allowed_actions=_PREPARED_PR_ACTIONS,
-      prepared_actions=frozenset({"pr"}),
+      prepared_actions=phase_actions,
+      submitter=submitter,
       before_claim_write=own_stack_claim,
+      confirmed=confirmed,
     )
     for row in rows:
       if row["record"].get("status") == "submitting":

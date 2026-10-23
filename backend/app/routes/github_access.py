@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from app import fs_locks, github_auth, models, source_status
 from app.config import get_settings
 from app.contribution_records import now_iso as _now_iso
+from app.github_contributions import PUBLICATION_APPROVAL_FIELDS
 from app.database import get_db
 from app.deps import (
   get_owner_or_app_with_github_access,
@@ -271,7 +272,10 @@ async def github_status(
   inherit those credential-management details.
 
   ``autopilot_available`` advertises the background review-response loop so an
-  app paired with an older backend hides that UI.
+  app paired with an older backend hides that UI. ``frozen_publication_binding``
+  advertises that publication accepts the confirmed frozen record(s) and names
+  the record fields its server-owned approval digest covers; an older backend
+  omits it.
   """
   state = github_auth.read_state() or {}
   connected = bool(state.get("token"))
@@ -299,6 +303,9 @@ async def github_status(
     "gh_version": github_auth.gh_version(),
     "active_attempt": active_attempt,
     "autopilot_available": True,
+    "frozen_publication_binding": {
+      "record_fields": list(PUBLICATION_APPROVAL_FIELDS),
+    },
   }
 
 
