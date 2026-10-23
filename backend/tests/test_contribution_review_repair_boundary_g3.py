@@ -64,9 +64,9 @@ def test_receipt_aware_sweep_preserves_unknown_and_active(checkout):
   os.utime(old, (1, 1))
   for marker in (path, path / ".git", path / ".git/HEAD"):
     os.utime(marker, (1, 1))
-  repairs.sweep_stale_checkouts(abandoned_paths=set(), now=10**12)
+  repairs.sweep_stale_checkouts(protected_paths={str(path)}, terminal_paths=set(), dormant_paths=set(), now=10**12)
   assert path.exists()
-  repairs.sweep_stale_checkouts(abandoned_paths={str(path)}, now=10**12)
+  repairs.sweep_stale_checkouts(protected_paths=set(), terminal_paths={str(path)}, dormant_paths=set(), now=10**12)
   assert not path.exists()
 
 
@@ -166,3 +166,57 @@ def test_repeated_proof_drift_never_dispatches_push(checkout, monkeypatch, drift
   assert len(proof_count) == 2
   if drift == "stop":
     assert len(guards) == 2
+
+
+@pytest.mark.parametrize("porcelain,remote,expected", [
+  ("!\t{head}:refs/heads/topic\t[rejected] (non-fast-forward)\n", "initial", "not_dispatched"),
+  ("!\t{head}:refs/heads/topic\t[remote rejected] (protected branch)\n", "initial", "not_dispatched"),
+  ("!\t{head}:refs/heads/other\t[rejected] (non-fast-forward)\n", "initial", "unknown"),
+  ("!\t{head}:refs/heads/topic\t[remote failure] (EOF)\n", "initial", "unknown"),
+  ("!\t{head}:refs/heads/topic\t[rejected] (non-fast-forward)\n", "moved", "unknown"),
+])
+def test_exact_porcelain_rejection_releases_only_when_remote_unchanged(checkout, monkeypatch, porcelain, remote, expected):
+  path, initial = checkout
+  validation = {"checkout": str(path), "initial_head_sha": initial,
+                "head_repo": "owner/fork", "head_repo_id": 2, "head_ref": "topic",
+                "allowed_files": ["owned.py"], "head_sha": "b" * 40,
+                "diff_sha256": "c" * 64, "base_sha": "a" * 40}
+  target = {"repo": "owner/base", "base_ref": "main", "head_sha": initial}
+  monkeypatch.setattr(repairs, "validate_repair", lambda *a, **kw: validation)
+  monkeypatch.setattr(repairs, "owned_checkout", lambda *a: path)
+  monkeypatch.setattr(repairs, "_target_base_head", lambda *a: "a" * 40)
+  pushed = []
+  monkeypatch.setattr(repairs, "_branch_head", lambda *a: ("d" * 40 if remote == "moved" else initial) if pushed else initial)
+  def rejected(*args, **kwargs):
+    pushed.append(1)
+    return type("Result", (), {"returncode": 1, "stdout": porcelain.format(head="b" * 40)})()
+  monkeypatch.setattr(repairs, "_git", rejected)
+  assert repairs.push_repair(None, path, None, target, validation).state == expected
+  assert pushed == [1]
+
+
+def test_final_base_drift_after_repeated_proof_never_pushes(checkout, monkeypatch):
+  path, initial = checkout
+  validation = {"checkout": str(path), "initial_head_sha": initial,
+                "head_repo": "owner/fork", "head_repo_id": 2, "head_ref": "topic",
+                "allowed_files": ["owned.py"], "head_sha": "b" * 40,
+                "diff_sha256": "c" * 64, "base_sha": "a" * 40}
+  target = {"repo": "owner/base", "base_ref": "main", "head_sha": initial}
+  proofs = []
+  monkeypatch.setattr(repairs, "validate_repair", lambda *a, **kw: proofs.append(1) or validation)
+  monkeypatch.setattr(repairs, "owned_checkout", lambda *a: path)
+  monkeypatch.setattr(repairs, "_branch_head", lambda *a: initial)
+  monkeypatch.setattr(repairs, "_target_base_head", lambda *a: "d" * 40 if len(proofs) == 2 else "a" * 40)
+  monkeypatch.setattr(repairs, "_git", lambda *a, **kw: pytest.fail("base moved before push"))
+  assert repairs.push_repair(None, path, None, target, validation).state == "not_dispatched"
+  assert len(proofs) == 2
+
+
+@pytest.mark.parametrize("marker", ["info/grafts", "commondir", "objects/info/commit-graph"])
+def test_forged_ancestry_metadata_is_rejected(checkout, marker):
+  path, initial = checkout
+  altered = path / ".git" / marker
+  altered.parent.mkdir(exist_ok=True)
+  altered.write_text(initial + "\n")
+  with pytest.raises(HTTPException):
+    repairs.owned_checkout(path)

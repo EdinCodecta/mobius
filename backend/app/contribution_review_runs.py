@@ -274,6 +274,31 @@ def require_public_transition_clear(db, row, target):
           "it read-only in its owning conversation before any new public action.")
 
 
+def reserve_public_work(db, row, principal, work_key, summary, action):
+  """Claim one exact effect and fence its receipt across overlapping grants.
+
+  The owner-row write fence, claim CAS and receipt save belong to one DB
+  transaction. Work ownership is not consent and cannot replace that receipt.
+  """
+  claim = agent_work_claims.claim_work(db, owner_id=row.owner_id,
+    chat_id=row.chat_id, run_id=principal.run_id, work_key=work_key,
+    summary=summary)
+  if claim["state"] in {"held_by_peer", "completed"}:
+    return claim
+  fence_public_transition(db, row)
+  fenced = db.execute(update(models.AgentWorkClaim).where(
+    models.AgentWorkClaim.id == claim["id"],
+    models.AgentWorkClaim.revision == claim["revision"],
+    models.AgentWorkClaim.owner_chat_id == row.chat_id,
+    models.AgentWorkClaim.completed_at.is_(None),
+    models.AgentWorkClaim.released_at.is_(None),
+  ).values(owner_run_id=principal.run_id))
+  if fenced.rowcount != 1:
+    db.rollback()
+    raise HTTPException(409, f"{action} ownership changed. No public attempt started.")
+  return claim
+
+
 def arm_merge(db, row, target, outcome, principal):
   """Reserve one exact public attempt across grants as well as within a grant.
 
@@ -282,7 +307,8 @@ def arm_merge(db, row, target, outcome, principal):
   That receipt also prevents replay after a claim was released or transferred.
   """
   work_key = merge_work_key(target)
-  claim = reserve_public_work(db, row, principal, work_key, f"Review and merge {key(target)} at {target['head_sha'][:12]}.", "Merge")
+  claim = reserve_public_work(db, row, principal, work_key,
+    f"Review and merge {key(target)} at {target['head_sha'][:12]}.", "Merge")
   if claim["state"] in {"held_by_peer", "completed"}:
     follow_status = claim.get("follow_status", "no_goal_follow")
     follows = follow_status in {"followed", "result_owed"}
@@ -291,8 +317,6 @@ def arm_merge(db, row, target, outcome, principal):
             "summary": ("This exact merge already has an owning conversation. Open that conversation. "
                         + ("Your Goal follows this claim and will receive its result." if follows else
                            f"No new Goal follow was created ({follow_status}); reconcile the result yourself."))}
-  # Keep this write and save_outcome in one transaction. A second worker must
-  # wait for the first receipt before checking other overlapping batches.
   item_key = key(target)
   previous = db.query(models.ContributionReviewRun).filter(
     models.ContributionReviewRun.owner_id == row.owner_id,
@@ -638,7 +662,8 @@ def arm_repair(db, row, target, previous, receipt, principal):
   authorize a second push after an ambiguous public outcome.
   """
   work_key = f"github:{target['head_repo'].lower()}:branch:{target['head_ref']}:{target['head_sha']}:repair"
-  claim = reserve_public_work(db, row, principal, work_key, f"Scoped repair of {key(target)} at {target['head_sha'][:12]}.", "Repair")
+  claim = reserve_public_work(db, row, principal, work_key,
+    f"Scoped repair of {key(target)} at {target['head_sha'][:12]}.", "Repair")
   if claim["state"] in {"held_by_peer", "completed"}:
     db.refresh(row)
     summary = "This predecessor repair already belongs to another saved work outcome. Follow its owning chat."
@@ -810,28 +835,6 @@ def mark_ready(gh, cwd, target):
       or pull.get("headRefOid") != target["head_sha"] or pull.get("isDraft") is not False):
     raise HTTPException(409, "GitHub did not confirm readiness of the exact pull request.")
   return pull
-
-
-def reserve_public_work(db, row, principal, work_key, summary, action):
-  """Claim an exact effect and fence its receipt against overlapping grants."""
-  claim = agent_work_claims.claim_work(db, owner_id=row.owner_id,
-    chat_id=row.chat_id, run_id=principal.run_id, work_key=work_key,
-    summary=summary)
-  if claim["state"] in {"held_by_peer", "completed"}:
-    return claim
-  # The owner-row write fence and the outcome save remain one transaction.
-  fence_public_transition(db, row)
-  fenced = db.execute(update(models.AgentWorkClaim).where(
-    models.AgentWorkClaim.id == claim["id"],
-    models.AgentWorkClaim.revision == claim["revision"],
-    models.AgentWorkClaim.owner_chat_id == row.chat_id,
-    models.AgentWorkClaim.completed_at.is_(None),
-    models.AgentWorkClaim.released_at.is_(None),
-  ).values(owner_run_id=principal.run_id))
-  if fenced.rowcount != 1:
-    db.rollback()
-    raise HTTPException(409, f"{action} ownership changed. No public attempt started.")
-  return claim
 
 
 def ready_work_key(target):

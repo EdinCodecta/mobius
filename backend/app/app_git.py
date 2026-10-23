@@ -906,6 +906,7 @@ def _canonical_diff(
   head_sha: str,
   *,
   read_only: bool = False,
+  env: dict[str, str] | None = None,
 ) -> bytes | None:
   """The byte-exact diff shape Contribute hashes before a PR can be sent."""
   try:
@@ -916,7 +917,7 @@ def _canonical_diff(
         "--src-prefix=a/", "--dst-prefix=b/", f"{base_sha}..{head_sha}",
       ],
       capture_output=True, timeout=_GIT_TIMEOUT, check=False,
-      env=_git_env(repo, read_only=read_only),
+      env=env if env is not None else _git_env(repo, read_only=read_only),
     )
   except (OSError, subprocess.SubprocessError):
     return None

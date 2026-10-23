@@ -7,10 +7,50 @@ import asyncio
 
 from fastapi import HTTPException
 
-from app import agent_work_claims, chat_queue, contribution_review_runs as reviews, settled
+from app import agent_work_claims, chat_queue, contribution_review_runs as reviews, models, settled
 from app import contribution_review_repairs as repairs
 from app.contribution_errors import ContributionSubmitError
 from app.contribution_review_effects import DispatchResult, NotDispatched
+
+
+def checkout_gc_scope(db) -> dict[str, set[str]]:
+  """Classify durable checkout receipts before a filesystem-only sweep.
+
+  An active physical parent/child turn or uncertain public effect always wins
+  over age. Dormant edits get a longer grace than unreceipted crash orphans.
+  """
+  active_chats = {chat_id for (chat_id,) in db.query(models.ChatRun.chat_id).filter(
+    models.ChatRun.status.in_(models.NONTERMINAL_RUN_STATUSES)).all()}
+  active_parents = {parent for (parent,) in db.query(models.Delegation.parent_chat_id).filter(
+    models.Delegation.child_chat_id.in_(active_chats),
+    models.Delegation.cancelled_at.is_(None)).all()} if active_chats else set()
+  protected: set[str] = set()
+  terminal: set[str] = set()
+  dormant: set[str] = set()
+  for row in db.query(models.ContributionReviewRun).populate_existing().all():
+    active_editor = row.chat_id in active_chats or row.chat_id in active_parents
+    stopped = (row.outcomes_json or {}).get("_review_stop", {}).get("state") == "requested"
+    for outcome in (row.outcomes_json or {}).values():
+      if not isinstance(outcome, dict):
+        continue
+      attempts = outcome.get("repair_attempts") or []
+      for attempt in attempts:
+        path = attempt.get("checkout") if isinstance(attempt, dict) else None
+        if not isinstance(path, str):
+          continue
+        (protected if attempt.get("state") in {"pushing", "push_unknown"} else terminal).add(path)
+      checkout = outcome.get("checkout") or {}
+      path = checkout.get("checkout") if isinstance(checkout, dict) else None
+      if not isinstance(path, str):
+        continue
+      if active_editor:
+        protected.add(path)
+      elif not stopped and outcome.get("state") == "repairing":
+        dormant.add(path)
+      else:
+        terminal.add(path)
+  return {"protected_paths": protected, "terminal_paths": terminal,
+          "dormant_paths": dormant}
 
 
 async def dispatch_repair(row, target, validation, *, gh, cwd, authorize):
@@ -41,21 +81,28 @@ async def publish_attempt(db, row, target, validation, receipt, principal, *, gh
   db.refresh(row)
   previous = row.outcomes_json[reviews.key(target)]
   attempts = list(previous["repair_attempts"])
-  result = await dispatch_repair(row, target, validation, gh=gh, cwd=cwd, authorize=authorize)
+  pushed = [*attempts[:-1], {**attempts[-1], "state": "pushed"}]
+  try:
+    # Successor invariants belong before the network effect. In particular,
+    # queue-removal history in a later layer must not fail after a real push.
+    successor = reviews.confirmed_successor(previous, pushed, validation)
+  except (HTTPException, KeyError, ValueError):
+    result = DispatchResult.not_dispatched("The successor receipt cannot be recorded safely.")
+  else:
+    result = await dispatch_repair(row, target, validation, gh=gh, cwd=cwd, authorize=authorize)
   if result.state == "not_dispatched":
     reviews.save_effect_outcome(db, row, reviews.key(target), {**previous,
       "repair_attempts": attempts[:-1], "state": "needs_you",
-      "summary": f"No push was attempted: {result.reason}"})
+      "summary": f"No branch update was applied: {result.reason}"})
     agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
-      work_key=attempts[-1]["work_key"], outcome="Repair push was not attempted.", release=True)
+      work_key=attempts[-1]["work_key"], outcome="Repair branch update was not applied.", release=True)
   elif result.state == "unknown":
     attempts[-1] = {**attempts[-1], "state": "push_unknown"}
     reviews.save_effect_outcome(db, row, reviews.key(target), {**previous,
       "repair_attempts": attempts, "state": "needs_you", "summary": result.reason})
   else:
     attempts[-1] = {**attempts[-1], "state": "pushed"}
-    reviews.save_effect_outcome(db, row, reviews.key(target),
-      reviews.confirmed_successor(previous, attempts, validation))
+    reviews.save_effect_outcome(db, row, reviews.key(target), successor)
     await settled.run_settled(repairs.discard_checkout, validation["checkout"])
   return None
 
@@ -71,9 +118,27 @@ async def reconcile_push(db, row, original, previous, pending, *, gh, cwd):
     return False
   attempts = [{**r, "state": "pushed"} if r is pending else r
               for r in previous.get("repair_attempts", [])]
-  reviews.save_effect_outcome(db, row, reviews.key(original), reviews.confirmed_successor(previous, attempts, pending))
+  try:
+    outcome = reviews.confirmed_successor(previous, attempts, pending)
+  except (HTTPException, KeyError, ValueError):
+    # GitHub already proves the push. Do not strand it as 'pushing' merely
+    # because a later local projection invariant needs manual repair.
+    outcome = {**previous, "repair_attempts": attempts, "state": "needs_you",
+      "summary": "The repair push is confirmed, but successor history needs manual reconciliation."}
+  reviews.save_effect_outcome(db, row, reviews.key(original), outcome)
   await settled.run_settled(repairs.discard_checkout, pending.get("checkout"))
   return True
+
+
+def escalate_unconfirmed_push(db, row, original, previous, pending):
+  """An old armed receipt is uncertain, never permission for another push."""
+  if pending.get("state") != "pushing":
+    return
+  attempts = [{**attempt, "state": "push_unknown"} if attempt.get("id") == pending.get("id") else attempt
+              for attempt in previous.get("repair_attempts", [])]
+  reviews.save_effect_outcome(db, row, reviews.key(original), {**previous,
+    "repair_attempts": attempts, "state": "needs_you",
+    "summary": "The earlier repair push is not confirmed; observe it without repeating the write."})
 
 
 async def abandon_checkouts(row):
