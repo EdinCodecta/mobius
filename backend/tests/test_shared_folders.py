@@ -348,6 +348,41 @@ def test_agent_command_round_trips_through_the_owner_browser(client, auth, live_
   assert outcome["response"].json() == {"ok": True, "result": {"text": "hello", "size": 5}}
 
 
+def _answer_a_read(client, auth, live_stream, result):
+  """The browser's answer response and what the waiting agent receives."""
+  client.put(f"/api/shared-folders/devices/{live_stream.id}", headers=auth, json=_REPORT)
+  outcome = {}
+
+  def agent_runs_command():
+    outcome["agent"] = client.post(
+      "/api/shared-folders/f1/commands", headers=_agent(), json={"op": "read", "path": "notes.txt"},
+    )
+
+  thread = threading.Thread(target=agent_runs_command)
+  thread.start()
+  event = _await_stream_event(live_stream)
+  answered = client.post("/api/shared-folders/responses", headers=auth, json={
+    "subscriptionId": live_stream.id, "commandId": event["commandId"], "ok": True, "result": result,
+  })
+  thread.join(timeout=10)
+  return answered, outcome["agent"].json()
+
+
+def test_non_ascii_answer_is_measured_by_its_real_size(client, auth, live_stream):
+  # 4 MB of Cyrillic: under the 8 MB cap, but 12 MB if each letter were \u-escaped.
+  text = "ж" * 2_000_000
+  answered, agent = _answer_a_read(client, auth, live_stream, {"text": text})
+  assert answered.status_code == 200, answered.text
+  assert agent["ok"] is True
+  assert len(agent["result"]["text"]) == 2_000_000
+
+
+def test_answer_over_the_size_cap_reaches_the_agent_as_too_large(client, auth, live_stream):
+  answered, agent = _answer_a_read(client, auth, live_stream, {"text": "a" * (8 * 1024 * 1024 + 1)})
+  assert answered.status_code == 413
+  assert (agent["ok"], agent["code"]) == (False, "too_large")
+
+
 def test_agent_sees_refusals_as_ordinary_results(client, auth, live_stream):
   report = {**_REPORT, "folders": [{**_REPORT["folders"][0], "mode": "read"}]}
   client.put(f"/api/shared-folders/devices/{live_stream.id}", headers=auth, json=report)

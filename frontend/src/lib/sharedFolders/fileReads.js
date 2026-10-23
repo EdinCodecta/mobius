@@ -27,20 +27,50 @@ export async function readFileSlice(file, path, options = {}) {
     ? Math.max(0, file.size - length)
     : Math.min(Math.max(0, options.offset || 0), file.size)
   const bytes = new Uint8Array(await file.slice(start, start + length).arrayBuffer())
-  const base = {
-    ...fileInfo(file, path),
-    offset: start,
-    length: bytes.length,
-    eof: start + bytes.length >= file.size,
+  if (options.encoding === 'base64') {
+    return { ...sliceInfo(file, path, start, bytes.length), base64: bytesToBase64(bytes) }
   }
-  if (options.encoding === 'base64') return { ...base, base64: bytesToBase64(bytes) }
   if (bytes.includes(0)) {
     throw new FolderError(
       'binary',
       'This looks like a binary file. Use `folders show` for images and PDFs, or read it with --base64.',
     )
   }
-  return { ...base, text: new TextDecoder('utf-8').decode(bytes) }
+  const [from, to] = wholeCharacterRange(bytes, start > 0, start + bytes.length < file.size)
+  return {
+    ...sliceInfo(file, path, start + from, to - from),
+    text: new TextDecoder('utf-8').decode(bytes.subarray(from, to)),
+  }
+}
+
+function sliceInfo(file, path, offset, length) {
+  return { ...fileInfo(file, path), offset, length, eof: offset + length >= file.size }
+}
+
+const isContinuationByte = byte => (byte & 0xc0) === 0x80
+
+function utf8SequenceLength(leadByte) {
+  if (leadByte >= 0xf0) return 4
+  if (leadByte >= 0xe0) return 3
+  if (leadByte >= 0xc0) return 2
+  return 1
+}
+
+/**
+ * The part of a text slice that holds whole UTF-8 characters, as [from, to).
+ * Page edges then never split a letter such as "č", and the next page's
+ * offset starts on a character. A slice too short to hold one is kept as is.
+ */
+function wholeCharacterRange(bytes, cutAtStart, cutAtEnd) {
+  let from = 0
+  while (cutAtStart && from < 3 && isContinuationByte(bytes[from])) from += 1
+  let to = bytes.length
+  if (cutAtEnd) {
+    let lead = to - 1
+    while (lead > from && to - lead < 4 && isContinuationByte(bytes[lead])) lead -= 1
+    if (to - lead < utf8SequenceLength(bytes[lead])) to = lead
+  }
+  return to > from ? [from, to] : [0, bytes.length]
 }
 
 // Formats every model reader accepts as they are; anything else is re-encoded.

@@ -1,9 +1,9 @@
 /* Settings → Shared folders: folders on this device that your agents can work in, without uploading. */
-import { useRef, useState, useSyncExternalStore } from 'react'
+import { useRef, useState } from 'react'
 import { Alert } from '@openai/apps-sdk-ui/components/Alert'
 import { FolderPlus } from '@openai/apps-sdk-ui/components/Icon'
 import { isSharedBrowserAuth } from '../../api/client.js'
-import { getSharedFoldersState, subscribeSharedFolders } from '../../lib/sharedFolders/hostState.js'
+import useSharedFolders from '../../hooks/useSharedFolders.js'
 import { addRememberedFolder, addVisitFolder } from '../../lib/sharedFolders/folderActions.js'
 import SharedFolderRow from './SharedFolderRow.jsx'
 import OtherDeviceFolders from './OtherDeviceFolders.jsx'
@@ -18,10 +18,6 @@ const MODES = [
     detail: 'Agents can also save, rename and move files. They never delete: unwanted files go to a “Möbius bin” folder.',
   },
 ]
-
-function useSharedFolders() {
-  return useSyncExternalStore(subscribeSharedFolders, getSharedFoldersState, getSharedFoldersState)
-}
 
 export default function SharedFoldersSection() {
   const state = useSharedFolders()

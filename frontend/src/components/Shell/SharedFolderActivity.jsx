@@ -1,14 +1,11 @@
 /* While the agent works in a shared folder, show it and offer Stop (pauses every shared folder). */
-import { useSyncExternalStore } from 'react'
 import { createPortal } from 'react-dom'
 import { FolderShared } from '@openai/apps-sdk-ui/components/Icon'
-import { getSharedFoldersState, subscribeSharedFolders } from '../../lib/sharedFolders/hostState.js'
+import useSharedFolders from '../../hooks/useSharedFolders.js'
 import { pauseAllFolders } from '../../lib/sharedFolders/folderActions.js'
 
 export default function SharedFolderActivity() {
-  const { activity } = useSyncExternalStore(
-    subscribeSharedFolders, getSharedFoldersState, getSharedFoldersState,
-  )
+  const { activity } = useSharedFolders()
   if (!activity || typeof document === 'undefined') return null
   return createPortal(
     <button

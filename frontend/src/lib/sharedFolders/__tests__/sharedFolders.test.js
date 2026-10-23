@@ -56,6 +56,34 @@ test('read returns only the requested piece, from the start or the end', async (
   assert.equal(encoded.base64, btoa('line'))
 })
 
+test('paged reads never split a letter at a page edge', async () => {
+  // Two-, three- and four-byte characters, so pages end inside each kind.
+  const text = 'Čevapi, ćevapčići, šljiva, žito, đak. Здраво. €5 😀 '.repeat(8)
+  const root = new FakeDirectoryHandle('Notes')
+  root.addFile('bs.txt', text)
+  const folder = createHandleFolder(root)
+  for (const length of [5, 7, 13]) {
+    let offset = 0
+    let joined = ''
+    for (;;) {
+      const page = await folder.run({ op: 'read', path: 'bs.txt', offset, length })
+      assert.ok(!page.text.includes('�'), `page at ${offset} split a letter`)
+      joined += page.text
+      offset = page.offset + page.length
+      if (page.eof) break
+    }
+    assert.equal(joined, text, `pages of ${length} bytes`)
+  }
+})
+
+test('a read from the end starts on a whole letter', async () => {
+  const root = new FakeDirectoryHandle('Notes')
+  root.addFile('end.txt', 'ab čć')
+  const tail = await createHandleFolder(root).run({ op: 'read', path: 'end.txt', length: 3, fromEnd: true })
+  assert.equal(tail.text, 'ć')
+  assert.equal(tail.offset, 5)
+})
+
 test('a binary file is not returned as garbled text', async () => {
   const root = new FakeDirectoryHandle('Pictures')
   root.addFile('photo.jpg', new Uint8Array([255, 216, 0, 1]))

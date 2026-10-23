@@ -40,59 +40,54 @@ function describe(entry) {
   return { name: entry.name, kind: 'file', size: entry.file.size, modified: entry.file.lastModified || null }
 }
 
+function fileAt(index, segments) {
+  const path = joinPath(segments)
+  const file = index.filesByPath.get(path)
+  if (file) return file
+  if (index.children.has(path)) throw new FolderError('wrong_kind', `"${path}" is a folder. Use list.`)
+  throw new FolderError('not_found', `Nothing is at "${path}" in this folder.`)
+}
+
+function folderAt(index, segments) {
+  const path = joinPath(segments)
+  const entries = index.children.get(path)
+  if (entries) return entries
+  if (index.filesByPath.has(path)) throw new FolderError('wrong_kind', `"${path}" is a file. Use read or info.`)
+  throw new FolderError('not_found', `Nothing is at "${path}" in this folder.`)
+}
+
+const OPERATIONS = {
+  list(index, command) {
+    const segments = pathSegments(command.path, { allowRoot: true })
+    const { page, total, nextCursor } = pageOf(sortEntries([...folderAt(index, segments).values()]), command)
+    return { path: joinPath(segments), entries: page.map(describe), total, nextCursor }
+  },
+  info(index, command) {
+    const segments = pathSegments(command.path, { allowRoot: true })
+    if (!index.children.has(joinPath(segments))) return fileInfo(fileAt(index, segments), joinPath(segments))
+    const name = segments.at(-1) || index.rootName
+    return { path: joinPath(segments), name, kind: 'folder', entries: folderAt(index, segments).size }
+  },
+  read(index, command) {
+    const segments = pathSegments(command.path)
+    return readFileSlice(fileAt(index, segments), joinPath(segments), command)
+  },
+  image(index, command) {
+    const segments = pathSegments(command.path)
+    return shrinkImage(fileAt(index, segments), joinPath(segments), command.maxEdge || DEFAULT_IMAGE_EDGE)
+  },
+}
+
 /** A one-visit folder: list, info and read only, from the files the browser handed over. */
 export function createSnapshotFolder(files) {
-  const { filesByPath, children, rootName } = indexFiles(files)
-
-  function fileAt(segments) {
-    const file = filesByPath.get(joinPath(segments))
-    if (file) return file
-    const kind = children.has(joinPath(segments)) ? 'wrong_kind' : 'not_found'
-    throw new FolderError(kind, kind === 'wrong_kind'
-      ? `"${joinPath(segments)}" is a folder. Use list.`
-      : `Nothing is at "${joinPath(segments)}" in this folder.`)
-  }
-
-  function folderAt(segments) {
-    const entries = children.get(joinPath(segments))
-    if (entries) return entries
-    const kind = filesByPath.has(joinPath(segments)) ? 'wrong_kind' : 'not_found'
-    throw new FolderError(kind, kind === 'wrong_kind'
-      ? `"${joinPath(segments)}" is a file. Use read or info.`
-      : `Nothing is at "${joinPath(segments)}" in this folder.`)
-  }
-
-  const operations = {
-    list(command) {
-      const segments = pathSegments(command.path, { allowRoot: true })
-      const { page, total, nextCursor } = pageOf(sortEntries([...folderAt(segments).values()]), command)
-      return { path: joinPath(segments), entries: page.map(describe), total, nextCursor }
-    },
-    info(command) {
-      const segments = pathSegments(command.path, { allowRoot: true })
-      if (children.has(joinPath(segments))) {
-        const name = segments.at(-1) || rootName
-        return { path: joinPath(segments), name, kind: 'folder', entries: folderAt(segments).size }
-      }
-      return fileInfo(fileAt(segments), joinPath(segments))
-    },
-    read(command) {
-      const segments = pathSegments(command.path)
-      return readFileSlice(fileAt(segments), joinPath(segments), command)
-    },
-    image(command) {
-      const segments = pathSegments(command.path)
-      return shrinkImage(fileAt(segments), joinPath(segments), command.maxEdge || DEFAULT_IMAGE_EDGE)
-    },
-  }
-
+  const index = indexFiles(files)
   return {
-    rootName,
-    fileCount: filesByPath.size,
+    rootName: index.rootName,
+    fileCount: index.filesByPath.size,
     async run(command) {
-      const operation = operations[command.op]
+      const operation = OPERATIONS[command.op]
       if (!operation) throw readOnlyError()
-      return operation(command)
+      return operation(index, command)
     },
   }
 }

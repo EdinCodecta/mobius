@@ -201,7 +201,8 @@ async def answer_folder_command(
   body: BrowserAnswerBody,
   _: Principal = Depends(browser_owner),
 ) -> dict[str, bool]:
-  encoded = json.dumps(body.result, ensure_ascii=True, separators=(",", ":"))
+  # Count UTF-8 bytes as sent: ASCII escaping would count "ж" as six bytes.
+  encoded = json.dumps(body.result, ensure_ascii=False, separators=(",", ":")).encode()
   if len(encoded) > MAX_RESPONSE_BYTES:
     accepted = registry.answer(body.subscriptionId, body.commandId, {
       "ok": False, "code": "too_large", "error": "The answer was too large. Read a smaller piece.",
