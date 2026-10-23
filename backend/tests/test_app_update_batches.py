@@ -1533,3 +1533,18 @@ async def test_refresh_settles_every_entry_it_can_beside_an_unknown_one(
   entries = {e["app_id"]: e for e in owner.snapshot(key)["entries"]}
   assert (entries[unknown]["status"], entries[unknown]["error"]) == ("conflict", "")
   assert (entries[landed]["status"], entries[landed]["version"]) == ("updated", "2.0")
+
+
+def test_an_unknown_app_logs_one_line_naming_the_app_and_cause(
+  tmp_path, db, caplog,
+):
+  app_id = add_app(db, tmp_path, "unread", version="1.0", source_commit=LANDED)
+  _unreadable_receipt(tmp_path / "unread")
+  with caplog.at_level(logging.WARNING, logger=batches.log.name):
+    outcome = batches._settled_outcomes({app_id: COMMIT})[app_id]
+  assert outcome == {"error": batches._UNKNOWN_OUTCOME}
+  [entry] = [r for r in caplog.records if "is unknown" in r.getMessage()]
+  assert f"app {app_id} update to {COMMIT}" in entry.getMessage()
+  assert "pending update receipt" in entry.getMessage()
+  assert "Is a directory" in entry.getMessage()
+  assert entry.exc_info is None

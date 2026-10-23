@@ -211,9 +211,14 @@ def _settled_outcomes(reviewed: dict[int, str]) -> dict[int, dict]:
     try:
       outcomes[app_id] = _settled_outcome(app_id, commit, row)
     except SettlementUnreadable as exc:
+      # One line, no traceback: an app that stays unknown is re-read on
+      # every refresh, and the cause names what to repair.
+      cause = exc
+      while cause.__cause__ is not None:
+        cause = cause.__cause__
       log.warning(
-        "app %s update to %s is unknown: %s could not be read",
-        app_id, commit, exc, exc_info=exc.__cause__ is not None,
+        "app %s update to %s is unknown: %s could not be read (%s)",
+        app_id, commit, exc, cause if cause is not exc else "no answer",
       )
       outcomes[app_id] = {"error": _UNKNOWN_OUTCOME}
   return outcomes
