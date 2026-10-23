@@ -5,13 +5,15 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine, inspect, text
 
-from app import contribution_review_runs as domain
+from app import contribution_review_runs as domain, models
 from app import schema_migrations
 from app.deps import Principal
 from app.routes import contribution_reviews as routes
 from tests.test_contribution_review_runs import ITEM, CHECKS, REPO, PULL, TARGET, setup, report
 from scripts import github_review as cli
 from scripts.github_review_selection import review_path, start_body, verify_selection
+from app.contribution_review_effects import classify_dispatch_error
+from app.contribution_errors import ContributionSubmitError
 
 
 def test_app_less_routes_do_not_expose_repair_or_posting():
@@ -25,6 +27,11 @@ def test_app_less_routes_do_not_expose_repair_or_posting():
 
 
 def test_cli_app_adapter_identity_and_body_use_canonical_helpers(monkeypatch):
+  from inspect import signature
+  for name in ("api", "prepare_selection", "freeze_preview", "verify_selection", "start_body", "review_path"):
+    assert callable(getattr(cli, name))
+  assert tuple(signature(cli.prepare_selection).parameters) == ("references", "mode", "chat_id", "app_id")
+  assert tuple(signature(cli.freeze_preview).parameters) == ("selection", "options", "agent")
   monkeypatch.setattr(cli, "inspect_pr", lambda ref: {**ITEM, "title": "Safe change", "url": "https://github.com/example/project/pull/7"})
   snapshot = {"review_prompt": "Review", "fix_prompt": "Fix", "merge_prompt": "Merge",
     "max_rounds": None, "autopilot": False, "provider": "codex", "model": "test-model",
@@ -56,6 +63,14 @@ def test_core_admission_is_null_app_and_app_context_is_read_only(setup, monkeypa
   assert row.app_id is None and row.app_nonce is None
   assert created["app_id"] is None
   assert any(item["id"] == row.id for item in routes.list_reviews(1, db, principal)["runs"])
+  app = Principal(owner=principal.owner, app_id=1)
+  projected = next(item for item in routes.list_reviews(1, db, app)["runs"] if item["id"] == row.id)
+  assert set(projected) <= {"id", "chat_id", "state", "execution_state", "app_id", "can_stop", "items"}
+  assert all(set(item) <= {"repo", "number", "head_sha", "state"} for item in projected["items"])
+  assert routes.get_review(1, row.id, db, app)["brief"] is None
+  with pytest.raises(HTTPException) as denied_core:
+    routes.core_list_reviews(db, app)
+  assert denied_core.value.status_code == 403
   with pytest.raises(HTTPException) as denied:
     routes._row(db, 1, row.id, principal)
   assert denied.value.status_code == 404
@@ -70,6 +85,25 @@ def test_private_all_clear_survives_moved_base(setup, monkeypatch):
   monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "PR moved")))
   assert report(setup)["run"]["items"][0]["state"] == "all_clear"
   assert asyncio.run(routes.observe_review(1, row.id, db, Principal(owner=row_owner(db, row), app_id=None)))["run"]["items"][0]["state"] == "all_clear"
+
+
+def test_observe_preserves_private_needs_you_evidence_when_live_read_fails(setup, monkeypatch):
+  db, row, _ = setup
+  row.mode = "review"
+  db.commit()
+  report(setup, state="needs_you", summary="Private finding: race in X")
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "PR moved")))
+  asyncio.run(routes.observe_review(1, row.id, db, Principal(owner=row_owner(db, row), app_id=None)))
+  db.refresh(row)
+  assert row.outcomes_json[domain.key(ITEM)]["summary"] == "Private finding: race in X"
+
+
+def test_private_finding_records_even_after_head_moved(setup, monkeypatch):
+  db, row, _ = setup
+  row.mode = "review"
+  db.commit()
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "PR moved")))
+  assert report(setup, state="needs_you", summary="Private finding: race in X")["run"]["items"][0]["summary"] == "Private finding: race in X"
 
 
 def test_completed_run_view_keeps_fact_when_chat_model_later_changes(setup):
@@ -164,6 +198,54 @@ def test_stop_after_dispatch_cannot_erase_confirmed_merge(setup, monkeypatch):
   assert row.outcomes_json[routes.REVIEW_STOP_KEY]["state"] == "requested"
 
 
+def test_definite_refusal_racing_stop_disarms_exact_reservation(setup, monkeypatch):
+  db, row, _ = setup
+  reads = 0
+
+  def drift_while_stop_lands(*args):
+    nonlocal reads
+    reads += 1
+    if reads == 2:
+      from app.database import SessionLocal
+      other = SessionLocal()
+      try:
+        live = other.get(models.ContributionReviewRun, row.id)
+        domain.save_outcome(other, live, routes.REVIEW_STOP_KEY, {"state": "requested"})
+      finally:
+        other.close()
+      raise HTTPException(409, "The target branch changed.")
+
+  monkeypatch.setattr(domain, "assert_current_base", drift_while_stop_lands)
+  monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("must not dispatch"))
+  try:
+    report(setup)
+  except HTTPException:
+    pass
+  db.refresh(row)
+  item = row.outcomes_json[domain.key(ITEM)]
+  assert item.get("merge_attempted") is False and item.get("state") != "merging"
+  assert row.outcomes_json[routes.REVIEW_STOP_KEY]["state"] == "requested"
+
+
+@pytest.mark.parametrize("message,status,expected", [
+  ("Pull Request is not mergeable", 405, "not_dispatched"),
+  ("gh: HTTP 422: rejected", 409, "not_dispatched"),
+  ("gh: HTTP 408: timeout", 409, "unknown"),
+  ("gh: HTTP 429: rate limited", 409, "unknown"),
+  ("gh: HTTP 503: server error", 409, "unknown"),
+  ("transport failed", 409, "unknown"),
+])
+def test_dispatch_classifier_requires_proved_rejection(message, status, expected):
+  assert classify_dispatch_error(ContributionSubmitError(message, status)).state == expected
+
+
+def test_definite_github_merge_rejection_is_not_unknown(setup, monkeypatch):
+  monkeypatch.setattr(domain, "perform_merge", lambda *a: (_ for _ in ()).throw(
+    ContributionSubmitError("Pull Request is not mergeable", 405)))
+  item = report(setup)["run"]["items"][0]
+  assert item["state"] == "needs_you" and item["merge_attempted"] is False
+
+
 @pytest.mark.parametrize("nonce_nullable", [False, True])
 def test_core_migration_adopts_prior_0079_variant_without_rewriting_it(tmp_path, nonce_nullable):
   eng = create_engine(f"sqlite:///{tmp_path / 'old-review.db'}")
@@ -181,3 +263,22 @@ def test_core_migration_adopts_prior_0079_variant_without_rewriting_it(tmp_path,
   with eng.connect() as conn:
     assert conn.execute(text("SELECT id, app_id, app_nonce FROM contribution_review_runs")).one() == ("old-run", 2, "old-nonce")
     assert conn.execute(text("SELECT version FROM schema_migrations")).scalar_one() == "0079_core_contribution_review_runs"
+
+
+def test_core_migration_preserves_exact_post_0079_nullable_shape(tmp_path):
+  eng = create_engine(f"sqlite:///{tmp_path / 'post-0079.db'}")
+  with eng.begin() as conn:
+    conn.execute(text("CREATE TABLE schema_migrations (version VARCHAR(128) PRIMARY KEY, applied_at TIMESTAMP)"))
+    conn.execute(text("INSERT INTO schema_migrations VALUES ('0079_core_contribution_review_runs', CURRENT_TIMESTAMP)"))
+    conn.execute(text("CREATE TABLE contribution_review_runs (id VARCHAR(64) PRIMARY KEY, app_id INTEGER, app_nonce VARCHAR(64), owner_id INTEGER NOT NULL, request_id VARCHAR(64) NOT NULL, options_json JSON)"))
+    conn.execute(text("CREATE UNIQUE INDEX uq_contribution_review_runs_core_request ON contribution_review_runs (owner_id, request_id) WHERE app_id IS NULL"))
+    conn.execute(text("INSERT INTO contribution_review_runs VALUES ('core-run', NULL, NULL, 1, 'same-request', '{}')"))
+    before = conn.execute(text("SELECT type, name, sql FROM sqlite_master WHERE tbl_name='contribution_review_runs' ORDER BY type, name")).all()
+  schema_migrations._allow_core_contribution_review_runs(eng)
+  schema_migrations._allow_core_contribution_review_runs(eng)
+  with eng.begin() as conn:
+    assert conn.execute(text("SELECT type, name, sql FROM sqlite_master WHERE tbl_name='contribution_review_runs' ORDER BY type, name")).all() == before
+    assert conn.execute(text("SELECT id, options_json FROM contribution_review_runs")).one() == ("core-run", "{}")
+    from sqlalchemy.exc import IntegrityError
+    with pytest.raises(IntegrityError):
+      conn.execute(text("INSERT INTO contribution_review_runs VALUES ('duplicate', NULL, NULL, 1, 'same-request', '{}')"))
