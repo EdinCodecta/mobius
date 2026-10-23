@@ -14,7 +14,7 @@ from sqlalchemy import or_, update
 
 from app import agent_work_claims, models
 from app.contribution_errors import ContributionSubmitError
-from app.contribution_review_effects import NotDispatched
+from app.contribution_review_effects import NotDispatched, graphql_mutation_result
 from app.terminal_output import readable_output
 
 
@@ -149,19 +149,8 @@ def enqueue(gh, cwd, target):
   }){mergeQueueEntry{id}}}"""
   response = gh(cwd, "api", "graphql", "-f", f"query={query}",
     "-f", f"id={target['pr_id']}", "-f", f"head={target['head_sha']}", check=False)
-  try:
-    result = json.loads(response.stdout)
-  except json.JSONDecodeError:
-    if getattr(response, "returncode", 0):
-      raise ContributionSubmitError((response.stderr or "GitHub GraphQL request failed.")[:600])
-    raise
-  if not isinstance(result, dict):
-    raise ContributionSubmitError("GitHub returned an unexpected merge-queue response.", code="merge_response_invalid_shape")
+  result = graphql_mutation_result(response)
   entry = ((result.get("data") or {}).get("enqueuePullRequest") or {}).get("mergeQueueEntry")
-  if result.get("errors") and not result.get("data"):
-    raise NotDispatched("GitHub rejected the merge-queue request without applying it.")
-  if getattr(response, "returncode", 0):
-    raise ContributionSubmitError((response.stderr or "GitHub GraphQL request failed.")[:600])
   if result.get("errors") or not isinstance(entry, dict) or not entry.get("id"):
     raise HTTPException(409, "GitHub did not confirm this exact pull request in the merge queue.")
   return entry
@@ -259,7 +248,7 @@ def arm_merge(db, row, target, outcome, principal):
   return None
 
 
-def disarm_merge(db, row, target, outcome, reason):
+def disarm_merge(db, row, target, reason):
   """Release only this run's definitely unspent merge reservation."""
   item_key = key(target)
   for _ in range(4):

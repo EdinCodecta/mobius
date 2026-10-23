@@ -54,7 +54,7 @@ async def _reserve_and_dispatch(db, row, target, outcome, repo, checks, principa
   armed = dict(row.outcomes_json[reviews.key(target)])
   result = await dispatch_merge(gh, cwd, target, repo, checks, authorize, method)
   if result.state == "not_dispatched":
-    reviews.disarm_merge(db, row, target, armed, result.reason)
+    reviews.disarm_merge(db, row, target, result.reason)
     if asyncio.current_task().cancelling():
       raise asyncio.CancelledError()
     return None
@@ -69,10 +69,10 @@ async def merge_reviewed_target(db, row, target, outcome, repo, pull, principal,
     reviews.save_effect_outcome(db, row, reviews.key(target), {
       **outcome, "state": "merged", "merge_sha": pull.get("merge_commit_sha")})
     return
-  checks = await asyncio.to_thread(reviews.pull_checks, gh, cwd, target)
+  checks = await asyncio.to_thread(reviews.pull_checks, gh, cwd, target)  # unsettled: read-only (GitHub PR checks)
   entry = reviews.queue_entry(checks, target)
   if entry:
-    await asyncio.to_thread(reviews.assert_current_base, gh, cwd, target)
+    await asyncio.to_thread(reviews.assert_current_base, gh, cwd, target)  # unsettled: read-only (GitHub target base)
     authorize()
     reviews.save_outcome(db, row, reviews.key(target), {**outcome, "state": "queued", "queue_entry_id": entry["id"]})
     return
