@@ -702,3 +702,44 @@ def test_an_app_that_asks_for_nothing_is_never_asked(client, owner_token, db):
   app.capability_contract = _contract(github_access=True)
   assert app_consent.status(app) == "required"
   assert [r["id"] for r in app_consent.needed_rows(app)] == ["github_access"]
+
+
+def test_an_update_that_starts_asking_notifies_even_when_nothing_was_accepted_before(
+  client, auth, owner_token, db, bypass_url_validation,
+):
+  import json as _json
+  from unittest.mock import patch
+
+  from app import models as m
+  from tests.test_app_skills import BASE, JSX, _fake_async_client, _skill_manifest
+
+  def serve(manifest):
+    responses = {BASE + "mobius.json": (200, _json.dumps(manifest).encode()),
+                 BASE + "index.jsx": (200, JSX.encode())}
+    return patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses))
+
+  plain = _skill_manifest(skills=[], source_files=[])
+  with serve(plain):
+    installed = client.post("/api/apps/install", headers=auth, json={"manifest_url": BASE + "mobius.json"})
+  app_id = installed.json()["id"]
+  assert not app_consent.dormant(db.get(m.App, app_id))  # it asks for nothing
+
+  wider = _skill_manifest(version="2.0.0", skills=[], source_files=[], permissions={
+    "cross_app_access": "none", "share_with_apps": "none", "github_access": True})
+  with serve(wider):
+    update = client.post("/api/apps/install", headers=auth, json={"manifest_url": BASE + "mobius.json"})
+    if update.status_code == 409:
+      update = client.post("/api/apps/install", headers=auth, json={
+        "manifest_url": BASE + "mobius.json",
+        "reviewed_capability_digest": update.json()["detail"]["preview"]["capability_digest"]})
+  assert update.status_code in (200, 201), update.text
+  assert app_consent.dormant(db.get(m.App, app_id))
+  note = db.query(m.Notification).filter(m.Notification.source_id == str(app_id)).one()
+  assert "needs your approval" in note.title
+
+
+def test_revoking_an_app_that_asks_for_nothing_reports_the_truth(client, owner_token, db):
+  app = _app(db, "nothing", contract=_contract())
+  response = client.delete(f"/api/apps/{app.id}/consent", headers=_owner_headers(client, owner_token))
+  assert response.status_code == 200
+  assert response.json()["status"] == "accepted"
