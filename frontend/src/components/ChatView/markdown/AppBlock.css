@@ -3,6 +3,7 @@
 .md-app-block > header { display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; padding:12px 16px 8px; }
 .md-app-block > header strong { flex:1 1 12rem; min-width:0; overflow-wrap:anywhere; font-size:16px; }
 .md-app-block__open { display:inline-flex; align-items:center; min-height:44px; margin-left:auto; font-size:14px; }
+.md-app-block__source { margin:-4px 0 0; padding:0 16px 8px; color:var(--muted); font-size:12px; }
 .md-app-block__facts { display:flex; flex-wrap:wrap; gap:6px 20px; padding:0 16px 12px; margin:0; }
 .md-app-block__facts > div { display:flex; gap:4px; align-items:baseline; min-width:0; }
 .md-app-block__facts dt { color:var(--muted); font-size:14px; }

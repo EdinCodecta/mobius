@@ -17,7 +17,7 @@ import {
 import { createAppStorageHost } from '../../lib/appStorageHost.js'
 import { acquireAudioSession } from '../../lib/audioSession.js'
 import { validNavLocationText } from '../../lib/appNavLocation.js'
-import { readAppNavLocation, writeValidatedAppNavLocation } from '../../lib/appNavLocationStore.js'
+import { appNavLocationStore } from '../../lib/appNavLocationStore.js'
 import {
   cacheAppToken, readAppFrameStorage, readCachedAppToken,
   isSharedVirtualStorageKey,
@@ -43,6 +43,7 @@ import {
   attributedFrameVersion,
   attributedShellShortcutAction,
   confirmAppFileExport,
+  navPushOutcome,
   retireStaleAppFileExport,
   serveAppFileExportRequest,
   serveClipboardWrite,
@@ -417,8 +418,9 @@ const AppCanvas = forwardRef(function AppCanvas({
   // the scrim, but compositor momentum inside its iframe must be cancelled so
   // background content cannot keep coasting beneath the drawer.
   interactive = visible,
-  // Whether this canvas's live frame is the app's shell navigation target
-  // (`data-app-id`, below). An embedded transcript view of the same app is not.
+  // Whether this canvas's live frame is the app's shell navigation target:
+  // `data-app-id` (below) and the app's saved shell location. An embedded
+  // transcript view of the same app neither restores nor overwrites that place.
   navigationTarget = true,
   pendingIntent = null,
   shellShortcuts = null,
@@ -684,6 +686,8 @@ const AppCanvas = forwardRef(function AppCanvas({
   interactiveRef.current = interactive
   const visibleRef = useRef(visible)
   visibleRef.current = visible
+  const navigationTargetRef = useRef(navigationTarget)
+  navigationTargetRef.current = navigationTarget
   const frameVisibleRef = useRef(frameVisible)
   frameVisibleRef.current = frameVisible
   function finishFileExport(request, result) {
@@ -827,7 +831,8 @@ const AppCanvas = forwardRef(function AppCanvas({
         bg: eff?.bg ?? theme?.bg,
         storage: readAppFrameStorage(appId, undefined, appSlug),
         capabilityContract,
-        navLocation: readAppNavLocation(appId, frameNavRef.current.get(v)?.instanceId),
+        navLocation: appNavLocationStore(navigationTargetRef.current)
+          .read(appId, frameNavRef.current.get(v)?.instanceId),
       },
       '*',
     )
@@ -1028,7 +1033,7 @@ const AppCanvas = forwardRef(function AppCanvas({
         const location = validNavLocationText(msg.location)
         if (msg.location !== null && location === null) return
         if (srcVersion === liveVersionRef.current && nav.mounted) {
-          writeValidatedAppNavLocation(appId, nav.instanceId, location)
+          appNavLocationStore(navigationTargetRef.current).write(appId, nav.instanceId, location)
           // A live report can arrive before the promotion effect flushes.
           delete nav.location
         } else {
@@ -1238,12 +1243,9 @@ const AppCanvas = forwardRef(function AppCanvas({
         // VISIBLE (active tab of any visible pane), not focused — a background
         // split's app is still interactive (contract §3.3.6). The shell permits
         // background restoration only when it reuses the retired current slot.
-        const ok = visibleRef.current ? onNavPush?.(appId, {
-          requestId: msg.requestId,
-          label: msg.label,
-          reversible: msg.reversible === true,
-          userActivated: msg.userActivated,
-        }) : false
+        // A host without a history owner (an embedded transcript view)
+        // installs no sentinel, so it rejects rather than acknowledges.
+        const ok = navPushOutcome({ visible: visibleRef.current, onNavPush, appId, message: msg })
         // Echo the iframe's optional requestId on both ack and reject so the app
         // can correlate when multiple nav-pushes are in flight. Apps that don't
         // pass a requestId get undefined back (backwards compatible).
@@ -1564,7 +1566,7 @@ const AppCanvas = forwardRef(function AppCanvas({
     if (loadedDocsRef.current.has(swap.liveVersion)) {
       const nav = frameNavRef.current.get(swap.liveVersion)
       if (swap.liveLoaded && nav?.mounted && 'location' in nav) {
-        writeValidatedAppNavLocation(appId, nav.instanceId, nav.location)
+        appNavLocationStore(navigationTargetRef.current).write(appId, nav.instanceId, nav.location)
         delete nav.location
       }
       sendVisibility(swap.liveVersion, frameVisible)

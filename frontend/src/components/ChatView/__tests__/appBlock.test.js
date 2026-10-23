@@ -113,3 +113,23 @@ test('an embedded transcript view may only open a conversation or an app', () =>
   }
   assert.equal(seen.length, 2)
 })
+
+test('invalid facts never take a valid fact\'s slot', () => {
+  const block = appBlockFromToken(token({ ...base, facts: [...Array(8).fill({ label: '', value: 'x' }), { label: 'Kept', value: 'yes' }] }))
+  assert.deepEqual(block.facts, [{ label: 'Kept', value: 'yes' }])
+})
+
+test('an over-limit item title drops the item, like the root rule, never truncated', () => {
+  const long = 'x'.repeat(APP_BLOCK_LIMITS.title + 1)
+  const block = appBlockFromToken(token({ ...base, items: [{ title: long, intent: 'open:a' }, { title: '  Kept  ', intent: 'open:b' }] }))
+  assert.deepEqual(block.items.map(item => item.title), ['Kept'])
+})
+
+test('repeated item destinations and badge labels collapse to their first entry', () => {
+  const row = { title: 'Same', intent: 'open:same', badges: [{ label: 'Dup', tone: 'success' }, { label: 'Dup', tone: 'danger' }, { label: 'Other' }] }
+  const block = appBlockFromToken(token({ ...base, items: [row, { ...row, title: 'Again' }, { title: 'Next', intent: 'open:next' }],
+    badges: [{ label: 'A' }, { label: 'A' }, { label: 'B' }, { label: 'C' }] }))
+  assert.deepEqual(block.items.map(item => item.title), ['Same', 'Next'])
+  assert.deepEqual(block.items[0].badges, [{ label: 'Dup', tone: 'success' }, { label: 'Other', tone: 'neutral' }])
+  assert.deepEqual(block.badges.map(badge => badge.label), ['A', 'B', 'C'])
+})
