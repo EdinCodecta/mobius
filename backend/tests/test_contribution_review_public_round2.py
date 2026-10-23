@@ -6,8 +6,9 @@ import pytest
 from fastapi import HTTPException
 from app import models, contribution_review_runs as domain, contribution_review_public as public
 from app.database import SessionLocal
+from app.deps import Principal
 from app.routes import contribution_reviews as routes
-from tests.test_contribution_review_runs import ITEM, setup, report
+from tests.test_contribution_review_runs import ITEM, TARGET, setup, report
 from tests.test_contribution_review_public import opted_in
 
 
@@ -28,6 +29,33 @@ def test_failed_live_read_preserves_concurrently_armed_receipt(setup, monkeypatc
   assert row.outcomes_json[domain.key(ITEM)] == confirmed
 
 
+@pytest.mark.parametrize('state', ['posting', 'unknown', 'posted'])
+def test_private_report_waiting_for_admission_cannot_erase_public_receipt(setup, monkeypatch, state):
+  db, row, _ = setup
+  opted_in(setup)
+  item_key = domain.key(ITEM)
+  concurrent = {'state': 'needs_you', 'summary': 'Frozen public finding',
+    'head_sha': ITEM['head_sha'], 'public_review': {'state': state, 'marker': 'other-worker'}}
+  real_parent = routes._parent
+  calls = 0
+  def parent(session, run, principal):
+    nonlocal calls
+    calls += 1
+    if calls == 2:
+      # A second DB worker publishes while this private report waits for the
+      # admission lock; _parent will refresh the owning row afterward.
+      with SessionLocal() as writer:
+        live = writer.get(models.ContributionReviewRun, row.id)
+        domain.save_outcome(writer, live, item_key, concurrent)
+    return real_parent(session, run, principal)
+  monkeypatch.setattr(routes, '_parent', parent)
+  with pytest.raises(HTTPException) as error:
+    report(setup, state='needs_you', summary='Private owner question', publish=False)
+  assert error.value.status_code == 409
+  db.refresh(row)
+  assert row.outcomes_json[item_key] == concurrent
+
+
 def test_owner_question_stays_private_until_explicit_public_verdict(setup, monkeypatch):
   db, row, _ = setup
   opted_in(setup)
@@ -38,6 +66,46 @@ def test_owner_question_stays_private_until_explicit_public_verdict(setup, monke
   assert not sent and 'public_review' not in row.outcomes_json[domain.key(ITEM)]
   report(setup, state='needs_you', summary='A concrete public correctness finding.', publish=True)
   assert len(sent) == 1 and 'private fixture' not in sent[0]
+
+
+def test_route_preview_start_freeze_opt_in_and_publish_requires_explicit_signal(setup, monkeypatch):
+  db, _old, principal = setup
+  owner = Principal(owner=principal.owner, app_id=None)
+  monkeypatch.setattr(routes, 'resolve_round_choice', lambda db: {
+    'provider': 'codex', 'model': 'gpt-5', 'effort': 'xhigh'})
+  monkeypatch.setattr(domain, 'inspect_target', lambda *args: TARGET)
+  async def admit(**kwargs):
+    db.add(models.ChatRun(id='posted-review-run', chat_id=kwargs['chat_id'], status='running'))
+    db.commit()
+    return True
+  monkeypatch.setattr(routes, 'start_programmatic_chat_turn', admit)
+  option = routes.ReviewOptions(post_review=True)
+  preview = routes.review_preview(1, routes.ReviewPreview(options=option), db, owner)
+  private = routes.review_preview(1, routes.ReviewPreview(), db, owner)
+  assert preview['options']['post_review'] is True
+  assert 'publish:true' in preview['options']['mandatory_instructions']
+  assert preview['preview_sha256'] != private['preview_sha256']
+  start = routes.StartReviews(request_id='posted-opt-in', mode='review', items=[ITEM],
+    options=option, preview_sha256=preview['preview_sha256'])
+  with pytest.raises(HTTPException):
+    asyncio.run(routes.start_reviews(1, start.model_copy(update={
+      'options': routes.ReviewOptions(post_review=False)}), db, owner))
+  selected = asyncio.run(routes.start_reviews(1, start, db, owner))
+  row = db.get(models.ContributionReviewRun, selected['run']['id'])
+  assert row.options_json['post_review'] is True
+  assert row.options_json['input_options'] == {'post_review': True}
+  assert 'publish:true' in selected['brief']
+  reporter = Principal(owner=principal.owner, app_id=None, chat_id=row.chat_id,
+    run_id='posted-review-run')
+  calls = []
+  monkeypatch.setattr(public, 'post_review', lambda *args: calls.append(args[-1]) or
+    public.DispatchResult.confirmed({'id': 7}))
+  def outcome(summary, publish):
+    return routes.ReviewOutcome(**ITEM, state='needs_you', summary=summary, publish=publish)
+  asyncio.run(routes.report_outcome(1, row.id, outcome('Private owner question', False), db, reporter))
+  assert not calls and not row.outcomes_json[domain.key(ITEM)].get('public_review')
+  asyncio.run(routes.report_outcome(1, row.id, outcome('Public correctness finding', True), db, reporter))
+  assert len(calls) == 1 and 'Private owner question' not in calls[0]
 
 
 @pytest.mark.parametrize('state', ['posting', 'unknown', 'posted'])
