@@ -4404,6 +4404,13 @@ def read_ref_tree(source_dir: str | Path, ref: str) -> dict[str, bytes]:
   return read_merged_tree(repo, tree_oid)
 
 
+def read_ref_subtree(source_dir: str | Path, ref: str, path: str) -> dict[str, bytes]:
+  """Read every file under directory `path` at `ref`, keyed repo-relative."""
+  repo = Path(source_dir)
+  tree_oid = _run(repo, "rev-parse", f"{ref}:{path}").stdout.strip()
+  return {f"{path}/{rel}": data for rel, data in read_merged_tree(repo, tree_oid).items()}
+
+
 def materialize_tree(
   source_dir: str | Path,
   tree_oid: str,

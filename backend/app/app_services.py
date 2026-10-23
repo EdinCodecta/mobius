@@ -30,11 +30,12 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from app import app_python_env, auth, models, service_preload, settled, tracing
+from app import app_consent, app_python_env, auth, models, service_preload, settled, tracing
 from app.applied_app_runtime import AppliedRuntimeUnavailable, hold_runtime, runtime_root
 from app.browser_access import BrowserLineage, require_live
 from app.config import get_settings
 from app.manifest_contract import (
+  PUBLIC_SERVICE_REQUESTS_PER_MINUTE, PUBLIC_SERVICE_REQUESTS_PER_MINUTE_MAX,
   SERVICE_REQUEST_MAX_BYTES,
   accepted_service_max_bytes, accepted_service_route_limits, service_route_key,
 )
@@ -881,6 +882,9 @@ def _reject_json_constant(value: str):
 
 
 def service_contract(app, *, access: str) -> dict:
+  # Every service path passes here: a Store app is dormant until accepted.
+  if app_consent.dormant(app):
+    raise HTTPException(404, "App service not found.")
   contract = app.capability_contract if isinstance(app.capability_contract, dict) else {}
   service = contract.get("service")
   if not isinstance(service, dict) or service.get("protocol") != "json-v1":
@@ -894,7 +898,24 @@ def service_contract(app, *, access: str) -> dict:
   if not isinstance(entry, str) or not entry.endswith(".py"):
     raise ServiceBoundaryError("invalid_declaration", 503, "Accepted app service declaration is invalid.")
   _accepted_transfer_limits(service)
+  public_requests_per_minute(service)
   return service
+
+
+def public_requests_per_minute(service: dict) -> int:
+  """All anonymous visitors' per-minute allowance for this accepted public service.
+
+  Like the transfer limits below, an accepted value the manifest contract
+  could not have produced disables the service rather than being clamped.
+  """
+  value = service.get("public_requests_per_minute", PUBLIC_SERVICE_REQUESTS_PER_MINUTE)
+  if type(value) is not int or not (
+    PUBLIC_SERVICE_REQUESTS_PER_MINUTE <= value <= PUBLIC_SERVICE_REQUESTS_PER_MINUTE_MAX
+  ):
+    raise ServiceBoundaryError(
+      "invalid_declaration", 503, "Accepted public request allowance is invalid.",
+    )
+  return value
 
 
 def service_max_bytes(service: dict) -> int:
@@ -1115,6 +1136,7 @@ def service_environment(app, owner, service: dict, *, public: bool, browser: Bro
       owner.username,
       owner.token_epoch,
       app_nonce=app.token_nonce,
+      consent=app_consent.session_id(app),
       expires_delta=timedelta(minutes=5),
       service="public" if public else "private",
       browser=browser,

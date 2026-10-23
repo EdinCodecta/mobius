@@ -7,12 +7,12 @@
    other Install buttons wait while a check, a review or an install is open, and a check that
    returns after the review was dismissed (or the guide was left) is dropped. */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { capabilityRows, installReviewedApp, previewAppAccess } from './walkthroughAccess.js'
+import { installReviewedApp, previewAppAccess } from './walkthroughAccess.js'
 
 const CHANGED_NOTICE = 'The publisher changed this app’s access after you started. Nothing was installed. Check the access below.'
 
 function reviewOf(id, item, preview, notice = '') {
-  return { id, item, rows: capabilityRows(preview.capability_contract), manifest: preview.manifest || null, digest: preview.capability_digest, notice }
+  return { id, item, rows: preview.access_rows || [], manifest: preview.manifest || null, digest: preview.capability_digest, notice }
 }
 
 export function useAppInstall(catalog) {

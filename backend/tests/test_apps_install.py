@@ -31,7 +31,7 @@ from app import (
   transcript_rows,
 )
 from app.config import get_settings
-from test_app_fixtures import create_local_app
+from test_app_fixtures import accept_app_consent, create_local_app
 from tests.cancel_helpers import assert_cancellation_drains_worker_under_lock
 
 
@@ -6664,6 +6664,7 @@ def test_service_rename_requires_and_routes_one_reviewed_transition_alias(
   assert unsafe.status_code == 409
   assert "previous identity" in unsafe.text
   assert transition.status_code == 201, transition.text
+  accept_app_consent(client, auth, transition.json()["id"])
   assert client.get("/api/app-services/social/status").status_code == 200
   assert client.get("/api/app-services/common/status").status_code == 200
   app = db.query(models.App).filter_by(package_id="app.example.social").one()
@@ -7287,6 +7288,7 @@ def test_catalog_rename_adopts_trusted_checkout_with_unrelated_git_history(
     Path(get_settings().data_dir) / "apps" / "social" / "index.jsx"
   ).read_text() == new_index
   assert storage.read_text() == '{"kept": true}'
+  accept_app_consent(client, auth, app_id)
   assert client.get("/api/app-services/social/status").status_code == 200
   assert client.get("/api/app-services/common/status").status_code == 200
 
@@ -9103,6 +9105,41 @@ def _update_check(
 
 
 
+
+
+def test_repeat_update_checks_reuse_one_fetch_until_the_recorded_upstream_moves(
+  client, auth, bypass_url_validation,
+):
+  """Store opens re-check every app; only discovery reuses a recent fetch.
+
+  A changed recorded upstream (install, update, reinstall) fetches afresh,
+  and the candidate preview the owner acts on always fetches.
+  """
+  base = "https://uc-reuse.test/repo/"
+  manifest_v1 = {**MANIFEST_NEWS, "id": "uc-reuse"}
+  installed = _install_v1(client, auth, base, manifest_v1, JSX_MULTI)
+  assert installed.status_code == 201, installed.text
+  app_id = installed.json()["id"]
+  repo = Path(get_settings().data_dir) / "apps" / "uc-reuse"
+  manifest_v2 = {**manifest_v1, "version": "2.0.0"}
+  upstream_v2 = JSX_MULTI.replace("ORIGINAL TITLE", "UPSTREAM TITLE")
+
+  with _git_update_source(_git_candidate(manifest_v2, upstream_v2)) as fetch:
+    for _ in range(2):
+      res = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
+      assert res.status_code == 200, res.text
+      assert res.json()["update_available"] is True
+    assert fetch.await_count == 1
+
+    client.get(f"/api/apps/{app_id}/update-candidate-preview", headers=auth)
+    assert fetch.await_count == 2
+
+    app_git.record_upstream(
+      repo, {"index.jsx": upstream_v2.encode()}, base + "mobius.json", "2.0.0",
+    )
+    res = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
+    assert res.status_code == 200, res.text
+    assert fetch.await_count == 3
 
 
 def test_known_origin_check_never_falls_back_to_http(tmp_path):
@@ -11427,7 +11464,7 @@ def test_install_preview_sizes_files_while_reading_the_installed_contract(
   def read_installed_contract(_manifest, _source):
     # Awaited one after the other, the lookup would only start once this returns.
     assert sizing_started.wait(timeout=5)
-    return None
+    return None, False
 
   with patch.object(install, "package_download_bytes", sizing), patch(
     "app.routes.apps._installed_contract_for_preview", read_installed_contract,

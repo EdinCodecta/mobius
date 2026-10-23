@@ -1452,6 +1452,54 @@ def _add_app_connect_manage(eng) -> None:
     ))
 
 
+def _add_app_accepted_consent(eng) -> None:
+  """Add the first-open consent record and grandfather every installed app.
+
+  Existing apps keep exactly what they hold today: their current contract
+  becomes their accepted copy, marked as coming from this migration, so an
+  upgrade never asks anything about an app the owner already runs.
+  """
+  import json
+  from sqlalchemy import inspect as sa_inspect, text
+
+  columns = {
+    column["name"] for column in sa_inspect(eng).get_columns("apps")
+  }
+  if "accepted_consent" not in columns:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE apps ADD COLUMN accepted_consent JSON"))
+  columns |= {"accepted_consent"}
+  if "capability_contract" not in columns:
+    return
+  templates_column = (
+    "project_templates_json" if "project_templates_json" in columns else "NULL"
+  )
+  now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+  with eng.begin() as conn:
+    rows = conn.execute(text(
+      f"SELECT id, capability_contract, {templates_column} FROM apps "
+      "WHERE accepted_consent IS NULL AND capability_contract IS NOT NULL"
+    )).fetchall()
+    for app_id, contract, templates in rows:
+      try:
+        parsed = json.loads(contract) if isinstance(contract, str) else contract
+      except ValueError:
+        continue
+      if not isinstance(parsed, dict):
+        continue
+      record = {
+        "contract": parsed,
+        "project_builders": bool(templates) and templates not in ("null", "[]", "{}"),
+        "digest": None,
+        "at": now,
+        "via": "migration",
+      }
+      conn.execute(
+        text("UPDATE apps SET accepted_consent = :record WHERE id = :id"),
+        {"record": json.dumps(record), "id": app_id},
+      )
+
+
 def _add_owner_auth_mode(eng) -> None:
   """Add the durable owner login mode (models.Owner.auth_mode).
 
@@ -6961,6 +7009,7 @@ _SCHEMA_MIGRATIONS = (
   ("0093_pending_goal_dependency_indexes", _index_pending_goal_dependencies),
   ("0094_retire_legacy_claim_notice_carriers", _retire_legacy_claim_notice_carriers),
   ("0095_unique_live_claim_follows", _enforce_unique_live_claim_follows),
+  ("0096_app_accepted_consent", _add_app_accepted_consent),
 )
 
 
