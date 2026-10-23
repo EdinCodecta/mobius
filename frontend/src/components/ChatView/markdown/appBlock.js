@@ -105,10 +105,10 @@ export function blockActions(block) {
 }
 
 /** A transcript is not a workspace navigation owner or a chat-control
- *  authority, so an embedded view may only open a conversation or an app,
- *  and only while the reader can see it: a hidden session never navigates. */
-export function transcriptHostRequest(request, { visible, navigate }) {
-  if (!visible) throw new Error('Open the app to continue. A hidden transcript view cannot navigate.')
+ *  authority, so an embedded view may only open a conversation or an app.
+ *  Hidden session canvases get no host-request handler at all (AppCanvas
+ *  refuses their requests). */
+export function transcriptHostRequest(request, { navigate }) {
   if (request?.type === 'moebius:open-chat' && request.chatId) {
     navigate(`/shell/?${new URLSearchParams({ chat: request.chatId })}`)
   } else if (request?.type === 'moebius:open-app' && request.appId) {

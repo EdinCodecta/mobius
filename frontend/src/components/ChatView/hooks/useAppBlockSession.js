@@ -3,7 +3,12 @@
    Everything app-reported (state, acknowledgements) is bound to the exact
    document generation that negotiated support. A new document resets idle
    controls; releasing an idle offscreen frame discards its state entirely, so
-   re-entry shows pending controls until the next document reports. */
+   re-entry shows pending controls until the next document reports.
+
+   Confirm takes the action's place, so it is armed only after its exact
+   confirmation (action key and app list) has been shown for CONFIRM_ARM_MS.
+   A second click of a double-click, or a list swapped just before a click,
+   therefore never confirms something the owner has not seen. */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { blockActions } from '../markdown/appBlock.js'
 import {
@@ -11,6 +16,12 @@ import {
 } from '../markdown/appBlockSession.js'
 
 const UNNEGOTIATED = Object.freeze({ generation: null, supported: null })
+export const CONFIRM_ARM_MS = 500
+
+function confirmationIdentity(state) {
+  const action = state?.actions.find(item => item.confirming && item.confirmation)
+  return action ? JSON.stringify([action.key, action.confirmation]) : null
+}
 
 export default function useAppBlockSession({ block, near }) {
   const [sessionId] = useState(() => crypto.randomUUID())
@@ -22,6 +33,20 @@ export default function useAppBlockSession({ block, near }) {
   const negotiationRef = useRef(UNNEGOTIATED)
   const actions = useMemo(() => blockActions(block), [block])
   const keys = useMemo(() => new Set(actions.map(action => action.key)), [actions])
+  const confirmIdentity = confirmationIdentity(state)
+  const confirmIdentityRef = useRef(null)
+  confirmIdentityRef.current = confirmIdentity
+  const [armedIdentity, setArmedIdentity] = useState(null)
+  const armedIdentityRef = useRef(null)
+  useEffect(() => {
+    if (!confirmIdentity) return undefined
+    const timer = setTimeout(() => {
+      armedIdentityRef.current = confirmIdentity
+      setArmedIdentity(confirmIdentity)
+    }, CONFIRM_ARM_MS)
+    return () => clearTimeout(timer)
+  }, [confirmIdentity])
+  const confirmArmed = confirmIdentity !== null && armedIdentity === confirmIdentity
   const retained = sessionRetained(state, event)
   const frameWanted = near || retained
   // An unsupported document still keeps unresolved ownership mounted.
@@ -68,6 +93,9 @@ export default function useAppBlockSession({ block, near }) {
   const dispatch = useCallback((key, kind) => {
     const current = negotiationRef.current
     if (eventRef.current || current.supported !== true || !keys.has(key)) return false
+    // Confirm only the exact list that has been on screen long enough.
+    const shown = confirmIdentityRef.current
+    if (kind === 'confirm' && (!shown || armedIdentityRef.current !== shown || JSON.parse(shown)[0] !== key)) return false
     const message = { sessionId, generation: current.generation, key, event: kind, nonce: crypto.randomUUID() }
     eventRef.current = message
     setEvent(message)
@@ -85,7 +113,7 @@ export default function useAppBlockSession({ block, near }) {
   }), [sessionId, actions, retained, recoveryError, checkpointId, checkpointData])
 
   return {
-    sessionId, state, event, awaitingAck: event !== null, supported: negotiation.supported,
+    sessionId, state, event, awaitingAck: event !== null, supported: negotiation.supported, confirmArmed,
     generation: negotiation.generation, retained, frameMounted, blockSession,
     onBlockCapability, onBlockState, dispatch,
   }

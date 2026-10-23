@@ -63,8 +63,16 @@ test('an owner event is posted once, only to the generation it was dispatched fo
   assert.equal(blockEventDelivery({ session: { sessionId: 'other' }, event, document, sentNonce: null }), null)
 })
 
-test('host requests are honoured only from the live document of a visible canvas', () => {
-  assert.equal(hostRequestAllowed({ sourceVersion: 'v1', liveVersion: 'v1', visible: true }), true)
-  assert.equal(hostRequestAllowed({ sourceVersion: 'v1', liveVersion: 'v1', visible: false }), false)
-  assert.equal(hostRequestAllowed({ sourceVersion: 'v2', liveVersion: 'v1', visible: true }), false)
+test('a transcript or session canvas makes host requests only while visible', () => {
+  assert.equal(hostRequestAllowed({ sourceVersion: 'v1', liveVersion: 'v1', visible: true, transcript: true }), true)
+  assert.equal(hostRequestAllowed({ sourceVersion: 'v1', liveVersion: 'v1', visible: false, transcript: true }), false)
+  assert.equal(hostRequestAllowed({ sourceVersion: 'v2', liveVersion: 'v1', visible: true, transcript: true }), false)
+})
+
+test('an ordinary shell app keeps its background host requests while another view is shown', () => {
+  // For example Contribute polling chat status, or a projects list, from a cached pane.
+  assert.equal(hostRequestAllowed({ sourceVersion: 'v1', liveVersion: 'v1', visible: false, transcript: false }), true)
+  assert.equal(hostRequestAllowed({ sourceVersion: 'v1', liveVersion: 'v1', visible: true, transcript: false }), true)
+  assert.equal(hostRequestAllowed({ sourceVersion: 'v2', liveVersion: 'v1', visible: false, transcript: false }), false,
+    'a buffered successor is still refused')
 })

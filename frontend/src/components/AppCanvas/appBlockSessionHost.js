@@ -64,8 +64,10 @@ export function blockEventDelivery({ session, event, document, sentNonce }) {
     key: event.key, event: event.event, nonce: event.nonce }
 }
 
-/** A host request is honoured only from the live, visible document. Hidden
- *  passive sessions and buffered successors mount without an owner gesture. */
-export function hostRequestAllowed({ sourceVersion, liveVersion, visible }) {
-  return sourceVersion === liveVersion && visible === true
+/** A host request is honoured only from the live document. A transcript or
+ *  passive-session canvas must also be visible: it mounts without an owner
+ *  gesture. An ordinary shell app keeps its background requests (for example
+ *  chat status or a projects list) while another view is on screen. */
+export function hostRequestAllowed({ sourceVersion, liveVersion, visible, transcript }) {
+  return sourceVersion === liveVersion && (!transcript || visible === true)
 }

@@ -1211,7 +1211,7 @@ const AppCanvas = forwardRef(function AppCanvas({
       // attribution and wire-format narrowing here, beside every other frame
       // request, so no host needs to rediscover iframe identity.
       const hostRequest = appHostRequest(msg)
-      if (hostRequest && onHostRequest) {
+      if (hostRequest) {
         const responseTarget = e.source
         const responseOrigin = e.origin === 'null' ? '*' : e.origin
         const respond = (payload) => {
@@ -1223,10 +1223,12 @@ const AppCanvas = forwardRef(function AppCanvas({
         const fallbackError = hostRequest.type === 'moebius:chat-control'
           ? 'Chat control failed.'
           : 'Projects request failed.'
-        // A hidden document (a passive transcript session, a buffered swap,
-        // a background pane) runs without an owner gesture on screen.
+        // A hidden transcript or session document runs without an owner
+        // gesture on screen. Ordinary shell apps keep their background reads.
         if (!hostRequestAllowed({ sourceVersion: srcVersion, liveVersion: liveVersionRef.current,
-          visible: visibleRef.current })) {
+          visible: visibleRef.current,
+          transcript: !navigationTargetRef.current || blockSessionRef.current != null })
+          || !onHostRequest) {
           if (hostRequest.requestId) {
             respond({ type: responseType, requestId: hostRequest.requestId, ok: false,
               error: 'A hidden app view cannot open or change anything. Open the app and try again.' })

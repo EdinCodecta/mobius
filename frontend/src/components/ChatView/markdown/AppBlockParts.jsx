@@ -103,7 +103,7 @@ export function AppBlockLayout({ block, app, appsLoading, onInternalNav, actionF
 export function StaticAppBlock({ block, app, appsLoading, onInternalNav, sectionRef = null }) {
   const [viewIntent, setViewIntent] = useState(null)
   const navigate = useTranscriptNavigation(onInternalNav)
-  const onHostRequest = useCallback((_, request) => transcriptHostRequest(request, { visible: true, navigate }), [navigate])
+  const onHostRequest = useCallback((_, request) => transcriptHostRequest(request, { navigate }), [navigate])
   const openable = block.inline && app
   const toggleView = intent => setViewIntent(current => current === intent ? null : intent)
   const actionFor = target => openable && target

@@ -111,8 +111,8 @@ test('an inline session for an app without the admitted capability is a static b
   }
 })
 
-const controls = (state, locked = false) => renderToStaticMarkup(createElement(SessionControls,
-  { target: { label: 'Contribute all', intent: 'send-batch:sel-1' }, state, locked, onEvent() {} }))
+const controls = (state, locked = false, confirmArmed = true) => renderToStaticMarkup(createElement(SessionControls,
+  { target: { label: 'Contribute all', intent: 'send-batch:sel-1' }, state, locked, confirmArmed, onEvent() {} }))
 const live = fields => ({ label: '', disabled: false, busy: false, confirming: false, confirmation: null, hidden: false,
   note: '', tone: 'neutral', status: '', statusTone: 'neutral', links: [], ...fields })
 
@@ -124,6 +124,12 @@ test('Confirm takes the action\'s own fixed-size place with Not now beside it', 
   const confirming = controls(live({ confirming: true, confirmation: [{ title: 'Exact', facts: [] }] }))
   assert.match(confirming, />Not now<\/button><button type="button" class="md-app-block__action">Confirm<\/button>/)
   assert.equal((confirming.match(/class="md-app-block__action"/g) || []).length, 1)
+})
+
+test('Confirm is shown disabled in place until it has been armed', () => {
+  const html = controls(live({ confirming: true, confirmation: [{ title: 'Exact', facts: [] }] }), false, false)
+  assert.match(html, /class="md-app-block__action" disabled="">Confirm/)
+  assert.doesNotMatch(html, /class="md-app-block__cancel" disabled/)
 })
 
 test('Confirm is disabled without the complete app list or while an event awaits acknowledgement', () => {
@@ -157,7 +163,8 @@ function passiveView(actions) {
       { title: 'Row B', intent: 'open:b', action: { label: 'Send B', intent: 'send:b' } }] }) })
   const state = sessionState({ type: 'moebius:app-block-state', sessionId: 's', actions },
     's', new Set(['send-batch:sel-1', 'send:a', 'send:b']))
-  return renderToStaticMarkup(createElement(PassiveBlockView, { block, app: admitted[0], state, locked: false, onEvent() {} }))
+  return renderToStaticMarkup(createElement(PassiveBlockView, { block, app: admitted[0], state, locked: false,
+    confirmArmed: true, onEvent() {} }))
 }
 const target = title => ({ confirming: true, confirmation: [{ title, facts: [{ label: 'Version', value: title }] }] })
 const enabledConfirms = html => (html.match(/class="md-app-block__action">Confirm</g) || []).length

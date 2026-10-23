@@ -477,8 +477,20 @@ Confirm without the reader opening the app. It needs all three of:
 
 Otherwise the block is static. While the block is near the viewport the host
 runs a hidden, inert instance of the app; it cannot navigate, open chats or
-apps, or use other host requests. Module startup and session hydration must be
-read-only. The host draws every control; the app reports state.
+apps, or use other host requests, and it never reads or writes the app's saved
+shell place. At most 3 idle hidden instances run per app (the blocks nearest
+the viewport); further blocks stay static with an explicit open, and an
+instance that reports `retain` always keeps its frame. Module startup and
+session hydration must be read-only. The host draws every control; the app
+reports state.
+
+**`actions[].intent` is untrusted.** The actions in `blockSession` and
+`app-block-init` come from the block, which the conversation wrote; any text
+the agent read can steer them, and a hidden instance mounts just because the
+block scrolled into view. Use an intent only to look up your own data for
+display. Never act, publish, or change state because of an intent at startup
+or on `app-block-init`; act only on an owner `app-block-action`, and check
+that request against your own data first.
 
 `props.blockSession` is `{sessionId, generation, actions, checkpoint, retain,
 recoveryError, subscribe(cb), setState(state)}`, where `actions` is
@@ -541,7 +553,11 @@ supply `badges`, and says the saved title and details come from the
 conversation. It never shortens the list: a missing, empty, oversized or
 malformed `confirmation` keeps Confirm disabled and shows "Open the app to
 review this action. Its full current identity is unavailable here." Confirm
-replaces the action's button in place, with "Not now" beside it. Treat
+replaces the action's button in place, with "Not now" beside it. It stays
+disabled until that exact confirmation (the action and its list) has been on
+screen for about 500 ms, and replacing the list starts that delay again, so a
+double-click on the action, or a list swapped just before a click, never
+sends `confirm`. Treat
 `confirm` as a request: check it again in the app before acting, and report
 `busy` and then the result.
 

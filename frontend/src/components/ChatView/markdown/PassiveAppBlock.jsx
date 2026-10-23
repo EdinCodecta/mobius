@@ -1,26 +1,30 @@
 /* Passive block session: a hidden, inert instance of an admitted app reports
    current state while the block is near the viewport; the host draws every
    control. See building-apps.md "Passive block sessions". */
-import { Suspense, useCallback, useEffect, useState } from 'react'
+import { Suspense, useEffect, useState } from 'react'
 import { appFrameVersion } from '../../../lib/appVersion.js'
 import useAppBlockSession from '../hooks/useAppBlockSession.js'
-import { transcriptHostRequest } from './appBlock.js'
 import { sessionSnapshot } from './appBlockSession.js'
-import { AppBlockLayout, AppCanvas, StaticAppBlock, useTranscriptNavigation } from './AppBlockParts.jsx'
+import { AppBlockLayout, AppCanvas, StaticAppBlock } from './AppBlockParts.jsx'
+import { usePassiveSlot } from './passiveSlots.js'
 
-/** A callback ref, so the observer follows whichever section is mounted. */
+/** A callback ref, so the observer follows whichever section is mounted.
+ *  `distance` (from the viewport's centre) orders blocks competing for slots. */
 function useNearViewport() {
   const [node, setNode] = useState(null)
-  const [near, setNear] = useState(false)
+  const [view, setView] = useState({ near: false, distance: Infinity })
   useEffect(() => {
     if (!node || typeof IntersectionObserver === 'undefined') return undefined
     const observer = new IntersectionObserver(entries => {
-      setNear(entries.some(entry => entry.isIntersecting))
+      const entry = entries.at(-1)
+      const rect = entry.boundingClientRect
+      const centre = entry.rootBounds ? (entry.rootBounds.top + entry.rootBounds.bottom) / 2 : window.innerHeight / 2
+      setView({ near: entry.isIntersecting, distance: Math.round(Math.abs((rect.top + rect.bottom) / 2 - centre)) })
     }, { rootMargin: '400px 0px' })
     observer.observe(node)
     return () => observer.disconnect()
   }, [node])
-  return [setNode, near]
+  return [setNode, view]
 }
 
 function SessionLinks({ links }) {
@@ -32,14 +36,14 @@ function SessionLinks({ links }) {
 /** Host-drawn controls for one app action. Before this document reports,
  *  saved actions are history, not controls. Confirm takes the action's own
  *  fixed-size place; "Not now" sits beside it. */
-export function SessionControls({ target, state, locked, onEvent }) {
+export function SessionControls({ target, state, locked, confirmArmed = false, onEvent }) {
   if (!state) return <span className="md-app-block__pending" role="status">Loading…</span>
   if (state.hidden) return null
   const control = state.confirming
     ? <span className="md-app-block__controls">
       <button type="button" className="md-app-block__cancel" disabled={locked}
         onClick={() => onEvent(target.intent, 'cancel')}>Not now</button>
-      <button type="button" className="md-app-block__action" disabled={locked || state.disabled || !state.confirmation}
+      <button type="button" className="md-app-block__action" disabled={locked || state.disabled || !state.confirmation || !confirmArmed}
         onClick={() => onEvent(target.intent, 'confirm')}>Confirm</button>
     </span>
     : <button type="button" className="md-app-block__action" disabled={locked || state.disabled}
@@ -73,10 +77,12 @@ export function SessionConfirmation({ action, appName }) {
 
 /** The passive block for one parsed session state. The parser allows at most
  *  one enabled confirmation, and this is the action whose list is shown. */
-export function PassiveBlockView({ block, app, state, locked, onEvent, onInternalNav, sectionRef = null, children = null }) {
+export function PassiveBlockView({ block, app, state, locked, confirmArmed = false, onEvent, onInternalNav,
+  sectionRef = null, children = null }) {
   const actionState = key => state?.actions.find(action => action.key === key) || null
   const actionFor = target => target
-    ? <SessionControls target={target} state={actionState(target.intent)} locked={locked} onEvent={onEvent} />
+    ? <SessionControls target={target} state={actionState(target.intent)} locked={locked}
+      confirmArmed={confirmArmed} onEvent={onEvent} />
     : null
   return <AppBlockLayout block={sessionSnapshot(block, state)} app={app} onInternalNav={onInternalNav}
     actionFor={actionFor} summary={state?.summary || ''} sectionRef={sectionRef}>
@@ -86,32 +92,34 @@ export function PassiveBlockView({ block, app, state, locked, onEvent, onInterna
   </AppBlockLayout>
 }
 
-function SessionHost({ app, session, onHostRequest }) {
+/** No host-request handler: AppCanvas refuses every request from this hidden canvas. */
+function SessionHost({ app, session }) {
   return <div className="md-app-block__session-host" aria-hidden="true" inert>
     <Suspense fallback={null}>
       <AppCanvas appId={app.id} appName={app.name} appSlug={app.slug} version={appFrameVersion(app)}
         storageGeneration={app.storage_generation} offlineCapable={app.offline_capable === true}
         capabilityContract={app.capability_contract || null} active={false} visible={false} interactive={false}
         navigationTarget={false} blockSession={session.blockSession} blockEvent={session.event}
-        onBlockState={session.onBlockState} onBlockCapability={session.onBlockCapability}
-        onHostRequest={onHostRequest} />
+        onBlockState={session.onBlockState} onBlockCapability={session.onBlockCapability} />
     </Suspense>
   </div>
 }
 
 export default function PassiveAppBlock({ block, app, onInternalNav }) {
-  const [sectionRef, near] = useNearViewport()
-  const session = useAppBlockSession({ block, near })
-  const navigate = useTranscriptNavigation(onInternalNav)
-  const onHostRequest = useCallback((_, request) => transcriptHostRequest(request, { visible: false, navigate }), [navigate])
-  // An app revision without session support is an ordinary static block.
-  if (session.supported === false && !session.retained) {
+  const [sectionRef, { near, distance }] = useNearViewport()
+  const [retained, setRetained] = useState(false)
+  const granted = usePassiveSlot(app.id, { wanted: near, retained, distance })
+  const session = useAppBlockSession({ block, near: near && granted })
+  useEffect(() => setRetained(session.retained), [session.retained])
+  // An app revision without session support, or a block beyond the app's
+  // idle-frame cap, is an ordinary static block with an explicit open.
+  if ((session.supported === false || (near && !granted)) && !session.retained) {
     return <StaticAppBlock block={block} app={app} appsLoading={false} onInternalNav={onInternalNav} sectionRef={sectionRef} />
   }
   const { state } = session
   const locked = session.awaitingAck || Boolean(state?.actions.some(action => action.busy))
-  return <PassiveBlockView block={block} app={app} state={state} locked={locked} onEvent={session.dispatch}
-    onInternalNav={onInternalNav} sectionRef={sectionRef}>
-    {session.frameMounted ? <SessionHost app={app} session={session} onHostRequest={onHostRequest} /> : null}
+  return <PassiveBlockView block={block} app={app} state={state} locked={locked} confirmArmed={session.confirmArmed}
+    onEvent={session.dispatch} onInternalNav={onInternalNav} sectionRef={sectionRef}>
+    {session.frameMounted ? <SessionHost app={app} session={session} /> : null}
   </PassiveBlockView>
 }

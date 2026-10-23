@@ -1,9 +1,9 @@
 /* The passive block session controller binds every app report to one
    document generation and lets exactly one owner event be in flight. */
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { mock } from 'node:test'
 import { renderHook } from './react-hook-shim.mjs'
-import useAppBlockSession from '../useAppBlockSession.js'
+import useAppBlockSession, { CONFIRM_ARM_MS } from '../useAppBlockSession.js'
 import { appBlockFromToken } from '../../markdown/appBlock.js'
 import { createBlockDocuments, forwardBlockState } from '../../../AppCanvas/appBlockSessionHost.js'
 
@@ -36,10 +36,10 @@ test('a double click before acknowledgement sends one event; only its exact ack 
   const { h, capability, report } = mounted()
   capability(true, 1)
   report({})
-  assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), true)
+  assert.equal(h.result.current.dispatch('send-batch:sel-1', 'activate'), true)
   const first = h.result.current.event
   assert.equal(first.generation, 1)
-  assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), false)
+  assert.equal(h.result.current.dispatch('send-batch:sel-1', 'activate'), false)
   assert.equal(h.result.current.dispatch('send:b', 'activate'), false)
   assert.equal(h.result.current.event, first)
   report({ ackNonce: 'not-the-reserved-nonce' })
@@ -75,8 +75,12 @@ test('state and acknowledgement from another document generation are ignored', (
 test('a reload during an unacknowledged Confirm holds ownership instead of offering controls', () => {
   const { h, capability, report } = mounted()
   capability(true, 1)
-  report({ actions: [{ key: 'send:b', confirming: true, confirmation: [{ title: 'Exact', facts: [] }] }] })
-  h.result.current.dispatch('send:b', 'confirm')
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    report({ actions: [{ key: 'send:b', confirming: true, confirmation: [{ title: 'Exact', facts: [] }] }] })
+    mock.timers.tick(CONFIRM_ARM_MS)
+  } finally { mock.timers.reset() }
+  assert.equal(h.result.current.dispatch('send:b', 'confirm'), true)
   capability(null, 2)
   const held = h.result.current.state
   assert.equal(held.recoveryPending, true)
@@ -150,4 +154,48 @@ test('through the AppCanvas route, an old document cannot resurrect Confirm afte
   assert.equal(h.result.current.state, null, 'no old Confirm and no old acknowledgement')
   assert.equal(deliver({ generation: next.generation, actions: [{ key: 'send:b', label: 'Send' }] }), true)
   assert.equal(h.result.current.state.actions[0].confirming, false)
+})
+
+const confirmList = title => ({ actions: [{ key: 'send-batch:sel-1', confirming: true, confirmation: [{ title, facts: [] }] }] })
+
+test('two quick clicks on the action deliver no confirm: Confirm arms only after its list was shown', () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const { h, capability, report } = mounted()
+    capability(true, 1)
+    report({})
+    // First click: activate. The app acknowledges and asks for confirmation at once.
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'activate'), true)
+    report({ ackNonce: h.result.current.event.nonce, ...confirmList('Target') })
+    // Second click lands where Confirm now is, tens of milliseconds later.
+    mock.timers.tick(40)
+    assert.equal(h.result.current.confirmArmed, false)
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), false)
+    assert.equal(h.result.current.event, null, 'no confirm reached the app')
+    mock.timers.tick(CONFIRM_ARM_MS)
+    assert.equal(h.result.current.confirmArmed, true)
+    assert.equal(h.result.current.dispatch('send:b', 'confirm'), false, 'only the shown action can confirm')
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), true)
+  } finally { mock.timers.reset() }
+})
+
+test('replacing the confirmation contents re-arms Confirm', () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const { h, capability, report } = mounted()
+    capability(true, 1)
+    report(confirmList('First'))
+    mock.timers.tick(CONFIRM_ARM_MS)
+    assert.equal(h.result.current.confirmArmed, true)
+    report(confirmList('Swapped'))
+    assert.equal(h.result.current.confirmArmed, false)
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), false)
+    mock.timers.tick(CONFIRM_ARM_MS - 1)
+    assert.equal(h.result.current.confirmArmed, false)
+    // The same list reported again does not restart the delay.
+    report(confirmList('Swapped'))
+    mock.timers.tick(1)
+    assert.equal(h.result.current.confirmArmed, true)
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), true)
+  } finally { mock.timers.reset() }
 })

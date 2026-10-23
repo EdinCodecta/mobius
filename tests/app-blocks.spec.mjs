@@ -103,10 +103,17 @@ test('a passive session drives an in-place Confirm through the real frame protoc
   const generation = Number(await log.getAttribute('data-generation'))
   expect(sessionId).toBeTruthy()
 
-  await action.click()
+  // A double-click on the action: the second click lands where Confirm
+  // appears, before it has been shown long enough to arm. No confirm is sent.
+  const centre = [box.x + box.width / 2, box.y + box.height / 2]
+  await page.mouse.click(...centre)
+  await expect(block.locator('footer .md-app-block__action')).toHaveText('Confirm')
+  await page.mouse.click(...centre)
   const confirm = block.locator('footer .md-app-block__action')
   await expect(confirm).toHaveText('Confirm')
   await expect(block.getByRole('button', { name: 'Not now' })).toBeVisible()
+  expect((await log.textContent()).split('\n').filter(line => line.endsWith(' confirm'))).toHaveLength(0)
+  await expect(confirm).toBeEnabled()
   // Same size, same place: Confirm replaces the action in its slot.
   const confirmBox = await confirm.boundingBox()
   expect(Math.round(confirmBox.width)).toBe(Math.round(box.width))
