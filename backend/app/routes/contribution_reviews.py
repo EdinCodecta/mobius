@@ -417,7 +417,9 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     if row.mode == "review" and previous.get("state") == "all_clear":
       if not (row.options_json or {}).get("post_review"):
         return {"run": _run_view(db, row)}
-      if not body.publish and public.evidence(previous) != public.evidence(body.model_dump()):
+      # Failed-live-read reporting also writes evidence without arming a post.
+      # Preserve this precheck as well as the concurrent writer-fenced check.
+      if public.evidence(previous) != public.evidence(body.model_dump()):
         raise HTTPException(409, "Retry the public review with its recorded evidence unchanged.")
     if body.state == "all_clear" and (set(body.scope) != SCOPE or not body.tests.strip() or body.tests_passed is False):
       raise HTTPException(422, "Record the complete review scope and test evidence before all clear.")
