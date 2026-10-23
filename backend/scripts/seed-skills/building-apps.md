@@ -559,7 +559,8 @@ replaces the action's button in place, with "Not now" beside it. It stays
 disabled until that exact confirmation (the action and its list) has been
 continuously on screen, with both the Confirm button and the list in the
 viewport of a visible page, for about 500 ms. Each showing earns its own delay:
-it ends when the list changes or disappears, after "Not now", on reload, or
+it ends when the list changes or disappears, when Confirm or "Not now" is
+pressed, on reload, or
 when the block goes offscreen or the page is hidden. So a double-click on the
 action, a list swapped just before a click, or a list that changed offscreen
 never sends `confirm`. Treat

@@ -260,3 +260,25 @@ test('a report that swaps the list disarms before the next render', () => {
     assert.equal(dispatch('send-batch:sel-1', 'confirm'), false)
   } finally { mock.timers.reset() }
 })
+
+test('a Confirm press spends its showing: an acknowledgement does not allow a second confirm', () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    const { h, capability, report } = mounted()
+    capability(true, 1)
+    report(confirmList('Same target'))
+    mock.timers.tick(CONFIRM_ARM_MS)
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), true)
+    const first = h.result.current.event
+    assert.equal(h.result.current.confirmArmed, false, 'the press disarms before any report')
+    report({ ...confirmList('Same target'), ackNonce: 'wrong' })
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), false)
+    // The app acknowledges but still reports the same list; a second click 40 ms later.
+    report({ ...confirmList('Same target'), ackNonce: first.nonce })
+    mock.timers.tick(40)
+    assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), false)
+    assert.equal(h.result.current.event, null, 'no second confirm reached the app')
+    mock.timers.tick(CONFIRM_ARM_MS)
+    assert.equal(h.result.current.confirmArmed, true, 'only a new showing re-arms, after its own delay')
+  } finally { mock.timers.reset() }
+})

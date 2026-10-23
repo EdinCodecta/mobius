@@ -120,8 +120,9 @@ export default function useAppBlockSession({ block, near, confirmVisible = false
     // Confirm only the current showing, once it has been on screen long enough.
     const shown = showingRef.current
     if (kind === 'confirm' && (!shown.key || armedShowingRef.current !== shown.number || shown.action !== key)) return false
-    // Any other owner event ends the showing (Not now, or a new activation).
-    if (kind !== 'confirm') disarm()
+    // Every owner event ends the showing, Confirm included: a press spends
+    // it, so another confirm needs a new showing and a fresh visible delay.
+    disarm()
     const message = { sessionId, generation: current.generation, key, event: kind, nonce: crypto.randomUUID() }
     eventRef.current = message
     setEvent(message)
