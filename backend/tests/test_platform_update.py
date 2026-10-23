@@ -6544,7 +6544,7 @@ def test_restart_blocker_is_recomputed_after_a_live_install(clone_env, monkeypat
   verdicts = []
   monkeypatch.setattr(
     restart_util, "image_package_verdict",
-    lambda root: verdicts.append(root) or (True, None),
+    lambda root: verdicts.append(root) or (True, None, True),
   )
   pu._RESTART_BLOCKER_CACHE.clear()
 
@@ -6556,6 +6556,35 @@ def test_restart_blocker_is_recomputed_after_a_live_install(clone_env, monkeypat
   os.utime(site_dir, ns=(1, site_dir.stat().st_mtime_ns + 1))
   pu.restart_blocker(platform)
   assert len(verdicts) == 2
+
+
+def test_a_strict_stand_in_for_a_failed_image_check_is_not_kept(clone_env, monkeypatch):
+  """When the image's own check fails or times out, the strict rule stands
+  in for that read only briefly: the next read after it expires asks the
+  image again, as restart admission would, instead of showing the stand-in
+  until something else changes."""
+  from app import restart_util
+
+  origin, platform = clone_env
+  _image_behind_a_release_pin(platform, origin, monkeypatch, {"claude-agent-sdk": "0.2.161"})
+  answers = [None]
+  monkeypatch.setattr(restart_util, "image_boot_checks_packages", lambda: True)
+  monkeypatch.setattr(restart_util, "_baked_package_verdict", lambda root: answers[-1])
+  clock = [1000.0]
+  monkeypatch.setattr(pu.time, "monotonic", lambda: clock[0])
+  pu._RESTART_BLOCKER_CACHE.clear()
+
+  stand_in = pu.restart_blocker(platform)
+  assert stand_in["blocking"] is True  # the strict rule, for now
+  assert restart_util.image_package_verdict(platform).settled is False
+  answers.append((True, {**stand_in, "blocking": False}))
+  assert pu.restart_blocker(platform)["blocking"] is True  # still within its window
+
+  clock[0] += pu._UNSETTLED_BLOCKER_SECONDS
+  assert pu.restart_blocker(platform)["blocking"] is False
+  clock[0] += 3600
+  answers.append(None)
+  assert pu.restart_blocker(platform)["blocking"] is False  # a settled answer keeps
 
 
 def test_concurrent_status_reads_share_one_image_check(clone_env, monkeypatch):
@@ -6574,7 +6603,7 @@ def test_concurrent_status_reads_share_one_image_check(clone_env, monkeypatch):
     calls.append(root)
     entered.set()
     release.wait(5)
-    return True, None
+    return True, None, True
 
   monkeypatch.setattr(restart_util, "image_package_verdict", slow_verdict)
   pu._RESTART_BLOCKER_CACHE.clear()
@@ -6685,6 +6714,19 @@ def test_an_uncommitted_local_gap_says_to_revert_the_edit():
   reason = pu.describe_package_gap(gap)
 
   assert "Revert the uncommitted edit or wait for its release." in reason
+
+
+def test_a_gap_without_a_known_release_names_none():
+  gap = {
+    "packages": [{"name": "pkg", "declared": "==2", "installed": "1",
+                  "kind": "version", "origin": "official_newer"}],
+    "inputs": ["backend/requirements.lock"], "origin": "official_newer", "declared_by": None,
+    "fix": {"action": "replace_container", "target_sha": None}, "blocking": False,
+  }
+
+  reason = pu.describe_package_gap(gap)
+
+  assert "Replace the container with a release that includes them (Settings" in reason
   assert "local commit" not in reason
 
 
@@ -8704,6 +8746,44 @@ async def test_stall_notification_fires_once_per_episode(
   second = await pu.notify_update_stall_once(SessionLocal, platform)
   assert second and second != first
   assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_idle_resolver_notification_opens_the_chat_it_names(
+  clone_env, db, owner_token, monkeypatch, tmp_path,
+):
+  """The alert links the resolver chat, so its text says to open that chat,
+  and names Settings only for the actions that live there."""
+  from app import models, push
+  from app.chat_writer import create_chat
+  from app.database import SessionLocal
+
+  _origin, platform = clone_env
+  monkeypatch.setattr(pu, "STALL_NOTIFIED_PATH", tmp_path / ".stall-notified")
+  _worktree, _index, then = _parked_update(platform, chat_id="resolver-1")
+  db.add(create_chat(id="resolver-1", title="Resolve platform update conflict",
+                     messages=[], pending_messages=[], provider="claude"))
+  db.commit()
+  db.query(models.Chat).filter(models.Chat.id == "resolver-1").update({
+    models.Chat.updated_at: pu.datetime.fromtimestamp(then, pu.timezone.utc).replace(tzinfo=None),
+  })
+  db.commit()
+  sent = []
+
+  async def record(session, owner_id, **kwargs):
+    sent.append(kwargs)
+    session.add(models.Notification(
+      id=kwargs["notification_id"], owner_id=owner_id,
+      source_type=kwargs["source_type"], title=kwargs["title"], body=kwargs["body"],
+    ))
+    session.commit()
+
+  monkeypatch.setattr(push, "notify_owner_async", record)
+
+  assert await pu.notify_update_stall_once(SessionLocal, platform)
+  assert sent[0]["target"] == "/shell/?chat=resolver-1"
+  assert sent[0]["body"].startswith("Its resolver chat stopped before finishing. Open it to continue")
+  assert "Open Settings" not in sent[0]["body"]
 
 
 @pytest.mark.asyncio

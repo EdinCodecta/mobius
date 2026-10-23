@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import NamedTuple
 
 from app.config import import_probe_env
 
@@ -74,6 +75,23 @@ _STARTUP_CHECK = (
 )
 
 
+def _probe_env() -> dict[str, str]:
+  """The environment of a child that judges source the way the entrypoint's
+  boot does: PYTHONPATH, every GIT_* variable and server-only credentials
+  scrubbed, DATA_DIR / DATABASE_URL retained, bytecode writes disabled, and
+  the withheld signing key replaced by an import-only placeholder."""
+  env = {
+    key: value for key, value in os.environ.items()
+    if not key.startswith("GIT_") and key not in {
+      "PYTHONPATH", "MOBIUS_SSO_CLIENT_SECRET", "MOBIUS_COMPUTE_INSTANCE_TOKEN",
+      "MOBIUS_IDENTITY_BOOTSTRAP",
+    }
+  }
+  env["PYTHONDONTWRITEBYTECODE"] = "1"
+  import_probe_env(env)
+  return env
+
+
 def run_candidate_startup_check(
   backend: Path, *, timeout: int = STARTUP_CHECK_TIMEOUT_SECONDS,
 ) -> str | None:
@@ -95,33 +113,15 @@ def run_candidate_startup_check(
   every boot runs import plus router verdict alone, because that file ships
   with the image and is not changed to delegate to the candidate.
 
-  The child mirrors the entrypoint's uvicorn exec: PYTHONPATH, GIT_* pointers
-  and server-only credentials are scrubbed, DATA_DIR / DATABASE_URL retained,
-  bytecode writes disabled, and the withheld signing key replaced by an
-  import-only placeholder. It must stay offline: no authentication, provider
-  process, network call or database write.
+  The child mirrors the entrypoint's uvicorn exec (``_probe_env``). It must
+  stay offline: no authentication, provider process, network call or
+  database write.
   """
-  env = os.environ.copy()
-  for key in (
-    "PYTHONPATH",
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_COMMON_DIR",
-    "GIT_NAMESPACE",
-    "MOBIUS_SSO_CLIENT_SECRET",
-    "MOBIUS_COMPUTE_INSTANCE_TOKEN",
-    "MOBIUS_IDENTITY_BOOTSTRAP",
-  ):
-    env.pop(key, None)
-  env["PYTHONDONTWRITEBYTECODE"] = "1"
-  import_probe_env(env)
   try:
     completed = subprocess.run(
       [sys.executable or "python3", "-c", _STARTUP_CHECK],
       cwd=backend,
-      env=env,
+      env=_probe_env(),
       capture_output=True,
       text=True,
       timeout=timeout,
@@ -192,22 +192,11 @@ def _baked_package_verdict(platform_root: Path) -> tuple[bool, dict | None] | No
   this image predates that command (or it could not answer)."""
   if not image_boot_checks_packages():
     return None
-  # The entrypoint's own scrub for the boot transaction, plus the import-only
-  # signing key placeholder (the served worker withholds the real one).
-  env = {
-    key: value for key, value in os.environ.items()
-    if not key.startswith("GIT_") and key not in {
-      "PYTHONPATH", "MOBIUS_SSO_CLIENT_SECRET", "MOBIUS_COMPUTE_INSTANCE_TOKEN",
-      "MOBIUS_IDENTITY_BOOTSTRAP",
-    }
-  }
-  env["PYTHONDONTWRITEBYTECODE"] = "1"
-  import_probe_env(env)
   try:
     completed = subprocess.run(
       [sys.executable or "python3", "-m", "app.platform_boot", "check-packages",
        str(platform_root)],
-      cwd=BAKED_BACKEND, env=env, capture_output=True, text=True,
+      cwd=BAKED_BACKEND, env=_probe_env(), capture_output=True, text=True,
       timeout=PACKAGE_CHECK_TIMEOUT_SECONDS, check=False,
     )
   except (OSError, subprocess.SubprocessError):
@@ -221,33 +210,43 @@ def _baked_package_verdict(platform_root: Path) -> tuple[bool, dict | None] | No
   return completed.returncode == 0, gap if isinstance(gap, dict) else None
 
 
-def image_package_verdict(platform_root: Path) -> tuple[bool, dict | None]:
+class ImagePackageVerdict(NamedTuple):
+  allowed: bool
+  gap: dict | None
+  # False when the image has ``check-packages`` but it could not answer, so
+  # the strict rule stood in for this attempt only.
+  settled: bool
+
+
+def image_package_verdict(platform_root: Path) -> ImagePackageVerdict:
   """Whether this image's next boot serves ``platform_root``'s Python
   packages, and the ``PackageGap`` it judged (None when there is none).
 
   The one verdict restart admission and the status ``restart_blocker``
-  share, so they cannot disagree. It predicts the image's boot guard, not
-  the served one: an image with ``check-packages`` answers itself (it serves
-  a version-only gap). An older image refuses any input from a newer
-  official release, so the served gap stands in with that strict rule;
-  relaxing it here would admit a restart the old image's boot then refuses.
+  share. It predicts the image's boot guard, not the served one: an image
+  with ``check-packages`` answers itself (it serves a version-only gap). An
+  older image refuses any input from a newer official release, so the
+  served gap stands in with that strict rule; relaxing it here would admit a
+  restart the old image's boot then refuses. The strict rule also stands in
+  when the image's own check fails or times out, which is not ``settled``.
   """
   verdict = _baked_package_verdict(platform_root)
   if verdict is not None:
-    return verdict
+    return ImagePackageVerdict(*verdict, settled=True)
   from app import platform_update
 
+  settled = not image_boot_checks_packages()
   gap = platform_update.python_package_gap(platform_root)
   if gap is None:
-    return True, None
+    return ImagePackageVerdict(True, None, settled)
   gap["blocking"] = gap["origin"] == "official_newer"
-  return not gap["blocking"], gap
+  return ImagePackageVerdict(not gap["blocking"], gap, settled)
 
 
 def _refuse_what_the_image_boot_refuses(platform_root: Path) -> None:
   from app import platform_update
 
-  allowed, gap = image_package_verdict(platform_root)
+  allowed, gap, _settled = image_package_verdict(platform_root)
   if allowed:
     return
   reason = platform_update.describe_package_gap(gap) if gap else (

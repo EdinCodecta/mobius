@@ -1350,7 +1350,8 @@ def _write_conflict_flag(
 
 def _parked_at(target: str) -> str:
   """When this target's update first parked: kept across re-parks and
-  rewrites of the same update, so stall detection measures the whole wait."""
+  rewrites of the same update, so it names one stall episode. Progress is
+  measured from the flag, candidate and chat instead (``detect_update_stall``)."""
   previous = _read_conflict_flag() or {}
   kept = (previous.get("overlay") or {}).get("parked_at")
   if kept and previous.get("upstream") == target:
@@ -3991,10 +3992,11 @@ def describe_package_gap(gap: PackageGap) -> str:
   sentences = []
   if gap["origin"] == "official_newer":
     target = (fix.get("target_sha") or "")[:12]
+    release = f"release {target}" if target else "a release that includes them"
     sentences.append(
       "the platform source declares Python packages from a newer release than "
       f"this container image{detail('official_newer')}. Replace the container "
-      f"with release {target or 'that release'} (Settings, Finish update)."
+      f"with {release} (Settings, Finish update)."
     )
   local = detail("local")
   if gap["origin"] == "local" or local:
@@ -4007,7 +4009,13 @@ def describe_package_gap(gap: PackageGap) -> str:
   return " ".join(sentences)
 
 
-_RESTART_BLOCKER_CACHE: dict[tuple, PackageGap | None] = {}
+# Key to the gap and, for a verdict the image's own check could not settle,
+# when it expires (``time.monotonic``); a settled one keeps until the key moves.
+_RESTART_BLOCKER_CACHE: dict[tuple, tuple[PackageGap | None, float | None]] = {}
+# An image check that failed or timed out is retried this soon, so status
+# does not keep the strict stand-in while restart admission's next attempt
+# gets the image's answer.
+_UNSETTLED_BLOCKER_SECONDS = 60
 # One image check at a time: concurrent status polls on a stale cache wait
 # for the first one's answer rather than each starting the subprocess.
 _RESTART_BLOCKER_LOCK = threading.Lock()
@@ -4034,7 +4042,8 @@ def restart_blocker(repo: Path = PLATFORM_REPO) -> PackageGap | None:
   installed distributions (so a live install that closes the gap shows at
   once), because the image's check and the history scan are too slow for
   every status poll. The image's check is bounded
-  (``restart_util.PACKAGE_CHECK_TIMEOUT_SECONDS``) and runs once at a time."""
+  (``restart_util.PACKAGE_CHECK_TIMEOUT_SECONDS``) and runs once at a time;
+  a verdict it could not settle is kept only ``_UNSETTLED_BLOCKER_SECONDS``."""
   from app.restart_util import image_boot_checks_packages, image_package_verdict
 
   inputs = tuple(
@@ -4047,39 +4056,22 @@ def restart_blocker(repo: Path = PLATFORM_REPO) -> PackageGap | None:
     _installed_distributions_stamp(),
   )
   with _RESTART_BLOCKER_LOCK:
-    if key not in _RESTART_BLOCKER_CACHE:
-      _allowed, gap = image_package_verdict(repo)
+    cached = _RESTART_BLOCKER_CACHE.get(key)
+    if cached is None or (cached[1] is not None and time.monotonic() >= cached[1]):
+      _allowed, gap, settled = image_package_verdict(repo)
       _RESTART_BLOCKER_CACHE.clear()
-      _RESTART_BLOCKER_CACHE[key] = gap
-    return _RESTART_BLOCKER_CACHE[key]
+      cached = _RESTART_BLOCKER_CACHE[key] = (
+        gap, None if settled else time.monotonic() + _UNSETTLED_BLOCKER_SECONDS,
+      )
+    return cached[0]
 
 
-def _commit_declaring(repo: Path, commit: str, path: str, data: bytes) -> str | None:
-  """The newest commit in ``commit`` whose ``path`` became exactly ``data``."""
-  try:
-    blob = subprocess.run(
-      ["git", "-C", str(repo), "hash-object", "--stdin"],
-      input=data, capture_output=True, check=True, timeout=_GIT_TIMEOUT,
-      env=_scrubbed_git_env(repo),
-    ).stdout.decode().strip()
-  except (OSError, subprocess.SubprocessError):
-    return None
-  history = _git(
-    "log", "-m", "--format=commit %H", "--raw", "--no-abbrev", "--no-renames",
-    commit, "--", path, repo=repo, check=False,
-  )
-  current = None
-  for line in history.stdout.splitlines() if history.returncode == 0 else []:
-    if line.startswith("commit "):
-      current = line.split()[1]
-    elif len(fields := line.split("\t", 1)[0].split()) >= 4 and fields[3] == blob:
-      return current
-  return None
-
-
-def _declared_in_history(repo: Path, commit: str, path: str, data: bytes) -> bool:
-  """Whether ``path`` held exactly ``data`` at some commit ``commit`` contains,
-  merge results included."""
+def _path_history(
+  repo: Path, commit: str, path: str, data: bytes,
+) -> tuple[str | None, list[tuple[str, str, str]]]:
+  """``data``'s blob, and each change to ``path`` in ``commit``'s history as
+  ``(commit, old blob, new blob)``, newest first and merge results included;
+  ``(None, [])`` when git cannot say."""
   try:
     blob = subprocess.run(
       ["git", "-C", str(repo), "hash-object", "--stdin"],
@@ -4087,21 +4079,37 @@ def _declared_in_history(repo: Path, commit: str, path: str, data: bytes) -> boo
       env=_scrubbed_git_env(repo),
     ).stdout.decode().strip()
     history = subprocess.run(
-      ["git", "-C", str(repo), "log", "-m", "--format=", "--raw", "--no-abbrev",
+      ["git", "-C", str(repo), "log", "-m", "--format=commit %H", "--raw", "--no-abbrev",
        "--no-renames", commit, "--", path],
       capture_output=True, text=True, check=False, timeout=_GIT_TIMEOUT,
       env=_scrubbed_git_env(repo),
     )
   except (OSError, subprocess.SubprocessError):
-    return False
+    return None, []
   if history.returncode != 0:
-    return False
+    return None, []
+  changes = []
+  current = ""
   # Raw lines read ":<mode> <mode> <old blob> <new blob> <status>\t<path>".
   for line in history.stdout.splitlines():
-    fields = line.split("\t", 1)[0].split()
-    if len(fields) >= 4 and blob in fields[2:4]:
-      return True
-  return False
+    if line.startswith("commit "):
+      current = line.split()[1]
+    elif len(fields := line.split("\t", 1)[0].split()) >= 4:
+      changes.append((current, fields[2], fields[3]))
+  return blob, changes
+
+
+def _commit_declaring(repo: Path, commit: str, path: str, data: bytes) -> str | None:
+  """The newest commit in ``commit`` whose ``path`` became exactly ``data``."""
+  blob, changes = _path_history(repo, commit, path, data)
+  return next((sha for sha, _old, new in changes if new == blob), None)
+
+
+def _declared_in_history(repo: Path, commit: str, path: str, data: bytes) -> bool:
+  """Whether ``path`` held exactly ``data`` at some commit ``commit`` contains,
+  merge results included."""
+  blob, changes = _path_history(repo, commit, path, data)
+  return any(blob in (old, new) for _sha, old, new in changes)
 
 
 def _refuse_source_newer_than_image_packages(repo: Path, image: str | None) -> None:
@@ -4985,7 +4993,9 @@ def update_progress_signals(repo: Path = PLATFORM_REPO) -> dict[str, float | Non
   """When the unfinished update last moved, from files alone (epoch seconds).
 
   ``parked_at``: the first park for this target (the flag's own time for a
-  flag written before that was recorded). ``worktree_changed_at``: the
+  flag written before that was recorded), which identifies the stall
+  episode; it is never later than the flag, so it is no progress signal of
+  its own. ``worktree_changed_at``: the
   newest of the candidate worktree's index (the resolver staged an answer)
   and the flag (the updater re-parked or rebound it). ``prepared_at``: the
   prepared update record, and ``activation_marked_at``: the activation
@@ -5102,7 +5112,7 @@ def detect_update_stall(
   if chat is not None and _resolver_is_busy(db, chat):
     return None
   moved = [
-    signals["parked_at"], signals["worktree_changed_at"],
+    signals["worktree_changed_at"],
     _naive_utc_timestamp(chat.updated_at) if chat is not None else None,
   ]
   last = max((value for value in moved if value is not None), default=now)
@@ -5156,7 +5166,10 @@ async def notify_update_stall_once(session_factory, repo: Path = PLATFORM_REPO) 
   notification_id = f"platform-stall-{stalled['episode']}"
   chat_id = stalled["resolver_chat_id"]
   body = {
-    "resolver_idle": "Its resolver chat stopped before finishing. Open Settings to resume, retry or cancel it.",
+    "resolver_idle": (
+      "Its resolver chat stopped before finishing. Open it to continue, or "
+      "resume, retry or cancel the update from Settings."
+    ),
     "resolver_missing": "No chat is resolving it. Open Settings to resume, retry or cancel it.",
     "restart_blocked": (
       "It needs a new container: this one lacks Python packages it declares. "

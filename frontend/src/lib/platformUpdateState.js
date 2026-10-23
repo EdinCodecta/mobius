@@ -182,7 +182,9 @@ export function platformPackageWarning(platform, rebuild) {
     return {
       title: 'Container packages are behind the platform source',
       message: `${running} until the container is updated: ${listed}. A container update (Finish update) installs them.`
-        + (gap.fix?.commit ? ` Some come from a local change; if the new container still lacks them, ${revert}.` : ''),
+        + (packages.some(item => item.origin === 'local')
+          ? ` Some come from a local change; if the new container still lacks them, ${revert}.`
+          : ''),
     }
   }
   return {

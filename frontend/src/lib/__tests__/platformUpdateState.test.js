@@ -313,3 +313,17 @@ test('a local package gap names the commit to revert and an unverifiable line', 
   })
   assert.match(uncommitted.message, /revert the uncommitted edit/)
 })
+
+test('a mixed gap with an uncommitted local edit still says to revert that edit', () => {
+  const warning = platformPackageWarning({
+    restart_blocker: {
+      origin: 'official_newer', blocking: false,
+      fix: { action: 'replace_container', target_sha: 'c'.repeat(40), commit: null },
+      packages: [
+        { name: 'aiohttp', declared: '==3.13.0', installed: '3.12.1', kind: 'version', origin: 'official_newer' },
+        { name: 'extra', declared: '==1', installed: null, kind: 'missing', origin: 'local' },
+      ],
+    },
+  })
+  assert.match(warning.message, /Some come from a local change; if the new container still lacks them, revert the uncommitted edit\./)
+})
