@@ -553,7 +553,9 @@ def push_repair(gh, cwd: Path, row, target: dict, validation: dict, *, before_pu
         and _exact_ref_rejected(getattr(result, "stdout", ""), fresh["head_sha"], branch)):
       # Git completed and named only this ref as rejected; the exact old tip
       # still exists. This proves no branch update, unlike timeout or EOF.
-      return DispatchResult.not_dispatched("GitHub rejected the exact repair ref; no branch update was applied.")
+      return DispatchResult("not_dispatched",
+        receipt={"kind": "remote_ref_rejection", "head_sha": fresh["head_sha"]},
+        reason="GitHub rejected the exact repair ref; no branch update was applied.")
   except Exception:
     pass
   return DispatchResult.unknown("The repair push was not confirmed; reconcile the exact remote head.")
