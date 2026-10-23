@@ -18,13 +18,16 @@ manually.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import NamedTuple
 
 from app.config import import_probe_env
 
@@ -41,7 +44,20 @@ _RESTART_ADMITTED = False
 
 
 class RestartSourceInvalid(RuntimeError):
-  """The editable platform would not survive the next startup probe."""
+  """The editable platform would not survive the next startup probe.
+
+  ``detail`` carries a structured reason when one exists: ``{"reason":
+  "image_packages_behind_source", "gap": PackageGap}``. The restart routes
+  add it beside their stable ``platform_source_invalid`` code.
+  """
+
+  def __init__(self, message: str, detail: dict | None = None) -> None:
+    super().__init__(message)
+    self.detail = detail or {}
+
+
+# The image's own checkout, whose boot transaction decides what may serve.
+BAKED_BACKEND = Path(os.environ.get("MOBIUS_BAKED_BACKEND", "/app/platform-baked/backend"))
 
 
 # A module-level infinite loop or blocking call in agent-edited source would
@@ -57,6 +73,23 @@ _STARTUP_CHECK = (
   "from app.routes import require_all_routers_loaded\n"
   "require_all_routers_loaded()\n"
 )
+
+
+def _probe_env() -> dict[str, str]:
+  """The environment of a child that judges source the way the entrypoint's
+  boot does: PYTHONPATH, every GIT_* variable and server-only credentials
+  scrubbed, DATA_DIR / DATABASE_URL retained, bytecode writes disabled, and
+  the withheld signing key replaced by an import-only placeholder."""
+  env = {
+    key: value for key, value in os.environ.items()
+    if not key.startswith("GIT_") and key not in {
+      "PYTHONPATH", "MOBIUS_SSO_CLIENT_SECRET", "MOBIUS_COMPUTE_INSTANCE_TOKEN",
+      "MOBIUS_IDENTITY_BOOTSTRAP",
+    }
+  }
+  env["PYTHONDONTWRITEBYTECODE"] = "1"
+  import_probe_env(env)
+  return env
 
 
 def run_candidate_startup_check(
@@ -80,33 +113,15 @@ def run_candidate_startup_check(
   every boot runs import plus router verdict alone, because that file ships
   with the image and is not changed to delegate to the candidate.
 
-  The child mirrors the entrypoint's uvicorn exec: PYTHONPATH, GIT_* pointers
-  and server-only credentials are scrubbed, DATA_DIR / DATABASE_URL retained,
-  bytecode writes disabled, and the withheld signing key replaced by an
-  import-only placeholder. It must stay offline: no authentication, provider
-  process, network call or database write.
+  The child mirrors the entrypoint's uvicorn exec (``_probe_env``). It must
+  stay offline: no authentication, provider process, network call or
+  database write.
   """
-  env = os.environ.copy()
-  for key in (
-    "PYTHONPATH",
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_COMMON_DIR",
-    "GIT_NAMESPACE",
-    "MOBIUS_SSO_CLIENT_SECRET",
-    "MOBIUS_COMPUTE_INSTANCE_TOKEN",
-    "MOBIUS_IDENTITY_BOOTSTRAP",
-  ):
-    env.pop(key, None)
-  env["PYTHONDONTWRITEBYTECODE"] = "1"
-  import_probe_env(env)
   try:
     completed = subprocess.run(
       [sys.executable or "python3", "-c", _STARTUP_CHECK],
       cwd=backend,
-      env=env,
+      env=_probe_env(),
       capture_output=True,
       text=True,
       timeout=timeout,
@@ -142,12 +157,7 @@ def validate_restart_source(platform_root: Path | None = None) -> None:
 
   failure = run_candidate_startup_check(backend)
   if failure is None:
-    # The next boot also refuses source that needs a newer image's packages.
-    from app.platform_update import release_packages_missing_from_image
-
-    reason = release_packages_missing_from_image(platform_root)
-    if reason:
-      raise RestartSourceInvalid(f"Restart stopped: {reason}")
+    _refuse_what_the_image_boot_refuses(platform_root)
     return
   if len(failure) > 1200:
     failure = failure[-1200:]
@@ -155,6 +165,96 @@ def validate_restart_source(platform_root: Path | None = None) -> None:
     "Restart stopped: the current platform source failed its startup check. "
     "Ask Möbius to repair it before restarting. "
     f"Details: {failure}"
+  )
+
+
+_PACKAGE_CHECK_PROTOCOL = re.compile(r"^PACKAGE_CHECK_PROTOCOL = (\d+)$", re.MULTILINE)
+# The image's own check answers in about a second; a status poll must not
+# wait on a stuck one for the startup check's full minute.
+PACKAGE_CHECK_TIMEOUT_SECONDS = 20
+
+
+def image_boot_checks_packages() -> bool:
+  """Whether this image's boot has ``check-packages`` and its relaxed rule
+  (only a missing official-newer distribution refuses a boot), by the
+  explicit ``platform_boot.PACKAGE_CHECK_PROTOCOL`` marker in its baked
+  source: importing it would run the served interpreter's view instead."""
+  try:
+    source = (BAKED_BACKEND / "app" / "platform_boot.py").read_text(encoding="utf-8")
+  except (OSError, UnicodeDecodeError):
+    return False
+  marker = _PACKAGE_CHECK_PROTOCOL.search(source)
+  return bool(marker) and int(marker.group(1)) >= 1
+
+
+def _baked_package_verdict(platform_root: Path) -> tuple[bool, dict | None] | None:
+  """The image's own ``platform_boot check-packages`` verdict, or None when
+  this image predates that command (or it could not answer)."""
+  if not image_boot_checks_packages():
+    return None
+  try:
+    completed = subprocess.run(
+      [sys.executable or "python3", "-m", "app.platform_boot", "check-packages",
+       str(platform_root)],
+      cwd=BAKED_BACKEND, env=_probe_env(), capture_output=True, text=True,
+      timeout=PACKAGE_CHECK_TIMEOUT_SECONDS, check=False,
+    )
+  except (OSError, subprocess.SubprocessError):
+    return None
+  if completed.returncode not in (0, 1):
+    return None  # an older image's usage error: it has no such command
+  try:
+    gap = json.loads(completed.stdout.strip().splitlines()[-1])
+  except (IndexError, ValueError):
+    return None
+  return completed.returncode == 0, gap if isinstance(gap, dict) else None
+
+
+class ImagePackageVerdict(NamedTuple):
+  allowed: bool
+  gap: dict | None
+  # False when the image has ``check-packages`` but it could not answer, so
+  # the strict rule stood in for this attempt only.
+  settled: bool
+
+
+def image_package_verdict(platform_root: Path) -> ImagePackageVerdict:
+  """Whether this image's next boot serves ``platform_root``'s Python
+  packages, and the ``PackageGap`` it judged (None when there is none).
+
+  The one verdict restart admission and the status ``restart_blocker``
+  share. It predicts the image's boot guard, not the served one: an image
+  with ``check-packages`` answers itself (it serves a version-only gap). An
+  older image refuses any input from a newer official release, so the
+  served gap stands in with that strict rule; relaxing it here would admit a
+  restart the old image's boot then refuses. The strict rule also stands in
+  when the image's own check fails or times out, which is not ``settled``.
+  """
+  verdict = _baked_package_verdict(platform_root)
+  if verdict is not None:
+    return ImagePackageVerdict(*verdict, settled=True)
+  from app import platform_update
+
+  settled = not image_boot_checks_packages()
+  gap = platform_update.python_package_gap(platform_root)
+  if gap is None:
+    return ImagePackageVerdict(True, None, settled)
+  gap["blocking"] = gap["origin"] == "official_newer"
+  return ImagePackageVerdict(not gap["blocking"], gap, settled)
+
+
+def _refuse_what_the_image_boot_refuses(platform_root: Path) -> None:
+  from app import platform_update
+
+  allowed, gap, _settled = image_package_verdict(platform_root)
+  if allowed:
+    return
+  reason = platform_update.describe_package_gap(gap) if gap else (
+    "this container image refuses the platform source's Python packages"
+  )
+  raise RestartSourceInvalid(
+    f"Restart stopped: {reason}",
+    {"reason": "image_packages_behind_source", "gap": gap},
   )
 
 
