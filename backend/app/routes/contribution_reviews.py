@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -31,6 +32,7 @@ from app.github_contribution_git import _gh
 from app.github_connection import _github_connection_transaction
 
 router = APIRouter(tags=["contribution-reviews"])
+_log = logging.getLogger(__name__)
 APP_PREFIX = "/api/github/contributions"
 SCOPE = {"correctness", "maintainability", "simplicity", "tests", "security_privacy", "technical_debt"}
 REVIEW_CAPABILITIES = {"post_review": True, "review_fix_merge": True}
@@ -248,6 +250,9 @@ async def start_reviews(app_id: int | None, body: StartReviews,
         raise HTTPException(409, {"message": "This selection already belongs to another review conversation. Follow it instead of starting again.",
                                   "chat_id": row.chat_id, "run_id": row.id})
     else:
+      if body.options is not None and body.mode != "review_fix_merge" and (
+          body.options.fix_prompt is not None or "max_rounds" in body.options.model_fields_set):
+        raise HTTPException(422, "fix_prompt and max_rounds require review_fix_merge mode.")
       if body.mode == "review_fix_merge" and not body.preview_sha256:
         raise HTTPException(422, "Preview and confirm the exact frozen takeover prompts/model before admission.")
       snapshot = _snapshot(db, body, principal)
@@ -667,9 +672,13 @@ async def stop_review(app_id: int | None, run_id: str, db: Session = Depends(get
   # Sweep even when cancellation has not settled. The receipt classifier
   # protects active editors and uncertain effects; a later Stop/prepare can
   # collect what was still active at this boundary.
-  async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
-    db.refresh(row)
-    await settled.run_settled(repair_actions.sweep_checkout_receipts_once)
+  if row.mode == "review_fix_merge":
+    try:
+      async with chat_queue.get_transition_lock(f"review-outcome:{run_id}"):
+        db.refresh(row)
+        await settled.run_settled(repair_actions.sweep_checkout_receipts_once)
+    except Exception:
+      _log.exception("repair checkout GC failed after Stop for review run %s", run_id)
   db.refresh(row)
   return {"stopped": parent_stopped and children_stopped, "run": _run_view(db, row)}
 
@@ -841,6 +850,9 @@ async def independent_review(app_id: int | None, run_id: str, body: ReviewOutcom
         if any(existing[k] != receipt[k] for k in receipt if k != "id"):
           raise HTTPException(409, "This independent review execution already recorded different evidence.")
         return {"independent_receipt_id": existing["id"], "run": _run_view(db, row)}
+      if any(r.get("delegation_id") == child.id and r.get("head_sha") == body.head_sha
+             and r.get("base_sha") == body.reviewed_base_sha for r in receipts):
+        raise HTTPException(409, "This reviewer delegation already reported on this head and base. Start a fresh independent reviewer.")
       receipts.append(receipt)
       reviews.save_outcome(db, row, reviews.key(target), {**previous,
         "state": previous.get("state", "reviewing"), "independent_reviews": receipts})
@@ -952,6 +964,7 @@ async def publish_repair(app_id: int | None, run_id: str, body: RepairPublish,
       if str(actor.get("id") or "") != row.github_actor_id:
         raise HTTPException(409, "The connected GitHub actor changed. No push started.")
       current_base = await asyncio.to_thread(reviews.base_head, _gh, cwd, target["repo"], target["base_ref"])  # unsettled: read-only (GitHub observation; no mutation)
+      await asyncio.to_thread(reviews.assert_approved_base_ancestry, _gh, cwd, target, current_base)  # unsettled: read-only (GitHub ancestry proof; no mutation)
       try:
         validation = await settled.run_settled(repairs.validate_repair, _gh, cwd, row, target,
                                              checkout, target["allowed_files"], base_sha=current_base)

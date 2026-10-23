@@ -528,7 +528,7 @@ def test_model_choice_drift_blocks_merge_not_only_repair(setup, monkeypatch):
 def test_review_frozen_rename_scope_includes_both_paths():
   import json
   def gh(*a):
-    return SimpleNamespace(stdout=json.dumps([[{"filename": "new.py", "previous_filename": "old.py", "status": "renamed"}]]))
+    return SimpleNamespace(stdout=json.dumps([{"filename": "new.py", "previous_filename": "old.py", "status": "renamed"}]))
   assert domain.repair_file_scope(gh, "/tmp", TARGET) == ["new.py", "old.py"]
 
 

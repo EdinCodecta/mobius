@@ -257,8 +257,7 @@ def require_public_transition_clear(db, row, target):
         item.get("merge_attempted") or item.get("state") in {"merging", "merge_unknown", "queued"})
       repair_pending = any(a.get("state") in {"pushing", "push_unknown"}
         for a in item.get("repair_attempts", []))
-      ready = item.get("ready_attempt")
-      unresolved = merge_pending or repair_pending or (ready and ready.get("state") != "ready")
+      unresolved = merge_pending or repair_pending
       merged_head = item.get("state") == "merged" and item.get("head_sha") == target["head_sha"]
       if not (unresolved or merged_head):
         continue
@@ -267,11 +266,13 @@ def require_public_transition_clear(db, row, target):
       same_branch = branch is not None and other_branch == branch
       # Missing legacy identity is not evidence of disjointness. Do not fill
       # frozen consent from live data, or assume an uncertain attempt settled.
-      unmatchable_pending = unresolved and (branch is None or other_branch is None)
+      unmatchable_pending = (unresolved and (branch is None or other_branch is None)
+        and original.get("repo", "").lower() == target.get("repo", "").lower())
       if same_item or same_branch or unmatchable_pending:
         raise HTTPException(409,
-          "An earlier public attempt may affect this PR or head branch. Reconcile "
-          "it read-only in its owning conversation before any new public action.")
+          f"An earlier public attempt in review run {grant.id}, owning chat {grant.chat_id}, "
+          "may affect this PR or head branch. Observe it read-only in that chat. "
+          "If it remains ambiguous, do not replay the public action; ask the owner to resolve the old receipt.")
 
 
 def reserve_public_work(db, row, principal, work_key, summary, action):
@@ -398,7 +399,8 @@ def brief(row):
     "the guarded outcome endpoint (not you) posts your summary and tests as one "
     "public comment review on that exact head. Write the summary for the PR "
     "author: concrete findings with file references. Keep any question meant "
-    "only for the owner in this conversation, not in the summary.\n"
+    "only for the owner in this conversation, not in the summary. "
+    "Evidence freezes once dispatch is armed; identical retry is read-only.\n"
     if frozen.get("post_review") is True else ""
   )
   return f'''{public_note}Review this exact selected public PR batch privately. Mode: {row.mode}.
@@ -491,12 +493,10 @@ def base_advance_eligible(row, previous) -> bool:
   """Whether a moved target branch may become a newer reviewed base.
 
   Scoped takeover only: the pinned modes bind their exact selected base. Any
-  saved public attempt (merge, uncertain push, unsettled readiness) must be
+  saved public attempt (merge or uncertain push) must be
   reconciled first; a base observation never clears or replaces a receipt.
   """
-  attempt = previous.get("ready_attempt")
   return (row.mode == "review_fix_merge" and not (previous.get("merge_attempted") or previous.get("state") in {"merging", "merge_unknown", "queued", "merged"})
-          and not (attempt and attempt.get("state") != "ready")
           and not any(r.get("state") in {"pushing", "push_unknown"}
                       for r in previous.get("repair_attempts", [])))
 
@@ -517,11 +517,7 @@ def observe_base_advance(gh, cwd, row, original, previous) -> dict | None:
   live = base_head(gh, cwd, target["repo"], target["base_ref"])
   if live == target["base_sha"]:
     return None
-  compare = read(gh, cwd, f"repos/{target['repo']}/compare/{target['base_sha']}...{live}")
-  if (not isinstance(compare, dict) or compare.get("status") != "ahead"
-      or (compare.get("base_commit") or {}).get("sha") != target["base_sha"]
-      or (compare.get("merge_base_commit") or {}).get("sha") != target["base_sha"]):
-    raise HTTPException(409, "The target branch was rewritten rather than advanced. Ask the owner how to continue.")
+  assert_approved_base_ancestry(gh, cwd, target, live)
   chain_start = _receipted_target(original, previous)["base_sha"]
   prior = previous.get("base_advance") or {}
   count = prior.get("count", 0) + 1 if prior.get("head_sha") == target["head_sha"] else 1
@@ -536,12 +532,32 @@ def observe_base_advance(gh, cwd, row, original, previous) -> dict | None:
                 "independent review against the new base before merge.")}
 
 
+def assert_approved_base_ancestry(gh, cwd, target, live):
+  """A repair may use the approved base or only its proved strict descendant."""
+  approved = target["base_sha"]
+  if live == approved:
+    return
+  compare = read(gh, cwd, f"repos/{target['repo']}/compare/{approved}...{live}")
+  if (not isinstance(compare, dict) or compare.get("status") != "ahead"
+      or (compare.get("base_commit") or {}).get("sha") != approved
+      or (compare.get("merge_base_commit") or {}).get("sha") != approved):
+    raise HTTPException(409, "The target branch was rewritten rather than advanced. Ask the owner how to continue.")
+
+
 def require_independent_clear(row, target, body):
   if body.tests_passed is not True or body.reviewed_base_sha != target["base_sha"]:
     raise HTTPException(422, "Fresh passing tests and the exact reviewed target base are required.")
   outcome = (row.outcomes_json or {}).get(key(target), {})
   receipt = next((r for r in outcome.get("independent_reviews", [])
     if r.get("id") == body.independent_receipt_id), None)
+  if receipt:
+    # One delegation is one independent reviewer. A later verdict supersedes
+    # earlier evidence; a needs-you verdict cannot be laundered by replaying
+    # an older all-clear receipt.
+    latest = next((r for r in reversed(outcome.get("independent_reviews", []))
+      if r.get("delegation_id") == receipt.get("delegation_id")), None)
+    if latest is not receipt:
+      raise HTTPException(422, "A fresh independent reviewer is required after changed review evidence.")
   if (not receipt or receipt.get("head_sha") != target["head_sha"]
       or receipt.get("base_sha") != target["base_sha"]
       or receipt.get("state") != "all_clear" or receipt.get("tests_passed") is not True):
@@ -599,8 +615,13 @@ without force. Never manually push. Ambiguous receipts only reconcile through
 the same endpoint; never repeat the public request. Each confirmed repair yields
 a successor that requires a NEW independent full-diff review and fresh tests
 before merge. {round_instruction}
-Autopilot continuation is {frozen.get('autopilot', False)}: when enabled continue
-these guarded steps in this run until reviewed/merged or concretely blocked.
+For an old uncertain public attempt, open its named owning chat/run and POST
+that old run's /observe endpoint for read-only reconciliation against GitHub.
+If the exact
+effect cannot be proved or disproved, ask the owner for supervised recovery;
+elapsed time, a closed PR, or an unchanged projection never releases the receipt.
+Autopilot is unsupported: perform only the requested immediate step and hand off;
+never schedule an automatic review Wait.
 When an exact repair push is confirmed, finish its saved receipt work_key via
 finish_agent_work with release:false and the confirmed head outcome. Never
 finish another chat's claim.
@@ -656,20 +677,8 @@ def arm_repair(db, row, target, previous, receipt, principal):
 
 
 def repair_file_scope(gh, cwd, target):
-  pages = json.loads(gh(cwd, "api", "--paginate", "--slurp",
-    f"repos/{target['repo']}/pulls/{target['number']}/files?per_page=100").stdout)
-  if not isinstance(pages, list) or not pages or any(not isinstance(page, list) for page in pages):
-    raise HTTPException(409, "GitHub did not confirm the complete repair file scope.")
-  files = [entry for page in pages for entry in page]
-  if len(files) >= 3000 or any(not isinstance(f, dict) or not isinstance(f.get("filename"), str) for f in files):
-    raise HTTPException(409, "This PR file scope is too large or ambiguous for scoped takeover.")
-  scope = {f["filename"] for f in files}
-  for entry in files:
-    if entry.get("status") == "renamed":
-      if not isinstance(entry.get("previous_filename"), str):
-        raise HTTPException(409, "GitHub did not confirm the renamed file source path.")
-      scope.add(entry["previous_filename"])
-  return sorted(scope)
+  from app.contribution_review_repairs import _changed_files
+  return sorted(_changed_files(gh, cwd, target))
 
 
 def independent_brief(row, target):

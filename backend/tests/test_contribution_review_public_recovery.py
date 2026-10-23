@@ -151,7 +151,7 @@ def test_stale_public_observation_cannot_erase_confirmed_receipt(setup):
   domain.save_outcome(db, row, domain.key(ITEM), confirmed)
   domain.save_effect_outcome(db, row, domain.key(ITEM), {**confirmed,
     'public_review': {**receipt, 'state': 'unknown'}})
-  assert all(row.outcomes_json[domain.key(ITEM)][key] == value for key, value in confirmed.items())
+  assert row.outcomes_json[domain.key(ITEM)] == confirmed
 
 
 @pytest.mark.parametrize('state', ['posting', 'unknown'])
@@ -161,7 +161,7 @@ def test_other_attempt_cannot_disarm_public_receipt(setup, state):
   domain.save_outcome(db, row, domain.key(ITEM), original)
   domain.save_effect_outcome(db, row, domain.key(ITEM), {'state': 'all_clear',
     'public_review': {'state': 'not_dispatched'}})
-  assert all(row.outcomes_json[domain.key(ITEM)][key] == value for key, value in original.items())
+  assert row.outcomes_json[domain.key(ITEM)] == original
 
 
 def test_provider_refusal_releases_only_own_public_attempt_for_retry(setup, monkeypatch):

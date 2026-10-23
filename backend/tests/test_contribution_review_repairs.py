@@ -53,6 +53,18 @@ def test_validate_derives_successor_from_git(repair):
   assert target["head_sha"] == snapshot["initial_head_sha"]
 
 
+def test_validate_intersects_frozen_scope_after_pr_file_removed(repair):
+  repo, target, _, snapshot = repair
+  snapshot["allowed_files"] = ["owned.py", "removed.py"]
+  (repo / "owned.py").write_text("after\n")
+  git(repo, "add", "owned.py")
+  git(repo, "commit", "-qm", "repair", "-m", COAUTHOR_TRAILER)
+  result = repairs.validate_repair(None, repo, None, target, snapshot,
+    allowed_files=["owned.py", "removed.py"])
+  assert result["files"] == ["owned.py"]
+  assert result["allowed_files"] == ["owned.py"]
+
+
 def test_validate_refuses_out_of_scope_file(repair):
   repo, target, _, snapshot = repair
   (repo / "unrelated.py").write_text("new\n")
