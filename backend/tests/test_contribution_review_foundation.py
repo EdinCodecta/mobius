@@ -246,6 +246,19 @@ def test_definite_github_merge_rejection_is_not_unknown(setup, monkeypatch):
   assert item["state"] == "needs_you" and item["merge_attempted"] is False
 
 
+def test_real_gh_graphql_no_data_rejection_is_definite(tmp_path, monkeypatch):
+  from app import github_contribution_git as transport
+  from app.contribution_review_effects import NotDispatched
+  fake_bin = tmp_path / "bin"
+  fake_bin.mkdir()
+  fake = fake_bin / "gh"
+  fake.write_text("#!/bin/sh\necho '{\"errors\":[{\"message\":\"not queueable\"}],\"data\":null}'\nexit 1\n")
+  fake.chmod(0o755)
+  monkeypatch.setattr(transport, "_git_env", lambda _cwd: {"PATH": str(fake_bin) + ":/usr/bin:/bin"})
+  with pytest.raises(NotDispatched):
+    domain.enqueue(transport._gh, tmp_path, TARGET)
+
+
 @pytest.mark.parametrize("nonce_nullable", [False, True])
 def test_core_migration_adopts_prior_0079_variant_without_rewriting_it(tmp_path, nonce_nullable):
   eng = create_engine(f"sqlite:///{tmp_path / 'old-review.db'}")

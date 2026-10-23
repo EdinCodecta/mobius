@@ -147,11 +147,21 @@ def enqueue(gh, cwd, target):
   query = """mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{
     pullRequestId:$id,expectedHeadOid:$head,jump:false
   }){mergeQueueEntry{id}}}"""
-  result = json.loads(gh(cwd, "api", "graphql", "-f", f"query={query}",
-    "-f", f"id={target['pr_id']}", "-f", f"head={target['head_sha']}").stdout)
+  response = gh(cwd, "api", "graphql", "-f", f"query={query}",
+    "-f", f"id={target['pr_id']}", "-f", f"head={target['head_sha']}", check=False)
+  try:
+    result = json.loads(response.stdout)
+  except json.JSONDecodeError:
+    if getattr(response, "returncode", 0):
+      raise ContributionSubmitError((response.stderr or "GitHub GraphQL request failed.")[:600])
+    raise
+  if not isinstance(result, dict):
+    raise ContributionSubmitError("GitHub returned an unexpected merge-queue response.", code="merge_response_invalid_shape")
   entry = ((result.get("data") or {}).get("enqueuePullRequest") or {}).get("mergeQueueEntry")
   if result.get("errors") and not result.get("data"):
     raise NotDispatched("GitHub rejected the merge-queue request without applying it.")
+  if getattr(response, "returncode", 0):
+    raise ContributionSubmitError((response.stderr or "GitHub GraphQL request failed.")[:600])
   if result.get("errors") or not isinstance(entry, dict) or not entry.get("id"):
     raise HTTPException(409, "GitHub did not confirm this exact pull request in the merge queue.")
   return entry
