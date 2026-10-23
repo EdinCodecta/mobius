@@ -207,7 +207,9 @@ def checked_pending_conflict_update_receipt(
     raise PendingReceiptUnreadable(f"symlinked pending receipt in {source_dir}")
   try:
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-  except (FileNotFoundError, NotADirectoryError):
+  except FileNotFoundError:
+    # Only a genuinely absent receipt is "none". Anything else, including a
+    # regular file where the receipt directory belongs, is unreadable.
     return None
   except (OSError, ValueError) as exc:
     raise PendingReceiptUnreadable(f"pending receipt in {source_dir}") from exc

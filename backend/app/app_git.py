@@ -2911,29 +2911,44 @@ def import_staged(source_dir: str | Path, staged: Staged) -> str:
   return staged.sha
 
 
-def complete_history_contains(
-  source_dir: str | Path, commit: str, tip: str,
-) -> bool | None:
-  """Whether ``commit`` is in ``tip``'s history, proven by walking all of it.
+def history_is_complete(source_dir: str | Path, tip: str) -> bool:
+  """Whether every commit reachable from ``tip`` is present and readable.
 
-  For a ``commit`` object Git does not have (an update never fetched), where
-  ``merge-base --is-ancestor`` cannot answer. ``None`` unless every commit
-  reachable from ``tip`` is present: a shallow repository, a missing commit
-  object, or a failed walk is not proof of absence.
+  Proves a negative ancestry answer trustworthy: across a shallow boundary or
+  a missing object Git can say "not an ancestor" without seeing the history
+  that would contain it. Walks all of ``tip``'s commits with no output, so
+  memory stays constant; time is linear in history and the walk keeps
+  ``_run``'s timeout. Any failure, including a timeout, is ``False``.
   """
   repo = Path(source_dir)
-  wanted = str(commit or "").lower()
-  if not _HEX_OID.fullmatch(wanted) or not is_repo(repo):
-    return None
+  if not is_repo(repo):
+    return False
   try:
     if _is_shallow(repo):
-      return None
-    proc = _run(repo, "rev-list", tip, "--", check=False, read_only=True)
+      return False
+    proc = _run(
+      repo, "rev-list", "--quiet", "--end-of-options", tip,
+      check=False, read_only=True,
+    )
   except (OSError, subprocess.SubprocessError):
-    return None
-  if proc.returncode != 0:
-    return None
-  return wanted in proc.stdout.split()
+    return False
+  return proc.returncode == 0
+
+
+def commit_object_absent(source_dir: str | Path, commit: str) -> bool:
+  """Whether Git cannot read ``commit`` as a commit object.
+
+  Meaningful only beside ``history_is_complete``: a commit absent from a
+  complete history is not in it. A failure to run Git is not absence.
+  """
+  try:
+    proc = _run(
+      Path(source_dir), "cat-file", "-e", f"{commit}^{{commit}}",
+      check=False, read_only=True,
+    )
+  except (OSError, subprocess.SubprocessError):
+    return False
+  return proc.returncode != 0
 
 
 def present_commit(source_dir: str | Path, ref: str) -> str | None:

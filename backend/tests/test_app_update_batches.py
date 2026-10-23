@@ -62,9 +62,10 @@ class _Receipts:
 
 @pytest.fixture
 def git_state(monkeypatch):
-  """Fake commits (ancestry only); receipts are real files."""
+  """Fake commits (ancestry over a complete history); receipts are real files."""
   monkeypatch.setattr(batches.app_git, "ref_is_ancestor",
     lambda path, reviewed, accepted: reviewed == COMMIT and accepted == LANDED)
+  monkeypatch.setattr(batches.app_git, "history_is_complete", lambda *args: True)
   return _Receipts()
 
 
@@ -1145,7 +1146,7 @@ async def test_a_prune_skips_a_batch_whose_save_is_in_flight(tmp_path):
 def _unknown_history(monkeypatch):
   """Git cannot answer: a timeout, a lock, or damaged metadata."""
   monkeypatch.setattr(batches.app_git, "ref_is_ancestor", lambda *args: None)
-  monkeypatch.setattr(batches.app_git, "complete_history_contains", lambda *args: None)
+  monkeypatch.setattr(batches.app_git, "history_is_complete", lambda *args: False)
 
 
 def _unreadable_receipt(source_dir):
@@ -1281,7 +1282,7 @@ def test_a_shallow_served_history_is_unknown(tmp_path, db):
   subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{origin}", str(shallow)],
     check=True)
   served = _git(shallow, "rev-parse", "HEAD")
-  assert batches.app_git.complete_history_contains(str(shallow), COMMIT, served) is None
+  assert batches.app_git.history_is_complete(str(shallow), served) is False
   with pytest.raises(batches.SettlementUnreadable):
     batches._contains(str(shallow), COMMIT, served)
 
@@ -1310,3 +1311,61 @@ def test_a_receipt_for_another_update_or_none_is_proven_absent(tmp_path):
   path.parent.mkdir(parents=True)
   path.write_text(json.dumps({"schema": 4, "app_id": 1, "upstream_commit": "b" * 40}))
   assert batches._pending_receipt(str(tmp_path), 1, COMMIT) is None
+
+
+def test_a_shallow_negative_answer_is_unknown_even_with_both_commits(tmp_path, db):
+  """Across a shallow boundary Git answers "not an ancestor" for a commit it
+  cannot reach; that is not proof the update did not land."""
+  origin = tmp_path / "origin"
+  origin.mkdir()
+  _git(origin, "init", "-q", "-b", "main")
+  _git(origin, "commit", "-q", "--allow-empty", "-m", "reviewed")
+  reviewed = _git(origin, "rev-parse", "HEAD")
+  _git(origin, "commit", "-q", "--allow-empty", "-m", "served")
+  served = _git(origin, "rev-parse", "HEAD")
+  repo = tmp_path / "shallow"
+  subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{origin}", str(repo)],
+    check=True)
+  # An earlier preview can supply the object without deepening the tip.
+  _git(repo, "fetch", "-q", "--depth", "1", "origin", reviewed)
+  assert batches.app_git.ref_is_ancestor(str(repo), reviewed, served) is False
+  app = models.App(name="Shallow", slug="shallow", jsx_source="export default 1",
+    source_dir=str(repo), source_commit=served, version="1")
+  db.add(app)
+  db.commit()
+  with pytest.raises(batches.SettlementUnreadable):
+    batches._settled_outcomes({app.id: reviewed})
+
+
+def test_an_unrelated_commit_on_complete_history_is_not_applied(tmp_path, db):
+  """The negative answer stays usable when the history is complete."""
+  repo = tmp_path / "complete"
+  repo.mkdir()
+  _git(repo, "init", "-q", "-b", "main")
+  _git(repo, "commit", "-q", "--allow-empty", "-m", "served")
+  served = _git(repo, "rev-parse", "HEAD")
+  _git(repo, "checkout", "-q", "--orphan", "other")
+  _git(repo, "commit", "-q", "--allow-empty", "-m", "reviewed elsewhere")
+  reviewed = _git(repo, "rev-parse", "HEAD")
+  assert batches.app_git.ref_is_ancestor(str(repo), reviewed, served) is False
+  app = models.App(name="Complete", slug="complete", jsx_source="export default 1",
+    source_dir=str(repo), source_commit=served, version="1.0")
+  db.add(app)
+  db.commit()
+  outcome = batches._settled_outcomes({app.id: reviewed})[app.id]
+  assert (outcome["status"], outcome["error_code"]) == ("failed", "update_not_applied")
+
+
+def test_a_file_where_the_receipt_directory_belongs_is_unknown(tmp_path, db, monkeypatch):
+  path = pending_update.pending_update_receipt_file(tmp_path)
+  path.parent.parent.mkdir(parents=True)
+  path.parent.write_bytes(b"corrupted receipt directory")
+  assert pending_update.pending_conflict_update_receipt_present(tmp_path)
+  monkeypatch.setattr(batches.app_git, "ref_is_ancestor", lambda *_: False)
+  monkeypatch.setattr(batches.app_git, "history_is_complete", lambda *_: True)
+  app = models.App(name="Receipt directory", slug="receipt-dir", jsx_source="export default 1",
+    source_dir=str(tmp_path), source_commit="b" * 40, version="1")
+  db.add(app)
+  db.commit()
+  with pytest.raises(batches.SettlementUnreadable):
+    batches._settled_outcomes({app.id: COMMIT})

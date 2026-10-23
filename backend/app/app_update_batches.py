@@ -125,18 +125,21 @@ def _pending_receipt(source_dir: str, app_id: int, commit: str) -> dict | None:
 def _contains(source_dir: str, reviewed_commit: str, source_commit: str) -> bool:
   """Whether the served revision contains the reviewed commit.
 
-  Proven by Git's ancestry check, or, for a reviewed commit Git cannot
-  resolve (an update never fetched), by walking the served revision's
-  complete history. Missing objects or partial history are unknown.
+  A positive ancestry answer is proof on its own. A negative one is trusted
+  only on complete history (not shallow, every commit readable): across a
+  shallow boundary Git can answer "no" without seeing the reviewed commit.
+  On complete history, a reviewed commit Git does not have (an update never
+  fetched) is not contained either. Anything else is unknown.
   """
   contained = app_git.ref_is_ancestor(source_dir, reviewed_commit, source_commit)
-  if contained is None:
-    contained = app_git.complete_history_contains(
-      source_dir, reviewed_commit, source_commit,
-    )
-  if contained is None:
-    raise SettlementUnreadable(f"history of {source_dir}")
-  return contained
+  if contained is True:
+    return True
+  if app_git.history_is_complete(source_dir, source_commit):
+    if contained is False:
+      return False
+    if app_git.commit_object_absent(source_dir, reviewed_commit):
+      return False
+  raise SettlementUnreadable(f"history of {source_dir}")
 
 
 def _reviewed_commit_landed(
