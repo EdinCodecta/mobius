@@ -160,6 +160,24 @@ def test_idle_live_grant_keeps_unpushed_files_until_dormant_grace(setup, monkeyp
   assert not path.exists()
 
 
+def test_rejected_push_keeps_idle_checkout_through_dormant_grace(setup, monkeypatch, tmp_path):
+  db, row, principal = setup
+  row.mode = "review_fix_merge"
+  db.get(models.ChatRun, principal.run_id).status = "completed"
+  path = tmp_path / "repair-rejected"
+  path.mkdir()
+  (path / "unpushed.py").write_text("preserve rejected commit\n")
+  monkeypatch.setattr(repairs, "_checkout_root", lambda: tmp_path)
+  domain.save_outcome(db, row, domain.key(ITEM), {"state": "needs_you",
+    "checkout": {"checkout": str(path), "initial_head_sha": SHA},
+    "repair_attempts": [{"state": "rejected", "from_sha": SHA,
+      "head_sha": NEW, "checkout": str(path)}]})
+  monkeypatch.setattr(repairs, "_last_activity", lambda candidate: 0)
+  repairs.sweep_stale_checkouts(**actions.checkout_gc_scope(db),
+    now=repairs.STALE_EDIT_SECONDS - 1)
+  assert (path / "unpushed.py").read_text() == "preserve rejected commit\n"
+
+
 def test_unreceipted_checkout_gets_one_hour_orphan_grace(monkeypatch, tmp_path):
   monkeypatch.setattr(repairs, "_checkout_root", lambda: tmp_path)
   path = tmp_path / "repair-unreceipted"
