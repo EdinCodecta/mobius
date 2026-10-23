@@ -151,6 +151,7 @@ export const coldRestoredCanvasAppId =
  *   replaceImplicitBootTab
  *                       true when the only boot tab is the unpinned home
  *                       surface, which an explicit deep link replaces.
+ *   beforeDrawerOpenRef   captures focus before the modal makes content inert.
  *   beforeRestoreRouteRef optional synchronous Back/Forward destination hook,
  *                       run after validation but before workspace mutation.
  *
@@ -169,6 +170,7 @@ export default function useNavigation({
   replaceImplicitBootTab,
   dragActiveRef,
   beforeRestoreRouteRef,
+  beforeDrawerOpenRef,
   navigationStorage = localStore(),
   routePath = '/shell/',
 }) {
@@ -714,6 +716,7 @@ export default function useNavigation({
           closeTraversal.recovered = true
         }
         drawerOpenRef.current = true
+        beforeDrawerOpenRef?.current?.()
         setDrawerVisible(true)
         return
       }
@@ -745,6 +748,7 @@ export default function useNavigation({
     // Advance the ref synchronously so a same-batch open→close sees "open" and
     // does not leave the just-pushed sentinel dangling (§5.3.2).
     drawerOpenRef.current = true
+    beforeDrawerOpenRef?.current?.()
     setDrawerVisible(true)
   }
 
@@ -1648,6 +1652,7 @@ export default function useNavigation({
       if (destination?.kind === 'drawer') {
         drawerPushedRef.current = true
         drawerOpenRef.current = true
+        beforeDrawerOpenRef?.current?.()
         setDrawerVisible(true)
       } else {
         drawerPushedRef.current = false

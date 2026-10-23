@@ -1,6 +1,7 @@
 import { memo, useRef } from 'react'
 import { useLogoModeGesture } from './useLogoModeGesture.js'
 import {
+  isEditableTarget,
   SHELL_SHORTCUTS,
   shortcutMatches,
 } from '../../lib/keyboardShortcuts.js'
@@ -64,6 +65,12 @@ const ShellBrand = memo(function ShellBrand({
           // A deliberate interaction immediately clears Android's compatibility-
           // click guard left by an OS Back gesture.
           backFiredRef.current = false
+          // Keep the source field focused until the click can remember which
+          // keyboard to restore. Opening navigation then dismisses it; a
+          // cancelled press or a Builder hold must not dismiss it early.
+          if (e.pointerType !== 'mouse' && isEditableTarget(document.activeElement)) {
+            e.preventDefault()
+          }
           logoGesture.onPointerDown(e)
         }}
         onPointerMove={logoGesture.onPointerMove}
