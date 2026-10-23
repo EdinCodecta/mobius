@@ -475,8 +475,17 @@ def push_repair(gh, cwd: Path, row, target: dict, validation: dict, *, before_pu
     repeated = validate_repair(gh, cwd, row, target, snapshot, base_sha=base_sha)
     if repeated["head_sha"] != fresh["head_sha"] or repeated["diff_sha256"] != fresh["diff_sha256"]:
       _fail("The repair checkout changed before dispatch.")
+    # The repeated proof may involve GitHub reads. Neither its old head check
+    # nor its earlier Stop check is a final dispatch guard.
+    if _branch_head(gh, cwd, slug, branch) != target["head_sha"]:
+      _fail("The remote PR head moved before the repair push.")
     if _target_base_head(gh, cwd, target) != base_sha:
       _fail("The target base moved before repair dispatch. Test the new combined result first.")
+    if before_push is not None:
+      # This also re-proves queue-removal authority in newer callers. Remote
+      # state cannot be sampled atomically with a push, but Stop observed
+      # during the repeated proof must never be ignored.
+      before_push()
   except Exception:
     # Every exception above occurs before the push subprocess is invoked.
     # In particular an execution callback refusal is never push_unknown.

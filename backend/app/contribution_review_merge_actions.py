@@ -12,8 +12,14 @@ async def dispatch_merge(gh, cwd, target, repo, checks, authorize):
   """Authority refusal precedes dispatch; a received remote fact survives Stop."""
   try:
     authorize()
+    # The earlier gate ran before reservation and claim persistence. A moved
+    # target tip is a known refusal, not an uncertain merge/queue attempt.
+    await asyncio.to_thread(reviews.assert_current_base, gh, cwd, target)
+    authorize()
   except HTTPException as exc:
     return DispatchResult.not_dispatched(str(exc.detail))
+  except Exception:
+    return DispatchResult.not_dispatched("The final target-base check failed before merge dispatch.")
   try:
     if checks.get("isMergeQueueEnabled") is True:
       receipt = await settled.run_settled(reviews.enqueue, gh, cwd, target)
