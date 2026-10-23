@@ -19,7 +19,7 @@ from app import contribution_review_repair_actions as repair_actions
 from app.contribution_review_public_actions import post_public_review
 from app.contribution_review_public import EVIDENCE_MAX_CHARS
 from app.contribution_errors import ContributionSubmitError
-from app.contribution_review_effects import DispatchResult, NotDispatched
+from app.contribution_review_effects import DispatchResult, NotDispatched, classify_dispatch_error
 from app import contribution_review_merge_actions as merge_actions
 from app.chat_start import start_programmatic_chat_turn
 from app.chat_visibility import coerce_agent_settings
@@ -1160,9 +1160,7 @@ async def _dispatch_ready(row, target, cwd):
   """One settled mutation; read-only confirmation never depends on the old base."""
   try:
     mutation = await settled.run_settled(reviews.mark_ready, _gh, cwd, target)
-  except NotDispatched as exc:
-    return DispatchResult.not_dispatched(str(exc))
-  except Exception:
-    return DispatchResult.unknown("The readiness response is uncertain.")
+  except (NotDispatched, ContributionSubmitError, HTTPException, OSError, json.JSONDecodeError) as exc:
+    return classify_dispatch_error(exc)
   blocked = await _confirm_ready_attempt(row, target, cwd)
   return DispatchResult.unknown(blocked) if blocked else DispatchResult.confirmed(mutation)

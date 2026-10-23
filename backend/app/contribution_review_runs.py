@@ -800,9 +800,12 @@ def mark_ready(gh, cwd, target):
   # GitHub's mutation has no expected-head parameter: caller must hold the
   # credential lock and recheck the exact PR immediately before this call.
   query = """mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft headRefOid}}}"""
-  result = json.loads(gh(cwd, "api", "graphql", "-f", f"query={query}",
-    "-f", f"id={target['pr_id']}").stdout)
-  pull = ((result.get("data") or {}).get("markPullRequestReadyForReview") or {}).get("pullRequest")
+  response = gh(cwd, "api", "graphql", "-f", f"query={query}",
+    "-f", f"id={target['pr_id']}", check=False)
+  result = graphql_mutation_result(response)
+  data = result.get("data")
+  mutation = data.get("markPullRequestReadyForReview") if isinstance(data, dict) else None
+  pull = mutation.get("pullRequest") if isinstance(mutation, dict) else None
   if (result.get("errors") or not isinstance(pull, dict) or pull.get("id") != target["pr_id"]
       or pull.get("headRefOid") != target["head_sha"] or pull.get("isDraft") is not False):
     raise HTTPException(409, "GitHub did not confirm readiness of the exact pull request.")
