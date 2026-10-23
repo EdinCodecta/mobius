@@ -88,6 +88,8 @@ import { hasSendablePayload } from './composerSubmission.js'
 import AgentContextInspector from './AgentContextInspector.jsx'
 import ContextPanel from './ContextPanel.jsx'
 import SideQuestionCard from './SideQuestionCard.jsx'
+import SharedFolderUploadPrompt from './SharedFolderUploadPrompt.jsx'
+import useSharedFolderUploadGate from './useSharedFolderUploadGate.js'
 import useSideQuestion from './hooks/useSideQuestion.js'
 import ChatSummaryViewer from './ChatSummaryViewer.jsx'
 import ChatDiffViewer from './ChatDiffViewer.jsx'
@@ -719,6 +721,14 @@ export default function ChatView({
     setDraftAside,
     takeDraftBack,
   } = useComposerDraftState({ chatId, hidden, inputRef })
+  const appendToComposer = useCallback((text) => {
+    const current = inputValueRef.current || ''
+    handleComposerInputChange(current.trim() ? `${current.trimEnd()}\n${text}` : text)
+  }, [handleComposerInputChange, inputValueRef])
+  // Big uploads wait here until the owner chooses to share the folder instead.
+  const uploadGate = useSharedFolderUploadGate({
+    chatId, addFiles: handleComposerAddFiles, appendToComposer,
+  })
   const composerDraftAside = useMemo(
     () => ({ set: setDraftAside, take: takeDraftBack }),
     [setDraftAside, takeDraftBack],
@@ -6115,7 +6125,7 @@ export default function ChatView({
     getDepth: () => fileDragDepthRef.current,
     setDepth: depth => { fileDragDepthRef.current = depth },
     setActive: setFileDropActive,
-    onFiles: handleComposerAddFiles,
+    onFiles: uploadGate.addFiles,
   })
   const reservedSteerMessage = combineOwnerMessagesForDisplay(
     pendingQueue.steerReservedMessages,
@@ -6602,6 +6612,12 @@ export default function ChatView({
           onClose={sideQuestions.close}
           onRetry={sideQuestions.retry}
         />
+        <SharedFolderUploadPrompt
+          pending={uploadGate.pending}
+          onUploadAnyway={uploadGate.uploadAnyway}
+          onCancel={uploadGate.cancel}
+          onShared={uploadGate.folderShared}
+        />
         <ChatInputBar
           chatId={chatId}
           input={input}
@@ -6636,7 +6652,7 @@ export default function ChatView({
           }
           questionBlocked={hasPendingQuestion && !localAnswerIntents.some(record => record.body?.question_id === answerableQuestionId)}
           pendingFiles={pendingFiles}
-          onAddFiles={handleComposerAddFiles}
+          onAddFiles={uploadGate.addFiles}
           onRemoveFile={handleComposerRemoveFile}
           attachTriggerRef={attachTriggerRef}
           messageHistory={messageHistory}

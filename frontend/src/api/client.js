@@ -310,6 +310,9 @@ function clearOwnerClientState({ preserveChatOutbox }) {
       : [clearChatOutbox()]),
     delDatabase('mobius-signals', 'signal queue').catch(() => {}),
     delDatabase('mobius-listings', 'directory listing cache').catch(() => {}),
+    // Folder permissions this owner granted must not carry over to a later
+    // owner signing in on the same browser.
+    delDatabase('mobius-shared-folders', 'shared folders').catch(() => {}),
     wipeSwCaches().catch(() => {}),
   ])
 }
@@ -1655,6 +1658,17 @@ export const api = {
       `/screen-control/sessions/${encodeURIComponent(sessionId)}`,
       { method: 'DELETE' },
     ),
+  },
+  sharedFolders: {
+    list: () => apiFetch('/shared-folders'),
+    report: (subscriptionId, body) => apiFetch(
+      `/shared-folders/devices/${encodeURIComponent(subscriptionId)}`,
+      { method: 'PUT', body: JSON.stringify(body) },
+    ),
+    respond: (body) => apiFetch('/shared-folders/responses', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   },
   events: {
     // `keepalive` lets the report sent as the page hides outlive the page
