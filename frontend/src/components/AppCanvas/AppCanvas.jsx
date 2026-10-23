@@ -417,6 +417,9 @@ const AppCanvas = forwardRef(function AppCanvas({
   // the scrim, but compositor momentum inside its iframe must be cancelled so
   // background content cannot keep coasting beneath the drawer.
   interactive = visible,
+  // Whether this canvas's live frame is the app's shell navigation target
+  // (`data-app-id`, below). An embedded transcript view of the same app is not.
+  navigationTarget = true,
   pendingIntent = null,
   shellShortcuts = null,
   onNavPush, onNavPop, onNavReset, onNavForwardResult,
@@ -1860,8 +1863,8 @@ const AppCanvas = forwardRef(function AppCanvas({
             // frame carries it (the live one) at every observable moment, so
             // useNavigation's `iframe[data-app-id="…"]` selector always resolves
             // the frame the user sees — even mid-swap. The hidden incoming frame
-            // withholds it.
-            data-app-id={isLive ? appId : undefined}
+            // withholds it, and so does an embedded transcript view.
+            data-app-id={isLive && navigationTarget ? appId : undefined}
             data-frame-version={v}
             // The app document is sandboxed to an opaque origin, so a bare
             // `allow="feature"` (which targets only the src origin) never
