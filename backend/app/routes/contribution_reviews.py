@@ -411,7 +411,12 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
       # A moved or temporarily unreadable PR must not replace their evidence.
       async with chat_queue.get_transition_lock(f"review-admission:{run_id}"):
         _parent(db, row, principal)
-        reviews.save_outcome(db, row, item_key, {**previous, "state": body.state,
+        current = (row.outcomes_json or {}).get(item_key, {})
+        if public.require_same_evidence(current, body.model_dump()):
+          return {"run": _run_view(db, row)}
+        if current != previous:
+          raise HTTPException(409, "This review changed during private reporting. Refresh before continuing.")
+        reviews.save_outcome(db, row, item_key, {**current, "state": body.state,
           "summary": body.summary, "scope": body.scope, "tests": body.tests,
           "tests_passed": body.tests_passed, "reviewed_base_sha": body.reviewed_base_sha,
           "head_sha": body.head_sha, "review_chat_id": row.chat_id,
