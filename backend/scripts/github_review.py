@@ -5,7 +5,7 @@ GitHub is connected in Settings. The platform owns grants, reviewers, receipts
 and public actions; this client neither installs an app nor creates a queue.
 
 Thin app adapters import api, prepare_selection(references, mode, chat_id,
-app_id=None), freeze_preview(selection, options=None, agent=None), and the
+app_id=None), freeze_preview(selection, options=None, agent=None, allow_mark_ready=False), and the
 re-exported verify_selection, start_body and review_path helpers. A saved
 selection binds app_id into its identity; the adapter must not reimplement
 preview hashing, selection inspection or admission.

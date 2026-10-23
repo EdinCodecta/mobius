@@ -30,7 +30,8 @@ def test_cli_app_adapter_identity_and_body_use_canonical_helpers(monkeypatch):
   for name in ("api", "prepare_selection", "freeze_preview", "verify_selection", "start_body", "review_path"):
     assert callable(getattr(cli, name))
   assert tuple(signature(cli.prepare_selection).parameters) == ("references", "mode", "chat_id", "app_id")
-  assert tuple(signature(cli.freeze_preview).parameters) == ("selection", "options", "agent")
+  assert tuple(signature(cli.freeze_preview).parameters) == ("selection", "options", "agent", "allow_mark_ready")
+  assert signature(cli.freeze_preview).parameters["allow_mark_ready"].default is False
   monkeypatch.setattr(cli, "inspect_pr", lambda ref: {**ITEM, "title": "Safe change", "url": "https://github.com/example/project/pull/7"})
   snapshot = {"review_prompt": "Review", "fix_prompt": "Fix", "merge_prompt": "Merge",
     "max_rounds": None, "autopilot": False, "provider": "codex", "model": "test-model",
