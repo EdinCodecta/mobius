@@ -9,7 +9,7 @@ from app import contribution_review_runs as domain
 from app import schema_migrations
 from app.deps import Principal
 from app.routes import contribution_reviews as routes
-from tests.test_contribution_review_runs import ITEM, setup, report
+from tests.test_contribution_review_runs import ITEM, CHECKS, REPO, PULL, TARGET, setup, report
 from scripts import github_review as cli
 from scripts.github_review_selection import review_path, start_body, verify_selection
 
@@ -70,6 +70,25 @@ def test_private_all_clear_survives_moved_base(setup, monkeypatch):
   monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "PR moved")))
   assert report(setup)["run"]["items"][0]["state"] == "all_clear"
   assert asyncio.run(routes.observe_review(1, row.id, db, Principal(owner=row_owner(db, row), app_id=None)))["run"]["items"][0]["state"] == "all_clear"
+
+
+def test_completed_run_view_keeps_fact_when_chat_model_later_changes(setup):
+  db, row, _ = setup
+  row.mode = "review"
+  row.options_json = {"provider": "codex", "model": "old-model", "reasoning_effort": "high"}
+  db.commit()
+  domain.save_outcome(db, row, domain.key(ITEM), {"state": "all_clear", "head_sha": ITEM["head_sha"]})
+  assert routes._run_view(db, row)["state"] == "complete"
+  from app import models
+  chat = db.get(models.Chat, row.chat_id)
+  chat.agent_settings_json = {"model": "new-model", "effort": "high"}
+  db.commit()
+  assert routes._run_view(db, row)["state"] == "complete"
+
+
+def test_null_rollup_does_not_invent_failing_checks():
+  checks = {**CHECKS, "commits": {"nodes": [{"commit": {"statusCheckRollup": None}}]}}
+  assert domain.merge_blocker(TARGET, REPO, PULL, checks) is None
 
 
 def row_owner(db, row):

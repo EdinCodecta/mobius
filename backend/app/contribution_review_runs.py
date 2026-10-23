@@ -118,6 +118,8 @@ def merge_blocker(target, repo, pull, pr) -> str | None:
   if len(commits) != 1:
     return "GitHub did not provide the current check result."
   rollup = (commits[0].get("commit") or {}).get("statusCheckRollup")
+  # Null is not proof that no check will ever register. It only means GitHub
+  # reports no current rollup; fresh merge/queue protections remain the gate.
   if rollup and rollup.get("state") != "SUCCESS":
     return "The current checks have not all passed."
   return None
