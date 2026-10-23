@@ -150,7 +150,10 @@ def _options_input(body):
     raise HTTPException(422, "max_rounds is not supported by this review-only workflow")
   if options.get("autopilot") is True:
     raise HTTPException(422, "autopilot is not supported by this review-only workflow")
-  return {key: options[key] for key in presets.PROMPT_KEYS if key in options}
+  selected = {key: options[key] for key in presets.PROMPT_KEYS if key in options}
+  if options.get("post_review") is True:
+    selected["post_review"] = True
+  return selected
 
 
 def _snapshot(db, body, principal):
