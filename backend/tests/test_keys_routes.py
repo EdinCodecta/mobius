@@ -306,6 +306,24 @@ def test_saved_app_secrets_move_into_the_vault_once(client, auth, db, vault):
   assert "api_key" not in {k["name"] for k in vault.list_keys()}
 
 
+def test_a_purged_apps_unimported_secrets_never_reach_an_app_reusing_its_id(client, auth, db, vault):
+  import asyncio
+  from app.config import get_settings
+  gone = _app(db, "gone")
+  _legacy_secret(gone.id, "api_key", "old-apps-secret")
+  # The first import cannot read the value, so it stays pending for a retry.
+  folder = Path(get_settings().data_dir) / "app-secrets" / str(gone.id)
+  (folder / "api_key").write_bytes(b"not a token yet")
+  assert asyncio.run(key_vault.import_legacy_app_secrets({gone.id})) == {}
+  _legacy_secret(gone.id, "api_key", "old-apps-secret")
+  asyncio.run(key_vault.forget_app(gone.id))   # the purge, before the id is freed
+  assert not folder.exists()
+  # A new app that receives the same id inherits nothing on the next start.
+  assert asyncio.run(key_vault.import_legacy_app_secrets({gone.id})) == {}
+  assert key_vault.reveal_for_app_platform_use(gone.id, "api_key") is None
+  assert vault.list_keys() == []
+
+
 def test_the_deprecated_secret_routes_use_the_vault(client, auth, db, vault):
   weather = _app(db, "weather")
   app_auth = _app_auth(db, weather)

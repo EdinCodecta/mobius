@@ -129,15 +129,12 @@ async def delete_secret(
 ):
   """Delete the app's key, or only its grant when other apps share the key."""
   _authorize_app(db, principal, app_id)
-  key = await _owned(app_id, name)
   try:
-    others = [a for a in key["grants"]["apps"] if a != app_id]
-    if others:
-      await key_vault.vault_call("PUT", f"/keys/{key['name']}", {
-        "inject": key["inject"], "grants": {**key["grants"], "apps": others},
-      })
-    else:
-      await key_vault.vault_call("DELETE", f"/keys/{key['name']}")
+    released = await key_vault.release_app_key(app_id, name)
   except key_vault.VaultUnavailable as exc:
     raise HTTPException(503, str(exc)) from exc
+  except key_vault.VaultRefused as exc:
+    raise HTTPException(exc.status, exc.reason) from exc
+  if released is None:
+    raise HTTPException(status_code=404, detail="Secret not found.")
   return Response(status_code=204, headers=_DEPRECATION)

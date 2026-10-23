@@ -212,6 +212,21 @@ async def store_app_key(app_id: int, name: str, value: str) -> str:
   return saved["name"]
 
 
+async def release_app_key(app_id: int, name: str) -> dict | None:
+  """Withdraw ``app_id``'s own secret ``name``; None when it owns no such key.
+
+  The vault checks ownership and deletes the key, or only withdraws this
+  app's grant when the owner shares it with other apps, in one locked step
+  (``Vault.release_owned``).
+  """
+  try:
+    return await vault_call("POST", "/owned/release", {"app": int(app_id), "name": name})
+  except VaultRefused as exc:
+    if exc.status == 404:
+      return None
+    raise
+
+
 # -- one-time import of the retired per-app secret store ----------------------
 
 _LEGACY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -298,12 +313,31 @@ async def import_legacy_app_secrets(live_app_ids: set[int]) -> dict:
   return moved
 
 
+def _remove_legacy_secrets(app_id: int) -> None:
+  """Delete a purged app's not-yet-imported values from the retired store.
+
+  The importer assigns each pending file to the live app with that id, so a
+  file left behind would be granted to an unrelated app that reuses the id.
+  Raises if the folder survives, so the purge keeps the id claimed.
+  """
+  import shutil
+  folder = _legacy_root() / str(int(app_id))
+  if folder.is_symlink() or folder.is_file():
+    folder.unlink()
+  elif folder.exists():
+    shutil.rmtree(folder)
+  if folder.exists() or folder.is_symlink():
+    raise OSError(f"legacy secrets for app {app_id} survived removal")
+
+
 async def forget_app(app_id: int) -> None:
   """Drop a purged app from every grant and request; raise if that fails.
 
-  An instance whose vault never stored anything has nothing to forget, so a
-  purge does not depend on a vault that was never used.
+  Its values still waiting in the retired per-app store are deleted first.
+  An instance whose vault never stored anything has nothing else to forget,
+  so a purge does not depend on a vault that was never used.
   """
+  await asyncio.to_thread(_remove_legacy_secrets, app_id)
   folder = vault_dir()
   if not (folder / "keys.json").exists() and not (folder / "requests.json").exists():
     return

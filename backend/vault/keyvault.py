@@ -617,6 +617,39 @@ class Vault:
           return {"name": name, "created": True}
     raise VaultError(409, f"No free vault name for {secret_name}.")
 
+  def release_owned(self, app_id: int, secret_name: str) -> dict | None:
+    """Let an app give up its own secret, in one locked step.
+
+    The app's grant is withdrawn from the key it created for ``secret_name``.
+    When no other app still holds a grant, the key itself is deleted;
+    otherwise it stays, with the owner's current settings, for the apps the
+    owner shared it with. Checking ownership and changing the key under the
+    same lock means a grant the owner adds meanwhile is never lost or deleted.
+    Returns None when the app owns no such key.
+    """
+    origin = validate_origin({"app": app_id, "name": secret_name})
+    with self._lock:
+      name = next(
+        (n for n, r in self._records.items()
+         if r.get("origin") == origin and app_id in r["grants"]["apps"]),
+        None,
+      )
+      if name is None:
+        return None
+      grants = self._records[name]["grants"]
+      others = [a for a in grants["apps"] if a != app_id]
+      if others:
+        grants["apps"] = others
+        self._records[name]["updated_at"] = _now()
+      else:
+        del self._records[name]
+      self._save()
+    self.log_usage(
+      name, caller_text(("app", str(app_id))), "-", "-", "-",
+      "released" if others else "revoked",
+    )
+    return {"name": name, "deleted": not others}
+
   def revoke_key(self, name: str) -> bool:
     validate_name(name)
     with self._lock:
@@ -939,6 +972,14 @@ class VaultHandler(BaseHTTPRequestHandler):
       if not isinstance(body.get("app"), int) or not isinstance(body.get("name"), str):
         raise VaultError(400, "Name the app id and its secret name.")
       self._send_json(200, vault.save_owned(body["app"], body["name"], body.get("value")))
+    elif method == "POST" and parts == ["owned", "release"]:
+      body = self._json_body()
+      if not isinstance(body.get("app"), int) or not isinstance(body.get("name"), str):
+        raise VaultError(400, "Name the app id and its secret name.")
+      released = vault.release_owned(body["app"], body["name"])
+      if released is None:
+        raise VaultError(404, "That app owns no such key.")
+      self._send_json(200, released)
     elif method == "DELETE" and len(parts) == 2 and parts[0] == "apps" and parts[1].isdigit():
       self._send_json(200, vault.forget_app(int(parts[1])))
     elif method == "DELETE" and len(parts) == 2 and parts[0] == "requests":

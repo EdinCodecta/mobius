@@ -451,3 +451,26 @@ def test_save_owned_finds_or_creates_by_origin_under_one_lock(vault):
   assert sum(r["created"] for r in results) == 1
   owned = [k for k in vault.list_keys() if k["origin"] == {"app": 9, "name": "api.key"}]
   assert [k["name"] for k in owned] == ["api-key"]
+
+
+def test_releasing_an_owned_key_keeps_the_owners_current_sharing(vault):
+  saved = vault.save_owned(9, "api.key", DUMMY)
+  [record] = [k for k in vault.list_keys() if k["name"] == saved["name"]]
+  # The owner shares the key and changes how it is sent after the app saved it.
+  vault.put_key(saved["name"], {"inject": HEADER_SLOT,
+                                "grants": {**record["grants"], "apps": [9, 11]}})
+  assert vault.release_owned(9, "api.key") == {"name": saved["name"], "deleted": False}
+  [kept] = [k for k in vault.list_keys() if k["name"] == saved["name"]]
+  assert kept["grants"]["apps"] == [11] and kept["inject"] == HEADER_SLOT
+  assert vault.reveal(saved["name"], ("owner", "")) == DUMMY
+  # It is no longer the app's own key, so a second release finds nothing.
+  assert vault.release_owned(9, "api.key") is None
+
+
+def test_releasing_an_unshared_owned_key_deletes_it_and_never_touches_borrowed_keys(vault):
+  saved = vault.save_owned(9, "api.key", DUMMY)
+  assert vault.release_owned(9, "api.key") == {"name": saved["name"], "deleted": True}
+  assert saved["name"] not in {k["name"] for k in vault.list_keys()}
+  # "echo" is granted to WEATHER but was never created by it.
+  assert vault.release_owned(WEATHER, "echo") is None
+  assert "echo" in {k["name"] for k in vault.list_keys()}
