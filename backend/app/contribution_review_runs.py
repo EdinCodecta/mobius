@@ -472,7 +472,10 @@ def brief(row):
     "Evidence freezes once dispatch is armed; identical retry is read-only.\n"
     if frozen.get("post_review") is True else ""
   )
-  return f'''{public_note}Review this exact selected public PR batch privately. Mode: {row.mode}.
+  opener = ("Review this exact selected public PR batch and report privately unless you publish a verdict."
+    if frozen.get("post_review") is True else "Review this exact selected public PR batch privately.")
+  publish_field = ' "publish": false,\n' if frozen.get("post_review") is True else ""
+  return f'''{public_note}{opener} Mode: {row.mode}.
 Frozen run prompts (mandatory instructions take priority):
 {json.dumps({k: frozen[k] for k in ("review_prompt", "fix_prompt", "merge_prompt", "mandatory_instructions") if k in frozen})}
 Read the core github-workflows skill (no Contribute installation required).
@@ -491,7 +494,7 @@ Do not edit any author's public branch, post comments/reviews, approve your own 
 push, or call raw GitHub mutations. Your own PRs are eligible for private review.
 For EACH target submit POST {endpoint} with your run bearer and JSON
 {{"repo": "owner/repo", "number": 1, "head_sha": "exact selected SHA",
- "state": "all_clear" or "needs_you", "summary": "evidence or concrete question",
+{publish_field} "state": "all_clear" or "needs_you", "summary": "evidence or concrete question",
  "scope": ["correctness", "maintainability", "simplicity", "tests", "security_privacy", "technical_debt"], "tests": "checks run and exact evidence, or justified limitations"}}.
 Only report all_clear after thorough exact-head review. The guarded endpoint,
 not you, attempts a normal merge only if this batch explicitly granted it and
