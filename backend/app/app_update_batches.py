@@ -51,6 +51,10 @@ _RETAIN_COMPLETE = timedelta(days=30)
 _NOT_APPLIED = (
   "This update was not applied. Check the app's update again before retrying."
 )
+_UNKNOWN_OUTCOME = (
+  "Whether this update landed could not be read yet; it is checked again "
+  "when this progress is opened."
+)
 _UNREADABLE = (
   "Saved update progress could not be read, so batch updates are paused; "
   "this is retried on the next request. Apps can still be updated one at a "
@@ -108,8 +112,8 @@ async def install_reviewed_update(update: dict) -> dict:
 
 
 class SettlementUnreadable(Exception):
-  """Durable app state could not be read, so whether an update landed is
-  unknown. Never a verdict: the entry keeps its state and is read again."""
+  """One app's durable state could not be read, so whether its update landed
+  is unknown. Never a verdict: that entry keeps its state and is read again."""
 
 
 def _pending_receipt(source_dir: str, app_id: int, commit: str) -> dict | None:
@@ -127,8 +131,9 @@ def _contains(source_dir: str, reviewed_commit: str, source_commit: str) -> bool
 
   Ancestry is read from commit objects, never the commit-graph cache, whose
   stale or corrupt parents could answer "no" falsely. A positive answer is
-  proof on its own. A negative one is trusted only on complete history (not shallow, every commit readable): across a
-  shallow boundary Git can answer "no" without seeing the reviewed commit.
+  proof on its own. A negative one is trusted only on complete history (not
+  shallow, every commit readable): across a shallow boundary Git can answer
+  "no" without seeing the reviewed commit.
   On complete history, a reviewed commit Git does not have (an update never
   fetched) is not contained either. Anything else is unknown.
   """
@@ -143,32 +148,45 @@ def _contains(source_dir: str, reviewed_commit: str, source_commit: str) -> bool
   raise SettlementUnreadable(f"history of {source_dir}")
 
 
-def _reviewed_commit_landed(
-  source_dir: str, app_id: int, reviewed_commit: str, source_commit: str | None,
-) -> bool:
-  """The served revision contains the reviewed commit, which is not pending.
+def _settled_outcome(
+  app_id: int, commit: str, row: tuple,
+) -> dict:
+  """One app's verdict, or ``SettlementUnreadable`` rather than a guess.
 
-  ``main`` can hold unapplied edits, and a conflicted update records the
-  reviewed commit as its upstream without serving it; only the accepted
-  ``source_commit`` is evidence. Only a receipt that names this commit means
-  it is still pending: a leftover pending directory or checkout is harmless,
-  and a receipt for a later update does not unseat an earlier one that landed.
-  Raises ``SettlementUnreadable`` rather than guess.
+  The pending receipt is read first: one naming this commit means
+  ``conflict`` whatever the history says. Only once it is proven absent does
+  ancestry decide between ``updated`` and not applied. ``main`` can hold
+  unapplied edits, and a conflicted update records the reviewed commit as its
+  upstream without serving it; only the accepted ``source_commit`` is
+  evidence. A leftover pending directory or checkout is harmless, and a
+  receipt for a later update does not unseat an earlier one that landed.
   """
-  return bool(source_commit) and _contains(
-    source_dir, reviewed_commit, source_commit,
-  ) and _pending_receipt(source_dir, app_id, reviewed_commit) is None
+  source_dir, source_commit, version, resolver, resolver_commit = row
+  if _pending_receipt(source_dir, app_id, commit) is not None:
+    return {
+      "status": "conflict", "version": version, "error": "",
+      "error_code": None, "retryable": False,
+      "resolver_chat_id": resolver if resolver_commit == commit else None,
+    }
+  if source_commit and _contains(source_dir, commit, source_commit):
+    return {
+      "status": "updated", "version": version, "error": "",
+      "error_code": None, "retryable": False, "resolver_chat_id": None,
+    }
+  return {
+    "status": "failed", "error": _NOT_APPLIED,
+    "error_code": "update_not_applied", "retryable": False, "resolver_chat_id": None,
+  }
 
 
 def _settled_outcomes(reviewed: dict[int, str]) -> dict[int, dict]:
   """The one "did it land" rule, from durable app state. Read-only, blocking.
 
-  ``reviewed`` maps app id to its reviewed upstream commit. For each app:
-  ``updated`` iff the accepted source contains that commit and no pending
-  update remains; ``conflict`` iff a pending-update receipt names that
-  commit (with the resolver chat opened for it); not applied only once both
-  reads succeed. A failed read raises ``SettlementUnreadable``, never a
-  verdict. Callers apply the returned patches to their record on the loop.
+  ``reviewed`` maps app id to its reviewed upstream commit. Each app settles
+  on its own (``_settled_outcome``). An app whose state cannot be read gets
+  only an explanatory note, no status: its entry stays unfinished and is
+  settled again later, while every other app still settles. Callers apply
+  the returned patches to their record on the loop.
   """
   with SessionLocal() as db:
     rows = {
@@ -190,23 +208,14 @@ def _settled_outcomes(reviewed: dict[int, str]) -> dict[int, dict]:
         "error_code": "app_not_found", "retryable": False, "resolver_chat_id": None,
       }
       continue
-    source_dir, source_commit, version, resolver, resolver_commit = row
-    if _reviewed_commit_landed(source_dir, app_id, commit, source_commit):
-      outcomes[app_id] = {
-        "status": "updated", "version": version, "error": "",
-        "error_code": None, "retryable": False, "resolver_chat_id": None,
-      }
-    elif _pending_receipt(source_dir, app_id, commit) is not None:
-      outcomes[app_id] = {
-        "status": "conflict", "version": version, "error": "",
-        "error_code": None, "retryable": False,
-        "resolver_chat_id": resolver if resolver_commit == commit else None,
-      }
-    else:
-      outcomes[app_id] = {
-        "status": "failed", "error": _NOT_APPLIED,
-        "error_code": "update_not_applied", "retryable": False, "resolver_chat_id": None,
-      }
+    try:
+      outcomes[app_id] = _settled_outcome(app_id, commit, row)
+    except SettlementUnreadable as exc:
+      log.warning(
+        "app %s update to %s is unknown: %s could not be read",
+        app_id, commit, exc, exc_info=exc.__cause__ is not None,
+      )
+      outcomes[app_id] = {"error": _UNKNOWN_OUTCOME}
   return outcomes
 
 
@@ -219,6 +228,8 @@ def _apply(record: dict, outcomes: dict[int, dict]) -> bool:
   changed = False
   for entry in record["entries"]:
     patch = outcomes.get(entry["app_id"])
+    if patch and "status" not in patch and entry["status"] not in _ACTIVE:
+      continue  # An unknown note never replaces a settled result.
     if patch and any(entry.get(k) != v for k, v in patch.items()):
       entry.update(patch)
       changed = True
@@ -339,10 +350,11 @@ class AppUpdateBatches:
         raise
       self.records = records
     except Exception:
-      # A damaged receipt or a failed settlement read (including a database
-      # error) must not fail readiness for unrelated chats and apps. Disable
-      # only this owner, visibly, and keep the evidence for repair. A failed
-      # settlement write is a write failure (_write_failed set it): never retried.
+      # A damaged batch receipt or a database error must not fail readiness
+      # for unrelated chats and apps. Disable only this owner, visibly, and
+      # keep the evidence for repair. One app's unreadable state never gets
+      # here: that entry alone stays unfinished. A failed settlement write is
+      # a write failure (_write_failed set it): never retried.
       self._read_failed = self.failure != _UNSAVED
       if self._read_failed:
         self.failure = _UNREADABLE
@@ -497,26 +509,26 @@ class AppUpdateBatches:
 
     A conflict takes whatever the rule says. A failure keeps its own reason
     unless the reviewed commit has since landed (the owner updated the app
-    another way), when it is no longer actionable.
+    another way), when it is no longer actionable. An entry left unfinished
+    because its outcome was unknown (and no longer running) is settled again.
     """
     record = self.records.get(key)
     if record is None:
       raise HTTPException(404, "App update batch not found.")
     if db is not None:
       db.rollback()  # release the request's read before blocking work
-    actionable = _unfinished(record, record["entries"], {"conflict", "failed"})
+    statuses = {"conflict", "failed"}
+    if key not in self.tasks:
+      # Nothing runs it: an entry left unfinished by an unknown settlement.
+      statuses |= _ACTIVE
+    actionable = _unfinished(record, record["entries"], statuses)
     if not actionable:
       return
-    try:
-      outcomes = await asyncio.to_thread(_settled_outcomes, actionable)
-    except SettlementUnreadable:
-      # Unknown is not a new answer: the saved result stands until a read works.
-      log.warning("app update batch %s results could not be re-read", key, exc_info=True)
-      return
+    outcomes = await asyncio.to_thread(_settled_outcomes, actionable)
     failed = {e["app_id"] for e in record["entries"] if e["status"] == "failed"}
     outcomes = {
       app_id: patch for app_id, patch in outcomes.items()
-      if app_id not in failed or patch["status"] == "updated"
+      if app_id not in failed or patch.get("status") == "updated"
     }
     if _apply(record, outcomes):
       try:
@@ -575,16 +587,11 @@ class AppUpdateBatches:
         # Shutdown, queued or running: the installer has settled. Read what
         # actually landed off the loop, then apply it here, where siblings
         # also save this record.
-        try:
-          outcomes = await asyncio.to_thread(
-            _settled_outcomes, _unfinished(record, [entry]),
-          )
-        except SettlementUnreadable:
-          # Unknown stays unfinished, never "not applied": boot settles it.
-          log.warning("app update for %s could not be settled", entry["app_id"], exc_info=True)
-        else:
-          _apply(record, outcomes)
-          await self._save_off_loop(record)
+        # An unknown outcome stays unfinished, never "not applied".
+        _apply(record, await asyncio.to_thread(
+          _settled_outcomes, _unfinished(record, [entry]),
+        ))
+        await self._save_off_loop(record)
         raise
       activity.log_event(
         "app_update_outcome", batch_id=record["id"], app_id=entry["app_id"],

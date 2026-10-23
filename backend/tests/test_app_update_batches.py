@@ -803,13 +803,15 @@ def test_landed_rule_against_a_real_repository(tmp_path):
   subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "other", base], check=True)
   unrelated = commit("served without the update")
 
-  assert batches._reviewed_commit_landed(str(repo), 1, reviewed, resolved) is True
-  assert batches._reviewed_commit_landed(str(repo), 1, reviewed, reviewed) is True
-  assert batches._reviewed_commit_landed(str(repo), 1, reviewed, unrelated) is False
-  assert batches._reviewed_commit_landed(str(repo), 1, reviewed, base) is False
+  assert batches._contains(str(repo), reviewed, resolved) is True
+  assert batches._contains(str(repo), reviewed, reviewed) is True
+  assert batches._contains(str(repo), reviewed, unrelated) is False
+  assert batches._contains(str(repo), reviewed, base) is False
+  row = (str(repo), resolved, "1.0", None, None)
+  assert batches._settled_outcome(1, reviewed, row)["status"] == "updated"
   # A receipt naming the reviewed commit means its answer is not installed.
   _Receipts().add(repo, 1, reviewed)
-  assert batches._reviewed_commit_landed(str(repo), 1, reviewed, resolved) is False
+  assert batches._settled_outcome(1, reviewed, row)["status"] == "conflict"
 
 
 def test_landed_update_with_a_leftover_pending_directory_reads_updated(tmp_path, db):
@@ -1157,9 +1159,11 @@ def _unreadable_receipt(source_dir):
 
 @pytest.mark.asyncio
 async def test_unreadable_settlement_state_is_never_a_failed_update(tmp_path, db, monkeypatch):
-  """Restart settles only from reads that worked; unknown pauses and retries."""
+  """Restart settles only from reads that worked. An unknown app stays
+  unfinished on its own; the owner keeps accepting other apps' batches."""
   app_id = add_app(db, tmp_path, "unknown", version="1.0", upstream_commit=COMMIT,
     source_commit=LANDED)
+  healthy = add_app(db, tmp_path, "healthy", version="1.0", source_commit=LANDED)
   body = request(app_id)
   key = str(body.id)
   owner = batches.AppUpdateBatches(str(tmp_path))
@@ -1168,28 +1172,35 @@ async def test_unreadable_settlement_state_is_never_a_failed_update(tmp_path, db
     "updates": [u.model_dump() for u in body.updates],
     "entries": [{"app_id": app_id, "status": "applying", "version": "1.0", "error": ""}]})
 
-  async def assert_paused():
-    reboot = batches.AppUpdateBatches(str(tmp_path))
+  async def reboot_leaves_it_unfinished():
+    reboot = batches.AppUpdateBatches(str(tmp_path), execute=lambda update: asyncio.Event().wait())
     await reboot.start()
-    assert not reboot.accepting and reboot.failure == batches._UNREADABLE
+    assert reboot.accepting and reboot.failure is None
     saved = json.loads((reboot.root / f"{key}.json").read_text())
     assert (saved["phase"], saved["entries"][0]["status"]) == ("applying", "applying")
+    assert saved["entries"][0]["error"] == batches._UNKNOWN_OUTCOME
     return reboot
 
   with monkeypatch.context() as patch:
     _unknown_history(patch)
-    await assert_paused()
+    reboot = await reboot_leaves_it_unfinished()
+    # An unrelated app's batch is still accepted; this app's stays blocked.
+    assert reboot.submit(request(healthy), db)["entries"][0]["status"] == "queued"
+    with pytest.raises(HTTPException) as running:
+      reboot.submit(request(app_id), db)
+    assert running.value.status_code == 409
+    await reboot.stop()
   monkeypatch.setattr(batches.app_git, "object_ancestry",
     lambda path, reviewed, accepted: reviewed == COMMIT and accepted == LANDED)
   _unreadable_receipt(tmp_path / "unknown")
-  reboot = await assert_paused()
+  reboot = await reboot_leaves_it_unfinished()
 
-  # Once the reads work again, the next request settles what really happened.
+  # Once the reads work again, opening the progress settles what happened.
   pending_update.pending_update_receipt_file(tmp_path / "unknown").rmdir()
-  await reboot.retry_start()
-  assert reboot.accepting
+  await reboot.refresh_results(key, db)
   entry = reboot.snapshot(key)["entries"][0]
-  assert (entry["status"], entry["version"]) == ("updated", "1.0")
+  assert (entry["status"], entry["version"], entry["error"]) == ("updated", "1.0", "")
+  assert reboot.snapshot(key)["phase"] == "complete"
 
 
 def test_a_reviewed_commit_never_fetched_proves_not_applied(tmp_path, db):
@@ -1269,8 +1280,7 @@ def test_a_missing_history_object_is_unknown_not_not_applied(tmp_path, db):
 
   (repo / ".git" / "objects" / reviewed[:2] / reviewed[2:]).unlink()
   assert batches.app_git.object_ancestry(str(repo), reviewed, served) is None
-  with pytest.raises(batches.SettlementUnreadable):
-    batches._settled_outcomes({app.id: reviewed})
+  assert batches._settled_outcomes({app.id: reviewed})[app.id] == {"error": batches._UNKNOWN_OUTCOME}
 
 
 def test_a_shallow_served_history_is_unknown(tmp_path, db):
@@ -1334,8 +1344,7 @@ def test_a_shallow_negative_answer_is_unknown_even_with_both_commits(tmp_path, d
     source_dir=str(repo), source_commit=served, version="1")
   db.add(app)
   db.commit()
-  with pytest.raises(batches.SettlementUnreadable):
-    batches._settled_outcomes({app.id: reviewed})
+  assert batches._settled_outcomes({app.id: reviewed})[app.id] == {"error": batches._UNKNOWN_OUTCOME}
 
 
 def test_an_unrelated_commit_on_complete_history_is_not_applied(tmp_path, db):
@@ -1368,8 +1377,7 @@ def test_a_file_where_the_receipt_directory_belongs_is_unknown(tmp_path, db, mon
     source_dir=str(tmp_path), source_commit="b" * 40, version="1")
   db.add(app)
   db.commit()
-  with pytest.raises(batches.SettlementUnreadable):
-    batches._settled_outcomes({app.id: COMMIT})
+  assert batches._settled_outcomes({app.id: COMMIT})[app.id] == {"error": batches._UNKNOWN_OUTCOME}
 
 
 def test_a_commit_graph_cannot_hide_a_missing_history_object(tmp_path, db):
@@ -1390,8 +1398,7 @@ def test_a_commit_graph_cannot_hide_a_missing_history_object(tmp_path, db):
   assert batches.app_git.object_ancestry(str(repo), reviewed, served) is None
   assert batches.app_git.commit_object_absent(str(repo), reviewed) is True
   assert batches.app_git.history_is_complete(str(repo), served) is False
-  with pytest.raises(batches.SettlementUnreadable):
-    batches._settled_outcomes({app.id: reviewed})
+  assert batches._settled_outcomes({app.id: reviewed})[app.id] == {"error": batches._UNKNOWN_OUTCOME}
 
 
 def test_failed_git_reads_never_certify_absence(tmp_path, monkeypatch):
@@ -1452,3 +1459,77 @@ def test_a_corrupt_cached_parent_cannot_make_a_landed_update_not_applied(tmp_pat
   db.add(app)
   db.commit()
   assert batches._settled_outcomes({app.id: reviewed})[app.id]["status"] == "updated"
+
+
+@pytest.mark.asyncio
+async def test_a_shallow_legacy_app_repo_blocks_only_its_own_entry(tmp_path, db):
+  """An app left shallow by an interrupted update stays unknown on its own:
+  boot keeps accepting, and another app's batch is admitted."""
+  origin = tmp_path / "origin"
+  origin.mkdir()
+  _git(origin, "init", "-q", "-b", "main")
+  for message in ("one", "two"):
+    _git(origin, "commit", "-q", "--allow-empty", "-m", message)
+  shallow = tmp_path / "shallow"
+  subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{origin}", str(shallow)],
+    check=True)
+  served = _git(shallow, "rev-parse", "HEAD")
+  legacy = models.App(name="Legacy", slug="legacy", jsx_source="export default 1",
+    source_dir=str(shallow), source_commit=served, version="1.0")
+  db.add(legacy)
+  db.commit()
+  healthy = add_app(db, tmp_path, "healthy", version="1.0", source_commit=served)
+  body = request(legacy.id)  # reviewed COMMIT was never fetched
+  key = str(body.id)
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  await owner.start()
+  owner._save({"id": key, "created_at": _now(),
+    "updates": [u.model_dump() for u in body.updates],
+    "entries": [{"app_id": legacy.id, "status": "applying", "version": "1.0", "error": ""}]})
+
+  reboot = batches.AppUpdateBatches(
+    str(tmp_path), execute=lambda update: asyncio.Event().wait(),
+  )
+  await reboot.start()
+  await reboot.retry_start()
+  assert reboot.accepting and reboot.failure is None
+  entry = reboot.snapshot(key)["entries"][0]
+  assert (entry["status"], entry["error"]) == ("applying", batches._UNKNOWN_OUTCOME)
+  other = reboot.submit(request(healthy), db)
+  assert other["entries"][0]["app_id"] == healthy
+  await reboot.stop()
+
+
+def test_a_receipt_naming_the_commit_is_a_conflict_whatever_the_history(
+  tmp_path, db, monkeypatch,
+):
+  app_id = add_app(db, tmp_path, "pending", version="1.0", source_commit=LANDED)
+  _Receipts().add(tmp_path / "pending", app_id)
+  _unknown_history(monkeypatch)
+  assert batches._settled_outcomes({app_id: COMMIT})[app_id]["status"] == "conflict"
+
+
+@pytest.mark.asyncio
+async def test_refresh_settles_every_entry_it_can_beside_an_unknown_one(
+  tmp_path, db, git_state, monkeypatch,
+):
+  """One app's unreadable receipt no longer stops its siblings re-settling."""
+  unknown = add_app(db, tmp_path, "unknown", version="1.0", source_commit="1" * 40)
+  landed = add_app(db, tmp_path, "landed", version="2.0", source_commit=LANDED)
+  body = request(unknown, landed)
+  key = str(body.id)
+  owner = batches.AppUpdateBatches(str(tmp_path))
+  await owner.start()
+  owner._save({"id": key, "created_at": _now(),
+    "updates": [u.model_dump() for u in body.updates],
+    "entries": [
+      {"app_id": app_id, "status": "conflict", "version": "1.0", "error": ""}
+      for app_id in (unknown, landed)
+    ]})
+  _unreadable_receipt(tmp_path / "unknown")
+
+  await owner.refresh_results(key, db)
+
+  entries = {e["app_id"]: e for e in owner.snapshot(key)["entries"]}
+  assert (entries[unknown]["status"], entries[unknown]["error"]) == ("conflict", "")
+  assert (entries[landed]["status"], entries[landed]["version"]) == ("updated", "2.0")
