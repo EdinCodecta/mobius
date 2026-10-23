@@ -2763,11 +2763,14 @@ def _reconcile_pass(
       reconciliation = outcome.reconciliation
       overlay_summary = outcome.overlay
       candidate = outcome.tip
-    return _finalize_update(
+    result = _finalize_update(
       repo, local, pre=pre, tip=candidate, target=target,
       progress=progress, reconciliation=reconciliation,
       overlay=overlay_summary,
     )
+    if result.status == "updated":
+      _pin_if_retired(repo, target, carried.served, reconciliation)
+    return result
   except Exception as exc:  # unexpected git failure — never serve a half-tree
     _abort_interrupted(repo)
     # A rejected checkout may mean a newer working edit, not a corrupt tree.
@@ -3028,8 +3031,6 @@ def _merged_candidate(
   conflict as ``(answer commit, the working commit it was resolved from)``.
   If live edits changed under that answer, they are merged afresh instead.
   """
-  if merged.reconciliation.retired_paths:
-    _pin_retired_local_copies(repo, target, carried.served)
   if merged.status == "conflict":
     return _park_net_conflict(
       repo, carried, target, source=merged.local_oid or carried.served,
@@ -3061,18 +3062,37 @@ def _merged_candidate(
 # Updates that retired local copies keep the served commit they came from
 # pinned, newest first, so the owner can recover them; older pins are dropped.
 _RETIRED_PINS_KEPT = 3
+_RETIRED_PIN_PREFIX = f"{_SET_ASIDE_PREFIX}/retired-"
+
+
+def _pin_if_retired(
+  repo: Path, target: str, served: str,
+  reconciliation: app_git.ReconciliationReceipt,
+) -> None:
+  """Pin ``served`` once an update that retired local copies of it is kept:
+  activated, prepared, or parked for a resolver. Best effort: the update
+  already succeeded, and the copies stay in ``served``'s history."""
+  if not reconciliation.retired_paths:
+    return
+  try:
+    _pin_retired_local_copies(repo, target, served)
+  except Exception:
+    log.warning("platform: could not pin retired local copies", exc_info=True)
 
 
 def _pin_retired_local_copies(repo: Path, target: str, served: str) -> str:
   """Pin ``served``, which still holds the copies an update to ``target``
   retired (status lists it under ``recovery_refs``), and drop the oldest
-  ``retired-*`` pins beyond the newest few. Other set-aside refs belong to
-  rollback and resolver recovery and are never touched here."""
-  ref = f"{_SET_ASIDE_PREFIX}/retired-{target[:8]}"
+  ``retired-*`` pins beyond the newest few. The name starts with the time
+  of retirement, so newest means most recently retired, whatever the commit
+  dates. Other set-aside refs belong to rollback and resolver recovery and
+  are never touched here."""
+  stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+  ref = f"{_RETIRED_PIN_PREFIX}{stamp}-{target[:8]}"
   _git("update-ref", ref, served, repo=repo)
   pins = _git(
-    "for-each-ref", "--sort=-committerdate", "--format=%(refname)",
-    f"{_SET_ASIDE_PREFIX}/retired-*", repo=repo,
+    "for-each-ref", "--sort=-refname", "--format=%(refname)",
+    f"{_RETIRED_PIN_PREFIX}*", repo=repo,
   ).stdout.split()
   for stale in [pin for pin in pins if pin != ref][_RETIRED_PINS_KEPT - 1:]:
     _git("update-ref", "-d", stale, repo=repo, check=False)
@@ -3112,6 +3132,7 @@ def _park_net_conflict(
   if stage == "committed" and source != carried.served:
     parked["left"] = source
   _write_conflict_flag(target, paths, overlay=parked)
+  _pin_if_retired(repo, target, carried.served, reconciliation)
   ROLLED_BACK_FLAG.unlink(missing_ok=True)
   _clear_reconcile_pre()
   return ReconcileResult.unchanged(
@@ -3194,6 +3215,7 @@ def _park_for_repair(
     **({"left": left} if left != source else {}),
   }
   _write_conflict_flag(target, paths, overlay=parked)
+  _pin_if_retired(repo, target, source, merged.reconciliation)
 
 
 class PreparedUpdate(TypedDict):
@@ -3417,12 +3439,14 @@ def prepare_reviewed_update(
       checkout = Path(tmp) / "platform"
       _git("worktree", "add", "--detach", "-q", str(checkout), outcome.tip, repo=repo)
       try:
-        return _prepare(
+        record = _prepare(
           repo, snapshot=current_sha, prepared=outcome.tip, target=target_sha,
           image_digest=image_digest, checkout=checkout,
         )
       finally:
         app_git.remove_overlay_worktree(repo, checkout)
+    _pin_if_retired(repo, target_sha, current_sha, outcome.reconciliation)
+    return record
 
 
 async def prepare_platform_update(
@@ -4758,16 +4782,18 @@ _OVERLAY_SUMMARY_UNITS = 20
 
 
 def local_overlay_summary(
-  repo: Path = PLATFORM_REPO, *, target: str | None = None,
+  repo: Path = PLATFORM_REPO, *, local: str | None = None, target: str | None = None,
 ) -> dict | None:
   """Size of the local platform overlay against the installed release.
 
   ``units`` lists the largest local units; ``retirable`` counts the files an
   update to ``target`` would set aside as merged pull requests' local copies,
   through the planner Apply uses, and names the PRs it retires.
+  ``local`` is the source tip the rest of status reports
+  (``_update_source_tip``). Computing it adds no objects to the repository.
   None when there is no installed release to compare with.
   """
-  local = _rev(repo, "HEAD")
+  local = local or _rev(repo, "HEAD")
   release = recorded_upstream_sha(repo)
   if not local or not release:
     return None
@@ -4816,11 +4842,11 @@ def _compute_overlay_summary(
   retired: tuple[app_git.RetiredPath, ...] = ()
   if target and _rev(repo, target) and not _is_ancestor(repo, target, local):
     # Exactly what Apply sets aside: superseded drafts and retired copies.
-    tip, retired = app_git.set_aside_merged_work(repo, local, target)
-    if tip != local:
-      set_aside = _git(
-        "diff", "--name-only", "-z", "--no-renames", local, tip, repo=repo,
-      ).stdout.split("\0")
+    # Status is a read, so the planner's commits go to a discarded store.
+    with app_git.quarantined_objects(repo):
+      tip, retired = app_git.set_aside_merged_work(repo, local, target)
+      if tip != local:
+        set_aside = sorted(app_git.endpoint_diff_paths(repo, local, tip) or ())
   added = sum(a for a, _r in lines.values())
   removed = sum(r for _a, r in lines.values())
   return {
@@ -4921,7 +4947,7 @@ def platform_status(
       rollback_target_sha=None, rollback_error=None,
       recovery_refs=recovery_refs,
       unfinished_update=unfinished_update(repo),
-      local_overlay=local_overlay_summary(repo, target=target),
+      local_overlay=local_overlay_summary(repo, local=local, target=target),
       )
 
   # A freshly published GHCR revision may not yet be in this clone's object
@@ -4959,7 +4985,7 @@ def platform_status(
     rollback_error=(rollback or {}).get("error"),
     recovery_refs=recovery_refs,
     unfinished_update=unfinished_update(repo),
-    local_overlay=local_overlay_summary(repo, target=target),
+    local_overlay=local_overlay_summary(repo, local=local, target=target),
   )
 
 

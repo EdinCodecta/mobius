@@ -72,6 +72,7 @@ import subprocess
 import tempfile
 import threading
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Callable, Iterable, Iterator
@@ -431,12 +432,41 @@ def _git_env(
   env["GCM_INTERACTIVE"] = "Never"
   env["GIT_ASKPASS"] = "/bin/false"
   env["SSH_ASKPASS"] = "/bin/false"
+  quarantine = _OBJECT_QUARANTINE.get()
+  if quarantine and quarantine[0] == str(Path(repo).resolve()):
+    env["GIT_OBJECT_DIRECTORY"], env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = quarantine[1:]
   if read_only:
     # Read-only status/provenance checks must not refresh the durable index or
     # leave an optional lock behind. Mandatory locks for ordinary write paths
     # remain enabled because their callers keep the default environment.
     env["GIT_OPTIONAL_LOCKS"] = "0"
   return env
+
+
+# (repository, temporary object store, the repository's own object store)
+# while ``quarantined_objects`` is active in this context.
+_OBJECT_QUARANTINE: ContextVar[tuple[str, str, str] | None] = ContextVar(
+  "app_git_object_quarantine", default=None,
+)
+
+
+@contextmanager
+def quarantined_objects(source_dir: str | Path) -> Iterator[None]:
+  """Let a read-only caller run planners that write trees and commits.
+
+  Git calls on ``source_dir`` inside the block still read every object of the
+  repository, but the objects they create go to a temporary store deleted on
+  exit, so nothing is added to the repository. Refs must not move inside it.
+  """
+  repo = Path(source_dir).resolve()
+  common = _run(repo, "rev-parse", "--git-common-dir").stdout.strip()
+  objects = (repo / common / "objects").resolve()
+  with tempfile.TemporaryDirectory(prefix="mobius-quarantine-") as tmp:
+    token = _OBJECT_QUARANTINE.set((str(repo), tmp, str(objects)))
+    try:
+      yield
+    finally:
+      _OBJECT_QUARANTINE.reset(token)
 
 
 def ref_file_size(source_dir: str | Path, ref: str, path: str) -> int | None:
@@ -2583,8 +2613,11 @@ def without_superseded_drafts(
   merges cleanly (local work built on the draft stays with the resolver, as
   before); removing it changes none of the ``protected`` paths, which the
   owner chose to keep local (an ``owner-choice:local`` unit touched them);
-  and ``upstream`` changed every path it restores (a merge this update also
-  reverts would otherwise just drop the local draft).
+  and ``upstream`` still differs from the shared base on every restored path
+  the merging commit changed (a merge this update also reverts would
+  otherwise just drop the local draft). A restored path the merge left alone
+  is a file reviewers dropped from the pull request; it returns to the base
+  as before.
   Upstream's version then arrives from the release side of the merge.
   The result's parent is ``local``, so merge bases and other witnesses hold.
   """
@@ -2614,7 +2647,7 @@ def without_superseded_drafts(
     changed = _tree_changes(repo, tree, removed.merged_tree_oid)
     if protected and not protected.isdisjoint(changed):
       continue
-    if _release_keeps_shared_base(repo, shared, upstream, changed):
+    if _release_reverts_merge(repo, draft.upstream_sha, shared, upstream, changed):
       continue
     tree = removed.merged_tree_oid
     set_aside += 1
@@ -2626,16 +2659,21 @@ def without_superseded_drafts(
   ).stdout.strip()
 
 
-def _release_keeps_shared_base(
-  repo: Path, shared: str, upstream: str, paths: Iterable[str],
+def _release_reverts_merge(
+  repo: Path, merge: str, shared: str, upstream: str, paths: Iterable[str],
 ) -> bool:
-  """Whether ``upstream`` leaves any of ``paths`` exactly as ``shared`` had it."""
-  paths = list(paths)
-  if not paths:
+  """Whether ``upstream`` leaves a path of ``paths`` that ``merge`` itself
+  changed exactly as ``shared`` had it: the merge was reverted or undone.
+
+  Judged per path, and only on the merging commit's own paths
+  (``merge^..merge``), as ``without_retired_units`` does.
+  """
+  merged = (endpoint_diff_paths(repo, f"{merge}^", merge) or set()) & set(paths)
+  if not merged:
     return False
-  released = _path_entries(repo, upstream, paths)
-  based = _path_entries(repo, shared, paths)
-  return any(released.get(path) == based.get(path) for path in paths)
+  released = _path_entries(repo, upstream, merged)
+  based = _path_entries(repo, shared, merged)
+  return any(released.get(path) == based.get(path) for path in merged)
 
 
 def retire_landed_equivalent_changes(
@@ -2661,11 +2699,8 @@ def retire_landed_equivalent_changes(
       retired += 1
   # Likewise a merged-contribution witness: once its merge is integrated it is
   # in every shared base and can never retire anything again; nor can one for
-  # another repository. A format-1 witness records no merge to judge by; it
-  # stays for the backfill to rewrite or drop.
+  # another repository.
   for contribution in _merged_contributions(repo):
-    if contribution.legacy:
-      continue
     if not contribution.for_platform_release or ref_is_ancestor(
       repo, contribution.merge_sha, integrated_upstream,
     ) is True:
@@ -3995,12 +4030,11 @@ class RetiredPath:
     return {"path": self.path, "pr": self.pr, "unit": self.unit, "proof": self.proof}
 
 
-# Witness metadata formats. Format 1 (``source_sha``, no ``repo``, a null
-# ``merge_sha``) took its tree from the staging source, which is not proof of
-# what the reviewed head carried, so it never retires anything; it is kept
-# only until ``backfill_merged_contribution_refs`` rewrites it as format 2
-# from Contribute's records. Format 2 takes the reviewed head's tree.
-_LEGACY_WITNESS_FORMAT = 1
+# Witness metadata version. Only this version is read; a ref under
+# ``MERGED_CONTRIBUTION_PREFIX`` in any other form is not a witness, so it
+# retires nothing and nothing here deletes it. (Pre-release builds wrote a
+# version 1 whose tree was the staging source, not the reviewed head;
+# ``backfill_merged_contribution_refs`` migrates those.)
 _MERGED_CONTRIBUTION_FORMAT = 2
 
 
@@ -4011,19 +4045,11 @@ class _MergedContribution:
   repo: str  # GitHub ``owner/name``; "" for an unreadable witness
   merge_sha: str | None
   paths: tuple[str, ...]
-  format: int = _MERGED_CONTRIBUTION_FORMAT
   metadata: dict = field(default_factory=dict, compare=False)
 
   @property
-  def legacy(self) -> bool:
-    return self.format != _MERGED_CONTRIBUTION_FORMAT
-
-  @property
   def for_platform_release(self) -> bool:
-    return (
-      not self.legacy and bool(self.merge_sha)
-      and self.repo.lower() == PLATFORM_RELEASE_REPO
-    )
+    return bool(self.merge_sha) and self.repo.lower() == PLATFORM_RELEASE_REPO
 
 
 _GITHUB_REPO_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -4049,7 +4075,7 @@ def record_merged_contribution(
   contains it. Returns the ref, or None when the reviewed head is not in this
   repository or an input is invalid. Recording the same witness again leaves
   the ref as it is, so a re-run backfill does not move the overlay evidence
-  a reviewed update plan is bound to; a format-1 witness is rewritten.
+  a reviewed update plan is bound to; anything else at the ref is replaced.
   """
   repo = Path(source_dir)
   head = _resolve_commit(repo, head_sha) if head_sha else None
@@ -4098,7 +4124,11 @@ def _merged_contributions(repo: Path) -> list[_MergedContribution]:
       metadata = json.loads(message)
     except ValueError:
       continue
-    if not isinstance(metadata, dict):
+    if (
+      not isinstance(metadata, dict)
+      or metadata.get("version") != _MERGED_CONTRIBUTION_FORMAT
+      or not metadata.get("head_sha")
+    ):
       continue
     number = metadata.get("number")
     merge = str(metadata.get("merge_sha") or "")
@@ -4106,37 +4136,13 @@ def _merged_contributions(repo: Path) -> list[_MergedContribution]:
     slug = metadata.get("repo")
     if not isinstance(number, int) or number <= 0 or not isinstance(paths, list):
       continue
-    version = metadata.get("version")
     found.append(_MergedContribution(
       ref=ref, number=number, repo=slug if isinstance(slug, str) else "",
       merge_sha=merge if _HEX_OID.fullmatch(merge) else None,
       paths=tuple(p for p in paths if isinstance(p, str) and p),
-      format=(
-        _MERGED_CONTRIBUTION_FORMAT
-        if version == _MERGED_CONTRIBUTION_FORMAT and metadata.get("head_sha")
-        else _LEGACY_WITNESS_FORMAT
-      ),
       metadata=metadata,
     ))
   return found
-
-
-def drop_legacy_merged_contributions(
-  source_dir: str | Path, *, dry_run: bool = False,
-) -> list[int]:
-  """Delete format-1 witnesses (see ``_LEGACY_WITNESS_FORMAT``); their numbers.
-
-  The backfill calls this after rewriting every witness Contribute's records
-  still support, so what remains in format 1 could never retire anything.
-  """
-  repo = Path(source_dir)
-  dropped = []
-  for contribution in _merged_contributions(repo):
-    if contribution.legacy:
-      if not dry_run:
-        _run(repo, "update-ref", "-d", contribution.ref, check=False)
-      dropped.append(contribution.number)
-  return sorted(dropped)
 
 
 def _pr_merge_commits(repo: Path, revisions: str) -> dict[int, str]:

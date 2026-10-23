@@ -37,8 +37,10 @@ owns activation and restarts, and `contributing` owns public GitHub actions.
   `python3 backend/scripts/platform_overlay.py mark <commit> pending-pr:#<N>`.
   Mark work the owner wants kept even after upstream merges a version of it
   `owner-choice:local`. Settings does not list retired files yet; each update
-  that retired some pins the commit holding the old copies at
-  `refs/mobius/platform-set-aside/retired-<release>` (the newest three stay).
+  that retired some (Apply, the agent repair path, or a parked conflict) pins
+  the commit holding the old copies at
+  `refs/mobius/platform-set-aside/retired-<time>-<release>` (the three most
+  recently retired stay).
 - **Owner-input cards.** Card access is deliberately uniform: any authenticated
   participant that can read a Q&A, Restart, or sealed-input card may answer it
   through that card's ordinary endpoint. The chat access check and exact card

@@ -792,6 +792,37 @@ def test_a_pr_merged_and_reverted_in_one_update_keeps_the_local_change(repo, pro
   assert _show(repo, result.merged_tree_oid, "greet.py") == _DRAFT
 
 
+@pytest.mark.parametrize("reverted", [False, True])
+def test_a_file_reviewers_dropped_from_the_pr_does_not_keep_its_draft(repo, reverted):
+  """The draft changed greet.py and notes.md; the merged PR kept only
+  greet.py. Only the paths the merging commit changed are judged for a
+  revert, so the draft is still set aside, unless the release reverts
+  greet.py itself."""
+  start = _commit(repo, {"greet.py": _HEADER + _BASE}, "header")
+  _git(repo, "branch", "-f", "upstream", start)
+  draft = _commit(
+    repo, {"greet.py": _HEADER + _DRAFT, "notes.md": "v1 draft\n"}, "Draft greet",
+  )
+  merge = _release(repo, [({"greet.py": _HEADER + _MERGED}, "Reviewed greeting (#7)")])
+  release = merge if not reverted else _release(repo, [
+    ({"greet.py": _HEADER + _BASE}, 'Revert "Reviewed greeting (#7)" (#9)'),
+  ], start=merge)
+  assert app_git.mark_draft_superseded(
+    repo, contribution_id="rec-7", base_sha=start, head_sha=draft, upstream_sha=merge,
+  )
+
+  result = platform_update._final_tree_merge(repo, draft, release)
+
+  assert result.status == "clean"
+  assert (result.local_oid == draft) is reverted
+  if reverted:
+    assert _show(repo, result.merged_tree_oid, "greet.py") == _HEADER + _DRAFT
+    assert _show(repo, result.merged_tree_oid, "notes.md") == "v1 draft\n"
+  else:
+    assert _show(repo, result.merged_tree_oid, "greet.py") == _HEADER + _MERGED
+    assert _show(repo, result.merged_tree_oid, "notes.md") == "v1\n"
+
+
 # --- Labels come only from the trailer block ---------------------------------
 
 
@@ -836,10 +867,13 @@ def test_superseded_drafts_are_still_set_aside_when_unit_labelling_fails(
 # --- Witness formats -----------------------------------------------------------
 
 
-def _legacy_witness(repo: Path, source: str, number: int = 7) -> str:
-  """A format-1 witness as earlier Contribute builds wrote it."""
+def _legacy_witness(
+  repo: Path, source: str, number: int = 7, merge: str | None = None,
+) -> str:
+  """A version 1 witness as pre-release Contribute builds wrote it."""
+  stored = f'"{merge}"' if merge else "null"
   metadata = (
-    f'{{"contribution_id":"rec-{number}","merge_sha":null,"number":{number},'
+    f'{{"contribution_id":"rec-{number}","merge_sha":{stored},"number":{number},'
     f'"paths":["greet.py"],"source_sha":"{source}","version":1}}'
   )
   anchor = _git(repo, "commit-tree", f"{source}^{{tree}}", "-p", source, "-m", metadata)
@@ -848,18 +882,16 @@ def _legacy_witness(repo: Path, source: str, number: int = 7) -> str:
   return ref
 
 
-def test_a_format_1_witness_never_retires_and_waits_for_the_backfill(repo):
+def test_a_pre_release_witness_retires_nothing_and_is_left_for_the_backfill(repo):
   draft = _commit(repo, {"greet.py": _DRAFT}, "Draft greet")
   local = _commit(repo, {"local.py": "OWNER = True\n"}, "unrelated local work")
   release = _release(repo, [({"greet.py": _MERGED}, "Reviewed greeting (#7)")])
-  ref = _legacy_witness(repo, draft)
+  ref = _legacy_witness(repo, draft, merge=release)
 
   result = platform_update._final_tree_merge(repo, local, release)
   app_git.retire_landed_equivalent_changes(repo, release)
 
   assert result.reconciliation.retired_paths == ()
-  assert _git(repo, "for-each-ref", "--format=%(refname)", ref) == ref
-  assert app_git.drop_legacy_merged_contributions(repo, dry_run=True) == [7]
   assert _git(repo, "for-each-ref", "--format=%(refname)", ref) == ref
 
 
@@ -878,7 +910,9 @@ def test_recording_the_same_witness_again_keeps_the_overlay_evidence(repo):
 # --- Retired copies stay pinned, newest few only -------------------------------
 
 
-def test_only_the_newest_retired_pins_are_kept(repo):
+def test_only_the_most_recently_retired_pins_are_kept(repo):
+  """Retention follows retirement order, not the served commits' dates: each
+  update here retires an older commit than the one before (a rollback)."""
   served = []
   for n in range(5):
     tree = _git(repo, "rev-parse", "HEAD^{tree}")
@@ -888,7 +922,7 @@ def test_only_the_newest_retired_pins_are_kept(repo):
       env={**app_git._git_env(repo), "GIT_AUTHOR_NAME": "T",
            "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "T",
            "GIT_COMMITTER_EMAIL": "t@example.invalid",
-           "GIT_COMMITTER_DATE": f"2026-01-0{n + 1}T00:00:00Z"},
+           "GIT_COMMITTER_DATE": f"2026-01-0{5 - n}T00:00:00Z"},
     ).stdout.strip())
   stamped = f"{platform_update._SET_ASIDE_PREFIX}/20260101T000000000000Z"
   _git(repo, "update-ref", stamped, served[0])
@@ -896,10 +930,15 @@ def test_only_the_newest_retired_pins_are_kept(repo):
   for n, commit in enumerate(served):
     platform_update._pin_retired_local_copies(repo, f"{n:08d}" + "f" * 32, commit)
 
-  pins = _git(repo, "for-each-ref", "--format=%(refname)",
-              platform_update._SET_ASIDE_PREFIX).split()
-  kept = [f"{platform_update._SET_ASIDE_PREFIX}/retired-{n:08d}" for n in (2, 3, 4)]
-  assert sorted(pins) == sorted([stamped, *kept])
+  pins = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)",
+              platform_update._SET_ASIDE_PREFIX).splitlines()
+  kept = {pin.split()[1] for pin in pins if "/retired-" in pin}
+  assert kept == {served[n] for n in (2, 3, 4)}
+  assert f"{stamped} {served[0]}" in pins
+  assert all(
+    pin.split()[0].endswith(f"-{n:08d}") for pin in pins for n in range(5)
+    if pin.split()[1] == served[n] and "/retired-" in pin
+  )
 
 
 # --- One planner: status counts what Apply sets aside -----------------------
@@ -918,9 +957,14 @@ def test_status_counts_superseded_drafts_the_way_apply_sets_them_aside(repo, own
   if owner_choice:
     app_git.mark_overlay_disposition(repo, tweak, "owner-choice:local")
 
+  def objects():
+    return _git(repo, "cat-file", "--batch-all-objects", "--batch-check")
+
+  before = objects()
   summary = platform_update._compute_overlay_summary(
     repo, draft, _git(repo, "rev-parse", "upstream"), merge,
   )
+  assert objects() == before  # status is a read: the planner's commits are discarded
   applied = platform_update._final_tree_merge(repo, draft, merge)
 
   assert summary["retirable"] == {"files": 0 if owner_choice else 1, "prs": []}

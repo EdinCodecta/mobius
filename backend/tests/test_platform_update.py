@@ -8241,9 +8241,55 @@ def test_diverged_update_emits_one_commit_per_unit_and_retires_a_merged_pr(clone
   # The retired unit emits nothing; the other unit keeps its own commit.
   assert _overlay_subjects(platform, target) == ["local feature"]
   assert [item.path for item in res.reconciliation.retired_paths] == ["backend/app/foo.py"]
-  pinned = f"{pu._SET_ASIDE_PREFIX}/retired-{target[:8]}"
+  [pinned] = _retired_pins(platform)
+  assert pinned.endswith(f"-{target[:8]}")
   assert _git(platform, "show", f"{pinned}:backend/app/foo.py").stdout == _FOO_DRAFT
   assert pinned in pu.platform_status(platform)["recovery_refs"]
+
+
+def _retired_pins(platform: Path) -> list[str]:
+  return _git(
+    platform, "for-each-ref", "--format=%(refname)", f"{pu._SET_ASIDE_PREFIX}/retired-*",
+  ).stdout.split()
+
+
+def test_the_agent_repair_path_pins_the_copies_it_retires(clone_env):
+  origin, platform = clone_env
+  target = _draft_pr_unit(platform, origin)
+  pu._fetch(platform)
+  served = _served_sha(platform)
+  plan = _apply_plan(served, target, platform)
+  plan.pop("repo")
+
+  pu.park_update_for_agent(**plan, repo=platform)
+
+  [pinned] = _retired_pins(platform)
+  assert _git(platform, "rev-parse", pinned).stdout.strip() == served
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _retired_pins(platform) == [pinned]
+
+
+def test_a_failed_prepare_pins_nothing_and_a_prepared_one_pins_once(
+  clone_env, monkeypatch,
+):
+  origin, platform = clone_env
+  target = _draft_pr_unit(platform, origin)
+  pu._fetch(platform)
+  served = _served_sha(platform)
+  plan = _apply_plan(served, target, platform)
+  plan.pop("repo")
+
+  with monkeypatch.context() as failing:
+    def broken(*_args, **_kwargs):
+      raise pu.PlatformUpdateError("local tests failed")
+    failing.setattr(pu, "_prepare", broken)
+    with pytest.raises(pu.PlatformUpdateError):
+      pu.prepare_reviewed_update(**plan, repo=platform)
+  assert _retired_pins(platform) == []
+
+  assert pu.prepare_reviewed_update(**plan, repo=platform)["state"] == "prepared"
+  [pinned] = _retired_pins(platform)
+  assert _git(platform, "show", f"{pinned}:backend/app/foo.py").stdout == _FOO_DRAFT
 
 
 def test_owner_choice_local_unit_is_never_retired_and_the_resolver_keeps_it(clone_env):

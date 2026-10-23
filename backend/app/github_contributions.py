@@ -1116,7 +1116,15 @@ def _merged_upstream_sha(record: dict, repo: Path) -> str | None:
     candidate = str(value or "").strip().lower()
     if _GIT_SHA.fullmatch(candidate):
       return candidate
+  return github_merge_commit(record, repo)
 
+
+def github_merge_commit(record: dict, repo: Path) -> str | None:
+  """GitHub's merge commit for a merged pull request record, or None.
+
+  Asks GitHub rather than trusting the record's own SHA fields, as settling a
+  personal publication does (``routes.github._personal_merge_commit``).
+  """
   plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
   repo_slug = plan.get("repo") or record.get("repo")
   number = record.get("number")
