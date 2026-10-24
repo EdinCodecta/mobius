@@ -776,6 +776,15 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
         continue  # An ambiguous receipt chain needs the owner; observe the others.
       try:
         _repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
+      except HTTPException:
+        # The selection no longer matches, but the same PR at a later head can
+        # still prove the head-pinned attempt can no longer land.
+        pull = await asyncio.to_thread(reviews.selected_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
+        fact = pull and reviews.moved_head_fact(target, previous, pull)
+        if fact:
+          reviews.settle_merge_observation(db, row, reviews.key(original), previous, fact)
+        continue
+      try:
         fact = await _observe_merge(target, pull, cwd)
       except HTTPException:
         # A failed read proves no new fact; historical review evidence and the

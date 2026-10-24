@@ -6,6 +6,7 @@ An ambiguous merge receipt is never retried: reconcile read-only or ask the owne
 """
 import json
 import re
+import subprocess
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -123,6 +124,55 @@ def current_pull(gh, cwd, target):
         or pull.get("head", {}).get("ref") != target["head_ref"]))):
     raise HTTPException(409, "This pull request no longer matches the approved selection.")
   return repo, pull
+
+
+def selected_pull(gh, cwd, target):
+  """Read the selected PR by repository id and node id, even after its head moved.
+
+  current_pull refuses a moved head, but facts the same PR proves about itself
+  still hold. A failed read or another PR proves nothing (None).
+  """
+  try:
+    repo = read(gh, cwd, f"repos/{target['repo']}")
+    pull = read(gh, cwd, f"repos/{target['repo']}/pulls/{target['number']}")
+  except (HTTPException, ContributionSubmitError, OSError, ValueError, subprocess.SubprocessError):
+    return None
+  if repo.get("id") != target["repo_id"] or pull.get("node_id") != target["pr_id"]:
+    return None
+  return pull
+
+
+def moved_head_fact(target, previous, pull):
+  """Settle a merge attempt at an old head from the same PR's later state.
+
+  Both dispatch paths pin the attempted head: the REST merge sends ``sha`` and
+  the queue request sends ``expectedHeadOid``. GitHub refuses either once the
+  head moves, and a push removes the PR from its merge queue. So an open,
+  unmerged PR at another head proves the attempt can no longer land. A merge
+  at a later head ends it too. A closed, unmerged PR proves nothing: it can be
+  reopened at the attempted head. The attempt's receipt fields stay as audit
+  history, and ``merge_attempted`` still forbids replaying that head.
+  """
+  attempted = target["head_sha"]
+  head_sha = (pull.get("head") or {}).get("sha")
+  if previous.get("head_sha") != attempted or not isinstance(head_sha, str) or head_sha == attempted:
+    return None
+  if pull.get("merged") is True:
+    return {"state": "needs_you", "pr_merged": {"head_sha": head_sha,
+      "merge_commit_sha": pull.get("merge_commit_sha"), "merged_at": pull.get("merged_at")},
+      "summary": "The pull request was merged at a later head. The earlier attempt can no longer land and was not repeated."}
+  if pull.get("state") != "open" or pull.get("merged") is not False:
+    return None
+  return {"state": "needs_you", "head_moved": {"attempted_head_sha": attempted,
+    "attempt_state": previous.get("state"), "head_sha": head_sha},
+    "summary": ("The pull request moved to a new head after the earlier merge or queue request, "
+                "which GitHub accepts only for the head it named. That request can no longer land "
+                "and was not repeated. Review the new head before any merge.")}
+
+
+def merge_settled(item) -> bool:
+  """A saved attempt the same PR later proved can no longer land."""
+  return bool(item.get("pr_merged") or item.get("head_moved"))
 
 
 def merge_blocker(target, repo, pull, pr) -> str | None:
@@ -254,7 +304,7 @@ def require_public_transition_clear(db, row, target):
   for grant in grants:
     for original in grant.targets_json:
       item = (grant.outcomes_json or {}).get(key(original), {})
-      merge_pending = item.get("state") != "merged" and (
+      merge_pending = item.get("state") != "merged" and not merge_settled(item) and (
         item.get("merge_attempted") or item.get("state") in {"merging", "merge_unknown", "queued"})
       repair_pending = any(a.get("state") in {"pushing", "push_unknown"}
         for a in item.get("repair_attempts", []))
@@ -385,8 +435,8 @@ def arm_merge(db, row, target, outcome, principal):
 
 
 def merge_pending(outcome) -> bool:
-  return outcome.get("merge_attempted") is True or outcome.get("state") in {
-    "merging", "merge_unknown", "queued", "merged"}
+  return not merge_settled(outcome) and (outcome.get("merge_attempted") is True or outcome.get("state") in {
+    "merging", "merge_unknown", "queued", "merged"})
 
 
 def keeps_public_receipts(current, outcome) -> bool:
