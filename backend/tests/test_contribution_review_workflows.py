@@ -213,6 +213,16 @@ def test_brief_reads_frozen_limit_without_widening_historical_grants(setup, opti
   assert row.options_json == options
 
 
+def test_takeover_brief_states_autopilot_and_wait_ownership_once(setup):
+  row = setup[1]
+  row.mode = "review_fix_merge"
+  brief = " ".join(domain.takeover_brief(row).split())
+  assert brief.count("Autopilot is unsupported") == 1 and "autopilot is disabled" not in brief
+  # The owning chat's existing durable Wait owns pending checks; nothing forbids it.
+  assert "never schedule" not in brief
+  assert "this owning chat's EXISTING durable Wait capability; these routes create no automatic Wait" in brief
+
+
 def test_legacy_default_limit_is_not_reconstructed_from_new_omission(setup, monkeypatch):
   db, row, principal = setup
   owner = Principal(owner=principal.owner, app_id=None)

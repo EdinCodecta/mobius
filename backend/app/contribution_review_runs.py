@@ -681,21 +681,20 @@ that old run's /observe endpoint for read-only reconciliation against GitHub.
 If the exact
 effect cannot be proved or disproved, ask the owner for supervised recovery;
 elapsed time, a closed PR, or an unchanged projection never releases the receipt.
-Autopilot is unsupported: perform only the requested immediate step and hand off;
-never schedule an automatic review Wait.
+Autopilot is unsupported: perform only the requested immediate step and hand off,
+rather than starting unattended follow-up turns. This never broadens mutation consent.
 When an exact repair push is confirmed, finish its saved receipt work_key via
 finish_agent_work with release:false and the confirmed head outcome. Never
 finish another chat's claim.
-When autopilot is disabled perform the requested immediate step and hand off, rather than
-starting unattended follow-up turns. This flag never broadens mutation consent.
 Then parent alone POST {endpoint}/outcomes with repo, number, exact head_sha,
 reviewed_base_sha, independent_receipt_id, state all_clear or needs_you, summary,
 all six scope values, tests and tests_passed. The server alone checks live base,
 checks, permissions and attempts exact normal merge/queue using its durable fence.
 POST {endpoint}/observe is read-only GitHub reconciliation of saved attempts;
 it can run after Stop but never starts agents or repeats a push/merge.
-For pending checks or a queue use the EXISTING durable Wait capability, not a
-transient poll process or second queue. Observation cannot start a stopped run.
+For pending checks or a queue use this owning chat's EXISTING durable Wait
+capability; these routes create no automatic Wait. Never use a transient poll
+process or second queue. Observation cannot start a stopped run.
 Keep every step in this one owning chat and expose concrete blockers to the owner.
 Review rubric: correctness, maintainability, simplicity, tests, security_privacy,
 technical_debt. Public comments and reviews are NOT authorized by this grant.
