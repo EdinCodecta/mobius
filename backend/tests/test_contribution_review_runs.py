@@ -677,6 +677,12 @@ def test_stop_or_permission_revocation_during_preflight_prevents_merge(setup, mo
   assert error.value.status_code == 409
 
 
+def test_view_reads_an_item_saved_without_state_as_reviewing(setup):
+  """Partial items (e.g. only reviewer steps) must not break the run view."""
+  db, row, _ = setup
+  domain.save_outcome(db, row, domain.key(ITEM), {"reviewer_steps": []})
+  assert domain.view(row)["state"] == "reviewing"
+
 def test_stopped_review_is_visible_not_forever_reviewing(setup):
   db, row, principal = setup
   db.get(models.ChatRun, "physical-run").status = "stopped"

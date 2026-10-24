@@ -429,7 +429,7 @@ def save_outcome(db, row, item_key, outcome, *, expected=None):
 def view(row):
   outcomes = row.outcomes_json or {}
   items = [outcomes.get(key(t), {"state": "reviewing"}) for t in row.targets_json]
-  states = [item["state"] for item in items]
+  states = [item.get("state", "reviewing") for item in items]
   state = ("needs_you" if any(s in {"needs_you", "merge_unknown"} for s in states)
            else "complete" if all(s in {"all_clear", "merged"} for s in states)
            else "queued" if all(s in {"queued", "merged", "all_clear"} for s in states)
