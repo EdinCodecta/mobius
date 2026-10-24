@@ -225,6 +225,41 @@ async def test_stop_on_any_device_refuses_everywhere_until_the_holder_confirms()
   assert (await waiting)["ok"] is True
 
 
+@pytest.mark.asyncio
+async def test_stop_holds_until_every_tab_holding_the_folder_has_paused():
+  # Two tabs of one browser hold the same remembered folder.
+  streams = _FakeStreams("tab-a", "tab-b")
+  registry = streams.registry()
+  registry.report(_report("tab-a", folders=[_folder("f1")]))
+  registry.report(_report("tab-b", folders=[_folder("f1")]))
+  registry.pause()
+  registry.report(_report("tab-a", sequence=2, folders=[_folder("f1", state="paused")]))
+  streams.sent.clear()
+  refused = await registry.issue("f1", {"op": "mkdir", "path": "new"})
+  assert refused["code"] == "paused"
+  assert _sent_of(streams, "shared_folder_command") == []
+  # Once both keep the pause, the owner resumes it in the browser.
+  registry.report(_report("tab-b", sequence=2, folders=[_folder("f1", state="paused")]))
+  registry.report(_report("tab-a", sequence=3, folders=[_folder("f1")]))
+  waiting = asyncio.create_task(registry.issue("f1", {"op": "mkdir", "path": "new"}))
+  subscription_id, event = await _next_event(streams)
+  assert (subscription_id, event["type"]) == ("tab-a", "shared_folder_command")
+  registry.answer("tab-a", event["commandId"], {"ok": True, "result": {}})
+  assert (await waiting)["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_change_must_start_before_the_server_stops_waiting_for_it():
+  streams = _FakeStreams("s1")
+  registry = streams.registry()
+  registry.report(_report("s1"))
+  waiting = asyncio.create_task(registry.issue("f1", {"op": "mkdir", "path": "new"}))
+  _, event = await _next_event(streams)
+  assert 0 < event["startWithinMs"] < shared_folders.COMMAND_TIMEOUT_SECONDS * 1000
+  registry.answer("s1", event["commandId"], {"ok": True, "result": {}})
+  await waiting
+
+
 def test_a_browser_closed_during_stop_is_told_again_when_it_returns():
   streams = _FakeStreams("old-tab")
   registry = streams.registry()
@@ -489,7 +524,7 @@ def test_agent_command_round_trips_through_the_owner_browser(client, auth, live_
   event = _await_stream_event(live_stream)
   assert event == {
     "type": "shared_folder_command", "commandId": event["commandId"], "folderId": "f1",
-    "op": "read", "path": "notes.txt", "length": 10,
+    "startWithinMs": 25000, "op": "read", "path": "notes.txt", "length": 10,
   }
   answered = client.post("/api/shared-folders/responses", headers=auth, json={
     "subscriptionId": live_stream.id, "commandId": event["commandId"],

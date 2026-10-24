@@ -42,7 +42,9 @@ beforeEach(() => {
 })
 
 function command(folderId, op, extra = {}) {
-  return { type: 'shared_folder_command', commandId: `c-${op}`, folderId, op, path: 'a.txt', ...extra }
+  return {
+    type: 'shared_folder_command', commandId: `c-${op}`, folderId, op, path: 'a.txt', startWithinMs: 25_000, ...extra,
+  }
 }
 
 test('an agent command is answered on the stream that delivered it', async () => {
@@ -89,24 +91,45 @@ const withdrawals = {
   read_only: store => { store.records.get('edit').mode = 'read' },
 }
 
+/** An earlier change holds the folder's lock until the returned release is awaited. */
+async function holdFolderLock(folderId) {
+  let release
+  const holding = new Promise(resolve => { release = resolve })
+  let lockHeld
+  const held = new Promise(resolve => { lockHeld = resolve })
+  const finished = navigator.locks.request(`mobius-shared-folder:${folderId}`, () => { lockHeld(); return holding })
+  await held
+  return async () => {
+    release()
+    await finished
+  }
+}
+
 for (const [code, withdraw] of Object.entries(withdrawals)) {
   test(`a change waiting its turn is refused if the owner withdraws rights meanwhile (${code})`, async () => {
     const root = new FakeDirectoryHandle('Downloads')
     editFolder(root)
-    let releaseLock
-    const holding = new Promise(resolve => { releaseLock = resolve })
-    let lockHeld
-    const held = new Promise(resolve => { lockHeld = resolve })
-    const earlier = navigator.locks.request('mobius-shared-folder:edit', () => { lockHeld(); return holding })
-    await held
+    const release = await holdFolderLock('edit')
     const waiting = handleSharedFolderCommand(command('edit', 'write', { path: 'late.txt', content: 'late' }))
     withdraw(hostStore())
-    releaseLock()
-    await Promise.all([earlier, waiting])
+    await release()
+    await waiting
     assert.deepEqual([answers[0].ok, answers[0].code], [false, code])
     assert.equal(root.children.has('late.txt'), false)
   })
 }
+
+test('a change still waiting when the server would stop waiting is dropped, not made late', async () => {
+  const root = new FakeDirectoryHandle('Downloads')
+  editFolder(root)
+  const release = await holdFolderLock('edit')
+  const waiting = handleSharedFolderCommand(command('edit', 'write', { path: 'late.txt', content: 'late', startWithinMs: 1 }))
+  await new Promise(resolve => setTimeout(resolve, 20))
+  await release()
+  await waiting
+  assert.deepEqual([answers[0].ok, answers[0].code], [false, 'busy'])
+  assert.equal(root.children.has('late.txt'), false)
+})
 
 test('a read already running when the owner taps Stop sends none of its contents', async () => {
   let finish
@@ -175,6 +198,19 @@ test('Stop on another device pauses the folders this browser holds, for good', a
   assert.equal(hostStore().records.get('read').paused, false)
   await handleSharedFolderCommand(command('edit', 'read', { length: 5 }))
   assert.deepEqual([answers[0].ok, answers[0].code], [false, 'paused'])
+})
+
+test('a change arriving while a remote Stop is still being saved finds every named folder paused', async () => {
+  const store = hostStore()
+  // The target is not the first folder Stop reaches.
+  store.records = new Map([['read', store.records.get('read')], ['edit', store.records.get('edit')]])
+  const root = new FakeDirectoryHandle('Downloads')
+  editFolder(root)
+  const pausing = applyRemotePause({ type: 'shared_folder_pause', folderIds: ['read', 'edit'] })
+  await handleSharedFolderCommand(command('edit', 'write', { path: 'after-stop.txt', content: 'x' }))
+  await pausing
+  assert.deepEqual([answers[0].ok, answers[0].code], [false, 'paused'])
+  assert.equal(root.children.has('after-stop.txt'), false)
 })
 
 test('Stop pauses this browser and asks every other device to stop', async () => {

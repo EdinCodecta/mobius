@@ -143,11 +143,29 @@ def _last_change(path: Path) -> float:
   return newest
 
 
+def _viewed_copies(root: Path) -> list[Path]:
+  """Entries of each chat's copies directory, never through a symlink.
+
+  An agent can replace its scratch or copies directory with a link, and the
+  expiry must not follow it to delete old files elsewhere.
+  """
+  copies: list[Path] = []
+  for chat_dir in root.iterdir():
+    folder = chat_dir / SHARED_FOLDER_COPIES_DIR
+    if chat_dir.is_symlink() or folder.is_symlink() or not folder.is_dir():
+      continue
+    try:
+      copies.extend(folder.iterdir())
+    except OSError as exc:
+      log.warning("shared-folder copy expiry skipped %s: %s", folder, exc)
+  return copies
+
+
 def _expire_shared_folder_copies(root: Path, now: float) -> int:
   """Delete viewed copies of shared-folder files older than their limit; return bytes."""
   cutoff = now - SHARED_FOLDER_COPY_SECONDS
   reclaimed = 0
-  for copy in root.glob(f"*/{SHARED_FOLDER_COPIES_DIR}/*"):
+  for copy in _viewed_copies(root):
     try:
       stat = copy.lstat()
       if not copy.is_file() or copy.is_symlink() or stat.st_mtime > cutoff:

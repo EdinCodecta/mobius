@@ -29,6 +29,10 @@ READ_OPERATIONS = frozenset({"list", "info", "read", "image"})
 EDIT_OPERATIONS = frozenset({"write", "move", "mkdir", "bin"})
 
 COMMAND_TIMEOUT_SECONDS = 30.0
+# A change still queued behind earlier ones this long after it reached the
+# browser is dropped there. The margin before the timeout covers delivery, so a
+# change never starts after the agent was told it timed out and retried.
+COMMAND_START_WITHIN_SECONDS = 25.0
 LIVENESS_POLL_SECONDS = 2.0
 MAX_PENDING_PER_STREAM = 16
 MAX_REMEMBERED_DEVICES = 32
@@ -101,8 +105,8 @@ class SharedFolderRegistry:
     self._deliver = deliver
     self._reports: dict[str, DeviceReport] = {}
     self._pending: dict[str, _PendingCommand] = {}
-    # Folders the owner stopped from some device whose own browser has not yet
-    # confirmed the pause. Refused here meanwhile, on every device.
+    # Folders the owner stopped from some device that a live holder has not yet
+    # confirmed paused. Refused here meanwhile, on every device.
     self._stopped: set[str] = set()
 
   def report(self, report: DeviceReport) -> bool:
@@ -112,15 +116,28 @@ class SharedFolderRegistry:
     current = self._reports.get(report.subscription_id)
     if current is None or report.sequence > current.sequence:
       self._reports[report.subscription_id] = report
-      # The holding browser now keeps the pause itself, so the owner resumes
-      # it there; one that missed the Stop (closed then) is told again.
-      held = {folder.id for folder in report.folders}
-      self._stopped -= {folder.id for folder in report.folders if folder.state == "paused"}
-      missed = sorted(self._stopped & held)
+      self._release_confirmed_stops()
+      # A holder that missed the Stop (closed then) is told again.
+      unpaused = {folder.id for folder in report.folders if folder.state != "paused"}
+      missed = sorted(self._stopped & unpaused)
       if missed:
         self._deliver(report.subscription_id, {"type": PAUSE_EVENT_TYPE, "folderIds": missed})
     self._prune()
     return True
+
+  def _release_confirmed_stops(self) -> None:
+    """Lift a Stop only once every live holder keeps the pause itself.
+
+    Several tabs of one browser hold the same remembered folder. Releasing on
+    the first one's confirmation would let a command reach another tab that
+    has not paused yet. From here on the owner resumes in the browser.
+    """
+    unpaused = {
+      folder.id
+      for report in self._reports.values() if self._is_live(report.subscription_id)
+      for folder in report.folders if folder.state != "paused"
+    }
+    self._stopped &= unpaused
 
   def pause(self, folder_ids: list[str] | None = None) -> list[str]:
     """Stop folders on every device at once: refuse here, and tell their browsers."""
@@ -166,7 +183,10 @@ class SharedFolderRegistry:
     command_id = secrets.token_urlsafe(12)
     future = asyncio.get_running_loop().create_future()
     self._pending[command_id] = _PendingCommand(report.subscription_id, future, folder, report)
-    event = {"type": COMMAND_EVENT_TYPE, "commandId": command_id, "folderId": folder.id, **command}
+    event = {
+      "type": COMMAND_EVENT_TYPE, "commandId": command_id, "folderId": folder.id,
+      "startWithinMs": int(COMMAND_START_WITHIN_SECONDS * 1000), **command,
+    }
     if not self._deliver(report.subscription_id, event):
       self._pending.pop(command_id, None)
       return _offline(report)

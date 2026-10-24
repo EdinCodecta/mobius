@@ -14,9 +14,11 @@ import { hostStore, publishFolders } from './hostState.js'
 const done = { ok: true }
 const failed = message => ({ ok: false, message })
 
-async function commit(record) {
-  hostStore().records.set(record.id, record)
-  await saveFolderRecord(record)
+async function commit(...records) {
+  // Every record takes effect before any save is awaited, so a command that
+  // arrives meanwhile never finds part of the change still undone.
+  records.forEach(record => hostStore().records.set(record.id, record))
+  for (const record of records) await saveFolderRecord(record)
   publishFolders()
   announceFolderChange()
   await reportFolders()
@@ -103,9 +105,10 @@ export async function setFolderPaused(id, paused) {
 
 /** Pause every folder this browser shares, or only the ones named. */
 export async function pauseAllFolders(ids = null) {
-  for (const record of [...hostStore().records.values()]) {
-    if (!record.paused && (!ids || ids.includes(record.id))) await setFolderPaused(record.id, true)
-  }
+  const paused = [...hostStore().records.values()]
+    .filter(record => !record.paused && (!ids || ids.includes(record.id)))
+    .map(record => ({ ...record, paused: true }))
+  if (paused.length) await commit(...paused)
   return done
 }
 

@@ -31,7 +31,7 @@ $F bin "Downloads/old.zip"               # moves it to the "Möbius bin" folder
 - Moving whole folders is not possible in browsers. Move the files inside it one by one, after telling the owner how many.
 - Before changing more than a few files, tell the owner what you will do and get a yes.
 - Keep `write` content exact. Use `--overwrite` only when the owner asked to replace that file; its old version goes to the bin.
-- If a change answers `timeout` or `offline`, it may still have happened. Check with `info` or `ls` before trying it again.
+- If a change answers `timeout` or `offline`, it may still have happened. Check with `info` or `ls` before trying it again. `busy` means nothing changed; try again shortly.
 - `original_kept` or `changed_during_move`: the file was copied but the original stayed, so both exist. Tell the owner; don't retry.
 - A refusal is an answer, not a bug. Relay its fix in plain words:
   - `offline`: Möbius is not open in that browser. Ask the owner to open it there.

@@ -167,16 +167,22 @@ async function runCommand(event) {
   delete command.type
   delete command.commandId
   delete command.folderId
+  delete command.startWithinMs
   if (!EDIT_OPERATIONS.has(event.op)) return allowedFolder(event.folderId, false).run(command)
   // A change checks its destination, then writes it. One change at a time per
   // folder, across this browser's tabs, so two can never claim the same name.
   // The owner can pause, remove or narrow the folder while a change waits, so
   // its rights are checked once it holds the lock. The callback is async so a
   // refusal rejects its promise: Node 24 keeps a lock whose callback throws.
-  return navigator.locks.request(
-    `mobius-shared-folder:${event.folderId}`,
-    async () => allowedFolder(event.folderId, true).run(command),
-  )
+  const startBy = performance.now() + event.startWithinMs
+  return navigator.locks.request(`mobius-shared-folder:${event.folderId}`, async () => {
+    // The server stops waiting soon after; starting now could repeat the
+    // agent's retry, so a change that waited too long is not made at all.
+    if (performance.now() > startBy) {
+      throw new FolderError('busy', 'An earlier change in this folder took too long, so this one was not made. Try again.')
+    }
+    return allowedFolder(event.folderId, true).run(command)
+  })
 }
 
 /** The folder's access as it stands now, or the reason it is refused. */
