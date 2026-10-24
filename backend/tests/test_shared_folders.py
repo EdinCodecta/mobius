@@ -272,6 +272,28 @@ def test_a_browser_closed_during_stop_is_told_again_when_it_returns():
   assert streams.sent == [("new-tab", {"type": "shared_folder_pause", "folderIds": ["f1"]})]
 
 
+@pytest.mark.asyncio
+async def test_a_stop_outlives_its_holder_closing_while_other_devices_report():
+  streams = _FakeStreams("laptop-tab", "phone-tab")
+  registry = streams.registry()
+  registry.report(_report("laptop-tab", folders=[_folder("f1")]))
+  registry.report(_report("phone-tab", device="phone", folders=[_folder("f2", name="Photos")]))
+  # The laptop closes before it can confirm the pause.
+  streams.live.discard("laptop-tab")
+  registry.pause()
+  registry.report(_report("phone-tab", device="phone", sequence=2, folders=[_folder("f2", name="Photos", state="paused")]))
+  streams.sent.clear()
+  # It comes back still unpaused: it is told again, and agents stay refused.
+  streams.live.add("laptop-again")
+  registry.report(_report("laptop-again", at=time.time() + 1, folders=[_folder("f1")]))
+  assert _sent_of(streams, "shared_folder_pause") == [
+    ("laptop-again", {"type": "shared_folder_pause", "folderIds": ["f1"]}),
+  ]
+  refused = await registry.issue("f1", {"op": "mkdir", "path": "new"})
+  assert refused["code"] == "paused"
+  assert _sent_of(streams, "shared_folder_command") == []
+
+
 def test_stop_can_name_folders_and_ignores_unknown_ones():
   streams = _FakeStreams("s1")
   registry = streams.registry()

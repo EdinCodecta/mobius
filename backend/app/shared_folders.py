@@ -126,18 +126,21 @@ class SharedFolderRegistry:
     return True
 
   def _release_confirmed_stops(self) -> None:
-    """Lift a Stop only once every live holder keeps the pause itself.
+    """Lift a Stop only once a live holder keeps the pause and none lacks it.
 
     Several tabs of one browser hold the same remembered folder. Releasing on
     the first one's confirmation would let a command reach another tab that
-    has not paused yet. From here on the owner resumes in the browser.
+    has not paused yet. With no live holder at all, nothing has confirmed the
+    pause, so the Stop stays and a holder that returns unpaused is told again.
+    From release on, the owner resumes in the browser.
     """
-    unpaused = {
-      folder.id
-      for report in self._reports.values() if self._is_live(report.subscription_id)
-      for folder in report.folders if folder.state != "paused"
-    }
-    self._stopped &= unpaused
+    paused: set[str] = set()
+    unpaused: set[str] = set()
+    for report in self._reports.values():
+      if self._is_live(report.subscription_id):
+        for folder in report.folders:
+          (paused if folder.state == "paused" else unpaused).add(folder.id)
+    self._stopped -= paused - unpaused
 
   def pause(self, folder_ids: list[str] | None = None) -> list[str]:
     """Stop folders on every device at once: refuse here, and tell their browsers."""
