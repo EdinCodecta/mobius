@@ -55,3 +55,13 @@ export function clearAppNavLocations(store = sessionStore()) {
     }
   } catch {}
 }
+
+/** The saved place belongs to the app's shell navigation target only. An
+ *  embedded transcript view neither restores nor overwrites it. */
+export function appNavLocationStore(navigationTarget, store) {
+  if (!navigationTarget) return { read: () => null, write: () => {} }
+  return {
+    read: (appId, instanceId) => readAppNavLocation(appId, instanceId, store),
+    write: (appId, instanceId, location) => writeValidatedAppNavLocation(appId, instanceId, location, store),
+  }
+}

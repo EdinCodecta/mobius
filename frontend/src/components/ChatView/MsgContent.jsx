@@ -485,6 +485,7 @@ function MsgContentInner({
                       isStreaming={block.reply_live_text || (isStreaming && i === lastEntryIdx)}
                       onInternalNav={onInternalNav}
                       mediaDimensions={msg.media_dimensions}
+                      allowAppBlocks
                     />
                   : <StandardMarkdown
                       text={text}
@@ -492,6 +493,7 @@ function MsgContentInner({
                       renderFraction={block._coldRenderFraction}
                       onInternalNav={onInternalNav}
                       mediaDimensions={msg.media_dimensions}
+                      allowAppBlocks
                     />)
               : msg.role === 'user'
                 ? <UserMessageText
@@ -792,12 +794,14 @@ function MsgContentInner({
                     isStreaming={isStreaming}
                     onInternalNav={onInternalNav}
                     mediaDimensions={msg.media_dimensions}
+                    allowAppBlocks
                   />
                 : <StandardMarkdown
                     text={text}
                     markdownRange={msg.markdown_range}
                     onInternalNav={onInternalNav}
                     mediaDimensions={msg.media_dimensions}
+                    allowAppBlocks
                   />)
             : msg.role === 'user'
               ? (msg.segments?.length > 1

@@ -416,6 +416,58 @@ line, which the tool's service returns in its result text (the shell reads that
 line whether the provider reports the result as text or as the JSON of an MCP
 result object). Everything else about the receipt is identical.
 
+### App blocks in assistant replies
+
+An app's skill or fragment can ask the agent to show something the app owns as
+a fenced `mobius-app` JSON block in its reply. Only the owner's assistant
+replies render it; owner messages, peer notes, helper summaries, documents,
+errors and every other Markdown surface keep it as code. The block is a
+conversation-written snapshot and a destination, never authority: opening it
+starts nothing and approves nothing.
+
+````text
+```mobius-app
+{"app":"example","intent":"open:item-42","title":"Item 42",
+ "facts":[{"label":"Source","value":"owner/repo","href":"https://github.com/owner/repo"}],
+ "badges":[{"label":"Ready","tone":"success"}]}
+```
+````
+
+Lengths count JavaScript characters (UTF-16 code units); the whole JSON is at
+most 16384.
+
+- Required: `app` (installed slug), `intent` and `title` (1-240). An intent is
+  `kind:payload`: `kind` is 1-32 of `a-z`, `0-9`, `-` starting with a letter;
+  `payload` is 1-256 printable ASCII characters with no whitespace. Invalid
+  JSON or a bad required field leaves an ordinary code block.
+- Optional: up to 8 `facts` `{label (80), value (240), href?}`; up to 3
+  `badges` `{label (40), tone}` with tone `success|attention|danger|accent|neutral`;
+  up to 12 `items` `{title, intent, facts? (up to 4), badges?, action?}`;
+  `action` `{label (40), intent}`; `inline` (default `true`; `false` is a
+  link-only snapshot without actions); `expand_label` (40); `height` (240-640,
+  default 480; a non-number is ignored). `href` is kept only for an
+  uncredentialed `https:` URL. Text is validated, never truncated: a field
+  over its limit (in parentheses) is invalid, so its fact, badge, item or
+  action is dropped and an over-limit `expand_label` falls back to the default.
+  An item title follows the root rule (1-240), and invalid facts don't use up
+  the 8 slots. A field of the wrong JSON type (an object, array or null where
+  a string or number belongs) is invalid the same way and never breaks the
+  reply.
+  Every intent field has the same bound. A repeated item intent or badge
+  label keeps only its first entry.
+- Every block links to `/shell/?app=<slug>&intent=<intent>`, and each item to
+  its own intent. Nothing app-owned runs until the reader clicks the expand
+  control or an action; the app's ordinary view then opens in the transcript
+  with that one intent. That embedded view may open a chat or an app, nothing
+  else, and never restores or overwrites the app's saved place in the shell.
+  If the app is not installed, the block keeps its snapshot and says so.
+- Every block is captioned "From this conversation": its title, facts and
+  badges are the agent's words, not status the app verified.
+- To act on many records, put a short app-owned handle in the intent (for
+  example `send-batch:sel-7f3a`) and resolve it in the app to the exact
+  records it names. A twelve-id list does not fit the 256-character payload.
+  The handle is a reference, never approval.
+
 ---
 
 ## Storage — `window.mobius.storage` is the default
