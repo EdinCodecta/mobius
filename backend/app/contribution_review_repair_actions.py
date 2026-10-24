@@ -150,33 +150,49 @@ async def publish_attempt(db, row, target, validation, receipt, principal, *, gh
   attempts = list(previous["repair_attempts"])
   armed = attempts[-1]
   pushed = [*attempts[:-1], {**armed, "state": "pushed"}]
-  try:
-    # Successor invariants belong before the network effect. In particular,
-    # queue-removal history in a later layer must not fail after a real push.
-    reviews.confirmed_successor(previous, pushed, validation)
-  except (HTTPException, KeyError, ValueError):
-    result = DispatchResult.not_dispatched("The successor receipt cannot be recorded safely.")
-  else:
-    result = await dispatch_repair(row, target, validation, gh=gh, cwd=cwd, authorize=authorize)
-  # Every fact settles this exact receipt on the refreshed item, never on the
-  # pre-dispatch snapshot: an observer may have recorded it meanwhile.
-  if result.state == "not_dispatched":
-    remote_rejection = (isinstance(result.receipt, dict)
-      and result.receipt.get("kind") == "remote_ref_rejection"
-      and result.receipt.get("head_sha") == armed["head_sha"])
-    def release(current, saved, index):
-      kept = [{**saved[index], "state": "rejected"}] if remote_rejection else []
-      return {**current, "repair_attempts": [*saved[:index], *kept, *saved[index + 1:]],
-        "state": "needs_you", "summary": f"No branch update was applied: {result.reason}"}
-    reviews.settle_repair_attempt(db, row, item_key, armed, release)
-    agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
-      work_key=armed["work_key"], outcome="Repair branch update was not applied.", release=True)
-  elif result.state == "unknown":
-    reviews.settle_repair_attempt(db, row, item_key, armed, _unknown_push(result.reason),
-                                  pending=("pushing",))
-  else:
-    reviews.settle_repair_attempt(db, row, item_key, armed, _confirm_push)
-    await settled.run_settled(repairs.discard_checkout, validation["checkout"])
+  caller = asyncio.current_task()
+
+  def authorize_live():
+    # The settled unit outlives a cancelled caller. A cancel that lands before
+    # the push starts is a known refusal, never permission to start it.
+    if caller.cancelling():
+      raise HTTPException(409, "The repair request was cancelled before any push began.")
+    authorize()
+
+  async def dispatch_and_settle():
+    try:
+      # Successor invariants belong before the network effect. In particular,
+      # queue-removal history in a later layer must not fail after a real push.
+      reviews.confirmed_successor(previous, pushed, validation)
+    except (HTTPException, KeyError, ValueError):
+      result = DispatchResult.not_dispatched("The successor receipt cannot be recorded safely.")
+    else:
+      result = await dispatch_repair(row, target, validation, gh=gh, cwd=cwd,
+                                     authorize=authorize_live)
+    # Every fact settles this exact receipt on the refreshed item, never on the
+    # pre-dispatch snapshot: an observer may have recorded it meanwhile.
+    if result.state == "not_dispatched":
+      remote_rejection = (isinstance(result.receipt, dict)
+        and result.receipt.get("kind") == "remote_ref_rejection"
+        and result.receipt.get("head_sha") == armed["head_sha"])
+      def release(current, saved, index):
+        kept = [{**saved[index], "state": "rejected"}] if remote_rejection else []
+        return {**current, "repair_attempts": [*saved[:index], *kept, *saved[index + 1:]],
+          "state": "needs_you", "summary": f"No branch update was applied: {result.reason}"}
+      reviews.settle_repair_attempt(db, row, item_key, armed, release)
+      agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
+        work_key=armed["work_key"], outcome="Repair branch update was not applied.", release=True)
+    elif result.state == "unknown":
+      reviews.settle_repair_attempt(db, row, item_key, armed, _unknown_push(result.reason),
+                                    pending=("pushing",))
+    else:
+      reviews.settle_repair_attempt(db, row, item_key, armed, _confirm_push)
+      await settled.run_settled(repairs.discard_checkout, validation["checkout"])
+
+  # Dispatch and its settlement are one unit: a restart or cancelled request
+  # mid-push still records the definite result (and releases an unspent
+  # claim) instead of stranding the receipt as 'pushing'.
+  await settled.settle(dispatch_and_settle(), what="Repair push and settlement")
   return None
 
 

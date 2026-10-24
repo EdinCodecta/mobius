@@ -139,3 +139,51 @@ def test_delayed_merge_observation_cannot_revive_a_disarmed_merge_over_a_repair(
   item = row.outcomes_json[domain.key(ITEM)]
   assert item["state"] == "pushing" and item["merge_attempted"] is False
   assert item["repair_attempts"] == [armed_repair]
+
+
+@pytest.mark.parametrize("outcome", ["confirmed", "refused", "cancelled_before_push"])
+def test_cancellation_mid_push_still_records_the_definite_result(setup, monkeypatch, outcome):
+  """A restart or cancelled request mid-push must not strand 'pushing'."""
+  import threading
+  from app.contribution_review_effects import DispatchResult
+  from tests.test_contribution_review_workflows import configure_repair, publish_body
+  db, row, principal = configure_repair(setup, monkeypatch)
+  monkeypatch.setattr(repairs, "discard_checkout", lambda path: None)
+  started, cancelled = threading.Event(), threading.Event()
+  sent = []
+  def push(*args, before_push=None, **kwargs):
+    started.set()
+    assert cancelled.wait(5)
+    if outcome == "cancelled_before_push":
+      try:
+        before_push()
+      except Exception:
+        return DispatchResult.not_dispatched("The repair failed a final pre-dispatch guard.")
+    sent.append(1)
+    if outcome == "refused":
+      return DispatchResult.not_dispatched("GitHub refused before any update.")
+    return DispatchResult.confirmed({"head_sha": NEW})
+  monkeypatch.setattr(repairs, "push_repair", push)
+
+  async def cancel_mid_push():
+    task = asyncio.create_task(routes.publish_repair(1, row.id, publish_body(), db, principal))
+    await asyncio.to_thread(started.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0)
+    cancelled.set()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+  asyncio.run(cancel_mid_push())
+
+  db.refresh(row)
+  item = row.outcomes_json[domain.key(ITEM)]
+  work_key = "github:example/project:branch:topic:" + SHA + ":repair"
+  claim = db.query(models.AgentWorkClaim).filter_by(work_key=work_key).one()
+  if outcome == "confirmed":
+    assert [a["state"] for a in item["repair_attempts"]] == ["pushed"]
+    assert item["successor"]["head_sha"] == NEW
+    assert claim.released_at is None and claim.completed_at is None
+  else:
+    assert sent == ([1] if outcome == "refused" else [])
+    assert item["repair_attempts"] == [] and item["state"] == "needs_you"
+    assert claim.released_at is not None
