@@ -303,6 +303,20 @@ def reserve_public_work(db, row, principal, work_key, summary, action):
   return claim
 
 
+def release_if_acquired(db, row, claim):
+  """Release a claim this admission newly acquired for an effect it did not start.
+
+  An earlier saved attempt already owns the exact effect. ``claimed`` means
+  the claim was free (absent or released) before this call, so it backs no
+  attempt; ``owned`` means this chat already held it, possibly for that
+  saved attempt, so it is kept.
+  """
+  if claim["state"] == "claimed":
+    agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
+      work_key=claim["work_key"], outcome="An earlier saved attempt owns this action; no attempt started.",
+      release=True)
+
+
 @contextmanager
 def released_on_refusal(db, row, claim):
   """A refused admission leaves no claim held without a saved attempt.
@@ -355,6 +369,7 @@ def arm_merge(db, row, target, outcome, principal):
               "review_selection_id": previous.id,
               "summary": "An earlier review already attempted this exact merge. Follow its saved result; no request was repeated."}
     db.rollback()
+    release_if_acquired(db, row, claim)
     return result
   with released_on_refusal(db, row, claim):
     require_public_transition_clear(db, row, target)
@@ -728,6 +743,7 @@ def arm_repair(db, row, target, previous, receipt, principal):
         if (attempt.get("work_key") == work_key and attempt.get("state") in {"pushing", "push_unknown", "pushed"}):
           owner_chat_id, selection_id = grant.chat_id, grant.id
           db.rollback()
+          release_if_acquired(db, row, claim)
           db.refresh(row)
           summary = f"An earlier repair attempt is saved in owning chat {owner_chat_id}; it was not repeated."
           save_outcome(db, row, key(target), {**row.outcomes_json.get(key(target), {}),

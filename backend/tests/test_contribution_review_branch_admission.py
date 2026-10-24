@@ -272,3 +272,29 @@ def test_refused_admission_releases_its_claim_for_another_chat(setup, monkeypatc
   claim = agent_work_claims.claim_work(db, owner_id=active.owner_id, chat_id="later-chat",
     run_id="later-run", work_key=work_key, summary="Retry after the blocker settles")
   assert claim["state"] == "claimed"
+
+
+@pytest.mark.parametrize("action", ["merge", "repair"])
+@pytest.mark.parametrize("held", [False, True], ids=["newly_acquired", "already_owned"])
+def test_same_key_early_return_releases_only_a_newly_acquired_claim(setup, monkeypatch, action, held):
+  """An earlier saved attempt owns the effect; this admission starts none."""
+  from tests.test_contribution_review_runs import create_chat
+  db, row, principal = configure_repair(setup, monkeypatch)
+  target = row.targets_json[0]
+  work_key = (domain.merge_work_key(target) if action == "merge" else
+    f"github:{target['head_repo'].lower()}:branch:{target['head_ref']}:{target['head_sha']}:repair")
+  saved = pending_outcome(action)
+  if action == "repair":
+    saved["repair_attempts"][0]["work_key"] = work_key
+  domain.save_outcome(db, row, domain.key(target), saved)
+  if held:
+    # This chat's claim backs the saved attempt and must survive.
+    agent_work_claims.claim_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
+      run_id=principal.run_id, work_key=work_key, summary="Backs the saved attempt")
+  assert arm(db, row, action, principal)
+  db.add(create_chat(id="later-chat", title="Later owner"))
+  db.add(models.ChatRun(id="later-run", chat_id="later-chat", status="running"))
+  db.commit()
+  claim = agent_work_claims.claim_work(db, owner_id=row.owner_id, chat_id="later-chat",
+    run_id="later-run", work_key=work_key, summary="Another chat looks at the same work")
+  assert claim["state"] == ("held_by_peer" if held else "claimed")
