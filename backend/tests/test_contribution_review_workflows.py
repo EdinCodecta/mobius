@@ -386,6 +386,23 @@ def test_core_routes_registered_without_install(setup):
     assert client.get("/api/github/review-presets").status_code == 200
 
 
+def test_review_presets_return_takeover_defaults_every_mode_accepts(setup, monkeypatch):
+  """The editor advertises review_fix_merge, so it needs that mode's defaults."""
+  from app import contribution_review_presets as presets
+  db, _, principal = setup
+  owner = Principal(owner=principal.owner, app_id=None)
+  monkeypatch.setattr(routes, "resolve_round_choice", lambda *a: {"provider": "codex", "model": "gpt-5", "effort": "xhigh"})
+  for view in (routes.review_presets(1, db, owner), routes.core_review_presets(db, owner)):
+    assert view["capabilities"]["review_fix_merge"] is True
+    defaults = view["presets"]
+    assert defaults["fix_prompt"] == presets.FIX_PROMPT and defaults["max_rounds"] is None
+    options = {k: v for k, v in defaults.items() if k != "mandatory_instructions"}
+    for mode in ("review", "review_merge", "review_fix_merge"):
+      preview = routes.review_preview(1, routes.ReviewPreview(mode=mode, options=options), db, owner)
+      assert preview["options"]["review_prompt"] == presets.REVIEW_PROMPT
+      assert ("fix_prompt" in preview["options"]) is (mode == "review_fix_merge")
+
+
 def test_takeover_denies_parent_forged_independent_clear(setup, monkeypatch):
   takeover(setup, monkeypatch)
   monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("not independently reviewed"))

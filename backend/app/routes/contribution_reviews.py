@@ -546,11 +546,17 @@ class ReviewPreview(BaseModel):
   options: ReviewOptions | None = None
 
 
+def _presets_view():
+  # One editor serves every advertised mode. The plain modes accept the
+  # takeover defaults unchanged, so the editor gets them all.
+  return {"presets": presets.presets(mode="review_fix_merge"), "capabilities": REVIEW_CAPABILITIES}
+
+
 @router.get(APP_PREFIX + "/{app_id}/review-presets")
 def review_presets(app_id: int, db: Session = Depends(get_db),
                    principal: Principal = Depends(get_principal)):
   _authorize_context(db, app_id, principal)
-  return {"presets": presets.presets(), "capabilities": REVIEW_CAPABILITIES}
+  return _presets_view()
 
 
 @router.post(APP_PREFIX + "/{app_id}/review-preview", dependencies=[Depends(reject_cross_site)])
@@ -661,7 +667,7 @@ def core_get_review(run_id: str, db: Session = Depends(get_db), principal: Princ
 @router.get("/api/github/review-presets")
 def core_review_presets(db: Session = Depends(get_db), principal: Principal = Depends(get_principal)):
   _authorize_context(db, None, principal)
-  return {"presets": presets.presets(), "capabilities": REVIEW_CAPABILITIES}
+  return _presets_view()
 
 
 @router.post("/api/github/review-preview", dependencies=[Depends(reject_cross_site)])
