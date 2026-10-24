@@ -233,3 +233,15 @@ export function applyVirtualStorageMutation(appId, message, emitShared) {
   }
   return false
 }
+
+/** The outcome of a frame's nav-push. Only a visible canvas with a history
+ *  owner installs a sentinel; any other host rejects, never acknowledges. */
+export function navPushOutcome({ visible, onNavPush, appId, message }) {
+  if (!visible || typeof onNavPush !== 'function') return false
+  return onNavPush(appId, {
+    requestId: message.requestId,
+    label: message.label,
+    reversible: message.reversible === true,
+    userActivated: message.userActivated,
+  })
+}

@@ -6,6 +6,8 @@ import InlineContent from './InlineContent.jsx'
 import { copyPlainText } from '../messageCopy.js'
 import { useMathHtml } from './math.js'
 import { highlightSync, highlightCode } from './highlight.js'
+import AppBlock from './AppBlock.jsx'
+import { appBlockFromToken } from './appBlock.js'
 
 /**
  * Block-level markdown components.
@@ -139,7 +141,7 @@ export function Table({ token, onInternalNav, mediaDimensions }) {
   )
 }
 
-export function BlockQuote({ token, onInternalNav, mediaDimensions }) {
+export function BlockQuote({ token, onInternalNav, mediaDimensions, allowAppBlocks = false }) {
   return (
     <blockquote className="md-blockquote">
       {token.tokens?.map((child, i) => (
@@ -148,13 +150,14 @@ export function BlockQuote({ token, onInternalNav, mediaDimensions }) {
           token={child}
           onInternalNav={onInternalNav}
           mediaDimensions={mediaDimensions}
+          allowAppBlocks={allowAppBlocks}
         />
       ))}
     </blockquote>
   )
 }
 
-export function ListBlock({ token, onInternalNav, mediaDimensions }) {
+export function ListBlock({ token, onInternalNav, mediaDimensions, allowAppBlocks = false }) {
   const Tag = token.ordered ? 'ol' : 'ul'
   return (
     <Tag className="md-list" start={token.ordered ? token.start : undefined}>
@@ -177,6 +180,7 @@ export function ListBlock({ token, onInternalNav, mediaDimensions }) {
                 token={child}
                 onInternalNav={onInternalNav}
                 mediaDimensions={mediaDimensions}
+                allowAppBlocks={allowAppBlocks}
               />
             )
           })}
@@ -217,7 +221,7 @@ export function HorizontalRule() {
  * Renders a single block-level token.
  * Used by BlockQuote and other nesting containers.
  */
-export function BlockToken({ token, onInternalNav, mediaDimensions }) {
+export function BlockToken({ token, onInternalNav, mediaDimensions, allowAppBlocks = false }) {
   switch (token.type) {
     case 'paragraph': return (
       <Paragraph
@@ -233,7 +237,12 @@ export function BlockToken({ token, onInternalNav, mediaDimensions }) {
         mediaDimensions={mediaDimensions}
       />
     )
-    case 'code': return <CodeBlock token={token} />
+    case 'code': {
+      // Only the owner's assistant replies opt in; peer notes, documents,
+      // errors and every other Markdown surface keep the fence as plain code.
+      const block = allowAppBlocks ? appBlockFromToken(token) : null
+      return block ? <AppBlock block={block} onInternalNav={onInternalNav} /> : <CodeBlock token={token} />
+    }
     case 'table': return (
       <Table
         token={token}
@@ -246,6 +255,7 @@ export function BlockToken({ token, onInternalNav, mediaDimensions }) {
         token={token}
         onInternalNav={onInternalNav}
         mediaDimensions={mediaDimensions}
+        allowAppBlocks={allowAppBlocks}
       />
     )
     case 'list': return (
@@ -253,6 +263,7 @@ export function BlockToken({ token, onInternalNav, mediaDimensions }) {
         token={token}
         onInternalNav={onInternalNav}
         mediaDimensions={mediaDimensions}
+        allowAppBlocks={allowAppBlocks}
       />
     )
     case 'hr': return <HorizontalRule />
@@ -272,4 +283,5 @@ export const MemoBlock = memo(BlockToken, (prev, next) => {
     && prev.token.rangeReferences === next.token.rangeReferences
     && prev.onInternalNav === next.onInternalNav
     && prev.mediaDimensions === next.mediaDimensions
+    && prev.allowAppBlocks === next.allowAppBlocks
 })

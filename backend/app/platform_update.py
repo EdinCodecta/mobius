@@ -371,6 +371,9 @@ class PlatformStatus(TypedDict):
   # While set, Settings offers only Finish update for this exact release and
   # no newer release is offered or accepted.
   unfinished_update: UnfinishedUpdate | None
+  # How much local platform work every update re-merges, by unit, and how much
+  # of it the next update retires as merged (:func:`local_overlay_summary`).
+  local_overlay: NotRequired[dict | None]
   # Python packages the served source declares that this image lacks. When
   # ``blocking`` restarts are refused (``restart_util.validate_restart_source``);
   # otherwise Settings shows it as a warning naming each package and its fix
@@ -390,7 +393,7 @@ class PlatformApplyResult(TypedDict):
   conflict_paths: list[str]
   chat_id: str | None
   phase: str
-  reconciliation: dict[str, list[str]]
+  reconciliation: dict[str, list]
   error: str | None
 
 
@@ -481,6 +484,11 @@ class PlatformUpdatePreview(TypedDict):
   # (:func:`local_image_changes`). They stay in the checkout; the update
   # reports them and never waits on them.
   local_image_paths: list[str]
+  # Unchanged local copies of pull requests this release merged; Apply takes
+  # the release's version of each (``app_git.without_retired_units``). The
+  # Settings update review does not list them yet; the old copies stay
+  # recoverable under the ``retired-*`` set-aside pins.
+  retired_paths: NotRequired[list[dict]]
   # Evidence from preparation, not a claim about later replayed edits.
   local_tests: NotRequired[dict]
 
@@ -624,15 +632,22 @@ def _update_plan_id(
   current_sha: str,
   target_sha: str,
   image_digest: str | None = None,
+  *,
+  evidence: str = "",
 ) -> str:
-  """Deterministic identity for the exact local tip + reviewed release pair."""
+  """Deterministic identity for the exact local tip + reviewed release pair.
+
+  ``evidence`` is ``app_git.overlay_evidence_fingerprint``: a disposition note
+  or merged-contribution witness written after Review changes what Apply
+  sets aside, so it makes the reviewed plan stale.
+  """
   if image_digest:
-    material = (
-      f"mobius-platform-update-v2\0{current_sha}\0{target_sha}\0{image_digest}"
-    ).encode()
+    material = f"mobius-platform-update-v2\0{current_sha}\0{target_sha}\0{image_digest}"
   else:
-    material = f"mobius-platform-update-v1\0{current_sha}\0{target_sha}".encode()
-  return hashlib.sha256(material).hexdigest()
+    material = f"mobius-platform-update-v1\0{current_sha}\0{target_sha}"
+  if evidence:
+    material += f"\0overlay-evidence\0{evidence}"
+  return hashlib.sha256(material.encode()).hexdigest()
 
 
 def _validate_update_plan(
@@ -650,7 +665,10 @@ def _validate_update_plan(
     raise PlatformUpdateError("update_plan_invalid")
   if image_digest is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
     raise PlatformUpdateError("update_plan_invalid")
-  if plan_id != _update_plan_id(current_sha, target_sha, image_digest):
+  if plan_id != _update_plan_id(
+    current_sha, target_sha, image_digest,
+    evidence=app_git.overlay_evidence_fingerprint(repo),
+  ):
     raise PlatformUpdateError("update_plan_invalid")
 
   local = _local_branch(repo)
@@ -2805,11 +2823,14 @@ def _reconcile_pass(
       reconciliation = outcome.reconciliation
       overlay_summary = outcome.overlay
       candidate = outcome.tip
-    return _finalize_update(
+    result = _finalize_update(
       repo, local, pre=pre, tip=candidate, target=target,
       progress=progress, reconciliation=reconciliation,
       overlay=overlay_summary,
     )
+    if result.status == "updated":
+      _pin_if_retired(repo, target, carried.served, reconciliation)
+    return result
   except Exception as exc:  # unexpected git failure — never serve a half-tree
     _abort_interrupted(repo)
     # A rejected checkout may mean a newer working edit, not a corrupt tree.
@@ -2999,14 +3020,23 @@ def _final_tree_merge(repo: Path, source: str, target: str) -> app_git.MergeResu
   duplicate-change conflicts; otherwise it is Git's ordinary three-way merge.
   A local draft of a contribution the release merged in revised form is set
   aside first, so the merged version arrives instead of a draft-vs-final
-  conflict. Review, Apply and the agent handoff all call this, so the conflict
-  Review predicts is the conflict Apply would park. It writes Git objects only;
-  no ref, index or working tree moves.
+  conflict. Likewise an unchanged local copy of a pull request the release
+  merged is retired (``app_git.set_aside_merged_work``). Review, Apply
+  and the agent handoff all call this, so the conflict Review predicts is the
+  conflict Apply would park. It writes Git objects only; no ref, index or
+  working tree moves. ``local_oid`` names the local commit actually merged.
   """
-  local = app_git.without_superseded_drafts(repo, source, target)
-  return (
+  local, retired = app_git.set_aside_merged_work(repo, source, target)
+  merged = (
     app_git.merge_with_equivalent_changes(repo, local, target)
     or app_git.merge_refs(repo, local, target)
+  )
+  return replace(
+    merged, local_oid=local,
+    reconciliation=(
+      replace(merged.reconciliation, retired_paths=retired) if retired
+      else merged.reconciliation
+    ),
   )
 
 
@@ -3028,6 +3058,10 @@ def _apply_overlay(
   merged = _final_tree_merge(repo, source, target)
   if merged.equivalent_change_refs:
     reconciliation = merged.reconciliation
+  elif merged.reconciliation.retired_paths:
+    reconciliation = replace(
+      reconciliation, retired_paths=merged.reconciliation.retired_paths,
+    )
   return _merged_candidate(
     repo, carried, target, merged,
     right=target, base=merged.merge_base_oid or ordinary_base,
@@ -3059,8 +3093,8 @@ def _merged_candidate(
   """
   if merged.status == "conflict":
     return _park_net_conflict(
-      repo, carried, target, source=carried.served, right=right, base=base,
-      stage="committed", reconciliation=reconciliation,
+      repo, carried, target, source=merged.local_oid or carried.served,
+      right=right, base=base, stage="committed", reconciliation=reconciliation,
     )
   if not merged.merged_tree_oid:
     raise PlatformUpdateError("The local and upstream trees could not be merged.")
@@ -3085,6 +3119,46 @@ def _merged_candidate(
   return _Candidate(tip, reconciliation, {"mode": "net", "source": carried.served})
 
 
+# Updates that retired local copies keep the served commit they came from
+# pinned, newest first, so the owner can recover them; older pins are dropped.
+_RETIRED_PINS_KEPT = 3
+_RETIRED_PIN_PREFIX = f"{_SET_ASIDE_PREFIX}/retired-"
+
+
+def _pin_if_retired(
+  repo: Path, target: str, served: str,
+  reconciliation: app_git.ReconciliationReceipt,
+) -> None:
+  """Pin ``served`` once an update that retired local copies of it is kept:
+  activated, prepared, or parked for a resolver. Best effort: the update
+  already succeeded, and the copies stay in ``served``'s history."""
+  if not reconciliation.retired_paths:
+    return
+  try:
+    _pin_retired_local_copies(repo, target, served)
+  except Exception:
+    log.warning("platform: could not pin retired local copies", exc_info=True)
+
+
+def _pin_retired_local_copies(repo: Path, target: str, served: str) -> str:
+  """Pin ``served``, which still holds the copies an update to ``target``
+  retired (status lists it under ``recovery_refs``), and drop the oldest
+  ``retired-*`` pins beyond the newest few. The name starts with the time
+  of retirement, so newest means most recently retired, whatever the commit
+  dates. Other set-aside refs belong to rollback and resolver recovery and
+  are never touched here."""
+  stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+  ref = f"{_RETIRED_PIN_PREFIX}{stamp}-{target[:8]}"
+  _git("update-ref", ref, served, repo=repo)
+  pins = _git(
+    "for-each-ref", "--sort=-refname", "--format=%(refname)",
+    f"{_RETIRED_PIN_PREFIX}*", repo=repo,
+  ).stdout.split()
+  for stale in [pin for pin in pins if pin != ref][_RETIRED_PINS_KEPT - 1:]:
+    _git("update-ref", "-d", stale, repo=repo, check=False)
+  return ref
+
+
 def _park_net_conflict(
   repo: Path, carried: _Carried, target: str,
   *, source: str, right: str, base: str, stage: str,
@@ -3094,7 +3168,9 @@ def _park_net_conflict(
 
   ``stage`` is ``committed`` when the committed source conflicts, or
   ``working`` when only the uncommitted edits conflict with a clean committed
-  candidate (``right``); a resolved working answer stays uncommitted.
+  candidate (``right``); a resolved working answer stays uncommitted. A
+  committed ``source`` other than ``served`` is the commit that retired merged
+  local copies; the resolver starts there (``left``).
   """
   worktree = _overlay_candidate_path(repo)
   app_git.remove_overlay_worktree(repo, worktree)
@@ -3111,8 +3187,12 @@ def _park_net_conflict(
     "mode": "net", "worktree": str(worktree), "served": carried.served,
     "pre": carried.pre, "target": target, "paths": paths,
     "stage": stage, "base": base, "right": right, "parked_at": _parked_at(target),
+    **_conflict_units(repo, carried.served, target, paths, reconciliation),
   }
+  if stage == "committed" and source != carried.served:
+    parked["left"] = source
   _write_conflict_flag(target, paths, overlay=parked)
+  _pin_if_retired(repo, target, carried.served, reconciliation)
   ROLLED_BACK_FLAG.unlink(missing_ok=True)
   _clear_reconcile_pre()
   return ReconcileResult.unchanged(
@@ -3121,6 +3201,35 @@ def _park_net_conflict(
       repo, base, right, local=source, conflict_paths=paths,
     ),
   )
+
+
+def _conflict_units(
+  repo: Path, served: str, target: str, paths: list[str],
+  reconciliation: app_git.ReconciliationReceipt,
+) -> dict:
+  """Which local unit owns each conflicted path, and what that unit intends.
+
+  Older readers ignore these keys; the resolver message groups by them.
+  """
+  try:
+    units = app_git.overlay_units(repo, served, target)
+  except Exception:
+    log.warning("platform: could not label conflicts by unit", exc_info=True)
+    return {}
+  wanted = set(paths)
+  owned = {path: unit for unit in units for path in unit.paths if path in wanted}
+  retired_prs = sorted({item.pr for item in reconciliation.retired_paths})
+  return {
+    "units": {path: unit.slug for path, unit in sorted(owned.items())},
+    "unit_intent": {
+      unit.slug: {
+        "subject": unit.subject, "disposition": unit.disposition,
+        "pr": unit.pr, "commits": list(unit.commits[-5:]),
+      }
+      for unit in owned.values()
+    },
+    "retired_prs": retired_prs,
+  }
 
 
 def _park_for_repair(
@@ -3141,8 +3250,8 @@ def _park_for_repair(
   ).stdout.strip()
   if merged.status == "conflict":
     _park_net_conflict(
-      repo, carried, target, source=source, right=target, base=base,
-      stage="committed", reconciliation=app_git.ReconciliationReceipt(),
+      repo, carried, target, source=merged.local_oid, right=target,
+      base=base, stage="committed", reconciliation=merged.reconciliation,
     )
     flag = _read_conflict_flag() or {}
     parked = {
@@ -3150,9 +3259,10 @@ def _park_for_repair(
     }
     _write_conflict_flag(target, list(flag.get("paths") or []), overlay=parked)
     return
+  left = merged.local_oid
   worktree = _overlay_candidate_path(repo)
   app_git.remove_overlay_worktree(repo, worktree)
-  _git("worktree", "add", "--detach", "-q", str(worktree), source, repo=repo)
+  _git("worktree", "add", "--detach", "-q", str(worktree), left, repo=repo)
   # Leave the clean merge open so the agent's staged answer is picked up by
   # the same continue step a conflict resolution uses.
   app_git._run(worktree, "merge", "--no-commit", "--no-ff", "-q", target, check=False)
@@ -3162,8 +3272,10 @@ def _park_for_repair(
     "mode": "net", "worktree": str(worktree), "served": source, "pre": source,
     "target": target, "paths": paths, "stage": "committed", "base": base,
     "right": target, "image_digest": image_digest, "parked_at": _parked_at(target),
+    **({"left": left} if left != source else {}),
   }
   _write_conflict_flag(target, paths, overlay=parked)
+  _pin_if_retired(repo, target, source, merged.reconciliation)
 
 
 class PreparedUpdate(TypedDict):
@@ -3387,12 +3499,14 @@ def prepare_reviewed_update(
       checkout = Path(tmp) / "platform"
       _git("worktree", "add", "--detach", "-q", str(checkout), outcome.tip, repo=repo)
       try:
-        return _prepare(
+        record = _prepare(
           repo, snapshot=current_sha, prepared=outcome.tip, target=target_sha,
           image_digest=image_digest, checkout=checkout,
         )
       finally:
         app_git.remove_overlay_worktree(repo, checkout)
+    _pin_if_retired(repo, target_sha, current_sha, outcome.reconciliation)
+    return record
 
 
 async def prepare_platform_update(
@@ -4538,15 +4652,42 @@ def keep_settling_update(repo: Path = PLATFORM_REPO) -> None:
 
 
 def _net_overlay_commit(repo: Path, target: str, tree: str, source: str) -> str:
-  """Make the one local commit after upstream; never rewrite the live branch."""
+  """Place the local delta ``tree`` on ``target``; never rewrite the live branch.
+
+  The delta becomes one labelled commit per local unit of ``source``
+  (``app_git.unit_chain``), so the next update can still tell the units apart
+  and retire one whose pull request merged. Prepare, the resolver's continue
+  and boot's late-edit replay all commit through here. If the chain cannot be
+  built or does not reproduce ``tree`` exactly, it falls back to the single
+  ``platform-local-tree`` commit older updaters made, which the next update
+  expands back into units.
+  """
   target_tree = _commit_tree_oid(repo, target)
   if not target_tree:
     raise PlatformUpdateError("The reviewed upstream tree is unavailable.")
   if tree == target_tree:
     return target
+  try:
+    return app_git.unit_chain(
+      repo, target, tree, app_git.overlay_units(repo, source, target),
+      resolution=app_git.OverlayUnit(
+        slug=f"update-resolution-{target[:8]}", disposition="local-only",
+        pr=None, subject="Reconcile local platform source with reviewed upstream",
+        body=f"Previous local source: {source}", commits=(), paths=(),
+      ),
+    )
+  except Exception:
+    # Units only label history, and boot's late-edit replay runs through
+    # here: no labelling failure may fail an update the one commit can carry.
+    log.warning("platform: unit chain failed; committing one overlay", exc_info=True)
+    return _single_overlay_commit(repo, target, tree, source)
+
+
+def _single_overlay_commit(repo: Path, target: str, tree: str, source: str) -> str:
+  """The whole local delta as one commit, as updaters before unit chains made it."""
   message = app_git.overlay_message(
     "Reconcile local platform source with reviewed upstream",
-    unit="platform-local-tree", disposition="local-only",
+    unit=app_git.LEGACY_OVERLAY_UNIT, disposition="local-only",
     body=f"Previous local source: {source}",
   )
   return app_git._run(
@@ -4710,7 +4851,10 @@ def continue_platform_overlay_update(repo: Path = PLATFORM_REPO) -> str:
 
 def _resolved_tree(parked: dict, worktree: Path, source: str) -> str:
   """The resolver's staged answer, only while its parked merge is intact."""
-  left = str(parked.get("pre") if parked.get("stage") == "working" else source)
+  left = str(
+    parked.get("pre") if parked.get("stage") == "working"
+    else parked.get("left") or source
+  )
   right = str(parked.get("right") or "")
   merging = app_git.merge_in_progress(worktree)
   active_merge = (
@@ -5245,6 +5389,99 @@ def park_update_for_agent(
     return pending
 
 
+# Status is polled; the summary walks local history, so it is recomputed only
+# when the local tip, the installed release, the checked target, or a
+# disposition note or merged-contribution witness moves.
+_overlay_summary_cache: dict[tuple, dict | None] = {}
+_OVERLAY_SUMMARY_MISS = object()
+_LARGE_OVERLAY_FILES = 100
+_LARGE_OVERLAY_LINES = 5000
+_OVERLAY_SUMMARY_UNITS = 20
+
+
+def local_overlay_summary(
+  repo: Path = PLATFORM_REPO, *, local: str | None = None, target: str | None = None,
+) -> dict | None:
+  """Size of the local platform overlay against the installed release.
+
+  ``units`` lists the largest local units; ``retirable`` counts the files an
+  update to ``target`` would set aside as merged pull requests' local copies,
+  through the planner Apply uses, and names the PRs it retires.
+  ``local`` is the source tip the rest of status reports
+  (``_update_source_tip``). Computing it adds no objects to the repository.
+  None when there is no installed release to compare with.
+  """
+  local = local or _rev(repo, "HEAD")
+  release = recorded_upstream_sha(repo)
+  if not local or not release:
+    return None
+  key = (
+    str(repo), local, release, target, app_git.overlay_evidence_fingerprint(repo),
+  )
+  # Another status poll may clear the cache between a check and a read.
+  cached = _overlay_summary_cache.get(key, _OVERLAY_SUMMARY_MISS)
+  if cached is not _OVERLAY_SUMMARY_MISS:
+    return cached
+  try:
+    summary = _compute_overlay_summary(repo, local, release, target)
+  except Exception:
+    log.warning("platform: could not summarize the local overlay", exc_info=True)
+    summary = None
+  _overlay_summary_cache.clear()
+  _overlay_summary_cache[key] = summary
+  return summary
+
+
+def _compute_overlay_summary(
+  repo: Path, local: str, release: str, target: str | None,
+) -> dict:
+  lines: dict[str, tuple[int, int]] = {}
+  numstat = _git("diff", "--numstat", "-z", "--no-renames", release, local, repo=repo)
+  for entry in numstat.stdout.split("\0"):
+    added, _, rest = entry.strip("\n").partition("\t")
+    removed, _, path = rest.partition("\t")
+    if path:
+      lines[path] = (
+        int(added) if added.isdigit() else 0, int(removed) if removed.isdigit() else 0,
+      )
+  units = app_git.overlay_units(repo, local, release)
+  sized = []
+  for unit in units:
+    files = [path for path in unit.paths if path in lines]
+    if files:
+      sized.append({
+        "slug": unit.slug, "disposition": unit.disposition, "pr": unit.pr,
+        "files": len(files),
+        "added": sum(lines[path][0] for path in files),
+        "removed": sum(lines[path][1] for path in files),
+      })
+  sized.sort(key=lambda item: item["added"] + item["removed"], reverse=True)
+  set_aside: list[str] = []
+  retired: tuple[app_git.RetiredPath, ...] = ()
+  if target and _rev(repo, target) and not _is_ancestor(repo, target, local):
+    # Exactly what Apply sets aside: superseded drafts and retired copies.
+    # Status is a read, so the planner's commits go to a discarded store.
+    with app_git.quarantined_objects(repo):
+      tip, retired = app_git.set_aside_merged_work(repo, local, target)
+      if tip != local:
+        set_aside = sorted(app_git.endpoint_diff_paths(repo, local, tip) or ())
+  added = sum(a for a, _r in lines.values())
+  removed = sum(r for _a, r in lines.values())
+  return {
+    "release_sha": release,
+    "files": len(lines), "added": added, "removed": removed,
+    "unit_count": len(sized), "units": sized[:_OVERLAY_SUMMARY_UNITS],
+    "retirable": {
+      "files": len([path for path in set_aside if path]),
+      "prs": sorted({item.pr for item in retired}),
+    },
+    "large": (
+      len(lines) > _LARGE_OVERLAY_FILES or added + removed > _LARGE_OVERLAY_LINES
+    ),
+    "computed_for": [local, release],
+  }
+
+
 def platform_status(
   repo: Path = PLATFORM_REPO,
   *,
@@ -5329,6 +5566,7 @@ def platform_status(
       rollback_target_sha=None, rollback_error=None,
       recovery_refs=recovery_refs,
       unfinished_update=unfinished_update(repo),
+      local_overlay=local_overlay_summary(repo, local=local, target=target),
       restart_blocker=blocker,
       )
 
@@ -5367,6 +5605,7 @@ def platform_status(
     rollback_error=(rollback or {}).get("error"),
     recovery_refs=recovery_refs,
     unfinished_update=unfinished_update(repo),
+    local_overlay=local_overlay_summary(repo, local=local, target=target),
     restart_blocker=blocker,
   )
 
@@ -5449,7 +5688,10 @@ def prepared_update_preview(
   preview.update(
     state=PlatformUpdateState.ACTIVATION_NEEDED.value, actionable=True,
     operation="finish", activation=activation, incoming_activation=activation,
-    plan_id=_update_plan_id(current, record["target"], record["image_digest"]),
+    plan_id=_update_plan_id(
+      current, record["target"], record["image_digest"],
+      evidence=app_git.overlay_evidence_fingerprint(repo),
+    ),
   )
   local_report = record["local_tests"]
   if local_report is not None:
@@ -5622,7 +5864,10 @@ def _platform_update_preview_unlocked(
         state=_state_for_activation(activation).value,
         actionable=True,
         operation="finish",
-        plan_id=_update_plan_id(local_sha, target, image_digest),
+        plan_id=_update_plan_id(
+          local_sha, target, image_digest,
+          evidence=app_git.overlay_evidence_fingerprint(repo),
+        ),
         activation=activation,
       )
     return preview
@@ -5638,7 +5883,10 @@ def _platform_update_preview_unlocked(
       actionable=True, operation="update",
       current_sha=local_sha, target_sha=target,
       plan_id=(
-        _update_plan_id(local_sha, target, image_digest) if local_sha else None
+        _update_plan_id(
+          local_sha, target, image_digest,
+          evidence=app_git.overlay_evidence_fingerprint(repo),
+        ) if local_sha else None
       ),
       image_digest=image_digest,
       activation=incoming_activation,
@@ -5651,9 +5899,13 @@ def _platform_update_preview_unlocked(
   commits = _preview_commits(repo, base, target)
   total_commits = _preview_commit_count(repo, base, target)
   parked = _read_conflict_flag() or {}
-  conflict_paths = parked.get("paths") or (
-    _final_tree_merge(repo, local, target).conflict_paths
-  )
+  conflict_paths = parked.get("paths") or []
+  retired: tuple[app_git.RetiredPath, ...] = ()
+  if not conflict_paths:
+    predicted = _final_tree_merge(repo, local, target)
+    conflict_paths, retired = (
+      predicted.conflict_paths, predicted.reconciliation.retired_paths,
+    )
   # Review this incoming release on its own. Existing activation drift remains
   # visible in status after Apply, but must not turn an unrelated source update
   # into an image replacement or agent-only dead end.
@@ -5663,7 +5915,10 @@ def _platform_update_preview_unlocked(
     actionable=True, operation="update",
     current_sha=local_sha, target_sha=target,
     plan_id=(
-      _update_plan_id(local_sha, target, image_digest) if local_sha else None
+      _update_plan_id(
+        local_sha, target, image_digest,
+        evidence=app_git.overlay_evidence_fingerprint(repo),
+      ) if local_sha else None
     ),
     image_digest=image_digest,
     activation=incoming_activation,
@@ -5674,6 +5929,7 @@ def _platform_update_preview_unlocked(
     files=_preview_files(repo, base, target),
     diff=diff, diff_truncated=truncated,
     conflict_paths=sorted(set(conflict_paths)),
+    retired_paths=[item.as_dict() for item in retired],
     local_image_paths=[],
   )
 
@@ -6019,7 +6275,7 @@ def _platform_conflict_resolver_message(
       "The owner asked you to finish a platform update that was predicted to "
       "overlap local changes.\n\n"
     )
-    return opening + (
+    return opening + _conflict_units_guidance(overlay) + (
       "The running platform is untouched. Resolve all marked files together "
       f"in the isolated candidate at `{overlay.get('worktree')}`; preserve "
       "the intended local behavior and the incoming upstream behavior. A "
@@ -6043,6 +6299,39 @@ def _platform_conflict_resolver_message(
     "print(a())\"` and ask the owner to review the update again, which "
     "compares the final local and upstream trees once."
   )
+
+
+def _conflict_units_guidance(overlay: dict) -> str:
+  """Group a parked merge's conflicts by the local unit that owns them."""
+  units = overlay.get("units") or {}
+  intents = overlay.get("unit_intent") or {}
+  retired = set(overlay.get("retired_prs") or [])
+  if not isinstance(units, dict) or not isinstance(intents, dict) or not units:
+    return ""
+  by_unit: dict[str, list[str]] = {}
+  for path, slug in units.items():
+    by_unit.setdefault(str(slug), []).append(str(path))
+  lines = []
+  for slug, paths in sorted(by_unit.items()):
+    intent = intents.get(slug) if isinstance(intents.get(slug), dict) else {}
+    disposition = str(intent.get("disposition") or "local-only")
+    pr = intent.get("pr")
+    if disposition == "owner-choice:local":
+      advice = "the owner chose to keep this local: preserve it."
+    elif pr in retired:
+      advice = f"upstream merged #{pr}; keep only what #{pr} lacks."
+    elif disposition.startswith("pending-pr"):
+      advice = (
+        f"its pull request #{pr} is not in this release: keep the local "
+        "change unless upstream now covers it."
+      )
+    else:
+      advice = "local-only work: keep its intent."
+    lines.append(
+      f"- `{slug}` ({intent.get('subject') or 'local change'}): "
+      + ", ".join(sorted(paths)) + f". {advice[0].upper()}{advice[1:]}"
+    )
+  return "Conflicted paths by local unit:\n" + "\n".join(lines) + "\n\n"
 
 
 async def spawn_platform_conflict_chat(
