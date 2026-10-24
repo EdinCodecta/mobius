@@ -226,11 +226,14 @@ def test_legacy_default_limit_is_not_reconstructed_from_new_omission(setup, monk
   with pytest.raises(HTTPException) as omitted:
     asyncio.run(routes.start_reviews(1, body, db, owner))
   assert omitted.value.status_code == 409
-  for options in [{"review_prompt": "Frozen", "max_rounds": None}, {"review_prompt": "Frozen", "max_rounds": 21}]:
+  # null is main's accepted no-op for review_merge, so it is compared with the
+  # frozen legacy limit (409) rather than rejected as a takeover option (422).
+  for options, status in [({"review_prompt": "Frozen", "max_rounds": None}, 409),
+                          ({"review_prompt": "Frozen", "max_rounds": 21}, 422)]:
     changed = body.model_copy(update={"options": routes.ReviewOptions(**options)})
     with pytest.raises(HTTPException) as error:
       asyncio.run(routes.start_reviews(1, changed, db, owner))
-    assert error.value.status_code == 422
+    assert error.value.status_code == status
   assert row.options_json == frozen
 
 

@@ -147,14 +147,23 @@ def _fingerprint(snapshot):
   return hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
+def _reject_takeover_options(mode, options):
+  """Only a takeover uses fix_prompt and max_rounds.
+
+  review/review_merge still accept main's no-op values (the Contribute app
+  always sends max_rounds: null); _options_input never freezes them there.
+  """
+  if mode != "review_fix_merge" and (options.fix_prompt not in (None, presets.FIX_PROMPT)
+                                     or options.max_rounds is not None):
+    raise HTTPException(422, "fix_prompt and max_rounds are not supported outside review_fix_merge mode")
+
+
 def _options_input(body):
   if body.options is None:
     return None
   options = body.options.model_dump(exclude_none=True, exclude_unset=True)
   mode = getattr(body, "mode", "review")
-  if mode != "review_fix_merge" and ("fix_prompt" in body.options.model_fields_set
-                                     or "max_rounds" in body.options.model_fields_set):
-    raise HTTPException(422, "fix_prompt and max_rounds are not supported outside review_fix_merge mode")
+  _reject_takeover_options(mode, body.options)
   if options.get("autopilot") is True:
     raise HTTPException(422, "autopilot is not supported by this review-only workflow")
   selected = {key: options[key] for key in presets.PROMPT_KEYS if key in options}
@@ -274,9 +283,8 @@ async def start_reviews(app_id: int | None, body: StartReviews,
         raise HTTPException(409, {"message": "This selection already belongs to another review conversation. Follow it instead of starting again.",
                                   "chat_id": row.chat_id, "run_id": row.id})
     else:
-      if body.options is not None and body.mode != "review_fix_merge" and (
-          body.options.fix_prompt is not None or "max_rounds" in body.options.model_fields_set):
-        raise HTTPException(422, "fix_prompt and max_rounds require review_fix_merge mode.")
+      if body.options is not None:
+        _reject_takeover_options(body.mode, body.options)
       if body.mode == "review_fix_merge" and not body.preview_sha256:
         raise HTTPException(422, "Preview and confirm the exact frozen takeover prompts/model before admission.")
       snapshot = _snapshot(db, body, principal)

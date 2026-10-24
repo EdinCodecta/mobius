@@ -895,3 +895,24 @@ def test_post_review_writes_a_comment_review_bound_to_the_head():
   payload = json.loads(kwargs["input_text"])
   assert payload["event"] == "COMMENT" and payload["commit_id"] == SHA
   assert args[-2:] == ("--input", "-")
+
+
+@pytest.mark.parametrize("mode", ["review", "review_merge"])
+def test_contribute_no_op_takeover_options_still_start_plain_reviews(setup, monkeypatch, mode):
+  """The installed Contribute app always sends max_rounds: null; main accepted it."""
+  from app import contribution_review_presets as presets
+  db, _, principal = setup
+  snapshot_owning_chat(db, principal)
+  monkeypatch.setattr(domain, "inspect_target", lambda *args: TARGET)
+  sent = {"max_rounds": None, "fix_prompt": presets.FIX_PROMPT, "autopilot": False}
+  preview = routes.review_preview(1, routes.ReviewPreview(mode=mode, options=sent), db, principal)
+  assert preview == routes.review_preview(1, routes.ReviewPreview(mode=mode), db, principal)
+  assert not {"max_rounds", "fix_prompt"} & preview["options"].keys()
+  body = approved_body().model_copy(update={"mode": mode, "options": routes.ReviewOptions(**sent)})
+  row = db.get(models.ContributionReviewRun,
+                asyncio.run(routes.start_reviews(1, body, db, principal))["run"]["id"])
+  assert not {"max_rounds", "fix_prompt"} & row.options_json.keys()
+  assert row.options_json["input_options"] == {}
+  with pytest.raises(HTTPException) as refused:
+    routes.review_preview(1, routes.ReviewPreview(mode=mode, options={"max_rounds": 2}), db, principal)
+  assert refused.value.status_code == 422
