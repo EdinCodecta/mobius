@@ -18,6 +18,11 @@ decides whether served source may run on it:
 ``guard``
   The fail-closed boot guard: prove the served tree is a clean committed
   state, or refuse to serve it.
+``check-packages [checkout]``
+  Read-only: print this image's Python package gap for the served checkout
+  (or ``checkout``) as JSON, ``null`` when there is none, and exit 1 only
+  when ``activate`` would refuse it. Restart admission asks this, so it
+  predicts this image's boot rather than the served code's rule.
 
 A nonzero exit means this image cannot establish a state it may serve from
 ``/data/platform``; the entrypoint then refuses to serve that tree.
@@ -37,6 +42,12 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+# The served worker reads this line from the image's baked copy of this file
+# (``restart_util.image_boot_checks_packages``) to learn that this image has
+# ``check-packages`` and serves a version-only package gap. Keep its spelling;
+# raise it when that command's contract changes.
+PACKAGE_CHECK_PROTOCOL = 1
 
 BOOT_LOG = Path("/data/logs/platform-boot.jsonl")
 _BOOT_LOG_RECORDS = 200
@@ -96,9 +107,23 @@ def record_boot_run(command: str, *, ok: bool, detail: str, log: Path | None = N
     print(f"platform boot: could not record this run in {log}: {exc!r}", file=sys.stderr)
 
 
+def check_packages(checkout: str | None) -> int:
+  from app import platform_update
+
+  repo = Path(checkout) if checkout else platform_update.PLATFORM_REPO
+  gap = platform_update.python_package_gap(repo)
+  print(json.dumps(gap))
+  return 1 if gap and gap["blocking"] else 0
+
+
 def main(argv: list[str]) -> int:
+  if len(argv) in (2, 3) and argv[1] == "check-packages":
+    return check_packages(argv[2] if len(argv) == 3 else None)
   if len(argv) != 2 or argv[1] not in {"activate", "revert", "guard"}:
-    print("usage: python3 -m app.platform_boot activate|revert|guard", file=sys.stderr)
+    print(
+      "usage: python3 -m app.platform_boot activate|revert|guard|check-packages [checkout]",
+      file=sys.stderr,
+    )
     return 2
   # Boot writes the served tree through ``su``, whose login umask can leave
   # files group-writable; the served-runtime check then rejects them.
