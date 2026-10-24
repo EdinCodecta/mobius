@@ -414,6 +414,39 @@ def test_independent_review_must_match_frozen_child_prompt(setup, monkeypatch):
   assert report(setup, tests_passed=True, reviewed_base_sha=BASE, independent_receipt_id=receipt_id)["run"]["state"] == "complete"
 
 
+
+def test_second_report_from_one_reviewer_names_the_real_recovery(setup, monkeypatch):
+  """One reviewer per head/base: /reviewers returns it again, so do not advise another."""
+  db, row, principal = takeover(setup, monkeypatch)
+  child_chat = create_chat(id="independent-child", title="Independent")
+  db.add(child_chat)
+  for run_id in ("child-review-run", "child-continuation-run"):
+    db.add(models.ChatRun(id=run_id, chat_id=child_chat.id, status="running"))
+  child = models.Delegation(id="independent", parent_chat_id=row.chat_id, parent_root_run_id=principal.run_id,
+    task_key="independent-review", child_chat_id=child_chat.id, provider="codex", model="gpt-5", effort="xhigh",
+    scope="write", cwd="/tmp", prompt_sha256=hashlib.sha256(domain.independent_brief(row, row.targets_json[0]).encode()).hexdigest())
+  db.add(child)
+  db.commit()
+  register_reviewer(db, row, child, row.targets_json[0])
+  body = routes.ReviewOutcome(**ITEM, state="needs_you", summary="A real bug", scope=sorted(routes.SCOPE),
+    tests="Passed", tests_passed=True, reviewed_base_sha=BASE)
+  first = Principal(owner=principal.owner, app_id=None, chat_id=child_chat.id, run_id="child-review-run", delegation_id=child.id)
+  asyncio.run(routes.independent_review(1, row.id, body, db, first))
+  later = Principal(owner=principal.owner, app_id=None, chat_id=child_chat.id, run_id="child-continuation-run", delegation_id=child.id)
+  clear = body.model_copy(update={"state": "all_clear", "summary": "Now clear"})
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.independent_review(1, row.id, clear, db, later))
+  detail = error.value.detail
+  assert error.value.status_code == 409
+  assert "fresh independent reviewer" not in detail
+  assert "/reviewers returns this same one" in detail
+  assert "new repair (a new head)" in detail and "target-base advance" in detail and "new grant" in detail
+  brief = " ".join(domain.takeover_brief(row).split())
+  assert "/reviewers returns that same reviewer again" in brief
+  skill = Path(__file__).resolve().parents[1] / "scripts" / "seed-skills" / "github-workflows.md"
+  assert "`/reviewers` returns that same reviewer again" in " ".join(skill.read_text().split())
+
+
 def configure_repair(setup, monkeypatch):
   db, row, principal = takeover(setup, monkeypatch)
   snapshot = {"checkout": "/fake/server-repair", "initial_head_sha": SHA, "allowed_files": ["owned.py"]}

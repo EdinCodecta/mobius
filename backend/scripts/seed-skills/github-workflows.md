@@ -99,6 +99,11 @@ Read the run's returned brief. The parent alone calls `/repair-checkout` and
 `/repairs`; independent reviewers are admitted through `/reviewers`, inherit
 the parent's Goal, and report exact head/base evidence through
 `/independent-reviews`. A repair author cannot supply their independent review.
+Each exact head and base admits one reviewer and one verdict: `/reviewers`
+returns that same reviewer again and a second report is refused, so a
+needs_you verdict cannot be replaced by asking another reviewer. Continue only
+through a new repair (a new head), an observed target-base advance, or a new
+owner grant.
 
 Edit only the server-provided checkout and frozen file scope. Ordinary
 fast-forward commits and one merge of the fetched `refs/mobius/target-base`

@@ -902,7 +902,10 @@ async def independent_review(app_id: int | None, run_id: str, body: ReviewOutcom
         return {"independent_receipt_id": existing["id"], "run": _run_view(db, row)}
       if any(r.get("delegation_id") == child.id and r.get("head_sha") == body.head_sha
              and r.get("base_sha") == body.reviewed_base_sha for r in receipts):
-        raise HTTPException(409, "This reviewer delegation already reported on this head and base. Start a fresh independent reviewer.")
+        raise HTTPException(409, "This reviewer delegation already reported on this head and base. "
+          "Its verdict stands: each head and base admits one independent reviewer, and /reviewers "
+          "returns this same one. To continue, publish a new repair (a new head), observe a "
+          "target-base advance, or ask the owner for a new grant.")
       receipts.append(receipt)
       reviews.save_outcome(db, row, reviews.key(target), {**previous,
         "state": previous.get("state", "reviewing"), "independent_reviews": receipts})

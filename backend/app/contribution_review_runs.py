@@ -618,7 +618,8 @@ def require_independent_clear(row, target, body):
     latest = next((r for r in reversed(outcome.get("independent_reviews", []))
       if r.get("delegation_id") == receipt.get("delegation_id")), None)
     if latest is not receipt:
-      raise HTTPException(422, "A fresh independent reviewer is required after changed review evidence.")
+      raise HTTPException(422, "This reviewer's later verdict supersedes that receipt. A new repair "
+                          "(a new head), a target-base advance or a new owner grant is required.")
   if (not receipt or receipt.get("head_sha") != target["head_sha"]
       or receipt.get("base_sha") != target["base_sha"]
       or receipt.get("state") != "all_clear" or receipt.get("tests_passed") is not True):
@@ -661,6 +662,10 @@ For each exact head obtain a fresh read-only durable independent child review of
 the FULL diff, six-scope rubric and tests against the exact current target base.
 Start that reviewer via POST {endpoint}/reviewers with repo, number, head_sha.
 The server freezes its prompt/provider/model/effort and durable child identity.
+Each exact head and base admits ONE reviewer and one verdict; /reviewers returns
+that same reviewer again, so its needs_you verdict cannot be replaced by asking
+another. Continue only through a new repair (a new head), an observed target-base
+advance, or a new owner grant.
 The child must POST {endpoint}/independent-reviews with repo, number, head_sha,
 reviewed_base_sha, state, summary, scope, tests and tests_passed using its own
 run bearer. This produces an independent_receipt_id. A repair author must never
