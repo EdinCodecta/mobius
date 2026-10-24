@@ -37,7 +37,9 @@ _GITHUB_AUTH_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
                     "GITHUB_ENTERPRISE_TOKEN", "GH_CONFIG_DIR")
 # Command-scope config, exactly like ``-c``. Git passes it on to any nested
 # repository, so a submodule's own config cannot start an fsmonitor either.
-_INERT_CONFIG = (("core.fsmonitor", "false"), ("submodule.recurse", "false"))
+# No hook runs either, including a pre-push hook while the token is present.
+_INERT_CONFIG = (("core.fsmonitor", "false"), ("submodule.recurse", "false"),
+                 ("core.hooksPath", "/dev/null"))
 
 
 def _repair_git_env(repo: Path, *, network: bool = False) -> dict[str, str]:
@@ -72,7 +74,9 @@ def _git(repo: Path, *args: str, check: bool = True):
   env = _repair_git_env(repo, network=network)
   # Global config is ignored, including the owner's configured credential
   # helper. Supply the one fixed GitHub helper for network operations only.
-  auth = ["-c", "credential.helper=!gh auth git-credential"] if network else []
+  # The empty value first resets the helper list, so a helper in the
+  # checkout's local config is never consulted with the token present.
+  auth = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"] if network else []
   return _run_cmd(["git", *auth, "-C", str(repo), *args], cwd=repo, check=check, env=env)
 
 
