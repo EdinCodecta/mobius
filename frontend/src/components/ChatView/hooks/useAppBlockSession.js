@@ -8,7 +8,7 @@
    When Confirm may be pressed is decided by useConfirmArming. An unsupported
    negotiation belongs to one applied revision: a newer revision is tried
    again. */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import useConfirmArming from './useConfirmArming.js'
 import { blockActions } from '../markdown/appBlock.js'
 import {
@@ -18,7 +18,8 @@ import {
 const UNNEGOTIATED = Object.freeze({ generation: null, supported: null })
 export { CONFIRM_ARM_MS } from './useConfirmArming.js'
 
-export default function useAppBlockSession({ block, near, revision = null, confirmView = null, listEndView = null }) {
+export default function useAppBlockSession({ block, near, revision = null, confirmView = null, listEndView = null,
+  admitted = true }) {
   const [sessionId] = useState(() => crypto.randomUUID())
   const [state, setState] = useState(null)
   const [event, setEvent] = useState(null)
@@ -35,6 +36,9 @@ export default function useAppBlockSession({ block, near, revision = null, confi
   const frameWanted = near || retained
   // An unsupported document still keeps unresolved ownership mounted.
   const frameMounted = frameWanted && (negotiation.supported !== false || retained)
+
+  const admittedRef = useRef(admitted)
+  useLayoutEffect(() => { admittedRef.current = admitted }, [admitted])
 
   const clearEvent = useCallback(() => {
     eventRef.current = null
@@ -90,7 +94,8 @@ export default function useAppBlockSession({ block, near, revision = null, confi
   // the app acknowledges this exact nonce, cannot send another event.
   const dispatch = useCallback((key, kind) => {
     const current = negotiationRef.current
-    if (eventRef.current || current.supported !== true || !keys.has(key)) return false
+    // Withdrawn admission: the session keeps settling, but takes no new event.
+    if (!admittedRef.current || eventRef.current || current.supported !== true || !keys.has(key)) return false
     if (kind === 'confirm' && !mayConfirm(key)) return false
     // Every owner event ends the showing, Confirm included: a press spends
     // it, so another confirm needs a new showing and a fresh visible delay.

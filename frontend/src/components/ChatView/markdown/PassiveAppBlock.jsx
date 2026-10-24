@@ -34,6 +34,12 @@ export function useOnScreen(showing) {
   return [setNode, { showing: seen.showing, visible: seen.intersecting && documentVisible }]
 }
 
+/** No new owner event while one awaits acknowledgement, an action is busy,
+ *  or admission was withdrawn under an unresolved session. */
+export function sessionLocked(session, admitted) {
+  return !admitted || session.awaitingAck || Boolean(session.state?.actions.some(action => action.busy))
+}
+
 /** Static unless an admitted, supporting session has a frame slot. A view
  *  the reader opened in the static form stays until the reader closes it. */
 export function passiveBlockMode({ supported, near, granted, retained, staticOpen }) {
@@ -96,7 +102,7 @@ export function SessionConfirmation({ action, appName, listEndRef = null }) {
 /** The passive block for one parsed session state. The parser allows at most
  *  one enabled confirmation, and this is the action whose list is shown. */
 export function PassiveBlockView({ block, app, state, locked, confirmArmed = false, onEvent, onInternalNav,
-  sectionRef = null, confirmRef = null, listEndRef = null, children = null }) {
+  sectionRef = null, confirmRef = null, listEndRef = null, notice = '', children = null }) {
   const actionState = key => state?.actions.find(action => action.key === key) || null
   const actionFor = target => target
     ? <SessionControls target={target} state={actionState(target.intent)} locked={locked}
@@ -105,6 +111,7 @@ export function PassiveBlockView({ block, app, state, locked, confirmArmed = fal
   return <AppBlockLayout block={sessionSnapshot(block, state)} app={app} onInternalNav={onInternalNav}
     actionFor={actionFor} summary={state?.summary || ''} sectionRef={sectionRef}>
     <SessionConfirmation action={state?.actions.find(action => action.confirming)} appName={app.name} listEndRef={listEndRef} />
+    {notice ? <p className="md-app-block__notice" role="status">{notice}</p> : null}
     {state?.notice ? <p className="md-app-block__notice" role="status">{state.notice}</p> : null}
     {children}
   </AppBlockLayout>
@@ -123,7 +130,10 @@ function SessionHost({ app, session }) {
   </div>
 }
 
-export default function PassiveAppBlock({ block, app, onInternalNav }) {
+export const ADMISSION_WITHDRAWN = name =>
+  `${name} can no longer run in this chat. Open ${name} to check the result of the last action before trying again.`
+
+export default function PassiveAppBlock({ block, app, onInternalNav, admitted = true, onRetainedChange = null }) {
   const [sectionRef, { near, distance }] = useNearViewport()
   // Observers follow the committed showing (set after it renders).
   const [showing, setShowing] = useState(null)
@@ -134,16 +144,16 @@ export default function PassiveAppBlock({ block, app, onInternalNav }) {
   const granted = usePassiveSlot(app.id, { wanted: near && !staticOpen, retained, distance })
   const session = useAppBlockSession({ block, near: near && granted && !staticOpen,
     revision: `${app.passive_block_module_digest}:${appFrameVersion(app)}`,
-    confirmView, listEndView })
+    confirmView, listEndView, admitted })
   useEffect(() => setShowing(session.showing), [session.showing])
   useEffect(() => setRetained(session.retained), [session.retained])
+  useEffect(() => { onRetainedChange?.(session.retained) }, [onRetainedChange, session.retained])
   if (passiveBlockMode({ supported: session.supported, near, granted, retained: session.retained, staticOpen }) === 'static') {
     return <StaticAppBlock block={block} app={app} appsLoading={false} onInternalNav={onInternalNav}
       sectionRef={sectionRef} onOpenChange={setStaticOpen} />
   }
-  const { state } = session
-  const locked = session.awaitingAck || Boolean(state?.actions.some(action => action.busy))
-  return <PassiveBlockView block={block} app={app} state={state} locked={locked} confirmArmed={session.confirmArmed}
+  return <PassiveBlockView block={block} app={app} state={session.state} locked={sessionLocked(session, admitted)}
+    confirmArmed={admitted && session.confirmArmed} notice={admitted ? '' : ADMISSION_WITHDRAWN(app.name)}
     onEvent={session.dispatch} onInternalNav={onInternalNav} sectionRef={sectionRef}
     confirmRef={confirmRef} listEndRef={listEndRef}>
     {session.frameMounted ? <SessionHost app={app} session={session} /> : null}

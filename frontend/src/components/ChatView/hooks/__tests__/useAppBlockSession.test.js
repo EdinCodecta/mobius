@@ -388,3 +388,34 @@ test('a replacement list cannot borrow the old sentinel\'s intersection (round-3
     assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), true)
   } finally { mock.timers.reset() }
 })
+
+for (const unresolved of ['busy after Confirm', 'unknown outcome']) {
+  test(`withdrawn admission mid-session keeps the unresolved outcome and offers no new action: ${unresolved}`, () => {
+    mock.timers.enable({ apis: ['setTimeout'] })
+    try {
+      const { h, capability, report } = mounted()
+      capability(true, 1)
+      report(confirmList('Publish'))
+      mock.timers.tick(CONFIRM_ARM_MS)
+      assert.equal(h.result.current.dispatch('send-batch:sel-1', 'confirm'), true)
+      const nonce = h.result.current.event.nonce
+      report(unresolved === 'busy after Confirm'
+        ? { ackNonce: nonce, retain: true, actions: [{ key: 'send-batch:sel-1', busy: true, disabled: true }] }
+        : { ackNonce: nonce, retain: true, checkpoint: { id: 'attempt-1', data: '{"phase":"unknown"}' } })
+      assert.equal(h.result.current.retained, true)
+      // An applied update drops the capability: AppBlock keeps this session, held.
+      h.rerender({ block, near: true, confirmVisible: true, listEndVisible: true, admitted: false })
+      assert.equal(h.result.current.retained, true, 'the unresolved outcome is not dropped')
+      assert.equal(h.result.current.frameMounted, true, 'its document keeps settling')
+      if (unresolved === 'unknown outcome') {
+        assert.deepEqual(h.result.current.blockSession.checkpoint, { id: 'attempt-1', data: '{"phase":"unknown"}' })
+      }
+      // The app may still report; no new owner event can be sent.
+      report({ ...confirmList('Publish again'), retain: true })
+      mock.timers.tick(CONFIRM_ARM_MS * 2)
+      for (const kind of ['activate', 'confirm', 'cancel']) {
+        assert.equal(h.result.current.dispatch('send-batch:sel-1', kind), false, `${kind} after admission is withdrawn`)
+      }
+    } finally { mock.timers.reset() }
+  })
+}

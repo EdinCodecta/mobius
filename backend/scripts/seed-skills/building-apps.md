@@ -537,8 +537,11 @@ included.
   without acting twice on the same nonce.
 - `retain: true` while you own a confirmation, an operation in progress or an
   unknown outcome; the host then keeps your document alive offscreen and does
-  not replace it with an app update. Release it only after cancellation or a
-  settled result.
+  not replace it with an app update. If an update removes the capability or
+  its applied admission while you retain, the block keeps your document and
+  its checkpoint, sends no new owner event, and tells the reader to open the
+  app to check the result; it becomes static once you release. Release it
+  only after cancellation or a settled result.
 - `checkpoint`: `{id (1-128), data (string, at most 32768 UTF-8 bytes)}` or
   `null`, opaque to the host and returned in the next document's
   `app-block-init`. Put only what is needed to recover an unresolved outcome

@@ -199,3 +199,29 @@ test('a static view the reader opened stays until the reader closes it, even whe
   assert.equal(passiveBlockMode({ ...base, supported: false, granted: true, staticOpen: false }), 'static')
   assert.equal(passiveBlockMode({ ...base, granted: false, staticOpen: true, retained: true }), 'passive', 'an unresolved owner keeps its session')
 })
+
+test('a session whose admission disappears stays mounted, held, while its outcome is unresolved', async () => {
+  const { appBlockRoute } = await import('../markdown/AppBlock.jsx')
+  const live = { requested: true, installed: true }
+  assert.equal(appBlockRoute({ ...live, admitted: true, unresolved: false }), 'passive')
+  assert.equal(appBlockRoute({ ...live, admitted: true, unresolved: true }), 'passive')
+  assert.equal(appBlockRoute({ ...live, admitted: false, unresolved: true }), 'held', 'not a fresh static open')
+  assert.equal(appBlockRoute({ ...live, admitted: false, unresolved: false }), 'static', 'once settled it may go static')
+  assert.equal(appBlockRoute({ ...live, requested: false, admitted: true, unresolved: false }), 'static')
+})
+
+test('a held session tells the reader to check the result and offers no control', async () => {
+  const { ADMISSION_WITHDRAWN, sessionLocked } = await import('../markdown/PassiveAppBlock.jsx')
+  const state = sessionState({ type: 'moebius:app-block-state', sessionId: 's', retain: true,
+    actions: [{ key: 'send-batch:sel-1', label: 'Send all', busy: true }] }, 's', new Set(['send-batch:sel-1']))
+  const block = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.stringify({ ...base, interaction: 'inline',
+    action: { label: 'Send all', intent: 'send-batch:sel-1' } }) })
+  const session = { state, awaitingAck: false }
+  assert.equal(sessionLocked(session, false), true)
+  assert.equal(sessionLocked({ state: null, awaitingAck: false }, false), true, 'locked even with no busy action')
+  assert.equal(sessionLocked({ state: null, awaitingAck: false }, true), false)
+  const html = renderToStaticMarkup(createElement(PassiveBlockView, { block, app: admitted[0], state,
+    locked: sessionLocked(session, false), confirmArmed: false, notice: ADMISSION_WITHDRAWN('Example'), onEvent() {} }))
+  assert.match(html, /Example can no longer run in this chat\. Open Example to check the result of the last action/)
+  assert.doesNotMatch(html, /class="md-app-block__action">/, 'no enabled control')
+})

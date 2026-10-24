@@ -829,7 +829,10 @@ and owner events are bound to it; a reload or version promotion resets idle
 controls, and an idle session released offscreen keeps nothing. A document that
 reports `retain` (an unacknowledged event, a confirmation, an operation in
 progress or an unknown outcome) stays mounted and is not replaced by an app
-update until it releases. AppCanvas refuses host requests from a buffered
+update until it releases. If admission itself is withdrawn meanwhile (an
+update drops the capability or its digest), the retained session stays
+mounted with its checkpoint, takes no new owner event, and tells the reader to
+open the app to check the result; it becomes a static block once it releases. AppCanvas refuses host requests from a buffered
 successor, and from any transcript or session canvas that is not visible (the
 hidden session canvas gets no host-request handler at all). An ordinary shell
 app keeps its background requests, such as chat status or a projects list,
