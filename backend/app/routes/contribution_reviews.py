@@ -428,14 +428,15 @@ def _merge_attempted(outcome) -> bool:
   return reviews.merge_pending(outcome)
 
 
-async def _reconcile_merge(previous, target, pull, cwd):
+async def _observe_merge(target, pull, cwd):
+  """The merge fact GitHub shows now, as fields for settle_merge_observation."""
   if pull.get("merged"):
-    return {**previous, "state": "merged", "merge_sha": pull.get("merge_commit_sha")}
+    return {"state": "merged", "merge_sha": pull.get("merge_commit_sha")}
   checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
   entry = reviews.queue_entry(checks, target)
   if entry:
-    return {**previous, "state": "queued", "queue_entry_id": entry["id"]}
-  return {**previous, "state": "merge_unknown", "summary":
+    return {"state": "queued", "queue_entry_id": entry["id"]}
+  return {"state": "merge_unknown", "summary":
     "The earlier merge or queue request is not confirmed. Check GitHub; it was not repeated."}
 
 
@@ -491,8 +492,8 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     outcome = {**_reported_outcome(previous, body, row, principal),
                "independent_receipt_id": body.independent_receipt_id}
     if attempted:
-      outcome = await _reconcile_merge(previous, target, pull, cwd)
-      reviews.save_effect_outcome(db, row, item_key, outcome)
+      reviews.settle_merge_observation(db, row, item_key, previous,
+                                       await _observe_merge(target, pull, cwd))
       return {"run": _run_view(db, row)}
     if body.state == "all_clear" and row.mode == "review_fix_merge":
       try:
@@ -767,13 +768,12 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
         continue  # An ambiguous receipt chain needs the owner; observe the others.
       try:
         _repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
-        outcome = await _reconcile_merge(previous, target, pull, cwd)
+        fact = await _observe_merge(target, pull, cwd)
       except HTTPException:
         # A failed read proves no new fact; historical review evidence and the
         # exact public-attempt fence both remain intact.
         continue
-      if outcome != previous:
-        reviews.save_effect_outcome(db, row, reviews.key(original), outcome)
+      reviews.settle_merge_observation(db, row, reviews.key(original), previous, fact)
     return {"run": _run_view(db, row)}
 
 

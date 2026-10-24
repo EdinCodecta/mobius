@@ -113,3 +113,29 @@ def test_refreshed_stale_write_cannot_drop_a_saved_public_attempt(setup, armed):
   assert error.value.status_code == 409
   db.refresh(row)
   assert row.outcomes_json[domain.key(ITEM)] == armed
+
+
+@pytest.mark.parametrize("observer", ["observe", "report"])
+def test_delayed_merge_observation_cannot_revive_a_disarmed_merge_over_a_repair(setup, monkeypatch, observer):
+  """A reads 'merging'; B disarms after definite non-dispatch and arms a repair."""
+  db, row, principal = takeover(setup, monkeypatch)
+  target = row.targets_json[0]
+  assert domain.arm_merge(db, row, target, {"head_sha": SHA}, principal) is None
+  armed_repair = {**FIRST, "work_key": (
+    f"github:{target['head_repo'].lower()}:branch:{target['head_ref']}:{target['head_sha']}:repair")}
+  def disarm_and_repair_during_read(*args):
+    with SessionLocal() as other:
+      current = other.get(models.ContributionReviewRun, row.id)
+      domain.disarm_merge(other, current, target, "GitHub refused the merge; nothing was sent.")
+      assert domain.arm_repair(other, current, target, {}, FIRST, principal) is None
+    return REPO, PULL
+  monkeypatch.setattr(domain, "current_pull", disarm_and_repair_during_read)
+  monkeypatch.setattr(domain, "pull_checks", lambda *a: {"headRefOid": SHA})
+  if observer == "observe":
+    asyncio.run(routes.observe_review(1, row.id, db, Principal(owner=principal.owner, app_id=None)))
+  else:
+    report(setup)
+  db.refresh(row)
+  item = row.outcomes_json[domain.key(ITEM)]
+  assert item["state"] == "pushing" and item["merge_attempted"] is False
+  assert item["repair_attempts"] == [armed_repair]

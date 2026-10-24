@@ -848,6 +848,23 @@ def save_effect_outcome(db, row, item_key, outcome):
   raise HTTPException(409, "The remote result could not be recorded after concurrent changes; observe this run.")
 
 
+def settle_merge_observation(db, row, item_key, observed, fact):
+  """Apply one read-only merge fact to the current item, never to a snapshot.
+
+  ``observed`` is the item the observer read before its GitHub reads. The
+  fact answers only for that reservation: once it was definitely disarmed
+  (and perhaps a repair armed) or the item moved to another head, the delayed
+  observation no longer applies. Otherwise only the fact's fields change, so
+  newer receipts and evidence survive.
+  """
+  def apply(current):
+    if not merge_pending(current) or current.get("head_sha") != observed.get("head_sha"):
+      return None
+    settled = {**current, **fact}
+    return None if settled == current else settled
+  save_effect_outcome(db, row, item_key, apply)
+
+
 def settle_repair_attempt(db, row, item_key, receipt, settle,
                           *, pending=("pushing", "push_unknown")):
   """Record one exact push fact on the current item, by immutable receipt identity.
