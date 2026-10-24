@@ -65,9 +65,13 @@
 .md-app-block__confirmation li { display:grid; gap:4px; min-width:0; overflow-wrap:anywhere; }
 .md-app-block__confirmation li > span { font-weight:600; }
 .md-app-block__confirmation dl { display:grid; gap:2px; margin:0; }
-.md-app-block__confirmation dl > div { display:grid; grid-template-columns:minmax(80px, max-content) minmax(0, 1fr); gap:12px; }
+/* The label column fits its content but never past 40%, and both cells wrap
+   anywhere, so a long label cannot squeeze the value to nothing. */
+.md-app-block__confirmation dl > div { display:grid; grid-template-columns:fit-content(40%) minmax(0, 1fr); gap:12px; }
+.md-app-block__confirmation dt, .md-app-block__confirmation dd { min-width:0; overflow-wrap:anywhere; }
 .md-app-block__confirmation dt { color:var(--muted); }
 .md-app-block__confirmation dt, .md-app-block__confirmation dd, .md-app-block__confirmation p { margin:0; font-size:13px; }
 .md-app-block__provenance { color:var(--muted); }
 .md-app-block__session-host { position:absolute; width:1px; height:1px; overflow:hidden; opacity:0; pointer-events:none; clip-path:inset(50%); }
 .md-app-block__list-end { display:block; height:1px; }
+@media (max-width:480px) { .md-app-block__confirmation dl > div { grid-template-columns:minmax(0, 1fr); gap:0; } }
