@@ -33,9 +33,22 @@ from app.github_contribution_contract import COAUTHOR_TRAILER, coauthor_trailer_
 from app.github_contribution_git import _git_env, _run_cmd, _validate_branch, _validate_repo_slug
 
 
-def _repair_git_env(repo: Path) -> dict[str, str]:
-  """One sanitized environment for every server proof in a repair checkout."""
+_GITHUB_AUTH_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
+                    "GITHUB_ENTERPRISE_TOKEN", "GH_CONFIG_DIR")
+# Command-scope config, exactly like ``-c``. Git passes it on to any nested
+# repository, so a submodule's own config cannot start an fsmonitor either.
+_INERT_CONFIG = (("core.fsmonitor", "false"), ("submodule.recurse", "false"))
+
+
+def _repair_git_env(repo: Path, *, network: bool = False) -> dict[str, str]:
+  """One sanitized environment for every server proof in a repair checkout.
+
+  GitHub credentials are present only for ``network`` commands (fetch and
+  push). Local reads never carry them, so a program a checkout manages to
+  start cannot see the token.
+  """
   env = _git_env(repo)
+  auth = {key: env.pop(key) for key in _GITHUB_AUTH_ENV if key in env}
   for key in tuple(env):
     if key.startswith("GIT_CONFIG_") or key in {
         "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
@@ -44,16 +57,22 @@ def _repair_git_env(repo: Path) -> dict[str, str]:
       env.pop(key, None)
   env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
              GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0",
-             GIT_ASKPASS="/bin/false", SSH_ASKPASS="/bin/false")
+             GIT_ASKPASS="/bin/false", SSH_ASKPASS="/bin/false",
+             GIT_CONFIG_COUNT=str(len(_INERT_CONFIG)))
+  for index, (name, value) in enumerate(_INERT_CONFIG):
+    env[f"GIT_CONFIG_KEY_{index}"], env[f"GIT_CONFIG_VALUE_{index}"] = name, value
+  if network:
+    env.update(auth)
   return env
 
 
 def _git(repo: Path, *args: str, check: bool = True):
   """Run server Git without inherited config, object redirects or prompts."""
-  env = _repair_git_env(repo)
+  network = args[:1] in {("fetch",), ("push",)}
+  env = _repair_git_env(repo, network=network)
   # Global config is ignored, including the owner's configured credential
   # helper. Supply the one fixed GitHub helper for network operations only.
-  auth = ["-c", "credential.helper=!gh auth git-credential"] if args[:1] in {("fetch",), ("push",)} else []
+  auth = ["-c", "credential.helper=!gh auth git-credential"] if network else []
   return _run_cmd(["git", *auth, "-C", str(repo), *args], cwd=repo, check=check, env=env)
 
 
@@ -293,8 +312,8 @@ def prepare_checkout(gh, cwd: Path, row, target: dict, allowed_files: list[str])
   os.chmod(checkout, 0o700)
   try:
     _git(checkout, "init", "-q")
-    _git(checkout, "fetch", "--no-tags", f"https://github.com/{slug}.git",
-         f"refs/heads/{branch}")
+    _git(checkout, "fetch", "--no-tags", "--no-recurse-submodules",
+         f"https://github.com/{slug}.git", f"refs/heads/{branch}")
     fetched = _git(checkout, "rev-parse", "FETCH_HEAD^{commit}").stdout.strip()
     if fetched != initial:
       _fail("The PR head moved during checkout preparation.")
@@ -326,7 +345,8 @@ def fetch_target_base(gh, cwd: Path, checkout: Path, target: dict) -> str:
   ref = _read(gh, cwd, f"repos/{target['repo']}/git/ref/heads/{quote(target['base_ref'], safe='')}")
   live = _sha((ref.get("object") or {}).get("sha") if isinstance(ref, dict) else None)
   try:
-    _git(checkout, "fetch", "--no-tags", f"https://github.com/{_validate_repo_slug(target['repo'])}.git",
+    _git(checkout, "fetch", "--no-tags", "--no-recurse-submodules",
+         f"https://github.com/{_validate_repo_slug(target['repo'])}.git",
          f"+refs/heads/{_validate_branch(target['base_ref'])}:{TARGET_BASE_REF}")
     fetched = _git(checkout, "rev-parse", f"{TARGET_BASE_REF}^{{commit}}").stdout.strip()
   except (ContributionSubmitError, OSError, subprocess.SubprocessError):
@@ -390,6 +410,13 @@ def _assert_git_metadata(path: Path) -> None:
     _fail("The dedicated checkout's Git references could not be verified.")
   if replaced.stdout.strip():
     _fail("Git replacement objects cannot authorize a public repair.")
+  # A gitlink names a nested repository with its own, unchecked config that
+  # status would otherwise enter. Repairs never need one.
+  index = _git(path, "ls-files", "--stage", "-z", check=False)
+  if index.returncode != 0:
+    _fail("The dedicated checkout's Git index could not be verified.")
+  if any(entry.startswith("160000 ") for entry in index.stdout.split("\x00")):
+    _fail("The dedicated checkout contains a submodule; repairs cannot include one.")
 
 
 def validate_repair(gh, cwd: Path, row, target: dict, checkout: dict,
@@ -424,7 +451,8 @@ def validate_repair(gh, cwd: Path, row, target: dict, checkout: dict,
   allowed = set(snapshot_allowed) & _changed_files(gh, cwd, target)
   if not allowed:
     _fail("No approved repair file remains in the current PR file scope.")
-  if _git(path, "status", "--porcelain", "--untracked-files=all").stdout.strip():
+  if _git(path, "status", "--porcelain", "--untracked-files=all",
+          "--ignore-submodules=all").stdout.strip():
     _fail("Commit or discard working changes before validating the repair.")
   initial = _sha(checkout["initial_head_sha"])
   head = _git(path, "rev-parse", "HEAD^{commit}").stdout.strip()
@@ -496,9 +524,16 @@ def _present_commit(path: Path, sha: str) -> str | None:
 
 
 def _tree_changes(path: Path, older: str, newer: str) -> set[str]:
-  names = _git(path, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z",
-               older, newer).stdout
-  return {name for name in names.split("\x00") if name}
+  """Paths changed between two trees; a new or changed gitlink is refused."""
+  fields = _git(path, "diff-tree", "--no-commit-id", "--no-renames", "-r", "-z",
+                older, newer).stdout.split("\x00")
+  names = set()
+  # Raw -z records: ":<old mode> <new mode> <old oid> <new oid> <status>\0<path>\0".
+  for meta, name in zip(fields[0::2], fields[1::2]):
+    if meta.split(" ")[1:2] == ["160000"]:
+      _fail("A repair commit cannot add or change a submodule.")
+    names.add(name)
+  return names
 
 
 def push_repair(gh, cwd: Path, row, target: dict, validation: dict, *, before_push=None) -> DispatchResult[dict]:
