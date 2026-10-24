@@ -701,3 +701,72 @@ Allow up to 60 minutes; network/registry/package failures fail the test rather
 than count as success. Hosted execution and any publication of the test branch
 are separate owner decisions. Running locally available syntax/contract tests
 is preparation, not evidence that the real image replay passed.
+
+## Disposable mixed upgrade proof
+
+A release that needs both an image replacement and a newer installed helper
+cannot be finished in Settings: the previous release refuses Update with
+`external_activation_required` and Apply with `image_rebuild_required`, and
+`scripts/test-upgrade-path.sh` deliberately fails on such a span. On a **fresh
+disposable amd64 systemd host only** (local Docker daemon, Compose v2, free
+ports 80/443, at least 15 GiB free for Docker, and a root-owned full-history
+checkout), `scripts/test-mixed-host-upgrade.sh` proves the rest of that
+contract with the previous release's official image:
+
+```sh
+sudo scripts/test-mixed-host-upgrade.sh <previous-sha> <target-sha>
+```
+
+It reruns itself in a constructed environment (no proxies, Docker or Compose
+selectors, Git or curl configuration, or deploy overrides) and refuses any
+existing Möbius container, volume, network, image, helper path or occupied
+port before changing the host. It proves the running image, served source and
+installed helper are the previous release, requires the review to be exactly
+the pinned image plus helper span, and requires each Settings refusal and the
+target's `deploy-prod.sh` (which refuses until the helper migration installs
+its root-pinned manual adapter) to leave the installation unchanged. It then
+runs `install-rebuild-helper.sh` and `deploy-prod.sh` from the updated
+operator checkout.
+
+`deploy-prod.sh`'s fixed public probe host resolves to loopback on that host,
+so the deploy must stop exactly there, after its cutover and internal checks:
+this is a **partial deploy**, and its shell reload broadcast, build-cache
+cleanup and completion line do not run. The proof then requires the bundled
+Caddy to serve the target, the original owner session and exactly the owed
+helper migration over local HTTPS, and the admitted app to keep its volume,
+chats and data. It installs root-owned units, publishes ports 80/443 and edits
+`/etc/hosts`; never run it against a live installation. Local contract tests
+are preparation, not evidence that the real host upgrade passed.
+
+### Opt-in hosted execution
+
+The existing **Tests** workflow has a default-off `mixed_upgrade_proof` input.
+It runs this historical pair on a disposable GitHub-hosted Ubuntu 24.04 runner:
+`f6e61ae4240c10daf7ece40a74bb14eca4d43f87` to
+`6bac85f6834ad0507eae8dc12b2dcbdbcbe65193`. These are the releases under test,
+not the commit containing the test itself. The job has read-only repository
+permissions, retains no checkout credentials, and allows 120 minutes.
+It never runs on pull-request or merge-group events.
+
+After separately approving publication and hosted execution, select the exact
+reviewed branch in **Run workflow**, enable only `mixed_upgrade_proof`, and
+leave the other optional host proofs off. The equivalent CLI invocation is:
+
+```sh
+gh workflow run test.yml --repo <owner>/mobius --ref <reviewed-branch> \
+  -f mixed_upgrade_proof=true
+```
+
+GitHub requires the workflow to exist on the repository's default branch;
+`test.yml` already does upstream. A fork must also have Actions enabled and
+that workflow available. Verify the resulting run's head SHA matches the
+reviewed commit before treating its results as evidence. Manual dispatch also
+runs the workflow's existing tests and consumes runner time; it does not only
+run this job. Do not repeat a failed run without diagnosing it.
+
+The job frees space in the disposable runner's preinstalled tool directories,
+copies the checkout into a root-owned directory, then runs the same script
+without weakening its fresh-host preflight. Its output must still describe a
+**partial deploy** and retain the helper-maintenance debt. Even a successful
+historical run does not make the separate Settings-only upgrade check pass,
+prove an arbitrary candidate upgrade, or authorize a live-host operation.
