@@ -6,6 +6,7 @@ import { renderHook } from './react-hook-shim.mjs'
 import useAppBlockSession, { CONFIRM_ARM_MS } from '../useAppBlockSession.js'
 import { appBlockFromToken } from '../../markdown/appBlock.js'
 import { createBlockDocuments, forwardBlockState } from '../../../AppCanvas/appBlockSessionHost.js'
+import { appBlockRoute, passiveBlockMode } from '../../markdown/blockOwnership.js'
 
 const block = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.stringify({
   app: 'example', intent: 'open:a', title: 'Fix', interaction: 'inline',
@@ -419,3 +420,29 @@ for (const unresolved of ['busy after Confirm', 'unknown outcome']) {
     } finally { mock.timers.reset() }
   })
 }
+
+test('the first retain report and the admission withdrawal in the same tick never drop the session', () => {
+  // AppBlock and PassiveAppBlock's decisions, made from the same render's state.
+  const h = renderObserved({ block, near: true, confirmVisible: true, listEndVisible: true, admitted: true })
+  const decide = (admitted, session) => ({
+    route: appBlockRoute({ requested: true, installed: true, admitted, started: true }),
+    mode: passiveBlockMode({ admitted, supported: session.supported, near: true, granted: true, retained: session.retained, staticOpen: false }),
+  })
+  h.result.current.onBlockCapability(true, { generation: 1, reset: true })
+  h.result.current.onBlockState({ type: 'moebius:app-block-state', sessionId: h.result.current.sessionId,
+    actions: [{ key: 'send-batch:sel-1', label: 'Ready' }] }, { generation: 1 })
+  assert.deepEqual(decide(true, h.result.current), { route: 'passive', mode: 'passive' })
+  // Co-delivered: the app's first retain + checkpoint report, then the app-list
+  // refresh that withdraws admission, before any effect can mirror state.
+  h.result.current.onBlockState({ type: 'moebius:app-block-state', sessionId: h.result.current.sessionId,
+    actions: [{ key: 'send-batch:sel-1', label: 'Ready' }], retain: true, checkpoint: { id: 'race', data: 'unknown' } }, { generation: 1 })
+  h.rerender({ block, near: true, confirmVisible: true, listEndVisible: true, admitted: false })
+  assert.deepEqual(decide(false, h.result.current), { route: 'passive', mode: 'passive' }, 'held, not a fresh static open')
+  assert.deepEqual(h.result.current.blockSession.checkpoint, { id: 'race', data: 'unknown' })
+  assert.equal(h.result.current.frameMounted, true)
+  assert.equal(h.result.current.dispatch('send-batch:sel-1', 'activate'), false)
+  // When the outcome settles, the same owner shows the static form.
+  h.result.current.onBlockState({ type: 'moebius:app-block-state', sessionId: h.result.current.sessionId,
+    actions: [{ key: 'send-batch:sel-1', label: 'Ready' }], retain: false, checkpoint: null, checkpointAck: 'race' }, { generation: 1 })
+  assert.deepEqual(decide(false, h.result.current), { route: 'passive', mode: 'static' })
+})

@@ -8,6 +8,9 @@ import { sessionSnapshot } from './appBlockSession.js'
 import { AppBlockLayout, AppCanvas, StaticAppBlock } from './AppBlockParts.jsx'
 import { usePassiveSlot } from './passiveSlots.js'
 import { useNearViewport } from './blockViewport.js'
+import { passiveBlockMode } from './blockOwnership.js'
+
+export { passiveBlockMode }
 
 /** Whether an element is actually on screen in a visible document (no
  *  prefetch margin), as `{ showing, visible }`. The observation belongs to the
@@ -40,12 +43,6 @@ export function sessionLocked(session, admitted) {
   return !admitted || session.awaitingAck || Boolean(session.state?.actions.some(action => action.busy))
 }
 
-/** Static unless an admitted, supporting session has a frame slot. A view
- *  the reader opened in the static form stays until the reader closes it. */
-export function passiveBlockMode({ supported, near, granted, retained, staticOpen }) {
-  if (retained) return 'passive'
-  return supported === false || staticOpen || (near && !granted) ? 'static' : 'passive'
-}
 
 function SessionLinks({ links }) {
   if (!links.length) return null
@@ -133,7 +130,7 @@ function SessionHost({ app, session }) {
 export const ADMISSION_WITHDRAWN = name =>
   `${name} can no longer run in this chat. Open ${name} to check the result of the last action before trying again.`
 
-export default function PassiveAppBlock({ block, app, onInternalNav, admitted = true, onRetainedChange = null }) {
+export default function PassiveAppBlock({ block, app, onInternalNav, admitted = true }) {
   const [sectionRef, { near, distance }] = useNearViewport()
   // Observers follow the committed showing (set after it renders).
   const [showing, setShowing] = useState(null)
@@ -141,14 +138,14 @@ export default function PassiveAppBlock({ block, app, onInternalNav, admitted = 
   const [listEndRef, listEndView] = useOnScreen(showing)
   const [retained, setRetained] = useState(false)
   const [staticOpen, setStaticOpen] = useState(false)
-  const granted = usePassiveSlot(app.id, { wanted: near && !staticOpen, retained, distance })
-  const session = useAppBlockSession({ block, near: near && granted && !staticOpen,
+  // Without admission no new frame starts; a retained one keeps its own.
+  const granted = usePassiveSlot(app.id, { wanted: admitted && near && !staticOpen, retained, distance })
+  const session = useAppBlockSession({ block, near: admitted && near && granted && !staticOpen,
     revision: `${app.passive_block_module_digest}:${appFrameVersion(app)}`,
     confirmView, listEndView, admitted })
   useEffect(() => setShowing(session.showing), [session.showing])
   useEffect(() => setRetained(session.retained), [session.retained])
-  useEffect(() => { onRetainedChange?.(session.retained) }, [onRetainedChange, session.retained])
-  if (passiveBlockMode({ supported: session.supported, near, granted, retained: session.retained, staticOpen }) === 'static') {
+  if (passiveBlockMode({ admitted, supported: session.supported, near, granted, retained: session.retained, staticOpen }) === 'static') {
     return <StaticAppBlock block={block} app={app} appsLoading={false} onInternalNav={onInternalNav}
       sectionRef={sectionRef} onOpenChange={setStaticOpen} />
   }

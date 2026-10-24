@@ -200,14 +200,19 @@ test('a static view the reader opened stays until the reader closes it, even whe
   assert.equal(passiveBlockMode({ ...base, granted: false, staticOpen: true, retained: true }), 'passive', 'an unresolved owner keeps its session')
 })
 
-test('a session whose admission disappears stays mounted, held, while its outcome is unresolved', async () => {
+test('once started, the passive session owns the block across admission changes and decides held or static itself', async () => {
   const { appBlockRoute } = await import('../markdown/AppBlock.jsx')
   const live = { requested: true, installed: true }
-  assert.equal(appBlockRoute({ ...live, admitted: true, unresolved: false }), 'passive')
-  assert.equal(appBlockRoute({ ...live, admitted: true, unresolved: true }), 'passive')
-  assert.equal(appBlockRoute({ ...live, admitted: false, unresolved: true }), 'held', 'not a fresh static open')
-  assert.equal(appBlockRoute({ ...live, admitted: false, unresolved: false }), 'static', 'once settled it may go static')
-  assert.equal(appBlockRoute({ ...live, requested: false, admitted: true, unresolved: false }), 'static')
+  assert.equal(appBlockRoute({ ...live, admitted: true, started: false }), 'passive')
+  assert.equal(appBlockRoute({ ...live, admitted: false, started: false }), 'static', 'a never-admitted app stays static')
+  assert.equal(appBlockRoute({ ...live, admitted: false, started: true }), 'passive', 'the owner stays mounted when admission goes')
+  assert.equal(appBlockRoute({ ...live, installed: false, admitted: false, started: true }), 'static')
+  assert.equal(appBlockRoute({ ...live, requested: false, admitted: true, started: true }), 'static')
+  // Inside the owner, from its own synchronous state:
+  const base = { supported: true, near: true, granted: true, staticOpen: false }
+  assert.equal(passiveBlockMode({ ...base, admitted: false, retained: true }), 'passive', 'held')
+  assert.equal(passiveBlockMode({ ...base, admitted: false, retained: false }), 'static', 'settled: static form')
+  assert.equal(passiveBlockMode({ ...base, admitted: true, retained: false }), 'passive')
 })
 
 test('a held session tells the reader to check the result and offers no control', async () => {
