@@ -203,11 +203,37 @@ async def reconcile_push(db, row, original, pending, *, gh, cwd):
   candidate = {**original, "head_sha": pending["head_sha"], "base_sha": pending["base_sha"]}
   try:
     await asyncio.to_thread(reviews.current_pull, gh, cwd, candidate)
-  except (HTTPException, ContributionSubmitError, OSError, ValueError, subprocess.SubprocessError):
+  except HTTPException:
+    if not await asyncio.to_thread(pushed_into_head, gh, cwd, original, pending["head_sha"]):
+      return False
+  except (ContributionSubmitError, OSError, ValueError, subprocess.SubprocessError):
     return False
   reviews.settle_repair_attempt(db, row, reviews.key(original), pending, _confirm_push)
   await settled.run_settled(repairs.discard_checkout, pending.get("checkout"))
   return True
+
+
+def pushed_into_head(gh, cwd, original, pushed_sha) -> bool:
+  """Whether the same PR's head branch now contains the pushed commit.
+
+  A later push on top of the repair proves the repair landed. Only the exact
+  PR and frozen head repository and branch count; a failed read, another
+  branch, or a head that does not contain the commit proves nothing.
+  """
+  pull = reviews.selected_pull(gh, cwd, original)
+  head = (pull or {}).get("head") or {}
+  head_repo = head.get("repo") or {}
+  current = head.get("sha")
+  if (pull is None or original.get("head_repo_id") is None
+      or head_repo.get("id") != original["head_repo_id"] or head.get("ref") != original.get("head_ref")
+      or not isinstance(head_repo.get("full_name"), str) or not isinstance(current, str)):
+    return False
+  try:
+    comparison = reviews.read(gh, cwd,
+      f"repos/{head_repo['full_name']}/compare/{pushed_sha}...{current}")
+  except (HTTPException, ContributionSubmitError, OSError, ValueError, subprocess.SubprocessError):
+    return False
+  return comparison.get("status") in {"ahead", "identical"} and comparison.get("behind_by") == 0
 
 
 def escalate_unconfirmed_push(db, row, original, pending):

@@ -8,6 +8,7 @@ import pytest
 from fastapi import HTTPException
 
 from app import agent_work_claims, contribution_review_runs as domain, models
+from app.contribution_review_effects import DispatchResult
 from app.database import SessionLocal
 from app.deps import Principal
 from app.routes import contribution_reviews as routes
@@ -400,3 +401,42 @@ def test_unproven_moved_head_leaves_the_attempt_fencing(setup, monkeypatch, pull
   assert normal.outcomes_json[domain.key(normal.targets_json[0])] == attempt
   assert not fence_clear(takeover)
 
+
+def unknown_push(setup, monkeypatch):
+  db, row, principal = configure_repair(setup, monkeypatch)
+  monkeypatch.setattr(repairs, "push_repair", lambda *a, **k: DispatchResult.unknown("Lost push response"))
+  asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
+  assert row.outcomes_json[domain.key(ITEM)]["repair_attempts"][0]["state"] == "push_unknown"
+  return db, row, principal
+
+
+def later_head(head=None):
+  return {"repos/example/project": REPO, "repos/example/project/pulls/7": {
+    **PULL, "merged": False, "head": {"sha": LATER, **(head or BRANCH)}}}
+
+
+def test_later_push_on_top_of_an_unknown_repair_push_confirms_it(setup, monkeypatch):
+  db, row, principal = unknown_push(setup, monkeypatch)
+  serve(monkeypatch, {**later_head(),
+    f"repos/example/project/compare/{NEW}...{LATER}": {"status": "ahead", "ahead_by": 1, "behind_by": 0}})
+  monkeypatch.setattr(repairs, "push_repair", lambda *a, **k: pytest.fail("PUBLIC_PUSH"))
+  item = observe_item(db, row, principal)
+  assert item["repair_attempts"][0]["state"] == "pushed"
+  assert row.outcomes_json[domain.key(ITEM)]["successor"]["head_sha"] == NEW
+
+
+@pytest.mark.parametrize("responses", [
+  {**later_head(), f"repos/example/project/compare/{NEW}...{LATER}": {"status": "diverged", "ahead_by": 1, "behind_by": 1}},
+  {**later_head(), f"repos/example/project/compare/{NEW}...{LATER}": {"status": "behind", "ahead_by": 0, "behind_by": 2}},
+  later_head(),
+  {**later_head({**BRANCH, "ref": "other"}), f"repos/example/project/compare/{NEW}...{LATER}": {"status": "ahead", "behind_by": 0}},
+  {**later_head({**BRANCH, "repo": {"id": 2, "full_name": "example/project"}}),
+   f"repos/example/project/compare/{NEW}...{LATER}": {"status": "ahead", "behind_by": 0}},
+], ids=["diverged", "behind", "failed-compare", "other-branch", "other-head-repository"])
+def test_unknown_push_not_contained_in_the_same_branch_stays_unknown(setup, monkeypatch, responses):
+  db, row, principal = unknown_push(setup, monkeypatch)
+  serve(monkeypatch, responses)
+  monkeypatch.setattr(repairs, "push_repair", lambda *a, **k: pytest.fail("PUBLIC_PUSH"))
+  item = observe_item(db, row, principal)
+  assert item["repair_attempts"][0]["state"] == "push_unknown"
+  assert "successor" not in row.outcomes_json[domain.key(ITEM)]
