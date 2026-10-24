@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -784,9 +785,10 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
         _repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
       except HTTPException:
         # The selection no longer matches, but the same PR at a later head can
-        # still prove the head-pinned attempt can no longer land.
+        # prove the head-pinned attempt can no longer land (see moved_head_fact).
+        read_at = time.time()
         pull = await asyncio.to_thread(reviews.selected_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
-        fact = pull and reviews.moved_head_fact(target, previous, pull)
+        fact = pull and reviews.moved_head_fact(target, previous, pull, read_at)
         if fact:
           reviews.settle_merge_observation(db, row, reviews.key(original), previous, fact)
         continue

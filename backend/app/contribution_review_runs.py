@@ -7,6 +7,7 @@ An ambiguous merge receipt is never retried: reconcile read-only or ask the owne
 import json
 import re
 import subprocess
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -142,16 +143,44 @@ def selected_pull(gh, cwd, target):
   return pull
 
 
-def moved_head_fact(target, previous, pull):
+# How long after arm_merge a request issued for that attempt might still be
+# evaluated by GitHub. In process, dispatch is at most two sequential gh calls
+# (the final base read, then the merge or enqueue request), each killed at
+# SUBMIT_TIMEOUT_SECONDS (90 s); GitHub ends any API request that takes over
+# 10 s to process. A crash can orphan the gh child past that timeout, but its
+# request can reach GitHub only while the kernel still retransmits it, which
+# Linux abandons after about 15 minutes by default. An hour covers both.
+MERGE_DISPATCH_WINDOW_SECONDS = 3600
+# Every attempt armed by this code records merge_armed_at. An attempt without
+# it was armed by an older build, so before this single-worker process loaded.
+_LOADED_AT = time.time()
+
+
+def merge_dispatch_closed(item, read_at: float) -> bool:
+  """Whether a read started at ``read_at`` follows every possible evaluation
+  of the requests armed for this attempt."""
+  try:
+    armed_at = datetime.fromisoformat(item["merge_armed_at"].replace("Z", "+00:00")).timestamp()
+  except (KeyError, AttributeError, TypeError, ValueError):
+    armed_at = _LOADED_AT
+  return read_at >= armed_at + MERGE_DISPATCH_WINDOW_SECONDS
+
+
+def moved_head_fact(target, previous, pull, read_at: float):
   """Settle a merge attempt at an old head from the same PR's later state.
 
-  Both dispatch paths pin the attempted head: the REST merge sends ``sha`` and
-  the queue request sends ``expectedHeadOid``. GitHub refuses either once the
-  head moves, and a push removes the PR from its merge queue. So an open,
-  unmerged PR at another head proves the attempt can no longer land. A merge
-  at a later head ends it too. A closed, unmerged PR proves nothing: it can be
-  reopened at the attempted head. The attempt's receipt fields stay as audit
-  history, and ``merge_attempted`` still forbids replaying that head.
+  ``read_at`` is when the read of ``pull`` started. A merge at a later head
+  ends the attempt at any time. Otherwise a moved head alone proves nothing:
+  both dispatch paths pin the attempted head (REST ``sha``, GraphQL
+  ``expectedHeadOid``), but that is an equality check. If the head returns to
+  it while a request is still in flight, that request can still land. So an
+  open, unmerged PR at another head settles the attempt only when read after
+  ``merge_dispatch_closed``: GitHub then has evaluated or dropped every request
+  issued for it. One evaluated at the attempted head merged the PR, which this
+  read would show, or queued it, and a push removes a PR from its merge queue.
+  A closed, unmerged PR proves nothing: it can be reopened at the attempted
+  head. The receipt fields stay as audit history, and ``merge_attempted``
+  still forbids replaying that head.
   """
   attempted = target["head_sha"]
   head_sha = (pull.get("head") or {}).get("sha")
@@ -161,13 +190,14 @@ def moved_head_fact(target, previous, pull):
     return {"state": "needs_you", "pr_merged": {"head_sha": head_sha,
       "merge_commit_sha": pull.get("merge_commit_sha"), "merged_at": pull.get("merged_at")},
       "summary": "The pull request was merged at a later head. The earlier attempt can no longer land and was not repeated."}
-  if pull.get("state") != "open" or pull.get("merged") is not False:
+  if (pull.get("state") != "open" or pull.get("merged") is not False
+      or not merge_dispatch_closed(previous, read_at)):
     return None
   return {"state": "needs_you", "head_moved": {"attempted_head_sha": attempted,
     "attempt_state": previous.get("state"), "head_sha": head_sha},
     "summary": ("The pull request moved to a new head after the earlier merge or queue request, "
-                "which GitHub accepts only for the head it named. That request can no longer land "
-                "and was not repeated. Review the new head before any merge.")}
+                "which GitHub accepts only for the head it named, and that request can no longer "
+                "be processed. It was not repeated. Review the new head before any merge.")}
 
 
 def merge_settled(item) -> bool:
@@ -429,7 +459,8 @@ def arm_merge(db, row, target, outcome, principal):
       "independent_receipt_id", "head_sha", "review_chat_id", "review_run_id")
     armed = {**row.outcomes_json.get(item_key, {}),
       **{k: outcome[k] for k in review_fields if k in outcome},
-      "state": "merging", "merge_attempted": True}
+      "state": "merging", "merge_attempted": True,
+      "merge_armed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
     save_outcome(db, row, item_key, armed)
   return None
 
