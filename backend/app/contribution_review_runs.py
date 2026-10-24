@@ -6,6 +6,7 @@ An ambiguous merge receipt is never retried: reconcile read-only or ask the owne
 """
 import json
 import re
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -302,6 +303,24 @@ def reserve_public_work(db, row, principal, work_key, summary, action):
   return claim
 
 
+@contextmanager
+def released_on_refusal(db, row, claim):
+  """A refused admission leaves no claim held without a saved attempt.
+
+  Inside this block the caller holds the owner-row fence and has already
+  checked every grant for a saved attempt on this work key, so the claim
+  protects nothing yet. A peer must not see it as held work.
+  """
+  try:
+    yield
+  except HTTPException:
+    db.rollback()
+    agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
+      work_key=claim["work_key"], outcome="Public admission was refused; no attempt started.",
+      release=True)
+    raise
+
+
 def arm_merge(db, row, target, outcome, principal):
   """Reserve one exact public attempt across grants as well as within a grant.
 
@@ -337,15 +356,16 @@ def arm_merge(db, row, target, outcome, principal):
               "summary": "An earlier review already attempted this exact merge. Follow its saved result; no request was repeated."}
     db.rollback()
     return result
-  require_public_transition_clear(db, row, target)
-  # Claim acquisition may have admitted new reviewer/other-action receipts.
-  # Carry forward those current audit lists, not the preflight's older copy.
-  review_fields = ("summary", "scope", "tests", "tests_passed", "reviewed_base_sha",
-    "independent_receipt_id", "head_sha", "review_chat_id", "review_run_id")
-  armed = {**row.outcomes_json.get(item_key, {}),
-    **{k: outcome[k] for k in review_fields if k in outcome},
-    "state": "merging", "merge_attempted": True}
-  save_outcome(db, row, item_key, armed)
+  with released_on_refusal(db, row, claim):
+    require_public_transition_clear(db, row, target)
+    # Claim acquisition may have admitted new reviewer/other-action receipts.
+    # Carry forward those current audit lists, not the preflight's older copy.
+    review_fields = ("summary", "scope", "tests", "tests_passed", "reviewed_base_sha",
+      "independent_receipt_id", "head_sha", "review_chat_id", "review_run_id")
+    armed = {**row.outcomes_json.get(item_key, {}),
+      **{k: outcome[k] for k in review_fields if k in outcome},
+      "state": "merging", "merge_attempted": True}
+    save_outcome(db, row, item_key, armed)
   return None
 
 
@@ -710,10 +730,11 @@ def arm_repair(db, row, target, previous, receipt, principal):
             "state": "needs_you", "summary": summary, "review_chat_id": owner_chat_id,
             "review_selection_id": selection_id})
           return summary
-  require_public_transition_clear(db, row, target)
-  previous = row.outcomes_json.get(key(target), {})
-  save_outcome(db, row, key(target), {**previous, "state": "pushing",
-    "repair_attempts": [*previous.get("repair_attempts", []), {**receipt, "work_key": work_key}]})
+  with released_on_refusal(db, row, claim):
+    require_public_transition_clear(db, row, target)
+    previous = row.outcomes_json.get(key(target), {})
+    save_outcome(db, row, key(target), {**previous, "state": "pushing",
+      "repair_attempts": [*previous.get("repair_attempts", []), {**receipt, "work_key": work_key}]})
   return None
 
 

@@ -247,3 +247,28 @@ def test_stopped_observation_cannot_resolve_or_reinterpret_identityless_pending_
     with pytest.raises(HTTPException) as error:
       domain.require_public_transition_clear(restarted, saved, saved.targets_json[0])
     assert error.value.status_code == 409
+
+
+@pytest.mark.parametrize("action", ["merge", "repair"])
+def test_refused_admission_releases_its_claim_for_another_chat(setup, monkeypatch, action):
+  """A 409 after claim acquisition must not leave held work with no attempt."""
+  from tests.test_contribution_review_runs import create_chat
+  db, takeover, normal, principal = mixed_grants(setup, monkeypatch)
+  active, peer = (normal, takeover) if action == "merge" else (takeover, normal)
+  domain.save_outcome(db, peer, domain.key(peer.targets_json[0]),
+    pending_outcome("repair" if action == "merge" else "merge"))
+  with pytest.raises(HTTPException) as error:
+    arm(db, active, action, principal)
+  assert error.value.status_code == 409
+  db.rollback()
+  db.refresh(active)
+  assert not active.outcomes_json.get(domain.key(active.targets_json[0]), {}).get("repair_attempts")
+  target = active.targets_json[0]
+  work_key = (domain.merge_work_key(target) if action == "merge" else
+    f"github:{target['head_repo'].lower()}:branch:{target['head_ref']}:{target['head_sha']}:repair")
+  db.add(create_chat(id="later-chat", title="Later owner"))
+  db.add(models.ChatRun(id="later-run", chat_id="later-chat", status="running"))
+  db.commit()
+  claim = agent_work_claims.claim_work(db, owner_id=active.owner_id, chat_id="later-chat",
+    run_id="later-run", work_key=work_key, summary="Retry after the blocker settles")
+  assert claim["state"] == "claimed"
