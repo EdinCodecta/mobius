@@ -205,7 +205,8 @@ def test_temporarily_changed_head_cannot_erase_an_ambiguous_attempt(setup, monke
   assert report(setup)["run"]["items"][0]["state"] == "merge_unknown"
   # A second grant cannot resurrect the same attempt either, even if the
   # visible first-row state was changed by temporary remote unavailability.
-  domain.save_outcome(db, row, domain.key(TARGET), {**item, "state": "needs_you"})
+  # Raw legacy state: save_outcome itself refuses to rewrite a live merge.
+  assert domain._cas_outcome(db, row, domain.key(TARGET), {**item, "state": "needs_you"})
   second = models.ContributionReviewRun(id="retry-grant", app_id=1, owner_id=principal.owner.id,
     request_id="retry-request", mode="review_merge", targets_json=[TARGET],
     outcomes_json={}, chat_id=row.chat_id, github_actor_id="42", app_nonce="nonce")

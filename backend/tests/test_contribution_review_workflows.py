@@ -623,15 +623,21 @@ def test_stopped_continuation_revokes_its_original_reviewer_root(setup, monkeypa
   assert error.value.status_code == 409
 
 
+@pytest.mark.parametrize("layout", ["legacy", "admitted"])
 @pytest.mark.parametrize("goal_status, admitted", [("open", True), ("stopped", False)])
-def test_goal_owned_reviewer_follows_goal_lifecycle(setup, monkeypatch, goal_status, admitted):
+def test_goal_owned_reviewer_follows_goal_lifecycle(setup, monkeypatch, goal_status, admitted, layout):
   db, row, parent, child, reviewer, body = reviewer_context(setup, monkeypatch)
   db.add(models.ChatGoal(id="review-goal", chat_id=row.chat_id,
     objective="Review", status=goal_status))
   root = db.get(models.ChatRun, parent.run_id)
   root.goal_id = "review-goal"
   root.status = "completed"
-  child.parent_root_run_id = "review-goal"
+  if layout == "legacy":
+    child.parent_root_run_id = "review-goal"
+  else:
+    # The reviewer-admission route keeps the physical root and names the Goal.
+    # A held Goal (idle-parent Stop) revokes it before child cancellation lands.
+    child.goal_id = "review-goal"
   db.add(models.ChatRun(id="unrelated-parent-run", chat_id=row.chat_id,
     root_run_id="unrelated-parent-run", status="running"))
   db.commit()
@@ -1495,10 +1501,14 @@ def test_pending_receipt_does_not_hide_corrupted_confirmed_successor(setup, monk
     attempts[0]["from_sha"] = "e" * 40
   else:
     successor[corruption + "_sha"] = "e" * 40
-  domain.save_outcome(db, row, domain.key(ITEM), {**previous, "successor": successor, "repair_attempts": attempts})
+  # Raw corruption: save_outcome itself refuses to rewrite saved receipts.
+  assert domain._cas_outcome(db, row, domain.key(ITEM), {**previous, "successor": successor, "repair_attempts": attempts})
   with pytest.raises(HTTPException) as error:
     domain.effective_target(row, row.targets_json[0])
   assert error.value.status_code == 409
+  # One ambiguous chain marks its item; it does not make the run unreadable.
+  view = domain.view(row)
+  assert view["state"] == "needs_you" and view["items"][0]["receipt_blocker"]
 
 
 def test_merge_keeps_new_server_receipts_admitted_during_claim_commit(setup, monkeypatch):
@@ -1550,3 +1560,23 @@ def test_stop_observation_and_parent_resume_do_not_clear_pending_repair_admissio
   db.refresh(row)
   assert row.outcomes_json[domain.key(ITEM)]["repair_attempts"] == [expected_attempt]
   assert not row.outcomes_json[domain.key(ITEM)].get("merge_attempted")
+
+
+@pytest.mark.parametrize("mode, live", [
+  ("review_merge", {"state": "queued", "queue_entry_id": "entry", "head_sha": SHA}),
+  ("review_fix_merge", {"state": "needs_you", "repair_attempts": [{"id": "unclear",
+    "state": "push_unknown", "from_sha": SHA, "head_sha": NEW, "base_sha": BASE}]}),
+])
+def test_reviewer_admission_never_resets_a_live_public_attempt(setup, monkeypatch, mode, live):
+  from app import delegations
+  db, row, principal = takeover(setup, monkeypatch)
+  row.mode = mode
+  db.commit()
+  domain.save_outcome(db, row, domain.key(ITEM), live)
+  monkeypatch.setattr(delegations, "ensure_delegation_started", lambda *a, **kw: pytest.fail("reviewer started"))
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.start_independent_reviewer(1, row.id, routes.PullIdentity(**ITEM), db, principal))
+  assert error.value.status_code == 409
+  db.refresh(row)
+  assert row.outcomes_json[domain.key(ITEM)] == live
+  assert db.query(models.Delegation).count() == 0

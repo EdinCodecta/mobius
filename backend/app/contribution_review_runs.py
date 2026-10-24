@@ -349,14 +349,44 @@ def arm_merge(db, row, target, outcome, principal):
   return None
 
 
-def write_outcome(db, row, item_key, outcome):
-  """CAS an outcome inside the caller's admission transaction; do not commit."""
-  if not _cas_outcome(db, row, item_key, outcome, commit=False):
+def merge_pending(outcome) -> bool:
+  return outcome.get("merge_attempted") is True or outcome.get("state") in {
+    "merging", "merge_unknown", "queued", "merged"}
+
+
+def keeps_public_receipts(current, outcome) -> bool:
+  """Only a remote-effect settlement may change an existing public receipt.
+
+  Admission and private writes may append a repair attempt. One built from an
+  older snapshot must not drop a repair arm, successor or live merge that
+  another writer saved before this row was refreshed.
+  """
+  saved = current.get("repair_attempts") or []
+  if (outcome.get("repair_attempts") or [])[:len(saved)] != saved:
+    return False
+  if "successor" in current and outcome.get("successor") != current["successor"]:
+    return False
+  return not merge_pending(current) or all(outcome.get(k) == current.get(k)
+    for k in ("state", "merge_attempted", "queue_entry_id", "merge_sha"))
+
+
+def write_outcome(db, row, item_key, outcome, *, expected=None):
+  """CAS an outcome inside the caller's admission transaction; do not commit.
+
+  ``expected`` is the item the outcome was built from. Pass it whenever the
+  row was refreshed after that read: the revision CAS alone then cannot see
+  a concurrent change.
+  """
+  current = (row.outcomes_json or {}).get(item_key, {})
+  if ((expected is not None and current != expected)
+      or not keeps_public_receipts(current, outcome)
+      or not _cas_outcome(db, row, item_key, outcome, commit=False)):
+    db.rollback()
     raise HTTPException(409, "This review changed. Refresh before continuing.")
 
 
-def save_outcome(db, row, item_key, outcome):
-  write_outcome(db, row, item_key, outcome)
+def save_outcome(db, row, item_key, outcome, *, expected=None):
+  write_outcome(db, row, item_key, outcome, expected=expected)
   db.commit()
   db.refresh(row)
 
@@ -373,13 +403,20 @@ def view(row):
            else "reviewing")
   if any((outcomes.get(key(t), {}).get("public_review") or {}).get("state") in {"posting", "unknown", "not_dispatched"} for t in row.targets_json):
     state = "needs_you"
+  views = []
+  for t, item in zip(row.targets_json, items):
+    try:
+      current = effective_target(row, t)
+      version = {"work_key": merge_work_key(current), "current_base_sha": current["base_sha"]}
+    except HTTPException as exc:
+      # One ambiguous receipt chain needs the owner; it must not hide the run.
+      version, state = {"receipt_blocker": str(exc.detail)}, "needs_you"
+    views.append({**t, "approved_head_sha": t["head_sha"], "approved_base_sha": t["base_sha"],
+                  **version, **item})
   return {"id": row.id, "request_id": row.request_id, "mode": row.mode,
           "chat_id": row.chat_id, "source_chat_id": row.chat_id, "app_id": row.app_id, "state": state,
           "options": row.options_json,
-          "created_at": row.created_at.isoformat() + "Z",
-          "items": [{**t, "approved_head_sha": t["head_sha"], "approved_base_sha": t["base_sha"],
-                     "work_key": merge_work_key(effective_target(row, t)), "current_base_sha": effective_target(row, t)["base_sha"], **item}
-                    for t, item in zip(row.targets_json, items)]}
+          "created_at": row.created_at.isoformat() + "Z", "items": views}
 
 
 def brief(row):
@@ -397,14 +434,11 @@ def brief(row):
     "preview/approval is needed for the new programmatic reviewer workflow."
   )
   public_note = (
-    "The owner chose to post each verdict on GitHub: after you report an item, "
-    "the guarded outcome endpoint (not you) posts your summary and tests as one "
-    "public comment review on that exact head. Write the summary for the PR "
-    "author: concrete findings with file references. Keep any question meant "
-    "only for the owner in this conversation, not in the summary. "
-    "Explicitly send publish:true only for the deliberate public verdict; "
-    "publish:false is the private default for owner questions and blocked verification. "
-    "Evidence freezes once dispatch is armed; identical retry is read-only.\n"
+    "The owner explicitly opted into one public COMMENT review per head. "
+    "Set publish:true only for a deliberate public verdict in /outcomes; the server posts it, never a raw mutation. "
+    "Owner questions and blocked work use publish:false (the default) and stay private. "
+    "Evidence freezes once dispatch is armed; identical retry is read-only. "
+    "Keep owner-only questions and private data out of public evidence.\n"
     if frozen.get("post_review") is True else ""
   )
   opener = ("Review this exact selected public PR batch and report privately unless you publish a verdict."
@@ -767,10 +801,17 @@ def save_effect_outcome(db, row, item_key, outcome):
 
   This is a CAS merge of one target slot, not a public retry. Read-only
   observation can race the dispatcher; never downgrade its confirmed merge.
+  ``outcome`` may be a function of the refreshed item, returning None when
+  its fact no longer applies, so a settlement never writes back a pre-I/O
+  snapshot (see ``settle_repair_attempt``).
   """
+  build = outcome if callable(outcome) else lambda _current: outcome
   for _ in range(4):
     db.refresh(row)
     current = (row.outcomes_json or {}).get(item_key, {})
+    outcome = build(current)
+    if outcome is None:
+      return
     if current.get("state") == "merged" and outcome.get("state") != "merged":
       return
     public_receipt = current.get("public_review") or {}
@@ -785,3 +826,24 @@ def save_effect_outcome(db, row, item_key, outcome):
       return
   raise HTTPException(409, "The remote result could not be recorded after concurrent changes; observe this run.")
 
+
+def settle_repair_attempt(db, row, item_key, receipt, settle,
+                          *, pending=("pushing", "push_unknown")):
+  """Record one exact push fact on the current item, by immutable receipt identity.
+
+  A receipt's fields other than its state never change. A delayed observer or
+  dispatcher may hold an old snapshot while another worker confirms this push
+  and arms the next repair. ``settle(current, attempts, index)`` derives the
+  new item from the refreshed state, so later attempts, a confirmed successor
+  and unrelated evidence survive. A receipt no longer in ``pending`` was
+  already settled; it never regresses.
+  """
+  identity = {k: v for k, v in receipt.items() if k != "state"}
+  def apply(current):
+    attempts = list(current.get("repair_attempts") or [])
+    index = next((i for i, attempt in enumerate(attempts)
+                  if {k: v for k, v in attempt.items() if k != "state"} == identity), None)
+    if index is None or attempts[index].get("state") not in pending:
+      return None
+    return settle(current, attempts, index)
+  save_effect_outcome(db, row, item_key, apply)

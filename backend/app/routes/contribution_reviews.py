@@ -425,7 +425,7 @@ def _frozen_model_matches(frozen, chat) -> bool:
 
 
 def _merge_attempted(outcome) -> bool:
-  return outcome.get("merge_attempted") is True or outcome.get("state") in {"merging", "merge_unknown", "queued", "merged"}
+  return reviews.merge_pending(outcome)
 
 
 async def _reconcile_merge(previous, target, pull, cwd):
@@ -523,12 +523,11 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
         and (previous.get("public_review") or {}).get("state") not in {"posting", "posted", "unknown"}):
       outcome = await post_public_review(db, row, item_key, target, outcome, principal, cwd,
         gh=_gh, authorize=lambda: _parent(db, row, principal))
-    if not outcome.get("merge_attempted") and not outcome.get("public_review"):
-      _parent(db, row, principal)
     if outcome.get("merge_attempted") or outcome.get("public_review"):
       reviews.save_effect_outcome(db, row, item_key, outcome)
     else:
-      reviews.save_outcome(db, row, item_key, outcome)
+      _parent(db, row, principal)
+      reviews.save_outcome(db, row, item_key, outcome, expected=previous)
     return {"run": _run_view(db, row)}
 
 
@@ -753,19 +752,19 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
         observed = await asyncio.to_thread(public.reconcile_review, _gh, cwd, original, receipt, row.github_actor_id)  # unsettled: read-only (public review receipt observation)
         reviews.save_effect_outcome(db, row, reviews.key(original), {**previous, "public_review": observed})
         continue
-      target = reviews.effective_target(row, original)
       pending = next((a for a in previous.get("repair_attempts", [])
                       if a.get("state") in {"pushing", "push_unknown"}), None)
       if pending:
-        if not await repair_actions.reconcile_push(db, row, original, previous, pending, gh=_gh, cwd=cwd):
-          repair_actions.escalate_unconfirmed_push(db, row, original, previous, pending)
+        if not await repair_actions.reconcile_push(db, row, original, pending, gh=_gh, cwd=cwd):
+          repair_actions.escalate_unconfirmed_push(db, row, original, pending)
           continue
         previous = row.outcomes_json[reviews.key(original)]
-      target = reviews.effective_target(row, original)
-      attempted = _merge_attempted(previous)
-
-      if not attempted:
+      if not _merge_attempted(previous):
         continue
+      try:
+        target = reviews.effective_target(row, original)
+      except HTTPException:
+        continue  # An ambiguous receipt chain needs the owner; observe the others.
       try:
         _repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
         outcome = await _reconcile_merge(previous, target, pull, cwd)
@@ -813,13 +812,19 @@ def _assert_independent_reviewer(row, child, target):
 
 
 def _reviewer_root_allows_evidence(db, child):
-  """A durable reviewer belongs to its spawning work, not today's parent turn."""
+  """A durable reviewer belongs to its spawning work, not today's parent turn.
+
+  A Goal-owned reviewer follows its Goal: a chat Stop holds it. The Goal is
+  child.goal_id, or the legacy layout's overloaded parent_root_run_id.
+  """
+  from app.delegations import delegation_goal_id
   root_id = child.parent_root_run_id
-  goal = db.query(models.ChatGoal).populate_existing().filter_by(id=root_id).first()
-  if goal is not None:
-    return (goal.chat_id == child.parent_chat_id and goal.status == "open"
+  goal_id = delegation_goal_id(db, child)
+  if goal_id is not None:
+    goal = db.query(models.ChatGoal).populate_existing().filter_by(id=goal_id).first()
+    return (goal is not None and goal.chat_id == child.parent_chat_id and goal.status == "open"
       and db.query(models.ChatRun.id).filter_by(
-        chat_id=child.parent_chat_id, goal_id=root_id).first() is not None)
+        chat_id=child.parent_chat_id, goal_id=goal_id).first() is not None)
   root = db.query(models.ChatRun).populate_existing().filter_by(
     id=root_id, chat_id=child.parent_chat_id).first()
   if root is None:
@@ -945,7 +950,8 @@ async def repair_checkout(app_id: int | None, run_id: str, body: RepairCheckout,
         checkout = {**previous["checkout"], "target_base_sha": await settled.run_settled(
           repairs.fetch_target_base, _gh, cwd, Path(previous["checkout"]["checkout"]), target)}
         _parent(db, row, principal)
-        reviews.save_outcome(db, row, reviews.key(target), {**previous, "checkout": checkout})
+        reviews.save_outcome(db, row, reviews.key(target), {**previous, "checkout": checkout},
+                             expected=previous)
         return {"checkout": checkout, "run": _run_view(db, row)}
       # Scope was frozen during admission, never supplied by an editing agent.
       allowed = target.get("allowed_files")
@@ -958,12 +964,13 @@ async def repair_checkout(app_id: int | None, run_id: str, body: RepairCheckout,
         raise
       try:
         _parent(db, row, principal)
+        reviews.save_outcome(db, row, reviews.key(target), {**previous, "state": "repairing",
+          "checkout": checkout, "findings": body.findings, "head_sha": target["head_sha"]},
+          expected=previous)
       except HTTPException:
         # This newly created path has never owned a public receipt.
         await settled.run_settled(repairs.discard_checkout, checkout.get("checkout"))
         raise
-    reviews.save_outcome(db, row, reviews.key(target), {**previous, "state": "repairing",
-      "checkout": checkout, "findings": body.findings, "head_sha": target["head_sha"]})
     return {"checkout": checkout, "run": _run_view(db, row)}
 
 
@@ -987,7 +994,7 @@ async def publish_repair(app_id: int | None, run_id: str, body: RepairPublish,
                     and r.get("state") in {"pushing", "push_unknown", "pushed"}), None)
     cwd = Path(get_settings().data_dir) / "platform"
     if pending:
-      confirmed = await repair_actions.reconcile_push(db, row, original, previous, pending, gh=_gh, cwd=cwd)
+      confirmed = await repair_actions.reconcile_push(db, row, original, pending, gh=_gh, cwd=cwd)
       return {"run": _run_view(db, row), **({} if confirmed else {
         "blocked": "The earlier push is not confirmed. It was not repeated."})}
     target = _target(row, body)
@@ -1078,6 +1085,11 @@ async def start_independent_reviewer(app_id: int | None, run_id: str, body: Pull
           await ensure_delegation_started(db, existing, start_turn=start_programmatic_chat_turn)
           _parent(db, row, principal)
         return {"delegation": serialize_delegation(db, existing), "run": _run_view(db, row)}
+      # Registration resets the item to reviewing. That would hide a live merge
+      # from /observe and the cross-grant fence, or mask an unclear push.
+      if _merge_attempted(previous) or any(a.get("state") in {"pushing", "push_unknown"}
+                                           for a in previous.get("repair_attempts", [])):
+        raise HTTPException(409, "An earlier merge or push for this item must be reconciled before a new reviewer starts.")
       root_id = parent_root_run_id(db, row.chat_id, require_active=True)
       if not root_id:
         raise HTTPException(409, "The owning review stopped before reviewer admission.")

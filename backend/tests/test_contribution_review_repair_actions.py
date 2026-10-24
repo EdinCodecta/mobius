@@ -1,10 +1,22 @@
 """Receipt-aware checkout ownership at Stop and confirmed publication."""
 import asyncio
 
+import pytest
+from fastapi import HTTPException
+
 from app import contribution_review_repair_actions as actions
 from app import contribution_review_repairs as repairs
-from app import contribution_review_runs as domain
-from tests.test_contribution_review_runs import setup, ITEM
+from app import contribution_review_runs as domain, models
+from app.database import SessionLocal
+from app.deps import Principal
+from app.routes import contribution_reviews as routes
+from tests.test_contribution_review_runs import setup, ITEM, PULL, REPO, report
+from tests.test_contribution_review_workflows import BASE, NEW, SHA, takeover
+
+FIRST = {"id": "push-1", "state": "pushing", "from_sha": SHA, "head_sha": NEW,
+         "base_sha": BASE, "checkout": "/first", "work_key": "first-push"}
+SECOND = {"id": "push-2", "state": "pushing", "from_sha": NEW, "head_sha": "d" * 40,
+          "base_sha": BASE, "checkout": "/second", "work_key": "second-push"}
 
 
 def test_confirmed_reconcile_discards_checkout_after_durable_successor(setup, monkeypatch):
@@ -18,6 +30,86 @@ def test_confirmed_reconcile_discards_checkout_after_durable_successor(setup, mo
     assert row.outcomes_json[domain.key(ITEM)]['repair_attempts'][0]['state'] == 'pushed'
     deleted.append(path)
   monkeypatch.setattr(repairs, 'discard_checkout', discard)
-  assert asyncio.run(actions.reconcile_push(db, row, ITEM, previous, receipt, gh=None, cwd=None))
+  assert asyncio.run(actions.reconcile_push(db, row, ITEM, receipt, gh=None, cwd=None))
   assert deleted == ['/confirmed']
   assert 'checkout' not in row.outcomes_json[domain.key(ITEM)]
+
+
+def confirm_and_arm_next(run_id):
+  """A second worker (own session) confirms repair 1, then arms repair 2."""
+  with SessionLocal() as other:
+    row = other.get(models.ContributionReviewRun, run_id)
+    previous = row.outcomes_json[domain.key(ITEM)]
+    pushed = [{**FIRST, "state": "pushed"}]
+    domain.save_effect_outcome(other, row, domain.key(ITEM),
+      domain.confirmed_successor(previous, pushed, FIRST))
+    successor = row.outcomes_json[domain.key(ITEM)]
+    domain.save_outcome(other, row, domain.key(ITEM), {**successor, "state": "pushing",
+      "repair_attempts": [*pushed, SECOND], "findings": "second round"})
+
+
+def assert_later_repair_survives(db, row):
+  db.refresh(row)
+  item = row.outcomes_json[domain.key(ITEM)]
+  assert [(a["id"], a["state"]) for a in item["repair_attempts"]] == [
+    ("push-1", "pushed"), ("push-2", "pushing")]
+  assert item["successor"] == {"head_sha": NEW, "base_sha": BASE}
+  assert item["findings"] == "second round"
+  target = domain.effective_target(row, row.targets_json[0])
+  with pytest.raises(HTTPException) as error:
+    domain.require_public_transition_clear(db, row, target)
+  assert "earlier public attempt" in error.value.detail
+
+
+def test_delayed_confirmation_keeps_a_later_armed_repair(setup, monkeypatch):
+  db, row, principal = takeover(setup, monkeypatch)
+  domain.save_outcome(db, row, domain.key(ITEM), {"state": "pushing", "repair_attempts": [FIRST]})
+  def delayed_read(*args):
+    confirm_and_arm_next(row.id)
+    return REPO, PULL
+  monkeypatch.setattr(domain, "current_pull", delayed_read)
+  monkeypatch.setattr(repairs, "discard_checkout", lambda path: None)
+  asyncio.run(routes.observe_review(1, row.id, db, Principal(owner=principal.owner, app_id=None)))
+  assert_later_repair_survives(db, row)
+
+
+def test_delayed_failed_observation_keeps_confirmed_successor_and_later_repair(setup, monkeypatch):
+  db, row, principal = takeover(setup, monkeypatch)
+  domain.save_outcome(db, row, domain.key(ITEM), {"state": "pushing", "repair_attempts": [FIRST]})
+  def delayed_failure(*args):
+    confirm_and_arm_next(row.id)
+    raise HTTPException(409, "PR projection lags")
+  monkeypatch.setattr(domain, "current_pull", delayed_failure)
+  asyncio.run(routes.observe_review(1, row.id, db, Principal(owner=principal.owner, app_id=None)))
+  assert_later_repair_survives(db, row)
+
+
+def test_private_report_cannot_overwrite_a_repair_armed_during_its_read(setup, monkeypatch):
+  db, row, _ = takeover(setup, monkeypatch)
+  def arm_during_read(*args):
+    with SessionLocal() as other:
+      current = other.get(models.ContributionReviewRun, row.id)
+      domain.save_outcome(other, current, domain.key(ITEM), {"state": "pushing", "repair_attempts": [FIRST]})
+    return REPO, PULL
+  monkeypatch.setattr(domain, "current_pull", arm_during_read)
+  with pytest.raises(HTTPException) as error:
+    report(setup, state="needs_you", summary="A question for the owner")
+  assert error.value.status_code == 409
+  db.refresh(row)
+  assert row.outcomes_json[domain.key(ITEM)] == {"state": "pushing", "repair_attempts": [FIRST]}
+
+
+@pytest.mark.parametrize("armed", [{"state": "pushing", "repair_attempts": [FIRST]},
+                                   {"state": "merging", "merge_attempted": True}])
+def test_refreshed_stale_write_cannot_drop_a_saved_public_attempt(setup, armed):
+  """E.g. a merge-blocker report: authorization refreshes the row after I/O."""
+  db, row, _ = setup
+  stale = row.outcomes_json.get(domain.key(ITEM), {})
+  with SessionLocal() as other:
+    domain.save_outcome(other, other.get(models.ContributionReviewRun, row.id), domain.key(ITEM), armed)
+  db.refresh(row)
+  with pytest.raises(HTTPException) as error:
+    domain.save_outcome(db, row, domain.key(ITEM), {**stale, "state": "needs_you", "summary": "Blocked"})
+  assert error.value.status_code == 409
+  db.refresh(row)
+  assert row.outcomes_json[domain.key(ITEM)] == armed

@@ -116,49 +116,71 @@ async def dispatch_repair(row, target, validation, *, gh, cwd, authorize):
                                   before_push=before_push)
 
 
+def _confirm_push(current, attempts, index):
+  """The confirmed push's successor, derived from the current item."""
+  pending = attempts[index]
+  attempts = [*attempts[:index], {**pending, "state": "pushed"}, *attempts[index + 1:]]
+  try:
+    return reviews.confirmed_successor(current, attempts, pending)
+  except (HTTPException, KeyError, ValueError):
+    # GitHub already proves the push. Do not strand it as 'pushing' merely
+    # because a later local projection invariant needs manual repair.
+    return {**current, "repair_attempts": attempts, "state": "needs_you",
+      "summary": "The repair push is confirmed, but successor history needs manual reconciliation."}
+
+
+def _unknown_push(summary):
+  def settle(current, attempts, index):
+    attempts[index] = {**attempts[index], "state": "push_unknown"}
+    return {**current, "repair_attempts": attempts, "state": "needs_you", "summary": summary}
+  return settle
+
+
 async def publish_attempt(db, row, target, validation, receipt, principal, *, gh, cwd, authorize):
   """Reserve, dispatch once, then preserve the exact public fact or uncertainty."""
+  item_key = reviews.key(target)
   async with chat_queue.get_transition_lock(f"review-admission:{row.id}"):
     authorize()
-    previous = row.outcomes_json.get(reviews.key(target), {})
+    previous = row.outcomes_json.get(item_key, {})
     owned = reviews.arm_repair(db, row, target, previous, receipt, principal)
     if owned:
       return owned
   db.refresh(row)
-  previous = row.outcomes_json[reviews.key(target)]
+  previous = row.outcomes_json[item_key]
   attempts = list(previous["repair_attempts"])
-  pushed = [*attempts[:-1], {**attempts[-1], "state": "pushed"}]
+  armed = attempts[-1]
+  pushed = [*attempts[:-1], {**armed, "state": "pushed"}]
   try:
     # Successor invariants belong before the network effect. In particular,
     # queue-removal history in a later layer must not fail after a real push.
-    successor = reviews.confirmed_successor(previous, pushed, validation)
+    reviews.confirmed_successor(previous, pushed, validation)
   except (HTTPException, KeyError, ValueError):
     result = DispatchResult.not_dispatched("The successor receipt cannot be recorded safely.")
   else:
     result = await dispatch_repair(row, target, validation, gh=gh, cwd=cwd, authorize=authorize)
+  # Every fact settles this exact receipt on the refreshed item, never on the
+  # pre-dispatch snapshot: an observer may have recorded it meanwhile.
   if result.state == "not_dispatched":
     remote_rejection = (isinstance(result.receipt, dict)
       and result.receipt.get("kind") == "remote_ref_rejection"
-      and result.receipt.get("head_sha") == attempts[-1]["head_sha"])
-    saved_attempts = ([*attempts[:-1], {**attempts[-1], "state": "rejected"}]
-      if remote_rejection else attempts[:-1])
-    reviews.save_effect_outcome(db, row, reviews.key(target), {**previous,
-      "repair_attempts": saved_attempts, "state": "needs_you",
-      "summary": f"No branch update was applied: {result.reason}"})
+      and result.receipt.get("head_sha") == armed["head_sha"])
+    def release(current, saved, index):
+      kept = [{**saved[index], "state": "rejected"}] if remote_rejection else []
+      return {**current, "repair_attempts": [*saved[:index], *kept, *saved[index + 1:]],
+        "state": "needs_you", "summary": f"No branch update was applied: {result.reason}"}
+    reviews.settle_repair_attempt(db, row, item_key, armed, release)
     agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
-      work_key=attempts[-1]["work_key"], outcome="Repair branch update was not applied.", release=True)
+      work_key=armed["work_key"], outcome="Repair branch update was not applied.", release=True)
   elif result.state == "unknown":
-    attempts[-1] = {**attempts[-1], "state": "push_unknown"}
-    reviews.save_effect_outcome(db, row, reviews.key(target), {**previous,
-      "repair_attempts": attempts, "state": "needs_you", "summary": result.reason})
+    reviews.settle_repair_attempt(db, row, item_key, armed, _unknown_push(result.reason),
+                                  pending=("pushing",))
   else:
-    attempts[-1] = {**attempts[-1], "state": "pushed"}
-    reviews.save_effect_outcome(db, row, reviews.key(target), successor)
+    reviews.settle_repair_attempt(db, row, item_key, armed, _confirm_push)
     await settled.run_settled(repairs.discard_checkout, validation["checkout"])
   return None
 
 
-async def reconcile_push(db, row, original, previous, pending, *, gh, cwd):
+async def reconcile_push(db, row, original, pending, *, gh, cwd):
   """Confirm the existing push from remote identity; never send another push."""
   if pending["state"] == "pushed":
     return True
@@ -167,26 +189,13 @@ async def reconcile_push(db, row, original, previous, pending, *, gh, cwd):
     await asyncio.to_thread(reviews.current_pull, gh, cwd, candidate)
   except (HTTPException, ContributionSubmitError, OSError, ValueError, subprocess.SubprocessError):
     return False
-  attempts = [{**r, "state": "pushed"} if r is pending else r
-              for r in previous.get("repair_attempts", [])]
-  try:
-    outcome = reviews.confirmed_successor(previous, attempts, pending)
-  except (HTTPException, KeyError, ValueError):
-    # GitHub already proves the push. Do not strand it as 'pushing' merely
-    # because a later local projection invariant needs manual repair.
-    outcome = {**previous, "repair_attempts": attempts, "state": "needs_you",
-      "summary": "The repair push is confirmed, but successor history needs manual reconciliation."}
-  reviews.save_effect_outcome(db, row, reviews.key(original), outcome)
+  reviews.settle_repair_attempt(db, row, reviews.key(original), pending, _confirm_push)
   await settled.run_settled(repairs.discard_checkout, pending.get("checkout"))
   return True
 
 
-def escalate_unconfirmed_push(db, row, original, previous, pending):
+def escalate_unconfirmed_push(db, row, original, pending):
   """An old armed receipt is uncertain, never permission for another push."""
-  if pending.get("state") != "pushing":
-    return
-  attempts = [{**attempt, "state": "push_unknown"} if attempt.get("id") == pending.get("id") else attempt
-              for attempt in previous.get("repair_attempts", [])]
-  reviews.save_effect_outcome(db, row, reviews.key(original), {**previous,
-    "repair_attempts": attempts, "state": "needs_you",
-    "summary": "The earlier repair push is not confirmed; observe it without repeating the write."})
+  reviews.settle_repair_attempt(db, row, reviews.key(original), pending, _unknown_push(
+    "The earlier repair push is not confirmed; observe it without repeating the write."),
+    pending=("pushing",))
