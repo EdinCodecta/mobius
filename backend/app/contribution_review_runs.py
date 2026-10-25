@@ -681,7 +681,7 @@ def base_advance_eligible(row, previous) -> bool:
   """Whether a moved target branch may become a newer reviewed base.
 
   Scoped takeover only: the pinned modes bind their exact selected base. Any
-  saved public attempt (merge or uncertain push) must be
+  saved public attempt (merge, uncertain push or pending readiness) must be
   reconciled first; a base observation never clears or replaces a receipt.
   """
   return (row.mode == "review_fix_merge" and not (previous.get("merge_attempted") or previous.get("state") in {"merging", "merge_unknown", "queued", "merged"})

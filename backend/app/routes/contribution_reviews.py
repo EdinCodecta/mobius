@@ -1340,6 +1340,7 @@ async def _admit_and_dispatch_ready(db, row, principal, target, cwd, caller):
     except HTTPException as exc:
       return DispatchResult.not_dispatched(str(exc.detail))
     except (Exception, asyncio.CancelledError):
+      _log.exception("Readiness preflight failed before dispatch for review run %s", row.id)
       return DispatchResult.not_dispatched("Readiness preflight failed before dispatch.")
     return await _dispatch_ready(target, cwd)
   finally:
