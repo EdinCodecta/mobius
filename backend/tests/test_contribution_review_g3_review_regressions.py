@@ -413,7 +413,7 @@ def test_confirmed_remote_push_survives_later_projection_failure(setup, monkeypa
   monkeypatch.setattr(domain, "confirmed_successor", lambda *a: (_ for _ in ()).throw(HTTPException(409, "history changed")))
   deleted = []
   monkeypatch.setattr(repairs, "discard_checkout", deleted.append)
-  assert asyncio.run(actions.reconcile_push(db, row, ITEM, previous, pending, gh=None, cwd=None))
+  assert asyncio.run(actions.reconcile_push(db, row, ITEM, pending, gh=None, cwd=None))
   actual = row.outcomes_json[domain.key(ITEM)]
   assert actual["repair_attempts"][-1]["state"] == "pushed"
   assert actual["state"] == "needs_you" and deleted == ["/fake/server-repair"]

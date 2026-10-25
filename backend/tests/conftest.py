@@ -45,6 +45,9 @@ os.environ["MOEBIUS_SKIP_BOOTSTRAP"] = "1"
 os.environ["MOBIUS_SSO_ISSUER"] = ""
 os.environ["MOBIUS_SSO_INSTANCE_ID"] = ""
 os.environ["MOBIUS_IDENTITY_BROKER_SOCKET"] = f"{_tmp}/no-identity-broker.sock"
+# Restart admission asks the image's baked checkout for its package verdict;
+# a test must never run the live image's code against its fixtures.
+os.environ["MOBIUS_BAKED_BACKEND"] = f"{_tmp}/no-baked-backend"
 # Nor may it inherit a Railway host's deployment identity: those markers switch
 # update, domain, and version behavior. Railway tests opt in with monkeypatch.
 for _name in [name for name in os.environ if name.startswith("RAILWAY_")]:

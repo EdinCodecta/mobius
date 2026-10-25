@@ -23,6 +23,9 @@ def removed_takeover(setup, monkeypatch, *, legacy=False):
   def read_live(gh, cwd, endpoint):
     if endpoint == "user": return {"id": 42}
     if endpoint == "repos/example/project": return REPO
+    if endpoint.startswith("repos/example/project/compare/"):
+      # The live head never contains an unconfirmed repair push.
+      return {"status": "behind", "behind_by": 1}
     assert endpoint == "repos/example/project/pulls/7"
     return {**PULL, "node_id": node["id"], "state": node["state"].lower(),
       "merged": node["merged"], "head": {"sha": node["headRefOid"],
@@ -121,7 +124,8 @@ def test_queue_recovery_route_refuses_unproven_removal(setup, monkeypatch, case)
   elif case == "changed_head": node["headRefOid"] = NEW
   elif case == "wrong_pr": node["id"] = "PR_other"
   elif case == "incomplete": node["timelineItems"]["pageInfo"]["hasPreviousPage"] = True
-  domain.save_outcome(db, row, domain.key(ITEM), previous)
+  # Seed the fixture directly: a private write cannot drop a saved queue receipt.
+  assert domain._cas_outcome(db, row, domain.key(ITEM), previous)
   monkeypatch.setattr(repairs, "prepare_checkout", lambda *a: pytest.fail("unproven repair"))
   item = observe_removed(db, row, principal)
   assert not item.get("queue_removal")

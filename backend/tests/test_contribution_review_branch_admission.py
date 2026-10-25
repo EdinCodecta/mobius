@@ -1,13 +1,16 @@
 """Branch exclusion spans ordinary merges, takeovers and immutable legacy grants."""
 import asyncio
+import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from datetime import datetime, timezone
 from threading import Barrier
 
 import pytest
 from fastapi import HTTPException
 
 from app import agent_work_claims, contribution_review_runs as domain, models
+from app.contribution_review_effects import DispatchResult
 from app.database import SessionLocal
 from app.deps import Principal
 from app.routes import contribution_reviews as routes
@@ -247,3 +250,272 @@ def test_stopped_observation_cannot_resolve_or_reinterpret_identityless_pending_
     with pytest.raises(HTTPException) as error:
       domain.require_public_transition_clear(restarted, saved, saved.targets_json[0])
     assert error.value.status_code == 409
+
+
+@pytest.mark.parametrize("action", ["merge", "repair"])
+def test_refused_admission_releases_its_claim_for_another_chat(setup, monkeypatch, action):
+  """A 409 after claim acquisition must not leave held work with no attempt."""
+  from tests.test_contribution_review_runs import create_chat
+  db, takeover, normal, principal = mixed_grants(setup, monkeypatch)
+  active, peer = (normal, takeover) if action == "merge" else (takeover, normal)
+  domain.save_outcome(db, peer, domain.key(peer.targets_json[0]),
+    pending_outcome("repair" if action == "merge" else "merge"))
+  with pytest.raises(HTTPException) as error:
+    arm(db, active, action, principal)
+  assert error.value.status_code == 409
+  db.rollback()
+  db.refresh(active)
+  assert not active.outcomes_json.get(domain.key(active.targets_json[0]), {}).get("repair_attempts")
+  target = active.targets_json[0]
+  work_key = (domain.merge_work_key(target) if action == "merge" else
+    f"github:{target['head_repo'].lower()}:branch:{target['head_ref']}:{target['head_sha']}:repair")
+  db.add(create_chat(id="later-chat", title="Later owner"))
+  db.add(models.ChatRun(id="later-run", chat_id="later-chat", status="running"))
+  db.commit()
+  claim = agent_work_claims.claim_work(db, owner_id=active.owner_id, chat_id="later-chat",
+    run_id="later-run", work_key=work_key, summary="Retry after the blocker settles")
+  assert claim["state"] == "claimed"
+
+
+@pytest.mark.parametrize("action", ["merge", "repair"])
+@pytest.mark.parametrize("held", [False, True], ids=["newly_acquired", "already_owned"])
+def test_same_key_early_return_releases_only_a_newly_acquired_claim(setup, monkeypatch, action, held):
+  """An earlier saved attempt owns the effect; this admission starts none."""
+  from tests.test_contribution_review_runs import create_chat
+  db, row, principal = configure_repair(setup, monkeypatch)
+  target = row.targets_json[0]
+  work_key = (domain.merge_work_key(target) if action == "merge" else
+    f"github:{target['head_repo'].lower()}:branch:{target['head_ref']}:{target['head_sha']}:repair")
+  saved = pending_outcome(action)
+  if action == "repair":
+    saved["repair_attempts"][0]["work_key"] = work_key
+  domain.save_outcome(db, row, domain.key(target), saved)
+  if held:
+    # This chat's claim backs the saved attempt and must survive.
+    agent_work_claims.claim_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
+      run_id=principal.run_id, work_key=work_key, summary="Backs the saved attempt")
+  assert arm(db, row, action, principal)
+  db.add(create_chat(id="later-chat", title="Later owner"))
+  db.add(models.ChatRun(id="later-run", chat_id="later-chat", status="running"))
+  db.commit()
+  claim = agent_work_claims.claim_work(db, owner_id=row.owner_id, chat_id="later-chat",
+    run_id="later-run", work_key=work_key, summary="Another chat looks at the same work")
+  assert claim["state"] == ("held_by_peer" if held else "claimed")
+
+
+# The real reads, before the setup fixture stubs current_pull.
+REAL_CURRENT_PULL = domain.current_pull
+LATER = "e" * 40
+BRANCH = {"repo": {"id": 1, "full_name": "example/project"}, "ref": "topic"}
+
+
+def serve(monkeypatch, responses):
+  monkeypatch.setattr(domain, "current_pull", REAL_CURRENT_PULL)
+  def read(gh, cwd, endpoint):
+    if endpoint not in responses:
+      raise HTTPException(404, "Not Found")
+    return responses[endpoint]
+  monkeypatch.setattr(domain, "read", read)
+  monkeypatch.setattr(domain, "pull_checks", lambda *a: pytest.fail("a moved head has no exact queue entry"))
+
+
+def observe_item(db, row, principal):
+  return asyncio.run(routes.observe_review(1, row.id, db,
+    Principal(owner=principal.owner, app_id=None)))["run"]["items"][0]
+
+
+def fence_clear(row):
+  with SessionLocal() as fresh:
+    saved = fresh.get(models.ContributionReviewRun, row.id)
+    try:
+      domain.require_public_transition_clear(fresh, saved, saved.targets_json[0])
+    except HTTPException as error:
+      assert error.status_code == 409
+      return False
+    return True
+
+
+def moved_pull(**changes):
+  return {**PULL, "node_id": "PR_8", "base": {"ref": "release"}, "state": "open", "merged": False,
+          "head": {"sha": LATER, **BRANCH}, **changes}
+
+
+def iso(seconds):
+  return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# Armed long enough ago that no request issued for it can still be processed.
+CLOSED = iso(time.time() - domain.MERGE_DISPATCH_WINDOW_SECONDS - 60)
+
+
+def attempted_merge(setup, monkeypatch, state, armed_at=CLOSED):
+  db, takeover, normal, principal = mixed_grants(setup, monkeypatch)
+  attempt = {**pending_outcome("merge", state), "summary": "GitHub did not confirm the merge."}
+  if armed_at is not None:
+    attempt["merge_armed_at"] = armed_at
+  if state == "queued":
+    attempt["queue_entry_id"] = "MQE_1"
+  domain.save_outcome(db, normal, domain.key(normal.targets_json[0]), attempt)
+  assert not fence_clear(takeover) and not fence_clear(normal)
+  return db, takeover, normal, principal, attempt
+
+
+@pytest.mark.parametrize("state", ["merge_unknown", "queued", "merging"])
+def test_head_moved_after_a_pinned_attempt_settles_it_without_rearming(setup, monkeypatch, state):
+  """The queue dropped the PR, the author pushed: the old attempt cannot land."""
+  db, takeover, normal, principal, attempt = attempted_merge(setup, monkeypatch, state)
+  serve(monkeypatch, {"repos/example/project": REPO, "repos/example/project/pulls/8": moved_pull()})
+  item = observe_item(db, normal, principal)
+  assert item["state"] == "needs_you"
+  saved = normal.outcomes_json[domain.key(normal.targets_json[0])]
+  assert saved["head_moved"] == {"attempted_head_sha": SHA, "attempt_state": state, "head_sha": LATER}
+  # Audit history stays: the attempted head, its receipt and the attempt flag.
+  assert saved["head_sha"] == SHA and saved["merge_attempted"] is True
+  assert saved.get("queue_entry_id") == attempt.get("queue_entry_id")
+  assert fence_clear(takeover) and fence_clear(normal)
+  # The settled attempt still forbids replaying its own head.
+  monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("PUBLIC_MERGE"))
+  replay = domain.arm_merge(db, normal, normal.targets_json[0], {"head_sha": SHA}, principal)
+  assert replay["state"] == "needs_you" and replay["head_moved"] == saved["head_moved"]
+  db.refresh(normal)
+  assert normal.outcomes_json[domain.key(normal.targets_json[0])] == saved
+  # Observation is now a no-op: the attempt is settled.
+  monkeypatch.setattr(domain, "read", lambda *a: pytest.fail("the attempt is already settled"))
+  observe_item(db, normal, principal)
+
+
+def test_pr_merged_at_a_later_head_settles_as_merged_not_a_non_merge(setup, monkeypatch):
+  """A merge is terminal at any time, even while the old request may be in flight."""
+  db, takeover, normal, principal, _ = attempted_merge(setup, monkeypatch, "merge_unknown",
+    armed_at=iso(time.time()))
+  serve(monkeypatch, {"repos/example/project": REPO, "repos/example/project/pulls/8": moved_pull(
+    state="closed", merged=True, merge_commit_sha="d" * 40, merged_at="2026-10-24T01:00:00Z")})
+  observe_item(db, normal, principal)
+  saved = normal.outcomes_json[domain.key(normal.targets_json[0])]
+  assert saved["pr_merged"] == {"head_sha": LATER, "merge_commit_sha": "d" * 40,
+    "merged_at": "2026-10-24T01:00:00Z"}
+  assert "head_moved" not in saved and saved["merge_attempted"] is True
+  assert fence_clear(takeover)
+
+
+@pytest.mark.parametrize("pull,repo", [
+  (moved_pull(state="closed"), REPO),
+  (moved_pull(merged=None), REPO),
+  (moved_pull(node_id="PR_other"), REPO),
+  (moved_pull(), {**REPO, "id": 2}),
+  (None, REPO),
+], ids=["closed-unmerged", "unconfirmed-merge-flag", "other-pr", "other-repository", "failed-read"])
+def test_unproven_moved_head_leaves_the_attempt_fencing(setup, monkeypatch, pull, repo):
+  db, takeover, normal, principal, attempt = attempted_merge(setup, monkeypatch, "merge_unknown")
+  responses = {"repos/example/project": repo}
+  if pull is not None:
+    responses["repos/example/project/pulls/8"] = pull
+  serve(monkeypatch, responses)
+  observe_item(db, normal, principal)
+  assert normal.outcomes_json[domain.key(normal.targets_json[0])] == attempt
+  assert not fence_clear(takeover)
+
+
+def unknown_push(setup, monkeypatch):
+  db, row, principal = configure_repair(setup, monkeypatch)
+  monkeypatch.setattr(repairs, "push_repair", lambda *a, **k: DispatchResult.unknown("Lost push response"))
+  asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))
+  assert row.outcomes_json[domain.key(ITEM)]["repair_attempts"][0]["state"] == "push_unknown"
+  return db, row, principal
+
+
+def later_head(head=None):
+  return {"repos/example/project": REPO, "repos/example/project/pulls/7": {
+    **PULL, "merged": False, "head": {"sha": LATER, **(head or BRANCH)}}}
+
+
+def test_later_push_on_top_of_an_unknown_repair_push_confirms_it(setup, monkeypatch):
+  db, row, principal = unknown_push(setup, monkeypatch)
+  serve(monkeypatch, {**later_head(),
+    f"repos/example/project/compare/{NEW}...{LATER}": {"status": "ahead", "ahead_by": 1, "behind_by": 0}})
+  monkeypatch.setattr(repairs, "push_repair", lambda *a, **k: pytest.fail("PUBLIC_PUSH"))
+  item = observe_item(db, row, principal)
+  assert item["repair_attempts"][0]["state"] == "pushed"
+  assert row.outcomes_json[domain.key(ITEM)]["successor"]["head_sha"] == NEW
+
+
+@pytest.mark.parametrize("responses", [
+  {**later_head(), f"repos/example/project/compare/{NEW}...{LATER}": {"status": "diverged", "ahead_by": 1, "behind_by": 1}},
+  {**later_head(), f"repos/example/project/compare/{NEW}...{LATER}": {"status": "behind", "ahead_by": 0, "behind_by": 2}},
+  later_head(),
+  {**later_head({**BRANCH, "ref": "other"}), f"repos/example/project/compare/{NEW}...{LATER}": {"status": "ahead", "behind_by": 0}},
+  {**later_head({**BRANCH, "repo": {"id": 2, "full_name": "example/project"}}),
+   f"repos/example/project/compare/{NEW}...{LATER}": {"status": "ahead", "behind_by": 0}},
+], ids=["diverged", "behind", "failed-compare", "other-branch", "other-head-repository"])
+def test_unknown_push_not_contained_in_the_same_branch_stays_unknown(setup, monkeypatch, responses):
+  db, row, principal = unknown_push(setup, monkeypatch)
+  serve(monkeypatch, responses)
+  monkeypatch.setattr(repairs, "push_repair", lambda *a, **k: pytest.fail("PUBLIC_PUSH"))
+  item = observe_item(db, row, principal)
+  assert item["repair_attempts"][0]["state"] == "push_unknown"
+  assert "successor" not in row.outcomes_json[domain.key(ITEM)]
+
+
+def pull_at(head, **changes):
+  return {"repos/example/project": REPO,
+          "repos/example/project/pulls/8": moved_pull(head={"sha": head, **BRANCH}, **changes)}
+
+
+@pytest.mark.parametrize("state", ["merging", "merge_unknown"])
+def test_head_moved_and_back_within_the_dispatch_window_keeps_the_attempt(setup, monkeypatch, state):
+  """A->B->A: the old request's sha pin matches again, so it can still land."""
+  db, takeover, normal, principal, attempt = attempted_merge(setup, monkeypatch, state,
+    armed_at=iso(time.time()))
+  serve(monkeypatch, pull_at(LATER))
+  observe_item(db, normal, principal)
+  assert normal.outcomes_json[domain.key(normal.targets_json[0])] == attempt
+  assert not fence_clear(takeover) and not fence_clear(normal)
+  # The head returns to the attempted one and the original request lands.
+  serve(monkeypatch, pull_at(SHA, state="closed", merged=True, merge_commit_sha="d" * 40))
+  item = observe_item(db, normal, principal)
+  saved = normal.outcomes_json[domain.key(normal.targets_json[0])]
+  assert item["state"] == saved["state"] == "merged" and saved["merge_sha"] == "d" * 40
+  assert "head_moved" not in saved
+
+
+def test_crash_left_merging_settles_only_after_the_dispatch_window(setup, monkeypatch):
+  db, takeover, normal, principal = mixed_grants(setup, monkeypatch)
+  before = time.time()
+  assert domain.arm_merge(db, normal, normal.targets_json[0], {"head_sha": SHA}, principal) is None
+  # The process died here: no dispatch result was ever saved.
+  armed = normal.outcomes_json[domain.key(normal.targets_json[0])]
+  assert armed["state"] == "merging" and armed["merge_attempted"] is True
+  armed_at = datetime.fromisoformat(armed["merge_armed_at"].replace("Z", "+00:00")).timestamp()
+  assert before - 1 <= armed_at <= time.time() + 1
+  serve(monkeypatch, pull_at(LATER))
+  observe_item(db, normal, principal)
+  assert normal.outcomes_json[domain.key(normal.targets_json[0])] == armed
+  assert not fence_clear(takeover)
+  monkeypatch.setattr(domain, "MERGE_DISPATCH_WINDOW_SECONDS", 0)
+  observe_item(db, normal, principal)
+  saved = normal.outcomes_json[domain.key(normal.targets_json[0])]
+  assert saved["head_moved"] == {"attempted_head_sha": SHA, "attempt_state": "merging", "head_sha": LATER}
+  assert fence_clear(takeover)
+
+
+@pytest.mark.parametrize("armed_at", [None, "not a time"], ids=["missing", "unreadable"])
+def test_legacy_attempt_without_arm_time_waits_a_window_from_process_load(setup, monkeypatch, armed_at):
+  """An older build armed it before this process loaded; that bounds its dispatch."""
+  db, takeover, normal, principal, attempt = attempted_merge(setup, monkeypatch, "merge_unknown",
+    armed_at=armed_at)
+  serve(monkeypatch, pull_at(LATER))
+  monkeypatch.setattr(domain, "_LOADED_AT", time.time())
+  observe_item(db, normal, principal)
+  assert normal.outcomes_json[domain.key(normal.targets_json[0])] == attempt
+  assert not fence_clear(takeover)
+  monkeypatch.setattr(domain, "_LOADED_AT", time.time() - domain.MERGE_DISPATCH_WINDOW_SECONDS - 1)
+  observe_item(db, normal, principal)
+  assert normal.outcomes_json[domain.key(normal.targets_json[0])]["head_moved"]["attempt_state"] == "merge_unknown"
+  assert fence_clear(takeover)
+
+
+def test_moved_head_settles_only_from_the_window_close_onward():
+  target, armed = {"head_sha": SHA}, {"head_sha": SHA, "merge_armed_at": iso(1000)}
+  closes = 1000 + domain.MERGE_DISPATCH_WINDOW_SECONDS
+  assert domain.moved_head_fact(target, armed, moved_pull(), closes - 1) is None
+  assert domain.moved_head_fact(target, armed, moved_pull(), closes)["head_moved"]["head_sha"] == LATER

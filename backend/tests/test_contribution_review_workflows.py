@@ -213,6 +213,16 @@ def test_brief_reads_frozen_limit_without_widening_historical_grants(setup, opti
   assert row.options_json == options
 
 
+def test_takeover_brief_states_autopilot_and_wait_ownership_once(setup):
+  row = setup[1]
+  row.mode = "review_fix_merge"
+  brief = " ".join(domain.takeover_brief(row).split())
+  assert brief.count("Autopilot is unsupported") == 1 and "autopilot is disabled" not in brief
+  # The owning chat's existing durable Wait owns pending checks; nothing forbids it.
+  assert "never schedule" not in brief
+  assert "this owning chat's EXISTING durable Wait capability; these routes create no automatic Wait" in brief
+
+
 def test_legacy_default_limit_is_not_reconstructed_from_new_omission(setup, monkeypatch):
   db, row, principal = setup
   owner = Principal(owner=principal.owner, app_id=None)
@@ -226,11 +236,14 @@ def test_legacy_default_limit_is_not_reconstructed_from_new_omission(setup, monk
   with pytest.raises(HTTPException) as omitted:
     asyncio.run(routes.start_reviews(1, body, db, owner))
   assert omitted.value.status_code == 409
-  for options in [{"review_prompt": "Frozen", "max_rounds": None}, {"review_prompt": "Frozen", "max_rounds": 21}]:
+  # null is main's accepted no-op for review_merge, so it is compared with the
+  # frozen legacy limit (409) rather than rejected as a takeover option (422).
+  for options, status in [({"review_prompt": "Frozen", "max_rounds": None}, 409),
+                          ({"review_prompt": "Frozen", "max_rounds": 21}, 422)]:
     changed = body.model_copy(update={"options": routes.ReviewOptions(**options)})
     with pytest.raises(HTTPException) as error:
       asyncio.run(routes.start_reviews(1, changed, db, owner))
-    assert error.value.status_code == 422
+    assert error.value.status_code == status
   assert row.options_json == frozen
 
 
@@ -373,6 +386,23 @@ def test_core_routes_registered_without_install(setup):
     assert client.get("/api/github/review-presets").status_code == 200
 
 
+def test_review_presets_return_takeover_defaults_every_mode_accepts(setup, monkeypatch):
+  """The editor advertises review_fix_merge, so it needs that mode's defaults."""
+  from app import contribution_review_presets as presets
+  db, _, principal = setup
+  owner = Principal(owner=principal.owner, app_id=None)
+  monkeypatch.setattr(routes, "resolve_round_choice", lambda *a: {"provider": "codex", "model": "gpt-5", "effort": "xhigh"})
+  for view in (routes.review_presets(1, db, owner), routes.core_review_presets(db, owner)):
+    assert view["capabilities"]["review_fix_merge"] is True
+    defaults = view["presets"]
+    assert defaults["fix_prompt"] == presets.FIX_PROMPT and defaults["max_rounds"] is None
+    options = {k: v for k, v in defaults.items() if k != "mandatory_instructions"}
+    for mode in ("review", "review_merge", "review_fix_merge"):
+      preview = routes.review_preview(1, routes.ReviewPreview(mode=mode, options=options), db, owner)
+      assert preview["options"]["review_prompt"] == presets.REVIEW_PROMPT
+      assert ("fix_prompt" in preview["options"]) is (mode == "review_fix_merge")
+
+
 def test_takeover_denies_parent_forged_independent_clear(setup, monkeypatch):
   takeover(setup, monkeypatch)
   monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("not independently reviewed"))
@@ -399,6 +429,39 @@ def test_independent_review_must_match_frozen_child_prompt(setup, monkeypatch):
   assert asyncio.run(routes.independent_review(1, row.id, body, db, reviewer))["independent_receipt_id"] == receipt_id
   monkeypatch.setattr(domain, "perform_merge", lambda *a: {"merged": True, "sha": "landed"})
   assert report(setup, tests_passed=True, reviewed_base_sha=BASE, independent_receipt_id=receipt_id)["run"]["state"] == "complete"
+
+
+
+def test_second_report_from_one_reviewer_names_the_real_recovery(setup, monkeypatch):
+  """One reviewer per head/base: /reviewers returns it again, so do not advise another."""
+  db, row, principal = takeover(setup, monkeypatch)
+  child_chat = create_chat(id="independent-child", title="Independent")
+  db.add(child_chat)
+  for run_id in ("child-review-run", "child-continuation-run"):
+    db.add(models.ChatRun(id=run_id, chat_id=child_chat.id, status="running"))
+  child = models.Delegation(id="independent", parent_chat_id=row.chat_id, parent_root_run_id=principal.run_id,
+    task_key="independent-review", child_chat_id=child_chat.id, provider="codex", model="gpt-5", effort="xhigh",
+    scope="write", cwd="/tmp", prompt_sha256=hashlib.sha256(domain.independent_brief(row, row.targets_json[0]).encode()).hexdigest())
+  db.add(child)
+  db.commit()
+  register_reviewer(db, row, child, row.targets_json[0])
+  body = routes.ReviewOutcome(**ITEM, state="needs_you", summary="A real bug", scope=sorted(routes.SCOPE),
+    tests="Passed", tests_passed=True, reviewed_base_sha=BASE)
+  first = Principal(owner=principal.owner, app_id=None, chat_id=child_chat.id, run_id="child-review-run", delegation_id=child.id)
+  asyncio.run(routes.independent_review(1, row.id, body, db, first))
+  later = Principal(owner=principal.owner, app_id=None, chat_id=child_chat.id, run_id="child-continuation-run", delegation_id=child.id)
+  clear = body.model_copy(update={"state": "all_clear", "summary": "Now clear"})
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.independent_review(1, row.id, clear, db, later))
+  detail = error.value.detail
+  assert error.value.status_code == 409
+  assert "fresh independent reviewer" not in detail
+  assert "/reviewers returns this same one" in detail
+  assert "new repair (a new head)" in detail and "target-base advance" in detail and "new grant" in detail
+  brief = " ".join(domain.takeover_brief(row).split())
+  assert "/reviewers returns that same reviewer again" in brief
+  skill = Path(__file__).resolve().parents[1] / "scripts" / "seed-skills" / "github-workflows.md"
+  assert "`/reviewers` returns that same reviewer again" in " ".join(skill.read_text().split())
 
 
 def configure_repair(setup, monkeypatch):
@@ -623,15 +686,21 @@ def test_stopped_continuation_revokes_its_original_reviewer_root(setup, monkeypa
   assert error.value.status_code == 409
 
 
+@pytest.mark.parametrize("layout", ["legacy", "admitted"])
 @pytest.mark.parametrize("goal_status, admitted", [("open", True), ("stopped", False)])
-def test_goal_owned_reviewer_follows_goal_lifecycle(setup, monkeypatch, goal_status, admitted):
+def test_goal_owned_reviewer_follows_goal_lifecycle(setup, monkeypatch, goal_status, admitted, layout):
   db, row, parent, child, reviewer, body = reviewer_context(setup, monkeypatch)
   db.add(models.ChatGoal(id="review-goal", chat_id=row.chat_id,
     objective="Review", status=goal_status))
   root = db.get(models.ChatRun, parent.run_id)
   root.goal_id = "review-goal"
   root.status = "completed"
-  child.parent_root_run_id = "review-goal"
+  if layout == "legacy":
+    child.parent_root_run_id = "review-goal"
+  else:
+    # The reviewer-admission route keeps the physical root and names the Goal.
+    # A held Goal (idle-parent Stop) revokes it before child cancellation lands.
+    child.goal_id = "review-goal"
   db.add(models.ChatRun(id="unrelated-parent-run", chat_id=row.chat_id,
     root_run_id="unrelated-parent-run", status="running"))
   db.commit()
@@ -1495,10 +1564,14 @@ def test_pending_receipt_does_not_hide_corrupted_confirmed_successor(setup, monk
     attempts[0]["from_sha"] = "e" * 40
   else:
     successor[corruption + "_sha"] = "e" * 40
-  domain.save_outcome(db, row, domain.key(ITEM), {**previous, "successor": successor, "repair_attempts": attempts})
+  # Raw corruption: save_outcome itself refuses to rewrite saved receipts.
+  assert domain._cas_outcome(db, row, domain.key(ITEM), {**previous, "successor": successor, "repair_attempts": attempts})
   with pytest.raises(HTTPException) as error:
     domain.effective_target(row, row.targets_json[0])
   assert error.value.status_code == 409
+  # One ambiguous chain marks its item; it does not make the run unreadable.
+  view = domain.view(row)
+  assert view["state"] == "needs_you" and view["items"][0]["receipt_blocker"]
 
 
 def test_merge_keeps_new_server_receipts_admitted_during_claim_commit(setup, monkeypatch):
@@ -1550,3 +1623,23 @@ def test_stop_observation_and_parent_resume_do_not_clear_pending_repair_admissio
   db.refresh(row)
   assert row.outcomes_json[domain.key(ITEM)]["repair_attempts"] == [expected_attempt]
   assert not row.outcomes_json[domain.key(ITEM)].get("merge_attempted")
+
+
+@pytest.mark.parametrize("mode, live", [
+  ("review_merge", {"state": "queued", "queue_entry_id": "entry", "head_sha": SHA}),
+  ("review_fix_merge", {"state": "needs_you", "repair_attempts": [{"id": "unclear",
+    "state": "push_unknown", "from_sha": SHA, "head_sha": NEW, "base_sha": BASE}]}),
+])
+def test_reviewer_admission_never_resets_a_live_public_attempt(setup, monkeypatch, mode, live):
+  from app import delegations
+  db, row, principal = takeover(setup, monkeypatch)
+  row.mode = mode
+  db.commit()
+  domain.save_outcome(db, row, domain.key(ITEM), live)
+  monkeypatch.setattr(delegations, "ensure_delegation_started", lambda *a, **kw: pytest.fail("reviewer started"))
+  with pytest.raises(HTTPException) as error:
+    asyncio.run(routes.start_independent_reviewer(1, row.id, routes.PullIdentity(**ITEM), db, principal))
+  assert error.value.status_code == 409
+  db.refresh(row)
+  assert row.outcomes_json[domain.key(ITEM)] == live
+  assert db.query(models.Delegation).count() == 0

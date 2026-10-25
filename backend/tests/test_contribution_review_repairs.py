@@ -293,3 +293,39 @@ def test_fsmonitor_cannot_hide_in_worktree_config(repair, monkeypatch):
   monkeypatch.setattr(repairs.app_git, "worktree_dirty", lambda *a: pytest.fail("reject before status"))
   with pytest.raises(HTTPException, match="ancestry metadata"):
     repairs.validate_repair(None, repo, None, target, snapshot)
+
+
+def test_validate_never_runs_a_staged_submodule_fsmonitor(repair):
+  repo, target, _, snapshot = repair
+  marker = repo.parent / "fsmonitor-ran"
+  (repo / "owned.py").write_text("after\n")
+  git(repo, "add", "owned.py")
+  git(repo, "commit", "-qm", "repair", "-m", COAUTHOR_TRAILER)
+  sub = repo / "sub"
+  sub.mkdir()
+  git(sub, "init", "-q")
+  git(sub, "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "--allow-empty", "-m", "s")
+  git(sub, "config", "core.fsmonitor", f"env > {marker}; false")
+  git(repo, "add", "sub")
+  with pytest.raises(HTTPException, match="submodule"):
+    repairs.validate_repair(None, repo, None, target, snapshot)
+  assert not marker.exists()
+
+
+def test_validate_refuses_a_gitlink_in_new_history_even_when_later_removed(repair, monkeypatch):
+  repo, target, _, snapshot = repair
+  snapshot["allowed_files"] = ["owned.py", "sub"]
+  monkeypatch.setattr(repairs, "_changed_files", lambda *a: {"owned.py", "sub"})
+  sub = repo / "sub"
+  sub.mkdir()
+  git(sub, "init", "-q")
+  git(sub, "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "--allow-empty", "-m", "s")
+  git(repo, "add", "sub")
+  git(repo, "commit", "-qm", "gitlink", "-m", COAUTHOR_TRAILER)
+  git(repo, "rm", "-q", "--cached", "sub")
+  subprocess.run(["rm", "-rf", str(sub)], check=True)
+  (repo / "owned.py").write_text("after\n")
+  git(repo, "add", "owned.py")
+  git(repo, "commit", "-qm", "drop gitlink", "-m", COAUTHOR_TRAILER)
+  with pytest.raises(HTTPException, match="cannot add or change a submodule"):
+    repairs.validate_repair(None, repo, None, target, snapshot)

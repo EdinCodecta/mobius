@@ -3,6 +3,8 @@ import asyncio
 import json
 import subprocess
 import threading
+import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
@@ -10,7 +12,6 @@ from app import contribution_review_runs as domain, contribution_review_repairs 
 from app.contribution_review_effects import NotDispatched
 from app.deps import Principal
 from app.routes import contribution_reviews as routes
-from app.chat_writer import create_chat
 from tests.test_contribution_review_runs import setup, ITEM, TARGET, SHA, BASE, REPO, PULL, CHECKS, report
 from tests.test_contribution_review_workflows import takeover, configure_repair, publish_body, checkout_body, overlapping_grant, NEW
 
@@ -32,6 +33,25 @@ def ready_takeover(setup, monkeypatch):
       "base_sha": BASE, "state": "all_clear", "tests_passed": True}]})
   monkeypatch.setattr(domain, "current_pull", lambda *args: (REPO, {**PULL, "draft": True}))
   return db, row, principal
+
+
+def iso(timestamp):
+  return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# Armed long enough ago that every request for the attempt has been evaluated.
+CLOSED = iso(time.time() - domain.MERGE_DISPATCH_WINDOW_SECONDS - 60)
+
+
+def moved_head_reads(monkeypatch, draft=False):
+  monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "head moved")))
+  def read(_gh, _cwd, path):
+    if path == f"repos/{ITEM['repo']}":
+      return REPO
+    if path == f"repos/{ITEM['repo']}/pulls/{ITEM['number']}":
+      return {**PULL, "head": {"sha": NEW}, "draft": draft}
+    pytest.fail("No actor read is needed")
+  monkeypatch.setattr(domain, "read", read)
 
 
 def successor_grant(db, row):
@@ -319,15 +339,8 @@ def test_lost_ready_response_confirms_same_head_without_current_authority(setup,
 def test_moved_head_retires_finished_unknown_without_attributing_ready_event(setup, monkeypatch):
   db, row, principal = ready_takeover(setup, monkeypatch)
   domain.save_ready_attempt(db, row, domain.key(ITEM),
-    {"id": "old-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE})
-  monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "head moved")))
-  def read(_gh, _cwd, path):
-    if path == f"repos/{ITEM['repo']}":
-      return REPO
-    if path == f"repos/{ITEM['repo']}/pulls/{ITEM['number']}":
-      return {**PULL, "head": {"sha": NEW}, "draft": False}
-    pytest.fail("No actor read is needed")
-  monkeypatch.setattr(domain, "read", read)
+    {"id": "old-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE, "armed_at": CLOSED})
+  moved_head_reads(monkeypatch)
   observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]
   assert observed["items"][0]["ready_attempt"]["state"] == "unattributable"
   assert observed["items"][0]["state"] == "ready_unattributable"
@@ -354,9 +367,8 @@ def test_moved_head_retires_finished_unknown_without_attributing_ready_event(set
 @pytest.mark.parametrize("invalid", ["missing_repo", "wrong_pr", "missing_head", "malformed_head"])
 def test_moved_head_requires_safe_exact_identity_before_retirement(setup, monkeypatch, state, invalid):
   db, row, principal = ready_takeover(setup, monkeypatch)
-  previous = row.outcomes_json[domain.key(ITEM)]
   domain.save_ready_attempt(db, row, domain.key(ITEM), {"id": "old-ready", "state": state,
-    "head_sha": SHA, "base_sha": BASE})
+    "head_sha": SHA, "base_sha": BASE, "armed_at": CLOSED})
   monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "head moved")))
   def read(_gh, _cwd, path):
     if path == f"repos/{ITEM['repo']}":
@@ -376,10 +388,8 @@ def test_moved_head_requires_safe_exact_identity_before_retirement(setup, monkey
 def test_moved_head_attempting_must_first_surface_unknown_then_retire(setup, monkeypatch):
   db, row, principal = ready_takeover(setup, monkeypatch)
   domain.save_ready_attempt(db, row, domain.key(ITEM), {"id": "old-ready", "state": "attempting",
-    "head_sha": SHA, "base_sha": BASE})
-  monkeypatch.setattr(domain, "current_pull", lambda *a: (_ for _ in ()).throw(HTTPException(409, "head moved")))
-  monkeypatch.setattr(domain, "read", lambda _gh, _cwd, path: REPO if path.endswith("project") else
-    {**PULL, "head": {"sha": NEW}})
+    "head_sha": SHA, "base_sha": BASE, "armed_at": CLOSED})
+  moved_head_reads(monkeypatch, draft=True)
   first = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]["items"][0]
   assert first["ready_attempt"]["state"] == "unknown"
   successor, new_head = successor_grant(db, row)
@@ -390,6 +400,80 @@ def test_moved_head_attempting_must_first_surface_unknown_then_retire(setup, mon
   assert [a["state"] for a in second["ready_audit"]] == ["attempting", "unknown", "unattributable"]
   domain.require_public_transition_clear(db, successor, new_head)
 
+
+@pytest.mark.parametrize("draft", [True, False])
+@pytest.mark.parametrize("route", ["observe", "ready"])
+def test_moved_head_keeps_fence_while_an_orphaned_ready_request_can_land(setup, monkeypatch, draft, route):
+  """GitHub's mark-ready names no head: an in-flight request marks the live head."""
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  domain.save_ready_attempt(db, row, domain.key(ITEM), {"id": "old-ready", "state": "attempting",
+    "head_sha": SHA, "base_sha": BASE, "armed_at": iso(time.time() - 60)})
+  moved_head_reads(monkeypatch, draft=draft)
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("never replayed"))
+  successor, new_head = successor_grant(db, row)
+  for observation in range(3):
+    if route == "observe":
+      item = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]["items"][0]
+    else:
+      result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+      item = result["run"]["items"][0]
+      if observation:
+        assert "an hour after it began" in result["blocked"]
+    assert item["ready_attempt"]["state"] == "unknown"
+    with pytest.raises(HTTPException):
+      domain.require_public_transition_clear(db, successor, new_head)
+    with pytest.raises(HTTPException):
+      routes._require_ready_attempt_resolved(row.outcomes_json[domain.key(ITEM)], new_head)
+  # Once the dispatch window has closed, no request for the attempt can land.
+  monkeypatch.setattr(domain, "MERGE_DISPATCH_WINDOW_SECONDS", 0)
+  asyncio.run(routes.observe_review(1, row.id, db, principal))
+  assert row.outcomes_json[domain.key(ITEM)]["ready_attempt"]["state"] == "unattributable"
+  domain.require_public_transition_clear(db, successor, new_head)
+
+
+def test_legacy_ready_receipt_without_arm_time_waits_a_window_from_process_load(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  domain.save_ready_attempt(db, row, domain.key(ITEM), {"id": "old-ready", "state": "unknown",
+    "head_sha": SHA, "base_sha": BASE})
+  moved_head_reads(monkeypatch)
+  monkeypatch.setattr(domain, "_LOADED_AT", time.time())
+  asyncio.run(routes.observe_review(1, row.id, db, principal))
+  assert row.outcomes_json[domain.key(ITEM)]["ready_attempt"]["state"] == "unknown"
+  monkeypatch.setattr(domain, "_LOADED_AT", time.time() - domain.MERGE_DISPATCH_WINDOW_SECONDS - 1)
+  asyncio.run(routes.observe_review(1, row.id, db, principal))
+  assert row.outcomes_json[domain.key(ITEM)]["ready_attempt"]["state"] == "unattributable"
+
+
+def test_ready_receipt_records_arm_time_before_dispatch(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  seen = []
+  def mutate(*args):
+    db.refresh(row)
+    seen.append(row.outcomes_json[domain.key(ITEM)]["ready_attempt"]["armed_at"])
+    return {"id": "PR_7", "isDraft": False, "headRefOid": SHA}
+  monkeypatch.setattr(domain, "mark_ready", mutate)
+  before = time.time()
+  result = asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  armed_at = datetime.fromisoformat(seen[0].replace("Z", "+00:00")).timestamp()
+  assert before - 1 <= armed_at <= time.time() + 1
+  assert result["run"]["items"][0]["ready_attempt"]["armed_at"] == seen[0]
+
+
+def test_observe_confirms_readiness_at_the_attempts_saved_head(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  prior = row.outcomes_json[domain.key(ITEM)]
+  # An effective successor head must not replace the receipt's own head.
+  domain.save_outcome(db, row, domain.key(ITEM), {**prior, "successor": {"head_sha": NEW, "base_sha": BASE},
+    "repair_attempts": [{"state": "pushed", "from_sha": SHA, "head_sha": NEW, "base_sha": BASE}],
+    "ready_attempt": {"id": "old-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE}})
+  heads = []
+  def pull(_gh, _cwd, target):
+    heads.append(target["head_sha"])
+    return REPO, {**PULL, "draft": False}
+  monkeypatch.setattr(domain, "current_pull", pull)
+  observed = asyncio.run(routes.observe_review(1, row.id, db, principal))["run"]["items"][0]
+  assert heads == [SHA]
+  assert observed["ready_attempt"]["state"] == "ready"
 
 
 
@@ -1131,7 +1215,7 @@ def test_stale_ready_observer_cannot_downgrade_saved_receipt(setup, monkeypatch,
   assert row.outcomes_json[item_key]["ready_audit"][-1]["state"] == current
 
 
-def test_ready_slot_rejects_other_receipt_but_accepts_confirmed_upgrade_and_deliberate_clear(setup, monkeypatch):
+def test_ready_slot_rejects_other_receipt_but_accepts_confirmed_upgrade(setup, monkeypatch):
   from app.database import SessionLocal
   db, row, _ = ready_takeover(setup, monkeypatch)
   item_key = domain.key(ITEM)
@@ -1149,5 +1233,149 @@ def test_ready_slot_rejects_other_receipt_but_accepts_confirmed_upgrade_and_deli
   domain.save_effect_outcome(db, row, item_key, confirmed)
   assert row.outcomes_json[item_key]["ready_attempt"]["state"] == "ready"
   assert [a["state"] for a in row.outcomes_json[item_key]["ready_audit"]] == ["unknown", "unattributable", "ready"]
-  domain.save_effect_outcome(db, row, item_key, {"state": "reviewing"})
-  assert "ready_attempt" not in row.outcomes_json[item_key]
+
+
+def test_stale_writers_cannot_erase_a_readiness_receipt_or_its_audit(setup, monkeypatch):
+  from app.database import SessionLocal
+  db, row, _ = ready_takeover(setup, monkeypatch)
+  item_key = domain.key(ITEM)
+  receipt = {"id": "one-ready", "state": "unknown", "head_sha": SHA, "base_sha": BASE}
+  domain.save_ready_attempt(db, row, item_key, receipt)
+  saved = row.outcomes_json[item_key]
+  assert not domain.keeps_public_receipts(saved, {"state": "reviewing"})
+  assert not domain.keeps_public_receipts(saved, {**saved, "ready_attempt": {**receipt, "state": "attempting"}})
+  assert not domain.keeps_public_receipts(saved, {**saved, "ready_audit": []})
+  # A plain writer built from a snapshot without the receipt is refused.
+  with pytest.raises(HTTPException) as error:
+    domain.save_outcome(db, row, item_key, {"state": "needs_you", "summary": "stale"})
+  assert error.value.status_code == 409
+  db.refresh(row)
+  assert row.outcomes_json[item_key] == saved
+  # A remote fact written by a generic effect writer still lands, but keeps the receipt.
+  with SessionLocal() as writer:
+    live = writer.get(models.ContributionReviewRun, row.id)
+    domain.save_effect_outcome(writer, live, item_key, {"state": "needs_you",
+      "public_review": {"state": "posted", "marker": "m"}})
+  db.refresh(row)
+  item = row.outcomes_json[item_key]
+  assert item["public_review"]["state"] == "posted"
+  assert item["ready_attempt"] == receipt and item["ready_audit"] == saved["ready_audit"]
+
+
+def test_disarm_is_the_only_release_and_matches_the_exact_receipt(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  target = row.targets_json[0]
+  receipt = {"id": "mine", "state": "attempting", "head_sha": SHA, "base_sha": BASE}
+  domain.arm_ready(db, row, target, receipt, principal)
+  with pytest.raises(HTTPException):
+    domain.disarm_ready(db, row, target, "another")
+  assert row.outcomes_json[domain.key(ITEM)]["ready_attempt"]["id"] == "mine"
+  domain.disarm_ready(db, row, target, "mine")
+  outcome = row.outcomes_json[domain.key(ITEM)]
+  assert "ready_attempt" not in outcome
+  assert [e["state"] for e in outcome["ready_audit"]] == ["attempting", "not_dispatched"]
+  claim = db.query(models.AgentWorkClaim).filter_by(work_key=domain.ready_work_key(target)).one()
+  assert claim.released_at is not None
+
+
+@pytest.mark.parametrize("state, eligible", [
+  ("attempting", False), ("unknown", False), ("ready", True), ("unattributable", True)])
+def test_base_advance_uses_the_shared_readiness_fence_rule(setup, monkeypatch, state, eligible):
+  db, row, _ = ready_takeover(setup, monkeypatch)
+  item = {"state": "reviewing", "ready_attempt": {"state": state, "head_sha": SHA}}
+  assert domain.ready_pending(item) is not eligible
+  assert domain.base_advance_eligible(row, item) is eligible
+
+
+def cancel_during_mutation(setup, monkeypatch, mutation):
+  """Cancel the HTTP task while the provider call runs; return the cancelled outcome."""
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  started, release = threading.Event(), threading.Event()
+  def mark_ready(*args):
+    started.set()
+    assert release.wait(5), "test did not release the provider call"
+    return mutation()
+  monkeypatch.setattr(domain, "mark_ready", mark_ready)
+  async def race():
+    task = asyncio.create_task(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+    try:
+      assert await asyncio.wait_for(asyncio.to_thread(started.wait, 5), 6)
+      task.cancel()
+      await asyncio.sleep(0.05)
+    finally:
+      release.set()
+    with pytest.raises(asyncio.CancelledError):
+      await asyncio.wait_for(task, 5)
+  asyncio.run(race())
+  db.refresh(row)
+  return db, row
+
+
+def test_cancelled_request_still_records_confirmed_readiness(setup, monkeypatch):
+  db, row = cancel_during_mutation(setup, monkeypatch,
+    lambda: {"id": "PR_7", "isDraft": False, "headRefOid": SHA})
+  item = row.outcomes_json[domain.key(ITEM)]
+  assert item["ready_attempt"]["state"] == "ready"
+  assert [e["state"] for e in item["ready_audit"]] == ["attempting", "ready"]
+
+
+def test_cancelled_request_still_releases_a_certified_refusal(setup, monkeypatch):
+  def refused():
+    raise NotDispatched("GitHub refused readiness.")
+  db, row = cancel_during_mutation(setup, monkeypatch, refused)
+  item = row.outcomes_json[domain.key(ITEM)]
+  assert "ready_attempt" not in item
+  assert [e["state"] for e in item["ready_audit"]] == ["attempting", "not_dispatched"]
+  claim = db.query(models.AgentWorkClaim).filter_by(work_key=domain.ready_work_key(row.targets_json[0])).one()
+  assert claim.released_at is not None
+
+
+def test_cancel_during_final_preflight_never_starts_the_mutation(setup, monkeypatch):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("mutation started after cancel"))
+  reads, started, release = [], threading.Event(), threading.Event()
+  def checks(*args):
+    reads.append(1)
+    if len(reads) == 2:  # The in-lock preflight after arming.
+      started.set()
+      assert release.wait(5), "test did not release the preflight read"
+    return CHECKS
+  monkeypatch.setattr(domain, "pull_checks", checks)
+  async def race():
+    task = asyncio.create_task(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+    try:
+      assert await asyncio.wait_for(asyncio.to_thread(started.wait, 5), 6)
+      task.cancel()
+      await asyncio.sleep(0.05)
+    finally:
+      release.set()
+    with pytest.raises(asyncio.CancelledError):
+      await asyncio.wait_for(task, 5)
+  asyncio.run(race())
+  db.refresh(row)
+  item = row.outcomes_json[domain.key(ITEM)]
+  assert "ready_attempt" not in item
+  assert item["ready_audit"][-1]["state"] == "not_dispatched"
+  claim = db.query(models.AgentWorkClaim).filter_by(work_key=domain.ready_work_key(row.targets_json[0])).one()
+  assert claim.released_at is not None
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("bug in a read"), asyncio.CancelledError()])
+def test_any_failure_before_the_send_is_a_known_non_dispatch(setup, monkeypatch, failure):
+  db, row, principal = ready_takeover(setup, monkeypatch)
+  monkeypatch.setattr(domain, "mark_ready", lambda *a: pytest.fail("mutation after failed preflight"))
+  reads = []
+  def checks(*args):
+    reads.append(1)
+    if len(reads) == 2:
+      raise failure
+    return CHECKS
+  monkeypatch.setattr(domain, "pull_checks", checks)
+  with pytest.raises((HTTPException, asyncio.CancelledError)):
+    asyncio.run(routes.mark_draft_ready(1, row.id, ready_body(), db, principal))
+  db.refresh(row)
+  item = row.outcomes_json[domain.key(ITEM)]
+  assert "ready_attempt" not in item
+  assert item["ready_audit"][-1]["state"] == "not_dispatched"
+  claim = db.query(models.AgentWorkClaim).filter_by(work_key=domain.ready_work_key(row.targets_json[0])).one()
+  assert claim.released_at is not None

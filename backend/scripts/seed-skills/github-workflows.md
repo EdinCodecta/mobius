@@ -88,6 +88,8 @@ Private evidence fields accept up to 200,000 characters each. The public copy
 is bounded conservatively to 65,536 UTF-16 units with explicit omission
 markers; the full accepted private evidence is retained.
 
+For an opted-in public-review grant, `/outcomes` publishes only when the agent explicitly sends `publish: true` with a deliberate public verdict. Owner questions and blocked verification use `publish: false` (the default), remain private, and do not post. Once armed, verdict evidence is immutable. Another grant for the same PR/head cannot post while an earlier posting/unknown/posted receipt exists; open the named holding run and observe it read-only. Lists retain full findings and frozen prompts for the owning app or owner. Foreign rows remain privacy-minimized; any bounded navigation summary explicitly marks omitted text.
+
 ## Scoped repair and independently reviewed successors
 
 Use `preview --mode review_fix_merge` only when the owning chat explicitly
@@ -97,6 +99,11 @@ Read the run's returned brief. The parent alone calls `/repair-checkout` and
 `/repairs`; independent reviewers are admitted through `/reviewers`, inherit
 the parent's Goal, and report exact head/base evidence through
 `/independent-reviews`. A repair author cannot supply their independent review.
+Each exact head and base admits one reviewer and one verdict: `/reviewers`
+returns that same reviewer again and a second report is refused, so a
+needs_you verdict cannot be replaced by asking another reviewer. Continue only
+through a new repair (a new head), an observed target-base advance, or a new
+owner grant.
 
 Edit only the server-provided checkout and frozen file scope. Ordinary
 fast-forward commits and one merge of the fetched `refs/mobius/target-base`
@@ -150,16 +157,23 @@ effects; it does not adopt this pre-dispatch base advance.
 A validated mark-ready response confirms the saved PR/head immediately; a
 later Stop, actor or rights change cannot undo that fact. If the response is
 lost, `/observe` may confirm the exact PR/head is non-draft, independently of
-the old base and current actor or rights. A moved head cannot confirm attribution: GitHub's
+the old base and current actor or rights. A moved head stays unknown: GitHub's
 `ReadyForReviewEvent` has no head SHA, so its timeline entry alone cannot
 attribute readiness to the reviewed head. Do not replay the mutation or claim
-that a later non-draft head proves this attempt. Once exact PR identity and a
-different live head are verified, a finished unknown receipt becomes visibly
-`unattributable`: its old-head claim and audit remain, but it no longer fences
-new grants on other heads. An `attempting` receipt must first surface as
-unknown; an unsafe identity read cannot retire it. Readiness never authorizes
-merge using an old review. Unknown readiness remains visible and fences new
-public actions until that conservative observation succeeds.
+that a later non-draft head proves this attempt. The mutation names only the
+PR, not a head, so a request still in flight (for example an orphaned `gh`
+child after a restart) would mark whatever head is live. An unknown receipt
+therefore becomes visibly `unattributable` only when an observation verifies
+exact PR identity and a different live head, and starts at least one hour
+after the attempt was armed (the same dispatch window as merge; a receipt
+without an arm time counts from server start). Its old-head claim and audit
+remain, but it no longer fences new grants on other heads. An `attempting`
+receipt must first surface as unknown; an unsafe identity read cannot retire
+it. Readiness never authorizes merge using an old review. Unknown readiness
+remains visible and fences new public actions until that conservative
+observation succeeds. A cancelled `/ready` request still records its definite
+result: a confirmed response stays ready, and a refusal or any failure before
+the send releases the exact reservation.
 
 ## Recover a confirmed queue removal
 
@@ -176,7 +190,3 @@ Observe, prepare, and final push each recheck that the earlier admission is
 removed and no active external queue entry has appeared.
 
 A lost-response enqueue later observed in the queue is marked `queue_receipt_unconfirmed`: the observed entry cannot prove it belongs to that lost request. Even if it has `enqueuedAt`, later removal does not authorize automatic successor repair for that receipt. Keep the uncertain grant fenced and resolve it in its owning conversation; do not retry the removed head.
-For an opted-in public-review grant, `/outcomes` publishes only when the agent explicitly sends `publish: true` with a deliberate public verdict. Owner questions and blocked verification use `publish: false` (the default), remain private, and do not post. Once armed, verdict evidence is immutable. Another grant for the same PR/head cannot post while an earlier posting/unknown/posted receipt exists; open the named holding run and observe it read-only. Lists retain full findings and frozen prompts for the owning app or owner. Foreign rows remain privacy-minimized; any bounded navigation summary explicitly marks omitted text.
-
-
-

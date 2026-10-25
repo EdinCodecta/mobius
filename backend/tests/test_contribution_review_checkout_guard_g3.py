@@ -211,3 +211,93 @@ def test_references_git_cannot_read_are_rejected_not_clean(owned):
   (checkout / ".git" / "packed-refs").write_text("garbage line\n")
   with pytest.raises(HTTPException, match="references could not be verified"):
     repairs.owned_checkout(checkout)
+
+
+# -- nested repositories and credentials ---------------------------------------------
+
+def plant_submodule(checkout: Path, marker: Path, *, stage: bool = True) -> None:
+  """An agent-made nested repository whose own config starts a program."""
+  sub = checkout / "sub"
+  sub.mkdir()
+  git(sub, "init", "-q")
+  git(sub, "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "--allow-empty", "-m", "s")
+  git(sub, "config", "--local", "core.fsmonitor", f"env > {marker}; false")
+  if stage:
+    git(checkout, "add", "sub")
+
+
+def test_a_staged_submodule_cannot_start_its_fsmonitor_or_pass_the_guard(owned, monkeypatch):
+  tmp_path, checkout = owned
+  marker = tmp_path / "fsmonitor-ran"
+  plant_submodule(checkout, marker)
+  network_git_never_runs(monkeypatch)
+  # The exact local read validate_repair runs first, even if a guard missed it.
+  repairs._git(checkout, "status", "--porcelain", "--untracked-files=all")
+  assert not marker.exists()
+  with pytest.raises(HTTPException, match="contains a submodule"):
+    repairs.owned_checkout(checkout)
+  assert not marker.exists()
+
+
+def test_github_credentials_reach_only_network_git(tmp_path, monkeypatch):
+  observed = {}
+  def run(argv, *, env, **_kwargs):
+    observed[argv[argv.index("-C") + 2]] = env
+    return type("Result", (), {"returncode": 0, "stdout": ""})()
+  monkeypatch.setattr(repairs, "_run_cmd", run)
+  monkeypatch.setattr(repairs, "_git_env", lambda _repo: {
+    "PATH": "/usr/bin", "GH_TOKEN": "server-secret", "GH_CONFIG_DIR": "/auth"})
+  for command in ("status", "diff-tree", "fetch", "push"):
+    repairs._git(tmp_path, command)
+  for local in ("status", "diff-tree"):
+    assert "GH_TOKEN" not in observed[local] and "GH_CONFIG_DIR" not in observed[local]
+    assert observed[local]["GIT_CONFIG_KEY_0"] == "core.fsmonitor"
+  for network in ("fetch", "push"):
+    assert observed[network]["GH_TOKEN"] == "server-secret"
+    assert observed[network]["GH_CONFIG_DIR"] == "/auth"
+  assert "GH_TOKEN" not in repairs._repair_git_env(tmp_path)
+
+
+def token_bearing_git(tmp_path, monkeypatch):
+  """Server Git env with a probe token, never the instance's real credentials."""
+  auth = tmp_path / "gh-auth"
+  auth.mkdir()
+  monkeypatch.setattr(repairs, "_git_env", lambda _repo: {
+    "PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "GH_TOKEN": "probe-token",
+    "GH_CONFIG_DIR": str(auth)})
+
+
+def test_push_never_runs_a_hook_planted_after_the_checkout_proof(owned, monkeypatch):
+  tmp_path, checkout = owned
+  token_bearing_git(tmp_path, monkeypatch)
+  git(checkout, "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "--allow-empty", "-m", "c")
+  remote = tmp_path / "remote.git"
+  subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+  marker = tmp_path / "pre-push-ran"
+  hook = checkout / ".git" / "hooks" / "pre-push"
+  hook.write_text(f"#!/bin/sh\nenv > {marker}\n")
+  hook.chmod(0o755)
+  result = repairs._git(checkout, "push", "--porcelain", str(remote), "HEAD:refs/heads/topic", check=False)
+  assert result.returncode == 0
+  assert not marker.exists()
+
+
+def test_network_git_never_consults_a_checkout_credential_helper(owned, monkeypatch):
+  tmp_path, checkout = owned
+  token_bearing_git(tmp_path, monkeypatch)
+  marker = tmp_path / "local-helper-ran"
+  git(checkout, "config", "--local", "credential.helper", f"!f() {{ env > {marker}; }}; f")
+  observed = {}
+  def capture(argv, *, env, **_kwargs):
+    observed.update(argv=argv, env=env)
+    return type("Result", (), {"returncode": 0, "stdout": ""})()
+  monkeypatch.setattr(repairs, "_run_cmd", capture)
+  for command in ("fetch", "push"):
+    repairs._git(checkout, command)
+    # Ask Git which helpers it consults under exactly this argv prefix and env.
+    prefix = observed["argv"][:observed["argv"].index("-C") + 2]
+    subprocess.run([*prefix, "credential", "fill"], input="protocol=https\nhost=github.com\n\n",
+                   env=observed["env"], text=True, capture_output=True, timeout=30)
+    assert not marker.exists(), command
+  assert "credential.helper=" in prefix
+  assert prefix.index("credential.helper=") < prefix.index("credential.helper=!gh auth git-credential")

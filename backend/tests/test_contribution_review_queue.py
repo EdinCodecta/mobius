@@ -254,6 +254,20 @@ def test_queue_removal_exemption_belongs_only_to_its_own_grant(setup):
     domain.require_public_transition_clear(db, row, TARGET)
 
 
+def test_private_write_after_removal_keeps_queue_receipt_and_history(setup):
+  db, row, _ = setup
+  removed = saved_queue_receipt(state="needs_you", queue_removal={"removed_event_id": "removed-1"},
+    merge_attempts=[saved_queue_receipt(queue_removal={"removed_event_id": "removed-1"})])
+  domain.save_outcome(db, row, domain.key(TARGET), removed)
+  for dropped in ({**removed, "queue_removal": None}, {**removed, "merge_attempts": []},
+                  {**removed, "queue_enqueued_at": None}):
+    with pytest.raises(HTTPException, match="Refresh"):
+      domain.save_outcome(db, row, domain.key(TARGET), dropped)
+  # The owning grant may move on to a repair while the receipt stays intact.
+  domain.save_outcome(db, row, domain.key(TARGET), {**removed, "state": "repairing"}, expected=removed)
+  assert row.outcomes_json[domain.key(TARGET)]["queue_removal"] == removed["queue_removal"]
+
+
 def test_shared_fence_projects_only_overlapping_or_unmatchable_grants(setup):
   db, row, principal = setup
   target = {**TARGET, "head_repo_id": 11, "head_ref": "topic"}

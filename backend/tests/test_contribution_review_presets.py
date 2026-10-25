@@ -52,7 +52,8 @@ def test_invalid_options_fail_before_provider_resolution(options, round_choice):
   assert round_choice == []
 
 
-@pytest.mark.parametrize("options", [None, {}, {"autopilot": False}])
+@pytest.mark.parametrize("options", [None, {}, {"max_rounds": None}, {"autopilot": False},
+                                     {"fix_prompt": subject.FIX_PROMPT}])
 def test_default_unsupported_options_are_neither_advertised_nor_frozen(options):
   snapshot = subject.resolve_options(object(), options)
   assert not {"max_rounds", "autopilot", "fix_prompt"} & snapshot.keys()
