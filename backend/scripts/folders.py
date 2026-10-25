@@ -43,14 +43,20 @@ class Folders:
     return self._listing
 
   def resolve(self, target: str, folder_id: str | None) -> tuple[dict, str]:
-    """(folder, path inside it) from `Name/inner/path` or --folder ID."""
-    if folder_id:
-      folder = next((f for f in self.shared() if f["id"] == folder_id), None)
-      if folder is None:
-        raise SystemExit(f"No shared folder has id {folder_id}. Run `folders list`.")
-      return folder, target.strip("/")
+    """(folder, path inside it) from `Name/inner/path`.
+
+    Paths always start with the folder's name; --folder ID only picks which
+    of several same-named folders is meant, so one path format works everywhere.
+    """
     name, _, inner = target.strip("/").partition("/")
-    return self._by_name(name), inner
+    if not folder_id:
+      return self._by_name(name), inner
+    folder = next((f for f in self.shared() if f["id"] == folder_id), None)
+    if folder is None:
+      raise SystemExit(f"No shared folder has id {folder_id}. Run `folders list`.")
+    if not _names_folder(name, folder):
+      raise SystemExit(f'Folder {folder_id} is "{folder["name"]}". Start the path with "{folder["name"]}/".')
+    return folder, inner
 
   def _by_name(self, name: str) -> dict:
     folders = self.shared()
@@ -63,7 +69,7 @@ class Folders:
     if len(ready) == 1 or len(matches) == 1:
       return (ready or matches)[0]
     choices = "; ".join(f'{f["id"]} ({f["device"]["label"]}, {f["state"]})' for f in matches)
-    raise SystemExit(f'Several folders are named "{name}": {choices}. Use --folder ID.')
+    raise SystemExit(f'Several folders are named "{name}": {choices}. Add --folder ID to pick one.')
 
   def attempt(self, folder: dict, command: dict) -> dict:
     """The server's answer as is: {ok, result} or {ok: false, code, error}."""
@@ -78,6 +84,11 @@ class Folders:
     if not body.get("ok"):
       raise SystemExit(f"{folder['name']}: {body.get('error')} ({body.get('code', 'error')})")
     return body.get("result") or {}
+
+
+def _names_folder(segment: str, folder: dict) -> bool:
+  """Whether a path's first segment names this folder: its id, or its name in any case."""
+  return segment == folder["id"] or segment.casefold() == folder["name"].casefold()
 
 
 def _size(value: int | None) -> str:
@@ -204,17 +215,14 @@ def write_file(client: Folders, args: argparse.Namespace) -> None:
 
 def move_file(client: Folders, args: argparse.Namespace) -> None:
   folder, inner = client.resolve(args.target, args.folder)
-  destination = args.destination.strip("/")
-  if not args.folder:
-    # Both paths start with the folder's name, so a move can't silently
-    # land somewhere else; moving between shared folders is not possible.
-    name, _, destination = destination.partition("/")
-    same = name == folder["id"] or name.casefold() == folder["name"].casefold()
-    if not same or not destination:
-      raise SystemExit(
-        f'Moves stay inside one shared folder. Start the new path with "{folder["name"]}/", '
-        f'for example "{folder["name"]}/Sorted/{Path(inner).name}".'
-      )
+  # Both paths start with the folder's name, so a move can't silently land
+  # somewhere else; moving between shared folders is not possible.
+  name, _, destination = args.destination.strip("/").partition("/")
+  if not _names_folder(name, folder) or not destination:
+    raise SystemExit(
+      f'Moves stay inside one shared folder. Start the new path with "{folder["name"]}/", '
+      f'for example "{folder["name"]}/Sorted/{Path(inner).name}".'
+    )
   result = client.run(folder, {"op": "move", "path": inner, "to": destination})
   print(f'Moved {result["path"]} → {result["to"]} in {folder["name"]}.')
 
@@ -239,7 +247,9 @@ def _parser() -> argparse.ArgumentParser:
   def target(name: str, run, help_text: str) -> argparse.ArgumentParser:
     command = sub.add_parser(name, help=help_text)
     command.add_argument("target", help="FolderName/path/inside")
-    command.add_argument("--folder", help="folder id, when two folders share a name")
+    command.add_argument(
+      "--folder", help="folder id from `folders list`, when two folders share a name; paths still start with the name",
+    )
     command.set_defaults(run=run)
     return command
 

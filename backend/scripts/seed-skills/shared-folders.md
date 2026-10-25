@@ -22,6 +22,8 @@ $F bin "Downloads/old.zip"               # moves it to the "Möbius bin" folder
 
 `write`, `move`, `mkdir` and `bin` work only in folders shared as **Read & edit** (Chrome or Edge). Safari, Firefox and Brave share folders read-only, for one visit. A move stays inside one shared folder; files can't move between shared folders.
 
+Two shared folders can have the same name, for example one on each device. Then add `--folder ID` (the id from `list`) to pick one; paths still start with the folder's name.
+
 ## Rules
 
 - Read the least you need: `ls`, `info`, then a slice or `--tail`. Every byte you read goes to the AI model.

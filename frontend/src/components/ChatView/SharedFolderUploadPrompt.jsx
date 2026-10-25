@@ -3,7 +3,7 @@ import { useRef, useState } from 'react'
 import { X } from '@openai/apps-sdk-ui/components/Icon'
 import useSharedFolders from '../../hooks/useSharedFolders.js'
 import { copyByteLabel } from '../../lib/projectCopies.js'
-import { addRememberedFolder, addVisitFolder } from '../../lib/sharedFolders/folderActions.js'
+import { addVisitFolder, shareUploadFolder } from '../../lib/sharedFolders/folderActions.js'
 import './QuestionCard.css'
 import './SharedFolderUploadPrompt.css'
 
@@ -26,7 +26,7 @@ function useShareFolder(canRemember, onShared) {
       visitInput.current?.click()
       return
     }
-    finish(await addRememberedFolder('read'))
+    finish(await shareUploadFolder())
   }
   const onVisitFiles = async (event) => {
     finish(await addVisitFolder(event.target.files))

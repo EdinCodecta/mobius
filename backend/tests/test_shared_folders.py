@@ -644,7 +644,8 @@ def folders_cli(monkeypatch):
   client = module.Folders.__new__(module.Folders)
   client._listing = [{"id": "f1", "name": "Downloads", "mode": "edit", "access": "remembered", "state": "ready"}]
   client.sent = []
-  client.run = lambda folder, command: client.sent.append(command) or {
+  client.targets = []
+  client.run = lambda folder, command: client.sent.append(command) or client.targets.append(folder["id"]) or {
     "path": command["path"], "to": command.get("to"), "size": 0, "created": True,
   }
 
@@ -654,6 +655,7 @@ def folders_cli(monkeypatch):
     args.run(client, args)
     return client.sent
 
+  run.client = client
   return run
 
 
@@ -675,4 +677,21 @@ def test_move_stays_inside_the_folder_named_by_both_paths(folders_cli):
   for destination in ("Photos/2026-10-01.jpg", "Downloads", "Downloads/"):
     with pytest.raises(SystemExit, match="inside one shared folder"):
       folders_cli("move", "Downloads/IMG_1.jpg", destination)
-  assert folders_cli("move", "IMG_1.jpg", "Photos/a.jpg", "--folder", "f1")[-1]["to"] == "Photos/a.jpg"
+  sent = folders_cli("move", "Downloads/IMG_1.jpg", "Downloads/Photos/a.jpg", "--folder", "f1")
+  assert sent[-1] == {"op": "move", "path": "IMG_1.jpg", "to": "Photos/a.jpg"}
+
+
+def test_folder_id_picks_between_same_named_folders_and_paths_keep_the_name(folders_cli):
+  # The same folder name shared from two devices, as the skill's paths teach.
+  folders_cli.client._listing = [
+    {"id": f"f{n}", "name": "Downloads", "mode": "edit", "access": "remembered", "state": "ready",
+     "device": {"label": label}}
+    for n, label in ((1, "Chrome on Mac"), (2, "Chrome on Android"))
+  ]
+  with pytest.raises(SystemExit, match="Add --folder ID"):
+    folders_cli("info", "Downloads/notes.txt")
+  assert folders_cli("info", "Downloads/notes.txt", "--folder", "f2")[-1]["path"] == "notes.txt"
+  assert folders_cli.client.targets[-1] == "f2"
+  # A path without the folder's name is refused, never looked up inside it.
+  with pytest.raises(SystemExit, match='Start the path with "Downloads/"'):
+    folders_cli("info", "notes.txt", "--folder", "f2")

@@ -1,13 +1,15 @@
 import { test, beforeEach, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import { IDBFactory } from 'fake-indexeddb'
-import { applyRemotePause, stopEverywhere } from '../folderActions.js'
+import {
+  addRememberedFolder, applyRemotePause, shareUploadFolder, stopEverywhere,
+} from '../folderActions.js'
 import {
   handleSharedFolderCommand, setSharedFolderSubscription, showSharedFolderActivity,
 } from '../folderHost.js'
 import { deviceId } from '../folderStore.js'
 import { createHandleFolder } from '../handleFolder.js'
-import { hostStore, publish } from '../hostState.js'
+import { folderState, hostStore, publish } from '../hostState.js'
 import { FakeDirectoryHandle, fileText } from './fakeDirectory.js'
 
 let answers = []
@@ -18,6 +20,7 @@ beforeEach(() => {
   answers = []
   pauses = []
   serverReachable = true
+  delete globalThis.showDirectoryPicker
   globalThis.indexedDB = new IDBFactory()
   globalThis.fetch = async (url, options) => {
     if (String(url).endsWith('/api/shared-folders/responses')) answers.push(JSON.parse(options.body))
@@ -223,4 +226,38 @@ test('Stop still pauses this browser when the server cannot be reached', async (
   serverReachable = false
   await stopEverywhere()
   assert.ok([...hostStore().records.values()].every(record => record.paused))
+})
+
+/** The folder the owner picks in the browser's folder picker. */
+function pickFolder(handle) {
+  globalThis.showDirectoryPicker = async () => handle
+}
+
+test('sharing the folder of a big upload never narrows one already shared with Read & edit', async () => {
+  const store = hostStore()
+  const shared = new FakeDirectoryHandle('Downloads')
+  store.records.set('edit', { ...store.records.get('edit'), handle: shared })
+  pickFolder(shared)
+  const outcome = await shareUploadFolder()
+  assert.deepEqual([outcome.ok, outcome.updated], [true, true])
+  assert.equal(store.records.get('edit').mode, 'edit')
+  assert.equal(folderState(store.records.get('edit')), 'ready')
+  // An edit grant the browser no longer holds asks for Reconnect; it never becomes Read only.
+  shared.grants.readwrite = 'prompt'
+  await shareUploadFolder()
+  assert.equal(store.records.get('edit').mode, 'edit')
+  assert.equal(folderState(store.records.get('edit')), 'needs_permission')
+})
+
+test('the upload card shares a new folder read-only, and Settings can still narrow one on purpose', async () => {
+  const store = hostStore()
+  pickFolder(new FakeDirectoryHandle('Photos'))
+  await shareUploadFolder()
+  const photos = [...store.records.values()].find(record => record.name === 'Photos')
+  assert.deepEqual([photos.mode, folderState(photos)], ['read', 'ready'])
+  const shared = new FakeDirectoryHandle('Downloads')
+  store.records.set('edit', { ...store.records.get('edit'), handle: shared })
+  pickFolder(shared)
+  await addRememberedFolder('read')
+  assert.equal(store.records.get('edit').mode, 'read')
 })

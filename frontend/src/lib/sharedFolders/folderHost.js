@@ -84,12 +84,7 @@ export async function refreshPermissions({ report = true } = {}) {
   const store = hostStore()
   for (const record of store.records.values()) {
     if (record.access !== 'remembered' || !record.handle) continue
-    let permission = 'prompt'
-    try {
-      permission = await record.handle.queryPermission({ mode: permissionMode(record) })
-    } catch {
-      permission = 'denied'
-    }
+    const permission = await folderPermission(record)
     store.permissions.set(record.id, permission)
     if (permission === 'granted' && !store.access.has(record.id)) {
       store.access.set(record.id, createHandleFolder(record.handle))
@@ -101,6 +96,15 @@ export async function refreshPermissions({ report = true } = {}) {
 
 export function permissionMode(record) {
   return record.mode === 'edit' ? 'readwrite' : 'read'
+}
+
+/** The browser's current grant for a remembered folder's rights, without asking the owner. */
+export async function folderPermission(record) {
+  try {
+    return await record.handle.queryPermission({ mode: permissionMode(record) })
+  } catch {
+    return 'denied'
+  }
 }
 
 export async function reportFolders() {

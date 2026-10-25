@@ -6,7 +6,7 @@ import {
   deleteFolderRecord, newFolderId, saveFolderRecord,
 } from './folderStore.js'
 import {
-  announceFolderChange, permissionMode, reportFolders,
+  announceFolderChange, folderPermission, permissionMode, reportFolders,
 } from './folderHost.js'
 import { hostStore, publishFolders } from './hostState.js'
 
@@ -32,25 +32,41 @@ async function findSameFolder(handle) {
 }
 
 /**
- * Chrome and Edge: pick a folder the browser will remember.
+ * Settings, in Chrome and Edge: pick a folder the browser will remember, with
+ * these rights. Picking an already shared folder again sets its rights.
  * Must run straight from the click: the picker needs the tap's activation.
  */
-export async function addRememberedFolder(mode) {
+export function addRememberedFolder(mode) {
+  return pickRememberedFolder(mode, () => mode)
+}
+
+/**
+ * The big-upload card: share the upload's folder read-only. A folder already
+ * shared with Read & edit keeps it: sharing to avoid an upload must not
+ * quietly take away rights the owner gave in Settings.
+ */
+export function shareUploadFolder() {
+  return pickRememberedFolder('read', existing => existing?.mode || 'read')
+}
+
+async function pickRememberedFolder(pickerMode, modeFor) {
   let handle
   try {
     handle = await globalThis.showDirectoryPicker({
-      id: 'mobius-shared-folder', mode: mode === 'edit' ? 'readwrite' : 'read',
+      id: 'mobius-shared-folder', mode: pickerMode === 'edit' ? 'readwrite' : 'read',
     })
   } catch (error) {
     if (error?.name === 'AbortError') return { ok: false, cancelled: true }
     return failed(pickerMessage(error))
   }
   const existing = await findSameFolder(handle)
+  const mode = modeFor(existing)
   const record = existing
     ? { ...existing, handle, mode, paused: false }
     : { id: newFolderId(), name: handle.name, mode, access: 'remembered', handle, paused: false, createdAt: Date.now() }
   const store = hostStore()
-  store.permissions.set(record.id, 'granted')
+  // The picker granted the rights it asked for; rights kept from before need their own grant.
+  store.permissions.set(record.id, mode === pickerMode ? 'granted' : await folderPermission(record))
   store.access.set(record.id, createHandleFolder(handle))
   await commit(record)
   return { ...done, name: record.name, updated: Boolean(existing) }

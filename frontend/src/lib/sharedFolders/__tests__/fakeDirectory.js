@@ -55,7 +55,12 @@ export class FakeDirectoryHandle {
     this.children = new Map()
     this.withMove = withMove
     this.denied = denied
+    // What queryPermission answers for each mode, as the browser remembers it.
+    this.grants = { read: 'granted', readwrite: 'granted' }
   }
+
+  async isSameEntry(other) { return other === this }
+  async queryPermission({ mode = 'read' } = {}) { return this.grants[mode] }
 
   adopt(child) {
     child.parent = this
