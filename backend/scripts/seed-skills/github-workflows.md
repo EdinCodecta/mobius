@@ -160,10 +160,17 @@ lost, `/observe` may confirm the exact PR/head is non-draft, independently of
 the old base and current actor or rights. A moved head stays unknown: GitHub's
 `ReadyForReviewEvent` has no head SHA, so its timeline entry alone cannot
 attribute readiness to the reviewed head. Do not replay the mutation or claim
-that a later non-draft head proves this attempt. Once exact PR identity and a
-different live head are verified, a finished unknown receipt becomes visibly
-`unattributable`: its old-head claim and audit remain, but it no longer fences
-new grants on other heads. An `attempting` receipt must first surface as
-unknown; an unsafe identity read cannot retire it. Readiness never authorizes
-merge using an old review. Unknown readiness remains visible and fences new
-public actions until that conservative observation succeeds.
+that a later non-draft head proves this attempt. The mutation names only the
+PR, not a head, so a request still in flight (for example an orphaned `gh`
+child after a restart) would mark whatever head is live. An unknown receipt
+therefore becomes visibly `unattributable` only when an observation verifies
+exact PR identity and a different live head, and starts at least one hour
+after the attempt was armed (the same dispatch window as merge; a receipt
+without an arm time counts from server start). Its old-head claim and audit
+remain, but it no longer fences new grants on other heads. An `attempting`
+receipt must first surface as unknown; an unsafe identity read cannot retire
+it. Readiness never authorizes merge using an old review. Unknown readiness
+remains visible and fences new public actions until that conservative
+observation succeeds. A cancelled `/ready` request still records its definite
+result: a confirmed response stays ready, and a refusal or any failure before
+the send releases the exact reservation.

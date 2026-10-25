@@ -28,8 +28,8 @@ _MERGE_DIAGNOSTIC_SECRET = re.compile(
 )
 
 READY_UNKNOWN_RECOVERY = ("If you choose to mark it ready in GitHub yourself, run /observe afterward; "
-  "or push a different head and run /observe so this old receipt can become unattributable. "
-  "Do not retry readiness on this head.")
+  "or push a different head and run /observe once an hour has passed since this attempt began, "
+  "so this old receipt can become unattributable. Do not retry readiness on this head.")
 
 
 def key(item: dict) -> str:
@@ -142,32 +142,40 @@ def selected_pull(gh, cwd, target):
     pull = read(gh, cwd, f"repos/{target['repo']}/pulls/{target['number']}")
   except (HTTPException, ContributionSubmitError, OSError, ValueError, subprocess.SubprocessError):
     return None
-  if repo.get("id") != target["repo_id"] or pull.get("node_id") != target["pr_id"]:
+  if (not isinstance(repo, dict) or not isinstance(pull, dict)
+      or repo.get("id") != target["repo_id"] or pull.get("node_id") != target["pr_id"]):
     return None
   return pull
 
 
-# How long after arm_merge a request issued for that attempt might still be
-# evaluated by GitHub. In process, dispatch is at most two sequential gh calls
-# (the final base read, then the merge or enqueue request), each killed at
+# How long after arming a public attempt (arm_merge or arm_ready) a request
+# issued for it might still be evaluated by GitHub. In process, dispatch is a
+# few sequential gh calls (at most six for readiness: the final actor, PR,
+# base and checks reads, then the mutation), each killed at
 # SUBMIT_TIMEOUT_SECONDS (90 s); GitHub ends any API request that takes over
 # 10 s to process. A crash can orphan the gh child past that timeout, but its
 # request can reach GitHub only while the kernel still retransmits it, which
 # Linux abandons after about 15 minutes by default. An hour covers both.
+# The merge-era name is kept: it is one window shared by every attempt kind.
 MERGE_DISPATCH_WINDOW_SECONDS = 3600
-# Every attempt armed by this code records merge_armed_at. An attempt without
-# it was armed by an older build, so before this single-worker process loaded.
+# Every attempt armed by this code records its arm time (merge_armed_at, or a
+# ready receipt's armed_at). An attempt without it was armed by an older
+# build, so before this single-worker process loaded.
 _LOADED_AT = time.time()
 
 
-def merge_dispatch_closed(item, read_at: float) -> bool:
+def dispatch_window_closed(armed_at, read_at: float) -> bool:
   """Whether a read started at ``read_at`` follows every possible evaluation
-  of the requests armed for this attempt."""
+  of the requests issued for an attempt armed at ``armed_at`` (UTC ISO)."""
   try:
-    armed_at = datetime.fromisoformat(item["merge_armed_at"].replace("Z", "+00:00")).timestamp()
-  except (KeyError, AttributeError, TypeError, ValueError):
-    armed_at = _LOADED_AT
-  return read_at >= armed_at + MERGE_DISPATCH_WINDOW_SECONDS
+    armed = datetime.fromisoformat(armed_at.replace("Z", "+00:00")).timestamp()
+  except (AttributeError, TypeError, ValueError):
+    armed = _LOADED_AT
+  return read_at >= armed + MERGE_DISPATCH_WINDOW_SECONDS
+
+
+def utc_now_iso() -> str:
+  return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def moved_head_fact(target, previous, pull, read_at: float):
@@ -179,7 +187,7 @@ def moved_head_fact(target, previous, pull, read_at: float):
   ``expectedHeadOid``), but that is an equality check. If the head returns to
   it while a request is still in flight, that request can still land. So an
   open, unmerged PR at another head settles the attempt only when read after
-  ``merge_dispatch_closed``: GitHub then has evaluated or dropped every request
+  ``dispatch_window_closed``: GitHub then has evaluated or dropped every request
   issued for it. One evaluated at the attempted head merged the PR, which this
   read would show, or queued it, and a push removes a PR from its merge queue.
   A closed, unmerged PR proves nothing: it can be reopened at the attempted
@@ -195,7 +203,7 @@ def moved_head_fact(target, previous, pull, read_at: float):
       "merge_commit_sha": pull.get("merge_commit_sha"), "merged_at": pull.get("merged_at")},
       "summary": "The pull request was merged at a later head. The earlier attempt can no longer land and was not repeated."}
   if (pull.get("state") != "open" or pull.get("merged") is not False
-      or not merge_dispatch_closed(previous, read_at)):
+      or not dispatch_window_closed(previous.get("merge_armed_at"), read_at)):
     return None
   return {"state": "needs_you", "head_moved": {"attempted_head_sha": attempted,
     "attempt_state": previous.get("state"), "head_sha": head_sha},
@@ -342,8 +350,7 @@ def require_public_transition_clear(db, row, target):
         item.get("merge_attempted") or item.get("state") in {"merging", "merge_unknown", "queued"})
       repair_pending = any(a.get("state") in {"pushing", "push_unknown"}
         for a in item.get("repair_attempts", []))
-      ready = item.get("ready_attempt")
-      unresolved = merge_pending or repair_pending or (ready and ready.get("state") not in {"ready", "unattributable"})
+      unresolved = merge_pending or repair_pending or ready_pending(item)
       merged_head = item.get("state") == "merged" and item.get("head_sha") == target["head_sha"]
       if not (unresolved or merged_head):
         continue
@@ -465,7 +472,7 @@ def arm_merge(db, row, target, outcome, principal):
     armed = {**row.outcomes_json.get(item_key, {}),
       **{k: outcome[k] for k in review_fields if k in outcome},
       "state": "merging", "merge_attempted": True,
-      "merge_armed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+      "merge_armed_at": utc_now_iso()}
     save_outcome(db, row, item_key, armed)
   return None
 
@@ -478,15 +485,19 @@ def merge_pending(outcome) -> bool:
 def keeps_public_receipts(current, outcome) -> bool:
   """Only a remote-effect settlement may change an existing public receipt.
 
-  Admission and private writes may append a repair attempt. One built from an
-  older snapshot must not drop a repair arm, successor or live merge that
-  another writer saved before this row was refreshed.
+  Admission and private writes may append a repair attempt or arm the first
+  readiness attempt. One built from an older snapshot must not drop a repair
+  arm, successor, readiness receipt or its audit, or live merge that another
+  writer saved before this row was refreshed. Only ``disarm_ready`` removes
+  an exact unspent readiness receipt.
   """
-  saved = current.get("repair_attempts") or []
-  if (outcome.get("repair_attempts") or [])[:len(saved)] != saved:
-    return False
-  if "successor" in current and outcome.get("successor") != current["successor"]:
-    return False
+  for history in ("repair_attempts", "ready_audit"):
+    saved = current.get(history) or []
+    if (outcome.get(history) or [])[:len(saved)] != saved:
+      return False
+  for receipt in ("successor", "ready_attempt"):
+    if receipt in current and outcome.get(receipt) != current[receipt]:
+      return False
   return not merge_pending(current) or all(outcome.get(k) == current.get(k)
     for k in ("state", "merge_attempted", "queue_entry_id", "merge_sha"))
 
@@ -673,9 +684,8 @@ def base_advance_eligible(row, previous) -> bool:
   saved public attempt (merge or uncertain push) must be
   reconciled first; a base observation never clears or replaces a receipt.
   """
-  attempt = previous.get("ready_attempt")
   return (row.mode == "review_fix_merge" and not (previous.get("merge_attempted") or previous.get("state") in {"merging", "merge_unknown", "queued", "merged"})
-          and not (attempt and attempt.get("state") != "ready")
+          and not ready_pending(previous)
           and not any(r.get("state") in {"pushing", "push_unknown"}
                       for r in previous.get("repair_attempts", [])))
 
@@ -980,17 +990,22 @@ def save_effect_outcome(db, row, item_key, outcome):
       return
     current_ready = current.get("ready_attempt")
     incoming_ready = outcome.get("ready_attempt")
-    if current_ready and incoming_ready:
+    if current_ready and not incoming_ready:
+      # A writer that never saw this receipt cannot remove it; its own fact
+      # still lands. Only disarm_ready removes an exact unspent receipt.
+      outcome = {**outcome, "ready_attempt": current_ready}
+    elif current_ready and (
+        current_ready.get("id") != incoming_ready.get("id")
+        or current_ready.get("head_sha") != incoming_ready.get("head_sha")
+        or (current_ready.get("state") == "ready" and incoming_ready.get("state") != "ready")
+        or (current_ready.get("state") == "unattributable"
+            and incoming_ready.get("state") not in {"unattributable", "ready"})):
       # A stale observer must not replace another attempt or erase a later
       # confirmed/retired receipt. A confirmed fact may still upgrade an
       # unattributable observation of the same exact attempt.
-      if (current_ready.get("id") != incoming_ready.get("id")
-          or current_ready.get("head_sha") != incoming_ready.get("head_sha")
-          or (current_ready.get("state") == "ready" and incoming_ready.get("state") != "ready")
-          or (current_ready.get("state") == "unattributable"
-              and incoming_ready.get("state") not in {"unattributable", "ready"})):
-        return
-      audit = list(current.get("ready_audit") or [])
+      return
+    if current.get("ready_audit"):
+      audit = list(current["ready_audit"])
       for event in outcome.get("ready_audit") or []:
         if event not in audit:
           audit.append(event)
@@ -1037,6 +1052,16 @@ def settle_repair_attempt(db, row, item_key, receipt, settle,
       return None
     return settle(current, attempts, index)
   save_effect_outcome(db, row, item_key, apply)
+
+
+def ready_pending(item) -> bool:
+  """Whether a saved readiness attempt may still have an unobserved effect.
+
+  The one rule for every fence: a confirmed receipt, or one retired as
+  unattributable after its dispatch window, can no longer act.
+  """
+  attempt = item.get("ready_attempt")
+  return bool(attempt) and attempt.get("state") not in {"ready", "unattributable"}
 
 
 def draft_ready_allowed(row):
@@ -1116,18 +1141,26 @@ def save_ready_attempt(db, row, item_key, receipt):
 
 
 def disarm_ready(db, row, target, receipt_id):
-  """Release only the exact still-unspent readiness reservation."""
+  """Release only the exact still-unspent readiness reservation.
+
+  This is the one writer allowed to remove a readiness receipt, matched by
+  its immutable id and head on the refreshed item, never on a snapshot.
+  """
   db.rollback()
-  db.refresh(row)
   item_key = key(target)
-  previous = (row.outcomes_json or {}).get(item_key, {})
-  attempt = previous.get("ready_attempt") or {}
-  if (attempt.get("state") != "attempting" or attempt.get("id") != receipt_id
-      or attempt.get("head_sha") != target["head_sha"]):
-    raise HTTPException(409, "The readiness reservation changed; it cannot be released.")
-  audit = [*(previous.get("ready_audit") or []),
-    {"id": receipt_id, "state": "not_dispatched", "head_sha": target["head_sha"]}]
-  save_outcome(db, row, item_key, {**{k: v for k, v in previous.items() if k != "ready_attempt"},
-    "ready_audit": audit})
+  for _ in range(4):
+    db.refresh(row)
+    previous = (row.outcomes_json or {}).get(item_key, {})
+    attempt = previous.get("ready_attempt") or {}
+    if (attempt.get("state") != "attempting" or attempt.get("id") != receipt_id
+        or attempt.get("head_sha") != target["head_sha"]):
+      raise HTTPException(409, "The readiness reservation changed; it cannot be released.")
+    audit = [*(previous.get("ready_audit") or []),
+      {"id": receipt_id, "state": "not_dispatched", "head_sha": target["head_sha"]}]
+    if _cas_outcome(db, row, item_key, {**{k: v for k, v in previous.items() if k != "ready_attempt"},
+                                        "ready_audit": audit}):
+      break
+  else:
+    raise HTTPException(409, "The readiness reservation changed; observe this run.")
   agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
     work_key=ready_work_key(target), outcome="Draft readiness was not attempted.", release=True)

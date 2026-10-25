@@ -44,6 +44,8 @@ REVIEW_CAPABILITIES = {"post_review": True, "review_fix_merge": True, "draft_tak
 TAKEOVER_SCOPES = {"named_pr_repairs_and_reviewed_successors", "named_pr_repairs_ready_and_reviewed_successors"}
 REVIEW_STOP_KEY = "_review_stop"
 READY_HEAD_MOVED = "The head changed; GitHub's ready event cannot identify the reviewed head. No action was repeated."
+READY_WINDOW_OPEN = ("A request from that attempt might still reach GitHub, so its receipt keeps "
+  "fencing new public actions until an hour after it began. Observe again then.")
 
 
 class PullIdentity(BaseModel):
@@ -786,16 +788,8 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
         previous = row.outcomes_json[reviews.key(original)]
       attempt = previous.get("ready_attempt")
       if attempt and attempt.get("state") in {"attempting", "unknown"}:
-        try:
-          target = reviews.effective_target(row, original)
-        except HTTPException:
-          continue  # An ambiguous receipt chain needs the owner; observe the others.
-        blocked = await _confirm_ready_attempt(target, cwd)
-        if blocked:
-          _escalate_unconfirmed_ready(db, row, reviews.key(original), previous, attempt)
-          _record_unattributable_ready(db, row, reviews.key(original), attempt, blocked)
+        if await _reconcile_ready_attempt(db, row, reviews.key(original), attempt, cwd):
           continue
-        reviews.save_ready_attempt(db, row, reviews.key(original), {**attempt, "state": "ready"})
         previous = row.outcomes_json[reviews.key(original)]
       if not _merge_attempted(previous):
         continue
@@ -1196,9 +1190,11 @@ def _save_base_advance(db, row, original, previous, advanced, principal):
 
 
 def _require_ready_attempt_resolved(previous, target):
-  attempt = previous.get("ready_attempt")
-  if attempt and attempt.get("state") != "ready" and not (
-      attempt.get("state") == "unattributable" and attempt.get("head_sha") != target["head_sha"]):
+  # A retired (unattributable) receipt no longer fences other heads, but the
+  # readiness of its own head stays unknown.
+  attempt = previous.get("ready_attempt") or {}
+  if reviews.ready_pending(previous) or (
+      attempt.get("state") == "unattributable" and attempt.get("head_sha") == target["head_sha"]):
     raise HTTPException(409, "The draft readiness attempt is uncertain. Reconcile it read-only before any new public action.")
 
 
@@ -1212,40 +1208,49 @@ async def _confirm_ready_attempt(target, cwd) -> str | None:
   try:
     _repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
   except HTTPException:
-    try:
-      repo = await asyncio.to_thread(reviews.read, _gh, cwd, f"repos/{target['repo']}")  # unsettled: read-only (GitHub observation)
-      pull = await asyncio.to_thread(reviews.read, _gh, cwd, f"repos/{target['repo']}/pulls/{target['number']}")  # unsettled: read-only (GitHub observation)
-    except (HTTPException, ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
-      return "The earlier readiness attempt is uncertain; it was not repeated."
-    if (not isinstance(repo, dict) or not isinstance(pull, dict)
-        or type(repo.get("id")) is not int or repo["id"] != target["repo_id"]
-        or not isinstance(pull.get("node_id"), str) or pull["node_id"] != target["pr_id"]):
-      return "The earlier readiness attempt cannot be tied to this pull request; it was not repeated."
-    head = pull.get("head")
-    head_sha = head.get("sha") if isinstance(head, dict) else None
-    if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
-      return "The earlier readiness attempt has no trustworthy live head; it was not repeated."
-    if head_sha != target["head_sha"]:
-      return READY_HEAD_MOVED
+    # The selection no longer matches, but the same PR still proves its own
+    # head and draft state.
+    pull = await asyncio.to_thread(reviews.selected_pull, _gh, cwd, target)  # unsettled: read-only (GitHub observation)
+    if pull is None:
+      return "The earlier readiness attempt could not be read or tied to this pull request; it was not repeated."
   except (ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
     return "The earlier readiness attempt is uncertain; it was not repeated."
+  head = pull.get("head")
+  head_sha = head.get("sha") if isinstance(head, dict) else None
+  if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+    return "The earlier readiness attempt has no trustworthy live head; it was not repeated."
+  if head_sha != target["head_sha"]:
+    return READY_HEAD_MOVED
   if pull.get("draft") is not False:
     return f"The earlier readiness attempt is not confirmed; it was not repeated. {reviews.READY_UNKNOWN_RECOVERY}"
   return None
 
 
-def _escalate_unconfirmed_ready(db, row, item_key, previous, attempt):
-  # A leftover "attempting" receipt (crash or lost response) that cannot be
-  # confirmed must surface to the owner instead of silently blocking.
+async def _reconcile_ready_attempt(db, row, item_key, attempt, cwd) -> str | None:
+  """Settle one saved readiness attempt read-only at its own saved head.
+
+  Returns why it stays unconfirmed, or None once it is confirmed ready.
+  """
+  original = next(t for t in row.targets_json if reviews.key(t) == item_key)
+  read_at = time.time()
+  blocked = await _confirm_ready_attempt({**original, "head_sha": attempt["head_sha"]}, cwd)
+  if blocked is None:
+    if attempt.get("state") != "ready":
+      reviews.save_ready_attempt(db, row, item_key, {**attempt, "state": "ready"})
+    return None
   if attempt.get("state") == "attempting":
+    # A leftover "attempting" receipt (crash or lost response) that cannot be
+    # confirmed must surface to the owner instead of silently blocking.
     reviews.save_ready_attempt(db, row, item_key, {**attempt, "state": "unknown"})
-
-
-def _record_unattributable_ready(db, row, item_key, attempt, blocked):
-  # Preserve the old-head receipt and audit, but retire its cross-head fence
-  # only after the provider proves this exact PR now has a different head.
-  if attempt.get("state") == "unknown" and blocked == READY_HEAD_MOVED:
+  elif attempt.get("state") == "unknown" and blocked == READY_HEAD_MOVED:
+    # GitHub's mark-ready mutation names no head: a request still in flight
+    # (an orphaned gh child after a crash) would mark whatever head is live.
+    # Keep the fence until every request for this attempt has been evaluated
+    # or dropped; the old-head receipt and audit always remain.
+    if not reviews.dispatch_window_closed(attempt.get("armed_at"), read_at):
+      return f"{blocked} {READY_WINDOW_OPEN}"
     reviews.save_ready_attempt(db, row, item_key, {**attempt, "state": "unattributable"})
+  return blocked
 
 
 class DraftReady(PullIdentity):
@@ -1280,43 +1285,65 @@ async def mark_draft_ready(app_id: int | None, run_id: str, body: DraftReady,
           "The readiness receipt is for an earlier head. This draft successor needs a new grant; the earlier action was not repeated."}
       if attempt.get("state") == "unattributable":
         return {"run": _run_view(db, row), "blocked": READY_HEAD_MOVED}
-      observed_target = {**target, "head_sha": attempt["head_sha"]}
-      blocked = await _confirm_ready_attempt(observed_target, cwd)
-      if blocked:
-        _escalate_unconfirmed_ready(db, row, item_key, previous, attempt)
-        _record_unattributable_ready(db, row, item_key, attempt, blocked)
-        return {"run": _run_view(db, row), "blocked": blocked}
-      if attempt.get("state") != "ready":
-        reviews.save_ready_attempt(db, row, item_key, {**attempt, "state": "ready"})
-      return {"run": _run_view(db, row)}
+      blocked = await _reconcile_ready_attempt(db, row, item_key, attempt, cwd)
+      return {"run": _run_view(db, row), **({"blocked": blocked} if blocked else {})}
     if body.tests_passed is not True or set(body.scope) != SCOPE or not body.tests.strip():
       raise HTTPException(422, "Fresh full-rubric review and passing tests are required before draft readiness.")
     reviews.require_independent_clear(row, target, body)
     async with _github_connection_transaction():
       await _ready_preflight(row, target, cwd)
       receipt = await _arm_ready(db, row, principal, target, body)
-      # Stop can acquire review-admission after _arm_ready releases it. Admit
-      # the actual mutation under that same lock, not merely its reservation.
-      async with chat_queue.get_transition_lock(f"review-admission:{run_id}"):
-        try:
-          # The original observation can go stale while the reservation is
-          # armed. Re-read the exact head, base and readiness immediately
-          # before the public effect, then recheck authority after the await.
-          await _ready_preflight(row, target, cwd)
-          _parent(db, row, principal)
-        except HTTPException as exc:
-          result = DispatchResult.not_dispatched(str(exc.detail))
-        except (ContributionSubmitError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
-          result = DispatchResult.not_dispatched("Readiness preflight failed before dispatch.")
-        else:
-          result = await _dispatch_ready(target, cwd)
-      if result.state == "not_dispatched":
-        reviews.disarm_ready(db, row, target, receipt["id"])
-        raise HTTPException(409, result.reason or "Readiness was refused without applying a public effect.")
-      receipt["state"] = "ready" if result.state == "confirmed" else "unknown"
-      db.refresh(row)
-      reviews.save_ready_attempt(db, row, item_key, receipt)
+      # Dispatch and its settlement are one unit, as in publish_attempt: a
+      # cancelled request still records the definite result (and releases a
+      # known refusal's claim) instead of stranding 'attempting'.
+      receipt = await settled.settle(_dispatch_and_settle_ready(
+        db, row, principal, target, receipt, cwd, asyncio.current_task()),
+        what="Draft readiness and settlement")
     return {"run": _run_view(db, row), **({"blocked": "The readiness response is uncertain; observe read-only before proceeding."} if receipt["state"] == "unknown" else {})}
+
+
+async def _dispatch_and_settle_ready(db, row, principal, target, receipt, cwd, caller):
+  result = await _admit_and_dispatch_ready(db, row, principal, target, cwd, caller)
+  if result.state == "not_dispatched":
+    reviews.disarm_ready(db, row, target, receipt["id"])
+    if asyncio.current_task().cancelling():
+      raise asyncio.CancelledError()
+    raise HTTPException(409, result.reason or "Readiness was refused without applying a public effect.")
+  receipt = {**receipt, "state": "ready" if result.state == "confirmed" else "unknown"}
+  reviews.save_ready_attempt(db, row, reviews.key(target), receipt)
+  return receipt
+
+
+async def _admit_and_dispatch_ready(db, row, principal, target, cwd, caller):
+  """The final gate and the single mutation, under Stop's admission lock.
+
+  Stop can acquire review-admission after _arm_ready releases it, so the
+  actual mutation, not merely its reservation, is admitted under that lock.
+  Every failure before the send, a shutdown included, is a known refusal.
+  """
+  admission = chat_queue.get_transition_lock(f"review-admission:{row.id}")
+  try:
+    await admission.acquire()
+  except asyncio.CancelledError:
+    return DispatchResult.not_dispatched("The readiness request was cancelled before any mutation began.")
+  try:
+    try:
+      # The original observation can go stale while the reservation is
+      # armed. Re-read the exact head, base and readiness immediately
+      # before the public effect, then recheck authority after the await.
+      await _ready_preflight(row, target, cwd)
+      _parent(db, row, principal)
+      # This unit outlives a cancelled caller. A cancel that lands before the
+      # mutation starts is a known refusal, never permission to start it.
+      if caller.cancelling():
+        raise HTTPException(409, "The readiness request was cancelled before any mutation began.")
+    except HTTPException as exc:
+      return DispatchResult.not_dispatched(str(exc.detail))
+    except (Exception, asyncio.CancelledError):
+      return DispatchResult.not_dispatched("Readiness preflight failed before dispatch.")
+    return await _dispatch_ready(target, cwd)
+  finally:
+    admission.release()
 
 
 async def _ready_preflight(row, target, cwd):
@@ -1344,7 +1371,9 @@ async def _arm_ready(db, row, principal, target, body):
       "head_sha": target["head_sha"], "base_sha": target["base_sha"],
       "independent_receipt_id": body.independent_receipt_id,
       "review_run_id": principal.run_id, "summary": body.summary,
-      "tests": body.tests, "tests_passed": True, "scope": body.scope}
+      "tests": body.tests, "tests_passed": True, "scope": body.scope,
+      # Opens the dispatch window; it must precede any request for this attempt.
+      "armed_at": reviews.utc_now_iso()}
     reviews.arm_ready(db, row, target, receipt, principal)
     try:
       _parent(db, row, principal)
