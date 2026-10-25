@@ -795,15 +795,15 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
         _repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
       except HTTPException:
         # The selection no longer matches, but the same PR at a later head can
-        # prove the head-pinned attempt can no longer land (see moved_head_fact).
+        # prove the head-pinned attempt can no longer land (see later_pull_fact).
         read_at = time.time()
         pull = await asyncio.to_thread(reviews.selected_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
-        fact = pull and reviews.moved_head_fact(target, previous, pull, read_at)
+        fact = pull and await asyncio.to_thread(reviews.later_pull_fact, _gh, cwd, target, previous, pull, read_at)  # unsettled: read-only (GitHub merge queue read)
         if fact:
           reviews.settle_merge_observation(db, row, reviews.key(original), previous, fact)
         continue
       # A PR closed unmerged at the attempted head still matches the selection.
-      fact = reviews.moved_head_fact(target, previous, pull, read_at)
+      fact = await asyncio.to_thread(reviews.later_pull_fact, _gh, cwd, target, previous, pull, read_at)  # unsettled: read-only (GitHub merge queue read)
       if fact:
         reviews.settle_merge_observation(db, row, reviews.key(original), previous, fact)
         continue

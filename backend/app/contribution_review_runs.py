@@ -191,9 +191,10 @@ def moved_head_fact(target, previous, pull, read_at: float):
   settles the attempt only when read after ``dispatch_window_closed``: GitHub
   then has evaluated or dropped every request issued for it. One evaluated at
   the attempted head merged the PR, which this read would show, or queued it,
-  and a push or a close removes a PR from its merge queue. Reopening cannot
-  revive a dropped request. So after the window an open PR at another head
-  records ``head_moved``, and a closed PR at any head ``pr_closed_unmerged``.
+  and a push removes a PR from its merge queue; for a close,
+  ``later_pull_fact`` observes the exit. Reopening cannot revive a dropped
+  request. So after the window an open PR at another head records
+  ``head_moved``, and a closed PR at any head ``pr_closed_unmerged``.
   The receipt fields stay as audit history, and ``merge_attempted`` still
   forbids replaying that head.
   """
@@ -223,6 +224,32 @@ def moved_head_fact(target, previous, pull, read_at: float):
     "summary": ("The pull request moved to a new head after the earlier merge or queue request, "
                 "which GitHub accepts only for the head it named, and that request can no longer "
                 "be processed. It was not repeated. Review the new head before any merge.")}
+
+
+def queue_entry_absent(gh, cwd, target) -> bool:
+  """Whether a live read shows the PR in no merge queue, at any head.
+
+  Unlike ``queue_entry``, an entry GitHub attached at another head counts.
+  A failed or incomplete read proves nothing (False).
+  """
+  try:
+    pr = pull_checks(gh, cwd, target)
+  except (HTTPException, ContributionSubmitError, OSError, ValueError, AttributeError,
+          subprocess.SubprocessError):
+    return False
+  return isinstance(pr, dict) and "mergeQueueEntry" in pr and pr["mergeQueueEntry"] is None
+
+
+def later_pull_fact(gh, cwd, target, previous, pull, read_at: float):
+  """``moved_head_fact``, with a closed PR's queue exit observed, not inferred.
+
+  GitHub does not document that closing a PR removes it from its merge queue,
+  so ``pr_closed_unmerged`` also requires a later read showing no entry.
+  """
+  fact = moved_head_fact(target, previous, pull, read_at)
+  if fact and "pr_closed_unmerged" in fact and not queue_entry_absent(gh, cwd, target):
+    return None
+  return fact
 
 
 # Facts the same PR later proved about a saved merge attempt (moved_head_fact).

@@ -1,20 +1,23 @@
 """Branch exclusion spans ordinary merges, takeovers and immutable legacy grants."""
 import asyncio
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timezone
 from threading import Barrier
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
 from app import agent_work_claims, contribution_review_runs as domain, models
+from app.contribution_errors import ContributionSubmitError
 from app.contribution_review_effects import DispatchResult
 from app.database import SessionLocal
 from app.deps import Principal
 from app.routes import contribution_reviews as routes
-from tests.test_contribution_review_runs import setup, ITEM, TARGET, SHA, BASE, REPO, PULL, report
+from tests.test_contribution_review_runs import setup, ITEM, TARGET, SHA, BASE, REPO, PULL, CHECKS, report
 from tests.test_contribution_review_workflows import configure_repair, overlapping_grant, publish_body, repairs, NEW
 
 
@@ -554,6 +557,7 @@ def test_closed_unmerged_after_the_dispatch_window_settles_without_rearming(setu
   """No request for the attempt can still be processed, and a closed PR cannot merge."""
   db, takeover, normal, principal, attempt = attempted_merge(setup, monkeypatch, state)
   serve(monkeypatch, closed_pull(head))
+  no_queue_entry(monkeypatch, head)
   item = observe_item(db, normal, principal)
   assert item["state"] == "needs_you"
   saved = normal.outcomes_json[domain.key(normal.targets_json[0])]
@@ -570,6 +574,90 @@ def test_closed_unmerged_after_the_dispatch_window_settles_without_rearming(setu
   assert normal.outcomes_json[domain.key(normal.targets_json[0])] == saved
   monkeypatch.setattr(domain, "read", lambda *a: pytest.fail("the attempt is already settled"))
   observe_item(db, normal, principal)
+
+
+def queue_read(monkeypatch, outcome):
+  def pull_checks(*a):
+    if isinstance(outcome, BaseException):
+      raise outcome
+    return outcome
+  monkeypatch.setattr(domain, "pull_checks", pull_checks)
+
+
+@pytest.mark.parametrize("head", [SHA, LATER], ids=["attempted-head", "later-head"])
+@pytest.mark.parametrize("queue", [
+  {"headRefOid": SHA, "mergeQueueEntry": {"id": "MQE_9", "enqueuedAt": "2026-10-24T02:30:00Z"}},
+  {"headRefOid": LATER, "mergeQueueEntry": {"id": "MQE_9", "enqueuedAt": "2026-10-24T02:30:00Z"}},
+  HTTPException(409, "GitHub could not confirm this pull request's checks."),
+  {"headRefOid": SHA},
+], ids=["entry-at-attempted-head", "entry-at-other-head", "read-failed", "entry-not-reported"])
+def test_closed_pr_settles_only_once_a_live_read_shows_no_queue_entry(setup, monkeypatch, head, queue):
+  """Closing is not documented to dequeue: observe the exit, never infer it."""
+  db, takeover, normal, principal, attempt = attempted_merge(setup, monkeypatch, "merge_unknown")
+  serve(monkeypatch, closed_pull(head))
+  queue_read(monkeypatch, queue)
+  observe_item(db, normal, principal)
+  saved = normal.outcomes_json[domain.key(normal.targets_json[0])]
+  assert domain.merge_pending(saved) and not set(domain.MERGE_SETTLEMENTS).intersection(saved)
+  assert saved["head_sha"] == SHA and saved["merge_attempted"] is True
+  assert not fence_clear(takeover) and not fence_clear(normal)
+  # The same closed PR, once read in no merge queue, settles.
+  no_queue_entry(monkeypatch, head)
+  observe_item(db, normal, principal)
+  assert normal.outcomes_json[domain.key(normal.targets_json[0])]["pr_closed_unmerged"]["head_sha"] == head
+  assert fence_clear(takeover)
+
+
+@pytest.mark.parametrize("failure", [subprocess.TimeoutExpired("gh", 90), OSError("gone"),
+  ValueError("unreadable"), ContributionSubmitError("GitHub failed.", code="gh_failed")],
+  ids=["timeout", "os-error", "unreadable", "gh-error"])
+def test_a_failed_queue_read_never_settles_a_closed_pr(monkeypatch, failure):
+  queue_read(monkeypatch, failure)
+  armed = {"head_sha": SHA, "merge_armed_at": CLOSED}
+  pull = moved_pull(state="closed", head={"sha": LATER, **BRANCH})
+  assert domain.moved_head_fact({"head_sha": SHA}, armed, pull, time.time())["pr_closed_unmerged"]
+  assert domain.later_pull_fact(None, "/tmp", {"head_sha": SHA, "pr_id": "PR_8"}, armed, pull, time.time()) is None
+
+
+def test_closed_window_is_judged_from_when_the_read_started(setup, monkeypatch):
+  """A read that starts before the window closes proves nothing, even if it ends after."""
+  db, takeover, normal, principal, attempt = attempted_merge(setup, monkeypatch, "merge_unknown",
+    armed_at=iso(time.time()))
+  armed = datetime.fromisoformat(attempt["merge_armed_at"].replace("Z", "+00:00")).timestamp()
+  closes = armed + domain.MERGE_DISPATCH_WINDOW_SECONDS
+  responses = closed_pull()
+  serve(monkeypatch, responses)
+  no_queue_entry(monkeypatch, SHA)
+  clock = [closes - 1]
+  served = domain.read
+  def slow_read(gh, cwd, endpoint):
+    clock[0] = closes + 60  # GitHub answers after the window closed.
+    return served(gh, cwd, endpoint)
+  monkeypatch.setattr(domain, "read", slow_read)
+  monkeypatch.setattr(routes, "time", SimpleNamespace(time=lambda: clock[0]))
+  observe_item(db, normal, principal)
+  still_pending(normal.outcomes_json[domain.key(normal.targets_json[0])], attempt)
+  assert not fence_clear(takeover)
+  observe_item(db, normal, principal)  # This read starts after the close.
+  assert normal.outcomes_json[domain.key(normal.targets_json[0])]["pr_closed_unmerged"]["head_sha"] == SHA
+
+
+def test_a_new_report_after_reopening_at_the_settled_head_never_dispatches(setup, monkeypatch):
+  db, takeover, normal, principal, attempt = attempted_merge(setup, monkeypatch, "merge_unknown")
+  serve(monkeypatch, closed_pull())
+  no_queue_entry(monkeypatch, SHA)
+  observe_item(db, normal, principal)
+  saved = normal.outcomes_json[domain.key(normal.targets_json[0])]
+  assert saved["pr_closed_unmerged"]
+  # Reopened at the attempted head, and GitHub would accept a merge now.
+  serve(monkeypatch, {**pull_at(SHA), "user": {"id": 42}})
+  monkeypatch.setattr(domain, "pull_checks", lambda *a: {**CHECKS, "mergeQueueEntry": None})
+  monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("PUBLIC_MERGE"))
+  monkeypatch.setattr(domain, "enqueue", lambda *a: pytest.fail("PUBLIC_ENQUEUE"))
+  item = report((db, normal, principal), number=8)["run"]["items"][0]
+  assert item["state"] == "needs_you"
+  db.refresh(normal)
+  assert normal.outcomes_json[domain.key(normal.targets_json[0])] == saved
 
 
 def test_closed_then_reopened_at_the_attempted_head_within_the_window_stays_pending(setup, monkeypatch):
