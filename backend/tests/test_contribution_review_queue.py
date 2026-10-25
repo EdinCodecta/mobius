@@ -49,7 +49,7 @@ def queue_graphql(monkeypatch, node, compare=None):
     if args[:1] == ("api",) and len(args) == 2:
       # The base-containment read: the base branch does not contain the head.
       assert args[1] == f"repos/example/project/compare/main...{SHA}"
-      return SimpleNamespace(stdout=json.dumps(compare or {"status": "diverged"}))
+      return SimpleNamespace(stdout=json.dumps({"status": "diverged"} if compare is None else compare))
     query = next(a[len("query="):] for a in args if a.startswith("query="))
     assert query.startswith("query(") and "mutation" not in query
     assert f"id={TARGET['pr_id']}" in args
