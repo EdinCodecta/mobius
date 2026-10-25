@@ -973,7 +973,7 @@ async def repair_checkout(app_id: int | None, run_id: str, body: RepairCheckout,
     attempts = previous.get("repair_attempts", [])
     if any(r.get("state") in {"pushing", "push_unknown"} for r in attempts):
       raise HTTPException(409, "An earlier push has an unclear public outcome. Reconcile it; do not prepare another repair.")
-    reviews.require_public_transition_clear(db, row, target)
+    reviews.require_public_transition_clear(db, row, target, repair=True)
     reviews.require_repair_round_available(row, attempts)
     cwd = Path(get_settings().data_dir) / "platform"
     async with _github_connection_transaction():

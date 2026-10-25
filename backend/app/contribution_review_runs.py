@@ -363,12 +363,14 @@ def _transition_candidates(db, owner_id, target):
   return query.all()
 
 
-def require_public_transition_clear(db, row, target):
+def require_public_transition_clear(db, row, target, *, repair=False):
   """New mutations must not cross an unresolved item or head-branch attempt.
 
   Observation and exact-action replay are handled before this boundary. Never
   infer resolution from the PR projection, which can lag a public branch push.
   Call again under the database fence after claim acquisition commits.
+  ``repair`` exempts only this exact item's own saved queue removal at its
+  removed head: the repair boundaries re-prove that removal, and nothing else.
   """
   grants = _transition_candidates(db, row.owner_id, target)
   # Projection does not refresh the ORM identity map. Re-read the owning row
@@ -382,8 +384,10 @@ def require_public_transition_clear(db, row, target):
   for grant in grants:
     for original in grant.targets_json:
       item = (grant.outcomes_json or {}).get(key(original), {})
-      merge_pending = (item.get("state") != "merged" and merge_attempted(item) and not merge_settled(item)
-        and not (grant.id == row.id and item.get("queue_removal")))
+      proven_removal = (repair and grant.id == row.id and key(original) == key(target)
+        and item.get("queue_removal") and item.get("head_sha") == target["head_sha"])
+      merge_pending = (item.get("state") != "merged" and merge_attempted(item)
+        and not merge_settled(item) and not proven_removal)
       repair_pending = any(a.get("state") in {"pushing", "push_unknown"}
         for a in item.get("repair_attempts", []))
       unresolved = merge_pending or repair_pending or ready_pending(item)
@@ -927,7 +931,7 @@ def arm_repair(db, row, target, previous, receipt, principal):
             "review_selection_id": selection_id})
           return summary
   with released_on_refusal(db, row, claim):
-    require_public_transition_clear(db, row, target)
+    require_public_transition_clear(db, row, target, repair=True)
     previous = row.outcomes_json.get(key(target), {})
     save_outcome(db, row, key(target), {**previous, "state": "pushing",
       "repair_attempts": [*previous.get("repair_attempts", []), {**receipt, "work_key": work_key}]})
@@ -962,13 +966,20 @@ def confirmed_successor(previous, attempts, receipt):
   if merge_attempted(previous):
     if (not previous.get("queue_removal") or receipt["head_sha"] == previous.get("head_sha")):
       raise HTTPException(409, "A merge attempt cannot be cleared without a newly repaired successor.")
-    fields = ("head_sha", "merge_attempted", "merge_armed_at", "queue_entry_id",
-              "queue_enqueued_at", "queue_removal", "merge_sha")
-    if not any(a.get("head_sha") == previous.get("head_sha")
-        and a.get("queue_removal") == previous["queue_removal"]
-        and merge_attempted(a) for a in previous.get("merge_attempts", [])):
+    history = list(previous.get("merge_attempts", []))
+    index = next((i for i, a in enumerate(history) if a.get("head_sha") == previous.get("head_sha")
+        and a.get("queue_removal") == previous["queue_removal"] and merge_attempted(a)), None)
+    if index is None:
       raise HTTPException(409, "The removed attempt must retain its immutable history.")
-    for field in (*fields, "queue_receipt_unconfirmed", "reviewed_base_sha", "independent_receipt_id", "scope", "tests", "tests_passed"):
+    # A settlement observed after the removal snapshot (head_moved, pr_merged)
+    # answers only for the predecessor. Archive it with that attempt: left
+    # active, merge_settled would hide the successor's own later attempt.
+    settlement = {k: previous[k] for k in ("head_moved", "pr_merged") if k in previous}
+    if settlement:
+      history[index] = {**settlement, **history[index]}
+      outcome["merge_attempts"] = history
+    for field in ("head_sha", "merge_attempted", "merge_armed_at", "queue_entry_id", "queue_enqueued_at",
+                  "queue_receipt_unconfirmed", "queue_removal", "merge_sha", "head_moved", "pr_merged"):
       outcome.pop(field, None)
   for field in ("base_advance", "checkout", "reviewed_base_sha", "independent_receipt_id", "scope", "tests", "tests_passed", "next_step"):
     outcome.pop(field, None)
@@ -1290,6 +1301,11 @@ def confirmed_queue_removal(gh, cwd, target, previous, *, unavailable_marker=Non
   if (not previous.get("queue_entry_id") or previous.get("queue_receipt_unconfirmed")
       or previous.get("head_sha") != target["head_sha"]):
     return None
+  if previous.get("queue_enqueued_at") is None and not dispatch_window_closed(
+      previous.get("merge_armed_at"), time.time()):
+    # A legacy receipt has no provenance: the uncertain request it may stand
+    # for could still admit the head until its dispatch window has closed.
+    return None
   query = """query($id:ID!){node(id:$id){... on PullRequest {
     id headRefOid state merged mergeQueueEntry{id}
     timelineItems(last:100,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){
@@ -1340,6 +1356,13 @@ def confirmed_queue_removal(gh, cwd, target, previous, *, unavailable_marker=Non
       "enqueued_at": added["createdAt"], "removed_event_id": removed["id"],
       "removed_at": removed["createdAt"]}
     if previous.get("queue_removal") not in (None, proof):
+      return None
+    # A queue merge also emits a removal event, and state/merged above can lag
+    # it briefly. A base that already contains the head may be that merge.
+    # (Squash/rebase groups rewrite the head; each action boundary re-reads merged.)
+    compare = read(gh, cwd, f"repos/{target['repo']}/compare/"
+      f"{quote(target['base_ref'], safe='/')}...{target['head_sha']}")
+    if not isinstance(compare, dict) or compare.get("status") not in {"ahead", "diverged"}:
       return None
     return proof
   except (subprocess.SubprocessError, OSError, json.JSONDecodeError, ContributionSubmitError):

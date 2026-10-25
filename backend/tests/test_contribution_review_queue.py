@@ -2,6 +2,7 @@
 import asyncio
 import json
 import subprocess
+import time
 from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
@@ -41,10 +42,14 @@ def queue_timeline():
          "reason": "failed_checks token=PRIVATE ghp_do_not_disclose"}]}}
 
 
-def queue_graphql(monkeypatch, node):
+def queue_graphql(monkeypatch, node, compare=None):
   """Schema fake for only the read-only fields these routes actually request."""
   calls = []
   def gh(cwd, *args):
+    if args[:1] == ("api",) and len(args) == 2:
+      # The base-containment read: the base branch does not contain the head.
+      assert args[1] == f"repos/example/project/compare/main...{SHA}"
+      return SimpleNamespace(stdout=json.dumps(compare or {"status": "diverged"}))
     query = next(a[len("query="):] for a in args if a.startswith("query="))
     assert query.startswith("query(") and "mutation" not in query
     assert f"id={TARGET['pr_id']}" in args
@@ -65,12 +70,18 @@ def saved_queue_receipt(**changes):
     "queue_entry_id": "entry-1", "queue_enqueued_at": QUEUE_TIME, **changes}
 
 
+def loaded_before_window(monkeypatch):
+  """This process loaded after any legacy receipt's dispatch window closed."""
+  monkeypatch.setattr(domain, "_LOADED_AT", time.time() - 2 * domain.MERGE_DISPATCH_WINDOW_SECONDS)
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_confirmed_queue_removal_uses_admission_not_synthetic_commit(monkeypatch, legacy):
   gh, calls = queue_graphql(monkeypatch, queue_timeline())
   previous = saved_queue_receipt()
   if legacy:
     previous.pop("queue_enqueued_at")
+    loaded_before_window(monkeypatch)
   proof = domain.confirmed_queue_removal(gh, "/tmp", TARGET, previous)
   assert proof == {"queue_entry_id": "entry-1", "head_sha": SHA,
     "added_event_id": "added-1", "enqueued_at": QUEUE_TIME,
@@ -98,6 +109,7 @@ def test_removal_proof_fails_closed(monkeypatch, case):
   elif case == "stale": previous["queue_enqueued_at"] = "2026-10-07T20:00:00Z"
   elif case == "ambiguous_legacy":
     previous.pop("queue_enqueued_at")
+    loaded_before_window(monkeypatch)
     events.extend(later)
   elif case == "readded": events.extend(later[:1])
   elif case == "unordered": events.reverse()
@@ -245,13 +257,53 @@ def test_queue_removal_exemption_belongs_only_to_its_own_grant(setup):
   db, row, principal = setup
   evidence = saved_queue_receipt(state="needs_you", queue_removal={"removed_event_id": "proof"})
   domain.save_outcome(db, row, domain.key(TARGET), evidence)
-  domain.require_public_transition_clear(db, row, TARGET)
+  domain.require_public_transition_clear(db, row, TARGET, repair=True)
   row.options_json = {}
   db.commit()
   peer = overlapping_grant(db, row)
   domain.save_outcome(db, peer, domain.key(TARGET), evidence)
   with pytest.raises(HTTPException, match="earlier public attempt"):
-    domain.require_public_transition_clear(db, row, TARGET)
+    domain.require_public_transition_clear(db, row, TARGET, repair=True)
+
+
+def test_queue_removal_exemption_is_only_the_exact_items_own_repair(setup):
+  db, row, _ = setup
+  removed = {**TARGET, "head_repo": "example/project", "head_repo_id": 11, "head_ref": "topic"}
+  sibling = {**removed, "number": 8, "pr_id": "PR_8", "base_ref": "release"}
+  row.targets_json = [removed, sibling]
+  db.commit()
+  # The removed PR was re-enqueued externally; observation kept its old proof.
+  domain.save_outcome(db, row, domain.key(removed), saved_queue_receipt(
+    queue_removal={"removed_event_id": "proof"}))
+  domain.require_public_transition_clear(db, row, removed, repair=True)
+  # A repair of another PR on the same branch never re-proves that removal.
+  with pytest.raises(HTTPException, match="earlier public attempt"):
+    domain.require_public_transition_clear(db, row, sibling, repair=True)
+  # Readiness, merge and other non-repair actions stay fenced on the removed head.
+  with pytest.raises(HTTPException, match="earlier public attempt"):
+    domain.require_public_transition_clear(db, row, removed)
+
+
+def test_legacy_receipt_inside_its_dispatch_window_is_not_removal_proof(monkeypatch):
+  # Main's observational shape: an entry seen after an uncertain request,
+  # saved without an admission time or any provenance marker.
+  legacy = {"state": "queued", "head_sha": SHA, "merge_attempted": True, "queue_entry_id": "entry-1"}
+  gh, calls = queue_graphql(monkeypatch, queue_timeline())
+  monkeypatch.setattr(domain, "_LOADED_AT", time.time())
+  assert domain.confirmed_queue_removal(gh, "/tmp", TARGET, legacy) is None
+  armed_now = {**legacy, "merge_armed_at": domain.utc_now_iso()}
+  loaded_before_window(monkeypatch)
+  assert domain.confirmed_queue_removal(gh, "/tmp", TARGET, armed_now) is None
+  assert calls == []
+  assert domain.confirmed_queue_removal(gh, "/tmp", TARGET, legacy)["removed_event_id"] == "removed-1"
+
+
+@pytest.mark.parametrize("compare,proven", [({"status": "behind"}, False), ({"status": "identical"}, False),
+  ({}, False), ({"status": "ahead"}, True), ({"status": "diverged"}, True)])
+def test_removal_requires_base_not_to_contain_the_head(monkeypatch, compare, proven):
+  # A merge emits the same removal event; its merged flag can briefly lag.
+  gh, _ = queue_graphql(monkeypatch, queue_timeline(), compare)
+  assert bool(domain.confirmed_queue_removal(gh, "/tmp", TARGET, saved_queue_receipt())) is proven
 
 
 def test_private_write_after_removal_keeps_queue_receipt_and_history(setup):

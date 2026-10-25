@@ -187,6 +187,11 @@ After confirmed removal, use the same owning takeover grant to prepare a
 head/base review and passing tests. Never requeue or merge the removed head,
 even through a different grant. Immutable historical receipts prevent replay.
 Observe, prepare, and final push each recheck that the earlier admission is
-removed and no active external queue entry has appeared.
+removed, no active external queue entry has appeared, and the target base does
+not already contain the head (a queue merge also records a removal). The
+removal exempts only that item's own repair: readiness or merge on the removed
+head, and repairs of other PRs sharing its branch, stay fenced. A receipt saved
+before admission times were recorded counts only once its one-hour dispatch
+window has closed.
 
 A lost-response enqueue later observed in the queue is marked `queue_receipt_unconfirmed`: the observed entry cannot prove it belongs to that lost request. Even if it has `enqueuedAt`, later removal does not authorize automatic successor repair for that receipt. Keep the uncertain grant fenced and resolve it in its owning conversation; do not retry the removed head.

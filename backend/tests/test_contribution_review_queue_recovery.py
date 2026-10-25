@@ -12,7 +12,7 @@ from app.deps import Principal
 from app.chat_writer import create_chat
 from tests.test_contribution_review_runs import setup, ITEM, TARGET, SHA, BASE, REPO, PULL, CHECKS, report
 from tests.test_contribution_review_workflows import takeover, configure_repair, publish_body, checkout_body, overlapping_grant, NEW
-from tests.test_contribution_review_queue import queue_timeline, saved_queue_receipt, queue_graphql, QUEUE_TIME, REMOVED_TIME
+from tests.test_contribution_review_queue import queue_timeline, saved_queue_receipt, queue_graphql, loaded_before_window, QUEUE_TIME, REMOVED_TIME
 CURRENT_PULL = domain.current_pull
 
 
@@ -23,6 +23,8 @@ def removed_takeover(setup, monkeypatch, *, legacy=False):
   def read_live(gh, cwd, endpoint):
     if endpoint == "user": return {"id": 42}
     if endpoint == "repos/example/project": return REPO
+    if endpoint == f"repos/example/project/compare/main...{SHA}":
+      return {"status": "diverged"}  # The base does not contain the removed head.
     if endpoint.startswith("repos/example/project/compare/"):
       # The live head never contains an unconfirmed repair push.
       return {"status": "behind", "behind_by": 1}
@@ -39,6 +41,7 @@ def removed_takeover(setup, monkeypatch, *, legacy=False):
       "review_run_id": "original-independent-run", "state": "all_clear", "tests_passed": True}])
   if legacy:
     saved.pop("queue_enqueued_at")
+    loaded_before_window(monkeypatch)
   domain.save_outcome(db, row, domain.key(ITEM), saved)
   monkeypatch.setattr(domain, "enqueue", lambda *a: pytest.fail("same-head enqueue"))
   monkeypatch.setattr(domain, "perform_merge", lambda *a: pytest.fail("same-head merge"))
@@ -260,3 +263,31 @@ def test_archived_removed_head_cannot_merge_under_another_grant_after_claim_rele
   db.commit()
   item = report((db, second, principal))["run"]["items"][0]
   assert item["state"] == "needs_you" and item["review_selection_id"] == row.id
+
+
+def test_successor_never_inherits_the_predecessors_settlement(setup, monkeypatch):
+  db, row, principal, node = prepare_removed(setup, monkeypatch)
+  # Removed H, then observed at external head K after the dispatch window.
+  loaded_before_window(monkeypatch)
+  node["headRefOid"] = "f" * 40
+  moved = observe_removed(db, row, principal)
+  assert moved["head_moved"]["attempted_head_sha"] == SHA and moved["queue_removal"]
+  node["headRefOid"] = SHA  # The author restored H; the removal proof still holds.
+  def push(*a, before_push=None):
+    before_push()
+    return DispatchResult.confirmed({})
+  monkeypatch.setattr(repairs, "push_repair", push)
+  item = asyncio.run(routes.publish_repair(1, row.id, publish_body(), db, principal))["run"]["items"][0]
+  saved = row.outcomes_json[domain.key(ITEM)]
+  assert item["head_sha"] == NEW and item["state"] == "reviewing"
+  assert not {"head_moved", "pr_merged", "queue_removal", "merge_attempted"}.intersection(saved)
+  # The settlement stays archived with the predecessor attempt it answers.
+  assert saved["merge_attempts"][0]["head_moved"] == moved["head_moved"]
+  assert saved["merge_attempts"][0]["head_sha"] == SHA
+  # The successor's own later uncertain merge stays observed and fenced.
+  successor = {**saved, "state": "merge_unknown", "merge_attempted": True}
+  assert domain._cas_outcome(db, row, domain.key(ITEM), successor)
+  assert domain.merge_pending(successor)
+  peer = overlapping_grant(db, row)
+  with pytest.raises(HTTPException, match="earlier public attempt"):
+    domain.require_public_transition_clear(db, peer, peer.targets_json[0])
