@@ -1736,8 +1736,9 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(plan),
     }),
-    conflictResolverChat: () => apiFetch('/platform/conflict-resolver-chat', {
+    conflictResolverChat: (body) => apiFetch('/platform/conflict-resolver-chat', {
       method: 'POST',
+      ...(body ? { body: JSON.stringify(body) } : {}),
     }),
     restart: () => apiFetch('/platform/restart', { method: 'POST' }),
   },

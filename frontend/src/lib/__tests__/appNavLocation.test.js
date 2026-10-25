@@ -7,6 +7,7 @@ import {
   validNavLocationText,
 } from '../appNavLocation.js'
 import {
+  appNavLocationStore,
   clearAppNavLocation,
   clearAppNavLocations,
   readAppNavLocation,
@@ -114,4 +115,15 @@ test('only explicit null and undefined clear a location', () => {
   assert.equal(encodeNavLocation(null), null)
   assert.equal(encodeNavLocation(undefined), null)
   assert.throws(() => encodeNavLocation({ toJSON: () => null }), TypeError)
+})
+
+test('an embedded transcript view neither restores nor overwrites the shell place', () => {
+  const store = memoryStore()
+  appNavLocationStore(true, store).write(1, 'nonce-a', '{"view":"owner"}')
+  assert.equal(appNavLocationStore(true, store).read(1, 'nonce-a'), '{"view":"owner"}')
+  const transcript = appNavLocationStore(false, store)
+  assert.equal(transcript.read(1, 'nonce-a'), null)
+  transcript.write(1, 'nonce-a', '{"view":"transcript"}')
+  transcript.write(1, 'nonce-a', null)
+  assert.equal(readAppNavLocation(1, 'nonce-a', store), '{"view":"owner"}')
 })

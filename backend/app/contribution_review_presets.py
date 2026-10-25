@@ -97,7 +97,11 @@ def resolve_options(db, options: dict | None = None, *, choice: dict | None = No
     if len(encoded) > MAX_PROMPT_BYTES:
       raise ValueError(f"{key} exceeds {MAX_PROMPT_BYTES} UTF-8 bytes")
     resolved[key] = value
-  if mode != "review_fix_merge" and ("fix_prompt" in options or "max_rounds" in options):
+  # review/review_merge accept the no-op values main always accepted (the
+  # Contribute app sends max_rounds: null); they are never frozen.
+  if mode != "review_fix_merge" and (
+      ("fix_prompt" in options and options["fix_prompt"] != FIX_PROMPT)
+      or options.get("max_rounds") is not None):
     raise ValueError("fix_prompt and max_rounds are not supported outside review_fix_merge mode")
   max_rounds = options.get("max_rounds") if mode == "review_fix_merge" else None
   if max_rounds is not None and (type(max_rounds) is not int or max_rounds < 1):

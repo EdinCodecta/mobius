@@ -6,6 +6,9 @@ An ambiguous merge receipt is never retried: reconcile read-only or ask the owne
 """
 import json
 import re
+import subprocess
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -126,6 +129,84 @@ def current_pull(gh, cwd, target):
         or pull.get("head", {}).get("ref") != target["head_ref"]))):
     raise HTTPException(409, "This pull request no longer matches the approved selection.")
   return repo, pull
+
+
+def selected_pull(gh, cwd, target):
+  """Read the selected PR by repository id and node id, even after its head moved.
+
+  current_pull refuses a moved head, but facts the same PR proves about itself
+  still hold. A failed read or another PR proves nothing (None).
+  """
+  try:
+    repo = read(gh, cwd, f"repos/{target['repo']}")
+    pull = read(gh, cwd, f"repos/{target['repo']}/pulls/{target['number']}")
+  except (HTTPException, ContributionSubmitError, OSError, ValueError, subprocess.SubprocessError):
+    return None
+  if repo.get("id") != target["repo_id"] or pull.get("node_id") != target["pr_id"]:
+    return None
+  return pull
+
+
+# How long after arm_merge a request issued for that attempt might still be
+# evaluated by GitHub. In process, dispatch is at most two sequential gh calls
+# (the final base read, then the merge or enqueue request), each killed at
+# SUBMIT_TIMEOUT_SECONDS (90 s); GitHub ends any API request that takes over
+# 10 s to process. A crash can orphan the gh child past that timeout, but its
+# request can reach GitHub only while the kernel still retransmits it, which
+# Linux abandons after about 15 minutes by default. An hour covers both.
+MERGE_DISPATCH_WINDOW_SECONDS = 3600
+# Every attempt armed by this code records merge_armed_at. An attempt without
+# it was armed by an older build, so before this single-worker process loaded.
+_LOADED_AT = time.time()
+
+
+def merge_dispatch_closed(item, read_at: float) -> bool:
+  """Whether a read started at ``read_at`` follows every possible evaluation
+  of the requests armed for this attempt."""
+  try:
+    armed_at = datetime.fromisoformat(item["merge_armed_at"].replace("Z", "+00:00")).timestamp()
+  except (KeyError, AttributeError, TypeError, ValueError):
+    armed_at = _LOADED_AT
+  return read_at >= armed_at + MERGE_DISPATCH_WINDOW_SECONDS
+
+
+def moved_head_fact(target, previous, pull, read_at: float):
+  """Settle a merge attempt at an old head from the same PR's later state.
+
+  ``read_at`` is when the read of ``pull`` started. A merge at a later head
+  ends the attempt at any time. Otherwise a moved head alone proves nothing:
+  both dispatch paths pin the attempted head (REST ``sha``, GraphQL
+  ``expectedHeadOid``), but that is an equality check. If the head returns to
+  it while a request is still in flight, that request can still land. So an
+  open, unmerged PR at another head settles the attempt only when read after
+  ``merge_dispatch_closed``: GitHub then has evaluated or dropped every request
+  issued for it. One evaluated at the attempted head merged the PR, which this
+  read would show, or queued it, and a push removes a PR from its merge queue.
+  A closed, unmerged PR proves nothing: it can be reopened at the attempted
+  head. The receipt fields stay as audit history, and ``merge_attempted``
+  still forbids replaying that head.
+  """
+  attempted = target["head_sha"]
+  head_sha = (pull.get("head") or {}).get("sha")
+  if previous.get("head_sha") != attempted or not isinstance(head_sha, str) or head_sha == attempted:
+    return None
+  if pull.get("merged") is True:
+    return {"state": "needs_you", "pr_merged": {"head_sha": head_sha,
+      "merge_commit_sha": pull.get("merge_commit_sha"), "merged_at": pull.get("merged_at")},
+      "summary": "The pull request was merged at a later head. The earlier attempt can no longer land and was not repeated."}
+  if (pull.get("state") != "open" or pull.get("merged") is not False
+      or not merge_dispatch_closed(previous, read_at)):
+    return None
+  return {"state": "needs_you", "head_moved": {"attempted_head_sha": attempted,
+    "attempt_state": previous.get("state"), "head_sha": head_sha},
+    "summary": ("The pull request moved to a new head after the earlier merge or queue request, "
+                "which GitHub accepts only for the head it named, and that request can no longer "
+                "be processed. It was not repeated. Review the new head before any merge.")}
+
+
+def merge_settled(item) -> bool:
+  """A saved attempt the same PR later proved can no longer land."""
+  return bool(item.get("pr_merged") or item.get("head_moved"))
 
 
 def merge_blocker(target, repo, pull, pr) -> str | None:
@@ -257,7 +338,7 @@ def require_public_transition_clear(db, row, target):
   for grant in grants:
     for original in grant.targets_json:
       item = (grant.outcomes_json or {}).get(key(original), {})
-      merge_pending = item.get("state") != "merged" and (
+      merge_pending = item.get("state") != "merged" and not merge_settled(item) and (
         item.get("merge_attempted") or item.get("state") in {"merging", "merge_unknown", "queued"})
       repair_pending = any(a.get("state") in {"pushing", "push_unknown"}
         for a in item.get("repair_attempts", []))
@@ -307,6 +388,38 @@ def reserve_public_work(db, row, principal, work_key, summary, action):
   return claim
 
 
+def release_if_acquired(db, row, claim):
+  """Release a claim this admission newly acquired for an effect it did not start.
+
+  An earlier saved attempt already owns the exact effect. ``claimed`` means
+  the claim was free (absent or released) before this call, so it backs no
+  attempt; ``owned`` means this chat already held it, possibly for that
+  saved attempt, so it is kept.
+  """
+  if claim["state"] == "claimed":
+    agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
+      work_key=claim["work_key"], outcome="An earlier saved attempt owns this action; no attempt started.",
+      release=True)
+
+
+@contextmanager
+def released_on_refusal(db, row, claim):
+  """A refused admission leaves no claim held without a saved attempt.
+
+  Inside this block the caller holds the owner-row fence and has already
+  checked every grant for a saved attempt on this work key, so the claim
+  protects nothing yet. A peer must not see it as held work.
+  """
+  try:
+    yield
+  except HTTPException:
+    db.rollback()
+    agent_work_claims.finish_work(db, owner_id=row.owner_id, chat_id=row.chat_id,
+      work_key=claim["work_key"], outcome="Public admission was refused; no attempt started.",
+      release=True)
+    raise
+
+
 def arm_merge(db, row, target, outcome, principal):
   """Reserve one exact public attempt across grants as well as within a grant.
 
@@ -341,27 +454,60 @@ def arm_merge(db, row, target, outcome, principal):
               "review_selection_id": previous.id,
               "summary": "An earlier review already attempted this exact merge. Follow its saved result; no request was repeated."}
     db.rollback()
+    release_if_acquired(db, row, claim)
     return result
-  require_public_transition_clear(db, row, target)
-  # Claim acquisition may have admitted new reviewer/other-action receipts.
-  # Carry forward those current audit lists, not the preflight's older copy.
-  review_fields = ("summary", "scope", "tests", "tests_passed", "reviewed_base_sha",
-    "independent_receipt_id", "head_sha", "review_chat_id", "review_run_id")
-  armed = {**row.outcomes_json.get(item_key, {}),
-    **{k: outcome[k] for k in review_fields if k in outcome},
-    "state": "merging", "merge_attempted": True}
-  save_outcome(db, row, item_key, armed)
+  with released_on_refusal(db, row, claim):
+    require_public_transition_clear(db, row, target)
+    # Claim acquisition may have admitted new reviewer/other-action receipts.
+    # Carry forward those current audit lists, not the preflight's older copy.
+    review_fields = ("summary", "scope", "tests", "tests_passed", "reviewed_base_sha",
+      "independent_receipt_id", "head_sha", "review_chat_id", "review_run_id")
+    armed = {**row.outcomes_json.get(item_key, {}),
+      **{k: outcome[k] for k in review_fields if k in outcome},
+      "state": "merging", "merge_attempted": True,
+      "merge_armed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+    save_outcome(db, row, item_key, armed)
   return None
 
 
-def write_outcome(db, row, item_key, outcome):
-  """CAS an outcome inside the caller's admission transaction; do not commit."""
-  if not _cas_outcome(db, row, item_key, outcome, commit=False):
+def merge_pending(outcome) -> bool:
+  return not merge_settled(outcome) and (outcome.get("merge_attempted") is True or outcome.get("state") in {
+    "merging", "merge_unknown", "queued", "merged"})
+
+
+def keeps_public_receipts(current, outcome) -> bool:
+  """Only a remote-effect settlement may change an existing public receipt.
+
+  Admission and private writes may append a repair attempt. One built from an
+  older snapshot must not drop a repair arm, successor or live merge that
+  another writer saved before this row was refreshed.
+  """
+  saved = current.get("repair_attempts") or []
+  if (outcome.get("repair_attempts") or [])[:len(saved)] != saved:
+    return False
+  if "successor" in current and outcome.get("successor") != current["successor"]:
+    return False
+  return not merge_pending(current) or all(outcome.get(k) == current.get(k)
+    for k in ("state", "merge_attempted", "queue_entry_id", "merge_sha"))
+
+
+def write_outcome(db, row, item_key, outcome, *, expected=None):
+  """CAS an outcome inside the caller's admission transaction; do not commit.
+
+  ``expected`` is the item the outcome was built from. Pass it whenever the
+  row was refreshed after that read: the revision CAS alone then cannot see
+  a concurrent change.
+  """
+  current = (row.outcomes_json or {}).get(item_key, {})
+  if ((expected is not None and current != expected)
+      or not keeps_public_receipts(current, outcome)
+      or not _cas_outcome(db, row, item_key, outcome, commit=False)):
+    db.rollback()
     raise HTTPException(409, "This review changed. Refresh before continuing.")
 
 
-def save_outcome(db, row, item_key, outcome):
-  write_outcome(db, row, item_key, outcome)
+def save_outcome(db, row, item_key, outcome, *, expected=None):
+  write_outcome(db, row, item_key, outcome, expected=expected)
   db.commit()
   db.refresh(row)
 
@@ -383,7 +529,7 @@ def view(row):
       return {**outcome, "state": "marking_ready"}
     return outcome
   projected_items = [projected(t) for t in row.targets_json]
-  states = [item["state"] for item in projected_items]
+  states = [item.get("state", "reviewing") for item in projected_items]
   state = ("needs_you" if any(s in {"needs_you", "merge_unknown", "ready_unknown", "ready_unattributable"} for s in states)
            else "complete" if all(s in {"all_clear", "merged"} for s in states)
            else "queued" if all(s in {"queued", "merged", "all_clear"} for s in states)
@@ -393,13 +539,20 @@ def view(row):
            else "reviewing")
   if any((outcomes.get(key(t), {}).get("public_review") or {}).get("state") in {"posting", "unknown", "not_dispatched"} for t in row.targets_json):
     state = "needs_you"
+  views = []
+  for t, item in zip(row.targets_json, projected_items):
+    try:
+      current = effective_target(row, t)
+      version = {"work_key": merge_work_key(current), "current_base_sha": current["base_sha"]}
+    except HTTPException as exc:
+      # One ambiguous receipt chain needs the owner; it must not hide the run.
+      version, state = {"receipt_blocker": str(exc.detail)}, "needs_you"
+    views.append({**t, "approved_head_sha": t["head_sha"], "approved_base_sha": t["base_sha"],
+                  **version, **item})
   return {"id": row.id, "request_id": row.request_id, "mode": row.mode,
           "chat_id": row.chat_id, "source_chat_id": row.chat_id, "app_id": row.app_id, "state": state,
           "options": row.options_json,
-          "created_at": row.created_at.isoformat() + "Z",
-          "items": [{**t, "approved_head_sha": t["head_sha"], "approved_base_sha": t["base_sha"],
-                     "work_key": merge_work_key(effective_target(row, t)), "current_base_sha": effective_target(row,t)["base_sha"], **item}
-                    for t, item in zip(row.targets_json, projected_items)]}
+          "created_at": row.created_at.isoformat() + "Z", "items": views}
 
 
 def brief(row):
@@ -417,14 +570,11 @@ def brief(row):
     "preview/approval is needed for the new programmatic reviewer workflow."
   )
   public_note = (
-    "The owner chose to post each verdict on GitHub: after you report an item, "
-    "the guarded outcome endpoint (not you) posts your summary and tests as one "
-    "public comment review on that exact head. Write the summary for the PR "
-    "author: concrete findings with file references. Keep any question meant "
-    "only for the owner in this conversation, not in the summary. "
-    "Explicitly send publish:true only for the deliberate public verdict; "
-    "publish:false is the private default for owner questions and blocked verification. "
-    "Evidence freezes once dispatch is armed; identical retry is read-only.\n"
+    "The owner explicitly opted into one public COMMENT review per head. "
+    "Set publish:true only for a deliberate public verdict in /outcomes; the server posts it, never a raw mutation. "
+    "Owner questions and blocked work use publish:false (the default) and stay private. "
+    "Evidence freezes once dispatch is armed; identical retry is read-only. "
+    "Keep owner-only questions and private data out of public evidence.\n"
     if frozen.get("post_review") is True else ""
   )
   opener = ("Review this exact selected public PR batch and report privately unless you publish a verdict."
@@ -586,7 +736,8 @@ def require_independent_clear(row, target, body):
     latest = next((r for r in reversed(outcome.get("independent_reviews", []))
       if r.get("delegation_id") == receipt.get("delegation_id")), None)
     if latest is not receipt:
-      raise HTTPException(422, "A fresh independent reviewer is required after changed review evidence.")
+      raise HTTPException(422, "This reviewer's later verdict supersedes that receipt. A new repair "
+                          "(a new head), a target-base advance or a new owner grant is required.")
   if (not receipt or receipt.get("head_sha") != target["head_sha"]
       or receipt.get("base_sha") != target["base_sha"]
       or receipt.get("state") != "all_clear" or receipt.get("tests_passed") is not True):
@@ -640,6 +791,10 @@ For each exact head obtain a fresh read-only durable independent child review of
 the FULL diff, six-scope rubric and tests against the exact current target base.
 Start that reviewer via POST {endpoint}/reviewers with repo, number, head_sha.
 The server freezes its prompt/provider/model/effort and durable child identity.
+Each exact head and base admits ONE reviewer and one verdict; /reviewers returns
+that same reviewer again, so its needs_you verdict cannot be replaced by asking
+another. Continue only through a new repair (a new head), an observed target-base
+advance, or a new owner grant.
 The child must POST {endpoint}/independent-reviews with repo, number, head_sha,
 reviewed_base_sha, state, summary, scope, tests and tests_passed using its own
 run bearer. This produces an independent_receipt_id. A repair author must never
@@ -660,13 +815,11 @@ that old run's /observe endpoint for read-only reconciliation against GitHub.
 If the exact
 effect cannot be proved or disproved, ask the owner for supervised recovery;
 elapsed time, a closed PR, or an unchanged projection never releases the receipt.
-Autopilot is unsupported: perform only the requested immediate step and hand off;
-never schedule an automatic review Wait.
+Autopilot is unsupported: perform only the requested immediate step and hand off,
+rather than starting unattended follow-up turns. This never broadens mutation consent.
 When an exact repair push is confirmed, finish its saved receipt work_key via
 finish_agent_work with release:false and the confirmed head outcome. Never
 finish another chat's claim.
-When autopilot is disabled perform the requested immediate step and hand off, rather than
-starting unattended follow-up turns. This flag never broadens mutation consent.
 {readiness_instruction}
 Then parent alone POST {endpoint}/outcomes with repo, number, exact head_sha,
 reviewed_base_sha, independent_receipt_id, state all_clear or needs_you, summary,
@@ -674,8 +827,9 @@ all six scope values, tests and tests_passed. The server alone checks live base,
 checks, permissions and attempts exact normal merge/queue using its durable fence.
 POST {endpoint}/observe is read-only GitHub reconciliation of saved attempts;
 it can run after Stop but never starts agents or repeats a push/merge.
-For pending checks or a queue use the EXISTING durable Wait capability, not a
-transient poll process or second queue. Observation cannot start a stopped run.
+For pending checks or a queue use this owning chat's EXISTING durable Wait
+capability; these routes create no automatic Wait. Never use a transient poll
+process or second queue. Observation cannot start a stopped run.
 Keep every step in this one owning chat and expose concrete blockers to the owner.
 Review rubric: correctness, maintainability, simplicity, tests, security_privacy,
 technical_debt. Public comments and reviews are NOT authorized by this grant.
@@ -704,16 +858,18 @@ def arm_repair(db, row, target, previous, receipt, principal):
         if (attempt.get("work_key") == work_key and attempt.get("state") in {"pushing", "push_unknown", "pushed"}):
           owner_chat_id, selection_id = grant.chat_id, grant.id
           db.rollback()
+          release_if_acquired(db, row, claim)
           db.refresh(row)
           summary = f"An earlier repair attempt is saved in owning chat {owner_chat_id}; it was not repeated."
           save_outcome(db, row, key(target), {**row.outcomes_json.get(key(target), {}),
             "state": "needs_you", "summary": summary, "review_chat_id": owner_chat_id,
             "review_selection_id": selection_id})
           return summary
-  require_public_transition_clear(db, row, target)
-  previous = row.outcomes_json.get(key(target), {})
-  save_outcome(db, row, key(target), {**previous, "state": "pushing",
-    "repair_attempts": [*previous.get("repair_attempts", []), {**receipt, "work_key": work_key}]})
+  with released_on_refusal(db, row, claim):
+    require_public_transition_clear(db, row, target)
+    previous = row.outcomes_json.get(key(target), {})
+    save_outcome(db, row, key(target), {**previous, "state": "pushing",
+      "repair_attempts": [*previous.get("repair_attempts", []), {**receipt, "work_key": work_key}]})
   return None
 
 
@@ -801,10 +957,17 @@ def save_effect_outcome(db, row, item_key, outcome):
 
   This is a CAS merge of one target slot, not a public retry. Read-only
   observation can race the dispatcher; never downgrade its confirmed merge.
+  ``outcome`` may be a function of the refreshed item, returning None when
+  its fact no longer applies, so a settlement never writes back a pre-I/O
+  snapshot (see ``settle_repair_attempt``).
   """
+  build = outcome if callable(outcome) else lambda _current: outcome
   for _ in range(4):
     db.refresh(row)
     current = (row.outcomes_json or {}).get(item_key, {})
+    outcome = build(current)
+    if outcome is None:
+      return
     if current.get("state") == "merged" and outcome.get("state") != "merged":
       return
     public_receipt = current.get("public_review") or {}
@@ -835,6 +998,45 @@ def save_effect_outcome(db, row, item_key, outcome):
     if _cas_outcome(db, row, item_key, outcome):
       return
   raise HTTPException(409, "The remote result could not be recorded after concurrent changes; observe this run.")
+
+
+def settle_merge_observation(db, row, item_key, observed, fact):
+  """Apply one read-only merge fact to the current item, never to a snapshot.
+
+  ``observed`` is the item the observer read before its GitHub reads. The
+  fact answers only for that reservation: once it was definitely disarmed
+  (and perhaps a repair armed) or the item moved to another head, the delayed
+  observation no longer applies. Otherwise only the fact's fields change, so
+  newer receipts and evidence survive.
+  """
+  def apply(current):
+    if not merge_pending(current) or current.get("head_sha") != observed.get("head_sha"):
+      return None
+    settled = {**current, **fact}
+    return None if settled == current else settled
+  save_effect_outcome(db, row, item_key, apply)
+
+
+def settle_repair_attempt(db, row, item_key, receipt, settle,
+                          *, pending=("pushing", "push_unknown")):
+  """Record one exact push fact on the current item, by immutable receipt identity.
+
+  A receipt's fields other than its state never change. A delayed observer or
+  dispatcher may hold an old snapshot while another worker confirms this push
+  and arms the next repair. ``settle(current, attempts, index)`` derives the
+  new item from the refreshed state, so later attempts, a confirmed successor
+  and unrelated evidence survive. A receipt no longer in ``pending`` was
+  already settled; it never regresses.
+  """
+  identity = {k: v for k, v in receipt.items() if k != "state"}
+  def apply(current):
+    attempts = list(current.get("repair_attempts") or [])
+    index = next((i for i, attempt in enumerate(attempts)
+                  if {k: v for k, v in attempt.items() if k != "state"} == identity), None)
+    if index is None or attempts[index].get("state") not in pending:
+      return None
+    return settle(current, attempts, index)
+  save_effect_outcome(db, row, item_key, apply)
 
 
 def draft_ready_allowed(row):
@@ -886,21 +1088,31 @@ def arm_ready(db, row, target, receipt, principal):
   ).populate_existing().first()
   if prior is not None:
     db.rollback()
+    release_if_acquired(db, row, claim)
     raise HTTPException(409, "An earlier draft readiness attempt is saved. Reconcile it read-only; do not repeat it.")
-  require_public_transition_clear(db, row, target)
-  save_ready_attempt(db, row, item_key, receipt)
+  with released_on_refusal(db, row, claim):
+    require_public_transition_clear(db, row, target)
+    save_ready_attempt(db, row, item_key, receipt)
 
 
 def save_ready_attempt(db, row, item_key, receipt):
-  """Keep the admission and each observed transition as immutable audit entries."""
-  previous = (row.outcomes_json or {}).get(item_key, {})
-  audit = list(previous.get("ready_audit") or [])
+  """Keep the admission and each observed transition as immutable audit entries.
+
+  An observed transition is derived from the refreshed item (see
+  ``save_effect_outcome``), so a delayed observer never writes back an older
+  snapshot over newer receipts and evidence.
+  """
   event = {"id": receipt.get("id"), "state": receipt["state"],
     "head_sha": receipt["head_sha"]}
-  if not audit or audit[-1] != event:
-    audit.append(event)
-  save = save_outcome if receipt["state"] == "attempting" else save_effect_outcome
-  save(db, row, item_key, {**previous, "ready_attempt": dict(receipt), "ready_audit": audit})
+  def apply(current):
+    audit = list(current.get("ready_audit") or [])
+    if not audit or audit[-1] != event:
+      audit.append(event)
+    return {**current, "ready_attempt": dict(receipt), "ready_audit": audit}
+  if receipt["state"] == "attempting":
+    save_outcome(db, row, item_key, apply((row.outcomes_json or {}).get(item_key, {})))
+  else:
+    save_effect_outcome(db, row, item_key, apply)
 
 
 def disarm_ready(db, row, target, receipt_id):

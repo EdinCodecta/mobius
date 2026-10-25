@@ -1116,7 +1116,15 @@ def _merged_upstream_sha(record: dict, repo: Path) -> str | None:
     candidate = str(value or "").strip().lower()
     if _GIT_SHA.fullmatch(candidate):
       return candidate
+  return github_merge_commit(record, repo)
 
+
+def github_merge_commit(record: dict, repo: Path) -> str | None:
+  """GitHub's merge commit for a merged pull request record, or None.
+
+  Asks GitHub rather than trusting the record's own SHA fields, as settling a
+  personal publication does (``routes.github._personal_merge_commit``).
+  """
   plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
   repo_slug = plan.get("repo") or record.get("repo")
   number = record.get("number")
@@ -1176,6 +1184,38 @@ def _mark_superseded_draft(
     return None
 
 
+def _record_merged_contribution(
+  record: dict, repo: Path, upstream_sha: str | None,
+) -> str | None:
+  """Hand the platform updater the exact bytes a merged contribution carried.
+
+  ``plan.head_sha`` is the reviewed head the pull request carried. The update
+  that brings ``upstream_sha`` retires each reviewed file whose live bytes
+  are still exactly that head's, whatever form the merged version took. Only
+  the live platform's updater reads these witnesses, so app contributions
+  record none.
+  """
+  platform = Path(get_settings().data_dir).resolve() / "platform"
+  plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+  number = record.get("number")
+  files = plan.get("files")
+  if (
+    repo.resolve() != platform or not upstream_sha
+    or not isinstance(number, int) or not isinstance(files, list)
+  ):
+    return None
+  try:
+    return app_git.record_merged_contribution(
+      repo, number=number,
+      repo_slug=str(plan.get("repo") or record.get("repo") or ""),
+      head_sha=str(plan.get("head_sha") or ""), merge_sha=upstream_sha,
+      paths=files, contribution_id=str(record.get("id") or ""),
+    )
+  except (OSError, subprocess.SubprocessError, RuntimeError):
+    log.warning("could not record a merged contribution", exc_info=True)
+    return None
+
+
 def _settle_equivalence(record: dict, upstream_sha: str | None = None) -> str | None:
   """Promote or discard the pending witness when GitHub settles the PR."""
   plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
@@ -1186,6 +1226,7 @@ def _settle_equivalence(record: dict, upstream_sha: str | None = None) -> str | 
   digest = str(plan.get("diff_sha256") or "")
   if record.get("status") == "merged":
     _mark_superseded_draft(record, repo, upstream_sha)
+    _record_merged_contribution(record, repo, upstream_sha)
     equivalent = app_git.mark_equivalent_change_landed(
       repo, digest, upstream_sha=upstream_sha,
     )

@@ -88,6 +88,8 @@ Private evidence fields accept up to 200,000 characters each. The public copy
 is bounded conservatively to 65,536 UTF-16 units with explicit omission
 markers; the full accepted private evidence is retained.
 
+For an opted-in public-review grant, `/outcomes` publishes only when the agent explicitly sends `publish: true` with a deliberate public verdict. Owner questions and blocked verification use `publish: false` (the default), remain private, and do not post. Once armed, verdict evidence is immutable. Another grant for the same PR/head cannot post while an earlier posting/unknown/posted receipt exists; open the named holding run and observe it read-only. Lists retain full findings and frozen prompts for the owning app or owner. Foreign rows remain privacy-minimized; any bounded navigation summary explicitly marks omitted text.
+
 ## Scoped repair and independently reviewed successors
 
 Use `preview --mode review_fix_merge` only when the owning chat explicitly
@@ -97,6 +99,11 @@ Read the run's returned brief. The parent alone calls `/repair-checkout` and
 `/repairs`; independent reviewers are admitted through `/reviewers`, inherit
 the parent's Goal, and report exact head/base evidence through
 `/independent-reviews`. A repair author cannot supply their independent review.
+Each exact head and base admits one reviewer and one verdict: `/reviewers`
+returns that same reviewer again and a second report is refused, so a
+needs_you verdict cannot be replaced by asking another reviewer. Continue only
+through a new repair (a new head), an observed target-base advance, or a new
+owner grant.
 
 Edit only the server-provided checkout and frozen file scope. Ordinary
 fast-forward commits and one merge of the fetched `refs/mobius/target-base`
@@ -160,6 +167,3 @@ new grants on other heads. An `attempting` receipt must first surface as
 unknown; an unsafe identity read cannot retire it. Readiness never authorizes
 merge using an old review. Unknown readiness remains visible and fences new
 public actions until that conservative observation succeeds.
-For an opted-in public-review grant, `/outcomes` publishes only when the agent explicitly sends `publish: true` with a deliberate public verdict. Owner questions and blocked verification use `publish: false` (the default), remain private, and do not post. Once armed, verdict evidence is immutable. Another grant for the same PR/head cannot post while an earlier posting/unknown/posted receipt exists; open the named holding run and observe it read-only. Lists retain full findings and frozen prompts for the owning app or owner. Foreign rows remain privacy-minimized; any bounded navigation summary explicitly marks omitted text.
-
-

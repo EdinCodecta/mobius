@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import logging
+import time
 import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -153,14 +154,23 @@ def _fingerprint(snapshot):
   return hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
+def _reject_takeover_options(mode, options):
+  """Only a takeover uses fix_prompt and max_rounds.
+
+  review/review_merge still accept main's no-op values (the Contribute app
+  always sends max_rounds: null); _options_input never freezes them there.
+  """
+  if mode != "review_fix_merge" and (options.fix_prompt not in (None, presets.FIX_PROMPT)
+                                     or options.max_rounds is not None):
+    raise HTTPException(422, "fix_prompt and max_rounds are not supported outside review_fix_merge mode")
+
+
 def _options_input(body):
   if body.options is None:
     return None
   options = body.options.model_dump(exclude_none=True, exclude_unset=True)
   mode = getattr(body, "mode", "review")
-  if mode != "review_fix_merge" and ("fix_prompt" in body.options.model_fields_set
-                                     or "max_rounds" in body.options.model_fields_set):
-    raise HTTPException(422, "fix_prompt and max_rounds are not supported outside review_fix_merge mode")
+  _reject_takeover_options(mode, body.options)
   if options.get("autopilot") is True:
     raise HTTPException(422, "autopilot is not supported by this review-only workflow")
   selected = {key: options[key] for key in presets.PROMPT_KEYS if key in options}
@@ -280,9 +290,8 @@ async def start_reviews(app_id: int | None, body: StartReviews,
         raise HTTPException(409, {"message": "This selection already belongs to another review conversation. Follow it instead of starting again.",
                                   "chat_id": row.chat_id, "run_id": row.id})
     else:
-      if body.options is not None and body.mode != "review_fix_merge" and (
-          body.options.fix_prompt is not None or "max_rounds" in body.options.model_fields_set):
-        raise HTTPException(422, "fix_prompt and max_rounds require review_fix_merge mode.")
+      if body.options is not None:
+        _reject_takeover_options(body.mode, body.options)
       if body.mode == "review_fix_merge" and not body.preview_sha256:
         raise HTTPException(422, "Preview and confirm the exact frozen takeover prompts/model before admission.")
       snapshot = _snapshot(db, body, principal)
@@ -433,17 +442,18 @@ def _frozen_model_matches(frozen, chat) -> bool:
 
 
 def _merge_attempted(outcome) -> bool:
-  return outcome.get("merge_attempted") is True or outcome.get("state") in {"merging", "merge_unknown", "queued", "merged"}
+  return reviews.merge_pending(outcome)
 
 
-async def _reconcile_merge(previous, target, pull, cwd):
+async def _observe_merge(target, pull, cwd):
+  """The merge fact GitHub shows now, as fields for settle_merge_observation."""
   if pull.get("merged"):
-    return {**previous, "state": "merged", "merge_sha": pull.get("merge_commit_sha")}
+    return {"state": "merged", "merge_sha": pull.get("merge_commit_sha")}
   checks = await asyncio.to_thread(reviews.pull_checks, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
   entry = reviews.queue_entry(checks, target)
   if entry:
-    return {**previous, "state": "queued", "queue_entry_id": entry["id"]}
-  return {**previous, "state": "merge_unknown", "summary":
+    return {"state": "queued", "queue_entry_id": entry["id"]}
+  return {"state": "merge_unknown", "summary":
     "The earlier merge or queue request is not confirmed. Check GitHub; it was not repeated."}
 
 
@@ -499,8 +509,8 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
     outcome = {**_reported_outcome(previous, body, row, principal),
                "independent_receipt_id": body.independent_receipt_id}
     if attempted:
-      outcome = await _reconcile_merge(previous, target, pull, cwd)
-      reviews.save_effect_outcome(db, row, item_key, outcome)
+      reviews.settle_merge_observation(db, row, item_key, previous,
+                                       await _observe_merge(target, pull, cwd))
       return {"run": _run_view(db, row)}
     if body.state == "all_clear" and row.mode == "review_fix_merge":
       try:
@@ -532,12 +542,11 @@ async def report_outcome(app_id: int | None, run_id: str, body: ReviewOutcome,
         and (previous.get("public_review") or {}).get("state") not in {"posting", "posted", "unknown"}):
       outcome = await post_public_review(db, row, item_key, target, outcome, principal, cwd,
         gh=_gh, authorize=lambda: _parent(db, row, principal))
-    if not outcome.get("merge_attempted") and not outcome.get("public_review"):
-      _parent(db, row, principal)
     if outcome.get("merge_attempted") or outcome.get("public_review"):
       reviews.save_effect_outcome(db, row, item_key, outcome)
     else:
-      reviews.save_outcome(db, row, item_key, outcome)
+      _parent(db, row, principal)
+      reviews.save_outcome(db, row, item_key, outcome, expected=previous)
     return {"run": _run_view(db, row)}
 
 
@@ -547,11 +556,17 @@ class ReviewPreview(BaseModel):
   options: ReviewOptions | None = None
 
 
+def _presets_view():
+  # One editor serves every advertised mode. The plain modes accept the
+  # takeover defaults unchanged, so the editor gets them all.
+  return {"presets": presets.presets(mode="review_fix_merge"), "capabilities": REVIEW_CAPABILITIES}
+
+
 @router.get(APP_PREFIX + "/{app_id}/review-presets")
 def review_presets(app_id: int, db: Session = Depends(get_db),
                    principal: Principal = Depends(get_principal)):
   _authorize_context(db, app_id, principal)
-  return {"presets": presets.presets(), "capabilities": REVIEW_CAPABILITIES}
+  return _presets_view()
 
 
 @router.post(APP_PREFIX + "/{app_id}/review-preview", dependencies=[Depends(reject_cross_site)])
@@ -662,7 +677,7 @@ def core_get_review(run_id: str, db: Session = Depends(get_db), principal: Princ
 @router.get("/api/github/review-presets")
 def core_review_presets(db: Session = Depends(get_db), principal: Principal = Depends(get_principal)):
   _authorize_context(db, None, principal)
-  return {"presets": presets.presets(), "capabilities": REVIEW_CAPABILITIES}
+  return _presets_view()
 
 
 @router.post("/api/github/review-preview", dependencies=[Depends(reject_cross_site)])
@@ -762,17 +777,19 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
         observed = await asyncio.to_thread(public.reconcile_review, _gh, cwd, original, receipt, row.github_actor_id)  # unsettled: read-only (public review receipt observation)
         reviews.save_effect_outcome(db, row, reviews.key(original), {**previous, "public_review": observed})
         continue
-      target = reviews.effective_target(row, original)
       pending = next((a for a in previous.get("repair_attempts", [])
                       if a.get("state") in {"pushing", "push_unknown"}), None)
       if pending:
-        if not await repair_actions.reconcile_push(db, row, original, previous, pending, gh=_gh, cwd=cwd):
-          repair_actions.escalate_unconfirmed_push(db, row, original, previous, pending)
+        if not await repair_actions.reconcile_push(db, row, original, pending, gh=_gh, cwd=cwd):
+          repair_actions.escalate_unconfirmed_push(db, row, original, pending)
           continue
         previous = row.outcomes_json[reviews.key(original)]
-      target = reviews.effective_target(row, original)
       attempt = previous.get("ready_attempt")
       if attempt and attempt.get("state") in {"attempting", "unknown"}:
+        try:
+          target = reviews.effective_target(row, original)
+        except HTTPException:
+          continue  # An ambiguous receipt chain needs the owner; observe the others.
         blocked = await _confirm_ready_attempt(target, cwd)
         if blocked:
           _escalate_unconfirmed_ready(db, row, reviews.key(original), previous, attempt)
@@ -780,18 +797,30 @@ async def observe_review(app_id: int | None, run_id: str, db: Session = Depends(
           continue
         reviews.save_ready_attempt(db, row, reviews.key(original), {**attempt, "state": "ready"})
         previous = row.outcomes_json[reviews.key(original)]
-      attempted = _merge_attempted(previous)
-      if not attempted:
+      if not _merge_attempted(previous):
         continue
       try:
+        target = reviews.effective_target(row, original)
+      except HTTPException:
+        continue  # An ambiguous receipt chain needs the owner; observe the others.
+      try:
         _repo, pull = await asyncio.to_thread(reviews.current_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
-        outcome = await _reconcile_merge(previous, target, pull, cwd)
+      except HTTPException:
+        # The selection no longer matches, but the same PR at a later head can
+        # prove the head-pinned attempt can no longer land (see moved_head_fact).
+        read_at = time.time()
+        pull = await asyncio.to_thread(reviews.selected_pull, _gh, cwd, target)  # unsettled: read-only (GitHub API reads)
+        fact = pull and reviews.moved_head_fact(target, previous, pull, read_at)
+        if fact:
+          reviews.settle_merge_observation(db, row, reviews.key(original), previous, fact)
+        continue
+      try:
+        fact = await _observe_merge(target, pull, cwd)
       except HTTPException:
         # A failed read proves no new fact; historical review evidence and the
         # exact public-attempt fence both remain intact.
         continue
-      if outcome != previous:
-        reviews.save_effect_outcome(db, row, reviews.key(original), outcome)
+      reviews.settle_merge_observation(db, row, reviews.key(original), previous, fact)
     return {"run": _run_view(db, row)}
 
 
@@ -830,13 +859,19 @@ def _assert_independent_reviewer(row, child, target):
 
 
 def _reviewer_root_allows_evidence(db, child):
-  """A durable reviewer belongs to its spawning work, not today's parent turn."""
+  """A durable reviewer belongs to its spawning work, not today's parent turn.
+
+  A Goal-owned reviewer follows its Goal: a chat Stop holds it. The Goal is
+  child.goal_id, or the legacy layout's overloaded parent_root_run_id.
+  """
+  from app.delegations import delegation_goal_id
   root_id = child.parent_root_run_id
-  goal = db.query(models.ChatGoal).populate_existing().filter_by(id=root_id).first()
-  if goal is not None:
-    return (goal.chat_id == child.parent_chat_id and goal.status == "open"
+  goal_id = delegation_goal_id(db, child)
+  if goal_id is not None:
+    goal = db.query(models.ChatGoal).populate_existing().filter_by(id=goal_id).first()
+    return (goal is not None and goal.chat_id == child.parent_chat_id and goal.status == "open"
       and db.query(models.ChatRun.id).filter_by(
-        chat_id=child.parent_chat_id, goal_id=root_id).first() is not None)
+        chat_id=child.parent_chat_id, goal_id=goal_id).first() is not None)
   root = db.query(models.ChatRun).populate_existing().filter_by(
     id=root_id, chat_id=child.parent_chat_id).first()
   if root is None:
@@ -906,7 +941,10 @@ async def independent_review(app_id: int | None, run_id: str, body: ReviewOutcom
         return {"independent_receipt_id": existing["id"], "run": _run_view(db, row)}
       if any(r.get("delegation_id") == child.id and r.get("head_sha") == body.head_sha
              and r.get("base_sha") == body.reviewed_base_sha for r in receipts):
-        raise HTTPException(409, "This reviewer delegation already reported on this head and base. Start a fresh independent reviewer.")
+        raise HTTPException(409, "This reviewer delegation already reported on this head and base. "
+          "Its verdict stands: each head and base admits one independent reviewer, and /reviewers "
+          "returns this same one. To continue, publish a new repair (a new head), observe a "
+          "target-base advance, or ask the owner for a new grant.")
       receipts.append(receipt)
       reviews.save_outcome(db, row, reviews.key(target), {**previous,
         "state": previous.get("state", "reviewing"), "independent_reviews": receipts})
@@ -963,7 +1001,8 @@ async def repair_checkout(app_id: int | None, run_id: str, body: RepairCheckout,
         checkout = {**previous["checkout"], "target_base_sha": await settled.run_settled(
           repairs.fetch_target_base, _gh, cwd, Path(previous["checkout"]["checkout"]), target)}
         _parent(db, row, principal)
-        reviews.save_outcome(db, row, reviews.key(target), {**previous, "checkout": checkout})
+        reviews.save_outcome(db, row, reviews.key(target), {**previous, "checkout": checkout},
+                             expected=previous)
         return {"checkout": checkout, "run": _run_view(db, row)}
       # Scope was frozen during admission, never supplied by an editing agent.
       allowed = target.get("allowed_files")
@@ -976,12 +1015,13 @@ async def repair_checkout(app_id: int | None, run_id: str, body: RepairCheckout,
         raise
       try:
         _parent(db, row, principal)
+        reviews.save_outcome(db, row, reviews.key(target), {**previous, "state": "repairing",
+          "checkout": checkout, "findings": body.findings, "head_sha": target["head_sha"]},
+          expected=previous)
       except HTTPException:
         # This newly created path has never owned a public receipt.
         await settled.run_settled(repairs.discard_checkout, checkout.get("checkout"))
         raise
-    reviews.save_outcome(db, row, reviews.key(target), {**previous, "state": "repairing",
-      "checkout": checkout, "findings": body.findings, "head_sha": target["head_sha"]})
     return {"checkout": checkout, "run": _run_view(db, row)}
 
 
@@ -1005,7 +1045,7 @@ async def publish_repair(app_id: int | None, run_id: str, body: RepairPublish,
                     and r.get("state") in {"pushing", "push_unknown", "pushed"}), None)
     cwd = Path(get_settings().data_dir) / "platform"
     if pending:
-      confirmed = await repair_actions.reconcile_push(db, row, original, previous, pending, gh=_gh, cwd=cwd)
+      confirmed = await repair_actions.reconcile_push(db, row, original, pending, gh=_gh, cwd=cwd)
       return {"run": _run_view(db, row), **({} if confirmed else {
         "blocked": "The earlier push is not confirmed. It was not repeated."})}
     target = _target(row, body)
@@ -1097,6 +1137,11 @@ async def start_independent_reviewer(app_id: int | None, run_id: str, body: Pull
           await ensure_delegation_started(db, existing, start_turn=start_programmatic_chat_turn)
           _parent(db, row, principal)
         return {"delegation": serialize_delegation(db, existing), "run": _run_view(db, row)}
+      # Registration resets the item to reviewing. That would hide a live merge
+      # from /observe and the cross-grant fence, or mask an unclear push.
+      if _merge_attempted(previous) or any(a.get("state") in {"pushing", "push_unknown"}
+                                           for a in previous.get("repair_attempts", [])):
+        raise HTTPException(409, "An earlier merge or push for this item must be reconciled before a new reviewer starts.")
       root_id = parent_root_run_id(db, row.chat_id, require_active=True)
       if not root_id:
         raise HTTPException(409, "The owning review stopped before reviewer admission.")

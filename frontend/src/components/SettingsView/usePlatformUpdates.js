@@ -297,16 +297,30 @@ export default function usePlatformUpdates({ active, refreshToken, onOpenChat })
     finally { pending.current = false; setPhase('idle') }
   }
 
+  // A stalled resolver gets a new turn in its chat, or a new chat when it is gone.
+  async function resume() {
+    if (pending.current || busy) return
+    pending.current = true
+    setPhase('resolving'); setError('')
+    try {
+      const body = await responseBody(await api.platform.conflictResolverChat({ resume: true }))
+      await refreshPlatform()
+      if (body?.chat_id && onOpenChat) onOpenChat(body.chat_id)
+    } catch (cause) { setError(cause.message || 'Could not resume this update.') }
+    finally { pending.current = false; setPhase('idle') }
+  }
+
   // Until an update is swapped in the live source is untouched, so dropping it
   // is always safe; it is the exit from a resolver that cannot finish.
   async function cancel() {
-    if (pending.current || busy) return
+    if (pending.current || busy) return false
     pending.current = true
     setPhase('cancelling'); setError('')
     try {
       await responseBody(await api.platform.cancelUnfinishedUpdate())
       await refreshPlatform()
-    } catch (cause) { setError(cause.message || 'Could not cancel this update.') }
+      return true
+    } catch (cause) { setError(cause.message || 'Could not cancel this update.'); return false }
     finally { pending.current = false; setPhase('idle') }
   }
 
@@ -343,7 +357,7 @@ export default function usePlatformUpdates({ active, refreshToken, onOpenChat })
 
   return {
     platform, cachedPlatform, rebuild, version: versionQuery.data, phase, busy, error, errorCode, checkResult,
-    progress, reconnecting: !!reconnect, observingKind: reconnect?.kind, slow, check, execute, restart, resolve, cancel,
+    progress, reconnecting: !!reconnect, observingKind: reconnect?.kind, slow, check, execute, restart, resolve, resume, cancel,
     withdrawHostRequest, keepSettling, clearError,
   }
 }

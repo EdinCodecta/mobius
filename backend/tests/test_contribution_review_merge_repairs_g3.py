@@ -285,7 +285,7 @@ def test_fetch_target_base_binds_the_ref_to_the_live_github_tip(tmp_path, monkey
     return type("Result", (), {"stdout": fetched["sha"] + "\n", "returncode": 0})()
   monkeypatch.setattr(repairs, "_git", fake_git)
   assert repairs.fetch_target_base(None, tmp_path, checkout, target) == live
-  assert ("fetch", "--no-tags", "https://github.com/owner/base.git",
+  assert ("fetch", "--no-tags", "--no-recurse-submodules", "https://github.com/owner/base.git",
           "+refs/heads/main:refs/mobius/target-base") in calls
   fetched["sha"] = "b" * 40
   with pytest.raises(HTTPException, match="moved while it was fetched"):
