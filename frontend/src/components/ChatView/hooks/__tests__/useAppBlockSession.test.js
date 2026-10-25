@@ -90,7 +90,8 @@ test('state and acknowledgement from another document generation are ignored', (
   h.result.current.dispatch('send:b', 'activate')
   const sent = h.result.current.event
   capability(null, 2)
-  // A document reload discards idle controls and the unacknowledged activate.
+  // A document reload discards idle controls and the unacknowledged activate:
+  // activate may not cause an effect (only confirm may), so nothing is unresolved.
   assert.equal(h.result.current.state, null)
   assert.equal(h.result.current.event, null)
   report({ ackNonce: sent.nonce, summary: 'stale' }, 1)

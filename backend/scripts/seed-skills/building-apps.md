@@ -497,8 +497,8 @@ reports state.
 the agent read can steer them, and a hidden instance mounts just because the
 block scrolled into view. Use an intent only to look up your own data for
 display. Never act, publish, or change state because of an intent at startup
-or on `app-block-init`; act only on an owner `app-block-action`, and check
-that request against your own data first.
+or on `app-block-init`; act only on an owner `confirm`, and check that
+request against your own data first.
 
 `props.blockSession` is `{sessionId, generation, actions, checkpoint, retain,
 recoveryError, subscribe(cb), setState(state)}`, where `actions` is
@@ -511,6 +511,14 @@ window messages; read them with `subscribe` or a `message` listener that checks
 - `{type:'moebius:app-block-action', sessionId, generation, key, event, nonce}`,
   `event` one of `activate | confirm | cancel`. Each reader click sends one
   event; the host sends no other event until you acknowledge that `nonce`.
+  **Only `confirm` may cause an effect** (publish, write, send, spend).
+  `activate` asks you to prepare: read, then report `confirming` with the
+  exact list, or say why nothing can be done. `cancel` withdraws a
+  confirmation. Neither may change anything outside your document. The host
+  relies on this: a `confirm` still unacknowledged when the document reloads
+  is held for recovery, while an unacknowledged `activate` or `cancel` is
+  simply discarded and the controls come back. An action that needs no list
+  still goes through `confirming`.
 
 A message for another session or document `generation`, or for a module without
 the export, is stopped before any app listener sees it. A reload or app update
