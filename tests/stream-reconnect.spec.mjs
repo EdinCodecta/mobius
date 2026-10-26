@@ -757,6 +757,7 @@ test.describe('Stream reconnection', () => {
       const message = { role: 'user', content: body.content, cid: body.cid, ts: 12340 + posts.length }
       if (posts.length === 1) {
         live.running = true
+        live.messages = [message]
         return route.fulfill({
           status: 202, contentType: 'application/json',
           json: { status: 'started', message },
