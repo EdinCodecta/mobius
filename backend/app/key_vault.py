@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -202,6 +203,34 @@ def reveal_for_app_platform_use(app_id: int, name: str) -> str | None:
     return None
 
 
+class AppGone(LookupError):
+  """The app was removed or reinstalled while a vault change was pending."""
+
+
+@contextlib.asynccontextmanager
+async def for_live_app(app_id: int, expected_nonce: str | None = None):
+  """Hold ``app_id``'s storage lock and confirm the app is still installed.
+
+  Anything that grants a key to an app, or queues a request an approval would
+  turn into a grant, runs inside this block. App removal holds the same lock
+  while ``forget_app`` withdraws the app from the vault, so a change that was
+  authorized before the removal can never land after it and be inherited by
+  an unrelated app that reuses the id. ``expected_nonce`` additionally
+  refuses a reinstall that happened since the caller was authorized.
+  """
+  from app import fs_locks, models
+  from app.database import SessionLocal
+  async with fs_locks.app_storage_lock(int(app_id)):
+    with SessionLocal() as db:
+      app = db.query(models.App).filter(
+        models.App.id == int(app_id), models.App.deleted_at.is_(None),
+      ).first()
+      live = app is not None and (expected_nonce is None or app.token_nonce == expected_nonce)
+    if not live:
+      raise AppGone(app_id)
+    yield
+
+
 async def store_app_key(app_id: int, name: str, value: str) -> str:
   """Save ``value`` as ``app_id``'s own secret ``name``; return the vault name.
 
@@ -301,8 +330,15 @@ async def import_legacy_app_secrets(live_app_ids: set[int]) -> dict:
       continue  # a purged app's id may be reused: never grant it onward
     entry = f"{app_id}/{secret.name}"
     try:
-      value = fernet.decrypt(secret.read_bytes()).decode()
-      ledger[entry] = await store_app_key(app_id, secret.name, value)
+      # A purge removes the file under the same lock, so a file still present
+      # here belongs to the app that is live now.
+      async with for_live_app(app_id):
+        if not secret.is_file():
+          continue
+        value = fernet.decrypt(secret.read_bytes()).decode()
+        ledger[entry] = await store_app_key(app_id, secret.name, value)
+    except AppGone:
+      continue
     except Exception as exc:  # unreadable or refused: retried on the next start
       log.warning("key vault: could not import secret %s: %s", entry, type(exc).__name__)
       continue

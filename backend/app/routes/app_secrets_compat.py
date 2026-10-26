@@ -77,9 +77,12 @@ async def put_secret(
   app_id: int, name: str, body: SecretWrite,
   db: Session = Depends(get_db), principal: Principal = Depends(get_principal),
 ):
-  _authorize_app(db, principal, app_id)
+  app = _authorize_app(db, principal, app_id)
   try:
-    await key_vault.store_app_key(app_id, name, body.value)
+    async with key_vault.for_live_app(app_id, app.token_nonce):
+      await key_vault.store_app_key(app_id, name, body.value)
+  except key_vault.AppGone:
+    raise HTTPException(status_code=404, detail="App not found.") from None
   except key_vault.VaultUnavailable as exc:
     raise HTTPException(503, str(exc)) from exc
   except key_vault.VaultRefused as exc:

@@ -324,6 +324,47 @@ def test_a_purged_apps_unimported_secrets_never_reach_an_app_reusing_its_id(clie
   assert vault.list_keys() == []
 
 
+@pytest.mark.parametrize("reinstalled", [False, True])
+def test_a_save_waiting_on_app_removal_never_grants_the_freed_id(client, auth, db, vault, reinstalled):
+  """A save authorized before the app was removed (or reinstalled) waits for
+  the removal's lock, then is refused, so no key outlives the app."""
+  import asyncio
+  from app import fs_locks
+  app = _app(db, "racing")
+  app_id, nonce = app.id, app.token_nonce
+
+  async def scenario():
+    order = []
+    purge_holds_lock = asyncio.Event()
+
+    async def remove():
+      async with fs_locks.app_storage_lock(app_id):
+        purge_holds_lock.set()
+        await asyncio.sleep(0.05)          # the save is queued on the lock now
+        await key_vault.forget_app(app_id)
+        if reinstalled:
+          app.token_nonce = "rotated-by-reinstall"
+        else:
+          db.delete(app)
+        db.commit()
+        order.append("removed")
+
+    async def save():
+      await purge_holds_lock.wait()
+      try:
+        async with key_vault.for_live_app(app_id, nonce):
+          await key_vault.store_app_key(app_id, "api_key", "late")
+          order.append("saved")
+      except key_vault.AppGone:
+        order.append("refused")
+
+    await asyncio.gather(remove(), save())
+    return order
+
+  assert asyncio.run(scenario()) == ["removed", "refused"]
+  assert vault.list_keys() == []
+
+
 def test_the_deprecated_secret_routes_use_the_vault(client, auth, db, vault):
   weather = _app(db, "weather")
   app_auth = _app_auth(db, weather)

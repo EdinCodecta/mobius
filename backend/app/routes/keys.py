@@ -170,7 +170,13 @@ async def request_key(
     raise HTTPException(404, "App not found.")
   payload = {k: body[k] for k in ("key", "reason", "sites", "inject") if k in body}
   payload["app_name"] = app.name
-  answer = await _relay("POST", "/requests", payload, caller=f"app:{app.id}")
+  # Queued under the app's lock: a request left behind by a removed app would
+  # otherwise grant its key to an unrelated app that reuses the id.
+  try:
+    async with key_vault.for_live_app(app.id, app.token_nonce):
+      answer = await _relay("POST", "/requests", payload, caller=f"app:{app.id}")
+  except key_vault.AppGone:
+    raise HTTPException(404, "App not found.") from None
   if answer.pop("created", False):
     activity.log_event("key_requested", app_id=app.id, key=answer["key"])
     await push.notify_owner_async(
