@@ -57,19 +57,25 @@ function bridgeFolder(bridge, nativeId) {
     return result
   }
 
-  /** Bytes [start, end) of a file, fetched in bridge-sized chunks; a short chunk is the end. */
+  /**
+   * Bytes [start, end) of a file, fetched in bridge-sized chunks. A short
+   * chunk is not taken as the end: reading goes on until `end` or the file's
+   * own size, so a provider that returns less than asked never truncates a
+   * read silently. An empty chunk ends it (the file shrank), so it cannot loop.
+   */
   async function readRange(path, start, end) {
     const parts = []
     let offset = start
     let total = 0
     while (offset < end) {
       const length = Math.min(NATIVE_CHUNK_BYTES, end - offset)
-      const { data } = await call('readFolderFile', path, offset, length)
+      const { size, data } = await call('readFolderFile', path, offset, length)
       const bytes = decodeBase64(data || '')
+      if (!bytes.length) break
       parts.push(bytes)
       total += bytes.length
       offset += bytes.length
-      if (bytes.length < length) break
+      if (typeof size === 'number' && offset >= size) break
     }
     return concatBytes(parts, total)
   }

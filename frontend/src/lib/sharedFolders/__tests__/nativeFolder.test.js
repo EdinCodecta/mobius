@@ -119,6 +119,24 @@ test('a short bridge read is the end of the file, and an unknown size is asked f
   assert.equal(slice.eof, true)
 })
 
+test('a short chunk in the middle of a file does not cut the read short', async () => {
+  const { bytes } = patternFile(10_000)
+  const folder = folderOver({ 'log.bin': { bytes } })
+  bridge.chunkLimit = 3000
+  const slice = await folder.run({ op: 'read', path: 'log.bin', offset: 100, length: 9000, encoding: 'base64' })
+  assert.equal(slice.length, 9000)
+  assert.deepEqual(Uint8Array.from(atob(slice.base64), c => c.charCodeAt(0)), bytes.subarray(100, 9100))
+  assert.deepEqual(bridge.reads.map(read => read.offset), [100, 3100, 6100])
+})
+
+test('a file shorter than its listing ends the read instead of asking forever', async () => {
+  // The listing says 50 bytes, but only 11 are left when it is read.
+  const folder = folderOver({ 'log.txt': textFile('hello world', { size: 50 }) })
+  const slice = await folder.run({ op: 'read', path: 'log.txt', length: 50 })
+  assert.equal(slice.text, 'hello world')
+  assert.ok(bridge.reads.length <= 2)
+})
+
 test('base64 decodes the same without Uint8Array.fromBase64', async () => {
   const folder = folderOver({ 'č.txt': textFile('čćž') })
   const native = Uint8Array.fromBase64

@@ -26,6 +26,8 @@ export class FakeNativeBridge {
     this.reads = []
     this.nextPick = null
     this.count = 0
+    // Most bytes one read returns, to act like a provider that answers in smaller pieces.
+    this.chunkLimit = MAX_CHUNK
   }
 
   addFolder(name, tree) {
@@ -90,7 +92,7 @@ export class FakeNativeBridge {
     const found = this.resolve(id, path)
     if (found.error) return found
     if (!isFile(found.node)) return failure('wrong_kind')
-    const capped = Math.min(length, MAX_CHUNK)
+    const capped = Math.min(length, this.chunkLimit)
     this.reads.push({ path, offset, length: capped })
     const { bytes } = found.node
     return { size: bytes.length, data: toBase64(bytes.subarray(offset, offset + capped)) }
