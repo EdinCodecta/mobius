@@ -191,6 +191,7 @@ def test_programmatic_start_callers_share_one_model_guard():
   assert callers == {
     "app/agent_coordination.py:_wake_idle_recipient",
     "app/contribution_autopilot.py:spawn_round_turn",
+    "app/platform_update.py:resume_platform_conflict_resolver",
     "app/platform_update.py:spawn_platform_conflict_chat",
     "app/routes/apps.py:_start_conflict_resolver_turn",
     "app/routes/contribution_reviews.py:start_reviews",

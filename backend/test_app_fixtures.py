@@ -106,6 +106,20 @@ def write_git_package(root: str | Path, files: dict[str, str | bytes]) -> Path:
   return bare
 
 
+def accept_app_consent(client, headers, app_id):
+  """Accept what a Store-installed app asks for, as the owner would at first open.
+
+  A Store app is dormant (no session, prompt fragment, tools or service) until
+  accepted; tests that install one and then use it do this first.
+  """
+  consent = client.get(f"/api/apps/{app_id}/consent", headers=headers).json()
+  if consent["status"] == "required":
+    accepted = client.post(
+      f"/api/apps/{app_id}/consent", json={"digest": consent["digest"]}, headers=headers,
+    )
+    assert accepted.status_code == 200, accepted.text
+
+
 def create_local_app(
   client,
   headers: dict,

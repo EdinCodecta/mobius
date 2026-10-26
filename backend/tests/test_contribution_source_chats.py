@@ -1,4 +1,5 @@
 """Project source discovery exposes names, never a broader chat read grant."""
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -168,3 +169,25 @@ def test_discovery_includes_live_edit_without_historical_preview(client, db, set
                 "edit_preview": {"diff": patch("/data/apps/garden/live.js")}}],
   })
   assert [c["chat_id"] for c in read(client, setup()).json()["chats"]] == ["live-only"]
+
+
+def test_project_root_boundary_normalizes_only_platform_and_app_sources():
+  from app.routes.github import _project_root
+
+  assert _project_root("/data/platform/") == "/data/platform"
+  assert _project_root("/data/apps/my-app/src/main.js") == "/data/apps/my-app"
+  for value in (
+    "", "/data", "/data/apps/123", "/data/apps/..",
+    "/data/apps/my-app/../other", "/data/shared", "/data/cli-auth", None,
+  ):
+    assert _project_root(value) == ""
+
+
+def test_contribution_source_rule_matches_shared_path_cases():
+  """Contribution discovery's rule, pinned beside Changes' display rule."""
+  from app.routes.github import _trackable_chat_source_path
+
+  fixture = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "components"
+             / "ChatView" / "__tests__" / "chatSourcePathCases.json")
+  for case in json.loads(fixture.read_text())["cases"]:
+    assert bool(_trackable_chat_source_path(case["path"])) is case["contribution"], case["path"]

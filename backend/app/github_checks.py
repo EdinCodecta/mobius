@@ -86,13 +86,24 @@ def _read_record_tolerant(path: Path) -> dict | None:
   """Reads a small JSON object — a contribution record, or the app's settings
   file — returning None (not raising) on a missing, oversized, or corrupt file so
   one bad record can't abort a whole refresh sweep."""
+  raw = _read_record_bytes(path)
+  return None if raw is None else _record_from_bytes(raw)
+
+
+def _read_record_bytes(path: Path) -> bytes | None:
+  """A record file's bytes, or None when missing, unreadable or oversized."""
   try:
     with path.open("rb") as handle:
       raw = handle.read(MAX_RECORD_BYTES + 1)
-    if len(raw) > MAX_RECORD_BYTES:
-      return None
+  except OSError:
+    return None
+  return None if len(raw) > MAX_RECORD_BYTES else raw
+
+
+def _record_from_bytes(raw: bytes) -> dict | None:
+  try:
     data = json.loads(raw)
-  except (OSError, UnicodeDecodeError, ValueError):
+  except (UnicodeDecodeError, ValueError):
     return None
   return data if isinstance(data, dict) else None
 

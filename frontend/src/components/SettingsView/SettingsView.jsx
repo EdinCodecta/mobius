@@ -9,6 +9,8 @@ import { authQueries, modelQueries, settingsQueries, themeQueries } from '../../
 import { settleBackgroundAgentSave } from '../../lib/backgroundAgentSave.js'
 import { connectedProvidersFirst, disablesLastConnectedProvider, moveConnectedProvider } from '../../lib/backgroundProviderOrder.js'
 import { clearExplicitOwnerSession } from '../../lib/explicitLogout.js'
+import { forgetNativePush } from '../../lib/nativePush.js'
+import { handOffExplicitSignOut } from '../../lib/nativeSession.js'
 import { stopShellInstallPassPreparation } from '../../lib/shellInstallPass.js'
 import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.js'
 import {
@@ -26,6 +28,7 @@ import ManageModelsModal from '../ChatView/ManageModelsModal.jsx'
 import PlatformUpdates from './PlatformUpdates.jsx'
 import ProviderUsage from './ProviderUsage.jsx'
 import GithubConnection from './GithubConnection.jsx'
+import SharedFoldersSection from './SharedFoldersSection.jsx'
 import { useSettingsFocus } from './useSettingsFocus.js'
 import MobiusProviderAccess from './MobiusProviderAccess.jsx'
 import { formatPlanStatus } from './providerUsage.js'
@@ -867,15 +870,20 @@ export default function SettingsView({
       return
     }
     setSigningOut(true)
+    let appTookOver = false
     try {
       await clearExplicitOwnerSession({
         stopInstallHandoffPreparation: stopShellInstallPassPreparation,
         revokeInstallHandoffs: () => api.auth.shellInstallPass.revoke(),
+        forgetPushDevice: forgetNativePush,
         dropCredential: clearToken,
         clearOwnerCache: clearQueryCache,
       })
+      // Only after the workspace sign-out is complete: the Möbius phone app
+      // closes this page as soon as it is told.
+      appTookOver = await handOffExplicitSignOut()
     } finally {
-      window.location.reload()
+      if (!appTookOver) window.location.reload()
     }
   }
 
@@ -1143,6 +1151,8 @@ export default function SettingsView({
         </section>
 
         {!detailPage && <>
+        <SharedFoldersSection />
+
         <PlatformUpdates active={active} refreshToken={refreshToken} onOpenChat={onOpenChat} inertBoundaryRef={settingsBoundaryRef} />
 
         <section className="settings__section settings__section--compact">

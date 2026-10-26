@@ -9,7 +9,7 @@ from unittest.mock import call, patch
 
 import pytest
 
-from app import app_apply, app_git, applied_app_runtime, icon_assets, models
+from app import app_apply, app_consent, app_git, applied_app_runtime, icon_assets, models
 from app.config import get_settings
 from app.database import SessionLocal
 
@@ -671,6 +671,7 @@ def test_store_managed_apply_refreshes_only_previously_approved_skills(
   contract = dict(row.capability_contract or {})
   contract["agent"] = {**(contract.get("agent") or {}), "skills": ["guide.md"]}
   row.capability_contract = contract
+  row.accepted_consent = app_consent.platform_acceptance(contract)  # the owner answered
   db.commit()
   (source / "guide.md").write_text("# Locally revised guidance\n")
 
@@ -704,6 +705,7 @@ def test_store_managed_apply_keeps_every_member_of_an_approved_folder_skill(
   contract = dict(row.capability_contract or {})
   contract["agent"] = {**(contract.get("agent") or {}), "skills": ["guide/"]}
   row.capability_contract = contract
+  row.accepted_consent = app_consent.platform_acceptance(contract)  # the owner answered
   db.commit()
   (source / "guide" / "publish.md").write_text("# Publish, revised\n")
   (source / "guide" / "notes.md").write_text("# Notes\n")
@@ -1597,6 +1599,11 @@ def test_store_local_package_apply_explicitly_accepts_manifest_authority(
 
   # Ordinary Store apply must recover the approved skill list from the durable
   # contract rather than treating the absent manifest authority as no skills.
+  # The widened package is dormant until the owner answers its first-open
+  # request; its skills stay aside until then.
+  assert not (Path(get_settings().data_dir) / "shared" / "skills" / "guide.md").exists()
+  from test_app_fixtures import accept_app_consent
+  accept_app_consent(client, auth, app_id)
   (source / "guide.md").write_text("# Locally revised guidance\n")
   ordinary = _apply(client, auth, source)
 

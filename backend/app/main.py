@@ -80,6 +80,7 @@ from app import activity, models, tracing
 # wrapped imports in lifespan() below.
 from app.routes import (
   admin_router, agent_coordination_router, apps_router, app_services_router,
+  app_consent_router,
   app_tools_router,
   auth_router, browser_access_router,
   app_chat_router,
@@ -99,6 +100,7 @@ from app.routes import (
   media_router,
   local_services_router, notifications_router, notify_router, proxy_router, push_router,
   screen_control_router,
+  shared_folders_router,
   public_apps_router,
   public_storage_router,
   secrets_router, self_reminders_router, settings_router, skills_router,
@@ -1030,6 +1032,7 @@ app.add_middleware(_RequestErrorTelemetryMiddleware)
 app.include_router(auth_router)
 app.include_router(apps_router)
 app.include_router(app_services_router)
+app.include_router(app_consent_router)
 app.include_router(storage_router)
 app.include_router(fs_router)
 app.include_router(projects_router)
@@ -1053,6 +1056,7 @@ app.include_router(connectors_public_router)
 app.include_router(app_chat_router)
 app.include_router(notify_router)
 app.include_router(screen_control_router)
+app.include_router(shared_folders_router)
 app.include_router(proxy_router)
 app.include_router(public_storage_router)
 app.include_router(public_apps_router)
