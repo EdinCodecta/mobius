@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 from app.main import _is_static_asset_path, _public_static_headers
+from tests.shell_serving_helpers import assert_shell_served
 
 
 def test_shell_and_frame_share_source_owned_font_contract():
@@ -118,18 +119,11 @@ def test_opaque_frame_public_assets_are_intrinsically_cors_readable():
   assert _public_static_headers("icons/icon-192.png") == {}
 
 
-def _assert_shell_served(client):
-  """Conftest provisions the shell; a missing route is a regression, not a skip."""
-  r = client.get("/")
-  assert r.status_code == 200, r.text
-  assert "text/html" in r.headers.get("content-type", ""), r.headers
-
-
 def test_live_vite_asset_route_is_intrinsically_cors_readable(
   client, monkeypatch, tmp_path,
 ):
   """The dedicated /assets handler must not bypass the opaque-frame policy."""
-  _assert_shell_served(client)
+  assert_shell_served(client)
   asset = tmp_path / "index-opaque-frame.js"
   asset.write_text("export default 1", encoding="utf-8")
   monkeypatch.setattr("app.main._resolve_asset_file", lambda _path: asset)
@@ -139,7 +133,7 @@ def test_live_vite_asset_route_is_intrinsically_cors_readable(
 
 
 def test_vendor_miss_returns_404_not_html(client):
-  _assert_shell_served(client)
+  assert_shell_served(client)
   for miss in (
     "/vendor/three@0.184.0/does-not-exist.js",
     "/vendor/three@0.184.0/missing.wasm",
@@ -152,7 +146,7 @@ def test_vendor_miss_returns_404_not_html(client):
 
 
 def test_app_route_still_serves_html(client):
-  _assert_shell_served(client)
+  assert_shell_served(client)
   r = client.get("/some-nonexistent-app-route")
   assert r.status_code == 200
   assert "text/html" in r.headers.get("content-type", "")

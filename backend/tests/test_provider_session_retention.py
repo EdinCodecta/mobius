@@ -61,6 +61,9 @@ def test_sweep_never_follows_symlinks(tmp_path):
   os.utime(outside, (0, 0))
   link = root / "rollout-linked.jsonl"
   link.symlink_to(outside)
+  # Age the link itself too: the sweep reads the link's own mtime, so a fresh
+  # link would be skipped as young even without the regular-file guard.
+  os.utime(link, (0, 0), follow_symlinks=False)
 
   result = sweep_stale_provider_sessions(tmp_path, now=4_000_000, max_age_days=0)
 

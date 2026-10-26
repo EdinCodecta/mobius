@@ -22,19 +22,13 @@ from app.install import _manifest_display
 import app.routes.standalone as standalone_routes
 from app.theme import get_bg_color
 from test_app_fixtures import create_local_app
+from tests.shell_serving_helpers import assert_shell_served
 
 
 def _create_app(client, owner_token, name):
   return create_local_app(
     client, {"Authorization": f"Bearer {owner_token}"}, name=name,
   )
-
-
-def _assert_shell_served(client):
-  """Conftest provisions the shell; a missing route is a regression, not a skip."""
-  r = client.get("/__definitely_shell_route__")
-  assert r.status_code == 200, r.text
-  assert "text/html" in r.headers.get("content-type", ""), r.headers
 
 
 @pytest.fixture(autouse=True)
@@ -67,7 +61,7 @@ def test_root_shell_manifest_is_theme_colored_and_no_cache(client):
   manifest theme_color for the system/gesture-nav bar tint, so a stale-cached
   manifest pins that bar to the old theme after a theme change (card 164)."""
   from app.main import _resolve_static_dir
-  _assert_shell_served(client)
+  assert_shell_served(client, "/__definitely_shell_route__")
   # A real frontend build copies frontend/public/manifest.webmanifest into the
   # served static dir; the venv test env has the static dir but not that file,
   # so provision a minimal one for the duration of the test (the route only
@@ -210,7 +204,7 @@ def test_manifest_display_validator_coerces():
 
 
 def test_top_level_app_slug_redirects_to_standalone_scope(client, owner_token):
-  _assert_shell_served(client)
+  assert_shell_served(client, "/__definitely_shell_route__")
   app = _create_app(client, owner_token, "CubeRun")
   assert app["slug"] == "cuberun"
 
@@ -224,7 +218,7 @@ def test_top_level_app_slug_redirects_to_standalone_scope(client, owner_token):
 def test_top_level_index_html_does_not_alias_to_standalone(
   client, owner_token,
 ):
-  _assert_shell_served(client)
+  assert_shell_served(client, "/__definitely_shell_route__")
   app = _create_app(client, owner_token, "CubeRun")
   assert app["slug"] == "cuberun"
 
@@ -278,7 +272,7 @@ def test_app_owned_static_assets_are_served_from_accepted_runtime(
 
 
 def test_reserved_top_level_routes_do_not_alias_to_apps(client, owner_token):
-  _assert_shell_served(client)
+  assert_shell_served(client, "/__definitely_shell_route__")
 
   db = SessionLocal()
   try:
@@ -301,7 +295,7 @@ def test_reserved_top_level_routes_do_not_alias_to_apps(client, owner_token):
 
 
 def test_unknown_top_level_route_still_serves_shell(client):
-  _assert_shell_served(client)
+  assert_shell_served(client, "/__definitely_shell_route__")
   r = client.get("/not-an-installed-app")
   assert r.status_code == 200
   assert "text/html" in r.headers.get("content-type", "")

@@ -60,7 +60,7 @@ test.describe('handleStop sync-ordering (Ticket 034 R1)', () => {
     let stopHits = 0
     let stopHeld = false
     let stopReleased = false
-    let refetchHits = 0
+    const staleRefetches = []
     let ordinaryMessageHits = 0
     let steerHits = 0
     let resolveStop
@@ -133,10 +133,9 @@ test.describe('handleStop sync-ordering (Ticket 034 R1)', () => {
     const chat = await createChat(page, 'handleStop')
     await page.route(url => url.pathname === `/api/chats/${chat.id}` && url.searchParams.has('limit'), route => {
       if (!stopHeld) return route.fallback()
-      refetchHits++
-      const url = new URL(route.request().url())
-      expect(url.searchParams.get('limit')).toBe('20')
-      expect(url.searchParams.get('compact')).toBe('1')
+      // Record rather than assert here, so an unexpected refetch fails the
+      // test below with its URL instead of throwing inside the route handler.
+      staleRefetches.push(route.request().url())
       return route.fulfill({
         status: 200,
         contentType: 'application/json',
@@ -222,7 +221,7 @@ test.describe('handleStop sync-ordering (Ticket 034 R1)', () => {
     expect(samples.every(count => count === 0), `queue counts during Stop await: ${samples}`).toBe(true)
     // With an ordinary non-Goal chat and a synchronously empty ref, natural
     // completion has no reason to request the stale page at all.
-    expect(refetchHits).toBe(0)
+    expect(staleRefetches).toEqual([])
     await expect(surface.locator('.queued__row')).toHaveCount(0)
 
     resolveStop()

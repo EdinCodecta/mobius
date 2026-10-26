@@ -33,57 +33,15 @@ def _frame_html() -> str:
   return frame.read_text()
 
 
-def test_retry_gates_on_transport_failure_and_premount():
-  html = _frame_html()
-  assert re.search(
-    r"retryable = Boolean\(importErr && importErr\.code === 'network'\)"
-    r"\s*\|\| isBlobModuleLoadFailure\(importErr\);"
-    r"[\s\S]{0,180}?if \(!retryable \|\| window\.__frameMounted\)",
-    html,
-  )
-
-
-def test_blob_retry_classifier_is_specific_to_dynamic_blob_imports():
-  html = _frame_html()
-  assert "error.name !== 'TypeError'" in html
-  assert re.search(
-    r"\(\?:failed to fetch\|error loading\) dynamically imported "
-    r"module:\\s\*blob:",
-    html,
-  )
-  assert "importErr instanceof TypeError" not in html
-
-
-def test_retry_is_delayed_and_single():
-  html = _frame_html()
-  assert re.search(
-    r"setTimeout\(\s*r\s*,\s*IMPORT_RETRY_DELAY_MS\s*\)[\s\S]{0,250}?"
-    r"await importBrokeredModule\(1\)",
-    html,
-  )
-  assert len(re.findall(r"await importBrokeredModule\(1\)", html)) == 1
-  assert len(re.findall(r"await importBrokeredModule\(0\)", html)) == 1
-
-
 def test_retry_marker_reaches_the_parent_broker():
+  # The entrypoint probe doubles importBrokeredModule, so the request field it
+  # posts to the parent is the one retry detail still checked in source.
   html = _frame_html()
   assert re.search(
     r"type: 'moebius:module-request', requestId,[\s\S]{0,100}?"
     r"retry: retry === 1 \? 1 : 0",
     html,
   )
-
-
-def test_retry_runs_after_token_renegotiation_branch():
-  html = _frame_html()
-  retry_delay = html.find("IMPORT_RETRY_DELAY_MS = ")
-  first_token_expired = html.find(
-    "renegotiateExpiredModuleToken(importErr)", retry_delay,
-  )
-  retry_use = html.find("IMPORT_RETRY_DELAY_MS", retry_delay + 1)
-  assert retry_delay != -1 and first_token_expired != -1 and retry_use != -1
-  assert first_token_expired < retry_use
-  assert html.count("renegotiateExpiredModuleToken(retryErr)") == 1
 
 
 _NETWORK_FAILURE = {"code": "network", "message": "parent fetch failed"}
