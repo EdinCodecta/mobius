@@ -1,6 +1,7 @@
 /* What the owner does in Settings → Shared folders: add, pick again, reconnect, pause, remove. */
 import { api } from '../../api/client.js'
 import { createHandleFolder } from './handleFolder.js'
+import { createNativeFolder, nativeFolderBridge } from './nativeFolder.js'
 import { createSnapshotFolder } from './snapshotFolder.js'
 import {
   deleteFolderRecord, newFolderId, saveFolderRecord,
@@ -37,6 +38,7 @@ async function findSameFolder(handle) {
  * Must run straight from the click: the picker needs the tap's activation.
  */
 export function addRememberedFolder(mode) {
+  if (hostStore().state.canPickNative) return addNativeFolder()
   return pickRememberedFolder(mode, () => mode)
 }
 
@@ -46,7 +48,68 @@ export function addRememberedFolder(mode) {
  * quietly take away rights the owner gave in Settings.
  */
 export function shareUploadFolder() {
+  if (hostStore().state.canPickNative) return addNativeFolder()
   return pickRememberedFolder('read', existing => existing?.mode || 'read')
+}
+
+/** The phone app's own folder picker: { ok, folder: { id, name } }, cancelled, or a message. */
+async function pickNativeFolder() {
+  let picked
+  try {
+    picked = await nativeFolderBridge().pickFolder()
+  } catch {
+    return failed('The Möbius app could not open the folder picker. Try again.')
+  }
+  if (!picked) return { ok: false, cancelled: true }
+  if (picked.error || !picked.id) return failed(picked.error?.message || 'The Möbius app could not share that folder.')
+  return { ok: true, folder: picked }
+}
+
+/**
+ * Inside the Möbius phone app: the app keeps the folder under an opaque id,
+ * read only (the bridge has no writes). There is no isSameEntry for these, so
+ * picking a folder again adds another entry rather than silently merging.
+ */
+async function addNativeFolder() {
+  const picked = await pickNativeFolder()
+  if (!picked.ok) return picked
+  const record = {
+    id: newFolderId(),
+    name: picked.folder.name || 'Folder',
+    mode: 'read',
+    access: 'remembered',
+    source: 'native',
+    nativeId: picked.folder.id,
+    paused: false,
+    createdAt: Date.now(),
+  }
+  const store = hostStore()
+  store.permissions.set(record.id, 'granted')
+  store.access.set(record.id, createNativeFolder(nativeFolderBridge(), record.nativeId))
+  await commit(record)
+  return { ...done, name: record.name, updated: false }
+}
+
+/** The app lost the folder: pick it again and keep the same shared folder, under the new native id. */
+async function repickNativeFolder(record) {
+  if (!nativeFolderBridge()) return failed('Update the Möbius app to share folders from it again.')
+  const picked = await pickNativeFolder()
+  if (!picked.ok) return picked
+  const store = hostStore()
+  const updated = { ...record, name: picked.folder.name || record.name, nativeId: picked.folder.id, paused: false }
+  store.permissions.set(record.id, 'granted')
+  store.access.set(record.id, createNativeFolder(nativeFolderBridge(), updated.nativeId))
+  await commit(updated)
+  if (record.nativeId && record.nativeId !== updated.nativeId) await forgetNativeFolder(record.nativeId)
+  return done
+}
+
+async function forgetNativeFolder(nativeId) {
+  try {
+    await nativeFolderBridge()?.forgetFolder(nativeId)
+  } catch {
+    // The record is gone either way; the app at worst keeps an unused grant.
+  }
 }
 
 async function pickRememberedFolder(pickerMode, modeFor) {
@@ -94,10 +157,11 @@ export async function addVisitFolder(fileList, replaceId = null) {
   return { ...done, name: record.name }
 }
 
-/** Chrome or Edge forgot the permission: ask again, from the owner's tap. */
+/** Chrome or Edge forgot the permission, or the phone app lost the folder: ask again, from the owner's tap. */
 export async function reconnectFolder(id) {
   const store = hostStore()
   const record = store.records.get(id)
+  if (record?.source === 'native') return repickNativeFolder(record)
   if (!record?.handle) return failed('This folder can no longer be reconnected. Remove it and add it again.')
   let permission
   try {
@@ -147,10 +211,12 @@ export async function applyRemotePause(event) {
 /** Stop sharing a folder. The folder and its files stay on the device. */
 export async function removeFolder(id) {
   const store = hostStore()
+  const record = store.records.get(id)
   store.records.delete(id)
   store.access.delete(id)
   store.permissions.delete(id)
   await deleteFolderRecord(id)
+  if (record?.source === 'native') await forgetNativeFolder(record.nativeId)
   publishFolders()
   announceFolderChange()
   await reportFolders()
