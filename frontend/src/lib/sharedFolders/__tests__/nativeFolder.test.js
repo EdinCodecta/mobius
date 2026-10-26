@@ -238,6 +238,35 @@ test('when the app loses a folder, Pick again replaces its native id and forgets
   assert.equal((await loadFolderRecords())[0].nativeId, 'native-2')
 })
 
+test('a folder deleted on the phone asks the owner to Pick again instead of staying ready', async () => {
+  bridge.willPick('Docs', { 'a.txt': textFile('a') })
+  await addRememberedFolder('read')
+  const [record] = hostStore().records.values()
+  bridge.deleteFolder(record.nativeId)
+
+  await refreshPermissions({ report: false })
+  assert.equal(folderState(record), 'needs_permission')
+  // Settings shows a native folder's needs_permission as Pick again.
+  assert.equal(hostStore().state.folders[0].native, true)
+  await handleSharedFolderCommand({ commandId: 'c1', folderId: record.id, op: 'read', path: 'a.txt' })
+  assert.equal(answers.at(-1).code, 'needs_permission')
+  assert.match(answers.at(-1).error, /Pick again/)
+
+  bridge.willPick('Docs', { 'a.txt': textFile('restored') })
+  assert.equal((await reconnectFolder(record.id)).ok, true)
+  assert.equal(folderState(hostStore().records.get(record.id)), 'ready')
+})
+
+test('a phone folder the app answers for with an unknown failure is not taken as ready', async () => {
+  bridge.willPick('Docs', {})
+  await addRememberedFolder('read')
+  const [record] = hostStore().records.values()
+  bridge.folderEntry = async () => ({ error: { code: 'something_new', message: 'Unexpected.' } })
+
+  await refreshPermissions({ report: false })
+  assert.equal(folderState(record), 'needs_permission')
+})
+
 test('removing a native folder tells the app to forget it', async () => {
   bridge.willPick('Docs', {})
   await addRememberedFolder('read')
