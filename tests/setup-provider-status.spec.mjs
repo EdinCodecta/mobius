@@ -79,6 +79,9 @@ test('Codex copies the code before the owner separately opens ChatGPT and stays 
   await page.getByRole('button', { name: 'Settings', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
 
+  await page.getByRole('button', { name: 'OpenAI Codex provider settings', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'OpenAI Codex', exact: true })).toBeVisible()
+
   const codexRow = page.locator('.provider-row').filter({ hasText: 'OpenAI Codex' })
   await codexRow.getByRole('button', { name: 'Connect OpenAI Codex' }).click()
   const setupSteps = codexRow.locator('.codex-auth__setup-steps')
@@ -126,9 +129,10 @@ test('Codex copies the code before the owner separately opens ChatGPT and stays 
   allowCompletion = true
   await page.evaluate(() => window.dispatchEvent(new Event('pageshow')))
 
-  await expect(codexRow.getByRole('button', {
-    name: /^Plan: .+, show usage$/,
-  })).toBeVisible()
+  // Native provider details show the plan inline rather than behind a usage
+  // disclosure. A failed overview probe must not undo the completed sign-in.
+  await expect(codexRow.getByText('Plan: Test', { exact: true })).toBeVisible()
+  await expect(codexRow.getByRole('button', { name: 'Manage OpenAI Codex', exact: true })).toBeVisible()
   await expect.poll(() => settingsWrites).toBe(1)
   await expect(setupSteps).toHaveCount(0)
   await expect(codexRow.getByText('TEST-CODE', { exact: true })).toHaveCount(0)

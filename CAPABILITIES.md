@@ -645,8 +645,9 @@ stages the app. Source: `backend/app/app_consent.py`.
   (`owner`, `platform` for first-boot apps, `migration` for apps that existed
   before this shipped). Saving rows, not the contract, means rewording or
   re-deriving rows can never turn an old answer into a new question.
-- **When it asks.** An app is *dormant* (`app_consent.dormant`) until the owner
-  answers: it was never accepted, or its contract now asks for a row, or a
+- **When it asks.** An app that asks for nothing is never asked. Otherwise it is
+  *dormant* (`app_consent.dormant`) until the owner answers: it was never
+  accepted, or its contract now asks for a row, or a
   higher level of a row, that the accepted answer does not cover. A narrower or
   equal request never asks. A dormant app gets no app or job token (`409
   consent_required`), no service invocation, no system-prompt fragment and no

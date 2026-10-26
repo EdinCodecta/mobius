@@ -118,3 +118,30 @@ def test_a_failed_boot_log_write_leaves_no_staged_file(tmp_path, monkeypatch, ca
 
   assert "could not record this run" in capsys.readouterr().err
   assert list(tmp_path.iterdir()) == []
+
+
+def test_check_packages_subcommand_reports_gap(tmp_path, monkeypatch, capsys):
+  """Restart admission reads this image's verdict: the gap as JSON, and a
+  nonzero exit only for a gap its boot would refuse. It records nothing."""
+  log = tmp_path / "platform-boot.jsonl"
+  monkeypatch.setattr(platform_boot, "BOOT_LOG", log)
+  seen = []
+  gap = {"packages": [{"name": "pkg", "declared": "==2", "installed": "1",
+                       "kind": "version"}], "blocking": False}
+  monkeypatch.setattr(
+    platform_update, "python_package_gap", lambda repo: seen.append(repo) or gap,
+  )
+
+  assert platform_boot.main(["platform_boot", "check-packages", str(tmp_path)]) == 0
+  assert json.loads(capsys.readouterr().out) == gap
+  assert seen == [tmp_path]
+
+  gap["blocking"] = True
+  assert platform_boot.main(["platform_boot", "check-packages"]) == 1
+  assert json.loads(capsys.readouterr().out)["blocking"] is True
+  assert seen[-1] == platform_update.PLATFORM_REPO
+
+  monkeypatch.setattr(platform_update, "python_package_gap", lambda repo: None)
+  assert platform_boot.main(["platform_boot", "check-packages"]) == 0
+  assert capsys.readouterr().out.strip() == "null"
+  assert not log.exists()

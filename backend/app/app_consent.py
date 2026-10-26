@@ -324,10 +324,13 @@ def needed_rows(app: models.App) -> list[dict[str, Any]]:
 
 
 def status(app: models.App) -> str:
-  """``not_applicable``, ``required`` (ask first) or ``accepted``."""
+  """``not_applicable``, ``required`` (ask first) or ``accepted``.
+
+  An app that asks for nothing has nothing to answer, so it is never asked.
+  """
   if not gated(app):
     return "not_applicable"
-  return "required" if accepted_rows(app) is None or needed_rows(app) else "accepted"
+  return "required" if needed_rows(app) else "accepted"
 
 
 def dormant(app: models.App) -> bool:

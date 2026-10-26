@@ -24,6 +24,7 @@ CHAT_WAIT_SWEEP_INTERVAL_SECS = 30.0
 DELEGATION_STARTUP_RECOVERY_INTERVAL_SECS = 60.0
 DELEGATION_WAKE_RECOVERY_INTERVAL_SECS = 60.0
 AUTOPILOT_LEASE_RECOVERY_INTERVAL_SECS = 60.0
+REPAIR_CHECKOUT_GC_INTERVAL_SECS = 60 * 60
 # Capacity monitor: sample /data headroom every tick; recompute the (more
 # expensive) per-domain attribution walk only every Nth tick unless pressure is
 # present, so the monitor never amplifies the disk pressure it watches.
@@ -170,6 +171,20 @@ class RuntimeSupervisors:
       except Exception as exc:
         self.log.error("agent-browser reaper failed: %s", exc, exc_info=True)
       await asyncio.sleep(BROWSER_REAPER_INTERVAL_SECS)
+
+  async def _repair_checkout_gc_loop(self) -> None:
+    """Collect retired repair checkouts at boot and hourly without a review Wait."""
+    from app.contribution_review_repair_actions import sweep_checkout_receipts_once
+    from app.settled import run_settled
+
+    while True:
+      try:
+        await run_settled(sweep_checkout_receipts_once)
+      except asyncio.CancelledError:
+        raise
+      except Exception as exc:
+        self.log.error("repair checkout GC failed: %s", exc, exc_info=True)
+      await asyncio.sleep(REPAIR_CHECKOUT_GC_INTERVAL_SECS)
 
   async def _oom_watchdog_loop(self) -> None:
     """Record a durable diagnostic whenever the cgroup loses a process to OOM.
@@ -403,18 +418,14 @@ class RuntimeSupervisors:
         system_broadcast.unsubscribe(events)
 
     async def delegation_startup_recovery_loop():
-      # Startup admission and source-attached work have their own repair path;
-      # neither can be delayed by a stalled parent wake or SQLite lease sweep.
-      from app.delegations import (
-        reconcile_unstarted_delegations,
-      )
-      from app.routes.github import reconcile_attached_contribution_work
+      # Startup admission has its own repair path; it cannot be delayed by a
+      # stalled parent wake or SQLite lease sweep.
+      from app.delegations import reconcile_unstarted_delegations
 
       while True:
         await asyncio.sleep(DELEGATION_STARTUP_RECOVERY_INTERVAL_SECS)
         try:
           await reconcile_unstarted_delegations()
-          await reconcile_attached_contribution_work()
         except asyncio.CancelledError:
           raise
         except Exception as exc:
@@ -598,6 +609,21 @@ class RuntimeSupervisors:
         tick += 1
         await asyncio.sleep(CAPACITY_MONITOR_INTERVAL_SECS)
 
+    async def platform_update_watch_loop():
+      # An unfinished update whose resolver stopped stays parked silently
+      # until the owner opens Settings; tell them once per stall episode.
+      from app.platform_update import notify_update_stall_once
+
+      await asyncio.sleep(300)
+      while True:
+        try:
+          await notify_update_stall_once(SessionLocal)
+        except asyncio.CancelledError:
+          raise
+        except Exception as exc:
+          self.log.error("platform update watch failed: %s", exc, exc_info=True)
+        await asyncio.sleep(60 * 60)
+
     async def provider_session_retention_loop():
       # Codex rollout JSONL is resumable context, not permanent owner data.
       # Startup owns the immediate, pre-DB sweep. Periodic sweeps need only
@@ -659,6 +685,8 @@ class RuntimeSupervisors:
     self._spawn("agent-scratch-retention", agent_scratch_loop())
     self._spawn("provider-session-retention", provider_session_retention_loop())
     self._spawn("capacity-monitor", capacity_monitor_loop())
+    self._spawn("repair-checkout-gc", self._repair_checkout_gc_loop())
+    self._spawn("platform-update-watch", platform_update_watch_loop())
 
   async def stop(self) -> None:
     """Cancel and observe every task, then stop external watcher resources."""
