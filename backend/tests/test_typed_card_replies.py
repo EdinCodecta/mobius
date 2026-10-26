@@ -117,6 +117,36 @@ def test_answer_to_an_older_card_quotes_that_card(db):
   assert "Owner wrote: what does the older plan change?" in note
 
 
+@pytest.mark.parametrize(("newer_answer", "newer_pick", "older_answer"), [
+  ("why", None, "why is option one safer?"),
+  ("Not now", {"question-1": ["1"]}, "Not now, what does waiting cost?"),
+])
+def test_a_newer_answer_inside_the_older_answer_does_not_claim_the_turn(
+  db, newer_answer, newer_pick, older_answer,
+):
+  older = {**_card({"Ship it?": older_answer}), "question_id": "older"}
+  newer = {**_card({"Ship it?": newer_answer}, newer_pick), "question_id": "newer"}
+  content = f"- Ship it?: {older_answer}"
+  chat = _chat(db, newer, content, earlier=[
+    {"role": "assistant", "content": "first ask", "blocks": [older]},
+    {"role": "user", "content": f"- Ship it?: {newer_answer}", "hidden": True,
+     "kind": "continuation", "continuation_reason": "question_answer"},
+  ])
+  note = typed_reply_context(db, chat, content, answered_by_owner=True)
+  assert f"Owner wrote: {older_answer}" in note
+
+
+def test_multi_line_answer_with_files_and_upload_notice_is_bound(db):
+  answer = "why this one?\nand what about the old one?"
+  content = (
+    "- Ship it?: why this one?\n  and what about the old one?\n  Files: plan.pdf"
+    "\n\n[Files in this session:\n- plan.pdf → /uploads/plan.pdf (application/pdf, 1 KB)]"
+  )
+  chat = _chat(db, _card({"Ship it?": answer}), content)
+  note = typed_reply_context(db, chat, content, answered_by_owner=True)
+  assert f"Owner wrote: {answer}" in note
+
+
 def test_option_pick_turn_carries_no_note(db):
   content = "- Ship it?: Not now"
   chat = _chat(db, _card({"Ship it?": "Not now"}, {"question-1": ["1"]}), content)

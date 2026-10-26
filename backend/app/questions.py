@@ -46,6 +46,8 @@ never filters post-card events, so a leak stays visible rather than masked.
 
 from __future__ import annotations
 
+import re
+
 from app import transcript_rows
 from app.pending_questions import PendingQuestion
 
@@ -215,18 +217,29 @@ def typed_replies(card: dict) -> list[tuple[str, str]]:
   return replies
 
 
-def _turn_carries_answers(card: dict, turn_content: str) -> bool:
-  """Whether this turn's text is the rendering of this card's answers.
+# What may follow one complete answer entry: the next entry, the owner client's
+# per-question file line, or the session upload notice the route appends.
+_ANSWER_ENTRY_END = r"(?=\Z|\n- |\n  Files: |\n\n\[Files in this session:)"
 
-  Each answer is rendered as "- <question>: <text>"; the owner's client
+
+def _turn_carries_answers(card: dict, turn_content: str) -> bool:
+  """Whether this turn's text renders every one of this card's answers.
+
+  Each answer is one complete "- <question>: <text>" entry; the owner's client
   indents continuation lines of multi-line text, an agent's answer does not.
+  Matching whole entries keeps a card whose answer merely occurs inside
+  another card's answer from claiming the turn.
   """
-  texts = [text for text in (card.get("answers") or {}).values()
-           if isinstance(text, str) and text.strip()]
-  return bool(texts) and all(
-    text in turn_content or text.replace("\n", "\n  ") in turn_content
-    for text in texts
-  )
+  def renders(question: str, text: str) -> bool:
+    for rendered in {text, text.replace("\n", "\n  ")}:
+      entry = re.escape(f"- {question}: {rendered}")
+      if re.search(rf"(?:\A|\n){entry}{_ANSWER_ENTRY_END}", turn_content):
+        return True
+    return False
+
+  entries = [(question, text) for question, text in (card.get("answers") or {}).items()
+             if isinstance(text, str) and text.strip()]
+  return bool(entries) and all(renders(question, text) for question, text in entries)
 
 
 def typed_reply_context(
