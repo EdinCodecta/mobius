@@ -712,3 +712,8 @@ def test_a_fence_closes_only_on_its_own_character_and_length():
   assert shots.references(body) == ["x.png"]
   pinned = shots.resolve_body(body, [{"name": "x.png"}], assets_repo="o/r", commit="a" * 40, branch="b")
   assert pinned.count("screenshot:x.png") == 3
+
+
+def test_a_same_line_triple_backtick_span_is_not_a_fence():
+  body = "```example```\n![a](screenshot:x.png)"
+  assert shots.references(body) == ["x.png"]

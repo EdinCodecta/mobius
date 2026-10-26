@@ -46,11 +46,12 @@ _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 # shows the syntax in backticks is neither checked nor rewritten.
 _REFERENCE = re.compile(r"\]\(screenshot:([^)\s]*)\)")
 # CommonMark code: a fenced block opens on its own line and closes on a line
-# holding a fence of the same character at least as long (or never closes);
+# holding a fence of the same character at least as long (or never closes),
+# and a backtick fence's info string holds no backtick;
 # an inline span is a run of backticks closed by a run of the same length,
 # which may span lines but not a blank line.
 _CODE = re.compile(
-  r"^[ ]{0,3}(?P<tick>`{3,})[^\n]*.*?(?:\n[ ]{0,3}(?P=tick)`*[ \t]*(?=\n|\Z)|\Z)"
+  r"^[ ]{0,3}(?P<tick>`{3,})[^`\n]*(?=\n|\Z).*?(?:\n[ ]{0,3}(?P=tick)`*[ \t]*(?=\n|\Z)|\Z)"
   r"|^[ ]{0,3}(?P<tilde>~{3,})[^\n]*.*?(?:\n[ ]{0,3}(?P=tilde)~*[ \t]*(?=\n|\Z)|\Z)"
   r"|(?<!`)(?P<span>`+)(?!`)(?:(?!\n[ \t]*\n).)*?(?<!`)(?P=span)(?!`)",
   re.M | re.S,
