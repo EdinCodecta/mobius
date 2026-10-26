@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from app import (
   app_git,
+  contribution_screenshots,
   contribution_staging,
   fs_locks,
   github_auth,
@@ -3407,6 +3408,82 @@ def _recover_normalized_attribution(
   return _git_ops._head_sha_patch(record, old_head, current_head)
 
 
+def _publish_reviewed_screenshots(
+  record: dict,
+  diff_path: Path,
+  repo: Path,
+  screenshots: list[dict],
+  body: str,
+  *,
+  upstream_repo: str,
+  login: str,
+  branch: str,
+  author: tuple[str, str],
+  is_update: bool,
+  record_patch: dict,
+) -> tuple[str, dict]:
+  """Upload a new PR's approved screenshots and pin its description to them.
+
+  Runs before the branch push, so a failed upload leaves nothing public but
+  the images. The images go to the owner's own repository: the target when
+  the owner owns it, otherwise the owner's fork, never a shared repository
+  the owner can merely push to.
+  """
+  if is_update:
+    raise ContributionSubmitError(
+      "An open pull request's description is edited on GitHub, so its "
+      "screenshots cannot be sent from here. Nothing was sent.",
+      code="screenshot_changed", record_patch=record_patch,
+    )
+  owns_target = upstream_repo.split("/", 1)[0].casefold() == login.casefold()
+  # Measure the pinned body before anything is uploaded: a fork normally
+  # shares the target's name, and the placeholder is the longest commit id.
+  likely_repo = upstream_repo if owns_target else (
+    f"{login}/{upstream_repo.split('/', 1)[1]}"
+  )
+  longest = contribution_screenshots.resolve_body(
+    body, screenshots, assets_repo=likely_repo, commit="0" * 64, branch=branch,
+  )
+  if len(longest.encode("utf-8")) > 65_536:
+    raise ContributionSubmitError(
+      "With its screenshot links, this description exceeds GitHub's size "
+      "limit. Ask the agent to shorten it. Nothing was sent.",
+      code="screenshot_body_too_large", record_patch=record_patch,
+    )
+  try:
+    try:
+      assets_repo = (
+        upstream_repo if owns_target
+        else _ensure_owner_fork_remote(repo, upstream_repo, login)
+      )
+    except ContributionSubmitError as exc:
+      raise ContributionSubmitError(
+        "Screenshots are hosted in your own fork, and it could not be "
+        "prepared (the repository may not allow forks). Ask the agent to "
+        "prepare this PR without screenshots. Nothing was sent.",
+        code="screenshot_upload_failed", detail=exc.message[:400],
+      ) from exc
+    prior = record.get("last_submit_screenshots")
+    prior = prior if isinstance(prior, dict) else {}
+    commit = contribution_screenshots.publish(
+      repo, diff_path.with_suffix(".json"), screenshots,
+      assets_repo=assets_repo, branch=branch, author=author,
+      reuse_commit=(
+        str(prior.get("commit") or "") or None
+        if prior.get("repo") == assets_repo else None
+      ),
+    )
+    resolved = contribution_screenshots.resolve_body(
+      body, screenshots, assets_repo=assets_repo, commit=commit, branch=branch,
+    )
+  except ContributionSubmitError as exc:
+    raise _git_ops._merge_error_patch(exc, record_patch) from exc
+  record_patch = _git_ops._record_patch_with(record_patch, {
+    "last_submit_screenshots": {"repo": assets_repo, "commit": commit},
+  })
+  return resolved, record_patch
+
+
 def _submit_prepared_pr(
   record: dict,
   diff_path: Path,
@@ -3837,6 +3914,16 @@ def _submit_prepared_pr(
         ) == push_source_sha
       except (ContributionSubmitError, subprocess.TimeoutExpired, OSError):
         return None
+
+    screenshots = contribution_screenshots.plan_entries(plan)
+    if screenshots:
+      body, record_patch = _publish_reviewed_screenshots(
+        record, diff_path, repo, screenshots, body,
+        upstream_repo=upstream_repo, login=login, branch=branch,
+        author=(author_name, author_email),
+        is_update=expected_existing_pr_number is not None,
+        record_patch=record_patch,
+      )
 
     if same_repo_submission:
       try:
@@ -4429,6 +4516,10 @@ def _preflight_prepared_stack(
       _git_ops._git(repo, "checkout", "-q", branch)
       _git_ops._assert_clean_worktree(repo)
       _git_ops._assert_fresh(record, row["diff_path"], repo, branch)
+      contribution_screenshots.verify(
+        Path(row["diff_path"]).with_suffix(".json"),
+        contribution_screenshots.plan_entries(plan),
+      )
       _git_ops._assert_coauthor_trailer(repo, branch, record)
       # This runs under the complete review/source lock set acquired by the
       # route. It is the last local-source boundary before any stack layer can

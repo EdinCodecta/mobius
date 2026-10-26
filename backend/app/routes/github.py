@@ -36,7 +36,7 @@ from typing import Literal
 from urllib.parse import quote
 from weakref import WeakValueDictionary
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -47,6 +47,7 @@ from app import (
   app_git,
   contribution_assignments,
   contribution_runtime,
+  contribution_screenshots,
   contribution_staging,
   fs_locks,
   github_auth,
@@ -833,6 +834,14 @@ def _assert_confirmed_publication(
   )
 
 
+class ContributionScreenshotItem(BaseModel):
+  """One PNG the description shows as ``![alt](screenshot:NAME)``."""
+
+  name: str
+  path: str
+  alt: str
+
+
 class ContributionStageBody(BaseModel):
   """What an agent supplies to stage a review branch; Git supplies the rest.
 
@@ -860,6 +869,8 @@ class ContributionStageBody(BaseModel):
   labels: list[str] | None = None
   prior_work: dict | None = None
   coauthor_trailer: Literal[False] | None = None
+  # Replaces the attached screenshots; [] removes them, None keeps them.
+  screenshots: list[ContributionScreenshotItem] | None = None
 
 
 class ContributionReviewBody(BaseModel):
@@ -1805,6 +1816,7 @@ def _stage_inputs(
     action = "pr_update"
   if action == "pr_update" and (
     body.title is not None or body.body_draft is not None
+    or body.screenshots
   ):
     raise ContributionSubmitError(
       "An open pull request's title and description are edited on GitHub "
@@ -1864,6 +1876,7 @@ def _source_contains(record: dict) -> bool:
 
 def _stage_record(
   record_id: str,
+  record_path: Path,
   previous: dict | None,
   body: ContributionStageBody,
   inputs: dict,
@@ -1894,6 +1907,18 @@ def _stage_record(
   if live is not None:
     plan["title"], plan["body_draft"] = live["title"], live["body"]
     plan["pr_metadata"] = {"old_title": live["title"], "old_body": live["body"]}
+    plan.pop("screenshots", None)
+  elif body.screenshots is not None:
+    plan["screenshots"] = contribution_screenshots.stage(
+      record_path, [item.model_dump() for item in body.screenshots],
+      str(plan.get("body_draft") or ""),
+    )
+  else:
+    contribution_screenshots.check_references(
+      contribution_screenshots.plan_entries(plan), str(plan.get("body_draft") or ""),
+    )
+  if not contribution_screenshots.plan_entries(plan):
+    plan.pop("screenshots", None)
   source_repo = inputs["source_repo"]
   plan.update({
     "action": inputs["action"],
@@ -2068,13 +2093,53 @@ async def stage_contribution(
         await source_locks.enter_async_context(fs_locks.source_dir_lock(lock_path))
       try:
         record, candidate = await settled.run_settled(
-          _stage_record, record_id, previous, body, inputs, principal,
+          _stage_record, record_id, record_path, previous, body, inputs,
+          principal,
         )
       except ContributionSubmitError as exc:
         raise _stage_error(exc) from exc
       atomic_write(diff_path, candidate.diff)
       _write_record(record_path, record)
+      contribution_screenshots.prune(
+        record_path, contribution_screenshots.plan_entries(record["plan"]),
+      )
   return {"record": record, "source_sync": record["source_sync"]}
+
+
+@router.get("/contributions/{app_id}/{record_id}/screenshots/{name}")
+@_limiter.limit("120/minute")
+async def contribution_screenshot(
+  request: Request,
+  app_id: int,
+  record_id: str,
+  name: str,
+  db: Session = Depends(get_db),
+  principal: Principal = Depends(get_principal),
+):
+  """One attached screenshot of a prepared PR, exactly as it was approved."""
+  _validate_submit_app(app_id, principal, db)
+  db.close()
+  if not _CONTRIBUTION_ID.fullmatch(record_id):
+    raise HTTPException(status_code=422, detail="Invalid contribution id.")
+  record_path, _ = _record_paths(app_id, record_id)
+  async with fs_locks.app_storage_lock(app_id):
+    plan = _read_record(record_path).get("plan")
+    entries = contribution_screenshots.plan_entries(
+      plan if isinstance(plan, dict) else {},
+    )
+    entry = next((item for item in entries if item.get("name") == name), None)
+    if entry is None:
+      raise HTTPException(status_code=404, detail="Screenshot not found.")
+    try:
+      data = contribution_screenshots.approved_bytes(record_path, entry)
+    except ContributionSubmitError as exc:
+      raise HTTPException(status_code=404, detail=exc.message) from exc
+  return Response(
+    content=data, media_type="image/png",
+    # Keyed by name, which a restage can point at new bytes: never let a
+    # cached copy stand in for the image the owner is approving.
+    headers={"Cache-Control": "no-store"},
+  )
 
 
 @router.post(
