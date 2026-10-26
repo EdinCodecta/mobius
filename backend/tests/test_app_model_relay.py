@@ -1,13 +1,15 @@
 """App model providers reach their company only through the loopback model relay."""
 
 import json
+import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import pytest
 from starlette.requests import Request
 
-from app import models, providers
+from app import app_consent, models, providers
 from app.app_capabilities import contract_from_manifest
 from app.config import get_settings
 from app.manifest_contract import ManifestContractError, validate_manifest_contract
@@ -111,7 +113,17 @@ def test_relay_checks_token_then_forwards_normalized_body_with_real_key(
     return httpx.Response(200, headers={"content-type": "text/event-stream"},
                           content=b"event: message_stop\ndata: {}\n\n")
 
-  monkeypatch.setattr(model_relay, "_is_direct_loopback", lambda _request: True)
+  from app import app_secret_crypto
+  real_decrypt = app_secret_crypto.decrypt_app_secret
+  decrypt_threads = []
+
+  def decrypt_once(path):
+    decrypt_threads.append(threading.get_ident())
+    return real_decrypt(path)
+
+  monkeypatch.setattr(app_secret_crypto, "decrypt_app_secret", decrypt_once)
+  monkeypatch.setattr(model_relay, "_is_direct_loopback",
+                      lambda _request: seen.update(relay_thread=threading.get_ident()) or True)
   monkeypatch.setattr(model_relay, "_http_client", httpx.AsyncClient(transport=httpx.MockTransport(upstream)))
   path = f"/api/model-relay/{provider_id}/v1/messages?beta=true"
   body = {"model": "example/flash", "messages": [
@@ -124,7 +136,8 @@ def test_relay_checks_token_then_forwards_normalized_body_with_real_key(
     assert client.post(path, json=body, headers={"x-api-key": "wrong"}).status_code == 401
     missing_key = client.post(path, json=body, headers=token)
     assert missing_key.status_code == 403
-    assert seen == {}
+    assert "url" not in seen
+    assert decrypt_threads == []
 
     _write_secret(Path(data_dir) / "app-secrets" / str(app.id) / "api_key", REAL_KEY)
     relayed = client.post(path, json=body, headers=token)
@@ -133,9 +146,178 @@ def test_relay_checks_token_then_forwards_normalized_body_with_real_key(
     assert relayed.content == b"event: message_stop\ndata: {}\n\n"
     assert seen["url"] == "https://models.example.com/v1/messages?beta=true"
     assert seen["key"] == REAL_KEY
+    assert len(decrypt_threads) == 1
+    assert decrypt_threads[0] != seen["relay_thread"]
     assert seen["body"]["messages"] == [{"role": "user", "content": [
       {"type": "text", "text": "hi"}, {"type": "text", "text": "env"},
     ]}]
+  finally:
+    providers.invalidate_model_cache()
+
+
+def test_store_model_relay_refuses_dormant_and_stale_access_before_using_saved_key(
+  client, db, monkeypatch,
+):
+  app = models.App(
+    name="Messages Connect", slug="messages-consent", description="",
+    source_dir="/tmp/messages-consent", manifest_url="https://store.example/app.json",
+    capability_contract=contract_from_manifest(_manifest()),
+  )
+  db.add(app)
+  db.commit()
+  data_dir = get_settings().data_dir
+  _write_secret(Path(data_dir) / "app-secrets" / str(app.id) / "api_key", REAL_KEY)
+  monkeypatch.setattr(model_relay, "_is_direct_loopback", lambda _request: True)
+  seen = []
+  monkeypatch.setattr(model_relay, "_http_client", httpx.AsyncClient(
+    transport=httpx.MockTransport(lambda request: seen.append(request) or httpx.Response(200)),
+  ))
+  provider_id = f"app-{app.id}"
+  path = f"/api/model-relay/{provider_id}/v1/messages"
+  headers = {"x-api-key": providers.model_relay_token(provider_id)}
+  body = {"model": "example/flash", "messages": []}
+
+  def relay():
+    return client.post(path, json=body, headers=headers)
+
+  try:
+    monkeypatch.setattr(providers, "_app_providers_fresh", lambda: True)
+    providers.sync_app_model_providers(data_dir, force=True)
+    assert relay().status_code == 404  # unaccepted Store app is not in the picker
+    assert seen == []
+
+    assert app_consent.accept(app, app_consent.request_digest(app_consent.current_rows(app)))
+    db.commit()
+    providers.sync_app_model_providers(data_dir, force=True)
+    stale_provider = providers.PROVIDERS[provider_id]
+    headers["x-api-key"] = stale_provider.relay_token()
+    assert relay().status_code == 200
+    assert len(seen) == 1
+
+    app_consent.revoke(app)
+    db.commit()
+    # The registry still holds this object inside its one-second refresh window.
+    from app import app_secret_crypto
+    decrypted = []
+    with monkeypatch.context() as patch:
+      patch.setattr(app_secret_crypto, "decrypt_app_secret",
+                    lambda _path: decrypted.append(_path) or REAL_KEY)
+      assert stale_provider.check_auth(data_dir) is not None
+      assert relay().status_code == 403
+    assert decrypted == []
+    assert len(seen) == 1
+    providers.sync_app_model_providers(data_dir, force=True)
+    assert provider_id not in providers.PROVIDERS
+
+    assert app_consent.accept(app, app_consent.request_digest(app_consent.current_rows(app)))
+    db.commit()
+    providers.sync_app_model_providers(data_dir, force=True)
+    headers["x-api-key"] = providers.PROVIDERS[provider_id].relay_token()
+    assert relay().status_code == 200
+    assert len(seen) == 2
+
+    from app import database
+    with monkeypatch.context() as patch:
+      patch.setattr(database, "SessionLocal", lambda: (_ for _ in ()).throw(OSError("read failed")))
+      assert relay().status_code == 403
+    assert len(seen) == 2
+
+    # A wider reviewed contract needs a new answer, even while the old object
+    # and relay token remain in memory.
+    app.capability_contract = {**app.capability_contract,
+                               "data": {**app.capability_contract.get("data", {}),
+                                        "manage_apps": True}}
+    db.commit()
+    assert relay().status_code == 403
+    assert len(seen) == 2
+    providers.sync_app_model_providers(data_dir, force=True)
+    assert provider_id not in providers.PROVIDERS
+    assert app_consent.accept(app, app_consent.request_digest(app_consent.current_rows(app)))
+    db.commit()
+    providers.sync_app_model_providers(data_dir, force=True)
+    headers["x-api-key"] = providers.PROVIDERS[provider_id].relay_token()
+    assert relay().status_code == 200
+    assert len(seen) == 3
+  finally:
+    providers.invalidate_model_cache()
+
+
+@pytest.mark.parametrize("protocol,path,key_name", [
+  ("anthropic_messages", "messages", "ANTHROPIC_API_KEY"),
+  ("responses", "responses", "MOBIUS_APP_MODEL_KEY"),
+])
+@pytest.mark.parametrize("manifest_url", ["https://store.example/app.json", ""])
+def test_store_reacceptance_never_revives_old_relay_token(
+  client, db, monkeypatch, protocol, path, key_name, manifest_url,
+):
+  manifest = _manifest(protocol=protocol)
+  app = models.App(
+    name="Renewed Connect", slug=f"renewed-{path}", description="",
+    source_dir=f"/tmp/renewed-{path}", manifest_url=manifest_url,
+    capability_contract=contract_from_manifest(manifest),
+  )
+  assert app_consent.accept(app, app_consent.request_digest(app_consent.current_rows(app)))
+  db.add(app)
+  db.commit()
+  data_dir = get_settings().data_dir
+  provider_id = f"app-{app.id}"
+  _write_secret(Path(data_dir) / "app-secrets" / str(app.id) / "api_key", REAL_KEY)
+  monkeypatch.setattr(model_relay, "_is_direct_loopback", lambda _request: True)
+  seen = []
+  monkeypatch.setattr(model_relay, "_http_client", httpx.AsyncClient(
+    transport=httpx.MockTransport(lambda request: seen.append(request) or httpx.Response(200)),
+  ))
+
+  def token(provider):
+    env = provider.build_env({}, data_dir)
+    return env[key_name if path == "messages" else f"{key_name}_{app.id}"]
+
+  def relay(value):
+    header = "x-api-key" if path == "messages" else "authorization"
+    presented = value if path == "messages" else f"Bearer {value}"
+    return client.post(f"/api/model-relay/{provider_id}/v1/{path}",
+                       json={"model": "example/flash"}, headers={header: presented})
+
+  try:
+    providers.sync_app_model_providers(data_dir, force=True)
+    monkeypatch.setattr(providers, "_app_providers_fresh", lambda: True)
+    old_provider = providers.PROVIDERS[provider_id]
+    old_token = token(old_provider)
+    assert relay(old_token).status_code == 200
+    app_consent.revoke(app)
+    db.commit()
+    assert relay(old_token).status_code == 403
+    assert app_consent.accept(app, app_consent.request_digest(app_consent.current_rows(app)))
+    db.commit()
+    assert old_provider.check_auth(data_dir) is not None
+    assert relay(old_token).status_code == 403  # stale object before registry refresh
+    providers.sync_app_model_providers(data_dir, force=True)
+    new_provider = providers.PROVIDERS[provider_id]
+    new_token = token(new_provider)
+    assert relay(old_token).status_code == 401
+    assert relay(new_token).status_code == 200
+    assert len(seen) == 2
+
+    app.capability_contract = {**app.capability_contract, "model_provider": {
+      **app.capability_contract["model_provider"],
+      "base_url": "https://replacement.example.com",
+    }}
+    db.commit()
+    assert new_provider.check_auth(data_dir) is not None
+    assert relay(new_token).status_code == 403
+    providers.sync_app_model_providers(data_dir, force=True)
+    replacement_token = token(providers.PROVIDERS[provider_id])
+    assert replacement_token != new_token
+    assert relay(new_token).status_code == 401
+    assert relay(replacement_token).status_code == 200
+    assert len(seen) == 3
+
+    app.deleted_at = datetime.now(UTC)
+    db.commit()
+    assert relay(replacement_token).status_code == 403
+    providers.sync_app_model_providers(data_dir, force=True)
+    assert relay(replacement_token).status_code == 404
+    assert len(seen) == 3
   finally:
     providers.invalidate_model_cache()
 
@@ -386,9 +568,10 @@ def relay_connection(monkeypatch, tmp_path):
   """Synthetic accepted connection without a real upstream or credential."""
   adapter = providers.AppModelProvider(4242, _manifest()["model_provider"])
   monkeypatch.setitem(providers.PROVIDERS, "app-4242", adapter)
-  monkeypatch.setattr(providers, "sync_app_model_providers", lambda *_: None)
-  monkeypatch.setattr(adapter, "check_auth", lambda *_: None)
-  monkeypatch.setattr("app.app_secret_crypto.decrypt_app_secret", lambda *_: REAL_KEY)
+  async def no_registry_refresh(*_args, **_kwargs):
+    return None
+  monkeypatch.setattr(providers, "refresh_app_model_providers", no_registry_refresh)
+  monkeypatch.setattr(adapter, "read_relay_key", lambda *_: providers.RelayKeyRead(REAL_KEY, None))
 
   async def receive():
     return {"type": "http.request", "body": b'{}', "more_body": False}

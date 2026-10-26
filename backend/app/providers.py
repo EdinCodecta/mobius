@@ -32,9 +32,10 @@ import shutil
 import stat
 import threading
 import time
+from types import SimpleNamespace
 import uuid
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, NamedTuple, Protocol
 
 from app.storage_io import atomic_write
 
@@ -1195,7 +1196,7 @@ class MobiusProvider(BaseProvider):
     return env
 
 
-def model_relay_token(provider_id: str) -> str:
+def model_relay_token(provider_id: str, consent_scope: str | None = None) -> str:
   """Local credential the agent presents to the model relay for one provider.
 
   Derived from the server secret, so it needs no storage and survives restarts,
@@ -1205,9 +1206,15 @@ def model_relay_token(provider_id: str) -> str:
   from app.config import get_settings
   return hmac.new(
     get_settings().secret_key.encode(),
-    f"mobius-model-relay:v1:{provider_id}".encode(),
+    f"mobius-model-relay:v1:{provider_id}:{consent_scope}".encode()
+    if consent_scope is not None else f"mobius-model-relay:v1:{provider_id}".encode(),
     hashlib.sha256,
   ).hexdigest()
+
+
+class RelayKeyRead(NamedTuple):
+  key: str | None
+  unavailable: str | None
 
 
 class AppModelProvider(BaseProvider):
@@ -1219,9 +1226,12 @@ class AppModelProvider(BaseProvider):
   and repairs request shapes compatible providers reject.
   """
 
-  def __init__(self, app_id: int, declaration: dict[str, Any]):
+  def __init__(self, app_id: int, declaration: dict[str, Any], consent_scope: str | None = None):
     self.app_id = app_id
     self.declaration = declaration
+    # Bound to the acceptance observed by the registry. A stale provider must
+    # never mint a credential for a later acceptance of the same declaration.
+    self.consent_scope = consent_scope
     self.name = declaration["name"]
     self.auth_dir = f"app-{app_id}"
     self.protocol = declaration.get("protocol", "responses")
@@ -1233,21 +1243,35 @@ class AppModelProvider(BaseProvider):
     ) or frozenset({"low", "medium", "high"})
 
   def check_auth(self, data_dir: str) -> str | None:
+    return self.read_relay_key(data_dir).unavailable
+
+  def read_relay_key(self, data_dir: str) -> RelayKeyRead:
+    """Resolve current authorization and the saved key in one blocking read.
+
+    The relay runs this in a worker; a stale registry object or failed consent
+    read must be refused before touching the encrypted app secret.
+    """
     if not provider_enabled(data_dir, f"app-{self.app_id}"):
-      return f"{self.name} is turned off in its app."
+      return RelayKeyRead(None, f"{self.name} is turned off in its app.")
+    if not _app_model_declaration_usable(self.app_id, self.declaration, self.consent_scope):
+      return RelayKeyRead(None, f"{self.name} is unavailable until its app's model access is accepted.")
     path = Path(data_dir) / "app-secrets" / str(self.app_id) / self.declaration["secret_name"]
     if not path.is_file():
-      return f"Connect {self.name} in its app to use these models."
+      return RelayKeyRead(None, f"Connect {self.name} in its app to use these models.")
     try:
       from app.app_secret_crypto import decrypt_app_secret
-      if decrypt_app_secret(path).strip():
-        return None
+      key = decrypt_app_secret(path).strip()
+      if key:
+        return RelayKeyRead(key, None)
     except Exception:
       pass
-    return f"Reconnect {self.name} in its app; its saved key is unavailable."
+    return RelayKeyRead(None, f"Reconnect {self.name} in its app; its saved key is unavailable.")
 
   async def fetch_models(self, data_dir: str) -> list[Any]:
     return self.declaration["models"]
+
+  def relay_token(self) -> str:
+    return model_relay_token(f"app-{self.app_id}", self.consent_scope)
 
   def measured_run_accounting(self, cost_usd, usage):
     # The engines price tokens at their own vendor's rates, meaningless for
@@ -1315,7 +1339,7 @@ class AppModelProvider(BaseProvider):
     env["no_proxy"] = no_proxy
     if self.protocol == "anthropic_messages":
       return self._claude_relay_env(env, data_dir, chat_id)
-    env[f"MOBIUS_APP_MODEL_KEY_{self.app_id}"] = model_relay_token(f"app-{self.app_id}")
+    env[f"MOBIUS_APP_MODEL_KEY_{self.app_id}"] = self.relay_token()
     # Isolate custom-provider threads and auth from the owner's Codex login.
     home = Path(data_dir) / "apps" / str(self.app_id) / "model-runtime"
     home.mkdir(parents=True, exist_ok=True)
@@ -1327,7 +1351,6 @@ class AppModelProvider(BaseProvider):
 
   def _claude_relay_env(self, env, data_dir, chat_id):
     """Point the Claude engine at the loopback relay with a relay-only token."""
-    provider_id = f"app-{self.app_id}"
     # Own config dir: sessions and settings never mix with the owner's Claude
     # sign-in, which must not be used for another company's models.
     home = Path(data_dir) / "apps" / str(self.app_id) / "model-runtime" / "claude"
@@ -1350,7 +1373,7 @@ class AppModelProvider(BaseProvider):
       env[name] = ""
     env.update(CLAUDE_CLI_POLICY_ENV)
     env["ANTHROPIC_BASE_URL"] = self._relay_base_url()
-    env["ANTHROPIC_API_KEY"] = model_relay_token(provider_id)
+    env["ANTHROPIC_API_KEY"] = self.relay_token()
     # Background and alias model slots must resolve to this provider's models;
     # Anthropic model ids would be unknown to it.
     default_model = self.declaration["default_model"]
@@ -1408,7 +1431,7 @@ def sync_app_model_providers(data_dir: str, *, force: bool = False) -> None:
     _apply_app_model_declarations(_read_app_model_declarations())
 
 
-async def refresh_app_model_providers(data_dir: str) -> None:
+async def refresh_app_model_providers(data_dir: str, *, force: bool = False) -> None:
   """``sync_app_model_providers`` for async callers, with the read off-loop.
 
   The declaration query froze the event loop for seconds on a saturated disk.
@@ -1416,35 +1439,95 @@ async def refresh_app_model_providers(data_dir: str) -> None:
   on the loop.
   """
   async with _app_provider_refresh_lock:
-    if not _app_providers_fresh():
+    if force or not _app_providers_fresh():
       declarations = await asyncio.to_thread(_read_app_model_declarations)  # unsettled: read-only (app declarations)
       _apply_app_model_declarations(declarations)
 
 
-def _read_app_model_declarations() -> list[tuple[Any, dict]] | None:
+def _read_app_model_declarations() -> list[tuple[Any, dict, str | None]] | None:
   """Accepted app model declarations as plain data; safe in a worker."""
   try:
     from app import models
     from app.database import SessionLocal
     with SessionLocal() as db:
-      # Only the contract column: full App rows carry source and icon blobs
-      # (megabytes across installs) and this runs about once a second.
-      rows = db.query(models.App.id, models.App.capability_contract).filter(
+      # Project only consent fields and the contract, never app source/icon
+      # blobs; this refresh runs about once a second.
+      rows = db.query(
+        models.App.id, models.App.capability_contract, models.App.manifest_url,
+        models.App.accepted_consent, models.App.project_templates_json,
+      ).filter(
         models.App.deleted_at.is_(None)
       ).all()
       return [
-        (app_id, contract["model_provider"])
-        for app_id, contract in rows
+        (app_id, contract["model_provider"],
+         _app_model_relay_scope(contract, manifest_url, accepted_consent))
+        for app_id, contract, manifest_url, accepted_consent, project_templates in rows
         if isinstance(contract, dict)
         and isinstance(contract.get("model_provider"), dict)
+        and (
+          contract["model_provider"].get("transport") == "identity_broker"
+          or not _app_model_consent_dormant(
+            contract, manifest_url, accepted_consent, project_templates,
+          )
+        )
       ]
   except Exception as exc:
     _model_registry_log.warning("app model registry read failed: %s", exc)
     return None
 
 
+def _app_model_consent_dormant(contract, manifest_url, accepted_consent, project_templates) -> bool:
+  from app import app_consent
+  return app_consent.dormant(SimpleNamespace(
+    capability_contract=contract, manifest_url=manifest_url,
+    accepted_consent=accepted_consent, project_templates_json=project_templates,
+  ))
+
+
+def _app_model_relay_scope(contract, manifest_url, accepted_consent) -> str | None:
+  """Bind Store credentials to both the acceptance and reviewed endpoint."""
+  if manifest_url is None:
+    return None  # Local apps retain their existing provider-id-only token.
+  accepted_id = accepted_consent.get("id") if isinstance(accepted_consent, dict) else None
+  declaration = contract.get("model_provider") if isinstance(contract, dict) else None
+  fingerprint = hashlib.sha256(json.dumps(declaration, sort_keys=True).encode()).hexdigest()
+  return f"{accepted_id or ''}:{fingerprint}"
+
+
+def _app_model_declaration_usable(
+  app_id: int, declaration: dict, consent_scope: str | None,
+) -> bool:
+  """Fail closed for stale provider objects, consent changes, and read errors.
+
+  A registry snapshot is deliberately throttled; it cannot authorize a new
+  relay request after revocation or contract replacement.
+  """
+  try:
+    from app import models
+    from app.database import SessionLocal
+    with SessionLocal() as db:
+      row = db.query(
+        models.App.capability_contract, models.App.manifest_url,
+        models.App.accepted_consent, models.App.project_templates_json,
+      ).filter(models.App.id == app_id, models.App.deleted_at.is_(None)).one_or_none()
+    if row is None:
+      return False
+    contract, manifest_url, accepted_consent, project_templates = row
+    return (
+      isinstance(contract, dict)
+      and contract.get("model_provider") == declaration
+      and not _app_model_consent_dormant(
+        contract, manifest_url, accepted_consent, project_templates,
+      )
+      and _app_model_relay_scope(contract, manifest_url, accepted_consent) == consent_scope
+    )
+  except Exception as exc:
+    _model_registry_log.warning("app model authorization read failed: %s", exc)
+    return False
+
+
 def _apply_app_model_declarations(
-  declarations: list[tuple[Any, dict]] | None,
+  declarations: list[tuple[Any, dict, str | None]] | None,
 ) -> None:
   """Apply one completed load; a failed read keeps the current registry."""
   global _app_provider_sync_at
@@ -1452,7 +1535,7 @@ def _apply_app_model_declarations(
   if declarations is None:
     return
   next_ids: set[str] = set()
-  native_match = next(((app_id, declaration) for app_id, declaration in declarations
+  native_match = next(((app_id, declaration) for app_id, declaration, _ in declarations
                        if declaration.get("transport") == "identity_broker"), None)
   native_id, native = native_match if native_match else (None, None)
   mobius = PROVIDERS["mobius"]
@@ -1468,7 +1551,7 @@ def _apply_app_model_declarations(
   claimed_models = {mid for key, ids in KNOWN_MODELS.items() if key != "mobius" for mid in ids}
   if native:
     claimed_models.update(model["id"] for model in native["models"])
-  for app_id, declaration in declarations:
+  for app_id, declaration, consent_scope in declarations:
     if declaration.get("transport") == "identity_broker":
       continue
     provider_id = f"app-{app_id}"
@@ -1482,8 +1565,9 @@ def _apply_app_model_declarations(
     next_ids.add(provider_id)
     claimed_models.update(model_ids)
     current = PROVIDERS.get(provider_id)
-    if not isinstance(current, AppModelProvider) or current.declaration != declaration:
-      PROVIDERS[provider_id] = AppModelProvider(app_id, declaration)
+    if (not isinstance(current, AppModelProvider) or current.declaration != declaration
+        or current.consent_scope != consent_scope):
+      PROVIDERS[provider_id] = AppModelProvider(app_id, declaration, consent_scope)
       _model_registry_cache.pop(provider_id, None)
     DEFAULT_MODELS[provider_id] = declaration["default_model"]
     DEFAULT_BACKGROUND_MODELS[provider_id] = declaration["default_model"]
@@ -2378,7 +2462,7 @@ async def list_models(
   KNOWN_MODELS fallback for both.
   """
 
-  sync_app_model_providers(data_dir, force=force_refresh)
+  await refresh_app_model_providers(data_dir, force=force_refresh)
 
   # Serve cached reads (fresh or stale, unless forced) without taking a
   # lock. Only providers with no catalog go through _fetch_model_entries

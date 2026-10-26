@@ -20,7 +20,6 @@ import json
 import logging
 from dataclasses import dataclass
 from http.cookiejar import CookieJar, DefaultCookiePolicy
-from pathlib import Path
 from typing import Any, Callable
 
 import anyio
@@ -239,28 +238,25 @@ async def relay_responses(provider_id: str, request: Request):
 
 
 async def _relay(provider_id: str, request: Request, protocol_name: str):
-  from app.app_secret_crypto import decrypt_app_secret
   from app.config import get_settings
   from app.providers import (
-    AppModelProvider, PROVIDERS, model_relay_token, sync_app_model_providers,
+    AppModelProvider, PROVIDERS, refresh_app_model_providers,
   )
 
   protocol = _PROTOCOLS[protocol_name]
   if not _is_direct_loopback(request):
     return protocol.error(404, "not_found_error", "Not found.")
   data_dir = get_settings().data_dir
-  sync_app_model_providers(data_dir)
+  await refresh_app_model_providers(data_dir)
   provider = PROVIDERS.get(provider_id)
   if not isinstance(provider, AppModelProvider) or provider.protocol != protocol_name:
     return protocol.error(404, "not_found_error", "This model connection is not installed.")
-  if not hmac.compare_digest(_presented_token(request), model_relay_token(provider_id)):
+  if not hmac.compare_digest(_presented_token(request), provider.relay_token()):
     return protocol.error(401, "authentication_error", "Invalid model relay token.")
-  unavailable = provider.check_auth(data_dir)
-  if unavailable:
-    return protocol.error(403, "permission_error", unavailable)
-  key = decrypt_app_secret(
-    Path(data_dir) / "app-secrets" / str(provider.app_id) / provider.declaration["secret_name"],
-  ).strip()
+  credential = await anyio.to_thread.run_sync(provider.read_relay_key, data_dir)
+  if credential.unavailable or credential.key is None:
+    return protocol.error(403, "permission_error", credential.unavailable or "Model key unavailable.")
+  key = credential.key
 
   body = await request.body()
   try:
