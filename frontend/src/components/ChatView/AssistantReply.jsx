@@ -142,7 +142,7 @@ function AssistantReply({
       copy={button => renderedReplyClipboard(
         button.closest('.chat__reply'), rows.map(row => row.key), outcome.parts,
       )}
-      onTryAgain={outcome.failed ? undefined : onTryAgain}
+      onTryAgain={outcome.failed || !onTryAgain ? undefined : () => onTryAgain(metaKey)}
       side="start"
       visible={metaVisible}
     />}

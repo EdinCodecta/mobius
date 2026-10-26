@@ -173,6 +173,7 @@ import { composerHistoryFromMessages } from './composerHistory.js'
 import { createQueuedEditOrder } from './queuedEditOrder.js'
 import { createFileDragHandlers } from './dragUpload.js'
 import {
+  detachedSendFailureMessage,
   isAmbiguousSendFailure,
   isModelSelectionRequiredFailure,
   isPendingQuestionSendFailure,
@@ -236,6 +237,7 @@ import {
 import { cidOf } from './messageIdentity.js'
 import {
   cidForSendAttempt,
+  mintSendCid,
   sendDraftIdentity,
 } from './sendAttemptIdentity.js'
 import {
@@ -836,7 +838,7 @@ export default function ChatView({
 
   const showMessageMeta = useCallback((event, key) => {
     if (event.defaultPrevented) return
-    if (event.target.closest?.('button, a, input, textarea, select, [role="button"]')) return
+    if (event.target.closest?.('button, a, input, textarea, select, summary, [role="button"]')) return
     if (window.getSelection?.()?.toString()) return
     if (messageMetaTimerRef.current) clearTimeout(messageMetaTimerRef.current)
     setVisibleMessageMetaKey(key)
@@ -3194,8 +3196,10 @@ export default function ChatView({
     // claim scroll ownership, or freeze queue geometry when nothing will send.
     const usesComposerFiles = !Array.isArray(opts.attachments)
     // A send the owner triggers from elsewhere (a reply's Try again) carries
-    // its own text: the composer's draft is not its payload, so the send
-    // neither clears it nor restores the sent text into it on failure.
+    // its own text and cid: the composer's draft is not its payload, so the
+    // send neither clears it, nor restores the sent text into it on failure,
+    // nor reads or writes the failed-attempt record that belongs to that draft
+    // (an unclear failure then only refreshes the transcript).
     const takesComposerDraft = opts.fromComposer !== false
     const composerFileSnapshot = usesComposerFiles ? [...pendingFiles] : []
     const attachments = Array.isArray(opts.attachments)
@@ -3213,7 +3217,7 @@ export default function ChatView({
 
     // Stop voice recognition so a late onresult doesn't refill input
     // after we clear it.
-    if (listeningRef.current) stopVoiceRef.current?.()
+    if (takesComposerDraft && listeningRef.current) stopVoiceRef.current?.()
 
     // Resolve the ONE direct/queued/steered pin rule BEFORE blurring the
     // textarea. Physical-tail geometry is authoritative; mode can lag a
@@ -3275,6 +3279,15 @@ export default function ChatView({
       if (takesComposerDraft) restoreComposerText(text, { preserveFailedAttempt: true })
       if (usesComposerFiles) restoreFiles(composerFileSnapshot)
     }
+    function clearComposerFailedAttempt() {
+      if (takesComposerDraft) clearFailedAttempt()
+    }
+    function failureMessage(err) {
+      const online = getOnlineSnapshot()
+      return takesComposerDraft
+        ? sendFailureMessage(err, { online })
+        : detachedSendFailureMessage(err, { online })
+    }
 
     function revealPendingQuestion() {
       // The 409 is authoritative proof that the durable question barrier owns
@@ -3289,13 +3302,13 @@ export default function ChatView({
     // server may have accepted it, an unchanged restored draft reuses that cid
     // and lets the backend's durable identity gate answer the ambiguity.
     const draftIdentity = sendDraftIdentity(chatId, text, attachments)
-    const cid = cidForSendAttempt({
-      failedAttempt: failedSendAttemptRef.current,
-      draftIdentity,
-      mintCid: () => ((typeof crypto !== 'undefined' && crypto.randomUUID)
-        ? crypto.randomUUID()
-        : `cid-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`),
-    })
+    const cid = takesComposerDraft
+      ? cidForSendAttempt({
+          failedAttempt: failedSendAttemptRef.current,
+          draftIdentity,
+          mintCid: mintSendCid,
+        })
+      : (opts.cid ?? mintSendCid())
 
     // ACTIVE-TURN PATH: every send gets one optimistic pending row immediately.
     // Ordinary sends present it in the queue; a direct steer reserves it in the
@@ -3362,10 +3375,10 @@ export default function ChatView({
           pendingQueue.clearInFlight(cid)
           if (result.status === 'locally_settled') void fetchMessages({ force: true, authoritative: true })
           releaseComposerFilesAfterAccepted()
-          clearFailedAttempt()
+          clearComposerFailedAttempt()
           return true
         }
-        clearFailedAttempt()
+        clearComposerFailedAttempt()
         releaseComposerFilesAfterAccepted()
         // The active-turn decision can be stale while the first POST is still
         // settling. Any successfully accepted queue result still proves this
@@ -3560,25 +3573,27 @@ export default function ChatView({
         if (keepQueued) {
           pendingQueue.clearInFlight(queuedMsg.cid)
           releaseComposerFilesAfterAccepted()
-          clearFailedAttempt()
+          clearComposerFailedAttempt()
         } else {
           // Authoritative rejection: roll back optimistic state and restore
           // the user's editable draft.
           pendingQueue.cancelByCid(queuedMsg.cid)
           forgetSendIntent({ cid: queuedMsg.cid })
-          failedAttempt = {
-            cid,
-            draftIdentity,
-            text,
-            transportContent: text,
-            attachments: composerFileSnapshot,
+          if (takesComposerDraft) {
+            failedAttempt = {
+              cid,
+              draftIdentity,
+              text,
+              transportContent: text,
+              attachments: composerFileSnapshot,
+            }
+            rememberFailedAttempt(failedAttempt)
           }
-          if (failedAttempt) rememberFailedAttempt(failedAttempt)
           restoreComposerAfterFailedSend()
         }
         setSendFailure(modelSelectionBlocked
           ? null
-          : sendFailureMessage(err, { online: getOnlineSnapshot() }))
+          : failureMessage(err))
         if (!keepQueued && isAmbiguousSendFailure(err)) {
           void settleAmbiguousSendConfirmation(failedAttempt)
         }
@@ -3683,10 +3698,10 @@ export default function ChatView({
         sendingRef.current = false
         setServerRunningState(false)
         releaseComposerFilesAfterAccepted()
-        clearFailedAttempt()
+        clearComposerFailedAttempt()
         return true
       }
-      clearFailedAttempt()
+      clearComposerFailedAttempt()
       releaseComposerFilesAfterAccepted()
       // A resolved fresh-send transport is authoritative acceptance even when
       // it reports an idempotent duplicate or a queued row. Claim the first
@@ -3789,16 +3804,18 @@ export default function ChatView({
         const { optimistic: _optimistic, ...queuedUserMsg } = userMsg
         pendingQueue.add({ ...queuedUserMsg, queued: true }, { inFlight: false })
         releaseComposerFilesAfterAccepted()
-        clearFailedAttempt()
+        clearComposerFailedAttempt()
       } else {
-        failedAttempt = {
-          cid,
-          draftIdentity,
-          text,
-          transportContent: sendText,
-          attachments: composerFileSnapshot,
+        if (takesComposerDraft) {
+          failedAttempt = {
+            cid,
+            draftIdentity,
+            text,
+            transportContent: sendText,
+            attachments: composerFileSnapshot,
+          }
+          rememberFailedAttempt(failedAttempt)
         }
-        if (failedAttempt) rememberFailedAttempt(failedAttempt)
         restoreComposerAfterFailedSend()
         // Ambiguity recovery already verified reachability and safely replayed
         // this exact cid once. If even that acknowledgement was lost, keep the
@@ -3813,7 +3830,7 @@ export default function ChatView({
       }
       setSendFailure(modelSelectionBlocked
         ? null
-        : sendFailureMessage(err, { online: getOnlineSnapshot() }))
+        : failureMessage(err))
       if (!keepQueued && isAmbiguousSendFailure(err)) {
         void settleAmbiguousSendConfirmation(failedAttempt)
       }
@@ -5982,11 +5999,19 @@ export default function ChatView({
   // Keep the identity-owned active row in its transcript slot through that
   // handoff; moving it to the tail would paint the owner message above it.
   // Replies are memoized; hand them one stable Try again that sends through
-  // the latest doSend without touching the owner's draft.
+  // the latest doSend without touching the owner's draft. A failed attempt
+  // leaves its reply the latest, and tapping again there reuses its cid: if
+  // the unconfirmed send did land, the server answers it as a duplicate
+  // instead of starting a second turn.
   const doSendRef = useRef(doSend)
   doSendRef.current = doSend
-  const handleTryAgain = useCallback(() => {
-    void doSendRef.current('Try again', { attachments: [], fromComposer: false })
+  const failedTryAgainRef = useRef(null)
+  const handleTryAgain = useCallback(async (replyKey) => {
+    const failed = failedTryAgainRef.current
+    const cid = failed?.replyKey === replyKey ? failed.cid : mintSendCid()
+    const sent = await doSendRef.current('Try again', { attachments: [], fromComposer: false, cid })
+    failedTryAgainRef.current = sent ? null : { replyKey, cid }
+    return sent
   }, [])
   const renderAssistantReply = group => {
     if (!group) return null

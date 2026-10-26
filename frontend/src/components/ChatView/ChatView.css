@@ -473,10 +473,10 @@
   pointer-events: auto;
   transition-delay: 0s;
 }
-/* With a mouse, hovering a message or reply reveals its row; touch keeps the
-   tap reveal above. Only the latest reply keeps its row visible (ChatView). */
+/* With a mouse, hovering a reply reveals its row; touch keeps the tap reveal
+   above, and owner messages keep tap only. Only the latest reply keeps its
+   row visible (ChatView). */
 @media (hover: hover) and (pointer: fine) {
-  .chat__msg:hover > .chat__msg-meta,
   .chat__reply:hover > .chat__msg-meta {
     opacity: 1;
     visibility: visible;

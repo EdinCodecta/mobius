@@ -94,15 +94,27 @@ test.describe('reply footer', () => {
         await expect(attachment).toBeVisible()
         release()
         if (rejected) {
-          await expect(f.surface.getByRole('status').filter({ hasText: 'Möbius couldn’t send the message.' })).toBeVisible()
+          const failure = f.surface.getByRole('status').filter({ hasText: 'Möbius couldn’t send the message.' })
+          await expect(failure).toBeVisible()
+          await expect(failure).not.toContainText('composer')
           await expect(f.surface.locator('.chat__msg--user').filter({ hasText: 'Try again' })).toHaveCount(0)
+          // The failed send stays retryable, under the same identity so an
+          // unconfirmed attempt that did land cannot start a second turn.
+          await f.replies.last().getByRole('button', { name: 'Try again' }).click()
+          await expect.poll(() => attempts.length).toBe(2)
+          expect(attempts[1].cid).toBe(attempts[0].cid)
+          await expect(f.composer).toHaveValue(draft)
+          // A failed Try again leaves no record that would replace the draft
+          // with its own text when the chat is opened again.
+          await page.reload({ waitUntil: 'domcontentloaded' })
+          await expect(f.replies).toHaveCount(2)
         } else {
           await expect(f.surface.getByText('Retried answer.', { exact: true })).toBeVisible()
           await expect(f.surface.locator('.chat__msg--user').last().locator('.chat__text--user')).toHaveText('Try again')
+          expect(attempts).toHaveLength(1)
         }
         await expect(f.composer).toHaveValue(draft)
         await expect(attachment).toBeVisible()
-        expect(attempts).toHaveLength(1)
       } finally { release() }
     })
   }
