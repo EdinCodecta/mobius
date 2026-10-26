@@ -296,6 +296,14 @@ class AppOut(BaseModel):
 
   @computed_field
   @property
+  def passive_block_module_digest(self) -> str | None:
+    """Pre-execution admission for this accepted applied bundle, or None."""
+    from app.app_capabilities import passive_block_module_digest
+
+    return passive_block_module_digest(self)
+
+  @computed_field
+  @property
   def frame_version(self) -> str:
     """The app frame's reload key; see app_compile_contract.app_frame_version."""
     from app.app_compile_contract import app_frame_version
@@ -928,6 +936,17 @@ class PushSubscribeRequest(BaseModel):
 
 class PushUnsubscribeRequest(BaseModel):
   endpoint: str
+
+
+class PushDeviceRequest(BaseModel):
+  """The FCM token from the mobile app's ``MobiusNative.registerPush()``.
+
+  FCM tokens are printable ASCII without spaces; this bounds what the relay is
+  handed without encoding today's token format. Other fields the app returns
+  (``platform``, APNs details) are ignored: the relay delivers through FCM.
+  """
+
+  token: str = Field(pattern=r"^[\x21-\x7e]{1,4096}$")
 
 
 class NotificationAction(BaseModel):
