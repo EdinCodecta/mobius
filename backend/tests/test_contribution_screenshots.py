@@ -704,3 +704,11 @@ def test_a_fork_send_resolves_the_fork_once(submit, monkeypatch):
   )
   submit["send"]("octo-org/project")
   assert submit["events"].count("fork") == 1
+
+
+def test_a_fence_closes_only_on_its_own_character_and_length():
+  shown = "![a](screenshot:x.png)"
+  body = f"````md\n```\n{shown}\n```\n{shown}\n````\n~~~~\n~~~\n{shown}\n~~~~\nThen {shown}"
+  assert shots.references(body) == ["x.png"]
+  pinned = shots.resolve_body(body, [{"name": "x.png"}], assets_repo="o/r", commit="a" * 40, branch="b")
+  assert pinned.count("screenshot:x.png") == 3
