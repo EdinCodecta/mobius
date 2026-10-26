@@ -145,6 +145,17 @@ async function copyFile(file, targetParent, targetName) {
   }
 }
 
+/**
+ * A file that changed while its old version was copied to the bin. Nothing is
+ * written then: the replacement would overwrite a version the bin never saw.
+ */
+export function changedDuringWrite(path, binned) {
+  return new FolderError(
+    'changed_during_write',
+    `"${path}" changed while it was being replaced, so nothing was written. The version from before that change is in the bin at "${binned}". Read the file again before deciding what to write.`,
+  )
+}
+
 async function binFolderOf(root) {
   return root.getDirectoryHandle(BIN_FOLDER_NAME, { create: true })
 }
@@ -168,8 +179,13 @@ async function write(root, command) {
   if (old) {
     const bin = await binFolderOf(root)
     const binName = await freeBinName(bin, name)
-    await copyFile(await old.getFile(), bin, binName)
+    const backedUp = await old.getFile()
+    await copyFile(backedUp, bin, binName)
     binned = `${BIN_FOLDER_NAME}/${binName}`
+    const current = await old.getFile()
+    if (current.lastModified !== backedUp.lastModified || current.size !== backedUp.size) {
+      throw changedDuringWrite(path, binned)
+    }
   }
   const writable = await (await parent.getFileHandle(name, { create: true })).createWritable()
   await writable.write(bytes)

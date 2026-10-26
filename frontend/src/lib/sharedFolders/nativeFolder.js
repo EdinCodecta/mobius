@@ -5,7 +5,7 @@ import {
 import {
   DEFAULT_IMAGE_EDGE, base64ToBytes, bytesToBase64, fileInfo, pageOf, readFileSlice, shrinkImage, sortEntries,
 } from './fileReads.js'
-import { ERROR_MESSAGES, MAX_WRITE_BYTES, editableSegments } from './handleFolder.js'
+import { ERROR_MESSAGES, MAX_WRITE_BYTES, changedDuringWrite, editableSegments } from './handleFolder.js'
 
 // The bridge returns at most this much per readFolderFile call.
 export const NATIVE_CHUNK_BYTES = 4 * 1024 * 1024
@@ -13,7 +13,7 @@ export const NATIVE_CHUNK_BYTES = 4 * 1024 * 1024
 const MAX_IMAGE_SOURCE_BYTES = 64 * 1024 * 1024
 const BRIDGE_CODES = new Set([
   'not_found', 'wrong_kind', 'needs_permission',
-  'exists', 'read_only', 'no_space', 'too_large', 'changed_during_move', 'original_kept',
+  'exists', 'read_only', 'no_space', 'too_large', 'changed_during_move', 'changed_during_write', 'original_kept',
 ])
 const EDIT_OPS = new Set(['write', 'move', 'mkdir', 'bin'])
 
@@ -212,8 +212,13 @@ const EDITS = {
     if (old && !command.overwrite) {
       throw new FolderError('exists', `"${path}" already exists. Use --overwrite to replace it.`)
     }
-    // Replacing keeps the old version: a copy goes to the bin before anything is written.
+    // Replacing keeps the old version: a copy goes to the bin before anything is written,
+    // and only that same version is replaced (a newer one is not, as the bin lacks it).
     const binned = old ? await copyToBin(folder, path, segments.at(-1)) : null
+    if (old) {
+      const current = await folder.entryOrNull(path)
+      if (current?.modified !== old.modified || current?.size !== old.size) throw changedDuringWrite(path, binned)
+    }
     // Canonical base64 of the checked bytes, whatever spacing the agent's text had.
     await folder.call('writeFolderFile', path, bytesToBase64(bytes), { overwrite: Boolean(old) })
     return { path, size: bytes.length, created: !old, ...(binned && { binned }) }

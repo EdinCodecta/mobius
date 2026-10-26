@@ -177,6 +177,24 @@ test('an older phone app without writes keeps its folders read only, before reac
   }
 })
 
+test('a native replace leaves alone a file that changed while it was backed up', async () => {
+  const tree = { 'todo.txt': textFile('milk') }
+  const folder = folderOver(tree)
+  const copy = bridge.copyFolderFile.bind(bridge)
+  // A synced provider saves a newer version just after the backup copy.
+  bridge.copyFolderFile = async (...args) => {
+    const result = await copy(...args)
+    tree['todo.txt'] = textFile('milk and honey', { modified: 2 })
+    return result
+  }
+  await failsWith(
+    folder.run({ op: 'write', path: 'todo.txt', content: 'eggs', overwrite: true }),
+    'changed_during_write',
+  )
+  assert.equal(new TextDecoder().decode(tree['todo.txt'].bytes), 'milk and honey')
+  assert.equal(new TextDecoder().decode(tree[BIN_FOLDER_NAME]['todo.txt'].bytes), 'milk')
+})
+
 test('a native folder shared to edit saves, moves and bins files, keeping replaced ones', async () => {
   const tree = { 'todo.txt': textFile('milk'), Notes: {} }
   const folder = folderOver(tree)
