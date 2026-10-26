@@ -33,6 +33,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from urllib.parse import urlsplit
 
 from app.storage_io import atomic_write
 
@@ -1205,12 +1206,15 @@ class AppModelProvider(BaseProvider):
       return f"{self.name} is turned off in its app."
     from app import key_vault
     # The declared secret name is the vault key the app asked for; the owner's
-    # grant to this app is what makes the models available.
-    if key_vault.app_may_use(self.app_id, self.declaration["secret_name"]):
+    # grant to this app, for the provider's own site, makes the models available.
+    if key_vault.model_provider_key_sync(
+      self.app_id, self.declaration["secret_name"], self.declaration["base_url"],
+    ):
       return None
     return (
-      f"Connect {self.name} in its app, then approve its key request in "
-      "Settings › Keys to use these models."
+      f"Connect {self.name} in its app, then approve its key request for "
+      f"{urlsplit(self.declaration['base_url']).hostname} in Settings › Keys "
+      "to use these models."
     )
 
   async def fetch_models(self, data_dir: str) -> list[Any]:
@@ -1240,7 +1244,9 @@ class AppModelProvider(BaseProvider):
 
   def build_env(self, base_env, data_dir, chat_id=None):
     from app import key_vault
-    key = key_vault.reveal_for_app_platform_use(self.app_id, self.declaration["secret_name"])
+    key = key_vault.reveal_model_provider_key(
+      self.app_id, self.declaration["secret_name"], self.declaration["base_url"],
+    )
     if not key:
       raise RuntimeError(f"{self.name}'s key is not available; check Settings › Keys.")
     env = dict(base_env)

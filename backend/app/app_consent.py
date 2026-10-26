@@ -17,6 +17,7 @@ import json
 import secrets
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy.orm import Session
 
@@ -171,10 +172,14 @@ def rows_from_contract(
       "agent_extend", "Add skills and tools to your agents",
       "Installs the skills it ships and lets agents call the tools it declares.",
     ))
-  if contract.get("model_provider"):
+  provider = contract.get("model_provider")
+  if provider:
     rows.append(_row(
       "model_provider", "Add a model provider",
-      "Adds a model provider whose requests use a secret saved in the app.",
+      "Adds a model provider served through your Möbius account."
+      if provider.get("transport") == "identity_broker" else
+      f"Adds a model provider at {urlsplit(provider.get('base_url') or '').hostname}. "
+      "Its requests use a key the app saved, or one you let it use on that site.",
     ))
   service = contract.get("service") or {}
   public = contract.get("public") or {}

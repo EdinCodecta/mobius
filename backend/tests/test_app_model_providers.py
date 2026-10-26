@@ -154,10 +154,13 @@ async def test_installed_app_models_join_chat_and_background_then_revoke(db, tmp
   # The owner approves the app's request for its declared vault key.
   from app import key_vault
   granted = {(app_id, "api_key")}
-  monkeypatch.setattr(key_vault, "app_may_use", lambda a, name: (a, name) in granted)
   monkeypatch.setattr(
-    key_vault, "reveal_for_app_platform_use",
-    lambda a, name: "test-only-placeholder-key" if (a, name) in granted else None,
+    key_vault, "model_provider_key_sync",
+    lambda a, name, base_url: name if (a, name) in granted else None,
+  )
+  monkeypatch.setattr(
+    key_vault, "reveal_model_provider_key",
+    lambda a, name, base_url: "test-only-placeholder-key" if (a, name) in granted else None,
   )
   adapter = providers.PROVIDERS[provider_id]
   assert providers.provider_runtime_kind(provider_id) == "codex_sdk"

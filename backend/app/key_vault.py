@@ -17,13 +17,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import functools
 import hashlib
+import importlib.util
 import json
 import logging
 import os
 import re
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 import httpx
@@ -172,27 +175,52 @@ def resolve_key_in(keys: list[dict], app_id: int, name: str) -> str | None:
   return None
 
 
-def granted_key_sync(app_id: int, name: str) -> str | None:
+@functools.cache
+def _vault_rules():
+  """The vault program's own destination rules (it imports only the stdlib)."""
+  spec = importlib.util.spec_from_file_location("mobius_vault_rules", VAULT_PROGRAM)
+  module = importlib.util.module_from_spec(spec)
+  sys.modules[spec.name] = module  # its dataclasses resolve their own module
+  spec.loader.exec_module(module)
+  return module
+
+
+def model_provider_key_in(keys: list[dict], app_id: int, name: str, base_url: str) -> str | None:
+  """The key an app's declared model provider may be sent with.
+
+  The platform sends the value to the provider's ``base_url`` for the app. A
+  key the app created for itself is the app's to send. A key the owner only
+  lets it borrow must also allow that destination, by the same site rule a use
+  through the vault meets: the runtime's ``POST <base_url>/responses``.
+  """
+  owned = owned_key_in(keys, app_id, name)
+  if owned is not None:
+    return owned["name"]
+  key = resolve_key_in(keys, app_id, name)
+  url = urllib.parse.urlsplit(base_url)
+  if key is None or url.scheme != "https" or url.port not in (None, 443):
+    return None
+  grants = next(k["grants"] for k in keys if k["name"] == key)
+  path = url.path.rstrip("/") + "/responses"
+  allowed = _vault_rules().site_allows(grants, url.hostname or "", "POST", path) is None
+  return key if allowed else None
+
+
+def model_provider_key_sync(app_id: int, name: str, base_url: str) -> str | None:
   try:
     keys = vault_call_sync("GET", "/keys")["keys"]
   except (VaultUnavailable, VaultRefused):
     return None
-  return resolve_key_in(keys, app_id, name)
+  return model_provider_key_in(keys, app_id, name, base_url)
 
 
-def app_may_use(app_id: int, name: str) -> bool:
-  """Whether the owner granted ``app_id`` the key its ``name`` refers to."""
-  return granted_key_sync(app_id, name) is not None
+def reveal_model_provider_key(app_id: int, name: str, base_url: str) -> str | None:
+  """The value an app's declared model runtime sends to ``base_url``.
 
-
-def reveal_for_app_platform_use(app_id: int, name: str) -> str | None:
-  """A granted key's value for platform code acting for an app.
-
-  The platform itself (not the app's code) sometimes needs the value, for
-  example to launch a model runtime an app declared. The app's grant still
-  decides, and the vault logs the read as ``platform:app-<id>``.
+  The platform itself (not the app's code) reads it; the vault logs the read
+  as ``platform:app-<id>``.
   """
-  key = granted_key_sync(app_id, name)
+  key = model_provider_key_sync(app_id, name, base_url)
   if key is None:
     return None
   try:

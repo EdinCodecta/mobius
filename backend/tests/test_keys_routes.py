@@ -32,6 +32,8 @@ SPEC.loader.exec_module(kv)
 
 DUMMY = "dummy-route-key-0123456789"
 SITE = {"host": "api.example.com", "methods": ["GET", "POST"], "paths": ["/v1/*"]}
+# A model provider an app declares; an app's own key may be sent to it.
+PROVIDER = "https://models.example.net/v1"
 
 
 class _Echo(BaseHTTPRequestHandler):
@@ -296,9 +298,9 @@ def test_saved_app_secrets_move_into_the_vault_once(client, auth, db, vault):
   assert keys[f"app{second.id}-api_key"]["grants"]["apps"] == [second.id]
   assert vault.reveal(f"app{second.id}-api_key", ("owner", "")) == "second-secret"
   # Model providers and the adapter find each app's own value by its old name.
-  assert key_vault.reveal_for_app_platform_use(second.id, "api_key") == "second-secret"
-  assert key_vault.reveal_for_app_platform_use(first.id, "api_key") == "first-secret"
-  assert key_vault.reveal_for_app_platform_use(999, "api_key") is None
+  assert key_vault.reveal_model_provider_key(second.id, "api_key", PROVIDER) == "second-secret"
+  assert key_vault.reveal_model_provider_key(first.id, "api_key", PROVIDER) == "first-secret"
+  assert key_vault.reveal_model_provider_key(999, "api_key", PROVIDER) is None
 
   # A key the owner deletes afterwards is never brought back.
   vault.revoke_key("api_key")
@@ -320,7 +322,7 @@ def test_a_purged_apps_unimported_secrets_never_reach_an_app_reusing_its_id(clie
   assert not folder.exists()
   # A new app that receives the same id inherits nothing on the next start.
   assert asyncio.run(key_vault.import_legacy_app_secrets({gone.id})) == {}
-  assert key_vault.reveal_for_app_platform_use(gone.id, "api_key") is None
+  assert key_vault.reveal_model_provider_key(gone.id, "api_key", PROVIDER) is None
   assert vault.list_keys() == []
 
 
@@ -425,7 +427,7 @@ def test_distinct_old_names_stay_distinct_keys(client, auth, db, vault):
   assert len(set(moved.values())) == 4
   for name, value in (("api.key", "dotted-value"), ("api-key", "dashed-value"),
                       (long_a, "long-a-value"), (long_b, "long-b-value")):
-    assert key_vault.reveal_for_app_platform_use(app.id, name) == value
+    assert key_vault.reveal_model_provider_key(app.id, name, PROVIDER) == value
   assert vault.reveal(long_a, ("owner", "")) == DUMMY    # the occupied names were untouched
 
 
@@ -443,4 +445,20 @@ def test_simultaneous_saves_leave_one_key_per_app_secret(client, auth, db, vault
   assert len(owned) == 1 and set(names) == {owned[0]["name"]}
   winner = vault.reveal(owned[0]["name"], ("owner", ""))
   assert winner in {f"value-{n}" for n in range(8)}
-  assert key_vault.reveal_for_app_platform_use(app.id, "provider-key") == winner
+  assert key_vault.reveal_model_provider_key(app.id, "provider-key", PROVIDER) == winner
+
+
+def test_a_borrowed_key_reaches_only_a_model_provider_on_its_sites(client, auth, db, vault):
+  app = _app(db, "router")
+  vault.put_key("shared-provider", {"value": DUMMY, "inject": ASK["inject"], "grants": {
+    "apps": [app.id], "agents": False, "sites": [SITE],
+  }})
+  reveal = key_vault.reveal_model_provider_key
+  assert reveal(app.id, "shared-provider", "https://api.example.com/v1") == DUMMY
+  # The app chooses its provider's address; the owner chose the key's sites.
+  assert reveal(app.id, "shared-provider", "https://attacker.example/v1") is None
+  assert reveal(app.id, "shared-provider", "https://api.example.com:8443/v1") is None
+  assert reveal(app.id, "shared-provider", "https://api.example.com/v2") is None
+  assert key_vault.model_provider_key_sync(app.id, "shared-provider", "https://attacker.example/v1") is None
+  other = _app(db, "bystander")
+  assert reveal(other.id, "shared-provider", "https://api.example.com/v1") is None

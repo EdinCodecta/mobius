@@ -65,6 +65,16 @@ def test_runtime_capability_wording_comes_from_the_contract():
   assert (row["title"], row["critical"]) == ("Record audio", False)
 
 
+def test_model_provider_consent_names_where_its_key_is_sent():
+  contract = _contract()
+  contract["model_provider"] = {"base_url": "https://api.example.com/v1", "secret_name": "key"}
+  (row,) = app_consent.rows_from_contract(contract)
+  assert "api.example.com" in row["text"]
+  contract["model_provider"] = {"base_url": "http://127.0.0.1:8765/v1", "transport": "identity_broker"}
+  (row,) = app_consent.rows_from_contract(contract)
+  assert "127.0.0.1" not in row["text"] and "key" not in row["text"]
+
+
 def test_unaccepted_store_app_is_dormant_until_accepted(client, owner_token, db):
   headers = _owner_headers(client, owner_token)
   app = _app(db, "newapp", contract=_contract(github_access=True))
