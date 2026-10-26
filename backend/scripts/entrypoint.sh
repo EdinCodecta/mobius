@@ -522,6 +522,14 @@ fi
 
 _own_as_mobius /data/platform 2>/dev/null || true
 
+# The import probe cannot see a crash or hang while the server starts, so
+# `admit` also refuses a commit that already failed to become ready in recent
+# boots; the health probe below reports `ready`. Admission counts this boot, so
+# it runs only after the probe passed.
+_platform_servable() {
+  _platform_import_probe && _platform_boot admit 2>&1
+}
+
 # One boot transaction, in this order, so the probe and uvicorn see the same
 # bytes, and no served code runs before the probe: the image settles the source
 # it may run (and its activation bookkeeping and trusted hooks), the fail-closed
@@ -537,15 +545,15 @@ _platform_serve_checkout() {
     echo "Platform layer: boot guard failed; refusing to serve the platform tree." >&2
     exit 1
   fi
-  if _platform_import_probe; then
+  if _platform_servable; then
     echo "Platform layer: import probe OK; serving /data/platform/backend."
     _platform_use_direct
   elif _platform_boot revert 2>&1 && _platform_boot guard 2>&1 &&
-       _platform_import_probe; then
+       _platform_servable; then
     echo "Platform layer: returned to the previous version; serving /data/platform/backend."
     _platform_use_direct
   else
-    echo "PLATFORM LAYER WARNING: import probe failed for /data/platform." >&2
+    echo "PLATFORM LAYER WARNING: /data/platform failed its import probe or did not finish starting in recent boots." >&2
     _platform_use_baked
   fi
 }
@@ -1057,6 +1065,10 @@ _health_url="http://127.0.0.1:${_public_port}/api/health"
     echo "WARNING: app cron supervision did not complete; cron remains disabled (fail closed)" >&2
   fi
   echo "Platform health probe: /api/health OK."
+  # The served commit started; forget its unready boots (see _platform_servable).
+  if [ "$_use_platform" -eq 1 ]; then
+    _platform_boot ready
+  fi
 ) &
 
 # Make agent helper scripts callable by bare name. The Bash tool's shell
