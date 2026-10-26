@@ -219,8 +219,16 @@ const EDITS = {
       const current = await folder.entryOrNull(path)
       if (current?.modified !== old.modified || current?.size !== old.size) throw changedDuringWrite(path, binned)
     }
-    // Canonical base64 of the checked bytes, whatever spacing the agent's text had.
-    await folder.call('writeFolderFile', path, bytesToBase64(bytes), { overwrite: Boolean(old) })
+    // Canonical base64 of the checked bytes, whatever spacing the agent's text had. An app that
+    // knows `expected` also refuses itself if the file changed after the check above.
+    const options = old
+      ? { overwrite: true, expected: { size: old.size ?? null, modified: old.modified ?? null } }
+      : { overwrite: false }
+    try {
+      await folder.call('writeFolderFile', path, bytesToBase64(bytes), options)
+    } catch (error) {
+      throw error?.code === 'changed_during_write' ? changedDuringWrite(path, binned) : error
+    }
     return { path, size: bytes.length, created: !old, ...(binned && { binned }) }
   },
   async move(folder, command) {

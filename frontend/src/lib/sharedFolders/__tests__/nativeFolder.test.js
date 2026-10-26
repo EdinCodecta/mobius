@@ -195,6 +195,25 @@ test('a native replace leaves alone a file that changed while it was backed up',
   assert.equal(new TextDecoder().decode(tree[BIN_FOLDER_NAME]['todo.txt'].bytes), 'milk')
 })
 
+test('the app refuses a native replace if the file changes after the page checked it', async () => {
+  const tree = { 'todo.txt': textFile('milk') }
+  const folder = folderOver(tree)
+  const write = bridge.writeFolderFile.bind(bridge)
+  const sent = []
+  // Saved again on the phone between the page's check and the app's write.
+  bridge.writeFolderFile = async (id, path, data, options) => {
+    sent.push(options)
+    tree['todo.txt'] = textFile('milk and honey', { modified: 2 })
+    return write(id, path, data, options)
+  }
+  await failsWith(
+    folder.run({ op: 'write', path: 'todo.txt', content: 'eggs', overwrite: true }),
+    'changed_during_write',
+  )
+  assert.deepEqual(sent, [{ overwrite: true, expected: { size: 4, modified: 1 } }])
+  assert.equal(new TextDecoder().decode(tree['todo.txt'].bytes), 'milk and honey')
+})
+
 test('a native folder shared to edit saves, moves and bins files, keeping replaced ones', async () => {
   const tree = { 'todo.txt': textFile('milk'), Notes: {} }
   const folder = folderOver(tree)

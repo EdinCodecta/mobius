@@ -101,12 +101,16 @@ export class FakeNativeBridge {
     return { folder: parent.node, name: path.slice(slash + 1) }
   }
 
-  async writeFolderFile(id, path, data, { overwrite } = {}) {
+  async writeFolderFile(id, path, data, { overwrite, expected } = {}) {
     const at = this.changeAt(id, path)
     if (at.error) return at
     const old = at.folder[at.name]
     if (old && !isFile(old)) return failure('wrong_kind')
     if (old && !overwrite) return failure('exists')
+    if (old && expected) {
+      const now = describe(at.name, old)
+      if (now.size !== expected.size || now.modified !== expected.modified) return failure('changed_during_write')
+    }
     const bytes = Uint8Array.from(atob(data), char => char.charCodeAt(0))
     at.folder[at.name] = { bytes }
     return { size: bytes.length, created: !old }
