@@ -39,7 +39,6 @@ async function installFixtures(page, request) {
 }
 
 async function openTranscript(page, { assistant, user = 'Show me' }) {
-  await page.addInitScript(chatId => localStorage.setItem('moebius_active_chat', chatId), CHAT_ID)
   await page.route(/\/api\/chats(?:\?.*)?$/, route => route.request().method() !== 'GET' ? route.fallback()
     : route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([{
       id: CHAT_ID, title: 'App block fixture', created_at: '2026-10-23T00:00:00Z', updated_at: '2026-10-23T00:00:00Z',
@@ -55,7 +54,9 @@ async function openTranscript(page, { assistant, user = 'Show me' }) {
       total: 2, offset: 0, ...runtimeSnapshot(),
     }) }))
   await page.route(/\/api\/chats\/[0-9a-f-]+\/stream$/, route => route.fulfill({ status: 204, body: '' }))
-  await page.goto(BASE, { waitUntil: 'domcontentloaded' })
+  // Fixture installation has already persisted a workspace. An explicit chat
+  // destination overrides that workspace; the legacy active-chat key does not.
+  await page.goto(`${BASE}/shell/?chat=${CHAT_ID}`, { waitUntil: 'domcontentloaded' })
   return page.locator('[data-chat-surface="painted"]')
 }
 
