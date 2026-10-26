@@ -72,6 +72,15 @@ async function sessionFrame(page) {
   return found
 }
 
+/** A scroll command can be reversed before the host observes the list end.
+ * Keep it intersecting through a render opportunity before returning to Confirm. */
+async function seeConfirmationEnd(block) {
+  const end = block.locator('.md-app-block__list-end')
+  await end.scrollIntoViewIfNeeded()
+  await expect(end).toBeInViewport()
+  await end.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+}
+
 test('a static block renders only in the reply and opens the app view on request', async ({ page, request }) => {
   const { session } = await installFixtures(page, request)
   const block = { app: 'e2e-block-session', intent: 'open:item-7', title: 'Fixture item',
@@ -125,7 +134,6 @@ test('a passive session drives an in-place Confirm through the real frame protoc
   await expect(confirm).toHaveText('Confirm')
   await expect(block.getByRole('button', { name: 'Not now' })).toBeVisible()
   expect((await log.textContent()).split('\n').filter(line => line.endsWith(' confirm'))).toHaveLength(0)
-  await expect(confirm).toBeEnabled()
   // Same size, same place: Confirm replaces the action in its slot.
   const confirmBox = await confirm.boundingBox()
   expect(Math.round(confirmBox.width)).toBe(Math.round(box.width))
@@ -134,6 +142,12 @@ test('a passive session drives an in-place Confirm through the real frame protoc
   await expect(block.locator('.md-app-block__confirmation')).toContainText('fixture/repo: Change one')
   await expect(block.locator('.md-app-block__confirmation')).toContainText('The list below comes from Block Session')
   await expect(block.locator('.md-app-block__badge')).toHaveCount(0)
+
+  // The twelve-item list may extend below the viewport even on desktop.
+  // Check the in-place geometry above before scrolling through that list.
+  await seeConfirmationEnd(block)
+  await confirm.scrollIntoViewIfNeeded()
+  await expect(confirm).toBeEnabled()
 
   // Foreign or stale-generation messages never reach the app's own listener.
   await page.evaluate(({ sessionId, generation }) => {
@@ -177,7 +191,7 @@ test('with the action at the bottom edge, Confirm arms only after the list end h
   await page.waitForTimeout(1200)
   await expect(confirm).toBeDisabled()
   // Scroll through the list to its end, then back up to Confirm.
-  await listEnd.scrollIntoViewIfNeeded()
+  await seeConfirmationEnd(block)
   await confirm.evaluate(button => button.scrollIntoView({ block: 'end' }))
   await expect(confirm).toBeEnabled()
   await confirm.click()
@@ -195,6 +209,7 @@ test('a list replaced after Confirm armed must have its own end seen (no borrowe
   await action.click()
   const confirm = block.locator('footer .md-app-block__action')
   // One target: its end is on screen, so Confirm arms.
+  await expect(confirm).toHaveText('Confirm')
   await expect(confirm).toBeEnabled()
   // The app replaces it with 256 targets while the old end was visible.
   await expect(block.locator('.md-app-block__confirmation li')).toHaveCount(256)
@@ -206,7 +221,7 @@ test('a list replaced after Confirm armed must have its own end seen (no borrowe
   await page.waitForTimeout(200)
   expect((await frame.locator('#block-log').textContent()).split('\n').filter(line => line.endsWith(' confirm'))).toHaveLength(0)
   // Scrolling to the new end and back arms it.
-  await block.locator('.md-app-block__list-end').scrollIntoViewIfNeeded()
+  await seeConfirmationEnd(block)
   await confirm.evaluate(button => button.scrollIntoView({ block: 'end' }))
   await expect(confirm).toBeEnabled()
 })
