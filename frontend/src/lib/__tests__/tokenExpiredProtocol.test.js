@@ -69,11 +69,12 @@ function frameHarness(failures = []) {
     let initialized = true, currentToken = 'expired-token', _reportToken = null;
     let currentCapabilityContract = null, currentNavLocation = null;
     let waitForNavigationReady = false;
+    let passiveRequested = false, currentBlockSession = null, supportsAppBlocks = false;
     let tokenRefreshResolve = null, tokenRefreshPromise = null;
     const _FRAME_APP_ID = 'protocol-app';
     ${['renegotiateExpiredModuleToken', 'isBlobModuleLoadFailure',
        'tokenAppInstanceId', 'tokenExpiresSoon', 'requestFreshToken', 'runtimeToken',
-       'renderMountedComponent', 'acceptToken', 'loadModule'].map(frameFunction).join('\n')}
+       'renderMountedComponent', 'acceptToken', 'loadModule', 'blockSessionApi'].map(frameFunction).join('\n')}
     ${frameScript.slice(frameListener.start, frameListener.end)}
     ({ renegotiateExpiredModuleToken, initialized: () => initialized,
        token: () => currentToken, reportToken: () => _reportToken, runtimeToken })
@@ -200,6 +201,8 @@ function canvasHarness(queryClient, appId) {
     accountLinkCompletion, attributedFrameVersion, applyVirtualStorageMutation,
     appMediaSessionEvent, appHostRequest,
     capabilityHostRef: { current: { handle: () => false } },
+    serveAppFileExportRequest: () => false, visibleRef: { current: true },
+    pendingFileExportRef: { current: null }, setPendingFileExport() {},
   })
   assert.equal(typeof listener, 'function')
   return { source, message(data, overrides = {}) {
