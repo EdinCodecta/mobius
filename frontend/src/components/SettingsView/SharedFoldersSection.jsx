@@ -79,11 +79,29 @@ function SectionBody({ state, report, pickForVisit }) {
           ))}
         </div>
       )}
-      {state.canRemember
-        ? <RememberedFolderPicker report={report} />
-        : <VisitFolderPicker onPick={() => pickForVisit()} />}
+      {state.canPickNative
+        ? <NativeFolderPicker report={report} />
+        : state.canRemember
+          ? <RememberedFolderPicker report={report} />
+          : <VisitFolderPicker onPick={() => pickForVisit()} />}
       <OtherDeviceFolders localFolders={state.folders} />
     </>
+  )
+}
+
+/** Inside the Möbius phone app: its own folder picker, read only (the app offers no writes). */
+function NativeFolderPicker({ report }) {
+  return (
+    <div>
+      <button
+        type="button"
+        className="settings__btn settings__btn--outline shared-folders__add"
+        onClick={async () => report(await addRememberedFolder('read'))}
+      >
+        <FolderPlus width={16} height={16} aria-hidden="true" /> Add folder
+      </button>
+      <p className="shared-folders__hint">Agents can list and read its files. The app remembers the folder until you remove it.</p>
+    </div>
   )
 }
 

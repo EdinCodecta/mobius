@@ -16,7 +16,7 @@ const ERROR_CODES = {
   InvalidModificationError: 'locked',
   QuotaExceededError: 'no_space',
 }
-const ERROR_MESSAGES = {
+export const ERROR_MESSAGES = {
   not_found: path => `Nothing is at "${path}" in this folder.`,
   wrong_kind: path => `"${path}" is a folder where a file was expected, or the other way round.`,
   needs_permission: () => 'The browser needs the owner to tap Reconnect for this folder in Settings → Shared folders.',
