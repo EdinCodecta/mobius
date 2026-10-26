@@ -1876,17 +1876,21 @@ def _source_contains(record: dict) -> bool:
 
 def _stage_record(
   record_id: str,
-  record_path: Path,
   previous: dict | None,
   body: ContributionStageBody,
   inputs: dict,
   principal: Principal,
-) -> tuple[dict, contribution_staging.StagedCandidate]:
-  """Build the staged record from Git; the caller holds every lock."""
+) -> tuple[dict, contribution_staging.StagedCandidate, list[bytes]]:
+  """Build the staged record from Git; the caller holds every lock.
+
+  Also returns the checked bytes of newly attached screenshots, which the
+  caller stores only once the whole record has passed its checks.
+  """
   repo_path = inputs["repo_path"]
   candidate = contribution_staging.derive_candidate(
     repo_path, inputs["branch"], inputs["base_ref"],
   )
+  screenshot_bytes: list[bytes] = []
   live = inputs["live"]
   if live is not None:
     _assert_reviewed_update_contains_live_head(
@@ -1909,8 +1913,8 @@ def _stage_record(
     plan["pr_metadata"] = {"old_title": live["title"], "old_body": live["body"]}
     plan.pop("screenshots", None)
   elif body.screenshots is not None:
-    plan["screenshots"] = contribution_screenshots.stage(
-      record_path, [item.model_dump() for item in body.screenshots],
+    plan["screenshots"], screenshot_bytes = contribution_screenshots.read(
+      [item.model_dump() for item in body.screenshots],
       str(plan.get("body_draft") or ""),
     )
   else:
@@ -1972,7 +1976,7 @@ def _stage_record(
       code="record_too_large",
     )
   record["source_sync"] = _track_live_source(previous, record, source_repo)
-  return record, candidate
+  return record, candidate, screenshot_bytes
 
 
 def _track_live_source(previous: dict | None, record: dict, source: Path) -> dict:
@@ -2092,12 +2096,12 @@ async def stage_contribution(
       for lock_path in sorted({str(inputs["repo_path"]), str(inputs["source_repo"])}):
         await source_locks.enter_async_context(fs_locks.source_dir_lock(lock_path))
       try:
-        record, candidate = await settled.run_settled(
-          _stage_record, record_id, record_path, previous, body, inputs,
-          principal,
+        record, candidate, screenshot_bytes = await settled.run_settled(
+          _stage_record, record_id, previous, body, inputs, principal,
         )
       except ContributionSubmitError as exc:
         raise _stage_error(exc) from exc
+      contribution_screenshots.store(record_path, screenshot_bytes)
       atomic_write(diff_path, candidate.diff)
       _write_record(record_path, record)
       contribution_screenshots.prune(

@@ -1,12 +1,13 @@
 """Screenshots a prepared pull request publishes alongside its description.
 
 GitHub has no API for description attachments, so a visible change's
-before/after images are hosted on an ``assets`` branch of the owner's fork and
-linked from the description. The owner approves the images together with the
-text: staging copies each file next to the record under its SHA-256 and lists
-``{name, sha256, size, alt}`` in ``plan.screenshots``, which the publication
-approval digest and the review-verdict reset already cover. The reviewed
-description refers to each image as ``(screenshot:NAME)``.
+before/after images are hosted on a ``mobius-screenshots`` branch of the
+owner's own repository and linked from the description. The owner approves
+the images together with the text: staging copies each file next to the
+record under its SHA-256 and lists ``{name, sha256, size, alt}`` in
+``plan.screenshots``, which the publication approval digest and the
+review-verdict reset already cover. The reviewed description refers to each
+image as ``(screenshot:NAME)``.
 
 Send uploads the exact approved bytes before anything else becomes public,
 proves each anonymous raw URL serves those bytes, and only then replaces each
@@ -17,7 +18,6 @@ before the branch is pushed.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import subprocess
 import tempfile
@@ -37,12 +37,21 @@ NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}\.png$")
 MAX_SCREENSHOTS = 8
 MAX_BYTES = 2 * 1024 * 1024
 MAX_ALT_CHARS = 200
-ASSETS_BRANCH = "assets"
+# A branch only Send writes, holding nothing but ASSETS_DIR: never a branch
+# the owner might already use for something else.
+ASSETS_BRANCH = "mobius-screenshots"
+ASSETS_DIR = "screenshots"
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 # A link or image target ``](screenshot:NAME)`` outside code, so a body that
 # shows the syntax in backticks is neither checked nor rewritten.
 _REFERENCE = re.compile(r"\]\(screenshot:([^)\s]*)\)")
-_CODE = re.compile(r"```.*?(?:```|$)|~~~.*?(?:~~~|$)|`[^`\n]*`", re.S)
+# Fenced blocks, then inline code: a run of backticks closed by a run of the
+# same length, which may span lines but not a blank line (CommonMark spans).
+_CODE = re.compile(
+  r"```.*?(?:```|$)|~~~.*?(?:~~~|$)"
+  r"|(?<!`)(`+)(?!`)(?:(?!\n[ \t]*\n).)*?(?<!`)\1(?!`)",
+  re.S,
+)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 # raw.githubusercontent.com serves a new commit within seconds, but not always
@@ -82,17 +91,18 @@ def _refuse(message: str, code: str = "screenshot_invalid") -> ContributionSubmi
   return ContributionSubmitError(message, status_code=422, code=code)
 
 
-def stage(record_path: Path, items: list[dict], body: str) -> list[dict]:
-  """Copy the requested files into the record's store and return plan entries.
+def read(items: list[dict], body: str) -> tuple[list[dict], list[bytes]]:
+  """Read and check the requested files; return plan entries and their bytes.
 
   Every screenshot must be referenced by the description and every reference
   must name a screenshot, so the owner never approves an image that is not
-  shown, or a link Send cannot fill.
+  shown, or a link Send cannot fill. Nothing is written: ``store`` keeps the
+  bytes once the whole stage has passed its checks.
   """
   if len(items) > MAX_SCREENSHOTS:
     raise _refuse(f"A pull request carries at most {MAX_SCREENSHOTS} screenshots.")
   entries: list[dict] = []
-  payloads: list[tuple[str, bytes]] = []
+  payloads: list[bytes] = []
   for item in items:
     name = str(item.get("name") or "")
     if not NAME.fullmatch(name):
@@ -111,14 +121,20 @@ def stage(record_path: Path, items: list[dict], body: str) -> list[dict]:
     data = _read_png(Path(str(item.get("path") or "")), name)
     sha = hashlib.sha256(data).hexdigest()
     entries.append({"name": name, "sha256": sha, "size": len(data), "alt": alt})
-    payloads.append((sha, data))
+    payloads.append(data)
   check_references(entries, body)
-  store = blob_dir(record_path)
-  store.mkdir(parents=True, exist_ok=True)
-  for sha, data in payloads:
+  return entries, payloads
+
+
+def store(record_path: Path, payloads: list[bytes]) -> None:
+  """Keep checked image bytes beside the record, under their digests."""
+  if not payloads:
+    return
+  folder = blob_dir(record_path)
+  folder.mkdir(parents=True, exist_ok=True)
+  for data in payloads:
     # Rewritten every time, so restaging repairs a damaged stored copy.
-    atomic_write(store / f"{sha}.png", data)
-  return entries
+    atomic_write(folder / f"{hashlib.sha256(data).hexdigest()}.png", data)
 
 
 def check_references(entries: list[dict], body: str) -> None:
@@ -162,15 +178,16 @@ def _read_png(path: Path, name: str) -> bytes:
 def prune(record_path: Path, keep: list[dict]) -> None:
   """Drop stored images the record no longer lists. Run after the record is
   written, so a failed stage never removes an image the old record needs."""
-  store = blob_dir(record_path)
-  if not store.is_dir():
+  folder = blob_dir(record_path)
+  if not folder.is_dir():
     return
   wanted = {f"{entry['sha256']}.png" for entry in keep}
-  for child in store.iterdir():
-    if child.name not in wanted:
+  for child in folder.iterdir():
+    # Only files staging wrote; anything else in the folder is left alone.
+    if child.name not in wanted and child.is_file():
       child.unlink(missing_ok=True)
-  if not wanted:
-    store.rmdir()
+  if not wanted and not any(folder.iterdir()):
+    folder.rmdir()
 
 
 def plan_entries(plan: dict) -> list[dict]:
@@ -206,8 +223,12 @@ def approved_bytes(record_path: Path, entry: dict) -> bytes:
   return data
 
 
+def _asset_path(branch: str, name: str) -> str:
+  return f"{ASSETS_DIR}/{branch}/{name}"
+
+
 def raw_url(assets_repo: str, commit: str, branch: str, name: str) -> str:
-  path = quote(f"{ASSETS_BRANCH}/{branch}/{name}", safe="/")
+  path = quote(_asset_path(branch, name), safe="/")
   return f"https://{RAW_GITHUB_HOST}/{assets_repo}/{commit}/{path}"
 
 
@@ -245,7 +266,6 @@ def _read_public(url: str) -> bytes | None:
 
 
 def publish(
-  repo: Path,
   record_path: Path,
   entries: list[dict],
   *,
@@ -262,7 +282,7 @@ def publish(
   ``reuse_commit`` is the commit an earlier attempt for this record already
   proved; it is used again when it still serves the same bytes, so a retried
   Send links the same URLs. Otherwise the images are added on top of the
-  current ``assets`` tip (a commit is made only when a file is new or
+  current ``ASSETS_BRANCH`` tip (a commit is made only when a file is new or
   different) and pushed behind that tip.
   """
   payloads = [(entry, approved_bytes(record_path, entry)) for entry in entries]
@@ -270,11 +290,13 @@ def publish(
   # id may reach a public link.
   reuse_commit = reuse_commit if _COMMIT.fullmatch(str(reuse_commit or "")) else None
   try:
-    return _publish(
-      repo, payloads, assets_repo=assets_repo, branch=branch, author=author,
-      reuse_commit=reuse_commit, remote=remote_url or f"https://github.com/{assets_repo}.git",
-      read_public=read_public,
-    )
+    with tempfile.TemporaryDirectory() as scratch:
+      return _publish(
+        Path(scratch), payloads, assets_repo=assets_repo, branch=branch,
+        author=author, reuse_commit=reuse_commit,
+        remote=remote_url or f"https://github.com/{assets_repo}.git",
+        read_public=read_public,
+      )
   except (subprocess.TimeoutExpired, OSError) as exc:
     raise ContributionSubmitError(
       f"Uploading the screenshots to {assets_repo} timed out or could not "
@@ -284,7 +306,7 @@ def publish(
 
 
 def _publish(
-  repo: Path,
+  scratch: Path,
   payloads: list[tuple[dict, bytes]],
   *,
   assets_repo: str,
@@ -296,9 +318,16 @@ def _publish(
 ) -> str:
   if reuse_commit and _serves(assets_repo, reuse_commit, branch, payloads, read_public, attempts=1):
     return reuse_commit
+  # A throwaway repository, so the review checkout never collects the
+  # branch's history or other PRs' images.
+  repo = scratch / "assets.git"
+  _run_cmd(["git", "init", "-q", "--bare", str(repo)], cwd=scratch)
   for _ in range(2):
-    tip = _remote_tip(repo, remote)
-    commit = _assets_commit(repo, remote, tip, payloads, branch, author)
+    tip = _remote_tip(repo, remote, assets_repo)
+    commit = _assets_commit(
+      repo, scratch, remote, tip, payloads,
+      assets_repo=assets_repo, branch=branch, author=author,
+    )
     if commit == tip:
       break
     pushed = _git(
@@ -343,11 +372,12 @@ def _serves(
   return True
 
 
-def _remote_tip(repo: Path, remote: str) -> str | None:
+def _remote_tip(repo: Path, remote: str, assets_repo: str) -> str | None:
   listed = _git(repo, "ls-remote", remote, f"refs/heads/{ASSETS_BRANCH}", check=False)
   if listed.returncode != 0:
     raise ContributionSubmitError(
-      "Could not read the screenshot branch on your fork. Nothing was sent.",
+      f"Could not read the screenshot branch of {assets_repo}. Nothing was "
+      "sent.",
       code="screenshot_upload_failed",
       detail=(listed.stderr or "").strip()[:400],
     )
@@ -356,38 +386,52 @@ def _remote_tip(repo: Path, remote: str) -> str | None:
 
 
 def _assets_commit(
-  repo: Path, remote: str, tip: str | None,
-  payloads: list[tuple[dict, bytes]], branch: str, author: tuple[str, str],
+  repo: Path, scratch: Path, remote: str, tip: str | None,
+  payloads: list[tuple[dict, bytes]], *,
+  assets_repo: str, branch: str, author: tuple[str, str],
 ) -> str:
   if tip:
-    _git(repo, "fetch", "--no-tags", "--quiet", remote, tip)
-  with tempfile.TemporaryDirectory() as scratch:
-    # Hash the verified bytes, never the app-writable file again.
-    blobs: dict[str, str] = {}
-    for index, (entry, data) in enumerate(payloads):
-      copy = Path(scratch) / f"{index}.png"
-      copy.write_bytes(data)
-      path = f"{ASSETS_BRANCH}/{branch}/{entry['name']}"
-      blobs[path] = _git(repo, "hash-object", "-w", str(copy)).stdout.strip()
-    if tip and all(_blob_at(repo, tip, path) == blob for path, blob in blobs.items()):
-      return tip
-    env = {
-      **_git_env(repo),
-      "GIT_INDEX_FILE": os.path.join(scratch, "index"),
-      "GIT_AUTHOR_NAME": author[0], "GIT_AUTHOR_EMAIL": author[1],
-      "GIT_COMMITTER_NAME": author[0], "GIT_COMMITTER_EMAIL": author[1],
-    }
+    # Only the tip's trees are needed to add files on top of it.
+    _git(
+      repo, "fetch", "--no-tags", "--quiet", "--depth=1",
+      "--filter=blob:none", remote, tip,
+    )
+    held = _git(repo, "ls-tree", "--name-only", tip).stdout.splitlines()
+    if set(held) - {ASSETS_DIR}:
+      raise ContributionSubmitError(
+        f"The {ASSETS_BRANCH} branch of {assets_repo} holds files "
+        "Send did not put there, so screenshots were not added to it. "
+        "Nothing was sent.",
+        code="screenshot_upload_failed",
+      )
+  # Hash the verified bytes, never the app-writable file again.
+  blobs: dict[str, str] = {}
+  for index, (entry, data) in enumerate(payloads):
+    copy = scratch / f"{index}.png"
+    copy.write_bytes(data)
+    blobs[_asset_path(branch, entry["name"])] = (
+      _git(repo, "hash-object", "-w", str(copy)).stdout.strip()
+    )
+  if tip and all(_blob_at(repo, tip, path) == blob for path, blob in blobs.items()):
+    return tip
+  env = {
+    **_git_env(repo),
+    "GIT_INDEX_FILE": str(scratch / "index"),
+    "GIT_AUTHOR_NAME": author[0], "GIT_AUTHOR_EMAIL": author[1],
+    "GIT_COMMITTER_NAME": author[0], "GIT_COMMITTER_EMAIL": author[1],
+  }
 
-    def git(*args: str) -> str:
-      return _run_cmd(["git", "-C", str(repo), *args], cwd=repo, env=env).stdout.strip()
+  def git(*args: str) -> str:
+    return _run_cmd(["git", "-C", str(repo), *args], cwd=repo, env=env).stdout.strip()
 
-    if tip:
-      git("read-tree", tip)
-    for path, blob in blobs.items():
-      git("update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
-    tree = git("write-tree")
-    parents = ["-p", tip] if tip else []
-    return git("commit-tree", tree, *parents, "-m", f"Add screenshots for {branch}")
+  if tip:
+    git("read-tree", tip)
+  for path, blob in blobs.items():
+    git("update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
+  # The tip's other images were not fetched; they stay on the remote.
+  tree = git("write-tree", "--missing-ok")
+  parents = ["-p", tip] if tip else []
+  return git("commit-tree", tree, *parents, "-m", f"Add screenshots for {branch}")
 
 
 def _blob_at(repo: Path, commit: str, path: str) -> str | None:

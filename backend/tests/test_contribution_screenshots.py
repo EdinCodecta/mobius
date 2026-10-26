@@ -60,6 +60,12 @@ def _items(tmp_path: Path, before=1, after=2) -> list[dict]:
   ]
 
 
+def _stage(record_path: Path, items: list[dict], body: str) -> list[dict]:
+  entries, data = shots.read(items, body)
+  shots.store(record_path, data)
+  return entries
+
+
 def _store(app_id: int, record_id: str = "greet") -> Path:
   return shots.blob_dir(
     Path(get_settings().data_dir) / "apps" / str(app_id) / "contributions"
@@ -150,16 +156,13 @@ def _git(repo: Path, *args: str) -> str:
 
 @pytest.fixture
 def fork(tmp_path, monkeypatch):
-  """A bare 'fork', a local checkout, and a record store with two images."""
+  """A bare 'fork' and a record store with two images."""
   monkeypatch.setattr(shots, "_PROOF_BACKOFF_SECONDS", 0)
   remote = tmp_path / "fork.git"
   _git(tmp_path, "init", "-q", "--bare", str(remote))
-  repo = tmp_path / "checkout"
-  repo.mkdir()
-  _git(repo, "init", "-q")
   record_path = tmp_path / "records" / "greet.json"
   record_path.parent.mkdir()
-  entries = shots.stage(record_path, _items(tmp_path), BODY)
+  entries = _stage(record_path, _items(tmp_path), BODY)
 
   def read_public(url: str) -> bytes | None:
     prefix = "https://raw.githubusercontent.com/octocat/project/"
@@ -172,7 +175,7 @@ def fork(tmp_path, monkeypatch):
 
   def publish(entries=entries, **overrides):
     return shots.publish(
-      repo, record_path, entries, assets_repo="octocat/project",
+      record_path, entries, assets_repo="octocat/project",
       branch="fix/header", author=("octocat", "1+octocat@users.noreply.github.com"),
       remote_url=str(remote), **{"read_public": read_public, **overrides},
     )
@@ -184,10 +187,10 @@ def fork(tmp_path, monkeypatch):
 def test_send_hosts_the_exact_images_and_pins_the_description_to_them(fork):
   commit = fork["publish"]()
   remote = fork["remote"]
-  assert _git(remote, "rev-parse", "refs/heads/assets") == commit
+  assert _git(remote, "rev-parse", "refs/heads/mobius-screenshots") == commit
   assert _git(remote, "log", "-1", "--format=%an", commit) == "octocat"
   shown = subprocess.run(
-    ["git", "show", f"{commit}:assets/fix/header/after.png"],
+    ["git", "show", f"{commit}:screenshots/fix/header/after.png"],
     cwd=remote, capture_output=True, check=True,
   ).stdout
   assert shown == _png(2)
@@ -199,7 +202,7 @@ def test_send_hosts_the_exact_images_and_pins_the_description_to_them(fork):
   assert "screenshot:" not in body
   assert (
     f"(https://raw.githubusercontent.com/octocat/project/{commit}"
-    "/assets/fix/header/after.png)"
+    "/screenshots/fix/header/after.png)"
   ) in body
 
 
@@ -207,22 +210,51 @@ def test_a_retried_send_links_the_same_upload_without_a_new_commit(fork):
   first = fork["publish"]()
   assert fork["publish"](reuse_commit=first) == first
   assert fork["publish"]() == first
-  assert _git(fork["remote"], "rev-list", "--count", "refs/heads/assets") == "1"
+  assert _git(fork["remote"], "rev-list", "--count", "refs/heads/mobius-screenshots") == "1"
 
 
-def test_send_adds_to_an_existing_assets_branch_without_rewriting_it(fork, tmp_path):
+def _push_to_assets_branch(fork, tmp_path, path: str, text: str) -> str:
   other = tmp_path / "other"
   _git(tmp_path, "clone", "-q", str(fork["remote"]), str(other))
-  _git(other, "checkout", "-q", "-b", "assets")
-  (other / "keep.txt").write_text("earlier upload\n")
-  _git(other, "add", "keep.txt")
+  _git(other, "checkout", "-q", "-b", shots.ASSETS_BRANCH)
+  (other / path).parent.mkdir(parents=True, exist_ok=True)
+  (other / path).write_text(text)
+  _git(other, "add", path)
   _git(other, "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "old")
-  _git(other, "push", "-q", "origin", "assets")
-  earlier = _git(other, "rev-parse", "HEAD")
+  _git(other, "push", "-q", "origin", shots.ASSETS_BRANCH)
+  return _git(other, "rev-parse", "HEAD")
 
+
+def test_send_adds_to_an_existing_screenshot_branch_without_rewriting_it(fork, tmp_path):
+  earlier = _push_to_assets_branch(
+    fork, tmp_path, "screenshots/fix/older/keep.png", "earlier upload\n",
+  )
   commit = fork["publish"]()
   assert _git(fork["remote"], "rev-parse", f"{commit}^") == earlier
-  assert _git(fork["remote"], "show", f"{commit}:keep.txt") == "earlier upload"
+  assert _git(fork["remote"], "show", f"{commit}:screenshots/fix/older/keep.png") == "earlier upload"
+
+
+def test_send_never_adds_to_a_branch_that_holds_other_files(fork, tmp_path):
+  earlier = _push_to_assets_branch(fork, tmp_path, "README.md", "not ours\n")
+  with pytest.raises(ContributionSubmitError) as raised:
+    fork["publish"]()
+  assert raised.value.code == "screenshot_upload_failed"
+  assert _git(fork["remote"], "rev-parse", f"refs/heads/{shots.ASSETS_BRANCH}") == earlier
+
+
+def test_send_fetches_only_the_tip_trees_of_the_screenshot_branch(fork, tmp_path, monkeypatch):
+  _push_to_assets_branch(fork, tmp_path, "screenshots/fix/older/keep.png", "old\n")
+  calls = []
+  original = shots._git
+
+  def git(repo, *args, **kwargs):
+    calls.append(args)
+    return original(repo, *args, **kwargs)
+
+  monkeypatch.setattr(shots, "_git", git)
+  fork["publish"]()
+  fetch = next(args for args in calls if args[0] == "fetch")
+  assert "--depth=1" in fetch and "--filter=blob:none" in fetch
 
 
 def test_send_refuses_an_image_that_changed_after_approval(fork):
@@ -232,7 +264,7 @@ def test_send_refuses_an_image_that_changed_after_approval(fork):
     fork["publish"]()
   assert raised.value.code == "screenshot_changed"
   assert subprocess.run(
-    ["git", "rev-parse", "--verify", "--quiet", "refs/heads/assets"],
+    ["git", "rev-parse", "--verify", "--quiet", "refs/heads/mobius-screenshots"],
     cwd=fork["remote"], capture_output=True,
   ).returncode != 0
 
@@ -251,7 +283,7 @@ def test_an_open_pr_update_cannot_carry_screenshots(fork):
       branch="fix/header", author=("octocat", "e"), is_update=True,
       record_patch={"head_repository": "octocat/project"},
     )
-  assert raised.value.code == "screenshot_changed"
+  assert raised.value.code == "screenshot_update_unsupported"
   assert raised.value.record_patch == {"head_repository": "octocat/project"}
 
 
@@ -262,7 +294,7 @@ def test_a_tampered_reuse_commit_never_reaches_the_public_link(fork):
   # The fragment is not sent, so the injected value still proves real bytes.
   after = [fork["entries"][1]]
   real = fork["publish"](after)
-  injected = f"{real}/assets/fix/header/after.png#) **Approved** ("
+  injected = f"{real}/screenshots/fix/header/after.png#) **Approved** ("
   commit = fork["publish"](after, reuse_commit=injected)
   assert commit == real
 
@@ -290,7 +322,7 @@ def test_send_refuses_stored_bytes_that_are_not_a_png(fork):
 def test_restaging_repairs_a_damaged_stored_image(fork, tmp_path):
   stored = shots.blob_dir(fork["record_path"]) / f"{fork['entries'][0]['sha256']}.png"
   stored.write_bytes(b"damaged")
-  shots.stage(fork["record_path"], _items(tmp_path), BODY)
+  _stage(fork["record_path"], _items(tmp_path), BODY)
   shots.verify(fork["record_path"], fork["entries"])
 
 
@@ -304,17 +336,18 @@ def test_a_concurrent_upload_is_kept_and_ours_rebuilt_on_top(fork, tmp_path, mon
     commit = original(*args, **kwargs)
     if not raced["done"]:
       raced["done"] = True
-      _git(other, "checkout", "-q", "--orphan", "assets")
-      (other / "theirs.txt").write_text("another send\n")
-      _git(other, "add", "theirs.txt")
+      _git(other, "checkout", "-q", "--orphan", shots.ASSETS_BRANCH)
+      (other / "screenshots").mkdir()
+      (other / "screenshots" / "theirs.png").write_text("another send\n")
+      _git(other, "add", "screenshots")
       _git(other, "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "theirs")
-      _git(other, "push", "-q", "origin", "assets")
+      _git(other, "push", "-q", "origin", shots.ASSETS_BRANCH)
     return commit
 
   monkeypatch.setattr(shots, "_assets_commit", race_then_build)
   commit = fork["publish"]()
-  assert _git(fork["remote"], "show", f"{commit}:theirs.txt") == "another send"
-  assert _git(fork["remote"], "rev-parse", "refs/heads/assets") == commit
+  assert _git(fork["remote"], "show", f"{commit}:screenshots/theirs.png") == "another send"
+  assert _git(fork["remote"], "rev-parse", "refs/heads/mobius-screenshots") == commit
 
 
 # --- Description references ---------------------------------------------------
@@ -382,7 +415,8 @@ def test_send_pins_the_body_and_remembers_the_upload(fork, monkeypatch):
     github_contributions.contribution_screenshots, "publish",
     lambda *a, **k: "b" * 40,
   )
-  body, patch = _send_screenshots(fork)
+  body, patch, assets_repo = _send_screenshots(fork)
+  assert assets_repo == "octocat/project"
   assert "screenshot:" not in body
   assert patch == {"k": "v", "last_submit_screenshots": {"repo": "octocat/project", "commit": "b" * 40}}
 
@@ -420,3 +454,253 @@ def test_an_open_pr_update_cannot_stage_screenshots(staging, tmp_path, monkeypat
   refused = staging["stage"](screenshots=_items(tmp_path))
   assert refused.status_code == 422
   assert refused.json()["detail"]["code"] == "stage_public_text"
+
+
+def test_a_failed_stage_stores_no_images(staging, tmp_path):
+  response = staging["new_record"](
+    title=" Padded title ", body_draft=BODY, screenshots=_items(tmp_path),
+  )
+  assert response.status_code == 409
+  assert "title" in response.text
+  assert not _store(staging["app_id"]).exists()
+
+
+def test_pruning_leaves_a_folder_it_did_not_write(tmp_path):
+  record_path = tmp_path / "greet.json"
+  entries = _stage(record_path, _items(tmp_path), BODY)
+  (shots.blob_dir(record_path) / "extra").mkdir()
+  shots.prune(record_path, entries[:1])
+  assert {p.name for p in shots.blob_dir(record_path).iterdir()} == {
+    "extra", f"{entries[0]['sha256']}.png",
+  }
+  shots.prune(record_path, [])
+  assert [p.name for p in shots.blob_dir(record_path).iterdir()] == ["extra"]
+
+
+@pytest.mark.parametrize("body", [
+  "Write ``![a](screenshot:x.png)`` with a ` inside.",
+  "Write `![a]\n(screenshot:x.png)` over two lines.",
+  "Write `x\n![a](screenshot:x.png)` over two lines.",
+])
+def test_every_inline_code_span_is_left_alone(body):
+  assert shots.references(body) == []
+
+
+def test_a_blank_line_ends_an_unclosed_code_span():
+  assert shots.references("A ` tick.\n\n![a](screenshot:x.png) then `.") == ["x.png"]
+
+
+# --- A whole Send ---------------------------------------------------------------
+
+
+@pytest.fixture
+def submit(tmp_path, monkeypatch):
+  """`_submit_prepared_pr` for a reviewed PR with screenshots on a repository
+  the owner can push to; Git and GitHub are faked, the order is recorded."""
+  from app import github_contributions
+  from tests.test_github_routes import _cp, _write_token
+
+  _write_token(login="octocat")
+  repo = Path(get_settings().data_dir) / "contrib" / "shots-send" / "worktree"
+  (repo / ".git").mkdir(parents=True, exist_ok=True)
+  diff_path = tmp_path / "records" / "shots-send.diff"
+  diff_path.parent.mkdir()
+  entries = _stage(diff_path.with_suffix(".json"), _items(tmp_path), BODY)
+  branch, base, head = "fix/header", "b" * 40, "a" * 40
+  events: list = []
+
+  def record(upstream_repo):
+    return {
+      "id": "shots-send", "type": "pr", "repo": upstream_repo,
+      "status": "submitting", "title": "Header", "branch": branch,
+      "plan": {
+        "action": "pr", "repo": upstream_repo, "title": "Header",
+        "body_draft": BODY, "branch": branch, "repo_path": str(repo),
+        "base_sha": base, "head_sha": head, "diff_sha256": "f" * 64,
+        "screenshots": entries,
+      },
+    }
+
+  git_ops = "app.github_contribution_git."
+  for name, value in {
+    "_assert_fresh": lambda *_a, **_k: (base, head, "f" * 64),
+    "_assert_clean_worktree": lambda *_a: None,
+    "_assert_coauthor_trailer": lambda *_a: None,
+    "_assert_head_attribution": lambda *_a, **_k: None,
+    "_assert_upstream_push_permission": lambda *_a: None,
+    "_authoritative_upstream_branch_sha": lambda *_a, **_k: None,
+    "_assert_merges_with_upstream": lambda *_a, **_k: {
+      "last_submit_upstream_branch": "main", "last_submit_upstream_sha": base,
+    },
+  }.items():
+    monkeypatch.setattr(git_ops + name, value)
+  monkeypatch.setattr(github_contributions.shutil, "which", lambda name: f"/bin/{name}")
+  monkeypatch.setattr(github_contributions, "_safe_repo_path", lambda _raw: repo)
+  monkeypatch.setattr(
+    github_contributions, "_confirm_existing_pr_update",
+    lambda _repo, upstream, number, **_k: (f"https://github.com/{upstream}/pull/{number}", "draft"),
+  )
+  monkeypatch.setattr(
+    github_contributions, "_ensure_owner_fork_remote",
+    lambda _repo, _upstream, login: events.append("fork") or f"{login}/project",
+  )
+
+  def upload(record_path, shown, *, assets_repo, **_k):
+    assert record_path == diff_path.with_suffix(".json") and shown == entries
+    events.append(("upload", assets_repo))
+    return "c" * 40
+
+  monkeypatch.setattr(github_contributions.contribution_screenshots, "publish", upload)
+  push = {"error": None}
+  monkeypatch.setattr(
+    github_contributions, "_push_branch",
+    lambda _repo, remote, *_a: events.append(("push", remote)) or push["error"],
+  )
+
+  def fake_git(_repo, *args, check=True):
+    if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+      return _cp(branch + "\n")
+    if args == ("rev-parse", "HEAD"):
+      return _cp(head + "\n")
+    return _cp("")
+
+  def fake_gh(_repo, *args, check=True):
+    if args[:1] == ("api",):
+      return _cp("true\n")
+    if args[:2] == ("pr", "list"):
+      return _cp("[]")
+    if args[:2] == ("pr", "create"):
+      events.append(("create", Path(args[args.index("--body-file") + 1]).read_text()))
+      return _cp(f"https://github.com/{args[args.index('-R') + 1]}/pull/9\n")
+    return _cp("")
+
+  monkeypatch.setattr(git_ops + "_git", fake_git)
+  monkeypatch.setattr(git_ops + "_gh", fake_gh)
+
+  def send(upstream_repo):
+    return github_contributions._submit_prepared_pr(record(upstream_repo), diff_path)
+
+  return {"send": send, "events": events, "push": push}
+
+
+@pytest.mark.parametrize(("upstream_repo", "assets_repo", "forked"), [
+  ("octocat/project", "octocat/project", False),
+  # A shared repository the owner can push to: code there, images in the fork.
+  ("octo-org/project", "octocat/project", True),
+])
+def test_send_uploads_to_the_owners_repository_before_pushing_the_code(
+  submit, upstream_repo, assets_repo, forked,
+):
+  _url, number, patch = submit["send"](upstream_repo)
+
+  assert number == 9
+  events = submit["events"]
+  assert ("fork" in events) == forked
+  assert events.index(("upload", assets_repo)) < events.index(
+    ("push", f"https://github.com/{upstream_repo}.git"),
+  )
+  created = next(event[1] for event in events if event[0] == "create")
+  assert "screenshot:" not in created
+  assert shots.raw_url(assets_repo, "c" * 40, "fix/header", "after.png") in created
+  assert patch["last_submit_screenshots"] == {"repo": assets_repo, "commit": "c" * 40}
+
+
+def test_a_failed_push_after_the_upload_keeps_the_upload_for_the_retry(submit):
+  submit["push"]["error"] = "rejected: protected branch"
+  with pytest.raises(ContributionSubmitError) as raised:
+    submit["send"]("octocat/project")
+  assert raised.value.record_patch["last_submit_screenshots"] == {
+    "repo": "octocat/project", "commit": "c" * 40,
+  }
+
+
+# --- Stacks ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def stack(tmp_path, monkeypatch):
+  """Two private layers: the first without screenshots, the second with."""
+  from app import github_contributions
+  from tests.test_github_routes import _cp, _write_token
+
+  _write_token(login="octocat")
+  rows = []
+  for position, body in ((1, "Model layer."), (2, BODY)):
+    repo = Path(get_settings().data_dir) / "contrib" / f"layer-{position}" / "worktree"
+    (repo / ".git").mkdir(parents=True, exist_ok=True)
+    diff_path = tmp_path / f"layer-{position}.diff"
+    plan = {
+      "action": "pr", "repo": "mobius-os/project", "title": f"Layer {position}",
+      "body_draft": body, "branch": f"stack/s/0{position}-layer",
+      "repo_path": str(repo),
+    }
+    if position == 2:
+      plan["screenshots"] = _stage(diff_path.with_suffix(".json"), _items(tmp_path), BODY)
+    rows.append({
+      "record": {"id": f"layer-{position}", "status": "submitting", "plan": plan},
+      "diff_path": str(diff_path),
+      "stack": {"base_branch": "main" if position == 1 else "stack/s/01-layer"},
+    })
+  git_ops = "app.github_contribution_git."
+  for name in (
+    "_assert_clean_worktree", "_assert_fresh", "_assert_coauthor_trailer",
+    "_assert_head_attribution", "_assert_merges_with_upstream",
+    "_assert_upstream_push_permission",
+  ):
+    monkeypatch.setattr(git_ops + name, lambda *_a, **_k: None)
+  monkeypatch.setattr(git_ops + "_upstream_default_branch", lambda *_a: "main")
+  monkeypatch.setattr(git_ops + "_git", lambda _repo, *args, check=True: _cp("main\n"))
+  monkeypatch.setattr(github_contributions.shutil, "which", lambda name: f"/bin/{name}")
+  uploads: list = []
+  monkeypatch.setattr(
+    github_contributions.contribution_screenshots, "publish",
+    lambda *_a, **k: uploads.append(k["assets_repo"]) or "c" * 40,
+  )
+
+  def preflight():
+    github_contributions._preflight_prepared_stack(rows, source_preflight=lambda _r: "")
+
+  return {"rows": rows, "uploads": uploads, "preflight": preflight}
+
+
+def test_a_stack_hosts_every_layers_screenshots_before_any_push(stack, monkeypatch):
+  from app import github_contributions
+  monkeypatch.setattr(github_contributions, "_ensure_owner_fork_remote", lambda *_: "octocat/project")
+  stack["preflight"]()
+  assert stack["uploads"] == ["octocat/project"]
+
+
+def test_a_stack_whose_later_layer_cannot_fork_stops_before_any_push(stack, monkeypatch):
+  from app import github_contributions
+
+  def no_fork(*_):
+    raise ContributionSubmitError("forking is disabled for this repository")
+
+  monkeypatch.setattr(github_contributions, "_ensure_owner_fork_remote", no_fork)
+  with pytest.raises(ContributionSubmitError) as raised:
+    stack["preflight"]()
+  assert raised.value.code == "screenshot_upload_failed"
+
+
+def test_a_stack_with_an_oversized_layer_uploads_nothing(stack, monkeypatch):
+  from app import github_contributions
+  monkeypatch.setattr(github_contributions, "_ensure_owner_fork_remote", lambda *_: pytest.fail("forked"))
+  plan = stack["rows"][1]["record"]["plan"]
+  plan["body_draft"] = BODY + "x" * (65_500 - len(BODY))
+  with pytest.raises(ContributionSubmitError) as raised:
+    stack["preflight"]()
+  assert raised.value.code == "screenshot_body_too_large"
+  assert stack["uploads"] == []
+
+
+def test_a_fork_send_resolves_the_fork_once(submit, monkeypatch):
+  from app import github_contributions
+  git_ops = "app.github_contribution_git."
+  monkeypatch.setattr(git_ops + "_has_upstream_push_permission", lambda *_a: False)
+  monkeypatch.setattr(git_ops + "_normalize_head_attribution", lambda *_a, **_k: {})
+  monkeypatch.setattr(
+    github_contributions, "_push_topic_branch",
+    lambda *_a: submit["events"].append(("push", "fork")),
+  )
+  submit["send"]("octo-org/project")
+  assert submit["events"].count("fork") == 1

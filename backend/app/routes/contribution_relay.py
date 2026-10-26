@@ -52,6 +52,7 @@ from app.github_contribution_git import (
   _validate_repo_slug,
 )
 from app.github_contributions import (
+  GITHUB_BODY_MAX_BYTES,
   ContributionSubmitError,
   _assert_pending_equivalence_preflight,
   _claim_record,
@@ -73,7 +74,6 @@ _CONTRIBUTION_ID = re.compile(r"^ctr_[0-9a-f]{32}$")
 _RELAY_TERMINAL_FAILURES = {"error", "failed", "rejected"}
 _RELAY_TERMINAL_CLOSED = {"closed", "merged", "withdrawn"}
 _RELAY_TITLE_MAX_CHARS = 256
-_RELAY_BODY_MAX_BYTES = 65_536
 _RELAY_SIGNED_ATTEMPT_FIELDS = (
   "relay_payload_sha256",
   "relay_attempt_input_sha256",
@@ -861,10 +861,10 @@ def _validated_reviewed_body(value: object) -> str:
       "The reviewed relay body must be valid UTF-8. Nothing was published.",
       code="relay_review_text_invalid",
     ) from exc
-  if len(encoded) > _RELAY_BODY_MAX_BYTES:
+  if len(encoded) > GITHUB_BODY_MAX_BYTES:
     raise ContributionSubmitError(
       "The reviewed relay body exceeds the supported "
-      f"{_RELAY_BODY_MAX_BYTES:,}-byte UTF-8 limit. Nothing was published.",
+      f"{GITHUB_BODY_MAX_BYTES:,}-byte UTF-8 limit. Nothing was published.",
       code="review_changed_large_diff",
     )
   return value
