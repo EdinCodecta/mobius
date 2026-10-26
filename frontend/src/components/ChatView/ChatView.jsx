@@ -3193,6 +3193,10 @@ export default function ChatView({
     // a stale callback or failed-file-only draft must not close the keyboard,
     // claim scroll ownership, or freeze queue geometry when nothing will send.
     const usesComposerFiles = !Array.isArray(opts.attachments)
+    // A send the owner triggers from elsewhere (a reply's Try again) carries
+    // its own text: the composer's draft is not its payload, so the send
+    // neither clears it nor restores the sent text into it on failure.
+    const takesComposerDraft = opts.fromComposer !== false
     const composerFileSnapshot = usesComposerFiles ? [...pendingFiles] : []
     const attachments = Array.isArray(opts.attachments)
       ? opts.attachments
@@ -3268,7 +3272,7 @@ export default function ChatView({
       if (usesComposerFiles) releaseFiles(composerFileSnapshot)
     }
     function restoreComposerAfterFailedSend() {
-      restoreComposerText(text, { preserveFailedAttempt: true })
+      if (takesComposerDraft) restoreComposerText(text, { preserveFailedAttempt: true })
       if (usesComposerFiles) restoreFiles(composerFileSnapshot)
     }
 
@@ -3330,9 +3334,9 @@ export default function ChatView({
         // its first presentation is the inline steering surface, never the tray.
         pendingQueue.reserveForSteer([cid])
       }
-      setComposerInput('')
+      if (takesComposerDraft) setComposerInput('')
       clearComposerFilesForSend()
-      if (inputRef.current) {
+      if (takesComposerDraft && inputRef.current) {
         resetComposerTextarea(inputRef.current)
         // Drop the multi-line `data-composer-tall` attribute so send/mic
         // re-center vertically. Without this, the pill stays in
@@ -3617,9 +3621,9 @@ export default function ChatView({
     const userMsg = { role: 'user', content: text, ts: Date.now(), cid, optimistic: true }
     if (attachments.length > 0) userMsg.attachments = attachments
     commitMessages(prev => [...prev, userMsg])
-    setComposerInput('')
+    if (takesComposerDraft) setComposerInput('')
     clearComposerFilesForSend()
-    if (inputRef.current) {
+    if (takesComposerDraft && inputRef.current) {
       resetComposerTextarea(inputRef.current)
       // Drop the multi-line `data-composer-tall` attribute — see queue-path
       // comment above for the full rationale.
@@ -5977,6 +5981,13 @@ export default function ChatView({
   // A DB refresh may commit the steer before its cut reaches this socket.
   // Keep the identity-owned active row in its transcript slot through that
   // handoff; moving it to the tail would paint the owner message above it.
+  // Replies are memoized; hand them one stable Try again that sends through
+  // the latest doSend without touching the owner's draft.
+  const doSendRef = useRef(doSend)
+  doSendRef.current = doSend
+  const handleTryAgain = useCallback(() => {
+    void doSendRef.current('Try again', { attachments: [], fromComposer: false })
+  }, [])
   const renderAssistantReply = group => {
     if (!group) return null
     const activeIndex = showActiveAssistantSurface
@@ -6019,6 +6030,10 @@ export default function ChatView({
       resumeCardRef={resumeCardRef}
       isStreaming={continuingRun || (active && activeAssistantIsStreaming)}
       isLastMsg={last}
+      // The latest reply keeps its actions in view; earlier ones reveal on demand.
+      metaVisible={last || visibleMessageMetaKey === group.rows[0].key}
+      onRevealMeta={showMessageMeta}
+      onTryAgain={last && !turnActive && !hasPendingQuestion ? handleTryAgain : undefined}
       suppressedQuestionKeys={showActiveAssistantSurface ? streamItemQuestionKeys : null}
       sealedSteerAssistant={active ? sealedSteerAssistant : sealedAssistantBeforeSteer(messages, group.start)}
     />
@@ -6243,7 +6258,7 @@ export default function ChatView({
               />
               <MessageMetaRow
                 timestamp={ownerUserMessage ? renderedMsg.ts : null}
-                copyText={copyText}
+                copy={copyText ? () => ({ plainText: copyText }) : null}
                 visible={visibleMessageMetaKey === dataKey}
               />
             </li>
@@ -6303,7 +6318,7 @@ export default function ChatView({
                 />
                 <MessageMetaRow
                   timestamp={reservedSteerMessage.ts || null}
-                  copyText={copyText}
+                  copy={copyText ? () => ({ plainText: copyText }) : null}
                   visible={visibleMessageMetaKey === dataKey}
                 />
               </li>

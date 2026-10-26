@@ -1,19 +1,24 @@
-/* MessageMetaRow keeps an owner's message timestamp and copy action in one
-   revealable row. */
+/* MessageMetaRow keeps a message's time and actions in one revealable row:
+   beside an owner message's bubble, or at a reply's start edge
+   (`side="start"`), where the latest reply can also offer Try again.
+   `copy(button)` returns the clipboard payload (see MessageCopyButton). */
 import MessageCopyButton from './MessageCopyButton.jsx'
+import MessageRetryButton from './MessageRetryButton.jsx'
 import { formatDateTime } from '../../lib/dateTimeFormat.js'
 
 
 export default function MessageMetaRow({
   timestamp,
-  copyText,
+  copy,
+  onTryAgain,
+  side = 'end',
   visible,
 }) {
-  if (!timestamp && !copyText) return null
+  if (!timestamp && !copy) return null
 
   return (
     <div
-      className={`chat__msg-meta${visible ? ' chat__msg-meta--visible' : ''}`}
+      className={`chat__msg-meta chat__msg-meta--${side}${visible ? ' chat__msg-meta--visible' : ''}`}
       aria-hidden={!visible}
     >
       {timestamp && (
@@ -21,7 +26,8 @@ export default function MessageMetaRow({
           {formatDateTime(timestamp)}
         </time>
       )}
-      {copyText && <MessageCopyButton text={copyText} />}
+      {copy && <MessageCopyButton read={copy} />}
+      {onTryAgain && <MessageRetryButton onTryAgain={onTryAgain} />}
     </div>
   )
 }
