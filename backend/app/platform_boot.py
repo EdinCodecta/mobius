@@ -24,18 +24,22 @@ decides whether served source may run on it:
   when ``activate`` would refuse it. Restart admission asks this, so it
   predicts this image's boot rather than the served code's rule.
 ``admit``
-  After the import probe passed. Refuses the served commit when it already
-  failed to become ready ``UNREADY_BOOT_LIMIT`` boots in a row, and otherwise
-  counts this boot against it. The import probe cannot see a crash or hang
-  while the server starts; without this, the container restarts into the same
-  commit until the host gives up, and the instance stays down.
+  After the import probe passed. Read-only: refuses the served commit when it
+  already failed to become ready ``UNREADY_BOOT_LIMIT`` boots in a row. The
+  import probe cannot see a crash or hang while the server starts; without
+  this, the container restarts into the same commit until the host gives up,
+  and the instance stays down.
+``starting``
+  Once the boot's choice to serve ``/data/platform`` is final, before any of
+  its code runs. Counts this boot against the served commit. A boot that ends
+  up serving the built-in copy for another reason never counts.
 ``ready``
   Run by the entrypoint's health probe once the served platform answers. The
   commit is good, so its count is forgotten.
 
 A nonzero exit means this image cannot establish a state it may serve from
 ``/data/platform``; the entrypoint then refuses to serve that tree (for
-``admit``: treats it like a failed import probe).
+``admit``: treats it like a failed import probe; for ``starting``: only warns).
 
 Every run is also appended to ``BOOT_LOG``. The container's console is outside
 the app container, so this durable record is the only place an agent repairing
@@ -67,9 +71,10 @@ _STDERR_CHARS = 2000
 # ready. Kept outside /data/platform so it never dirties the served tree.
 UNREADY_BOOTS = Path("/data/.platform-unready-boots.json")
 # Two, not one: a single boot can die for reasons that are not the commit's
-# (out of memory, the host stopping a deploy). The host's own retry budget
-# (railway.toml restartPolicyMaxRetries = 3) must leave one boot to serve the
-# built-in copy after the limit is reached.
+# (out of memory, the host stopping a deploy). The host's own retry budget for
+# a crashing boot (railway.toml restartPolicyMaxRetries = 3) must leave one boot
+# to serve the built-in copy after the limit is reached. A hang never exits, so
+# it counts only when something else restarts the container.
 UNREADY_BOOT_LIMIT = 2
 
 
@@ -82,31 +87,35 @@ def _read_unready_boots(path: Path) -> tuple[str, int]:
     return "", 0
 
 
-def admit_served_commit(sha: str, *, path: Path | None = None) -> str | None:
-  """Count this boot against ``sha``; return why it is refused, or None.
+def unready_refusal(sha: str, *, path: Path | None = None) -> str | None:
+  """Why ``sha`` is set aside, or None while boot may still serve it."""
+  recorded, count = _read_unready_boots(path or UNREADY_BOOTS)
+  if recorded != sha or count < UNREADY_BOOT_LIMIT:
+    return None
+  return (
+    f"platform commit {sha} did not finish starting in {count} boots in a row; "
+    "setting it aside. An approved restart, or a new commit, tries again."
+  )
 
-  Bookkeeping failures admit the commit: this guard exists to keep a box
-  serving, so it must never be the thing that stops a boot.
+
+def count_unready_boot(sha: str, *, path: Path | None = None) -> int:
+  """Count a boot that starts ``sha``, until ``ready`` forgets it; the new count.
+
+  Bookkeeping failures only warn: this guard exists to keep a box serving, so
+  it must never be the thing that stops a boot.
   """
   path = path or UNREADY_BOOTS
   recorded, count = _read_unready_boots(path)
-  count = count if recorded == sha else 0
-  if count >= UNREADY_BOOT_LIMIT:
-    return (
-      f"platform commit {sha} did not finish starting in {count} boots in a row; "
-      "setting it aside. An approved restart, or a new commit, tries again."
-    )
-  staged = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+  count = (count if recorded == sha else 0) + 1
+  staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
   try:
-    staged.write_text(
-      json.dumps({"sha": sha, "unready_boots": count + 1}), encoding="utf-8",
-    )
+    staged.write_text(json.dumps({"sha": sha, "unready_boots": count}), encoding="utf-8")
     os.replace(staged, path)
   except Exception as exc:  # noqa: BLE001 - see docstring
     with contextlib.suppress(OSError):
       staged.unlink(missing_ok=True)
     print(f"platform boot: could not count this boot in {path}: {exc!r}", file=sys.stderr)
-  return None
+  return count
 
 
 def forget_unready_boots(*, path: Path | None = None) -> None:
@@ -180,11 +189,11 @@ def check_packages(checkout: str | None) -> int:
 def main(argv: list[str]) -> int:
   if len(argv) in (2, 3) and argv[1] == "check-packages":
     return check_packages(argv[2] if len(argv) == 3 else None)
-  commands = {"activate", "revert", "guard", "admit", "ready"}
+  commands = {"activate", "revert", "guard", "admit", "starting", "ready"}
   if len(argv) != 2 or argv[1] not in commands:
     print(
       "usage: python3 -m app.platform_boot "
-      "activate|revert|guard|admit|ready|check-packages [checkout]",
+      "activate|revert|guard|admit|starting|ready|check-packages [checkout]",
       file=sys.stderr,
     )
     return 2
@@ -215,12 +224,18 @@ def main(argv: list[str]) -> int:
       outcome = "reverted"
     elif command == "admit":
       sha = platform_update._rev(repo, "HEAD")
-      refusal = admit_served_commit(sha) if sha else None
+      refusal = unready_refusal(sha) if sha else None
       if refusal:
         print(f"platform boot admit: {refusal}", file=sys.stderr)
         record_boot_run(command, ok=False, detail=refusal)
         return 1
       outcome = f"admitted {sha or 'unknown commit'}"
+    elif command == "starting":
+      sha = platform_update._rev(repo, "HEAD")
+      if sha:
+        outcome = f"starting {sha}; unready boots in a row: {count_unready_boot(sha)}"
+      else:
+        outcome = "starting an unknown commit; not counted"
     else:
       outcome = platform_update.boot_guard_sync()
   except Exception as exc:  # noqa: BLE001 - any failure must refuse the tree

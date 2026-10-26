@@ -6242,7 +6242,7 @@ def test_entrypoint_settles_guards_and_probes_before_any_served_code_runs():
     branch.index("elif _platform_boot revert"),
   ]
   assert order == sorted(order)
-  # Admission counts a boot against the commit, so only after its probe passed.
+  # Served means it imports and was not set aside for never finishing its start.
   assert "_platform_import_probe && _platform_boot admit 2>&1" in script
   assert "reconcile_clone_sync" not in body
   assert "cd /app/platform-baked/backend" in script
