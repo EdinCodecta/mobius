@@ -40,10 +40,12 @@ an app removes it from every grant and request.
   from the server. Its folder `/data/.vault/` (mode 0700, reasserted at
   start, with its own `.gitignore`) holds `master.key`, `keys.json` (AES-GCM
   per value, the key name as associated data), `requests.json`, `usage.jsonl`
-  (rotated at 512 KiB, never values) and `vault.sock` (mode 0600). There is
-  no TCP port: only the server, through the socket, talks to the vault, and
-  it states the attested caller in `X-Vault-Caller`
-  (`app:<id>`, `agent:<chat>`, `owner`, `platform:<purpose>`).
+  (rotated at 512 KiB, never values), `vault.lock` (one vault per folder)
+  and `vault.sock` (mode 0600). There is no TCP port. The vault trusts any
+  process that can open the socket: the server, which states the attested
+  caller in `X-Vault-Caller` (`app:<id>`, `agent:<chat>`, `owner`,
+  `platform:<purpose>`), and owner tools running as the same user, such as
+  `store-key.py`. The peer check under *Future work* narrows that.
 - `backend/app/key_vault.py`: supervises the vault (task `key-vault`,
   restarts with backoff; the vault exits when the server is no longer its
   parent; output in `/data/logs/key-vault.log`) and is the server's client.
@@ -74,12 +76,16 @@ reads that key at turn launch while the owner's grant to the app stands
 `/data/app-secrets/<id>/<name>` move into the vault (`import_legacy_app_secrets`):
 each becomes a key granted to its own app and the owner's agents, sent as a
 bearer token, with no sites until the owner adds them. Each key records its
-origin (the app and its exact old name), set once at creation. The vault
+origin (the app and its exact old name), set at creation. The vault
 finds or creates that key in one locked step (`Vault.save_owned`), at the
 first free name (`api.key` → `api-key`, then `app<id>-api-key`, then
 numbered), so distinct old names never merge, simultaneous saves never leave
 two keys for one secret, and no existing key is overwritten. Model providers and the adapter below find a
-secret by that origin, not by its vault name. A ledger
+secret by that origin, not by its vault name. Once the owner or an agent
+stores a new value in such a key, the origin is cleared: the key is the
+owner's, and the app only borrows it like any other. Wiping an app's data or
+purging the app erases its own keys (a key the owner shared with other apps
+stays for them), as the per-app store did. A ledger
 (`.vault-import.json`) next to the old files means a key the owner deletes is
 never re-imported, unreadable values are retried, and a purged app's leftover
 values are skipped because its id may be reused. The old ciphertext stays in

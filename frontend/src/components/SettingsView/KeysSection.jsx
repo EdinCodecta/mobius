@@ -278,7 +278,7 @@ function KeyDetail({ keyRecord: key, onDeleted }) {
         <div className="settings-keys-card__row">
           <span className="settings-keys-card__copy">
             <strong>Agents</strong>
-            <small>They borrow it without seeing it</small>
+            <small>Through the vault, on its sites. Agents can still read any key.</small>
           </span>
           <Switch
             className="settings-keys-switch"

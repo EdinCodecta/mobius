@@ -11,6 +11,7 @@ import contextlib
 import http.client
 import importlib.util
 import json
+import os
 import shutil
 import socket
 import stat
@@ -403,7 +404,7 @@ def test_non_public_destination_is_logged_as_a_refusal(vault):
 def test_a_purged_app_loses_every_grant_and_request(vault):
   vault.request_access(WEATHER, ASK)
   vault.request_access(9, ASK)
-  assert vault.forget_app(WEATHER) == {"keys": ["echo"], "requests": 1}
+  assert vault.forget_app(WEATHER) == {"keys": ["echo"], "deleted": [], "requests": 1}
   [record] = vault.list_keys()
   assert record["grants"]["apps"] == []
   assert [r["app"] for r in vault.list_requests()] == [9]
@@ -425,16 +426,45 @@ def test_decoding_is_bounded_and_strips_the_encoding(monkeypatch):
     kv.decoded_body([("Content-Encoding", "gzip")], b"not gzip")
 
 
-def test_create_only_refuses_an_occupied_name_and_origin_is_set_once(vault):
+def test_create_only_refuses_an_occupied_name_and_an_update_never_moves_origin(vault):
   with pytest.raises(kv.VaultError, match="already exists"):
     vault.put_key("echo", {"value": "other", "inject": HEADER_SLOT, "create_only": True})
   assert vault.reveal("echo", ("owner", "")) == DUMMY
   vault.put_key("mine", {"value": DUMMY, "inject": HEADER_SLOT, "create_only": True,
                          "origin": {"app": 7, "name": "api.key"}})
+  # Changing how the key is sent keeps it the app's own.
+  vault.put_key("mine", {"inject": HEADER_SLOT, "origin": {"app": 8, "name": "stolen"}})
+  assert {k["name"]: k["origin"] for k in vault.list_keys()}["mine"] == {"app": 7, "name": "api.key"}
+  # A value written under another origin never hands the key to that app.
   vault.put_key("mine", {"value": "next", "inject": HEADER_SLOT,
                          "origin": {"app": 8, "name": "stolen"}})
-  [mine] = [k for k in vault.list_keys() if k["name"] == "mine"]
-  assert mine["origin"] == {"app": 7, "name": "api.key"}
+  assert {k["name"]: k["origin"] for k in vault.list_keys()}["mine"] is None
+
+
+def test_an_owner_value_ends_the_apps_ownership_of_the_key(vault):
+  saved = vault.save_owned(9, "OPENAI_API_KEY", "app-dummy")
+  assert saved == {"name": "OPENAI_API_KEY", "created": True}
+  [record] = [k for k in vault.list_keys() if k["name"] == "OPENAI_API_KEY"]
+  # The owner (or an agent's store-key.py) fills in the real value, keeping
+  # the key's current grants as the Settings page and store-key.py do.
+  vault.put_key("OPENAI_API_KEY", {"value": "owners-real-key", "inject": record["inject"],
+                                   "grants": record["grants"]})
+  [record] = [k for k in vault.list_keys() if k["name"] == "OPENAI_API_KEY"]
+  assert record["origin"] is None and record["grants"]["apps"] == [9]
+  # The app can neither delete nor replace it; its next save is a key of its own.
+  assert vault.release_owned(9, "OPENAI_API_KEY") is None
+  assert vault.save_owned(9, "OPENAI_API_KEY", "app-chosen") == {
+    "name": "app9-OPENAI_API_KEY", "created": True,
+  }
+  assert vault.reveal("OPENAI_API_KEY", ("owner", "")) == "owners-real-key"
+  assert vault.erase_owned(9) == ["app9-OPENAI_API_KEY"]
+  assert vault.reveal("OPENAI_API_KEY", ("owner", "")) == "owners-real-key"
+
+
+def test_the_apps_own_save_keeps_its_ownership(vault):
+  vault.save_owned(9, "api.key", "first")
+  assert vault.save_owned(9, "api.key", "second") == {"name": "api-key", "created": False}
+  assert {k["name"]: k["origin"] for k in vault.list_keys()}["api-key"] == {"app": 9, "name": "api.key"}
 
 
 def test_save_owned_finds_or_creates_by_origin_under_one_lock(vault):
@@ -474,3 +504,32 @@ def test_releasing_an_unshared_owned_key_deletes_it_and_never_touches_borrowed_k
   # "echo" is granted to WEATHER but was never created by it.
   assert vault.release_owned(WEATHER, "echo") is None
   assert "echo" in {k["name"] for k in vault.list_keys()}
+
+
+def test_erasing_an_apps_data_erases_only_its_own_keys(vault):
+  alone = vault.save_owned(WEATHER, "token", DUMMY)["name"]
+  shared = vault.save_owned(WEATHER, "shared", DUMMY)["name"]
+  [record] = [k for k in vault.list_keys() if k["name"] == shared]
+  vault.put_key(shared, {"inject": HEADER_SLOT, "grants": {**record["grants"], "apps": [WEATHER, 9]}})
+  assert vault.erase_owned(WEATHER) == [alone]
+  keys = {k["name"]: k for k in vault.list_keys()}
+  assert alone not in keys
+  assert keys[shared]["grants"]["apps"] == [9]
+  # "echo" is only lent to WEATHER: the owner's grant is not app data.
+  assert keys["echo"]["grants"]["apps"] == [WEATHER]
+
+
+def test_a_purge_erases_the_apps_own_keys(vault):
+  own = vault.save_owned(WEATHER, "token", DUMMY)["name"]
+  assert vault.forget_app(WEATHER) == {"keys": ["echo"], "deleted": [own], "requests": 0}
+  assert [k["name"] for k in vault.list_keys()] == ["echo"]
+
+
+def test_only_one_vault_runs_on_a_folder(tmp_path):
+  fd = kv.hold_single_instance_lock(tmp_path / "store")
+  try:
+    with pytest.raises(SystemExit, match="another vault"):
+      kv.hold_single_instance_lock(tmp_path / "store")
+  finally:
+    os.close(fd)
+  os.close(kv.hold_single_instance_lock(tmp_path / "store"))

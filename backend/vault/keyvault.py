@@ -4,10 +4,11 @@ The owner and the owner's agents may read a key. Apps never receive a value:
 they send an ordinary HTTPS request through the vault, naming the key and the
 destination, and the vault adds the key on the way out.
 
-Only the Möbius server talks to the vault, over one Unix socket in the vault
-folder (mode 0600, so app code running as another user cannot connect). The
-server authenticates every caller with its own platform-issued token and
-passes the attested identity in ``X-Vault-Caller``:
+The vault listens on one Unix socket in its folder (mode 0600, so app code
+running as another user cannot connect). It trusts whoever can open that
+socket: the Möbius server, and owner tools running as the same user such as
+``store-key.py``. The server authenticates every caller with its own
+platform-issued token and passes the attested identity in ``X-Vault-Caller``:
 
     app:<app-id> | agent:<chat-id> | owner | platform:<purpose>
 
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import fnmatch
 import http.client
 import ipaddress
@@ -548,8 +550,12 @@ class Vault:
 
     ``create_only`` refuses an occupied name atomically, so a caller choosing a
     free name can never overwrite another key. ``origin`` records the app and
-    the app's own secret name a key was created for; it is set once, at
-    creation, and never changed by an update.
+    the app's own secret name a key was created for. It is set at creation and
+    an update never moves it to another app. A new value from anyone but that
+    app's own save (``save_owned``, which states the same origin) clears it:
+    once the owner or an agent supplies the value, the key is the owner's, and
+    the app can no longer replace it, delete it or send it to a host of its
+    choosing as its own.
     """
     validate_name(name)
     inject = validate_inject(body.get("inject"))
@@ -576,6 +582,8 @@ class Vault:
         "updated_at": now,
       }
       kept_origin = existing.get("origin") if existing else origin
+      if existing is not None and body.get("value") is not None and origin != kept_origin:
+        kept_origin = None
       if kept_origin:
         self._records[name]["origin"] = kept_origin
       self._save()
@@ -603,7 +611,8 @@ class Vault:
     with self._lock:
       for name, record in self._records.items():
         if record.get("origin") == origin and app_id in record["grants"]["apps"]:
-          self.put_key(name, {"value": value, "inject": record["inject"], "grants": record["grants"]})
+          self.put_key(name, {"value": value, "inject": record["inject"],
+                              "grants": record["grants"], "origin": origin})
           return {"name": name, "created": False}
       for name in owned_name_candidates(app_id, secret_name):
         if name not in self._records:
@@ -636,19 +645,50 @@ class Vault:
       )
       if name is None:
         return None
-      grants = self._records[name]["grants"]
-      others = [a for a in grants["apps"] if a != app_id]
-      if others:
-        grants["apps"] = others
-        self._records[name]["updated_at"] = _now()
-      else:
-        del self._records[name]
+      deleted = self._release_locked(name, app_id)
       self._save()
     self.log_usage(
       name, caller_text(("app", str(app_id))), "-", "-", "-",
-      "released" if others else "revoked",
+      "revoked" if deleted else "released",
     )
-    return {"name": name, "deleted": not others}
+    return {"name": name, "deleted": deleted}
+
+  def _release_locked(self, name: str, app_id: int) -> bool:
+    """Withdraw ``app_id`` from its own key; delete the key unless shared.
+
+    The caller holds the lock and saves. Returns whether the key was deleted.
+    """
+    record = self._records[name]
+    others = [a for a in record["grants"]["apps"] if a != app_id]
+    if others:
+      record["grants"]["apps"] = others
+      record["updated_at"] = _now()
+    else:
+      del self._records[name]
+    return not others
+
+  def erase_owned(self, app_id: int) -> list[str]:
+    """Release every key ``app_id`` created for itself and still holds.
+
+    Erasing an app's data (or purging the app) erases its secrets, as the
+    per-app store did: each such key is deleted, or kept only for the other
+    apps the owner shared it with. Keys the app merely borrows, and keys whose
+    value the owner or an agent supplied (no longer the app's), are untouched.
+    Returns the names of the deleted keys.
+    """
+    if isinstance(app_id, bool) or not isinstance(app_id, int) or app_id < 1:
+      raise VaultError(400, "Invalid app id.")
+    with self._lock:
+      owned = [n for n, r in self._records.items()
+               if (r.get("origin") or {}).get("app") == app_id and app_id in r["grants"]["apps"]]
+      deleted = [name for name in owned if self._release_locked(name, app_id)]
+      if owned:
+        self._save()
+    for name in owned:
+      self.log_usage(name, "platform", "-", "-", "-",
+                     "revoked" if name in deleted else "released",
+                     reason=f"app:{app_id} data erased")
+    return deleted
 
   def revoke_key(self, name: str) -> bool:
     validate_name(name)
@@ -770,14 +810,13 @@ class Vault:
     return {"denied": request_id}
 
   def forget_app(self, app_id: int) -> dict:
-    """Drop a purged app from every grant and request.
+    """Erase a purged app's own keys and drop it from every grant and request.
 
     App ids can be reused once an app is purged, so a grant must never outlive
     the app it was given to.
     """
-    if isinstance(app_id, bool) or not isinstance(app_id, int) or app_id < 1:
-      raise VaultError(400, "Invalid app id.")
     with self._lock:
+      deleted = self.erase_owned(app_id)
       keys = [n for n, r in self._records.items() if app_id in r["grants"]["apps"]]
       for name in keys:
         grants = self._records[name]["grants"]
@@ -791,7 +830,7 @@ class Vault:
         self._save_requests()
     for name in keys:
       self.log_usage(name, "platform", "-", "-", "-", f"revoked app:{app_id} (app purged)")
-    return {"keys": keys, "requests": len(requests)}
+    return {"keys": keys, "deleted": deleted, "requests": len(requests)}
 
   def forget_request(self, request_id: str) -> bool:
     with self._lock:
@@ -982,6 +1021,8 @@ class VaultHandler(BaseHTTPRequestHandler):
       self._send_json(200, released)
     elif method == "DELETE" and len(parts) == 2 and parts[0] == "apps" and parts[1].isdigit():
       self._send_json(200, vault.forget_app(int(parts[1])))
+    elif method == "DELETE" and len(parts) == 3 and parts[0] == "apps" and parts[1].isdigit() and parts[2] == "owned":
+      self._send_json(200, {"deleted": vault.erase_owned(int(parts[1]))})
     elif method == "DELETE" and len(parts) == 2 and parts[0] == "requests":
       if not vault.forget_request(parts[1]):
         raise VaultError(404, "That request is gone.")
@@ -1101,7 +1142,26 @@ class VaultServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
   daemon_threads = True
 
 
+def hold_single_instance_lock(data_dir: Path) -> int:
+  """Hold the folder's lock for this process's lifetime, or exit.
+
+  Two vaults on one folder would each load their own copy of the store and
+  unlink each other's socket. A vault outliving a restarted server exits
+  within seconds; until then the new one exits and is restarted by the
+  supervisor's backoff, so it loads the store only after the last write.
+  """
+  data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+  fd = os.open(data_dir / "vault.lock", os.O_RDWR | os.O_CREAT, 0o600)
+  try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+  except BlockingIOError:
+    os.close(fd)
+    raise SystemExit("key vault: another vault is running on this folder")
+  return fd
+
+
 def serve(data_dir: Path, parent_pid: int | None) -> None:
+  hold_single_instance_lock(data_dir)
   vault = Vault(data_dir)
   handler = type("BoundVaultHandler", (VaultHandler,), {"vault": vault})
   socket_path = data_dir / SOCKET_NAME

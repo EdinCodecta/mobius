@@ -80,6 +80,7 @@ def vault(monkeypatch):
   server = kv.VaultServer(str(folder / "vault.sock"), handler)
   threading.Thread(target=server.serve_forever, daemon=True).start()
   monkeypatch.setattr(key_vault, "vault_socket", lambda: folder / "vault.sock")
+  monkeypatch.setattr(key_vault, "vault_dir", lambda: folder / "store")
   yield store
   server.shutdown()
   server.server_close()
@@ -462,3 +463,44 @@ def test_a_borrowed_key_reaches_only_a_model_provider_on_its_sites(client, auth,
   assert key_vault.model_provider_key_sync(app.id, "shared-provider", "https://attacker.example/v1") is None
   other = _app(db, "bystander")
   assert reveal(other.id, "shared-provider", "https://api.example.com/v1") is None
+
+
+def test_an_owner_filled_key_is_no_longer_the_apps_to_replace_delete_or_send(client, auth, db, vault):
+  """An app that created a key under a plain name loses it once the owner
+  fills in the value: it can no longer swap the value, delete the key, or
+  have the platform send it to the app's own model provider host."""
+  app = _app(db, "squatter")
+  app_auth = _app_auth(db, app)
+  path = f"/api/apps/{app.id}/secrets/OPENAI_API_KEY"
+  assert client.put(path, headers=app_auth, json={"value": "app-dummy"}).status_code == 204
+  [record] = vault.list_keys()
+  assert record["name"] == "OPENAI_API_KEY" and record["origin"]["app"] == app.id
+  # The owner fills in the real value from Settings › Keys, keeping the grants.
+  filled = client.put("/api/keys/OPENAI_API_KEY", headers=auth, json={
+    "value": "owners-real-key", "inject": record["inject"], "grants": record["grants"],
+  })
+  assert filled.status_code == 200
+  attacker = "https://attacker.example/v1"
+  assert key_vault.reveal_model_provider_key(app.id, "OPENAI_API_KEY", attacker) is None
+  assert client.head(path, headers=app_auth).status_code == 404
+  assert client.delete(path, headers=app_auth).status_code == 404
+  assert client.put(path, headers=app_auth, json={"value": "app-chosen"}).status_code == 204
+  assert vault.reveal("OPENAI_API_KEY", ("owner", "")) == "owners-real-key"
+  # The app's provider now gets only the value the app saved itself.
+  assert key_vault.reveal_model_provider_key(app.id, "OPENAI_API_KEY", attacker) == "app-chosen"
+
+
+def test_wiping_an_apps_data_erases_its_own_secrets_but_not_borrowed_keys(client, auth, db, vault):
+  from app.config import get_settings
+  app = _app(db, "wiped")
+  app_auth = _app_auth(db, app)
+  assert client.put(f"/api/apps/{app.id}/secrets/token", headers=app_auth,
+                    json={"value": "apps-own"}).status_code == 204
+  _legacy_secret(app.id, "old_token", "legacy-value")
+  vault.put_key("lent", {"value": DUMMY, "inject": ASK["inject"],
+                         "grants": {"apps": [app.id], "agents": False, "sites": [SITE]}})
+  assert client.delete(f"/api/apps/{app.id}/data", headers=auth).status_code == 204
+  keys = {k["name"]: k for k in vault.list_keys()}
+  assert "token" not in keys
+  assert keys["lent"]["grants"]["apps"] == [app.id]
+  assert not (Path(get_settings().data_dir) / "app-secrets" / str(app.id)).exists()

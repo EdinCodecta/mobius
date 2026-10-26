@@ -3519,9 +3519,12 @@ async def delete_app_data(
     # next write (atomic_write mkdirs its parent). Wipe LOUDLY: a swallowed
     # failure would rotate the nonce and answer 204 while artifact values the
     # owner asked to erase are still on disk and readable by the still-live app.
+    from app import key_vault
     try:
       await settled.run_settled(_rmtree_strict, storage_dir)
-    except OSError as exc:
+      # The app's own secrets are its data too (keys it only borrows are not).
+      await settled.settle(key_vault.erase_app_keys(app.id), what="App key erase")
+    except (OSError, key_vault.VaultUnavailable, key_vault.VaultRefused) as exc:
       log.error("app %s data wipe failed: %s", app.id, exc)
       raise HTTPException(
         500,

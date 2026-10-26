@@ -111,10 +111,13 @@ name, the owner approves it, and the app then sends requests through
 `/api/keys/use/…`, where the server identifies the app from its own
 platform-issued token and the vault adds the key on the way out (default-deny
 sites, methods and paths; public-address pinning; no redirects; echoed values
-redacted; answers sandboxed). Only the server talks to the vault, over a
-mode-0600 socket. Approving requests and changing grants is refused to apps,
-shared-browser guests and delegated helpers. App ids are reused after a purge,
-so a purge removes that app's grants. Backups carry the vault only in the
+redacted; answers sandboxed). The vault listens only on a mode-0600 socket
+and trusts any process that can open it (the server, and owner tools running
+as the same user). Approving requests and changing grants is refused to apps,
+shared-browser guests and delegated helpers. A key an app saved for itself
+stops being the app's once the owner or an agent stores a new value in it.
+App ids are reused after a purge, so a purge removes that app's grants and,
+like a data wipe, erases the keys it saved for itself. Backups carry the vault only in the
 encrypted secrets archive (skipped when no backup recipient is configured),
 and agents are guided to borrow keys through the vault rather than read them,
 so values stay out of chat logs.

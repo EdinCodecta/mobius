@@ -378,7 +378,7 @@ async def import_legacy_app_secrets(live_app_ids: set[int]) -> dict:
 
 
 def _remove_legacy_secrets(app_id: int) -> None:
-  """Delete a purged app's not-yet-imported values from the retired store.
+  """Delete an app's files from the retired store, imported or not.
 
   The importer assigns each pending file to the live app with that id, so a
   file left behind would be granted to an unrelated app that reuses the id.
@@ -394,18 +394,34 @@ def _remove_legacy_secrets(app_id: int) -> None:
     raise OSError(f"legacy secrets for app {app_id} survived removal")
 
 
-async def forget_app(app_id: int) -> None:
-  """Drop a purged app from every grant and request; raise if that fails.
+def _vault_ever_used() -> bool:
+  folder = vault_dir()
+  return (folder / "keys.json").exists() or (folder / "requests.json").exists()
 
-  Its values still waiting in the retired per-app store are deleted first.
-  An instance whose vault never stored anything has nothing else to forget,
-  so a purge does not depend on a vault that was never used.
+
+async def erase_app_keys(app_id: int) -> None:
+  """Erase an app's own secrets when its data is wiped; raise if that fails.
+
+  Its files in the retired per-app store go, and each vault key the app
+  created for itself is deleted (or kept only for other apps the owner shared
+  it with). Keys it borrows stay granted: the owner's choices are not app data.
   """
   await asyncio.to_thread(_remove_legacy_secrets, app_id)
-  folder = vault_dir()
-  if not (folder / "keys.json").exists() and not (folder / "requests.json").exists():
-    return
-  await vault_call("DELETE", f"/apps/{int(app_id)}")
+  if _vault_ever_used():
+    await vault_call("DELETE", f"/apps/{int(app_id)}/owned")
+
+
+async def forget_app(app_id: int) -> None:
+  """Erase a purged app's own keys and drop it from every grant and request.
+
+  Raises if that fails. Its values still waiting in the retired per-app store
+  are deleted first. An instance whose vault never stored anything has
+  nothing else to forget, so a purge does not depend on a vault that was
+  never used.
+  """
+  await asyncio.to_thread(_remove_legacy_secrets, app_id)
+  if _vault_ever_used():
+    await vault_call("DELETE", f"/apps/{int(app_id)}")
 
 
 async def _import_when_ready() -> None:
