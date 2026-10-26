@@ -6,7 +6,7 @@ import {
   DEFAULT_IMAGE_EDGE, MAX_READ_BYTES, base64ToBytes, fileInfo, pageOf, readFileSlice, shrinkImage, sortEntries,
 } from './fileReads.js'
 
-const MAX_WRITE_BYTES = MAX_READ_BYTES
+export const MAX_WRITE_BYTES = MAX_READ_BYTES
 const ERROR_CODES = {
   NotFoundError: 'not_found',
   TypeMismatchError: 'wrong_kind',
@@ -106,7 +106,7 @@ async function image(root, command) {
  * belongs to the owner, and hidden names (.git/hooks, .vscode/tasks.json,
  * .envrc) hold settings other programs run later.
  */
-function editableSegments(path) {
+export function editableSegments(path) {
   const segments = pathSegments(path)
   if (isInBin(segments)) {
     throw new FolderError(

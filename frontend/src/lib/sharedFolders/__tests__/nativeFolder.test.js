@@ -8,6 +8,7 @@ import { handleSharedFolderCommand, refreshPermissions } from '../folderHost.js'
 import { loadFolderRecords } from '../folderStore.js'
 import { folderState, hostStore, publish } from '../hostState.js'
 import { NATIVE_CHUNK_BYTES, createNativeFolder, nativeFolderBridge } from '../nativeFolder.js'
+import { BIN_FOLDER_NAME } from '../folderPaths.js'
 import { shouldSuggestSharedFolder } from '../uploadSuggestion.js'
 import { FakeNativeBridge, patternFile, textFile } from './fakeNativeBridge.js'
 
@@ -167,21 +168,67 @@ test('bridge failures become the folder errors agents already know', async () =>
   await failsWith(broken.run({ op: 'info', path: 'a' }), 'device_error')
 })
 
-test('a native folder is read only: changes are refused before reaching the app', async () => {
-  const folder = folderOver({ 'a.txt': textFile('a') })
+test('an older phone app without writes keeps its folders read only, before reaching the app', async () => {
+  const id = bridge.addFolder('Docs', { 'a.txt': textFile('a') })
+  const olderApp = { pickFolder() {}, folderEntry: (...args) => bridge.folderEntry(...args) }
+  const folder = createNativeFolder(olderApp, id)
   for (const op of ['write', 'move', 'mkdir', 'bin']) {
     await failsWith(folder.run({ op, path: 'a.txt', content: 'x', to: 'b.txt' }), 'read_only')
   }
 })
 
-test('Add folder in the phone app picks natively, read only, and remembers it across reloads', async () => {
+test('a native folder shared to edit saves, moves and bins files, keeping replaced ones', async () => {
+  const tree = { 'todo.txt': textFile('milk'), Notes: {} }
+  const folder = folderOver(tree)
+  assert.equal((await folder.run({ op: 'write', path: 'new.txt', content: 'hi' })).created, true)
+  assert.equal(new TextDecoder().decode(tree['new.txt'].bytes), 'hi')
+  await failsWith(folder.run({ op: 'write', path: 'todo.txt', content: 'eggs' }), 'exists')
+  await failsWith(folder.run({ op: 'write', path: 'missing/a.txt', content: 'x' }), 'not_found')
+
+  const replaced = await folder.run({ op: 'write', path: 'todo.txt', content: 'eggs', overwrite: true })
+  assert.deepEqual([replaced.created, replaced.binned], [false, `${BIN_FOLDER_NAME}/todo.txt`])
+  assert.equal(new TextDecoder().decode(tree[BIN_FOLDER_NAME]['todo.txt'].bytes), 'milk')
+  const again = await folder.run({ op: 'write', path: 'todo.txt', content: 'bread', overwrite: true })
+  assert.equal(again.binned, `${BIN_FOLDER_NAME}/todo (2).txt`)
+
+  assert.deepEqual(await folder.run({ op: 'mkdir', path: 'Notes/2026' }), { path: 'Notes/2026', created: true })
+  assert.equal((await folder.run({ op: 'mkdir', path: 'Notes' })).created, false)
+  assert.deepEqual(
+    await folder.run({ op: 'move', path: 'new.txt', to: 'Notes/hello.txt' }),
+    { path: 'new.txt', to: 'Notes/hello.txt' },
+  )
+  assert.equal(tree['new.txt'], undefined)
+  await failsWith(folder.run({ op: 'move', path: 'todo.txt', to: 'Notes/hello.txt' }), 'exists')
+  await failsWith(folder.run({ op: 'move', path: 'Notes', to: 'Other' }), 'folder_move_unsupported')
+
+  assert.deepEqual(await folder.run({ op: 'bin', path: 'Notes/hello.txt' }), {
+    path: 'Notes/hello.txt', to: `${BIN_FOLDER_NAME}/hello.txt`,
+  })
+  assert.equal(tree.Notes['hello.txt'], undefined)
+})
+
+test('agents cannot change the bin or hidden names in a native folder', async () => {
+  const folder = folderOver({ '.env': textFile('KEY=1'), [BIN_FOLDER_NAME]: { 'old.txt': textFile('old') } })
+  await failsWith(folder.run({ op: 'write', path: '.env', content: 'x', overwrite: true }), 'hidden_name')
+  await failsWith(folder.run({ op: 'write', path: `${BIN_FOLDER_NAME}/old.txt`, content: 'x', overwrite: true }), 'in_bin')
+  await failsWith(folder.run({ op: 'bin', path: `${BIN_FOLDER_NAME}/old.txt` }), 'already_in_bin')
+  await failsWith(folder.run({ op: 'move', path: '.env', to: 'env' }), 'hidden_name')
+})
+
+test('the app refusing a change reaches the agent as its code', async () => {
+  const id = bridge.addFolder('Docs', { 'a.txt': textFile('a') }, 'read')
+  await failsWith(createNativeFolder(bridge, id).run({ op: 'mkdir', path: 'new' }), 'read_only')
+})
+
+test('Add folder in the phone app picks natively with the chosen rights, and remembers it across reloads', async () => {
   bridge.willPick('Camera', { 'a.jpg': textFile('jpeg') })
   const outcome = await addRememberedFolder('edit')
   assert.equal(outcome.ok, true)
   assert.equal(outcome.name, 'Camera')
+  assert.equal(outcome.notice, undefined)
   const [saved] = await loadFolderRecords()
   assert.equal(saved.source, 'native')
-  assert.equal(saved.mode, 'read', 'the bridge has no writes, so edit is never granted')
+  assert.equal(saved.mode, 'edit')
   assert.equal(saved.access, 'remembered')
   assert.equal(saved.nativeId, 'native-1')
   assert.notEqual(saved.id, saved.nativeId, 'the page keeps its own id scheme')
@@ -197,6 +244,26 @@ test('Add folder in the phone app picks natively, read only, and remembers it ac
   await handleSharedFolderCommand({ commandId: 'c1', folderId: saved.id, op: 'read', path: 'a.jpg' })
   assert.equal(answers.at(-1).ok, true)
   assert.equal(answers.at(-1).result.text, 'jpeg')
+})
+
+test('a phone folder asked for with Read & edit is shared Read only when the app cannot change it', async () => {
+  bridge.writable = false
+  bridge.willPick('Drive', { 'a.txt': textFile('a') })
+  const outcome = await addRememberedFolder('edit')
+  assert.equal(outcome.ok, true)
+  assert.match(outcome.notice, /Read only/)
+  const [record] = hostStore().records.values()
+  assert.equal(record.mode, 'read')
+  await handleSharedFolderCommand({ commandId: 'c1', folderId: record.id, op: 'mkdir', path: 'new' })
+  assert.equal(answers.at(-1).code, 'read_only')
+})
+
+test('Read only from the phone app stays read only, and the upload prompt never asks to edit', async () => {
+  bridge.willPick('Docs', {})
+  await addRememberedFolder('read')
+  bridge.willPick('Docs', {})
+  await shareUploadFolder()
+  assert.deepEqual([...hostStore().records.values()].map(record => record.mode), ['read', 'read'])
 })
 
 test('cancelling the phone picker adds nothing', async () => {
