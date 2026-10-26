@@ -1,8 +1,9 @@
-"""A card answer the owner typed instead of picking reaches the agent framed.
+"""A card answer typed instead of picking an option reaches the agent framed.
 
 Agents read "- <question>: <text>" as a choice, so a typed question was parked
 for later and the same card re-asked with no visible reply. The turn that
-carries such an answer gets a note naming it as the owner's message.
+carries such an answer gets a note naming it as a message, attributed to the
+owner only when the turn carries owner-input provenance.
 """
 
 import uuid
@@ -43,6 +44,14 @@ def test_label_answer_from_a_client_without_option_ids_is_a_pick():
   assert typed_replies(_card({"Ship it?": "Not now"})) == []
 
 
+def test_legacy_multi_select_label_pick_is_not_a_typed_reply():
+  question = {"id": "question-1", "question": "Which?", "multiSelect": True, "options": [
+    {"label": "Docs"}, {"label": "Tests"}, {"label": "Code"}]}
+  assert typed_replies(_card({"Which?": "Docs, Code"}, questions=[question])) == []
+  assert typed_replies(_card({"Which?": "Docs, and why?"}, questions=[question])) == [
+    ("Which?", "Docs, and why?")]
+
+
 def test_question_without_options_expects_typed_text():
   card = _card({"Name?": "Ada"}, questions=[{"id": "question-1", "question": "Name?"}])
   assert typed_replies(card) == []
@@ -61,12 +70,13 @@ def test_mixed_card_reports_only_the_typed_question():
   assert typed_replies(card) == [("Ship it?", "does this break anything?")]
 
 
-def _chat(db, card, turn_content, reason="question_answer"):
+def _chat(db, card, turn_content, reason="question_answer", earlier=()):
   chat = chat_writer.create_chat(
     id="typed-reply-chat",
     title="typed reply",
     messages=[
       {"role": "user", "content": "go"},
+      *earlier,
       {"role": "assistant", "content": "asking", "blocks": [card]},
       {"role": "user", "content": turn_content, "hidden": True,
        "kind": "continuation", "continuation_reason": reason},
@@ -80,25 +90,49 @@ def _chat(db, card, turn_content, reason="question_answer"):
 def test_typed_reply_turn_tells_the_agent_to_answer_visibly_first(db):
   content = "- Ship it?: why is option one safer?"
   chat = _chat(db, _card({"Ship it?": "why is option one safer?"}), content)
-  note = typed_reply_context(db, chat, content)
+  note = typed_reply_context(db, chat, content, answered_by_owner=True)
   assert "Owner wrote: why is option one safer?" in note
   assert "visible reply text first" in note
+
+
+def test_answer_from_an_agent_is_not_framed_as_the_owners_message(db):
+  content = "- Ship it?: why is option one safer?"
+  chat = _chat(db, _card({"Ship it?": "why is option one safer?"}), content)
+  note = typed_reply_context(db, chat, content, answered_by_owner=False)
+  assert "owner typed" not in note and "Owner wrote" not in note
+  assert "a participant other than the owner (an agent or app) typed" in note
+  assert "Participant wrote: why is option one safer?" in note
+
+
+def test_answer_to_an_older_card_quotes_that_card(db):
+  older = {**_card({"Ship it?": "what does the older plan change?"}), "question_id": "older"}
+  newer = {**_card({"Ship it?": "Not now"}, {"question-1": ["1"]}), "question_id": "newer"}
+  content = "- Ship it?: what does the older plan change?"
+  chat = _chat(db, newer, content, earlier=[
+    {"role": "assistant", "content": "first ask", "blocks": [older]},
+    {"role": "user", "content": "- Ship it?: Not now", "hidden": True,
+     "kind": "continuation", "continuation_reason": "question_answer"},
+  ])
+  note = typed_reply_context(db, chat, content, answered_by_owner=True)
+  assert "Owner wrote: what does the older plan change?" in note
 
 
 def test_option_pick_turn_carries_no_note(db):
   content = "- Ship it?: Not now"
   chat = _chat(db, _card({"Ship it?": "Not now"}, {"question-1": ["1"]}), content)
-  assert typed_reply_context(db, chat, content) == ""
+  assert typed_reply_context(db, chat, content, answered_by_owner=True) == ""
 
 
 def test_note_belongs_only_to_the_turn_that_carries_the_answer(db):
   chat = _chat(db, _card({"Ship it?": "why?"}), "- Ship it?: why?")
-  assert typed_reply_context(db, chat, "a later ordinary message") == ""
+  assert typed_reply_context(
+    db, chat, "a later ordinary message", answered_by_owner=True,
+  ) == ""
 
 
 def test_ordinary_message_is_never_framed_as_a_card_reply(db):
   chat = _chat(db, _card({"Ship it?": "why?"}), "why?", reason=None)
-  assert typed_reply_context(db, chat, "why?") == ""
+  assert typed_reply_context(db, chat, "why?", answered_by_owner=True) == ""
 
 
 class _Provider:
@@ -115,8 +149,11 @@ class _Provider:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("owner_input", "attribution"), [
+  (True, "Owner wrote:"), (False, "Participant wrote:"),
+])
 async def test_the_answer_turn_reaches_the_agent_with_the_typed_reply_note(
-  monkeypatch, db, owner_token,
+  monkeypatch, db, owner_token, owner_input, attribution,
 ):
   from app import chat as chat_mod
   from app import chat_queue, claude_sdk_runner, schemas
@@ -156,7 +193,7 @@ async def test_the_answer_turn_reaches_the_agent_with_the_typed_reply_note(
     chat_id=chat.id, run_token="answer-turn",
     user_msg={"role": "user", "content": content, "ts": 10**13, "cid": "answer-turn",
               "hidden": True, "kind": "continuation", "continuation_reason": "question_answer"},
-    title_source=content, default_provider="claude",
+    title_source=content, default_provider="claude", owner_input=owner_input,
   )).result(timeout=5)
   create_broadcast(chat.id)
   try:
@@ -168,5 +205,5 @@ async def test_the_answer_turn_reaches_the_agent_with_the_typed_reply_note(
     remove_broadcast(chat.id)
 
   prompt = calls[0]["user_message"]
-  assert "Owner wrote: can you explain that first?" in prompt
-  assert prompt.index("Owner wrote:") < prompt.index(content)
+  assert f"{attribution} can you explain that first?" in prompt
+  assert prompt.index(attribution) < prompt.index(content)

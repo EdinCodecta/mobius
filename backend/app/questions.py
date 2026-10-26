@@ -188,12 +188,13 @@ def closes_without_reply(card: dict, answers: dict, selections: dict | None) -> 
 
 
 def typed_replies(card: dict) -> list[tuple[str, str]]:
-  """(question, text) for each offered choice the owner answered in own words.
+  """(question, text) for each offered choice answered in the answerer's own words.
 
   `selected_options` is the card's record of an option pick; the client omits
   it whenever custom text is part of the answer. A question offered without
-  options expects typed text, so it is never a typed reply. An exact label
-  still counts as a pick from a client that predates option identities.
+  options expects typed text, so it is never a typed reply. A client that
+  predates option identities sends a pick as its label, and a multi-select
+  pick as its labels joined with ", ", so those still count as picks.
   """
   answers = card.get("answers") or {}
   picked = card.get("selected_options") or {}
@@ -203,21 +204,46 @@ def typed_replies(card: dict) -> list[tuple[str, str]]:
     prompt = question.get("question")
     answer = answers.get(prompt, answers.get(question.get("id")))
     if (not options or question.get("id") in picked
-        or not isinstance(answer, str) or not answer.strip()
-        or answer in {option.get("label") for option in options}):
+        or not isinstance(answer, str) or not answer.strip()):
+      continue
+    labels = {option.get("label") for option in options}
+    if answer in labels or (
+      question.get("multiSelect") and set(answer.split(", ")) <= labels
+    ):
       continue
     replies.append((prompt, answer))
   return replies
 
 
-def typed_reply_context(db, chat, turn_content: str) -> str:
-  """Frame a card answer the owner typed instead of picking an option.
+def _turn_carries_answers(card: dict, turn_content: str) -> bool:
+  """Whether this turn's text is the rendering of this card's answers.
+
+  Each answer is rendered as "- <question>: <text>"; the owner's client
+  indents continuation lines of multi-line text, an agent's answer does not.
+  """
+  texts = [text for text in (card.get("answers") or {}).values()
+           if isinstance(text, str) and text.strip()]
+  return bool(texts) and all(
+    text in turn_content or text.replace("\n", "\n  ") in turn_content
+    for text in texts
+  )
+
+
+def typed_reply_context(
+  db, chat, turn_content: str, *, answered_by_owner: bool,
+) -> str:
+  """Frame a card answer typed instead of picking an option.
 
   The answer reaches the agent as "- <question>: <text>", which reads like a
   choice. When the text is a question or objection, agents have parked the
   answer for later and re-saved the card without ever showing one, so the
-  owner sees the same card again with no reply. This turn-only note names the
-  text as the owner's message and puts the reply before any new card.
+  answerer sees the same card again with no reply. This turn-only note names
+  the text as a message and puts the reply before any new card.
+
+  Any participant that can read a card may answer it, so the note names the
+  owner only when the turn carries owner-input provenance. The card is the
+  one whose answers this turn carries, not merely the latest answered one:
+  an older card can be answered after a newer one.
   """
   found_turn = False
   for _seq, message in transcript_rows.reverse_iter(db, chat):
@@ -233,17 +259,27 @@ def typed_reply_context(db, chat, turn_content: str) -> str:
       continue
     if message.get("role") != "assistant":
       continue
-    cards = [block for block in message.get("blocks") or []
-             if block.get("type") == "question" and block.get("answers")]
-    replies = typed_replies(cards[-1]) if cards else []
+    card = next((
+      block for block in reversed(message.get("blocks") or [])
+      if block.get("type") == "question" and block.get("answers")
+      and _turn_carries_answers(block, turn_content)
+    ), None)
+    if card is None:
+      continue
+    replies = typed_replies(card)
     if not replies:
       return ""
-    quoted = "\n".join(f"- {question}\n  Owner wrote: {text}" for question, text in replies)
+    if answered_by_owner:
+      answerer, wrote = "the owner", "Owner wrote"
+    else:
+      answerer = "a participant other than the owner (an agent or app)"
+      wrote = "Participant wrote"
+    quoted = "\n".join(f"- {question}\n  {wrote}: {text}" for question, text in replies)
     return (
-      "On your question card, the owner typed their own reply instead of "
+      f"On your question card, {answerer} typed their own reply instead of "
       "picking an option:\n"
       f"{quoted}\n"
-      "Treat it as the owner's message, not a choice. If it asks something, "
+      "Treat it as their message, not a choice. If it asks something, "
       "objects, or asks for an explanation, answer it in visible reply text "
       "first; an answer kept in thinking or promised for later never reaches "
       "them. Only then save a new card, and only if the decision is still open."
