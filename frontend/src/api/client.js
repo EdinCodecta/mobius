@@ -310,6 +310,9 @@ function clearOwnerClientState({ preserveChatOutbox }) {
       : [clearChatOutbox()]),
     delDatabase('mobius-signals', 'signal queue').catch(() => {}),
     delDatabase('mobius-listings', 'directory listing cache').catch(() => {}),
+    // Folder permissions this owner granted must not carry over to a later
+    // owner signing in on the same browser.
+    delDatabase('mobius-shared-folders', 'shared folders').catch(() => {}),
     wipeSwCaches().catch(() => {}),
   ])
 }
@@ -1656,6 +1659,22 @@ export const api = {
       { method: 'DELETE' },
     ),
   },
+  sharedFolders: {
+    list: () => apiFetch('/shared-folders'),
+    report: (subscriptionId, body) => apiFetch(
+      `/shared-folders/devices/${encodeURIComponent(subscriptionId)}`,
+      { method: 'PUT', body: JSON.stringify(body) },
+    ),
+    respond: (body) => apiFetch('/shared-folders/responses', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+    // Stop on every device at once; no ids means every shared folder.
+    pause: (folderIds = null) => apiFetch('/shared-folders/pause', {
+      method: 'POST',
+      body: JSON.stringify(folderIds ? { folderIds } : {}),
+    }),
+  },
   events: {
     // `keepalive` lets the report sent as the page hides outlive the page
     // being frozen or unloaded; a lost "hidden" report would withhold pushes.
@@ -1752,5 +1771,18 @@ export const api = {
       method: 'DELETE',
       body: JSON.stringify(payload),
     }),
+    // Native push for the Möbius mobile app (lib/nativePush.js).
+    devices: {
+      register: (payload) => apiFetch('/push/devices', {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      }),
+      forget: (payload) => apiFetch('/push/devices', {
+        method: 'DELETE',
+        body: JSON.stringify(payload),
+        // Sign-out reloads the page right after; let the request finish.
+        keepalive: true,
+      }),
+    },
   },
 }
