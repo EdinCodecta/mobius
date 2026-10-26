@@ -16,10 +16,11 @@ export default function MessageMetaRow({
 }) {
   if (!timestamp && !copy) return null
 
+  // CSS visibility owns hiding: a hidden row leaves the focus order and the
+  // accessibility tree, and a hover-revealed one rejoins both.
   return (
     <div
       className={`chat__msg-meta chat__msg-meta--${side}${visible ? ' chat__msg-meta--visible' : ''}`}
-      aria-hidden={!visible}
     >
       {timestamp && (
         <time className="chat__ts">

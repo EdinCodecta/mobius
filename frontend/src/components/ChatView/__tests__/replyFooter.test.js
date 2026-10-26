@@ -67,6 +67,13 @@ test('an earlier reply hides its action row until revealed', () => {
   assert.match(renderReply([turn], { metaVisible: true }), /chat__msg-meta--visible/)
 })
 
+test('a hidden action row is not also hidden from assistive technology', () => {
+  // Hover reveals the row through CSS alone; an aria-hidden ancestor would
+  // leave its now-focusable buttons without accessible semantics.
+  const row = renderReply([turn]).match(/<div class="chat__msg-meta[^>]*>/)[0]
+  assert.doesNotMatch(row, /aria-hidden/)
+})
+
 test('a streaming reply has no action row yet', () => {
   assert.equal(metaRows(renderReply([turn], { isStreaming: true })).length, 0)
 })
