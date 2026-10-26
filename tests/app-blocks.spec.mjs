@@ -81,6 +81,15 @@ async function seeConfirmationEnd(block) {
   await end.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
 }
 
+/** Include container reflow in failures of the action's same-slot contract. */
+async function actionLayout(action) {
+  return action.evaluate(button => Object.fromEntries([
+    ['action', button], ['footer', button.closest('footer')],
+    ['block', button.closest('.md-app-block')],
+    ['text', button.closest('.chat__text--assistant')],
+  ].map(([name, element]) => [name, element?.getBoundingClientRect().toJSON() ?? null])))
+}
+
 test('a static block renders only in the reply and opens the app view on request', async ({ page, request }) => {
   const { session } = await installFixtures(page, request)
   const block = { app: 'e2e-block-session', intent: 'open:item-7', title: 'Fixture item',
@@ -106,7 +115,8 @@ test('a passive session drives an in-place Confirm through the real frame protoc
   const block = chat.locator('.md-app-block')
   const action = block.locator('footer .md-app-block__action')
   await expect(action).toHaveText('Send all')
-  const box = await action.boundingBox()
+  const before = await actionLayout(action)
+  const box = before.action
   const frame = await sessionFrame(page)
   const log = frame.locator('#block-log')
   const sessionId = await log.getAttribute('data-session')
@@ -128,6 +138,7 @@ test('a passive session drives an in-place Confirm through the real frame protoc
     })
     observer.observe(section, { subtree: true, childList: true, characterData: true })
   }))
+  const beforeClick = await actionLayout(action)
   await action.click()
   const confirm = block.locator('footer .md-app-block__action')
   expect(await drawn).toBe(true)
@@ -135,10 +146,12 @@ test('a passive session drives an in-place Confirm through the real frame protoc
   await expect(block.getByRole('button', { name: 'Not now' })).toBeVisible()
   expect((await log.textContent()).split('\n').filter(line => line.endsWith(' confirm'))).toHaveLength(0)
   // Same size, same place: Confirm replaces the action in its slot.
-  const confirmBox = await confirm.boundingBox()
+  const after = await actionLayout(confirm)
+  const confirmBox = after.action
   expect(Math.round(confirmBox.width)).toBe(Math.round(box.width))
   expect(Math.round(confirmBox.height)).toBe(Math.round(box.height))
-  expect(Math.abs(confirmBox.x + confirmBox.width - (box.x + box.width))).toBeLessThan(2)
+  expect(Math.abs(confirmBox.x + confirmBox.width - (box.x + box.width)),
+    `Action slot layout: ${JSON.stringify({ before, beforeClick, after })}`).toBeLessThan(2)
   await expect(block.locator('.md-app-block__confirmation')).toContainText('fixture/repo: Change one')
   await expect(block.locator('.md-app-block__confirmation')).toContainText('The list below comes from Block Session')
   await expect(block.locator('.md-app-block__badge')).toHaveCount(0)
