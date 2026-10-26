@@ -74,7 +74,8 @@ MAX_CONTRIBUTION_BODY = 3_000_000
 log = logging.getLogger("mobius.identity_broker")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$")
 INSTANCE_RE = re.compile(r"^mob_[A-Za-z0-9_-]{3,160}$")
-MANAGED_INSTANCE_RE = re.compile(r"^mob_[A-Za-z0-9_-]{3,80}$")
+MANAGED_INSTANCE_ID = r"mob_[A-Za-z0-9_-]{3,80}"
+MANAGED_INSTANCE_RE = re.compile(rf"^{MANAGED_INSTANCE_ID}$")
 OAUTH_STATE_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 MANAGED_PREFIX = "/managed"
 # Railway management is read-only from an instance apart from a few reviewed
@@ -93,9 +94,9 @@ MANAGED_EXACT_ROUTES = frozenset({
   ("POST", "/api/instance/v1/railway/plan/refresh"),
 })
 MANAGED_RAILWAY_INSTANCE_WRITES = (
-  ("PATCH", re.compile(r"/api/instance/v1/railway/instances/mob_[A-Za-z0-9_-]{3,80}")),
+  ("PATCH", re.compile(rf"/api/instance/v1/railway/instances/{MANAGED_INSTANCE_ID}")),
   ("PATCH", re.compile(
-    r"/api/instance/v1/railway/instances/mob_[A-Za-z0-9_-]{3,80}/updates"
+    rf"/api/instance/v1/railway/instances/{MANAGED_INSTANCE_ID}/updates"
   )),
 )
 MANAGED_USER_AGENT = "mobius-managed-deployment/1"
