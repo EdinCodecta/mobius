@@ -45,6 +45,18 @@ function isClosingControl(block) {
   return block?.type === 'tool' && CLOSING_CONTROLS.has(bareControlName(name) ?? name)
 }
 
+/** Thinking and closing bookkeeping, as opposed to real work. A compacted
+ *  activity block (a reloaded transcript folds adjacent tool and thinking
+ *  steps into one) is bookkeeping only when every step it folded is. */
+function isBookkeeping(block) {
+  if (block?.type === 'thinking') return true
+  if (block?.type === 'activity') {
+    const entries = block.entries || []
+    return entries.length > 0 && entries.every(entry => isBookkeeping(entry?.item))
+  }
+  return isClosingControl(block)
+}
+
 /** An ordinary question card as copyable text: each question, then its
  * choices as a list. Sealed secret cards never copy. */
 function questionCopyText(block) {
@@ -91,7 +103,7 @@ export function replyOutcome(messages) {
       } else if (isAgentWorkBlock(block)) {
         workedSinceRun = true
         failed = false
-        if (block.type !== 'thinking' && !isClosingControl(block)) {
+        if (!isBookkeeping(block)) {
           realWorkSinceRun = true
           endingQuestion = null
         }

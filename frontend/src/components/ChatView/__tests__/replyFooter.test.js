@@ -160,6 +160,40 @@ test('thinking and closing bookkeeping after the answer keep it', () => {
   ] }]), 'The build is clean.')
 })
 
+// A reloaded transcript folds two or more adjacent tool/thinking steps into
+// one activity block (`compact_messages_for_detail`); its steps are entries.
+const folded = (...items) => ({
+  type: 'activity', activity_id: '0:1:3', message_index: 0, start: 1, end: 1 + items.length,
+  entries: items.map((item, offset) => ({ item, idx: 1 + offset })),
+  tool_count: items.filter(item => item.type === 'tool').length,
+})
+
+test('folded bookkeeping after the answer keeps it after a reload', () => {
+  const question = { type: 'question', questions: [{ question: 'Which way?', options: [{ label: 'A' }] }] }
+  const reloaded = { role: 'assistant', id: 'run', blocks: [
+    { type: 'text', content: 'The build is clean.' },
+    folded({ type: 'thinking' },
+      { type: 'tool', tool: 'mcp__mobius_control__checkpoint_chat', status: 'done' }),
+  ] }
+  assert.equal(replyAnswerText([reloaded]), 'The build is clean.')
+  assert.equal(metaRows(renderReply([reloaded])).length, 1,
+    'the reloaded reply keeps its action row')
+  assert.equal(replyAnswerText([{ ...reloaded, blocks: [...reloaded.blocks, question] }]),
+    'The build is clean.', 'a card after folded bookkeeping does not replace the answer')
+})
+
+test('folded real work after a note still makes it a progress note', () => {
+  const question = { type: 'question', questions: [{ question: 'Which way?', options: [{ label: 'A' }] }] }
+  const narration = [
+    { type: 'text', content: 'Checking the logs next:' },
+    folded({ type: 'tool', tool: 'Bash', status: 'done' },
+      { type: 'tool', tool: 'mcp__mobius_control__checkpoint_chat', status: 'done' }),
+  ]
+  assert.equal(replyAnswerText([{ role: 'assistant', blocks: narration }]), '')
+  assert.equal(replyAnswerText([{ role: 'assistant', blocks: [...narration, question] }]),
+    'Which way?\n- A')
+})
+
 test('a sealed secret card is never copied as the answer', () => {
   assert.equal(replyAnswerText([{ role: 'assistant', blocks: [
     { type: 'text', content: 'Opening the sealed card:' },
