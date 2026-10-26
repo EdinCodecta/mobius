@@ -12,11 +12,13 @@ import hashlib
 import json
 import re
 from copy import deepcopy
+from functools import lru_cache
 from typing import Any
 from urllib.parse import urlsplit
 
 from app.manifest_contract import (
-  SERVICE_REQUEST_MAX_BYTES, accepted_service_max_bytes, accepted_service_route_limits,
+  MANIFEST_MAX_BYTES, PUBLIC_SERVICE_REQUESTS_PER_MINUTE, SERVICE_REQUEST_MAX_BYTES,
+  accepted_service_max_bytes, accepted_service_route_limits,
 )
 
 
@@ -292,6 +294,23 @@ def public_access_declaration_from_contract(
 # its own integer version, so adding (say) camera v2 never forces every storage
 # or microphone consumer onto a new global runtime version.
 RUNTIME_CAPABILITY_DEFINITIONS: dict[str, dict[str, Any]] = {
+  # Runs accepted app code in a hidden frame while one of its chat blocks is
+  # near the viewport. See CAPABILITIES.md "Passive transcript sessions".
+  "chat.blocks.passive": {
+    "version": 1,
+    "kind": "session",
+    "title": "Run in its chat blocks",
+    "description": (
+      "Run this app's code, without showing it, while one of its blocks is "
+      "near the visible part of a chat, so the block can show current status. "
+      "After you press the block's Confirm, the app can act on your behalf, "
+      "for example publish a change."
+    ),
+    "risk": "execution",
+    "lifecycle": "passive_frame",
+    "default_limits": {},
+    "hard_limits": {},
+  },
   "device.storage": {
     "version": 1,
     "kind": "invoke",
@@ -597,6 +616,8 @@ def contract_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     aliases = list(service.get("aliases") or [])
     if aliases:
       accepted_service["aliases"] = aliases
+    if "public_requests_per_minute" in service:
+      accepted_service["public_requests_per_minute"] = service["public_requests_per_minute"]
     # Omitted when empty so services without route ceilings keep their
     # existing review digest. A sorted list, not a path-keyed object, so
     # update review compares it as one value instead of splitting slashes.
@@ -728,6 +749,8 @@ def contract_from_app_state(
       }
       if accepted_service.get("aliases"):
         service["aliases"] = list(accepted_service["aliases"])
+      if "public_requests_per_minute" in accepted_service:
+        service["public_requests_per_minute"] = accepted_service["public_requests_per_minute"]
       # Re-deriving transfer limits through manifest form could repair a
       # grant the runtime refuses (re-enabling a disabled service) or drop a
       # reviewed route ceiling (widening that route to the whole grant). Keep
@@ -898,7 +921,7 @@ def diff_contracts(
     k for k in before.keys() & after.keys()
     if before[k] != after[k] or (
       # Python equates 1, True and 1.0; only the integer is a valid ceiling.
-      k in _TRANSFER_LIMIT_PATHS and _exact_json(before[k]) != _exact_json(after[k])
+      k in _EXACT_CEILING_PATHS and _exact_json(before[k]) != _exact_json(after[k])
     )
   )
   widens = any(
@@ -949,6 +972,8 @@ _ROUTE_LIMITS_PATH = "service.route_limits"
 # The accepted service fields the runtime reads to bound every exchange.
 _TRANSFER_LIMIT_FIELDS = ("max_request_bytes", "max_response_bytes", "route_limits")
 _TRANSFER_LIMIT_PATHS = {f"service.{field}" for field in _TRANSFER_LIMIT_FIELDS}
+# Integer ceilings review compares by exact JSON, so 60 and 60.0 differ.
+_EXACT_CEILING_PATHS = _TRANSFER_LIMIT_PATHS | {"service.public_requests_per_minute"}
 
 
 def _exact_json(value: Any) -> str:
@@ -1028,6 +1053,13 @@ def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
     old = SERVICE_REQUEST_MAX_BYTES if before is None else before
     new = SERVICE_REQUEST_MAX_BYTES if after is None else after
     return type(old) is not int or type(new) is not int or new > old
+  if path == "service.public_requests_per_minute":
+    if not any(key.startswith("service.") for key in after_leaves):
+      return False  # Complete revocation cannot restore a request allowance.
+    # A public allowance is a reviewed ceiling; omitted means the default.
+    old = PUBLIC_SERVICE_REQUESTS_PER_MINUTE if before is None else before
+    new = PUBLIC_SERVICE_REQUESTS_PER_MINUTE if after is None else after
+    return type(old) is not int or type(new) is not int or new > old
   if path == _ROUTE_LIMITS_PATH:
     if not any(key.startswith("service.") for key in after_leaves):
       return False  # Complete revocation cannot restore a route allowance.
@@ -1056,3 +1088,69 @@ def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
     group = path.split(".", 1)[0]
     return any(key.startswith(f"{group}.") for key in after_leaves)
   return True
+
+
+PASSIVE_BLOCK_CAPABILITY = "chat.blocks.passive"
+
+
+class _RuntimeManifestUnavailable(Exception):
+  """The frozen runtime tree is absent; never cache that answer."""
+
+
+@lru_cache(maxsize=512)
+def _applied_passive_digest(app_id: int, runtime_revision: str, compiled_path: str) -> str | None:
+  """Digest of one immutable (runtime revision, compiled bundle) pair.
+
+  Both inputs are content addressed, so the answer can never change for this
+  key: a new Apply produces a new revision and bundle name. The editable source
+  manifest is never consulted, and a missing runtime cache is not rebuilt from
+  a serializer; it simply stays unadmitted until the frame is next served.
+  """
+  from app.applied_app_runtime import AppliedRuntimeUnavailable, runtime_parent
+  from app.compiler import app_bundle_digest
+
+  digest = app_bundle_digest(app_id, compiled_path)
+  if digest is None:
+    return None
+  try:
+    root = runtime_parent(app_id) / runtime_revision
+    if not root.is_dir():
+      raise _RuntimeManifestUnavailable
+    manifest_path = root / "mobius.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+      return None
+    with manifest_path.open("rb") as handle:
+      raw = handle.read(MANIFEST_MAX_BYTES + 1)
+    if len(raw) > MANIFEST_MAX_BYTES:
+      return None
+    declaration = normalize_runtime_capabilities(json.loads(raw)).get(PASSIVE_BLOCK_CAPABILITY)
+  except (AppliedRuntimeUnavailable, OSError) as exc:
+    raise _RuntimeManifestUnavailable from exc
+  except (ValueError, TypeError, AttributeError):
+    return None
+  return digest if declaration and declaration["version"] == 1 else None
+
+
+def passive_block_module_digest(app: Any) -> str | None:
+  """Admit passive execution only for accepted, applied opt-in app code.
+
+  Local Store capability acceptance may precede source Apply, so neither that
+  acceptance nor the editable manifest alone proves the served revision opted
+  in. Require the owner's live grant (read on every call, so revocation is
+  immediate) and the immutable applied declaration, and return the compiled
+  content address the frame verifies before evaluating module bytes.
+  """
+  contract = getattr(app, "capability_contract", None)
+  runtime = contract.get("runtime") if isinstance(contract, dict) else None
+  grant = runtime.get(PASSIVE_BLOCK_CAPABILITY) if isinstance(runtime, dict) else None
+  if not isinstance(grant, dict) or type(grant.get("version")) is not int or grant["version"] != 1:
+    return None
+  revision = getattr(app, "runtime_revision", None)
+  compiled = getattr(app, "compiled_path", None)
+  if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision) \
+      or not isinstance(compiled, str) or not compiled:
+    return None
+  try:
+    return _applied_passive_digest(int(app.id), revision, compiled)
+  except _RuntimeManifestUnavailable:
+    return None

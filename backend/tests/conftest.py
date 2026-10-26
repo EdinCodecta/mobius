@@ -45,6 +45,9 @@ os.environ["MOEBIUS_SKIP_BOOTSTRAP"] = "1"
 os.environ["MOBIUS_SSO_ISSUER"] = ""
 os.environ["MOBIUS_SSO_INSTANCE_ID"] = ""
 os.environ["MOBIUS_IDENTITY_BROKER_SOCKET"] = f"{_tmp}/no-identity-broker.sock"
+# Restart admission asks the image's baked checkout for its package verdict;
+# a test must never run the live image's code against its fixtures.
+os.environ["MOBIUS_BAKED_BACKEND"] = f"{_tmp}/no-baked-backend"
 # Nor may it inherit a Railway host's deployment identity: those markers switch
 # update, domain, and version behavior. Railway tests opt in with monkeypatch.
 for _name in [name for name in os.environ if name.startswith("RAILWAY_")]:
@@ -130,6 +133,15 @@ def _test_secret_key_in_environment():
   need the fixed test key there."""
   yield
   os.environ["SECRET_KEY"] = _TEST_SECRET_KEY
+
+
+@pytest.fixture(autouse=True)
+def _fresh_update_discovery():
+  """Update-check reuses a recent upstream fetch per repo, source and recorded
+  upstream. Tests reuse app paths and produce identical commits, so each one
+  starts without an earlier test's discovery."""
+  from app.routes import apps as apps_routes
+  apps_routes._discovered_commits.clear()
 
 
 @pytest.fixture(autouse=True)

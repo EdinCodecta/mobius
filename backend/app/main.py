@@ -80,6 +80,7 @@ from app import activity, models, tracing
 # wrapped imports in lifespan() below.
 from app.routes import (
   admin_router, agent_coordination_router, apps_router, app_services_router,
+  app_consent_router,
   app_tools_router,
   auth_router, browser_access_router,
   app_chat_router,
@@ -100,6 +101,7 @@ from app.routes import (
   media_router,
   local_services_router, notifications_router, notify_router, proxy_router, push_router,
   screen_control_router,
+  shared_folders_router,
   public_apps_router,
   public_storage_router,
   secrets_router, self_reminders_router, settings_router, skills_router,
@@ -1034,6 +1036,7 @@ app.add_middleware(_RequestErrorTelemetryMiddleware)
 app.include_router(auth_router)
 app.include_router(apps_router)
 app.include_router(app_services_router)
+app.include_router(app_consent_router)
 app.include_router(storage_router)
 app.include_router(fs_router)
 app.include_router(projects_router)
@@ -1058,6 +1061,7 @@ app.include_router(connectors_public_router)
 app.include_router(app_chat_router)
 app.include_router(notify_router)
 app.include_router(screen_control_router)
+app.include_router(shared_folders_router)
 app.include_router(proxy_router)
 app.include_router(public_storage_router)
 app.include_router(public_apps_router)
@@ -1500,16 +1504,29 @@ def _resolve_asset_file(asset_path: str) -> Path | None:
     pass
   roots.append(_baked_dir / "assets")  # per-request corruption/boot floor
   for root in roots:
-    try:
-      root_r = root.resolve()
-      target = (root_r / asset_path).resolve()
-    except OSError:
-      continue
-    if target == root_r or root_r not in target.parents:
-      continue  # the dir itself, or a `..` traversal escaping the root
-    if target.is_file():
+    target = _contained_file(root, asset_path)
+    if target is not None:
       return target
   return None
+
+
+def _contained_file(root: Path, rel_path: str) -> Path | None:
+  """Return the existing file ``rel_path`` names strictly inside ``root``.
+
+  Every public static lookup joins a request-controlled path to a directory,
+  and Starlette has already percent-decoded it (``..%2f`` arrives as ``../``).
+  Resolving both sides and requiring ``root`` as an ancestor is what keeps an
+  unauthenticated request from reading arbitrary files such as the signing key.
+  The directory itself, an escape, and a miss all return None.
+  """
+  try:
+    root_r = root.resolve()
+    target = (root_r / rel_path).resolve()
+  except (OSError, ValueError):
+    return None
+  if target == root_r or root_r not in target.parents:
+    return None
+  return target if target.is_file() else None
 
 
 # Root-served worker scripts: `sw.js` caches the shell, `sw-push.js` owns Web
@@ -1962,16 +1979,14 @@ if _baked_dir.is_dir() or _live_dir.is_dir():
         headers={"Cache-Control": "no-cache, must-revalidate"},
       )
 
-    file = static_dir / path
-    if not file.is_file() and static_dir != _baked_dir and path != "index.html":
+    file = _contained_file(static_dir, path)
+    if file is None and static_dir != _baked_dir and path != "index.html":
       # A complete live build can still omit an image-installed vendor asset,
       # or a new public file until that build refreshes. Pick the baked copy
       # before response policy so executable fallbacks cannot bypass the cache
       # and Range invariants enforced below.
-      baked = _baked_dir / path
-      if baked.is_file():
-        file = baked
-    if file.is_file() and path != "index.html":
+      file = _contained_file(_baked_dir, path)
+    if file is not None and path != "index.html":
       # The service worker MUST be served with `Cache-Control:
       # no-cache` so the browser revalidates it on every page load.
       # Without this header the browser caches sw.js by HTTP

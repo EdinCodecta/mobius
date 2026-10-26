@@ -134,7 +134,13 @@ test('installing an app asks for access first and installs exactly what was revi
     const request = route.request()
     requests.push({ path: new URL(request.url()).pathname.split('/').pop(), body: request.postDataJSON() })
     if (request.url().endsWith('/preview')) {
-      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ manifest: { id: 'memory' }, capability_contract: { data: { shared_memory: 'write' } }, capability_digest: 'digest-1' }) })
+      // The server words the review: access_rows is exactly what it sends for this contract.
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        manifest: { id: 'memory' },
+        capability_contract: { data: { shared_memory: 'write' } },
+        capability_digest: 'digest-1',
+        access_rows: [{ id: 'shared_memory', title: 'Use shared memory', text: 'Can read and change the shared memory area.', level: 'write', rank: 2, critical: false, scope: null }],
+      }) })
     }
     return route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ warnings: [] }) })
   })
@@ -145,7 +151,8 @@ test('installing an app asks for access first and installs exactly what was revi
 
   const access = page.getByRole('alertdialog', { name: 'Memory asks for access' })
   await expect(access).toBeVisible()
-  await expect(access.getByText('Shared memory', { exact: true })).toBeVisible()
+  await expect(access.getByText('Use shared memory (write)', { exact: true })).toBeVisible()
+  await expect(access.getByText('Can read and change the shared memory area.', { exact: true })).toBeVisible()
   await expect(access.getByRole('button', { name: 'Confirm and install' })).toBeFocused()
   // Nothing is installed while the access is being read.
   expect(requests.map(request => request.path)).toEqual(['preview'])

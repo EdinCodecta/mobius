@@ -1452,6 +1452,54 @@ def _add_app_connect_manage(eng) -> None:
     ))
 
 
+def _add_app_accepted_consent(eng) -> None:
+  """Add the first-open consent record and grandfather every installed app.
+
+  Existing apps keep exactly what they hold today: their current contract
+  becomes their accepted copy, marked as coming from this migration, so an
+  upgrade never asks anything about an app the owner already runs.
+  """
+  import json
+  from sqlalchemy import inspect as sa_inspect, text
+
+  columns = {
+    column["name"] for column in sa_inspect(eng).get_columns("apps")
+  }
+  if "accepted_consent" not in columns:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE apps ADD COLUMN accepted_consent JSON"))
+  columns |= {"accepted_consent"}
+  if "capability_contract" not in columns:
+    return
+  templates_column = (
+    "project_templates_json" if "project_templates_json" in columns else "NULL"
+  )
+  now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+  with eng.begin() as conn:
+    rows = conn.execute(text(
+      f"SELECT id, capability_contract, {templates_column} FROM apps "
+      "WHERE accepted_consent IS NULL AND capability_contract IS NOT NULL"
+    )).fetchall()
+    for app_id, contract, templates in rows:
+      try:
+        parsed = json.loads(contract) if isinstance(contract, str) else contract
+      except ValueError:
+        continue
+      if not isinstance(parsed, dict):
+        continue
+      record = {
+        "contract": parsed,
+        "project_builders": bool(templates) and templates not in ("null", "[]", "{}"),
+        "digest": None,
+        "at": now,
+        "via": "migration",
+      }
+      conn.execute(
+        text("UPDATE apps SET accepted_consent = :record WHERE id = :id"),
+        {"record": json.dumps(record), "id": app_id},
+      )
+
+
 def _add_owner_auth_mode(eng) -> None:
   """Add the durable owner login mode (models.Owner.auth_mode).
 
@@ -6844,6 +6892,89 @@ def _enforce_unique_live_claim_follows(eng) -> None:
     ))
 
 
+def _allow_core_contribution_review_runs(eng) -> None:
+  """Allow app-less review runs without weakening app-scoped request identity."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "contribution_review_runs" not in inspector.get_table_names():
+    return
+  columns = {c["name"]: c for c in inspector.get_columns("contribution_review_runs")}
+  needs_rebuild = (
+    eng.dialect.name == "sqlite"
+    and (not columns["app_id"]["nullable"] or not columns["app_nonce"]["nullable"])
+  )
+  if needs_rebuild:
+    # SQLite cannot drop NOT NULL. Keep the original table definition and all
+    # explicit indexes/triggers, changing only the two ownership columns.
+    raw = eng.raw_connection()
+    cursor = raw.cursor()
+    foreign_keys = cursor.execute("PRAGMA foreign_keys").fetchone()[0]
+    try:
+      cursor.execute("PRAGMA foreign_keys=OFF")
+      cursor.execute("BEGIN IMMEDIATE")
+      original = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='contribution_review_runs'"
+      ).fetchone()[0]
+      changed = original
+      for name, width in (("app_id", "INTEGER"), ("app_nonce", "VARCHAR(64)")):
+        if columns[name]["nullable"]:
+          continue
+        changed, count = re.subn(
+          rf'("{name}"|\b{name}\b)(\s+{re.escape(width)})\s+NOT\s+NULL',
+          r'\1\2', changed, count=1, flags=re.IGNORECASE,
+        )
+        if count != 1:
+          raise RuntimeError(f"Cannot identify review-run {name} column")
+      objects = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE tbl_name='contribution_review_runs' "
+        "AND type IN ('index','trigger') AND sql IS NOT NULL"
+      ).fetchall()
+      names = ", ".join(
+        '"' + row[1].replace('"', '""') + '"'
+        for row in cursor.execute("PRAGMA table_info(contribution_review_runs)")
+      )
+      cursor.execute(
+        "CREATE TABLE contribution_review_runs__core_0097 ("
+        + changed.partition("(")[2]
+      )
+      cursor.execute(
+        f"INSERT INTO contribution_review_runs__core_0097 ({names}) "
+        f"SELECT {names} FROM contribution_review_runs"
+      )
+      cursor.execute("DROP TABLE contribution_review_runs")
+      cursor.execute(
+        "ALTER TABLE contribution_review_runs__core_0097 "
+        "RENAME TO contribution_review_runs"
+      )
+      for (sql,) in objects:
+        cursor.execute(sql)
+      raw.commit()
+    except BaseException:
+      raw.rollback()
+      raise
+    finally:
+      cursor.execute(f"PRAGMA foreign_keys={int(foreign_keys)}")
+      cursor.close()
+      raw.close()
+  with eng.begin() as conn:
+    if eng.dialect.name != "sqlite":
+      for name in ("app_id", "app_nonce"):
+        if not columns[name]["nullable"]:
+          conn.execute(text(
+            f"ALTER TABLE contribution_review_runs ALTER COLUMN {name} DROP NOT NULL"
+          ))
+    if "options_json" not in columns:
+      conn.execute(text(
+        "ALTER TABLE contribution_review_runs ADD COLUMN options_json JSON NULL"
+      ))
+    conn.execute(text(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_contribution_review_runs_core_request "
+      "ON contribution_review_runs (owner_id, request_id) WHERE app_id IS NULL"
+    ))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -6961,6 +7092,8 @@ _SCHEMA_MIGRATIONS = (
   ("0093_pending_goal_dependency_indexes", _index_pending_goal_dependencies),
   ("0094_retire_legacy_claim_notice_carriers", _retire_legacy_claim_notice_carriers),
   ("0095_unique_live_claim_follows", _enforce_unique_live_claim_follows),
+  ("0096_app_accepted_consent", _add_app_accepted_consent),
+  ("0097_core_contribution_review_runs", _allow_core_contribution_review_runs),
 )
 
 

@@ -2402,6 +2402,7 @@
 
 .chat__foot .queued,
 .chat__foot .side-question,
+.chat__foot .upload-folder-prompt,
 .chat__foot .chat__history-strip,
 .chat__foot .connection-status,
 .chat__foot .chat__attach-tray,
@@ -3260,17 +3261,6 @@
   align-items: center;
   gap: 7px;
   min-width: 0;
-}
-
-.composer-popover__row-attention {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  flex-shrink: 0;
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1.4;
-  color: var(--warning, #d8922f);
 }
 
 .composer-popover__row-sub {

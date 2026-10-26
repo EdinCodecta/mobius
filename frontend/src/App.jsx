@@ -15,6 +15,7 @@ import { safeReturnPath } from './lib/safeReturnPath.js'
 import { clearSignInMarks, recordSignInRedirect, shouldRedirectToMobiusSignIn } from './lib/mobiusSignIn.js'
 import { rememberProjectCopyRequest } from './lib/projectCopies.js'
 import { readStandaloneBoot } from './lib/standaloneBoot.js'
+import { isNativeSignOutAvailable } from './lib/nativeSession.js'
 import { shellReloadNavigationTransitionIsActive } from './lib/shellReloadNavigationTransition.js'
 import { opensDegradedRepairChat } from './lib/errorRecovery.js'
 import { consumeSharedBrowserEntry } from './lib/sharedBrowserInvite.js'
@@ -345,6 +346,7 @@ function AppRoot() {
         && shouldRedirectToMobiusSignIn({
           authMode: setupStatusQuery.data.auth_mode,
           standalone: Boolean(STANDALONE_APP),
+          appOwnsSignOut: isNativeSignOutAvailable(),
         })
       ) {
         // Navigate only once the mark that prevents a repeat is stored.

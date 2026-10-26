@@ -56,6 +56,7 @@ admin_router = _load("admin")
 agent_coordination_router = _load("agent_coordination")
 apps_router = _load("apps")
 app_services_router = _load("app_services")
+app_consent_router = _load("app_consent")
 app_tools_router = _load("app_tools")
 auth_router = _load("auth")
 chat_router = _load("chat")
@@ -75,6 +76,7 @@ public_storage_router = _load("public_storage")
 local_services_router = _load("local_services")
 notify_router = _load("notify")
 screen_control_router = _load("screen_control")
+shared_folders_router = _load("shared_folders")
 settings_router = _load("settings")
 storage_router = _load("storage")
 fs_router = _load("fs")
@@ -116,6 +118,7 @@ __all__ = [
   "auth_router",
   "apps_router",
   "app_services_router",
+  "app_consent_router",
   "app_tools_router",
   "storage_router",
   "fs_router",
@@ -135,6 +138,7 @@ __all__ = [
   "local_services_router",
   "notify_router",
   "screen_control_router",
+  "shared_folders_router",
   "settings_router",
   "uploads_router",
   "generated_files_router",

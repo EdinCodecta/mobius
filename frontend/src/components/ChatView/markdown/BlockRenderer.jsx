@@ -65,6 +65,7 @@ export function ProgressiveMarkdown({
   isStreaming = false,
   onInternalNav,
   mediaDimensions,
+  allowAppBlocks = false,
 }) {
   // Counted because `text` grows by a few characters per reveal commit while
   // this re-tokenises the ENTIRE answer each time, making live streaming cost
@@ -107,6 +108,7 @@ export function ProgressiveMarkdown({
               token={token}
               onInternalNav={onInternalNav}
               mediaDimensions={mediaDimensions}
+              allowAppBlocks={allowAppBlocks}
             />
           )
         })}
@@ -134,6 +136,7 @@ export function StandardMarkdown({
   writtenByOwner = false,
   onInternalNav,
   mediaDimensions,
+  allowAppBlocks = false,
 }) {
   // The settled-transcript renderer, so this is the one that matters for "a
   // stopped chat still feels slow". `useMemo` only holds while the component
@@ -176,6 +179,7 @@ export function StandardMarkdown({
             token={token}
             onInternalNav={onInternalNav}
             mediaDimensions={mediaDimensions}
+            allowAppBlocks={allowAppBlocks}
           />
         )
       })}

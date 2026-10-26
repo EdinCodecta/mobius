@@ -34,10 +34,12 @@ export function combineMessageSources(pages) {
   return [...sources.values()]
 }
 
-// Only complete http(s) URLs may reach an href. URL() rejects superficially
-// plausible but unusable values such as `https://` and hosts with whitespace;
-// checking the parsed protocol rejects javascript:/data:/mailto:.
-export function safeSourceUrl(value) {
+// The one external-link policy for chat content. Only complete http(s) URLs
+// may reach an href. URL() rejects superficially plausible but unusable values
+// such as `https://` and hosts with whitespace; checking the parsed protocol
+// rejects javascript:/data:/mailto:. `httpsOnly` is the stricter policy for
+// app-authored snapshots: HTTPS only and no embedded credentials.
+export function safeSourceUrl(value, { httpsOnly = false } = {}) {
   if (typeof value !== 'string') return ''
   // Avoid allocating a second huge string just to reject malformed metadata.
   if (value.length > MAX_SOURCE_URL_CHARS + 64) return ''
@@ -45,9 +47,9 @@ export function safeSourceUrl(value) {
   if (!candidate || candidate.length > MAX_SOURCE_URL_CHARS) return ''
   try {
     const parsed = new URL(candidate)
-    return ['http:', 'https:'].includes(parsed.protocol) && parsed.host
-      ? candidate
-      : ''
+    if (!parsed.host) return ''
+    if (!httpsOnly) return ['http:', 'https:'].includes(parsed.protocol) ? candidate : ''
+    return parsed.protocol === 'https:' && !parsed.username && !parsed.password ? candidate : ''
   } catch {
     return ''
   }

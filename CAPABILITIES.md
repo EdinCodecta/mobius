@@ -417,7 +417,16 @@ platform-maintenance skill for setup guidance. No UI or ad-hoc install capture.
 Same-app calls use `/api/apps/{app_id}/service/{path}`. An app can expose a
 reviewed service to other installed apps at `/api/services/{service_id}/{path}`
 by setting `access` to `apps`, or additionally expose anonymous calls at
-`/api/app-services/{service_id}/{path}` by setting it to `public`. `service.id`
+`/api/app-services/{service_id}/{path}` by setting it to `public`. Anonymous
+requests are counted per public service, 60 a minute by default across all its
+visitors, and one visitor may use at most a quarter of that allowance (never
+less than 60). A visitor is the network client address; Möbius does not trust
+forwarded client addresses, so behind a hosting proxy every visitor arrives as
+the same caller and shares one visitor share. A public service whose product
+needs a faster cadence may declare `service.public_requests_per_minute`, from
+60 to 600, which the owner accepts with the rest of its capability contract;
+that reviewed number is the service's ceiling. Request polling suits
+turn-based or slow-changing state; it is not a real-time transport. `service.id`
 is the stable public contract and does not change when the app's display name,
 manifest `id`, repository, or installed slug changes. These are explicit
 install-time grants and do not widen the service app token's accepted
@@ -633,6 +642,52 @@ access, the provider stops the newly returned tracks without starting a
 recorder. Finish before readiness fails rather than manufacturing an empty or
 invalid video. Finish after readiness returns the useful partial recording.
 
+## First-open consent for Store apps
+
+A Store-installed app is dormant until the owner accepts what it asks for, once,
+in one all-or-nothing request shown the first time it is opened. Install only
+stages the app. Source: `backend/app/app_consent.py`.
+
+- **Declared vs accepted.** The declared side is the reviewed capability
+  contract. The accepted side is `App.accepted_consent`: the rows the owner
+  accepted (id and rank), a row-vocabulary `version`, and who, when and how
+  (`owner`, `platform` for first-boot apps, `migration` for apps that existed
+  before this shipped). Saving rows, not the contract, means rewording or
+  re-deriving rows can never turn an old answer into a new question.
+- **When it asks.** An app that asks for nothing is never asked. Otherwise it is
+  *dormant* (`app_consent.dormant`) until the owner answers: it was never
+  accepted, or its contract now asks for a row, or a
+  higher level of a row, that the accepted answer does not cover. A narrower or
+  equal request never asks. A dormant app gets no app or job token (`409
+  consent_required`), no service invocation, no system-prompt fragment and no
+  agent tools. Token validation (`deps._enforce_app_scope`) refuses a dormant
+  app, and every app, job and service credential carries the id of the
+  acceptance it was issued under, so a token from before a revoke stays dead
+  after re-accepting. Revoking never touches the app's install identity (token
+  nonce, storage generation, publications). The first acceptance starts the
+  `initialize_on_install` run that install could not; that job should be
+  idempotent, because a revoke followed by a new acceptance starts it again.
+  Install stages the rest the same way: a dormant app's shared skills are set
+  aside (inside `_sync_app_skills` and `restore_app_skills`, so install, update, apply and
+  recover all follow it; the tombstone is the one uninstall uses) and come
+  back on acceptance, scheduled runs log `skipped: waiting for owner approval`
+  instead of timing out, and an update that pauses an accepted app sends the
+  owner one notification so an app they rarely open does not stop silently.
+- **Who can answer.** `POST /api/apps/{id}/consent` takes the digest of the
+  request that was shown and accepts only a human owner session
+  (`get_current_owner_for_owner_input`): agent runs, delegated helpers, apps and
+  shared-browser guests are refused. `DELETE` makes the app dormant again.
+- **Rows come from one place.** `rows_from_contract` turns a contract into
+  rows with their wording and a platform-defined `critical` flag (an app cannot
+  mark itself harmless). The install preview returns the same `access_rows`, so
+  the install dialog and the first-open request never keep separate wording.
+  `HANDLED_DATA_KEYS` plus a test fail the build when a new contract permission
+  has no row.
+- **Not yet covered** (next steps): install-time effects (setup, schedules,
+  skills, the first-run job) still start at install; a Store update's new
+  grants still apply before the owner answers; local and agent-built apps are
+  not gated; there is no Settings screen for revoking.
+
 ## Stable error codes
 
 Providers may use DOM-style names for familiar browser handling, but app logic
@@ -739,6 +794,57 @@ session API; the app remains responsible for presentation, interpretation, and
 licensing of the bytes. A `read` consumer sends `control('next')` after taking
 ownership of every `chunk` event, so neither message port accumulates a whole
 large package in memory.
+
+### Passive transcript sessions
+
+`chat.blocks.passive` v1 lets an app's `"interaction": "inline"` chat blocks
+run its accepted code in a hidden, inert frame while the block is near the
+viewport, so the block can show current status and an in-place Confirm. It is
+an execution capability, not an HTTP permission: the app keeps its ordinary
+app token and server grants, so this is not a read-only sandbox. Its contract
+requires read-only module startup and session hydration; the app may act only
+after an explicit owner event (`activate`, `confirm`, `cancel`) and must check
+it again itself. The review copy says so: after the owner presses Confirm the
+app can act, for example publish a change. Omission is no grant; existing
+owners are never auto-granted it, and declaring it is a reviewable widening.
+
+Admission is server-owned. `AppOut.passive_block_module_digest` (also injected
+into the frame and folded into its ETag) is non-null only when the owner's live
+grant exists and the immutable applied runtime manifest declares the
+capability; it is the content address of the applied compiled bundle. It is
+computed once per (runtime revision, bundle) pair, never from the editable
+manifest, and a missing runtime cache is reported as unadmitted rather than
+rebuilt during serialization. The frame verifies the transferred module bytes
+against that SHA-256 before evaluation; without a digest or WebCrypto it does
+not run the module. That integrity check also applies offline, but admission
+then reflects the last digest the shell received: a cached app list and frame
+can run cached, admitted bytes, so a revocation takes effect once the shell
+reaches the server again. An admitted module that does not export
+`appBlockSessions = true` is never mounted as its ordinary view on this path;
+the block falls back to an explicit, visible open. That verdict belongs to one
+applied revision; after an update the block negotiates again.
+
+Each frame document has a host-assigned generation, echoed by the frame in
+`frame-mounted` and every `app-block-state`. Negotiation, reported state
+and owner events are bound to it; a reload or version promotion resets idle
+controls, and an idle session released offscreen keeps nothing. A document that
+reports `retain` (an unacknowledged event, a confirmation, an operation in
+progress or an unknown outcome) stays mounted and is not replaced by an app
+update until it releases. If admission itself is withdrawn meanwhile (an
+update drops the capability or its digest), the retained session stays
+mounted with its checkpoint, takes no new owner event, and tells the reader to
+open the app to check the result; it becomes a static block once it releases. AppCanvas refuses host requests from a buffered
+successor, and from any transcript or session canvas that is not visible (the
+hidden session canvas gets no host-request handler at all). An ordinary shell
+app keeps its background requests, such as chat status or a projects list,
+while another view is on screen. At most 3 idle session frames run per app
+(nearest the viewport centre, measured as the page scrolls; a reader-opened
+static view is never torn down for a slot). Confirm arms only after the end of
+its exact list (a sentinel after the last item, drawn below Confirm) has been
+observed on screen after the current showing's layout and Confirm itself has then been on
+screen in a visible page for about 500 ms; every new showing starts over. The
+wire protocol and the confirmation contract are in
+`building-apps.md` "Passive block sessions".
 
 ## Adding a capability
 

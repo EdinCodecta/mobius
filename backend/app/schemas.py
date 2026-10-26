@@ -296,6 +296,14 @@ class AppOut(BaseModel):
 
   @computed_field
   @property
+  def passive_block_module_digest(self) -> str | None:
+    """Pre-execution admission for this accepted applied bundle, or None."""
+    from app.app_capabilities import passive_block_module_digest
+
+    return passive_block_module_digest(self)
+
+  @computed_field
+  @property
   def frame_version(self) -> str:
     """The app frame's reload key; see app_compile_contract.app_frame_version."""
     from app.app_compile_contract import app_frame_version
@@ -452,10 +460,32 @@ class AppPreviewOut(BaseModel):
   capability_contract: dict
   capability_digest: str
   installed_contract: dict | None = None
+  # Whether the installed version ships project templates; with the contract it
+  # fixes the installed side's rows (a templates change is an access change).
+  installed_project_templates: bool = False
   capability_diff: dict
   # What a fresh install would download; None when any declared file's size is
   # unknown, and for update previews, which arrive as a Git transfer instead.
   download_bytes: int | None = None
+
+  # The owner-facing rows (app_consent.py): the one source of wording that the
+  # install dialog, the first-open popup and the Store's reviews all show.
+  @computed_field
+  @property
+  def access_rows(self) -> list[dict]:
+    from app import app_consent
+
+    return app_consent.rows_for_manifest(self.manifest, self.capability_contract)
+
+  @computed_field
+  @property
+  def installed_access_rows(self) -> list[dict]:
+    from app import app_consent
+
+    return app_consent.rows_from_contract(
+      self.installed_contract,
+      project_builders=self.installed_project_templates,
+    )
 
 
 class ReconciliationReceiptOut(BaseModel):
@@ -906,6 +936,17 @@ class PushSubscribeRequest(BaseModel):
 
 class PushUnsubscribeRequest(BaseModel):
   endpoint: str
+
+
+class PushDeviceRequest(BaseModel):
+  """The FCM token from the mobile app's ``MobiusNative.registerPush()``.
+
+  FCM tokens are printable ASCII without spaces; this bounds what the relay is
+  handed without encoding today's token format. Other fields the app returns
+  (``platform``, APNs details) are ignored: the relay delivers through FCM.
+  """
+
+  token: str = Field(pattern=r"^[\x21-\x7e]{1,4096}$")
 
 
 class NotificationAction(BaseModel):
