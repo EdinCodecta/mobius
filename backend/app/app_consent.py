@@ -80,7 +80,8 @@ _FLAGS = (
   ("railway_manage", "railway_manage", "Manage Railway deployments",
    "Can manage deployments on your Railway account."),
   ("helper_activity_read", "helper_activity_read", "Read helper activity",
-   "Can read the status and results of every helper agent."),
+   "Can see every helper agent's chat, status, open questions, working folder "
+   "and full final report."),
 )
 
 
