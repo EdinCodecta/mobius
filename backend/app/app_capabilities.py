@@ -703,6 +703,13 @@ def contract_from_app_state(
     )
   if tools is None:
     tools = agent_tools_from_contract(getattr(app, "capability_contract", None))
+  # Contract-only grants have no App column. An explicit mapping (manifest
+  # apply) is authoritative; otherwise keep what the stored contract accepted.
+  contract_grants = contract_permissions
+  if contract_grants is None:
+    stored = getattr(app, "capability_contract", None)
+    stored_data = stored.get("data") if isinstance(stored, dict) else None
+    contract_grants = stored_data if isinstance(stored_data, dict) else {}
   manifest = {
     "system_prompt": getattr(app, "system_prompt_file", None),
     "embeds_agent": bool(getattr(app, "embeds_agent", False)),
@@ -718,20 +725,13 @@ def contract_from_app_state(
       "connections_manage": bool(getattr(app, "connections_manage", False)),
       "connect_manage": bool(getattr(app, "connect_manage", False)),
       # Manifest apply passes an explicit mapping: omission revokes. An
-      # unrelated row projection (no mapping) retains reviewed job access.
-      "job_secret_read": (
-        contract_permissions if contract_permissions is not None else
-        (getattr(app, "capability_contract", None) or {}).get("data", {})
-      ).get("job_secret_read", []),
-      # These contract-only grants must be declared on every local apply.
-      "identity_manage": bool(
-        (contract_permissions or {}).get("identity_manage", False)
-      ),
-      "railway_manage": bool(
-        (contract_permissions or {}).get("railway_manage", False)
-      ),
+      # unrelated row projection (no mapping, e.g. a PATCH of pinned or
+      # chat_log_access) retains every contract-only grant the owner accepted.
+      "job_secret_read": contract_grants.get("job_secret_read", []),
+      "identity_manage": bool(contract_grants.get("identity_manage", False)),
+      "railway_manage": bool(contract_grants.get("railway_manage", False)),
       "helper_activity_read": bool(
-        (contract_permissions or {}).get("helper_activity_read", False)
+        contract_grants.get("helper_activity_read", False)
       ),
     },
     "offline_capable": bool(getattr(app, "offline_capable", False)),
