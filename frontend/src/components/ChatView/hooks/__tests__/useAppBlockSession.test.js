@@ -447,3 +447,22 @@ test('the first retain report and the admission withdrawal in the same tick neve
     actions: [{ key: 'send-batch:sel-1', label: 'Ready' }], retain: false, checkpoint: null, checkpointAck: 'race' }, { generation: 1 })
   assert.deepEqual(decide(false, h.result.current), { route: 'passive', mode: 'static' })
 })
+
+test('the session init carries the parsed item intents, in card order, intents only', () => {
+  const card = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.stringify({
+    app: 'example', intent: 'review:sel-1', title: 'Ready', interaction: 'inline',
+    action: { label: 'Publish all', intent: 'send-batch:sel-1' },
+    items: [
+      { title: 'B change', intent: 'review:b', facts: [{ label: 'Project', value: 'example/web' }] },
+      { title: 'Bad', intent: 'not an intent' },
+      { title: 'x'.repeat(241), intent: 'review:too-long-title' },
+      { title: 'A change', intent: 'review:a' },
+      { title: 'B again', intent: 'review:b' },
+    ] }) })
+  const h = renderObserved({ block: card, near: true })
+  assert.deepEqual(h.result.current.blockSession.items, [{ intent: 'review:b' }, { intent: 'review:a' }])
+  assert.deepEqual(h.result.current.blockSession.actions.map(action => action.key), ['send-batch:sel-1'])
+  const bare = appBlockFromToken({ type: 'code', lang: 'mobius-app', text: JSON.stringify({
+    app: 'example', intent: 'open:a', title: 'Bare', interaction: 'inline', action: { label: 'Go', intent: 'go:a' } }) })
+  assert.deepEqual(renderObserved({ block: bare, near: true }).result.current.blockSession.items, [])
+})

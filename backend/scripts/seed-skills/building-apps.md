@@ -504,14 +504,20 @@ display. Never act, publish, or change state because of an intent at startup
 or on `app-block-init`; act only on an owner `confirm`, and check that
 request against your own data first.
 
-`props.blockSession` is `{sessionId, generation, actions, checkpoint, retain,
-recoveryError, subscribe(cb), setState(state)}`, where `actions` is
-`[{key, intent, label}]` and `key` is the action's intent. The host also posts
+`props.blockSession` is `{sessionId, generation, actions, items, checkpoint,
+retain, recoveryError, subscribe(cb), setState(state)}`, where `actions` is
+`[{key, intent, label}]` and `key` is the action's intent, and `items` is
+`[{intent}]`: the block's item intents in card order, after the host's
+validation and deduplication (an empty array when the block lists no items).
+Like `actions[].intent`, `items` is agent-printed and untrusted: it tells a
+single block-level action which records the card shows, but re-verify every
+intent against your own data before you build a confirmation, and build that
+confirmation list from your data, never from the block. The host also posts
 window messages; read them with `subscribe` or a `message` listener that checks
 `event.source === window.parent`:
 
-- `{type:'moebius:app-block-init', sessionId, generation, actions, checkpoint,
-  retain, recoveryError}` when the session envelope changes.
+- `{type:'moebius:app-block-init', sessionId, generation, actions, items,
+  checkpoint, retain, recoveryError}` when the session envelope changes.
 - `{type:'moebius:app-block-action', sessionId, generation, key, event, nonce}`,
   `event` one of `activate | confirm | cancel`. Each reader click sends one
   event; the host sends no other event until you acknowledge that `nonce`.

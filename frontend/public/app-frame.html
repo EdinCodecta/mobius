@@ -652,7 +652,7 @@
     //      it to the runtime's init (`frameVisible` in its config).
     //  11. transcript block session (building-apps.md "Passive block
     //      sessions"): frame-init may carry blockSession {sessionId,
-    //      generation, actions, checkpoint, retain, recoveryError}. Only a
+    //      generation, actions, items, checkpoint, retain, recoveryError}. Only a
     //      server-admitted revision whose bytes match _FRAME_PASSIVE_BLOCK_DIGEST
     //      and whose module exports `appBlockSessions = true` mounts; it gets
     //      props.blockSession. frame-mounted reports supportsAppBlocks and the
@@ -1143,6 +1143,7 @@
         sessionId: session.sessionId,
         generation: session.generation,
         actions: Array.isArray(session.actions) ? session.actions : [],
+        items: Array.isArray(session.items) ? session.items : [],
         checkpoint: session.checkpoint || null,
         retain: session.retain === true,
         recoveryError: session.recoveryError || null,
