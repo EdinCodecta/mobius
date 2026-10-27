@@ -1735,6 +1735,19 @@ export const api = {
     // Drop an unclaimed host request so a stalled self-hosted update can retry.
     withdrawRebuildRequest: () => apiFetch('/admin/rebuild/request', { method: 'DELETE' }),
   },
+  // Settings Storage and Memory box. Works without an agent by design.
+  resources: {
+    overview: async ({ refresh = false } = {}) => jsonOrThrow(
+      await apiFetch(`/resources${refresh ? '?refresh=true' : ''}`), 'Storage and memory are unavailable',
+    ),
+    previewCleanup: async (target) => jsonOrThrow(
+      await apiFetch(`/resources/cleanup/${encodeURIComponent(target)}`), 'Could not measure this now',
+    ),
+    runCleanup: async (target) => jsonOrThrow(
+      await apiFetch(`/resources/cleanup/${encodeURIComponent(target)}`, { method: 'POST' }),
+      'The cleanup did not finish',
+    ),
+  },
   platform: {
     status: () => apiFetch('/platform/status'),
     check: () => apiFetch('/platform/check', { method: 'POST' }),

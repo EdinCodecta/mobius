@@ -26,6 +26,7 @@ import ModelSheet from '../ui/ModelSheet.jsx'
 import { modelEfforts, validEffort } from '../ui/modelEfforts.js'
 import ManageModelsModal from '../ChatView/ManageModelsModal.jsx'
 import PlatformUpdates from './PlatformUpdates.jsx'
+import StorageMemorySection from './storageMemory/StorageMemorySection.jsx'
 import ProviderUsage from './ProviderUsage.jsx'
 import GithubConnection from './GithubConnection.jsx'
 import SharedFoldersSection from './SharedFoldersSection.jsx'
@@ -1152,6 +1153,15 @@ export default function SettingsView({
 
         {!detailPage && <>
         <SharedFoldersSection />
+
+        <StorageMemorySection
+          active={active}
+          focusRequest={focusTarget?.section === 'storage' ? focusTarget : null}
+          onOpenApp={onOpenApp}
+          onOpenChat={onOpenChat}
+          sectionRef={(node) => setSetupFocusRef('storage', node)}
+          inertBoundaryRef={settingsBoundaryRef}
+        />
 
         <PlatformUpdates active={active} refreshToken={refreshToken} onOpenChat={onOpenChat} inertBoundaryRef={settingsBoundaryRef} />
 

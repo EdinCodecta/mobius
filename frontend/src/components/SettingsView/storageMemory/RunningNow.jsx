@@ -1,0 +1,100 @@
+/* Running chats lead the memory section; estimates stay separate from Stop. */
+import { useId, useRef, useState } from 'react'
+import StatusDot from '../../ui/StatusDot.jsx'
+import ResourceConfirmDrawer from './ResourceConfirmDrawer.jsx'
+import { GROUP_COPY, formatBytes, memoryGroupLabel, removedQueuedSentence, runningTurnTitle } from './storageMemoryPresentation.js'
+
+function stoppedSentence({ title, clearedQueued }) {
+  if (!clearedQueued) return `Stopped “${title}”. Your messages stay.`
+  return `Stopped “${title}”. ${removedQueuedSentence(clearedQueued)}`
+}
+
+function StopConfirmation({ turn, phase, error, cancelRef, onCancel, onConfirm }) {
+  const stopping = phase === 'stopping'
+  return (
+    <div className="storage-memory__confirm" role="group" aria-label={`Confirm stop: ${turn.title}`} aria-busy={stopping}>
+      <p className="storage-memory__confirm-lead">Stop this turn?</p>
+      <p className="storage-memory__note">Ends the current agent reply in “{turn.title}”.</p>
+      {turn.helpers > 0 && <p className="storage-memory__note">{turn.helpers === 1 ? 'Its helper agent stops too.' : `Its ${turn.helpers} helper agents stop too.`}</p>}
+      <p className="storage-memory__note">Messages stay. Unfinished work may need checking before you resume.</p>
+      {error && <p className="storage-memory__item-sub--failed" role="alert">{error}</p>}
+      <div className="storage-memory__confirm-actions">
+        <button ref={cancelRef} type="button" className="settings__btn settings__btn--outline settings__btn--sm" onClick={onCancel} disabled={stopping}>Cancel</button>
+        <button type="button" className="settings__btn settings__btn--outline settings__btn--sm storage-memory__stop"
+          onClick={onConfirm} disabled={stopping} aria-label={`Confirm stop: ${turn.title}`}>{stopping ? 'Stopping…' : 'Stop turn'}</button>
+      </div>
+    </div>
+  )
+}
+
+function RunningTurnRow({ turn, onStop, onOpenChat }) {
+  const [phase, setPhase] = useState('idle')
+  const [error, setError] = useState('')
+  const cancelRef = useRef(null)
+  const openerRef = useRef(null)
+  const drawerId = useId()
+  const open = phase !== 'idle'
+  async function stop() {
+    setPhase('stopping'); setError('')
+    try { await onStop(turn); setPhase('idle') }
+    catch (err) { setPhase('failed'); setError(err?.message || 'Could not stop this turn. Try again.') }
+  }
+  // Stop clears the chat's queued messages and only the chat screen sends
+  // them again, so a chat with a queue is stopped from there.
+  const queued = turn.queued > 0
+  return (
+    <li className="storage-memory__turn">
+      <div className="storage-memory__turn-main">
+        <span className="storage-memory__turn-name">{turn.title}</span>
+        {!queued && <button ref={openerRef} type="button" className="settings__btn settings__btn--outline settings__btn--sm"
+          disabled={open} onClick={() => setPhase('confirm')} aria-label={`Stop turn: ${turn.title}`} aria-expanded={open} aria-controls={drawerId}>Stop turn</button>}
+        <div className="storage-memory__turn-meta">
+          <StatusDot color="--green">{phase === 'stopping' ? 'Stopping…' : 'Running'}</StatusDot>
+          {onOpenChat && <button type="button" className="storage-memory__chat-link" onClick={() => onOpenChat(turn.chat_id)} aria-label={`Open chat: ${turn.title}`}>{queued ? 'Open chat to stop' : 'Open chat'}</button>}
+        </div>
+        {queued && <p className="storage-memory__note storage-memory__turn-queued">Has queued messages, so stop it in the chat to keep them.</p>}
+      </div>
+      <ResourceConfirmDrawer id={drawerId} open={open} busy={phase === 'stopping'} initialFocusRef={cancelRef} restoreFocusRef={openerRef} onCancel={() => setPhase('idle')}>
+        <StopConfirmation turn={turn} phase={phase} error={error} cancelRef={cancelRef} onCancel={() => setPhase('idle')} onConfirm={stop} />
+      </ResourceConfirmDrawer>
+    </li>
+  )
+}
+
+function MemoryBreakdown({ memory }) {
+  if (!memory?.groups?.length) return null
+  return (
+    <details className="storage-memory__memory-details">
+      <summary>What is using memory?</summary>
+      <dl className="storage-memory__memory-use">
+        {memory.groups.map(group => <div key={group.label}><dt>{memoryGroupLabel(group.label)}</dt><dd className="storage-memory__size">≈ {formatBytes(group.bytes)}</dd></div>)}
+      </dl>
+      <p className="storage-memory__note">Estimates by group, not what Stop will free. They can differ from the total above.</p>
+    </details>
+  )
+}
+
+export default function RunningNow({ memory, running, onStop, onOpenChat }) {
+  const [stopped, setStopped] = useState(null)
+  const headingRef = useRef(null)
+  async function stop(turn) {
+    const { clearedQueued } = await onStop(turn.chat_id)
+    setStopped({ title: turn.title, clearedQueued })
+    headingRef.current?.focus({ preventScroll: true })
+  }
+  return (
+    <section className="storage-memory__group" data-resource-group="running" tabIndex={-1} aria-labelledby="storage-running-title">
+      <div className="storage-memory__group-head">
+        <div className="storage-memory__group-text">
+          <h3 ref={headingRef} tabIndex={-1} id="storage-running-title" className="storage-memory__group-title">{GROUP_COPY.running.title}</h3>
+          <p className="storage-memory__group-helper">{GROUP_COPY.running.helper}</p>
+        </div>
+        <span className="storage-memory__count">{running.length} {running.length === 1 ? 'turn' : 'turns'}</span>
+      </div>
+      {stopped && <p className="storage-memory__note" role="status">{stoppedSentence(stopped)}</p>}
+      {running.length ? <ul className="storage-memory__turns">{running.map(turn => <RunningTurnRow key={turn.chat_id} turn={{ ...turn, title: runningTurnTitle(turn.title) }} onStop={stop} onOpenChat={onOpenChat} />)}</ul>
+        : <div className="storage-memory__empty"><strong>No agent turns running</strong><p className="storage-memory__note">Möbius and other processes still use memory.</p></div>}
+      <MemoryBreakdown memory={memory} />
+    </section>
+  )
+}

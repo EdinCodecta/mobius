@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Callable
 
-from app.storage_io import atomic_write
+from app.storage_io import app_dir_usage, atomic_write, newest_change
 
 
 DEFAULT_RETENTION_DAYS = {
@@ -37,6 +39,10 @@ MAX_FILES_PER_SWEEP = 10_000
 # Codex turns wait on the sweep lock, so store work stops at this wall-clock
 # bound; a backlog resumes on the next pass.
 STORE_COMPACTION_BUDGET_SECONDS = 5.0
+
+
+def _is_rollout_name(name: str) -> bool:
+  return name.startswith("rollout-") and name.endswith(".jsonl")
 
 
 def sweep_stale_provider_sessions(
@@ -93,7 +99,7 @@ def sweep_stale_provider_sessions(
         files.sort()
         empty_dir_candidates.append(base)
         for name in files:
-          if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+          if not _is_rollout_name(name):
             continue
           if scanned >= max_files:
             truncated = True
@@ -181,3 +187,118 @@ def ensure_claude_settings_defaults(data_dir: str | Path) -> list[str]:
       json.dumps(decoded, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     )
   return added
+
+
+# Owner-run cleanup ("Agent working copies" in Settings). Deleting an old provider
+# session only costs a warm resume: Möbius keeps every chat's transcript and
+# reseeds a fresh session from it when the provider's copy is gone.
+
+def _stale_claude_session(transcript: Path, cutoff: float) -> tuple[Path, Path | None, int] | None:
+  """A Claude transcript and its side folder, when neither changed since ``cutoff``."""
+  info = transcript.lstat()
+  if not stat.S_ISREG(info.st_mode) or info.st_mtime >= cutoff:
+    return None
+  side = transcript.with_suffix("")
+  if side.is_symlink() or not side.is_dir():
+    return transcript, None, info.st_size
+  if newest_change(side) >= cutoff:
+    return None
+  return transcript, side, info.st_size + app_dir_usage(side)
+
+
+def _stale_claude_sessions(
+  data_dir: str | Path, cutoff: float, in_use: frozenset[str],
+) -> list[tuple[Path, Path | None, int]]:
+  root = Path(data_dir) / "cli-auth" / "claude" / "projects"
+  if root.is_symlink() or not root.is_dir():
+    return []
+  transcripts = [
+    transcript
+    for project in root.iterdir() if project.is_dir() and not project.is_symlink()
+    for transcript in project.glob("*.jsonl")
+  ]
+  stale = []
+  for transcript in transcripts:
+    if transcript.stem in in_use:
+      continue
+    try:
+      session = _stale_claude_session(transcript, cutoff)
+    except OSError:
+      continue
+    if session is not None:
+      stale.append(session)
+  return stale
+
+
+def _codex_rollouts(data_dir: str | Path):
+  root = Path(data_dir) / "cli-auth" / "codex" / "sessions"
+  if root.is_symlink() or not root.is_dir():
+    return
+  for directory, _names, files in os.walk(root, followlinks=False):
+    yield from (Path(directory) / name for name in files if _is_rollout_name(name))
+
+
+def _stale_codex_usage(data_dir: str | Path, cutoff: float) -> tuple[int, int]:
+  sizes = []
+  for rollout in _codex_rollouts(data_dir):
+    try:
+      info = rollout.lstat()
+    except OSError:
+      continue
+    if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff:
+      sizes.append(info.st_size)
+  return sum(sizes), len(sizes)
+
+
+def stale_session_usage(
+  data_dir: str | Path, *, max_age_days: int, in_use: frozenset[str] = frozenset(),
+  now: float | None = None,
+) -> dict:
+  """Bytes and count of Claude and Codex sessions older than ``max_age_days``.
+
+  ``in_use`` holds Claude session ids of chats that are running or starting;
+  an old session about to be resumed is never counted or deleted.
+  """
+  cutoff = (time.time() if now is None else now) - max_age_days * 86400
+  claude = _stale_claude_sessions(data_dir, cutoff, in_use)
+  codex_bytes, codex_count = _stale_codex_usage(data_dir, cutoff)
+  return {
+    "bytes": sum(size for _transcript, _side, size in claude) + codex_bytes,
+    "sessions": len(claude) + codex_count,
+  }
+
+
+def clear_stale_sessions(
+  data_dir: str | Path, *, max_age_days: int,
+  in_use: Callable[[], frozenset[str]] = frozenset,
+  now: float | None = None,
+) -> dict:
+  """Delete Claude and Codex sessions older than ``max_age_days``.
+
+  Codex goes through its own sweep, which waits for no turn and skips while
+  any Codex process is active; that skip is reported, not hidden.
+  """
+  now = time.time() if now is None else now
+  cutoff = now - max_age_days * 86400
+  removed = reclaimed = 0
+  stale = _stale_claude_sessions(data_dir, cutoff, in_use())
+  # Sizing every transcript takes a moment; ask again right before deleting,
+  # so a chat that started meanwhile keeps the session it is resuming.
+  started = in_use()
+  for transcript, side, size in stale:
+    if transcript.stem in started:
+      continue
+    try:
+      transcript.unlink()
+      if side is not None:
+        shutil.rmtree(side)
+    except OSError:
+      continue
+    removed += 1
+    reclaimed += size
+  codex = sweep_stale_provider_sessions(data_dir, now=now, max_age_days=max_age_days)
+  return {
+    "bytes": reclaimed + codex["reclaimed_bytes"] + codex.get("store_reclaimed_bytes", 0),
+    "sessions": removed + codex["removed_files"],
+    "codex_skipped": codex["status"] == "skipped_active",
+  }
