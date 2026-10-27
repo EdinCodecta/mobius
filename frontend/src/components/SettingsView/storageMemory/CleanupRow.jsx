@@ -7,7 +7,7 @@ import { CLEANUP_COPY, formatBytes, previewSentence, resultSentence, storedSize 
 // so Clear stays available even when the stored size is unknown.
 function storedLabel(item) {
   const { value, note } = storedSize(item)
-  return <>{value}<small>{note}</small></>
+  return <>{value} <small>{note}</small></>
 }
 
 // The confirm step opens immediately with its fixed words; only the size and

@@ -38,7 +38,7 @@ test('running work leads the optional memory accounting and has explicit navigat
 test('closed confirmations are inert and their buttons are not approval', () => {
   const html = render(Details)
   assert.equal((html.match(/data-open="false" inert=""/g) || []).length, 2)
-  assert.match(html, /918 MB<small>stored<\/small>/)
+  assert.match(html, /918 MB <small>stored<\/small>/)
   assert.doesNotMatch(html, /This frees about 918 MB/)
   assert.match(html, /only ones older than 2 days clear/)
 })

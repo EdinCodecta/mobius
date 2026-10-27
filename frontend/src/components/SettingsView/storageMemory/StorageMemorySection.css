@@ -63,23 +63,26 @@
 
 /* Rows share one column plan: name | size | action. Sizes and buttons sit on
    the name's line, so they align across rows whatever the description length. */
-.storage-memory__items { margin: 8px 0 0; padding: 0; list-style: none; }
+.storage-memory__items { margin: 12px 0 0; padding: 0 14px; list-style: none; border-radius: 10px; background: var(--surface-2); }
 .storage-memory__item {
-  display: grid; grid-template-columns: minmax(0, 1fr) 72px auto;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
   grid-template-areas: "name size action" "sub sub ." "drawer drawer drawer";
   align-items: center; column-gap: 12px; row-gap: 2px;
-  padding: 10px 0; border-top: 1px solid var(--border-light, var(--border));
+  padding: 12px 0; border-top: 1px solid var(--border-light, var(--border));
 }
 .storage-memory__item:first-child { border-top: 0; }
-.storage-memory__item-name { grid-area: name; min-width: 0; font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
-.storage-memory__item-sub { grid-area: sub; color: var(--muted); font-size: 12.5px; line-height: 1.45; }
+.storage-memory__item-name { grid-area: name; min-width: 0; font-size: 13.5px; font-weight: 500; overflow-wrap: anywhere; }
+.storage-memory__item-sub { grid-area: sub; color: var(--muted); font-size: 12px; line-height: 1.45; }
 .storage-memory__item-sub--done { color: var(--green); }
 .storage-memory__item-sub--failed { color: var(--danger); }
 .storage-memory__item-action { grid-area: action; display: flex; justify-content: flex-end; gap: 8px; }
 .storage-memory__size { flex: none; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; text-align: end; white-space: nowrap; }
-.storage-memory__stored small { display: block; font-size: 12px; font-weight: 400; line-height: 1.3; }
+.storage-memory__stored small { font-size: 12px; font-weight: 400; }
 .storage-memory__item > .storage-memory__size { grid-area: size; }
 .storage-memory .settings__btn { margin: 0; white-space: nowrap; min-height: 44px; min-width: 64px; }
+/* Keep the compact visible button's touch target at 44px. */
+.storage-memory__item-action .settings__btn { position: relative; min-height: 32px; min-width: 56px; }
+.storage-memory__item-action .settings__btn::before { content: ""; position: absolute; inset: -6px 0; }
 .storage-memory .storage-memory__stop { color: var(--danger); }
 
 /* The confirm step slides open under its row and back; its fixed words are
@@ -91,7 +94,7 @@
 .storage-memory__drawer[data-open="true"] { grid-template-rows: 1fr; opacity: 1; }
 .storage-memory__drawer-inner { min-height: 0; overflow: hidden; visibility: hidden; transition: visibility 0s linear 0.24s; }
 .storage-memory__drawer[data-open="true"] .storage-memory__drawer-inner { visibility: visible; transition-delay: 0s; }
-.storage-memory__confirm { display: grid; gap: 10px; margin-top: 10px; padding: 12px 14px; border-radius: 8px; background: var(--surface-2); }
+.storage-memory__confirm { display: grid; gap: 10px; margin-top: 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .storage-memory__confirm-lead { margin: 0; font-size: 13.5px; font-weight: 500; }
 .storage-memory__confirm-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 14px; margin: 0; font-size: 12.5px; line-height: 1.5; }
 .storage-memory__confirm-facts dt { color: var(--muted); }
