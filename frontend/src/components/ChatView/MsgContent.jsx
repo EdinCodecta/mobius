@@ -621,6 +621,10 @@ function MsgContentInner({
             autoResume={automaticContinuation}
             resetElapsed={!!limitResetElapsed}
             recoveryCredit={recoveryCredit}
+            refusalActions={recoveryOwner && providerRefusal ? {
+              switchModel: !!onRefusalModelChoice,
+              freshSession: !!onRefusalFreshSession,
+            } : null}
             cardRef={recoveryOwner ? resumeCardRef : undefined}
           >
             {recoveryOwner && parked && !modelCapacity && autoResumeAvailable && onAutoResumeChange && (

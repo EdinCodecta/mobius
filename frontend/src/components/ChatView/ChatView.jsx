@@ -83,6 +83,7 @@ import { composerAdjacentActionProps } from './composerAdjacentAction.js'
 import ChatInputBar from './ChatInputBar.jsx'
 import CompactionProgress from './CompactionProgress.jsx'
 import useCompactCommands from './hooks/useCompactCommands.js'
+import { canStartRefusalFreshSession, refusalActionSentence } from './ErrorCard.jsx'
 import { chatCommandRejection, mobiusChatCommand } from './slashCommands.js'
 import { hasSendablePayload } from './composerSubmission.js'
 import AgentContextInspector from './AgentContextInspector.jsx'
@@ -4417,6 +4418,10 @@ export default function ChatView({
   const handleRefusalFreshSession = useCallback(() => {
     void runCompactCommandRef.current?.('', null)
   }, [])
+  // The fresh session is the /compact handoff, which the server reserves for
+  // the owner's lifecycle control: a chat embed has no manual compaction and a
+  // shared-workspace guest is refused, so neither is offered the button.
+  const canStartFreshSession = canStartRefusalFreshSession({ embedded })
   // Cancel one queued message via DELETE. Keep reconciliation scoped to that
   // CID: full queue snapshots can arrive out of order when two rows are
   // cancelled quickly and would otherwise resurrect a sibling cancellation.
@@ -5853,7 +5858,10 @@ export default function ChatView({
       return 'Response paused for restart. Möbius will continue automatically.'
     }
     if (pendingResumeBlock.pause?.kind === 'provider_refusal') {
-      return 'This model declined to continue. Switch model or start a fresh session.'
+      return ['This model declined to continue.', refusalActionSentence({
+        switchModel: showPicker,
+        freshSession: canStartFreshSession,
+      })].filter(Boolean).join(' ')
     }
     return 'Turn paused — Resume available.'
   })()
@@ -6061,7 +6069,7 @@ export default function ChatView({
       onQuestionSubmitCancel={cancelQuestionSubmission}
       onResume={activeAssistantIsStreaming && active ? undefined : handleResume}
       onRefusalModelChoice={showPicker ? handleRefusalModelChoice : undefined}
-      onRefusalFreshSession={handleRefusalFreshSession}
+      onRefusalFreshSession={canStartFreshSession ? handleRefusalFreshSession : undefined}
       resumeState={resumeState}
       onInternalNav={internalNav}
       autoResumeEnabled={last && autoResumeEnabled}

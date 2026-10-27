@@ -5,6 +5,7 @@ import { ChevronRight, Clock, Pause, Warning } from '@openai/apps-sdk-ui/compone
 import MessageCopyButton from './MessageCopyButton.jsx'
 import { isResourcePause } from './waitingPresentation.js'
 import { providerInfoFor } from './providerRegistry.jsx'
+import { isOwnerWorkspace } from '../../lib/workspaceStorage.js'
 
 // The single renderer for the error/pause/park card family. MsgContent consumes
 // both persisted blocks and the converted live stream, so source selection
@@ -69,6 +70,25 @@ function creditsCopy(provider) {
   return `${where} is out of credits. Your progress is saved. Add credits, or ask whoever manages that workspace, then Resume.`
 }
 
+// The refusal card names only the moves this viewer is actually offered: the
+// model picker can be hidden, and a fresh session (the /compact handoff) is
+// owner lifecycle control that a chat embed or shared-workspace guest lacks.
+export function canStartRefusalFreshSession({
+  embedded = false,
+  ownerWorkspace = isOwnerWorkspace(),
+} = {}) {
+  return !embedded && ownerWorkspace
+}
+
+export function refusalActionSentence({ switchModel = false, freshSession = false } = {}) {
+  if (switchModel && freshSession) {
+    return 'Switch model, then Resume, or start a fresh session from a summary of this chat.'
+  }
+  if (switchModel) return 'Switch model, then Resume.'
+  if (freshSession) return 'Start a fresh session from a summary of this chat.'
+  return ''
+}
+
 // `children` is the slot for surface-specific affordances — MsgContent
 // appends its tail-gated Resume button there; the live surface renders none
 // (a terminal error promotes within the same breath, and the button's
@@ -80,6 +100,7 @@ export default function ErrorCard({
   manualRecovery = false,
   resetElapsed = false,
   recoveryCredit = null,
+  refusalActions = null,
   cardRef,
   children,
 }) {
@@ -105,7 +126,7 @@ export default function ErrorCard({
         : 'Provider limit reached'
     : null
   const recoveryCopy = vm.providerRefusal
-    ? 'Its safety check stopped this turn, so retrying the same conversation on this model usually fails again. Your work is saved. Switch model, then Resume or start a fresh session from a summary of this chat.'
+    ? ['Its safety check stopped this turn, so retrying the same conversation on this model usually fails again. Your work is saved.', refusalActionSentence(refusalActions || {})].filter(Boolean).join(' ')
     : platformHold
     ? block.pause?.kind === 'restart'
       ? continuationWait === 'restart_required'
