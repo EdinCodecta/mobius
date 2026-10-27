@@ -2,12 +2,7 @@
 import { useId, useRef, useState } from 'react'
 import StatusDot from '../../ui/StatusDot.jsx'
 import ResourceConfirmDrawer from './ResourceConfirmDrawer.jsx'
-import { GROUP_COPY, formatBytes, memoryGroupLabel, removedQueuedSentence, runningTurnTitle } from './storageMemoryPresentation.js'
-
-function stoppedSentence({ title, clearedQueued }) {
-  if (!clearedQueued) return `Stopped “${title}”. Your messages stay.`
-  return `Stopped “${title}”. ${removedQueuedSentence(clearedQueued)}`
-}
+import { GROUP_COPY, formatBytes, memoryGroupLabel, runningTurnTitle } from './storageMemoryPresentation.js'
 
 function StopConfirmation({ turn, phase, error, cancelRef, onCancel, onConfirm }) {
   const stopping = phase === 'stopping'
@@ -75,11 +70,11 @@ function MemoryBreakdown({ memory }) {
 }
 
 export default function RunningNow({ memory, running, onStop, onOpenChat }) {
-  const [stopped, setStopped] = useState(null)
+  const [stoppedTitle, setStoppedTitle] = useState('')
   const headingRef = useRef(null)
   async function stop(turn) {
-    const { clearedQueued } = await onStop(turn.chat_id)
-    setStopped({ title: turn.title, clearedQueued })
+    await onStop(turn.chat_id)
+    setStoppedTitle(turn.title)
     headingRef.current?.focus({ preventScroll: true })
   }
   return (
@@ -91,7 +86,7 @@ export default function RunningNow({ memory, running, onStop, onOpenChat }) {
         </div>
         <span className="storage-memory__count">{running.length} {running.length === 1 ? 'turn' : 'turns'}</span>
       </div>
-      {stopped && <p className="storage-memory__note" role="status">{stoppedSentence(stopped)}</p>}
+      {stoppedTitle && <p className="storage-memory__note" role="status">Stopped “{stoppedTitle}”. Your messages stay.</p>}
       {running.length ? <ul className="storage-memory__turns">{running.map(turn => <RunningTurnRow key={turn.chat_id} turn={{ ...turn, title: runningTurnTitle(turn.title) }} onStop={stop} onOpenChat={onOpenChat} />)}</ul>
         : <div className="storage-memory__empty"><strong>No agent turns running</strong><p className="storage-memory__note">Möbius and other processes still use memory.</p></div>}
       <MemoryBreakdown memory={memory} />

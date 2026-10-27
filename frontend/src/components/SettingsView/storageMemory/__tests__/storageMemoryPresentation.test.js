@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   CLEANUP_COPY, GROUP_COPY, boxStatus, formatBytes, keptDescription, keptTotal, measuredLabel, memoryMeter,
-  previewSentence, resultSentence, storageMeter, memoryCheckedLabel, memoryGroupLabel, runningTurnTitle, storedSize, removedQueuedSentence, resourceWarning,
+  previewSentence, resultSentence, storageMeter, memoryCheckedLabel, memoryGroupLabel, runningTurnTitle, storedSize, resourceWarning,
 } from '../storageMemoryPresentation.js'
 
 test('sizes use the decimal units the storage alert and hosts use', () => {
@@ -111,9 +111,4 @@ test('a stored size says when it is unmeasured or only partly measured', () => {
   assert.deepEqual(storedSize({ bytes: 302e6, incomplete: false }), { value: '302 MB', note: 'stored' })
   assert.deepEqual(storedSize({ bytes: 302e6, incomplete: true }), { value: '302 MB+', note: 'partly measured' })
   assert.deepEqual(storedSize({ bytes: null }), { value: 'Not measured', note: 'yet' })
-})
-
-test('messages cleared by a Stop are named as removed, never as recoverable', () => {
-  assert.equal(removedQueuedSentence(1), '1 queued message was removed; type it again in the chat.')
-  assert.equal(removedQueuedSentence(3), '3 queued messages were removed; type them again in the chat.')
 })

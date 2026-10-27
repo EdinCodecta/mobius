@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 from app import agent_scratch, capacity, config, models, resource_cleanup, resource_overview
 from app.browser_profiles import clear_closed_chat_profiles, closed_chat_profile_usage
-from app.provider_session_retention import clear_stale_sessions, stale_session_usage
+from app.provider_session_retention import stale_session_usage
 from test_app_fixtures import create_local_app
 
 DAY = 86400
@@ -31,7 +31,15 @@ def _age(path, age_days):
 # --- old agent sessions ------------------------------------------------------
 
 
-def test_old_session_clear_keeps_recent_sessions_and_removes_old_ones_with_their_folder(tmp_path):
+def _clear_sessions(monkeypatch, tmp_path, *, owners=None, idle=lambda _chat_id: True):
+  monkeypatch.setattr(resource_cleanup, "_session_owners", lambda _ids: dict(owners or {}))
+  monkeypatch.setattr(resource_cleanup, "_chat_turn_running", lambda chat_id: not idle(chat_id))
+  return asyncio.run(resource_cleanup._clear_agent_sessions(str(tmp_path)))
+
+
+def test_old_session_clear_keeps_recent_sessions_and_removes_old_ones_with_their_folder(
+  tmp_path, monkeypatch,
+):
   project = tmp_path / "cli-auth" / "claude" / "projects" / "-data"
   _write(project / "old.jsonl", 1000, age_days=5)
   _write(project / "old" / "tool-results" / "r.txt", 500, age_days=5)
@@ -45,41 +53,69 @@ def test_old_session_clear_keeps_recent_sessions_and_removes_old_ones_with_their
   preview = stale_session_usage(tmp_path, max_age_days=2)
   assert preview == {"bytes": 1500, "sessions": 1}
 
-  result = clear_stale_sessions(tmp_path, max_age_days=2)
+  result = _clear_sessions(monkeypatch, tmp_path)
 
-  assert result["sessions"] == 1 and result["bytes"] == 1500
-  assert not (project / "old.jsonl").exists() and not (project / "old").exists()
-  assert (project / "recent.jsonl").exists()
-  assert (project / "resumed.jsonl").exists() and (project / "resumed").exists()
+  assert result["items"] == 1 and result["bytes"] >= 1500
+  assert sorted(path.name for path in project.iterdir()) == ["recent.jsonl", "resumed", "resumed.jsonl"]
 
 
-def test_old_session_of_a_running_chat_is_never_cleared(tmp_path):
+def test_old_session_of_a_running_chat_is_never_cleared(tmp_path, monkeypatch):
   project = tmp_path / "cli-auth" / "claude" / "projects" / "-data"
   _write(project / "resuming.jsonl", 1000, age_days=5)
   _write(project / "idle.jsonl", 400, age_days=5)
-  in_use = frozenset({"resuming"})
 
-  assert stale_session_usage(tmp_path, max_age_days=2, in_use=in_use) == {"bytes": 400, "sessions": 1}
-  clear_stale_sessions(tmp_path, max_age_days=2, in_use=lambda: in_use)
+  preview = stale_session_usage(tmp_path, max_age_days=2, in_use=frozenset({"resuming"}))
+  assert preview == {"bytes": 400, "sessions": 1}
+  _clear_sessions(
+    monkeypatch, tmp_path, owners={"resuming": "chat-r", "idle": "chat-i"},
+    idle=lambda chat_id: chat_id != "chat-r",
+  )
 
   assert (project / "resuming.jsonl").exists()
   assert not (project / "idle.jsonl").exists()
 
 
-def test_a_chat_that_starts_while_sessions_are_sized_keeps_its_session(tmp_path):
+def test_a_chat_that_starts_while_another_session_is_deleted_keeps_its_own(
+  tmp_path, monkeypatch,
+):
+  """Each session is checked and moved under its own chat's run-start lock."""
+  from app import chat_queue, provider_session_retention
+
   project = tmp_path / "cli-auth" / "claude" / "projects" / "-data"
-  _write(project / "late.jsonl", 1000, age_days=5)
-  _write(project / "idle.jsonl", 400, age_days=5)
-  answers = iter([frozenset(), frozenset({"late"})])
+  _write(project / "first.jsonl", 1000, age_days=5)
+  _write(project / "second.jsonl", 400, age_days=5)
+  owners = {"first": "chat-1", "second": "chat-2"}
+  started = set()
+  real_detach = provider_session_retention.detach_claude_session
 
-  result = clear_stale_sessions(tmp_path, max_age_days=2, in_use=lambda: next(answers))
+  def detach_then_other_chat_starts(transcript, side):
+    assert chat_queue.get_lock(owners[transcript.stem]).locked()
+    moved = real_detach(transcript, side)
+    started.update(set(owners.values()) - {owners[transcript.stem]})
+    return moved
 
-  assert result["sessions"] == 1
-  assert (project / "late.jsonl").exists()
-  assert not (project / "idle.jsonl").exists()
+  monkeypatch.setattr(provider_session_retention, "detach_claude_session", detach_then_other_chat_starts)
+  result = _clear_sessions(
+    monkeypatch, tmp_path, owners=owners, idle=lambda chat_id: chat_id not in started,
+  )
+
+  assert result["items"] == 1
+  kept = [path.stem for path in project.glob("*.jsonl")]
+  assert len(kept) == 1 and owners[kept[0]] in started
 
 
-def test_old_session_clear_never_follows_a_linked_project_outside_claude(tmp_path):
+def test_sessions_left_aside_by_an_interrupted_clear_are_reclaimed_next_time(tmp_path, monkeypatch):
+  project = tmp_path / "cli-auth" / "claude" / "projects" / "-data"
+  _write(project / ".gone.jsonl.released-abc", 600, age_days=5)
+  _write(project / ".gone.released-abc" / "tool-results" / "r.txt", 200, age_days=5)
+
+  result = _clear_sessions(monkeypatch, tmp_path)
+
+  assert result["bytes"] >= 800
+  assert list(project.iterdir()) == []
+
+
+def test_old_session_clear_never_follows_a_linked_project_outside_claude(tmp_path, monkeypatch):
   outside = tmp_path / "elsewhere"
   _write(outside / "keep.jsonl", 100, age_days=30)
   projects = tmp_path / "cli-auth" / "claude" / "projects"
@@ -87,7 +123,7 @@ def test_old_session_clear_never_follows_a_linked_project_outside_claude(tmp_pat
   (projects / "linked").symlink_to(outside, target_is_directory=True)
 
   assert stale_session_usage(tmp_path, max_age_days=2)["sessions"] == 0
-  clear_stale_sessions(tmp_path, max_age_days=2)
+  _clear_sessions(monkeypatch, tmp_path)
 
   assert (outside / "keep.jsonl").exists()
 

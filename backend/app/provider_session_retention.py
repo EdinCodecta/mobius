@@ -24,9 +24,9 @@ import os
 import shutil
 import stat
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 
 from app.storage_io import app_dir_usage, atomic_write, newest_change
 
@@ -268,37 +268,59 @@ def stale_session_usage(
   }
 
 
-def clear_stale_sessions(
-  data_dir: str | Path, *, max_age_days: int,
-  in_use: Callable[[], frozenset[str]] = frozenset,
-  now: float | None = None,
-) -> dict:
-  """Delete Claude and Codex sessions older than ``max_age_days``.
+def stale_claude_sessions(
+  data_dir: str | Path, *, max_age_days: int, now: float | None = None,
+) -> list[tuple[Path, Path | None, int]]:
+  """Claude transcripts (with their side folders) untouched for ``max_age_days``."""
+  cutoff = (time.time() if now is None else now) - max_age_days * 86400
+  return _stale_claude_sessions(data_dir, cutoff, frozenset())
 
-  Codex goes through its own sweep, which waits for no turn and skips while
-  any Codex process is active; that skip is reported, not hidden.
+
+_RELEASED = ".released-"
+
+
+def detach_claude_session(transcript: Path, side: Path | None) -> list[Path] | None:
+  """Move one session aside under hidden names, so Claude can no longer resume it.
+
+  Renames are instant, so the caller can do this inside the same uninterrupted
+  step as its "is this chat idle" check; the slow delete happens later through
+  ``reclaim_released_claude_sessions``. ``None`` means the session stayed.
   """
-  now = time.time() if now is None else now
-  cutoff = now - max_age_days * 86400
-  removed = reclaimed = 0
-  stale = _stale_claude_sessions(data_dir, cutoff, in_use())
-  # Sizing every transcript takes a moment; ask again right before deleting,
-  # so a chat that started meanwhile keeps the session it is resuming.
-  started = in_use()
-  for transcript, side, size in stale:
-    if transcript.stem in started:
-      continue
+  def released(path: Path) -> Path:
+    return path.with_name(f".{path.name}{_RELEASED}{uuid.uuid4().hex}")
+
+  try:
+    moved = [transcript.rename(released(transcript))]
+  except OSError:
+    return None
+  if side is not None:
     try:
-      transcript.unlink()
-      if side is not None:
-        shutil.rmtree(side)
+      moved.append(side.rename(released(side)))
     except OSError:
+      pass  # The transcript is gone, so nothing can resume this folder.
+  return moved
+
+
+def reclaim_released_claude_sessions(data_dir: str | Path) -> int:
+  """Delete every session moved aside, including leftovers of an interrupted clear."""
+  root = Path(data_dir) / "cli-auth" / "claude" / "projects"
+  if root.is_symlink() or not root.is_dir():
+    return 0
+  freed = 0
+  for project in root.iterdir():
+    if project.is_symlink() or not project.is_dir():
       continue
-    removed += 1
-    reclaimed += size
-  codex = sweep_stale_provider_sessions(data_dir, now=now, max_age_days=max_age_days)
-  return {
-    "bytes": reclaimed + codex["reclaimed_bytes"] + codex.get("store_reclaimed_bytes", 0),
-    "sessions": removed + codex["removed_files"],
-    "codex_skipped": codex["status"] == "skipped_active",
-  }
+    for entry in project.iterdir():
+      if not (entry.name.startswith(".") and _RELEASED in entry.name):
+        continue
+      try:
+        if entry.is_dir() and not entry.is_symlink():
+          size = app_dir_usage(entry)
+          shutil.rmtree(entry)
+        else:
+          size = entry.lstat().st_size
+          entry.unlink()
+      except OSError:
+        continue
+      freed += size
+  return freed

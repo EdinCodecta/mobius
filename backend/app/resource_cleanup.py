@@ -45,19 +45,6 @@ def _alive_chat_ids() -> set[str]:
   return registry.all_alive_chat_ids()
 
 
-def _alive_chat_ids_from_thread() -> set[str]:
-  """The registry from a worker thread; a concurrent change makes it retry."""
-  from app.runner_registry import registry
-
-  for _ in range(5):
-    try:
-      return registry.all_alive_chat_ids()
-    except RuntimeError:
-      continue
-  # Nothing has been deleted yet; failing is safer than guessing.
-  raise RuntimeError("Could not read which chats are running.")
-
-
 def _still_in_use(chat_id: str) -> bool:
   """A late re-check from a worker thread; an unreadable registry counts as in use."""
   from app.runner_registry import registry
@@ -120,17 +107,75 @@ async def _preview_agent_sessions(data_dir: str) -> dict:
   return {"bytes": usage["bytes"], "items": usage["sessions"]}
 
 
+def _session_owners(session_ids: list[str]) -> dict[str, str]:
+  """The chat that can resume each provider session, when there is one."""
+  from app import models
+  from app.database import SessionLocal
+
+  if not session_ids:
+    return {}
+  with SessionLocal() as db:
+    linked = db.query(models.ChatSessionLink.session_id, models.ChatSessionLink.chat_id).filter(
+      models.ChatSessionLink.session_id.in_(session_ids),
+    ).all()
+    latest = db.query(models.Chat.session_id, models.Chat.id).filter(
+      models.Chat.session_id.in_(session_ids),
+    ).all()
+  return {session_id: chat_id for session_id, chat_id in [*linked, *latest]}
+
+
+def _chat_turn_running(chat_id: str) -> bool:
+  """A live or starting runner, or a durable running turn, for this chat.
+
+  Starts claim the registry before their run row exists, so checking both with
+  no await in between leaves no gap (the rule Chat work files rely on too).
+  """
+  from app.database import SessionLocal
+  from app.run_state import has_running_run
+  from app.runner_registry import registry
+
+  if registry.is_alive(chat_id):
+    return True
+  with SessionLocal() as db:
+    return has_running_run(db, chat_id)
+
+
 async def _clear_agent_sessions(data_dir: str) -> dict:
-  from app.provider_session_retention import clear_stale_sessions
+  from app.chat_queue import get_lock
+  from app.provider_session_retention import (
+    detach_claude_session,
+    reclaim_released_claude_sessions,
+    stale_claude_sessions,
+    sweep_stale_provider_sessions,
+  )
 
   # Clears run under the cleanup lock; a cancelled request must not release
   # it while its thread is still deleting, so each step settles first.
-  result = await run_settled(
-    clear_stale_sessions, data_dir, max_age_days=SESSION_KEEP_DAYS,
-    in_use=lambda: _sessions_in_use(_alive_chat_ids_from_thread()),
-  )
-  outcome = {"bytes": result["bytes"], "items": result["sessions"]}
-  if result["codex_skipped"]:
+  stale = await run_settled(stale_claude_sessions, data_dir, max_age_days=SESSION_KEEP_DAYS)
+  owners = await run_settled(_session_owners, [transcript.stem for transcript, _side, _size in stale])
+  by_chat: dict[str | None, list] = {}
+  for transcript, side, _size in stale:
+    by_chat.setdefault(owners.get(transcript.stem), []).append((transcript, side))
+  removed = 0
+  for chat_id, sessions in by_chat.items():
+    if chat_id is None:
+      # No chat can resume a session it is not linked to.
+      removed += sum(detach_claude_session(*session) is not None for session in sessions)
+      continue
+    # A starting turn claims this chat's run-start lock. With no await between
+    # the check and the moves, a turn either started first and keeps its
+    # sessions, or starts afterwards and finds none to resume.
+    async with get_lock(chat_id):
+      if _chat_turn_running(chat_id):
+        continue
+      removed += sum(detach_claude_session(*session) is not None for session in sessions)
+  freed = await run_settled(reclaim_released_claude_sessions, data_dir)
+  codex = await run_settled(sweep_stale_provider_sessions, data_dir, max_age_days=SESSION_KEEP_DAYS)
+  outcome = {
+    "bytes": freed + codex["reclaimed_bytes"] + codex.get("store_reclaimed_bytes", 0),
+    "items": removed + codex["removed_files"],
+  }
+  if codex["status"] == "skipped_active":
     outcome["note"] = "Codex is busy, so its old copies stay until it is idle."
   return outcome
 

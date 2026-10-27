@@ -12,12 +12,6 @@ export function formatBytes(bytes) {
   return `${Math.max(1, Math.round(bytes / 1e3))} KB`
 }
 
-/** Messages queued during a Stop are cleared, and Settings has no copy to resend. */
-export function removedQueuedSentence(count) {
-  const messages = count === 1 ? '1 queued message was' : `${count} queued messages were`
-  return `${messages} removed; type ${count === 1 ? 'it' : 'them'} again in the chat.`
-}
-
 /** A stored size that may be unmeasured or only partly measured. */
 export function storedSize({ bytes, incomplete }) {
   if (bytes == null) return { value: 'Not measured', note: 'yet' }

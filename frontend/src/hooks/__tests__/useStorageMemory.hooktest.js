@@ -54,13 +54,27 @@ test('cleanup uses its returned reading and clears an earlier measurement error'
   assert.equal(result.current.error, '')
 })
 
-test('a refused Stop preserves its exact reason and does not report or reload success', async t => {
+test('a failed Stop preserves its exact reason and does not report or reload success', async t => {
   const { result } = install(t)
   let reads = 0
   api.resources.overview = async () => { reads += 1; return snapshot }
-  api.chats.stop = async () => new Response(JSON.stringify({ detail: 'Cannot stop this turn now' }), { status: 409 })
+  api.chats.stop = async () => new Response(JSON.stringify({ detail: 'Cannot stop this turn now' }), { status: 500 })
   await assert.rejects(result.current.stopTurn('example'), /Cannot stop this turn now/)
   assert.equal(reads, 0)
+})
+
+test('Settings asks the server to refuse when typed messages are queued, then rereads', async t => {
+  const { result } = install(t)
+  let reads = 0
+  let body = null
+  api.resources.overview = async () => { reads += 1; return snapshot }
+  api.chats.stop = async (_chatId, options) => {
+    body = options
+    return new Response(JSON.stringify({ detail: 'This chat has queued messages. Stop it from the chat so they are kept.' }), { status: 409 })
+  }
+  await assert.rejects(result.current.stopTurn('example'), /Stop it from the chat/)
+  assert.deepEqual(body, { refuseIfQueued: true })
+  assert.equal(reads, 1)
 })
 
 test('successful Stop followed by a failed read leaves a visible stale-reading error', async t => {
@@ -81,10 +95,4 @@ test('a Stop that timed out is a failure to retry, never reported as stopped', a
   api.chats.stop = async () => new Response('{"stopped": false, "cleared_pending_cids": []}', { headers: { 'Content-Type': 'application/json' } })
   await assert.rejects(result.current.stopTurn('example'), /did not stop in time/)
   assert.equal(reads, 0)
-})
-
-test('a Stop reports queued messages it had to clear', async t => {
-  const { result } = install(t)
-  api.chats.stop = async () => new Response('{"stopped": true, "cleared_pending_cids": ["a", "b"]}', { headers: { 'Content-Type': 'application/json' } })
-  assert.deepEqual(await result.current.stopTurn('example'), { clearedQueued: 2 })
 })

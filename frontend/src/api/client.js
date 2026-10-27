@@ -1041,10 +1041,12 @@ export const api = {
       `/chats/${encodeURIComponent(chatId)}/goal-plan`,
       options,
     ),
-    stop: (chatId, options = {}) => apiFetch('/chat/stop', {
+    // refuseIfQueued: the server refuses instead of clearing typed queued
+    // messages, for callers that cannot resend them.
+    stop: (chatId, { refuseIfQueued = false, ...options } = {}) => apiFetch('/chat/stop', {
       ...options,
       method: 'POST',
-      body: JSON.stringify({ chat_id: chatId }),
+      body: JSON.stringify(refuseIfQueued ? { chat_id: chatId, refuse_if_queued: true } : { chat_id: chatId }),
     }),
     detail: (chatId, { limit, compact, anchor, signal, timeoutMs } = {}) => {
       const params = new URLSearchParams()

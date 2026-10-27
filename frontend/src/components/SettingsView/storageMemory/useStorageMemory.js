@@ -1,7 +1,6 @@
 /* Loads the Storage and Memory overview and runs its owner actions. */
 import { useCallback, useEffect, useState } from 'react'
 import { api, jsonOrThrow } from '../../../api/client.js'
-import { removedQueuedSentence } from './storageMemoryPresentation.js'
 
 export default function useStorageMemory({ active }) {
   const [overview, setOverview] = useState(null)
@@ -36,16 +35,20 @@ export default function useStorageMemory({ active }) {
     return result
   }, [])
 
+  // Settings cannot resend cleared messages, so the server refuses (409) when
+  // the owner has typed messages queued; a fresh reading then offers the chat.
   // A Stop that timed out answers 200 with stopped: false; that is a failure
   // the owner can retry, not a success.
   const stopTurn = useCallback(async (chatId) => {
-    const result = await jsonOrThrow(await api.chats.stop(chatId), 'Could not stop this turn')
-    const clearedQueued = result?.cleared_pending_cids?.length || 0
-    if (result?.stopped !== true) {
-      throw new Error(`The turn did not stop in time. Try again.${clearedQueued ? ` ${removedQueuedSentence(clearedQueued)}` : ''}`)
+    let result
+    try {
+      result = await jsonOrThrow(await api.chats.stop(chatId, { refuseIfQueued: true }), 'Could not stop this turn')
+    } catch (err) {
+      if (err?.status === 409) void load()
+      throw err
     }
+    if (result?.stopped !== true) throw new Error('The turn did not stop in time. Try again.')
     await load()
-    return { clearedQueued }
   }, [load])
 
   return {
