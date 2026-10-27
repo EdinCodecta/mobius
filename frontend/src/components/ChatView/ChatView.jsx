@@ -88,18 +88,13 @@ import { hasSendablePayload } from './composerSubmission.js'
 import AgentContextInspector from './AgentContextInspector.jsx'
 import ContextPanel from './ContextPanel.jsx'
 import SideQuestionCard from './SideQuestionCard.jsx'
+import SharedFolderUploadPrompt from './SharedFolderUploadPrompt.jsx'
+import useSharedFolderUploadGate from './useSharedFolderUploadGate.js'
 import useSideQuestion from './hooks/useSideQuestion.js'
 import ChatSummaryViewer from './ChatSummaryViewer.jsx'
 import ChatDiffViewer from './ChatDiffViewer.jsx'
 import ChatUsageInspector from './ChatUsageInspector.jsx'
 import ChatNetworkInspector from './ChatNetworkInspector.jsx'
-import {
-  contributionStartFailureOutcome,
-  finishContributionWork,
-  followupContributionWork,
-  prepareContributionWork,
-  updatesContributionWork,
-} from './chatContributionIntent.js'
 import ComposerPopover from './ComposerPopover.jsx'
 import BrainUsageButton from './BrainUsageButton.jsx'
 import ConnectionStatus from './ConnectionStatus.jsx'
@@ -111,14 +106,6 @@ import { currentChatAnnouncement, currentProgressGoal, goalAwaitsChanges, goalCo
 import AssistantReply from './AssistantReply.jsx'
 import ArchivedChatNotice from './ArchivedChatNotice.jsx'
 import QueuedMessages from './QueuedMessages.jsx'
-import {
-  chatChangesActionIsCurrent,
-  contributionsForChatQueryKey,
-  refreshChatChangesOverview,
-} from './chatChangesQueries.js'
-import {
-  reviewActionKey,
-} from './contributionReviewModel.js'
 import MsgContent from './MsgContent.jsx'
 import MessageMetaRow from './MessageMetaRow.jsx'
 import ActivityLineHeader from './ActivityLineHeader.jsx'
@@ -161,6 +148,7 @@ import {
 import {
   chatCacheEntryState,
   chatDetailCacheValue,
+  hasUnloadedNewerMessages,
   chatSnapshotMatchesRuntime,
   shouldRefetchTranscriptForRuntime,
   mergeRecentMessagesIntoLoadedWindow,
@@ -175,12 +163,9 @@ import {
   consumeChatSearchActivation,
   reconcileChatSearchActivation,
   subscribeChatSearchReveal,
+  retireMissingChatReveal,
 } from '../../lib/chatSearchReveal.js'
-import {
-  chatQuestionRevealFor,
-  consumeChatQuestionReveal,
-  subscribeChatQuestionReveal,
-} from '../../lib/chatQuestionReveal.js'
+import { useChatQuestionActivation, useChatQuestionReveal } from './hooks/useChatQuestionReveal.js'
 import {
   highlightSearchTerms,
 } from '../../lib/searchTermHighlight.js'
@@ -188,6 +173,7 @@ import { composerHistoryFromMessages } from './composerHistory.js'
 import { createQueuedEditOrder } from './queuedEditOrder.js'
 import { createFileDragHandlers } from './dragUpload.js'
 import {
+  detachedSendFailureMessage,
   isAmbiguousSendFailure,
   isModelSelectionRequiredFailure,
   isPendingQuestionSendFailure,
@@ -251,11 +237,13 @@ import {
 import { cidOf } from './messageIdentity.js'
 import {
   cidForSendAttempt,
+  mintSendCid,
   sendDraftIdentity,
 } from './sendAttemptIdentity.js'
 import {
   clearFailedSendAttempt,
   coordinateFailedSendRecovery,
+  sendAttemptIsDurable,
   settleFailedSendConfirmation,
 } from './sendAttemptRecovery.js'
 import {
@@ -448,7 +436,6 @@ export default function ChatView({
   onDisplayReady = null,
   artifactsAppId = null,
   onOpenArtifact = null,
-  focusPendingQuestion = false,
 }) {
   const queryClient = useQueryClient()
   const provisionalNewChat = !!newChatSession && !newChatSession.materialized
@@ -482,11 +469,12 @@ export default function ChatView({
   const searchRevealConsumed = searchActivationRef.current.consumedId === searchReveal?.id
   const searchRevealCleanupRef = useRef(() => {})
   useEffect(() => () => searchRevealCleanupRef.current(), [])
-  const [, setQuestionRevealVersion] = useState(0)
-  useEffect(() => subscribeChatQuestionReveal(chatId, () => {
-    setQuestionRevealVersion(version => version + 1)
-  }), [chatId])
-  const questionReveal = chatQuestionRevealFor(chatId)
+  const questionActivation = useChatQuestionActivation({
+    chatId, hidden, searchRevealId: searchReveal?.id,
+  })
+  const decisionQuestionId = questionActivation.reveal?.questionId
+  const decisionRevealId = questionActivation.reveal?.id
+  const decisionAnchorKey = decisionQuestionId ? `question:${decisionQuestionId}` : null
   const inputRef = useRef(null)
   const handleInternalNav = useCallback((url) => {
     onInternalNav?.(url)
@@ -523,9 +511,12 @@ export default function ChatView({
     messagesRef,
     offset,
     offsetRef,
+    hasUnloadedNewer,
+    setHasUnloadedNewer,
     applyMessagesToView,
     commitMessages,
   } = useTranscriptState({ cacheKey: transcriptCacheKey, cached, queryClient })
+  const loadingLatestRef = useRef(false)
   const messageHistory = useMemo(
     () => composerHistoryFromMessages(messages),
     [messages],
@@ -535,11 +526,11 @@ export default function ChatView({
   // saved coordinate; an incomplete restoration window stays hidden until the
   // anchor-addressed read repairs or retires that coordinate.
   const initialSavedAnchorKey = savedReadingAnchorKey(chatId)
-  const initialActivationAnchorKey = searchReveal?.anchorKey || initialSavedAnchorKey
+  const initialActivationAnchorKey = decisionAnchorKey || searchReveal?.anchorKey || initialSavedAnchorKey
   const initialCacheEntryState = chatCacheEntryState(
     cached,
     initialActivationAnchorKey,
-    !searchReveal && savedReadingAnchorHasNestedPart(chatId),
+    !decisionAnchorKey && !searchReveal && savedReadingAnchorHasNestedPart(chatId),
   )
   const [loading, setLoading] = useState(
     provisionalNewChat ? false : initialCacheEntryState === 'missing',
@@ -718,6 +709,14 @@ export default function ChatView({
     setDraftAside,
     takeDraftBack,
   } = useComposerDraftState({ chatId, hidden, inputRef })
+  const appendToComposer = useCallback((text) => {
+    const current = inputValueRef.current || ''
+    handleComposerInputChange(current.trim() ? `${current.trimEnd()}\n${text}` : text)
+  }, [handleComposerInputChange, inputValueRef])
+  // Big uploads wait here until the owner chooses to share the folder instead.
+  const uploadGate = useSharedFolderUploadGate({
+    chatId, addFiles: handleComposerAddFiles, appendToComposer,
+  })
   const composerDraftAside = useMemo(
     () => ({ set: setDraftAside, take: takeDraftBack }),
     [setDraftAside, takeDraftBack],
@@ -840,7 +839,7 @@ export default function ChatView({
 
   const showMessageMeta = useCallback((event, key) => {
     if (event.defaultPrevented) return
-    if (event.target.closest?.('button, a, input, textarea, select, [role="button"]')) return
+    if (event.target.closest?.('button, a, input, textarea, select, summary, [role="button"]')) return
     if (window.getSelection?.()?.toString()) return
     if (messageMetaTimerRef.current) clearTimeout(messageMetaTimerRef.current)
     setVisibleMessageMetaKey(key)
@@ -1168,7 +1167,7 @@ export default function ChatView({
     hidden,
     loadNonce,
     provisionalNewChat,
-    searchAnchorKey: searchReveal?.anchorKey,
+    searchAnchorKey: decisionAnchorKey || searchReveal?.anchorKey,
     searchRevealId: searchReveal?.id,
     loadingOlderRef: loadingOlder,
     pageRef: olderPageRef,
@@ -1466,7 +1465,7 @@ export default function ChatView({
           recentOffset: data.offset || 0,
           preserveLocalSuffix: true,
         })
-        commitMessages(refreshed.messages, refreshed.offset)
+        commitMessages(refreshed.messages, refreshed.offset, { total: data.total })
         setTranscriptReconcileSeq(seq => seq + 1)
       } else if (!staleSnapshot) {
         const refreshed = mergeRecentMessagesIntoLoadedWindow({
@@ -1475,7 +1474,7 @@ export default function ChatView({
           recentMessages: msgs,
           recentOffset: data.offset || 0,
         })
-        commitMessages(refreshed.messages, refreshed.offset)
+        commitMessages(refreshed.messages, refreshed.offset, { total: data.total })
         setTranscriptReconcileSeq(seq => seq + 1)
       }
       if (data.running) {
@@ -1592,6 +1591,15 @@ export default function ChatView({
     pendingQueue.pendingMessagesRef,
     reconcileFailedSendAttempt,
   ])
+  // A send that never took the draft (a reply's Try again) has no
+  // failed-attempt record to reconcile. Once the transcript shows its cid
+  // landed, its "couldn't confirm" banner is stale.
+  const settleDetachedSendConfirmation = useCallback(async (cid, banner) => {
+    await fetchMessages({ force: true, expectedFailedAttempt: null })
+    if (sendAttemptIsDurable({ cid }, messagesRef.current, pendingQueue.pendingMessagesRef.current)) {
+      setSendFailure(current => (current === banner ? null : current))
+    }
+  }, [fetchMessages, messagesRef, pendingQueue.pendingMessagesRef, setSendFailure])
 
   // Active-turn runtime reconciliation. The SSE stream is authoritative for
   // assistant output, but queued-message affordances depend on the durable
@@ -2508,7 +2516,7 @@ export default function ChatView({
     setChatInfo(activationCache?.chatInfo ?? null)
     setContinuationWait(activationCache?.continuationWait || null)
     const savedAnchorKey = savedReadingAnchorKey(chatId)
-    const searchAnchorKey = searchReveal?.anchorKey || null
+    const searchAnchorKey = decisionAnchorKey || searchReveal?.anchorKey || null
     // A search selection is a deliberate one-shot navigation, so it wins over
     // the stored reader coordinate for this activation. It never remaps or
     // retires that saved position.
@@ -2712,7 +2720,10 @@ export default function ChatView({
             retireSavedReadingPosition(chatId)
             anchorRetired = true
           } else {
-            clearChatSearchReveal(chatId, searchReveal?.id)
+            retireMissingChatReveal(chatId, {
+              decisionRevealId: decisionAnchorKey ? decisionRevealId : null,
+              searchRevealId: searchReveal?.id,
+            })
           }
         } else {
           // Rolling servers may omit the coverage bit. A row that is present
@@ -2728,6 +2739,7 @@ export default function ChatView({
         return
       }
       const msgs = detailCache.messages
+      setHasUnloadedNewer(hasUnloadedNewerMessages(detailCache))
       await reconcileFailedSendOutbox({
         visibleMessages: msgs,
         pendingMessages: runtime.pending_messages || [],
@@ -2977,6 +2989,8 @@ export default function ChatView({
     provisionalNewChat,
     searchReveal?.anchorKey,
     searchReveal?.id,
+    decisionAnchorKey,
+    decisionRevealId,
     commitRuntimeSnapshot,
     inspectRuntimeSnapshot,
     onRuntimeSettledIdle,
@@ -3191,6 +3205,11 @@ export default function ChatView({
     // a stale callback or failed-file-only draft must not close the keyboard,
     // claim scroll ownership, or freeze queue geometry when nothing will send.
     const usesComposerFiles = !Array.isArray(opts.attachments)
+    // A send the owner triggers from elsewhere (a reply's Try again) carries
+    // its own text and cid: the composer's draft is not its payload, so the
+    // send neither clears it, nor restores the sent text into it on failure,
+    // nor reads or writes the failed-attempt record that belongs to that draft.
+    const takesComposerDraft = opts.fromComposer !== false
     const composerFileSnapshot = usesComposerFiles ? [...pendingFiles] : []
     const attachments = Array.isArray(opts.attachments)
       ? opts.attachments
@@ -3207,7 +3226,7 @@ export default function ChatView({
 
     // Stop voice recognition so a late onresult doesn't refill input
     // after we clear it.
-    if (listeningRef.current) stopVoiceRef.current?.()
+    if (takesComposerDraft && listeningRef.current) stopVoiceRef.current?.()
 
     // Resolve the ONE direct/queued/steered pin rule BEFORE blurring the
     // textarea. Physical-tail geometry is authoritative; mode can lag a
@@ -3266,8 +3285,21 @@ export default function ChatView({
       if (usesComposerFiles) releaseFiles(composerFileSnapshot)
     }
     function restoreComposerAfterFailedSend() {
-      restoreComposerText(text, { preserveFailedAttempt: true })
+      if (takesComposerDraft) restoreComposerText(text, { preserveFailedAttempt: true })
       if (usesComposerFiles) restoreFiles(composerFileSnapshot)
+    }
+    function clearComposerFailedAttempt() {
+      if (takesComposerDraft) clearFailedAttempt()
+    }
+    function failureMessage(err) {
+      const online = getOnlineSnapshot()
+      return takesComposerDraft
+        ? sendFailureMessage(err, { online })
+        : detachedSendFailureMessage(err, { online })
+    }
+    function settleUnconfirmedSend(failedAttempt, banner) {
+      if (takesComposerDraft) void settleAmbiguousSendConfirmation(failedAttempt)
+      else void settleDetachedSendConfirmation(cid, banner)
     }
 
     function revealPendingQuestion() {
@@ -3283,13 +3315,13 @@ export default function ChatView({
     // server may have accepted it, an unchanged restored draft reuses that cid
     // and lets the backend's durable identity gate answer the ambiguity.
     const draftIdentity = sendDraftIdentity(chatId, text, attachments)
-    const cid = cidForSendAttempt({
-      failedAttempt: failedSendAttemptRef.current,
-      draftIdentity,
-      mintCid: () => ((typeof crypto !== 'undefined' && crypto.randomUUID)
-        ? crypto.randomUUID()
-        : `cid-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`),
-    })
+    const cid = takesComposerDraft
+      ? cidForSendAttempt({
+          failedAttempt: failedSendAttemptRef.current,
+          draftIdentity,
+          mintCid: mintSendCid,
+        })
+      : (opts.cid ?? mintSendCid())
 
     // ACTIVE-TURN PATH: every send gets one optimistic pending row immediately.
     // Ordinary sends present it in the queue; a direct steer reserves it in the
@@ -3328,9 +3360,9 @@ export default function ChatView({
         // its first presentation is the inline steering surface, never the tray.
         pendingQueue.reserveForSteer([cid])
       }
-      setComposerInput('')
+      if (takesComposerDraft) setComposerInput('')
       clearComposerFilesForSend()
-      if (inputRef.current) {
+      if (takesComposerDraft && inputRef.current) {
         resetComposerTextarea(inputRef.current)
         // Drop the multi-line `data-composer-tall` attribute so send/mic
         // re-center vertically. Without this, the pill stays in
@@ -3356,10 +3388,10 @@ export default function ChatView({
           pendingQueue.clearInFlight(cid)
           if (result.status === 'locally_settled') void fetchMessages({ force: true, authoritative: true })
           releaseComposerFilesAfterAccepted()
-          clearFailedAttempt()
+          clearComposerFailedAttempt()
           return true
         }
-        clearFailedAttempt()
+        clearComposerFailedAttempt()
         releaseComposerFilesAfterAccepted()
         // The active-turn decision can be stale while the first POST is still
         // settling. Any successfully accepted queue result still proves this
@@ -3554,28 +3586,27 @@ export default function ChatView({
         if (keepQueued) {
           pendingQueue.clearInFlight(queuedMsg.cid)
           releaseComposerFilesAfterAccepted()
-          clearFailedAttempt()
+          clearComposerFailedAttempt()
         } else {
           // Authoritative rejection: roll back optimistic state and restore
           // the user's editable draft.
           pendingQueue.cancelByCid(queuedMsg.cid)
           forgetSendIntent({ cid: queuedMsg.cid })
-          failedAttempt = {
-            cid,
-            draftIdentity,
-            text,
-            transportContent: text,
-            attachments: composerFileSnapshot,
+          if (takesComposerDraft) {
+            failedAttempt = {
+              cid,
+              draftIdentity,
+              text,
+              transportContent: text,
+              attachments: composerFileSnapshot,
+            }
+            rememberFailedAttempt(failedAttempt)
           }
-          if (failedAttempt) rememberFailedAttempt(failedAttempt)
           restoreComposerAfterFailedSend()
         }
-        setSendFailure(modelSelectionBlocked
-          ? null
-          : sendFailureMessage(err, { online: getOnlineSnapshot() }))
-        if (!keepQueued && isAmbiguousSendFailure(err)) {
-          void settleAmbiguousSendConfirmation(failedAttempt)
-        }
+        const banner = modelSelectionBlocked ? null : failureMessage(err)
+        setSendFailure(banner)
+        if (!keepQueued && isAmbiguousSendFailure(err)) settleUnconfirmedSend(failedAttempt, banner)
         if (modelSelectionBlocked) {
           setModelSelectionRequest(request => request + 1)
         } else if (pendingQuestionBlocked) {
@@ -3615,9 +3646,9 @@ export default function ChatView({
     const userMsg = { role: 'user', content: text, ts: Date.now(), cid, optimistic: true }
     if (attachments.length > 0) userMsg.attachments = attachments
     commitMessages(prev => [...prev, userMsg])
-    setComposerInput('')
+    if (takesComposerDraft) setComposerInput('')
     clearComposerFilesForSend()
-    if (inputRef.current) {
+    if (takesComposerDraft && inputRef.current) {
       resetComposerTextarea(inputRef.current)
       // Drop the multi-line `data-composer-tall` attribute — see queue-path
       // comment above for the full rationale.
@@ -3677,10 +3708,10 @@ export default function ChatView({
         sendingRef.current = false
         setServerRunningState(false)
         releaseComposerFilesAfterAccepted()
-        clearFailedAttempt()
+        clearComposerFailedAttempt()
         return true
       }
-      clearFailedAttempt()
+      clearComposerFailedAttempt()
       releaseComposerFilesAfterAccepted()
       // A resolved fresh-send transport is authoritative acceptance even when
       // it reports an idempotent duplicate or a queued row. Claim the first
@@ -3783,16 +3814,18 @@ export default function ChatView({
         const { optimistic: _optimistic, ...queuedUserMsg } = userMsg
         pendingQueue.add({ ...queuedUserMsg, queued: true }, { inFlight: false })
         releaseComposerFilesAfterAccepted()
-        clearFailedAttempt()
+        clearComposerFailedAttempt()
       } else {
-        failedAttempt = {
-          cid,
-          draftIdentity,
-          text,
-          transportContent: sendText,
-          attachments: composerFileSnapshot,
+        if (takesComposerDraft) {
+          failedAttempt = {
+            cid,
+            draftIdentity,
+            text,
+            transportContent: sendText,
+            attachments: composerFileSnapshot,
+          }
+          rememberFailedAttempt(failedAttempt)
         }
-        if (failedAttempt) rememberFailedAttempt(failedAttempt)
         restoreComposerAfterFailedSend()
         // Ambiguity recovery already verified reachability and safely replayed
         // this exact cid once. If even that acknowledgement was lost, keep the
@@ -3805,12 +3838,9 @@ export default function ChatView({
           return next
         })
       }
-      setSendFailure(modelSelectionBlocked
-        ? null
-        : sendFailureMessage(err, { online: getOnlineSnapshot() }))
-      if (!keepQueued && isAmbiguousSendFailure(err)) {
-        void settleAmbiguousSendConfirmation(failedAttempt)
-      }
+      const banner = modelSelectionBlocked ? null : failureMessage(err)
+      setSendFailure(banner)
+      if (!keepQueued && isAmbiguousSendFailure(err)) settleUnconfirmedSend(failedAttempt, banner)
       if (modelSelectionBlocked) {
         setModelSelectionRequest(request => request + 1)
         onStreamEndRef.current?.({ continues: false })
@@ -3845,6 +3875,7 @@ export default function ChatView({
     commitMessages,
     fetchMessages,
     settleAmbiguousSendConfirmation,
+    settleDetachedSendConfirmation,
     clearFiles,
     restoreFiles,
     releaseFiles,
@@ -4158,9 +4189,9 @@ export default function ChatView({
   })
 
   // Chat commands (slashCommands.mobiusChatCommand) run here and are never
-  // sent. Nothing typed is lost to a failure: /compact and /new leave the chat
-  // box only once their action has happened, and /btw moves its question into
-  // the side-question card, which offers Try again.
+  // sent. Nothing typed is lost to a failure: /compact leaves the chat box once
+  // the server starts compacting and /new once the new chat exists, and /btw
+  // moves its question into the side-question card, which offers Try again.
   function dispatchMobiusChatCommand(composed) {
     const command = mobiusChatCommand(composed)
     if (!command) return false
@@ -4293,6 +4324,20 @@ export default function ChatView({
     void doSend(input.trim(), { directSteer: true, ...composerSendFiles(fromHistory) })
       .finally(() => { submitSteerInFlightRef.current = false })
   }
+
+  const handleStopFollowing = useCallback(async (dependencyId) => {
+    const res = await apiFetch(`/chat-waits/dependencies/${encodeURIComponent(dependencyId)}/withdraw`, {
+      method: 'POST', timeoutMs: CHAT_FETCH_TIMEOUT_MS,
+    })
+    if (!res.ok) {
+      let data = null
+      try { data = await res.json() } catch { /* use the fallback below */ }
+      throw new Error(typeof data?.detail === 'string' ? data.detail : 'Could not stop following. Try again.')
+    }
+    // No optimistic deletion: the committed result/history and remaining Goal
+    // ownership arrive together, including Resume when no handoff remains.
+    await fetchMessages({ force: true, authoritative: true })
+  }, [fetchMessages])
 
   // Goal clearing is lifecycle control, never chat content. The rail confirms
   // first, then this exact-id request dismisses completed work without
@@ -5045,109 +5090,6 @@ export default function ChatView({
   // (The fast-forward identity/readiness gates are computed separately below.)
   const turnActive = sending || isStreaming || serverRunning
 
-  // Contribution cards and Changes share one semantic in-flight claim set. A
-  // click is claimed synchronously (before React can rerender), while the
-  // server's immutable work envelope owns durable idempotency across reloads,
-  // retries, and the second surface. The source chat never starts a provider
-  // turn for ordinary contribution preparation.
-  const contributionIntentClaimsRef = useRef(new Set())
-
-  const refreshContributionOverview = useCallback((appId) => (
-    refreshChatChangesOverview({
-      queryClient,
-      appId,
-      chatId,
-    })
-  ), [chatId, queryClient])
-
-  const startContributionWork = useCallback(async (
-    key, request, action = null, context = null,
-  ) => {
-    if (!key || contributionIntentClaimsRef.current.has(key)) {
-      return { kind: 'blocked', message: 'That contribution action is already starting.' }
-    }
-    contributionIntentClaimsRef.current.add(key)
-    try {
-      const appId = Number(context?.appId)
-      if (!appId) {
-        return { kind: 'blocked', message: 'The Contribute app is not available.' }
-      }
-      if (action) {
-        const overview = await refreshContributionOverview(appId)
-        // The endpoint repeats this freshness check against authoritative
-        // state. This fast client gate avoids even creating an attached-work
-        // request when the card visibly became obsolete during the tap.
-        if (overview && !chatChangesActionIsCurrent(overview, action)) {
-          return { kind: 'refreshed' }
-        }
-      }
-      const response = await api.contributions.startWork(appId, chatId, request)
-      if (!response.ok) {
-        // A stale/conflicting request is normal reconciliation, not a reason to
-        // wake the source agent. Refresh both contribution records and edits so
-        // the current action replaces it in place.
-        const failure = await response.json().catch(() => null)
-        const overview = await refreshContributionOverview(appId)
-        return contributionStartFailureOutcome({
-          status: response.status,
-          detail: failure?.detail,
-          actionChanged: Boolean(
-            action && overview && !chatChangesActionIsCurrent(overview, action)
-          ),
-        })
-      }
-      const payload = await response.json().catch(() => null)
-      if (payload?.work) {
-        queryClient.setQueryData(
-          contributionsForChatQueryKey(appId, chatId),
-          current => ({ ...(current || {}), work: payload.work }),
-        )
-      }
-      // Records/settlements may have changed during deterministic
-      // reconciliation before a helper was needed. Let the shared projection
-      // catch up without blocking the immediate visible work state above.
-      void refreshContributionOverview(appId)
-      return payload?.work || payload?.settled === true
-        ? { kind: 'accepted' }
-        : { kind: 'unavailable' }
-    } catch {
-      return { kind: 'unavailable' }
-    } finally {
-      contributionIntentClaimsRef.current.delete(key)
-    }
-  }, [chatId, queryClient, refreshContributionOverview])
-
-  const handlePrepareChatChanges = useCallback((revision = '', context = null) => {
-    return startContributionWork(
-      `prepare:${revision || 'current'}`,
-      prepareContributionWork(revision, context?.retryOf),
-      revision ? { kind: 'unsorted', revision } : null,
-      context,
-    )
-  }, [startContributionWork])
-
-  const handleContributeAll = useCallback((revision = '', context = null) => {
-    return startContributionWork(
-      `finish:${revision || 'current'}`,
-      finishContributionWork(revision, context?.retryOf),
-      revision ? { kind: 'workflow', revision } : null,
-      context,
-    )
-  }, [startContributionWork])
-
-  const handleCheckContributionUpdates = useCallback((records, context = null) => {
-    const revision = (Array.isArray(records) ? records : [records])
-      .map(record => reviewActionKey(record))
-      .sort()
-      .join('|')
-    return startContributionWork(
-      `updates:${revision || 'current'}`,
-      updatesContributionWork(records, revision, context?.retryOf),
-      revision ? { kind: 'records', recordKeys: revision.split('|') } : null,
-      context,
-    )
-  }, [startContributionWork])
-
   const handleOpenChanges = useCallback((returnFocus = null) => {
     changesReturnFocusRef.current = returnFocus || document.activeElement
     setShowChanges(true)
@@ -5162,45 +5104,6 @@ export default function ChatView({
     openRequestedChanges()
     return unsubscribe
   }, [chatId, embedded, hidden, handleOpenChanges])
-
-  const handleContributionFollowup = useCallback((record, context = null) => {
-    const revision = reviewActionKey(record)
-    return startContributionWork(
-      `followup:${revision}`,
-      followupContributionWork(record, revision, context?.retryOf),
-      revision ? { kind: 'records', recordKeys: [revision] } : null,
-      context,
-    )
-  }, [startContributionWork])
-
-  const handleStopContributionWork = useCallback(async (_work, context = null) => {
-    const appId = Number(context?.appId)
-    if (!appId) {
-      return { kind: 'blocked', message: 'The Contribute app is not available.' }
-    }
-    try {
-      const response = await api.contributions.stopWork(appId, chatId)
-      const payload = await response.json().catch(() => null)
-      if (!response.ok) {
-        return {
-          kind: response.status >= 400 && response.status < 500
-            ? 'blocked'
-            : 'unavailable',
-          message: String(payload?.detail || '').trim(),
-        }
-      }
-      if (payload?.work) {
-        queryClient.setQueryData(
-          contributionsForChatQueryKey(appId, chatId),
-          current => ({ ...(current || {}), work: payload.work }),
-        )
-      }
-      void refreshContributionOverview(appId)
-      return payload?.stopped === true ? true : { kind: 'refreshed' }
-    } catch {
-      return { kind: 'unavailable' }
-    }
-  }, [chatId, queryClient, refreshContributionOverview])
 
   const chatProvider = chatInfo?.provider || null
   const wasTurnActiveRef = useRef(turnActive)
@@ -5812,17 +5715,13 @@ export default function ChatView({
     scrollRef, hasPendingResume, resumeCardEl,
   )
   const questionNudgeShown = hasPendingQuestion && pendingCardOffscreen
-  const questionRevealConsumedRef = useRef(null)
-  useLayoutEffect(() => {
-    const requestId = questionReveal?.id ?? (focusPendingQuestion ? 'deep-link' : null)
-    if (!requestId || questionRevealConsumedRef.current === requestId) return
-    if (!hasPendingQuestion || !pendingQuestionEl) return
-    questionRevealConsumedRef.current = requestId
-    revealPendingQuestion(pendingQuestionEl)
-    if (questionReveal?.id != null) consumeChatQuestionReveal(chatId, questionReveal.id)
-  }, [chatId, focusPendingQuestion, hasPendingQuestion, pendingQuestionEl, questionReveal, revealPendingQuestion])
+  useChatQuestionReveal({
+    activation: questionActivation, hidden, displayReady, rootRef: scrollRef,
+    pendingElement: hasPendingQuestion ? pendingQuestionEl : null,
+    revealElement: revealPendingQuestion, contentVersion: messages,
+  })
   const resumeNudgeShown = hasPendingResume && resumeCardOffscreen
-  const jumpToLatestVisible = jumpToLatestShown({
+  const jumpToLatestVisible = hasUnloadedNewer || jumpToLatestShown({
     // A send-owned PIN_USER_MSG is the expected latest-turn location, not a
     // reader escape. Its keyboard-close reachability floor can temporarily
     // extend the physical tail before the viewport grows, so suppress the
@@ -5832,6 +5731,34 @@ export default function ChatView({
     questionNudgeShown,
     resumeNudgeShown,
   })
+  const followLatestIncludingUnloaded = useCallback(async () => {
+    if (!hasUnloadedNewer) {
+      followLatest()
+      return
+    }
+    if (loadingLatestRef.current) return
+    loadingLatestRef.current = true
+    const generation = fetchGenRef.current
+    try {
+      const response = await apiFetch(`/chats/${chatId}?limit=20&compact=1`, {
+        timeoutMs: CHAT_FETCH_TIMEOUT_MS,
+      })
+      if (!response.ok) return
+      const latest = chatDetailCacheValue(await response.json())
+      if (chatIdStaleRef.current || fetchGenRef.current !== generation
+          || !latest.restorationWindowComplete) return
+      queryClient.setQueryData(chatMessagesQueryKey(chatId), latest)
+      flushSync(() => {
+        applyMessagesToView(latest.messages, latest.offset)
+        setHasUnloadedNewer(false)
+      })
+      followLatest()
+    } catch {
+      // Keep the control available for retry; never label the old window latest.
+    } finally {
+      loadingLatestRef.current = false
+    }
+  }, [hasUnloadedNewer, followLatest, chatId, queryClient, applyMessagesToView])
   const offscreenControlsVisible = questionNudgeShown
     || resumeNudgeShown
     || jumpToLatestVisible
@@ -6013,9 +5940,14 @@ export default function ChatView({
         actionError: goalResumeState.error,
       } : {}),
       icon: <Flag width={14} height={14} aria-hidden="true" />,
-      ...(goalPresentation?.plan || goalPresentation?.hold_reason || continuationHandoff
+      ...(goalPresentation?.plan || goalPresentation?.hold_reason || continuationHandoff || goalPresentation?.dependencies?.length || goalPresentation?.dependency_history?.length || goalPresentation?.needed_by?.length
         ? { details: <GoalPlanDetails
             plan={goalPresentation?.plan}
+            dependencies={goalPresentation?.dependencies}
+            onStopFollowing={!embedded ? handleStopFollowing : undefined}
+            dependencyHistory={goalPresentation?.dependency_history}
+            neededBy={goalPresentation?.needed_by}
+            onInternalNav={internalNav}
             holdReason={continuationHandoff
               ? `${continuationHandoff.description} ${continuationHandoff.boundary}`
               : goalPresentation?.hold_reason}
@@ -6079,7 +6011,7 @@ export default function ChatView({
     getDepth: () => fileDragDepthRef.current,
     setDepth: depth => { fileDragDepthRef.current = depth },
     setActive: setFileDropActive,
-    onFiles: handleComposerAddFiles,
+    onFiles: uploadGate.addFiles,
   })
   const reservedSteerMessage = combineOwnerMessagesForDisplay(
     pendingQueue.steerReservedMessages,
@@ -6088,6 +6020,21 @@ export default function ChatView({
   // A DB refresh may commit the steer before its cut reaches this socket.
   // Keep the identity-owned active row in its transcript slot through that
   // handoff; moving it to the tail would paint the owner message above it.
+  // Replies are memoized; hand them one stable Try again that sends through
+  // the latest doSend without touching the owner's draft. A failed attempt
+  // leaves its reply the latest, and tapping again there reuses its cid: if
+  // the unconfirmed send did land, the server answers it as a duplicate
+  // instead of starting a second turn.
+  const doSendRef = useRef(doSend)
+  doSendRef.current = doSend
+  const failedTryAgainRef = useRef(null)
+  const handleTryAgain = useCallback(async (replyKey) => {
+    const failed = failedTryAgainRef.current
+    const cid = failed?.replyKey === replyKey ? failed.cid : mintSendCid()
+    const sent = await doSendRef.current('Try again', { attachments: [], fromComposer: false, cid })
+    failedTryAgainRef.current = sent ? null : { replyKey, cid }
+    return sent
+  }, [])
   const renderAssistantReply = group => {
     if (!group) return null
     const activeIndex = showActiveAssistantSurface
@@ -6132,6 +6079,12 @@ export default function ChatView({
       resumeCardRef={resumeCardRef}
       isStreaming={continuingRun || (active && activeAssistantIsStreaming)}
       isLastMsg={last}
+      // The latest reply keeps its actions in view; earlier ones reveal on demand.
+      metaVisible={last || visibleMessageMetaKey === group.rows[0].key}
+      onRevealMeta={showMessageMeta}
+      // A queued message is already the next turn; Try again would only queue behind it.
+      onTryAgain={last && !turnActive && !hasPendingQuestion
+        && pendingQueue.pendingMessages.length === 0 ? handleTryAgain : undefined}
       suppressedQuestionKeys={showActiveAssistantSurface ? streamItemQuestionKeys : null}
       sealedSteerAssistant={active ? sealedSteerAssistant : sealedAssistantBeforeSteer(messages, group.start)}
     />
@@ -6205,12 +6158,6 @@ export default function ChatView({
           chatId={chatId}
           initialEntries={chatDiffEntries}
           onClose={() => setShowChanges(false)}
-          onPrepareChanges={handlePrepareChatChanges}
-          onContributeAll={handleContributeAll}
-          onCheckUpdates={handleCheckContributionUpdates}
-          onOpenApp={onOpenApp}
-          onContinueInChat={handleContributionFollowup}
-          onStopWork={handleStopContributionWork}
           returnFocusRef={changesReturnFocusRef}
         />
       )}
@@ -6362,7 +6309,7 @@ export default function ChatView({
               />
               <MessageMetaRow
                 timestamp={ownerUserMessage ? renderedMsg.ts : null}
-                copyText={copyText}
+                copy={copyText ? () => ({ plainText: copyText }) : null}
                 visible={visibleMessageMetaKey === dataKey}
               />
             </li>
@@ -6422,7 +6369,7 @@ export default function ChatView({
                 />
                 <MessageMetaRow
                   timestamp={reservedSteerMessage.ts || null}
-                  copyText={copyText}
+                  copy={copyText ? () => ({ plainText: copyText }) : null}
                   visible={visibleMessageMetaKey === dataKey}
                 />
               </li>
@@ -6457,9 +6404,9 @@ export default function ChatView({
             owner must act on, such as "Connection lost — Retry", earns a place
             in this footer. */}
         <div className="chat__floating-actions">
-          {/* Only short-lived navigation nudges may float over the transcript.
-              Contribution state lives in Changes so it can never cover the
-              composer or an unanswered question. */}
+          {/* Only short-lived navigation nudges may float over the transcript,
+              so nothing persistent can cover the composer or an unanswered
+              question. */}
           {connectionError !== 'disconnected'
             && offscreenControlsVisible && (
             <div className="chat__floating-transients">
@@ -6511,7 +6458,7 @@ export default function ChatView({
                       className="chat__jump-latest"
                       aria-label="Jump to the latest message"
                       title="Jump to latest"
-                      {...composerAdjacentActionProps(followLatest, {
+                      {...composerAdjacentActionProps(followLatestIncludingUnloaded, {
                         activateOnTouchEnd: true,
                       })}
                     >
@@ -6570,6 +6517,12 @@ export default function ChatView({
           onClose={sideQuestions.close}
           onRetry={sideQuestions.retry}
         />
+        <SharedFolderUploadPrompt
+          pending={uploadGate.pending}
+          onUploadAnyway={uploadGate.uploadAnyway}
+          onCancel={uploadGate.cancel}
+          onShared={uploadGate.folderShared}
+        />
         <ChatInputBar
           chatId={chatId}
           input={input}
@@ -6604,7 +6557,7 @@ export default function ChatView({
           }
           questionBlocked={hasPendingQuestion && !localAnswerIntents.some(record => record.body?.question_id === answerableQuestionId)}
           pendingFiles={pendingFiles}
-          onAddFiles={handleComposerAddFiles}
+          onAddFiles={uploadGate.addFiles}
           onRemoveFile={handleComposerRemoveFile}
           attachTriggerRef={attachTriggerRef}
           messageHistory={messageHistory}

@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { serveClipboardWrite } from '../../components/AppCanvas/appFrameProtocol.js'
+import { navPushOutcome, serveClipboardWrite } from '../../components/AppCanvas/appFrameProtocol.js'
 
 test('clipboard host returns only the attributed write outcome', async () => {
   const replies = []
@@ -27,4 +27,16 @@ test('clipboard host ignores unrelated messages', () => {
     source: null,
     writeText: async () => true,
   }), false)
+})
+
+test('a nav-push is acknowledged only by a visible canvas with a history owner', () => {
+  const message = { type: 'moebius:nav-push', requestId: 'r1', label: 'Detail', reversible: 'yes', userActivated: true }
+  const calls = []
+  const onNavPush = (appId, meta) => { calls.push([appId, meta]); return true }
+  assert.equal(navPushOutcome({ visible: true, onNavPush, appId: 7, message }), true)
+  assert.deepEqual(calls, [[7, { requestId: 'r1', label: 'Detail', reversible: false, userActivated: true }]])
+  assert.equal(navPushOutcome({ visible: false, onNavPush, appId: 7, message }), false)
+  // An embedded transcript view has no history owner: reject, never acknowledge.
+  assert.equal(navPushOutcome({ visible: true, onNavPush: undefined, appId: 7, message }), false)
+  assert.equal(calls.length, 1)
 })

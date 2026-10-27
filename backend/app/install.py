@@ -36,9 +36,10 @@ import socket
 import subprocess
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import AsyncIterator, Callable, Mapping, Sequence
 from urllib.parse import quote, urljoin, urlparse
 
 import httpx
@@ -59,7 +60,7 @@ from app import (
   models,
   settled,
 )
-from app import app_cron
+from app import app_consent, app_cron
 from app.build_admission import BuildLeaseUnavailable
 from app.app_capabilities import contract_and_digest
 from app.app_compile_contract import RolldownStalled
@@ -232,6 +233,18 @@ _SYSTEM_PROMPT_MAX_BYTES = _CONTRACT_SYSTEM_PROMPT_MAX_BYTES
 _MERGED_NON_SOURCE = managed_paths.MERGED_NON_SOURCE
 
 _HTTP_TIMEOUT = 15.0
+_SIZE_LOOKUP_CONCURRENCY = 16
+# The download size is optional metadata on the preview that gates Install, so
+# a host that stalls HEAD requests costs this long at most, not a timeout per
+# batch of lookups.
+_SIZE_LOOKUP_DEADLINE = 3.0
+# Reopening a listing sizes the same files again. Remembering each size for a
+# few minutes keeps that off the request budget installs share, at the cost of
+# a file edited meanwhile showing its earlier size until the TTL ends.
+_FILE_SIZE_TTL = 600.0
+_FILE_SIZE_CACHE_MAX = 512
+# URL -> (monotonic time sized, bytes). Insertion order is oldest first.
+_FILE_SIZE_CACHE: dict[str, tuple[float, int]] = {}
 
 # Tests override this module attribute to prevent production cron mutation.
 CRON_SCAFFOLD = app_cron.BAKED_CRON_SCAFFOLD
@@ -651,10 +664,34 @@ def pending_conflict_update_matches_app(
   )
 
 
-async def _http_get(
-  client: httpx.AsyncClient, url: str, max_bytes: int, _hops: int = 0,
-) -> bytes:
-  """GETs a URL with SSRF validation + manual redirect handling.
+def _redirect_target(url: str, r: httpx.Response) -> str | None:
+  """The next hop of a redirect, or None for a usable response.
+
+  Error statuses raise here, so every caller refuses them the same way.
+  """
+  if r.status_code in (301, 302, 303, 307, 308):
+    loc = r.headers.get("Location")
+    if not loc:
+      raise HTTPException(502, f"Redirect from {url} missing Location header.")
+    return urljoin(url, loc)
+  if r.status_code == 404:
+    raise HTTPException(404, f"Not found: {url}")
+  if _is_rate_limited(url, r.status_code, r.headers):
+    raise _rate_limit_error(url, r.headers)
+  if r.status_code >= 400:
+    raise HTTPException(502, f"Upstream {r.status_code} fetching {url}")
+  return None
+
+
+@asynccontextmanager
+async def _validated_response(
+  client: httpx.AsyncClient,
+  url: str,
+  method: str = "GET",
+  headers: Mapping[str, str] | None = None,
+  _hops: int = 0,
+) -> AsyncIterator[httpx.Response]:
+  """Open one request with SSRF validation + manual redirect handling.
 
   Each hop is re-validated through `_validate_url_safe` so a 302 to
   a private IP gets rejected just like a direct request to one — and the
@@ -664,11 +701,7 @@ async def _http_get(
   closing the DNS-rebinding gap where httpx would re-resolve at connect time.
   `follow_redirects` is False on the client; we walk the chain ourselves with a
   hop count cap, resolving each Location against the original (hostname) URL.
-
-  Reads the body as a stream and aborts as soon as the running byte
-  total crosses `max_bytes` — `r.content` would buffer the full
-  response before the cap fires, so a hostile upstream could force
-  us to allocate `max_bytes` × N pending requests in memory.
+  Yields the final response with its body still unread.
   """
   if _hops > _MAX_REDIRECTS:
     raise HTTPException(
@@ -676,52 +709,115 @@ async def _http_get(
     )
   # getaddrinfo blocks; resolve off the event loop.
   pinned_url, host_header, sni_host = await asyncio.to_thread(_validate_url_safe, url)
+  next_url = None
   try:
     async with client.stream(
-      "GET", pinned_url,
-      headers={"Host": host_header},
+      method, pinned_url,
+      headers={**(headers or {}), "Host": host_header},
       # httpcore/anyio expect a hostname string here. Passing bytes worked with
       # older httpx but now reaches idna2008_resolve(), which calls `.encode()`
       # and crashes every real HTTPS install/update before the request is sent.
       extensions={"sni_hostname": sni_host},
     ) as r:
-      # Handle redirects + error statuses with the stream closed
-      # quickly so we don't hold a connection while recursing.
-      if r.status_code in (301, 302, 303, 307, 308):
-        loc = r.headers.get("Location")
-        if not loc:
-          raise HTTPException(
-            502, f"Redirect from {url} missing Location header.",
-          )
-        next_url = urljoin(url, loc)
-      else:
-        next_url = None
-        if r.status_code == 404:
-          raise HTTPException(404, f"Not found: {url}")
-        if _is_rate_limited(url, r.status_code, r.headers):
-          raise _rate_limit_error(url, r.headers)
-        if r.status_code >= 400:
-          raise HTTPException(
-            502, f"Upstream {r.status_code} fetching {url}",
-          )
-        chunks: list[bytes] = []
-        total = 0
-        async for chunk in r.aiter_bytes():
-          total += len(chunk)
-          if total > max_bytes:
-            raise HTTPException(
-              413,
-              f"{url} exceeds {max_bytes} byte cap ({total}+ received).",
-            )
-          chunks.append(chunk)
-        return b"".join(chunks)
+      next_url = _redirect_target(url, r)
+      if next_url is None:
+        yield r
   except httpx.TimeoutException:
     raise HTTPException(504, f"Timeout fetching {url}")
   except httpx.RequestError as exc:
     raise HTTPException(502, f"Failed to fetch {url}: {exc}")
-  # Recurse outside the stream context so the previous connection is
+  if next_url is None:
+    return
+  # Follow outside the stream context so the previous connection is
   # already released by the time we open the next one.
-  return await _http_get(client, next_url, max_bytes, _hops + 1)
+  async with _validated_response(
+    client, next_url, method, headers, _hops + 1,
+  ) as r:
+    yield r
+
+
+async def _http_get(client: httpx.AsyncClient, url: str, max_bytes: int) -> bytes:
+  """GETs a URL through `_validated_response`.
+
+  Reads the body as a stream and aborts as soon as the running byte
+  total crosses `max_bytes` — `r.content` would buffer the full
+  response before the cap fires, so a hostile upstream could force
+  us to allocate `max_bytes` × N pending requests in memory.
+  """
+  async with _validated_response(client, url) as r:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in r.aiter_bytes():
+      total += len(chunk)
+      if total > max_bytes:
+        raise HTTPException(
+          413,
+          f"{url} exceeds {max_bytes} byte cap ({total}+ received).",
+        )
+      chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _remember_file_size(url: str, size: int) -> None:
+  _FILE_SIZE_CACHE.pop(url, None)  # a refreshed entry is the newest again
+  _FILE_SIZE_CACHE[url] = (time.monotonic(), size)
+  if len(_FILE_SIZE_CACHE) > _FILE_SIZE_CACHE_MAX:
+    del _FILE_SIZE_CACHE[next(iter(_FILE_SIZE_CACHE))]
+
+
+async def _remote_file_size(client: httpx.AsyncClient, url: str) -> int | None:
+  """A remote file's size from its response headers, or None when unknown.
+
+  Asks for `identity` encoding: httpx advertises gzip by default, and a
+  compressed length is not the number of bytes install writes. A known size is
+  reused for `_FILE_SIZE_TTL`; an unknown one is looked up again next time.
+  """
+  cached = _FILE_SIZE_CACHE.get(url)
+  if cached is not None and time.monotonic() - cached[0] < _FILE_SIZE_TTL:
+    return cached[1]
+  try:
+    async with _validated_response(
+      client, url, "HEAD", {"Accept-Encoding": "identity"},
+    ) as r:
+      length = r.headers.get("Content-Length", "")
+      encoding = r.headers.get("Content-Encoding", "identity")
+  except HTTPException:
+    return None
+  if encoding != "identity" or not length.isdigit():
+    return None
+  size = int(length)
+  _remember_file_size(url, size)
+  return size
+
+
+async def package_download_bytes(manifest: Mapping, raw_base: str) -> int | None:
+  """Bytes install would download for `manifest`, or None if any is unknown.
+
+  The pre-install review shows this, so it reads response headers only and
+  never fetches app code; install still fetches and binds the bytes itself.
+  The sum is `package_bytes`, the same count the package limit uses. Lookups
+  still running after `_SIZE_LOOKUP_DEADLINE` are cancelled and the size is
+  unknown.
+  """
+  paths = sorted(set(package_input_paths(manifest)))
+  # A manifest may declare many files; keep the burst on one host small.
+  gate = asyncio.Semaphore(_SIZE_LOOKUP_CONCURRENCY)
+
+  async with pinned_client(timeout=_HTTP_TIMEOUT) as client:
+    async def size_of(rel: str) -> int | None:
+      async with gate:
+        return await _remote_file_size(client, raw_base + quote(rel))
+
+    try:
+      found = await asyncio.wait_for(
+        asyncio.gather(*map(size_of, paths)), _SIZE_LOOKUP_DEADLINE,
+      )
+    except TimeoutError:
+      return None
+  sizes = dict(zip(paths, found))
+  if None in sizes.values():
+    return None
+  return package_bytes(manifest, sizes.__getitem__)
 
 
 class _PackageDownload:
@@ -2468,6 +2564,7 @@ def _require_reviewed_capabilities(
       "manifest": manifest,
       "capability_contract": capability_contract,
       "capability_digest": capability_digest,
+      "access_rows": app_consent.rows_for_manifest(manifest, capability_contract),
     })
 
 
@@ -2949,6 +3046,7 @@ async def _run_post_commit_effects(
   mode: str,
   candidate: InstallCandidate,
   warnings: list[str],
+  was_usable: bool = False,
 ) -> None:
   """Converge cron, skills, and initialization after durability.
 
@@ -2991,6 +3089,28 @@ async def _run_post_commit_effects(
   except Exception as exc:
     log.exception("install: skill sync failed post-commit")
     warnings.append(f"skills: sync failed — {exc!r}")
+  if mode == "update" and was_usable and app_consent.dormant(app):
+    # Only the owner's answer re-enables it, and an app they rarely open would
+    # otherwise stop without a word.
+    app_id, app_name = app.id, app.name
+    try:
+      from app import push
+      from app.database import SessionLocal
+
+      # Its own session: the notification's commit must not expire the
+      # install's app row, which the caller still reads.
+      with SessionLocal() as notify_db:
+        owner = notify_db.query(models.Owner).first()
+        if owner is not None:
+          push.notify_owner(
+            notify_db, owner.id, title=f"{app_name} needs your approval",
+            body="An update asks for more access. Open the app to review it.",
+            source_type="app", source_id=str(app_id),
+            target=f"/shell/?app={app_id}", tag=f"app-consent-{app_id}",
+          )
+    except Exception as exc:
+      log.exception("install: approval notification failed post-commit")
+      warnings.append(f"notification: not sent — {exc!r}")
 
   if (
     mode == "install"
@@ -2998,6 +3118,8 @@ async def _run_post_commit_effects(
     and schedule.get("initialize_on_install") is True
     and job_name
     and app.source_dir
+    # A dormant app's first run starts when the owner accepts (routes/app_consent).
+    and not app_consent.dormant(app)
   ):
     try:
       from app.app_jobs import launch_app_job
@@ -3174,6 +3296,15 @@ async def _prepare_app_row(
     system_prompt_file=manifest.get("system_prompt") or None,
     capability_contract=capability_contract,
     project_templates_json=manifest.get("project_templates") or None,
+    # Apps that ship with the platform are accepted with it; every other
+    # Store install waits for the owner's first-open answer.
+    accepted_consent=(
+      app_consent.platform_acceptance(
+        capability_contract,
+        project_builders=bool(manifest.get("project_templates")),
+      )
+      if source == "bootstrap" else None
+    ),
   )
   db.add(app)
   db.flush()
@@ -3865,6 +3996,12 @@ async def _install_candidate(
   existing = target.existing
   revive_after_commit = bool(existing and existing.deleted_at is not None)
   mode = target.mode
+  # Whether the app could run before this install changes its contract: an
+  # update that stops it is one the owner must be told about.
+  was_usable = (
+    existing is not None and existing.deleted_at is None
+    and not app_consent.dormant(existing)
+  )
   canonical_manifest_url = target.canonical_manifest_url
 
   warnings: list[str] = []
@@ -4673,6 +4810,7 @@ async def _install_candidate(
     mode=mode,
     candidate=candidate,
     warnings=warnings,
+    was_usable=was_usable,
   )
   # Only now is the update fully converged. Until the receipt goes, a retry
   # reruns this whole install, post-commit effects included.

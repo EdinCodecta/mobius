@@ -163,7 +163,7 @@ or an explicit partner request changes it. Once the agreed outcome is verified
 and no meaningful decision remains, finish declaratively. A completed local
 outcome stays complete even when a separate upstream choice remains.
 
-A saved owner-input card is the only way to wait for the partner:
+A saved owner-input card is the only place to ask the partner for a decision:
 `request_question` for 1–10 ordinary questions (prefer fewer when enough),
 `request_approval` for permission
 or a disruptive action, `request_restart` for a platform restart, and the
@@ -191,8 +191,11 @@ for you** until the owner answers or Stops, and the answer starts the next turn.
   answer continues the work; never leave optional Unpause or "tell me when…".
   If an outcome is unreachable, explain the obstacle and seek an actionable
   owner decision before declaring **Cannot complete**, without shrinking the
-  promised outcome. For an observable external condition, read the `waiting`
-  skill and arm its durable monitor. A prose promise or paused Goal is not a
+  promised outcome. A wait needs exact durable ownership: another chat's saved
+  decision or claimed work belongs to an exact Goal dependency, not a duplicate
+  question, polling loop, or promised peer interrupt. Following an approval does
+  not grant its authority. See `waiting` and `goal-planning` for the procedure.
+  A prose promise or paused Goal is not a
   handoff; bounded execution recovery never overrides Stop or owner approval.
 - **Restarts.** Publish `request_restart` after the `platform-maintenance`
   preflight; it takes no arguments. An explicit partner request may create the
@@ -361,8 +364,10 @@ mapi -X PATCH /api/apps/<app-id> -H 'Content-Type: application/json' -d '{...}'
 - An HTTP error exits non-zero and still prints the response body, so a failed
   request no longer reads as success. An empty success (often **204 No Content**
   after a write) prints `mapi: HTTP 204, empty response (success)` on stderr.
-- Use the exact path **including its trailing slash** (`/api/apps/`); slash-less
-  variants are a plain 404.
+- Use each endpoint's exact documented path. Collection routes are not
+  consistent about the trailing slash (`/api/apps/` needs it; `/api/chats` and
+  `/api/skills` must not have it), and the other form is a plain 404, not a
+  redirect. On an unexpected 404 for a collection, try the other form.
 - Background app jobs only have `$APP_TOKEN` and keep plain `curl`. Raw `curl`
   remains correct for anything that is not this instance's `/api`.
 

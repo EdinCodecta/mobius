@@ -34,6 +34,12 @@ required by the advanced feature below. An installable app starts as a
 root-level repository package and is installed from its raw `mobius.json` URL;
 an ordinary local app stays on the quickstart path.
 
+A Store-installed app is dormant until the owner accepts what it asks for in
+one popup the first time they open it. Declare what the app needs in
+`mobius.json` as before; neither you nor the app can approve it. The rows and
+their wording are defined once by the platform (`CAPABILITIES.md`, "First-open
+consent for Store apps").
+
 ### Accepting a local chat-history scope for an installed app
 
 Editing and applying a Store-installed app's source never silently widens its
@@ -186,9 +192,8 @@ of the app's source, so it is reviewed, versioned and published with the code:
   (turning it upright first, since the orientation tag goes with the rest,
   and keeping its colour profile;
   the same works for PNG and WebP without `quality`), or remove it if
-  nothing uses it. A bare PNG `tIME` timestamp and a PNG text chunk keyed
-  exactly `Software` (the tool that wrote it) are allowed; any other text key
-  (`Author`, `Comment`, `Description`, XMP...) is not.
+  nothing uses it. A bare PNG `tIME` timestamp is allowed; any PNG text
+  chunk is not, whatever its key (`Software`, `Author`, `Comment`, XMP...).
 - Screenshots must be truthful and private: capture the app's real UI in an
   empty, demo, or fixture state, never the owner's own records, names,
   accounts, chats, or machines. Build a small demo state if the app has none.
@@ -411,6 +416,189 @@ line, which the tool's service returns in its result text (the shell reads that
 line whether the provider reports the result as text or as the JSON of an MCP
 result object). Everything else about the receipt is identical.
 
+### App blocks in assistant replies
+
+An app's skill or fragment can ask the agent to show something the app owns as
+a fenced `mobius-app` JSON block in its reply. Only the owner's assistant
+replies render it; owner messages, peer notes, helper summaries, documents,
+errors and every other Markdown surface keep it as code. The block is a
+conversation-written snapshot and a destination, never authority: opening it
+starts nothing and approves nothing.
+
+````text
+```mobius-app
+{"app":"example","intent":"open:item-42","title":"Item 42",
+ "facts":[{"label":"Source","value":"owner/repo","href":"https://github.com/owner/repo"}],
+ "badges":[{"label":"Ready","tone":"success"}]}
+```
+````
+
+Lengths count JavaScript characters (UTF-16 code units); the whole JSON is at
+most 16384.
+
+- Required: `app` (installed slug), `intent` and `title` (1-240). An intent is
+  `kind:payload`: `kind` is 1-32 of `a-z`, `0-9`, `-` starting with a letter;
+  `payload` is 1-256 printable ASCII characters with no whitespace. Invalid
+  JSON or a bad required field leaves an ordinary code block.
+- Optional: up to 8 `facts` `{label (80), value (240), href?}`; up to 3
+  `badges` `{label (40), tone}` with tone `success|attention|danger|accent|neutral`;
+  up to 12 `items` `{title, intent, facts? (up to 4), badges?, action?}`;
+  `action` `{label (40), intent}`; `inline` (default `true`; `false` is a
+  link-only snapshot without actions); `expand` (default `true`; only the
+  JSON boolean `false` turns it off: no "Show details here" and no inline
+  app view ever, and an action opens the app at its intent like a link;
+  passive sessions and their Confirm are unaffected. Use it when every item
+  already links to its own entry in the app); `expand_label` (40); `height` (240-640,
+  default 480; a non-number is ignored). `href` is kept only for an
+  uncredentialed `https:` URL. Text is validated, never truncated: a field
+  over its limit (in parentheses) is invalid, so its fact, badge, item or
+  action is dropped and an over-limit `expand_label` falls back to the default.
+  An item title follows the root rule (1-240), and invalid facts don't use up
+  the 8 slots. A field of the wrong JSON type (an object, array or null where
+  a string or number belongs) is invalid the same way and never breaks the
+  reply.
+  Every intent field has the same bound. A repeated item intent or badge
+  label keeps only its first entry.
+- Every block links to `/shell/?app=<slug>&intent=<intent>`, and each item to
+  its own intent. Nothing app-owned runs until the reader clicks the expand
+  control or an action; the app's ordinary view then opens in the transcript
+  with that one intent. That embedded view may open a chat or an app, nothing
+  else, and never restores or overwrites the app's saved place in the shell.
+  If the app is not installed, the block keeps its snapshot and says so.
+- Every block is captioned "From this conversation": its title, facts and
+  badges are the agent's words, not status the app verified.
+- To act on many records, put a short app-owned handle in the intent (for
+  example `send-batch:sel-7f3a`) and resolve it in the app to the exact
+  records it names. A twelve-id list does not fit the 256-character payload.
+  The handle is a reference, never approval.
+
+### Passive block sessions
+
+A block with `"interaction": "inline"` can show live status and an in-place
+Confirm without the reader opening the app. It needs all three of:
+
+1. `"capabilities": {"chat.blocks.passive": {"version": 1}}` in `mobius.json`,
+   accepted by the owner and applied (the editable manifest alone is never
+   enough; the frame checks the exact applied bundle's SHA-256 before running);
+2. `export const appBlockSessions = true` from the entry module;
+3. a default component that, given `props.blockSession`, exchanges the
+   messages below. Its output is never shown.
+
+Otherwise the block is static. An "unsupported" result belongs to the applied
+revision that gave it: after the app is updated, the block negotiates again. While the block is near the viewport the host
+runs a hidden, inert instance of the app; it cannot navigate, open chats or
+apps, or use other host requests, and it never reads or writes the app's saved
+shell place. At most 3 idle hidden instances run per app (the blocks nearest
+the viewport, measured as the page scrolls); further blocks stay static with
+an explicit open, and an instance that reports `retain` always keeps its frame.
+A view the reader opened in a static block stays open until they close it,
+even if a slot frees up. Module startup and
+session hydration must be read-only. The host draws every control; the app
+reports state.
+
+**`actions[].intent` is untrusted.** The actions in `blockSession` and
+`app-block-init` come from the block, which the conversation wrote; any text
+the agent read can steer them, and a hidden instance mounts just because the
+block scrolled into view. Use an intent only to look up your own data for
+display. Never act, publish, or change state because of an intent at startup
+or on `app-block-init`; act only on an owner `confirm`, and check that
+request against your own data first.
+
+`props.blockSession` is `{sessionId, generation, actions, items, checkpoint,
+retain, recoveryError, subscribe(cb), setState(state)}`, where `actions` is
+`[{key, intent, label}]` and `key` is the action's intent, and `items` is
+`[{intent}]`: the block's item intents in card order, after the host's
+validation and deduplication (an empty array when the block lists no items).
+Like `actions[].intent`, `items` is agent-printed and untrusted: it tells a
+single block-level action which records the card shows, but re-verify every
+intent against your own data before you build a confirmation, and build that
+confirmation list from your data, never from the block. The host also posts
+window messages; read them with `subscribe` or a `message` listener that checks
+`event.source === window.parent`:
+
+- `{type:'moebius:app-block-init', sessionId, generation, actions, items,
+  checkpoint, retain, recoveryError}` when the session envelope changes.
+- `{type:'moebius:app-block-action', sessionId, generation, key, event, nonce}`,
+  `event` one of `activate | confirm | cancel`. Each reader click sends one
+  event; the host sends no other event until you acknowledge that `nonce`.
+  **Only `confirm` may cause an effect** (publish, write, send, spend).
+  `activate` asks you to prepare: read, then report `confirming` with the
+  exact list, or say why nothing can be done. `cancel` withdraws a
+  confirmation. Neither may change anything outside your document. The host
+  relies on this: a `confirm` still unacknowledged when the document reloads
+  is held for recovery, while an unacknowledged `activate` or `cancel` is
+  simply discarded and the controls come back. An action that needs no list
+  still goes through `confirming`.
+
+A message for another session or document `generation`, or for a module without
+the export, is stopped before any app listener sees it. A reload or app update
+starts a new generation; the previous document's controls are discarded.
+
+Report state with `setState(state)`, which stamps `type`, `sessionId` and
+`generation` for you, or by posting
+`{type:'moebius:app-block-state', sessionId, generation, ...state}` to the
+parent yourself. `generation` must be the number from this document's
+`blockSession` (the same value every `app-block-init` carries). A reload keeps
+the frame's window, so the host cannot tell documents apart by sender: it drops
+any report with a missing, older or newer generation, acknowledgements
+included.
+
+- `actions`: up to 24 `{key, label?, disabled?, busy?, hidden?, confirming?,
+  confirmation?, note?, tone?, status?, statusTone?, links?, badges?}`, one
+  per key from `actions` (a key you do not report stays "Loading…"; use
+  `hidden: true` to remove its control). Unknown keys are dropped. Text is plain and bounded (`label` and `status` 40, `note` 500);
+  `links` are up to 12 `{label, url}` with uncredentialed `https:` URLs; tones
+  are `neutral|success|attention|danger`; `badges` replaces the block's saved
+  badges for that action (omit to keep them, `[]` to clear them).
+- `notice` (500) and `summary` (240): plain text shown in the block.
+- `ackNonce`: the `nonce` of the last owner event you accepted. Acknowledge
+  without acting twice on the same nonce.
+- `retain: true` while you own a confirmation, an operation in progress or an
+  unknown outcome; the host then keeps your document alive offscreen and does
+  not replace it with an app update. If an update removes the capability or
+  its applied admission while you retain, the block keeps your document and
+  its checkpoint, sends no new owner event, and tells the reader to open the
+  app to check the result; it becomes static once you release. Release it
+  only after cancellation or a settled result.
+- `checkpoint`: `{id (1-128), data (string, at most 32768 UTF-8 bytes)}` or
+  `null`, opaque to the host and returned in the next document's
+  `app-block-init`. Put only what is needed to recover an unresolved outcome
+  in it, never an approval or a request to replay. A new document must report
+  `checkpointAck` equal to the checkpoint `id` it imported before its controls
+  are enabled; until then they stay disabled. `recoveryError: true` reports a
+  checkpoint you could not use and keeps the block locked with a note to open
+  the app.
+
+**Confirmation contract.** To ask for Confirm, report the action with
+`confirming: true` and `confirmation`: the complete, current list of what
+Confirm will do, `[{title, facts: [{label, value}]}]` with 1-256 items, at most
+8 facts each and every text 1-512 characters. Only one action may be
+confirming at a time, and a `hidden` action never is: if two or more report
+`confirming: true`, the host enables no Confirm, shows no list, and asks the
+reader to open the app. Describe the exact targets and
+versions your app will act on now, from your own data, not the block's saved
+snapshot. The host shows every item, hides the block's saved badges unless you
+supply `badges`, and says the saved title and details come from the
+conversation. It never shortens the list: a missing, empty, oversized or
+malformed `confirmation` keeps Confirm disabled and shows "Open the app to
+review this action. Its full current identity is unavailable here." Confirm
+replaces the action's button in place, with "Not now" beside it. It stays
+disabled until, during this showing of that exact confirmation (the action
+and its list), the end of the list has been on screen at least once (as
+observed after this showing's own layout; a position under an earlier list
+never counts), and
+then Confirm itself has been on screen in a visible page for about 500 ms
+without interruption. The list is drawn below Confirm, so its end having been
+on screen means the whole list has passed through the viewport; a long list
+just needs scrolling to its end and back. A showing ends, and the next one
+starts from nothing, when the list changes or disappears, when Confirm or "Not
+now" is pressed, or on reload; Confirm leaving the screen or the page being
+hidden restarts the delay. So a double-click on the action, a list swapped
+just before a click, or a list that was never on screen never sends
+`confirm`. Treat
+`confirm` as a request: check it again in the app before acting, and report
+`busy` and then the result.
+
 ---
 
 ## Storage — `window.mobius.storage` is the default
@@ -512,7 +700,7 @@ Do not copy a generic auto-recovery callback that writes from inside `storage.on
 - **Carry intent onto any recovery write that can queue** by passing the original `conflictContext` with the fresh version guard, so a recovery that conflicts again still has the intent it needs.
 - **Queued is not accepted.** A `durability: "queued"` result is not server acceptance, and a separate `pendingCount()` check cannot prove it; only `durability === 'synced'` confirms the write.
 
-**Any view the agent might write to externally MUST `subscribe()`, not load-on-mount.** A current-session draft, today's log, an inbox — anything the Möbius agent populates from a chat turn while the app sits open — has to use `window.mobius.storage.subscribe(path, cb)` so it repaints when that storage changes under it. A view that only reads once in its mount effect leaves the owner staring at a blank panel after the agent writes. If a view genuinely can't subscribe, tell the owner up front they must reopen or refresh to see agent-written entries — and never claim the shell remounts a mini-app when your turn ends, because there is no such guarantee (the iframe stays in the LRU cache).
+**A view showing externally-written data MUST re-read, not load-once-on-mount — and `subscribe()` alone is not the re-read.** A subscription fires on this app's own `set`/`remove` and when its own queued writes sync; a write made from *outside* the running app (an agent chat turn, a cron job) never reaches an open view through `subscribe()` by itself — there is no server push. For a current-session draft, today's log, an inbox — anything the Möbius agent populates while the app sits open — keep the `subscribe()` *and* re-read with `get()` when the view becomes visible plus a modest interval while visible: a `get()` whose server value changed notifies the path's subscribers, so the same callback repaints. A view that only reads once in its mount effect leaves the owner staring at a blank panel after the agent writes. If a view genuinely can't do this, tell the owner up front they must reopen or refresh to see agent-written entries — and never claim the shell remounts a mini-app when your turn ends, because there is no such guarantee (the iframe stays in the LRU cache).
 
 ### The `.json`-no-envelope trap (silent data loss)
 
@@ -895,10 +1083,21 @@ useEffect(() => {
 ## Pausing work while the app is hidden
 
 The shell keeps recently used apps loaded but hidden so switching back is
-instant. A hidden app frame's `document.hidden` stays `false` unless the whole
-browser tab is hidden, so a timer gated only on `document.hidden` keeps
-polling, animating, or playing audio for an app nobody can see. Gate that work
-on the runtime's combined signal instead:
+instant. While an app is hidden, its frame reads as a hidden page the standard
+way (`document.hidden`, `document.visibilityState`, and `visibilitychange` on
+the way out and back), so engines and libraries that follow the Page Visibility
+API pause themselves. The frame also pauses the app's sound: it suspends every
+Web Audio context and pauses playing `<audio>`/`<video>` elements — including
+media that begins on its own while hidden, such as autoplay or a clip that was
+still loading — holds any `resume()` or `play()` the app calls while hidden, and
+on return resumes exactly what it paused, never what the app paused itself (nor
+an element the app removed from the page while hidden). A held `resume()` or
+`play()` resolves right away: it reports that the request was accepted, not that
+audio is playing, and a later failure when it actually starts on return is not
+surfaced — so don't treat that resolution as proof sound is audible.
+
+Timers keep running, so pause polling, animation, and game clocks yourself and
+catch up on return:
 
 ```jsx
 useEffect(() => {
@@ -917,7 +1116,32 @@ useEffect(() => {
 tab is visible. `onVisibilityChange(cb)` calls `cb(visible)` immediately and on
 every change, and returns an unsubscribe function. A Store app that may run on
 an older Möbius checks `window.mobius.runtimeFeatures?.frameVisibility` and
-otherwise falls back to `document.hidden` with `visibilitychange`.
+otherwise falls back to `document.hidden` with `visibilitychange`; on those
+hosts, pause the app's own sound as well.
+
+Playback the owner starts deliberately and expects to keep hearing (a podcast,
+read-aloud, music) keeps playing while the app is hidden if the app opens a
+shell media session for it. The drawer then shows a now-playing control:
+
+```js
+const send = (message) => window.parent.postMessage(
+  { type: 'moebius:media-session', sessionId: 'episode-42', ...message },
+  window.location.origin,
+)
+send({ event: 'open', title: 'Episode 42', playbackState: 'playing' })
+send({ event: 'update', playbackState: 'paused' }) // 'loading' | 'playing' | 'paused'
+send({ event: 'close' })                            // playback ended
+// The drawer's controls arrive as
+// { type: 'moebius:media-control', sessionId, action: 'play' | 'pause' | 'stop' }.
+```
+
+The page still reads as hidden while such playback continues. Documents the
+app embeds in its own child iframes are separate pages: forward the visibility
+to them yourself. For the same reason, `<audio>`/`<video>` inside an open
+shadow root isn't reached — the frame's scan doesn't cross shadow boundaries
+and `play` events don't escape them — so pause shadow-DOM media yourself from
+`onVisibilityChange` as well. Plain (light-DOM) elements and `new Audio()` are
+handled for you.
 
 ---
 
@@ -936,12 +1160,12 @@ const { chatId } = await window.mobius.chat.start({
 window.parent.postMessage({ type: 'moebius:open-chat', chatId }, '*')
 ```
 
-Use `moebius:new-chat` only for an editable draft. Do not add an `autoSend`
-field to that shell message: retained panes and navigation make a
-create-then-send handoff inherently timing-sensitive. `window.mobius.chat.start`
-is the shared first-turn primitive. It creates a visible app-owned chat, waits
-for the first message to be accepted, then returns its id for navigation. Catch
-errors and preserve the source UI so the owner can retry without losing work.
+`moebius:new-chat` always opens an editable draft; the owner's own Send is
+what approves app-chosen text, so the shell ignores any `autoSend` field.
+`window.mobius.chat.start` is the shared first-turn primitive. It creates a
+visible app-owned chat, waits for the first message to be accepted, then
+returns its id for navigation. Catch errors and preserve the source UI so the
+owner can retry without losing work.
 
 The opaque app document cannot name the shell as a target origin, so raw
 app-to-shell messages use `'*'`. For reply protocols, require

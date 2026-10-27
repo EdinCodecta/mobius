@@ -1,4 +1,5 @@
 import { Fragment, memo, useMemo } from 'react'
+import { useGeneratedFiles } from './hooks/useGeneratedFiles.js'
 import { usePositionedPeerNotes } from './peerTimelineContext.js'
 import {
   insertPositionedActivity,
@@ -6,7 +7,8 @@ import {
   mergeAdjacentPeerActivityEntries,
   mergePositionedActivityEntries,
 } from './activityPosition.js'
-import { ProgressiveMarkdown, StandardMarkdown } from './markdown/BlockRenderer.jsx'
+import { ProgressiveMarkdown, StandardMarkdown, markdownImageHrefs } from './markdown/BlockRenderer.jsx'
+import { safeImageHref } from './markdown/InlineContent.jsx'
 import ActivityStretch from './ActivityStretch.jsx'
 import {
   activitySummaryTools,
@@ -17,7 +19,7 @@ import { foldAppActivityOperations } from './activityGrouping.js'
 import QuestionCard from './QuestionCard.jsx'
 import { isDurableRestartOffer } from './restartCard.js'
 import SecureInputCard from './SecureInputCard.jsx'
-import Attachments from './Attachments.jsx'
+import Attachments, { attachmentIsGalleryImage, generatedImageHref } from './Attachments.jsx'
 import CompactionCard from './CompactionCard.jsx'
 import ContinuationCard from './ContinuationCard.jsx'
 import SideQuestionNote from './SideQuestionNote.jsx'
@@ -26,8 +28,8 @@ import { questionKey } from './questionKey.js'
 import {
   legacyRestartActivityOwners,
   repairInterleavedQuestionText,
+  renderedBlockEntries,
   restartCardActivityEntries,
-  suppressedQuestionToolIndices,
 } from './streamReducers.js'
 import { stripAugmentation } from './msgText.js'
 import ErrorCard, { errorCardViewModel } from './ErrorCard.jsx'
@@ -135,33 +137,80 @@ function UserMessageSegments({ segments, onInternalNav, mediaDimensions }) {
   ))
 }
 
-function GoalHistory({ msg }) {
+function GoalHistory({ msg, onInternalNav }) {
   if (msg.role !== 'assistant' || !Array.isArray(msg.goal_summaries)) return null
   return msg.goal_summaries.map(summary => (
-    <GoalHistoryCard key={summary.id} summary={summary} />
+    <GoalHistoryCard key={summary.id} summary={summary} onInternalNav={onInternalNav} />
   ))
 }
 
 // Whatever started this answer leads it and stays visible while it streams:
 // a recovery resume (projected from its run) or a wait that woke the chat.
-function AnswerCause({ msg }) {
+function AnswerCause({ msg, onInternalNav }) {
   if (msg.role !== 'assistant') return null
   const waits = (msg.wait_summaries || []).filter(waitWokeItsAnswer)
   if (!msg.continuation_reason && !waits.length) return null
   return (
     <div className="chat__answer-cause">
       {msg.continuation_reason && <ContinuationCard msg={msg} />}
-      {waits.map(summary => <WaitHistoryCard key={summary.id} summary={summary} />)}
+      {waits.map(summary => <WaitHistoryCard key={summary.id} summary={summary} onInternalNav={onInternalNav} />)}
     </div>
   )
 }
 
 // A deliberately stopped wait is an outcome of the answer that owned it.
-function StoppedWaits({ msg }) {
+function StoppedWaits({ msg, onInternalNav }) {
   if (msg.role !== 'assistant' || !Array.isArray(msg.wait_summaries)) return null
   return msg.wait_summaries
     .filter(summary => !waitWokeItsAnswer(summary))
-    .map(summary => <WaitHistoryCard key={summary.id} summary={summary} />)
+    .map(summary => <WaitHistoryCard key={summary.id} summary={summary} onInternalNav={onInternalNav} />)
+}
+
+// Image hrefs a text block's Markdown renders, cached per block object: a
+// streaming answer re-renders on every delta, but only its growing tail block
+// has new text to lex. Rejected (unsafe) URLs never count, because the
+// renderer drops them too.
+const markdownImagePathsByBlock = new WeakMap()
+
+function markdownImagePaths(block) {
+  let paths = markdownImagePathsByBlock.get(block)
+  if (!paths) {
+    paths = markdownImageHrefs(block.content || block.text || '')
+      .map(safeImageHref).filter(Boolean)
+      .map(src => new URL(src, 'https://mobius.local').pathname)
+    markdownImagePathsByBlock.set(block, paths)
+  }
+  return paths
+}
+
+/** Where each published file shows. A picture appears as soon as it is
+ * published, right after the step that produced it when the server named one,
+ * unless the prose already embeds it. Every other file, and any document only
+ * once the turn has finished, sits after the answer. */
+function generatedFileLayout(files, { chatId, isStreaming, embeddedImageKey }) {
+  const embedded = new Set(embeddedImageKey.split('\n'))
+  const visible = files.filter(file => attachmentIsGalleryImage(file)
+    ? !embedded.has(generatedImageHref(chatId, file.name))
+    : !isStreaming)
+  const byStep = new Map()
+  for (const file of visible) {
+    const step = attachmentIsGalleryImage(file) ? file.source_tool_use_id : null
+    if (step) byStep.set(step, [...(byStep.get(step) || []), file])
+  }
+  return {
+    visible,
+    byStep,
+    afterAnswer: visible.filter(file => !byStep.has(file.source_tool_use_id)),
+  }
+}
+
+/** One string naming every image path the message's prose embeds, so a memo
+ * can depend on the set's content rather than on a per-render Set. */
+function embeddedImagePathKey(blocks) {
+  return (blocks || [])
+    .flatMap(block => block?.type === 'text' ? markdownImagePaths(block) : [])
+    .sort()
+    .join('\n')
 }
 
 function MsgContentInner({
@@ -222,16 +271,17 @@ function MsgContentInner({
   activitySourceBlocks,
 }) {
   const positionedNotes = usePositionedPeerNotes(activityMessageId || msg.id)
-  // Memoized once per message: open image previews derive from this list.
-  const generatedFiles = useMemo(() => (
-    msg.role === 'assistant' && !isStreaming
-      ? (msg.blocks || []).flatMap(block =>
-          block.type === 'generated_files' && Array.isArray(block.files)
-            ? block.files.map(file => ({ ...file, kind: 'generated' }))
-            : [],
-        )
-      : []
-  ), [msg.role, msg.blocks, isStreaming])
+  // One identity per message while its files are unchanged: open image
+  // previews and document cards derive from this list. It holds every
+  // published file; the layout below decides where each one shows.
+  const generatedFiles = useGeneratedFiles(msg)
+  const embeddedImageKey = generatedFiles.some(attachmentIsGalleryImage)
+    ? embeddedImagePathKey(msg.blocks)
+    : ''
+  const fileLayout = useMemo(
+    () => generatedFileLayout(generatedFiles, { chatId, isStreaming, embeddedImageKey }),
+    [generatedFiles, chatId, isStreaming, embeddedImageKey],
+  )
   // Build a stable per-render answerable predicate that closes over the
   // scalar props (no function prop needed from ChatView).
   const isQuestionAnswerable = (block) =>
@@ -270,17 +320,11 @@ function MsgContentInner({
       displayBlocks,
       msg.interaction_tool_projection_version,
     )
-    // The persisted transcript keeps the raw AskUserQuestion tool block
-    // AND the question card (backend events.process_event appends both);
-    // the live stream absorbs the tool twin into the card. Skip the twin
-    // here so a reopened chat matches the live view — render-time, so it
-    // also cleans up already-persisted old chats with no backend migration.
-    const skipToolIdx = suppressedQuestionToolIndices(displayBlocks)
-
     // Entry idx is the POST-suppression position, not the raw msg.blocks
     // ordinal. The two surfaces of the active answer disagree about the twin:
     // the live reducer absorbs the AskUserQuestion tool into the question card,
-    // while the DB partial keeps both and relies on the render-time skip above.
+    // while the DB partial keeps both and relies on the render-time skip in
+    // renderedBlockEntries, which also numbers a reply's Copy parts.
     // Raw ordinals therefore differ by one for every block after a mid-turn
     // question, and an ordinal-keyed entry (thinking, a tokenless tool, the
     // question itself) would change key across the live↔DB surface switch —
@@ -289,14 +333,7 @@ function MsgContentInner({
     // surfaces produce identical positions for identical visible content, so
     // keys survive the switch. (Appends only ever extend the tail, so earlier
     // positions — and their keys — are stable mid-run too.)
-    const entries = displayBlocks
-      .map((block, i) => ({ item: block, rawIdx: i }))
-      // Deliverables are positioned separately below, so they do not change
-      // the visible tail used by Resume/Try-now ownership.
-      .filter(({ item, rawIdx }) => (
-        item.type !== 'generated_files' && !skipToolIdx.has(rawIdx)
-      ))
-      .map(({ item }, pos) => ({ item, idx: pos }))
+    const entries = renderedBlockEntries(displayBlocks)
     // Repair already-persisted transcripts where a continuous reasoning pass was
     // fragmented into many thinking blocks: coalesce runs of adjacent thinking
     // AFTER idx assignment (each survivor keeps its first fragment's position)
@@ -347,7 +384,7 @@ function MsgContentInner({
     // nodes — text, question, error, and provider context compaction.
     const renderBlock = (block, i) => {
       if (block.type === 'goal_history') {
-        return <GoalHistoryCard key={`goal-${block.summary.id}`} summary={block.summary} />
+        return <GoalHistoryCard key={`goal-${block.summary.id}`} summary={block.summary} onInternalNav={onInternalNav} />
       }
       if (block.type === 'activity' && Array.isArray(block.entries)) {
         // Cold, very long turns can reach this renderer with their adjacent
@@ -439,6 +476,7 @@ function MsgContentInner({
                       isStreaming={block.reply_live_text || (isStreaming && i === lastEntryIdx)}
                       onInternalNav={onInternalNav}
                       mediaDimensions={msg.media_dimensions}
+                      allowAppBlocks
                     />
                   : <StandardMarkdown
                       text={text}
@@ -446,6 +484,7 @@ function MsgContentInner({
                       renderFraction={block._coldRenderFraction}
                       onInternalNav={onInternalNav}
                       mediaDimensions={msg.media_dimensions}
+                      allowAppBlocks
                     />)
               : msg.role === 'user'
                 ? <UserMessageText
@@ -510,6 +549,8 @@ function MsgContentInner({
               questions={block.questions || []}
               questionId={block.question_id}
               answeredMap={answers}
+              neededBy={block.needed_by}
+              onInternalNav={onInternalNav}
               platformAction={block.platform_action}
               submittedOptions={block.selected_options}
               attachments={block.attachments}
@@ -663,22 +704,43 @@ function MsgContentInner({
     // arrive here after conversion to the same block shape, so the transcript
     // doesn't reshuffle on promote.
     const nodes = groupActivityRuns(foldAppActivityOperations(finalEntries))
-    // The inbox is captured after the turn ends, which can be after a saved
-    // question. Place those files after the agent's last prose but before any
-    // terminal question card, including in already-saved transcripts.
+    // A picture follows the step that made it. If that step is not on screen
+    // (an older or reduced transcript), it joins the files after the answer.
+    const shownSteps = new Set(nodes.flatMap(node => (
+      node.group ? node.group.map(entry => entry.item?.tool_use_id).filter(Boolean) : []
+    )))
+    const followsShownStep = file => fileLayout.byStep.has(file.source_tool_use_id)
+      && shownSteps.has(file.source_tool_use_id)
+    const afterAnswerFiles = [...fileLayout.byStep.keys()].every(step => shownSteps.has(step))
+      ? fileLayout.afterAnswer
+      : fileLayout.visible.filter(file => !followsShownStep(file))
+    const stepAttachments = node => {
+      const steps = (node.group || []).map(entry => entry.item?.tool_use_id)
+        .filter(step => fileLayout.byStep.has(step))
+      return steps.map(step => (
+        <Attachments
+          key={`generated-files-${step}`}
+          attachments={fileLayout.byStep.get(step)}
+          chatId={chatId}
+          mediaDimensions={msg.media_dimensions}
+        />
+      ))
+    }
+    // The rest sit after the agent's last prose and before any terminal
+    // question card, including in already-saved transcripts.
     const lastTextNode = nodes.findLastIndex(node => node.single?.item?.type === 'text')
-    const beforeQuestionNode = generatedFiles.length
+    const beforeQuestionNode = afterAnswerFiles.length
       ? nodes.findIndex((node, index) =>
           index > lastTextNode && node.single?.item?.type === 'question',
         )
       : -1
-    const fileAttachments = generatedFiles.length
-      ? <Attachments key="generated-files" attachments={generatedFiles} chatId={chatId} />
+    const fileAttachments = afterAnswerFiles.length
+      ? <Attachments key="generated-files" attachments={afterAnswerFiles} chatId={chatId} mediaDimensions={msg.media_dimensions} />
       : null
 
     return (
       <MarkdownCopySurface msg={msg} markdownByIndex={markdownByIndex}>
-        <AnswerCause msg={msg} />
+        <AnswerCause msg={msg} onInternalNav={onInternalNav} />
         {msg.role === 'user' && <Attachments attachments={msg.attachments} chatId={chatId} />}
         {nodes.flatMap((node, nodeIdx) => {
           const before = nodeIdx === beforeQuestionNode ? [fileAttachments] : []
@@ -714,14 +776,14 @@ function MsgContentInner({
                   onInternalNav={onInternalNav}
                 />
               </div>
-            )]
+            ), ...stepAttachments(node)]
           }
           return [...before, renderBlock(node.single.item, node.single.idx)]
         })}
         {/* The final attachment owns each deliverable, before any terminal question. */}
         {beforeQuestionNode < 0 && fileAttachments}
-        {!isStreaming && <GoalHistory msg={msg} />}
-        {!isStreaming && <StoppedWaits msg={msg} />}
+        {!isStreaming && <GoalHistory msg={msg} onInternalNav={onInternalNav} />}
+        {!isStreaming && <StoppedWaits msg={msg} onInternalNav={onInternalNav} />}
       </MarkdownCopySurface>
     )
   }
@@ -731,7 +793,7 @@ function MsgContentInner({
 
   return (
     <MarkdownCopySurface msg={msg}>
-      <AnswerCause msg={msg} />
+      <AnswerCause msg={msg} onInternalNav={onInternalNav} />
       {msg.role === 'user' && <Attachments attachments={msg.attachments} chatId={chatId} />}
       {text ? (
         <div
@@ -747,12 +809,14 @@ function MsgContentInner({
                     isStreaming={isStreaming}
                     onInternalNav={onInternalNav}
                     mediaDimensions={msg.media_dimensions}
+                    allowAppBlocks
                   />
                 : <StandardMarkdown
                     text={text}
                     markdownRange={msg.markdown_range}
                     onInternalNav={onInternalNav}
                     mediaDimensions={msg.media_dimensions}
+                    allowAppBlocks
                   />)
             : msg.role === 'user'
               ? (msg.segments?.length > 1
@@ -769,8 +833,8 @@ function MsgContentInner({
               : text}
         </div>
       ) : null}
-      {!isStreaming && <GoalHistory msg={msg} />}
-      {!isStreaming && <StoppedWaits msg={msg} />}
+      {!isStreaming && <GoalHistory msg={msg} onInternalNav={onInternalNav} />}
+      {!isStreaming && <StoppedWaits msg={msg} onInternalNav={onInternalNav} />}
     </MarkdownCopySurface>
   )
 }

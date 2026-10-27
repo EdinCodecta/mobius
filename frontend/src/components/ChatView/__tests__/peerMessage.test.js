@@ -296,3 +296,12 @@ test('single received note names its sender once; grouped notes retain each send
   assert.match(many, /from Review agent/)
   assert.match(many, /from Build agent/)
 })
+
+test('a peer note cannot present an app block; the fence stays quoted code', () => {
+  const fence = JSON.stringify({ app: 'contribute', intent: 'review:a', title: 'Fix typo',
+    action: { label: 'Contribute', intent: 'send:rec-REAL' }, badges: [{ label: 'All clear', tone: 'success' }] })
+  const html = renderCard({ ...sentTool.peer_message, body: `Look:\n\n\`\`\`mobius-app\n${fence}\n\`\`\`` },
+    { open: true, suffix: 'app-block' })
+  assert.match(html, /<pre[^]*&quot;app&quot;:&quot;contribute&quot;/)
+  assert.doesNotMatch(html, /md-app-block|<button[^>]*>Contribute</)
+})

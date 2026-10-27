@@ -33,6 +33,7 @@ import {
   enrichMessageSource,
 } from './messageSources.js'
 import { toolBlockFailed } from './toolResultFormat.js'
+import { VIEWED_SNAPSHOT_NAME } from './toolImageResult.js'
 
 // Tool names whose tool events describe an AskUserQuestion-style
 // call: Claude's AskUserQuestion and Codex's request_user_input.
@@ -442,6 +443,27 @@ export function suppressedQuestionToolIndices(blocks) {
 }
 
 /**
+ * The blocks MsgContent renders in place, each with its rendered position
+ * `idx` — the number its text carries as `data-markdown-block`. Deliverables
+ * (`generated_files`) are positioned separately, so they do not change the
+ * visible tail used by Resume/Try-now ownership, and the persisted transcript
+ * keeps the raw AskUserQuestion tool block AND its question card (backend
+ * events.process_event appends both) while the live stream absorbs that twin
+ * into the card; skipping it here makes a reopened chat match the live view
+ * and cleans up already-persisted chats with no backend migration. Anything
+ * that locates a rendered block (a reply's Copy) must number blocks this way.
+ */
+export function renderedBlockEntries(blocks) {
+  const skipToolIdx = suppressedQuestionToolIndices(blocks)
+  return blocks
+    .map((item, rawIdx) => ({ item, rawIdx }))
+    .filter(({ item, rawIdx }) => (
+      item?.type !== 'generated_files' && !skipToolIdx.has(rawIdx)
+    ))
+    .map(({ item }, idx) => ({ item, idx }))
+}
+
+/**
  * Applies a `question` event to the stream items.
  *
  * Merge policy, in priority order:
@@ -596,8 +618,10 @@ export function attachToolOutput(prev, content, event = null) {
 
 /**
  * Applies a `generated_file` event to one provider-neutral turn block.
- * Deliverables render after the answer, so coupling them to a guessed tool
- * identity adds failure modes without changing the visible result.
+ * Deliverables render after the answer and are never tied to a guessed tool.
+ * A native picture is the exception the server states outright: it carries
+ * the step that produced it and its decoded size (events.py keeps the same
+ * fields), so it shows beside that step in a frame sized before it loads.
  */
 export function attachGeneratedFile(prev, event) {
   const name = event?.name
@@ -609,6 +633,13 @@ export function attachGeneratedFile(prev, event) {
     previewable: event.previewable === true,
   }
   if (typeof event.sha256 === 'string') entry.sha256 = event.sha256
+  if (typeof event.source_tool_use_id === 'string' && event.source_tool_use_id) {
+    entry.source_tool_use_id = event.source_tool_use_id
+  }
+  if ([event.width, event.height].every(side => Number.isInteger(side) && side > 0)) {
+    entry.width = event.width
+    entry.height = event.height
+  }
   const i = prev.findLastIndex(it => it.type === 'generated_files')
   if (i < 0) return [...prev, { type: 'generated_files', files: [entry] }]
   const block = prev[i]
@@ -616,6 +647,26 @@ export function attachGeneratedFile(prev, event) {
   if (existing.some(f => f.name === name)) return prev  // idempotent
   const updated = [...prev]
   updated[i] = { ...block, files: [...existing, entry] }
+  return updated
+}
+
+/**
+ * Applies a `viewed_image` event: the chat snapshot of exactly the image a
+ * finished ViewImage sent to the model. Codex records that image only after
+ * the view completes, so the runner binds it when the turn ends. Exact id
+ * only, so a snapshot can never land on a different view; idempotent under
+ * catch-up replay.
+ */
+export function attachViewedImage(prev, event) {
+  const name = event?.viewed_image_media
+  const toolUseId = event?.tool_use_id
+  if (!toolUseId || typeof name !== 'string' || !VIEWED_SNAPSHOT_NAME.test(name)) return prev
+  const i = prev.findLastIndex(
+    it => it.type === 'tool' && it.tool === 'ViewImage' && it.tool_use_id === toolUseId,
+  )
+  if (i < 0 || prev[i].viewed_image_media === name) return prev
+  const updated = [...prev]
+  updated[i] = { ...prev[i], viewed_image_media: name }
   return updated
 }
 

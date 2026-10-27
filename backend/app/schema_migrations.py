@@ -1452,6 +1452,54 @@ def _add_app_connect_manage(eng) -> None:
     ))
 
 
+def _add_app_accepted_consent(eng) -> None:
+  """Add the first-open consent record and grandfather every installed app.
+
+  Existing apps keep exactly what they hold today: their current contract
+  becomes their accepted copy, marked as coming from this migration, so an
+  upgrade never asks anything about an app the owner already runs.
+  """
+  import json
+  from sqlalchemy import inspect as sa_inspect, text
+
+  columns = {
+    column["name"] for column in sa_inspect(eng).get_columns("apps")
+  }
+  if "accepted_consent" not in columns:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE apps ADD COLUMN accepted_consent JSON"))
+  columns |= {"accepted_consent"}
+  if "capability_contract" not in columns:
+    return
+  templates_column = (
+    "project_templates_json" if "project_templates_json" in columns else "NULL"
+  )
+  now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+  with eng.begin() as conn:
+    rows = conn.execute(text(
+      f"SELECT id, capability_contract, {templates_column} FROM apps "
+      "WHERE accepted_consent IS NULL AND capability_contract IS NOT NULL"
+    )).fetchall()
+    for app_id, contract, templates in rows:
+      try:
+        parsed = json.loads(contract) if isinstance(contract, str) else contract
+      except ValueError:
+        continue
+      if not isinstance(parsed, dict):
+        continue
+      record = {
+        "contract": parsed,
+        "project_builders": bool(templates) and templates not in ("null", "[]", "{}"),
+        "digest": None,
+        "at": now,
+        "via": "migration",
+      }
+      conn.execute(
+        text("UPDATE apps SET accepted_consent = :record WHERE id = :id"),
+        {"record": json.dumps(record), "id": app_id},
+      )
+
+
 def _add_owner_auth_mode(eng) -> None:
   """Add the durable owner login mode (models.Owner.auth_mode).
 
@@ -6553,6 +6601,392 @@ def _add_chat_compaction_drafts(eng) -> None:
     )
 
 
+def _add_wait_result_receipts(eng) -> None:
+  """Separate receipt from retirement without inventing old receiving runs."""
+  from sqlalchemy import inspect, text
+
+  inspector = inspect(eng)
+  tables = set(inspector.get_table_names())
+  with eng.begin() as conn:
+    # Minimal historical databases may not have either table yet. Production
+    # create_all owns missing tables; this migration upgrades existing ones.
+    if "chat_runs" in tables:
+      columns = {column["name"] for column in inspector.get_columns("chat_runs")}
+      for name, sql_type in (
+        ("admitted_wait_results_json", "JSON"),
+        ("owner_superseded_by_run_id", "VARCHAR(64)"),
+      ):
+        if name not in columns:
+          conn.execute(text(f"ALTER TABLE chat_runs ADD COLUMN {name} {sql_type}"))
+    if "chat_waits" in tables:
+      columns = {column["name"] for column in inspector.get_columns("chat_waits")}
+      for name, sql_type in (
+        ("result_disposition", "VARCHAR(32)"),
+        ("result_disposed_at", "TIMESTAMP"),
+        ("received_run_id", "VARCHAR(64)"),
+      ):
+        if name not in columns:
+          conn.execute(text(f"ALTER TABLE chat_waits ADD COLUMN {name} {sql_type}"))
+      # A timestamp previously meant either provider success, scheduling, or
+      # Goal retirement. Preserve that uncertainty and suppress historic wakes.
+      conn.execute(text("UPDATE chat_waits SET result_disposition='legacy_consumed', "
+                        "result_disposed_at=resume_delivered_at "
+                        "WHERE result_disposition IS NULL AND resume_delivered_at IS NOT NULL"))
+      conn.execute(text("UPDATE chat_waits SET result_disposition='withdrawn', "
+                        "result_disposed_at=cancelled_at "
+                        "WHERE result_disposition IS NULL AND status='cancelled'"))
+
+
+def _add_goal_dependencies(eng) -> None:
+  """Create native Goal follows without converting legacy interest history.
+
+  AgentWorkInterest has no durable acquisition or receiving-run identity.
+  Even a persisted ``running`` source may be interrupted by startup recovery,
+  so old interests must never become newly owed results during upgrade.
+  """
+  from sqlalchemy import inspect, text
+
+  inspector = inspect(eng)
+  tables = set(inspector.get_table_names())
+  with eng.begin() as conn:
+    if "chat_runs" in tables and "admitted_dependency_results_json" not in {
+      col["name"] for col in inspector.get_columns("chat_runs")
+    }:
+      conn.execute(text("ALTER TABLE chat_runs ADD COLUMN admitted_dependency_results_json JSON"))
+    if "agent_work_claims" in tables:
+      columns = {col["name"] for col in inspector.get_columns("agent_work_claims")}
+      if "acquisition_id" not in columns:
+        conn.execute(text("ALTER TABLE agent_work_claims ADD COLUMN acquisition_id VARCHAR(64)"))
+      for (claim_id,) in conn.execute(text(
+        "SELECT id FROM agent_work_claims WHERE acquisition_id IS NULL"
+      )):
+        conn.execute(text(
+          "UPDATE agent_work_claims SET acquisition_id=:acquisition_id "
+          "WHERE id=:id AND acquisition_id IS NULL"
+        ), {"id": claim_id, "acquisition_id": uuid.uuid4().hex})
+      conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_work_claims_acquisition_id "
+                        "ON agent_work_claims (acquisition_id)"))
+
+    conn.execute(text("""
+      CREATE TABLE IF NOT EXISTS goal_dependencies (
+        id VARCHAR(64) PRIMARY KEY,
+        waiting_goal_id VARCHAR(64) NOT NULL,
+        waiting_chat_id VARCHAR(64) NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        created_by_run_id VARCHAR(64), task_id VARCHAR(64),
+        target_kind VARCHAR(32) NOT NULL, target_key VARCHAR(160) NOT NULL,
+        target_claim_id VARCHAR(64), target_acquisition_id VARCHAR(64),
+        target_chat_id VARCHAR(64), target_question_id VARCHAR(64),
+        outcome_json JSON, resolved_at TIMESTAMP,
+        result_disposition VARCHAR(32), result_disposed_at TIMESTAMP,
+        received_run_id VARCHAR(64), withdrawn_at TIMESTAMP,
+        owner_suppressed_at TIMESTAMP, created_at TIMESTAMP NOT NULL,
+        CONSTRAINT uq_goal_dependency_target UNIQUE (waiting_goal_id, target_key)
+      )
+    """))
+    # create_all may have supplied the table already; repair partially created
+    # draft schemas without changing any existing follow or legacy interest.
+    if "goal_dependencies" in tables and "owner_suppressed_at" not in {
+      col["name"] for col in inspector.get_columns("goal_dependencies")
+    }:
+      conn.execute(text(
+        "ALTER TABLE goal_dependencies ADD COLUMN owner_suppressed_at TIMESTAMP"
+      ))
+    for name, columns in (
+      ("ix_goal_dependencies_waiting_goal_id", "waiting_goal_id"),
+      ("ix_goal_dependencies_waiting_chat_id", "waiting_chat_id"),
+      ("ix_goal_dependencies_target_claim_id", "target_claim_id"),
+      ("ix_goal_dependencies_owed", "waiting_goal_id, resolved_at, result_disposition"),
+      ("ix_goal_dependencies_source", "target_kind, target_acquisition_id, resolved_at"),
+    ):
+      conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON goal_dependencies ({columns})"))
+
+
+def _add_saved_decision_cards(eng) -> None:
+  """Schema only: no ambiguous old cancellation or historical wakes invented."""
+  from sqlalchemy import text
+  with eng.begin() as conn:
+    conn.execute(text("""
+      CREATE TABLE IF NOT EXISTS saved_decision_cards (
+        chat_id VARCHAR(64) NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        question_id VARCHAR(64) NOT NULL,
+        source_goal_id VARCHAR(64), family VARCHAR(16) NOT NULL,
+        summary TEXT NOT NULL, outcome_json JSON, resolved_at TIMESTAMP,
+        PRIMARY KEY (chat_id, question_id)
+      )
+    """))
+
+
+def _add_transfer_notice_revision(eng) -> None:
+  """Transfer identity must survive later completion/release revisions."""
+  from sqlalchemy import inspect, text
+  inspector = inspect(eng)
+  if "agent_work_claims" not in inspector.get_table_names():
+    return
+  has_revision = "transfer_notice_revision" in {
+    column["name"] for column in inspector.get_columns("agent_work_claims")
+  }
+  with eng.begin() as conn:
+    if not has_revision:
+      conn.execute(text("ALTER TABLE agent_work_claims ADD COLUMN transfer_notice_revision INTEGER"))
+    # SQLite may retain the column after an interrupted backfill. Retry from
+    # data state, preserving event identities already captured by this migration
+    # or runtime transfers even when the claim revision has since advanced.
+    # An open pending transfer has a known event revision. Do not guess one
+    # from older settled rows whose later revisions erased that distinction.
+    conn.execute(text(
+      "UPDATE agent_work_claims SET transfer_notice_revision=revision "
+      "WHERE transfer_notice_revision IS NULL AND previous_owner_chat_id IS NOT NULL "
+      "AND completed_at IS NULL AND released_at IS NULL "
+      "AND notification_revision < revision"
+    ))
+
+
+def _index_pending_goal_dependencies(eng) -> None:
+  """Seek live claim sources and owed results without scanning follow history."""
+  from sqlalchemy import text
+  with eng.begin() as conn:
+    conn.execute(text(
+      "CREATE INDEX IF NOT EXISTS ix_goal_dependencies_pending_claims "
+      "ON goal_dependencies (id) WHERE target_kind='claim_acquisition' "
+      "AND resolved_at IS NULL AND result_disposition IS NULL "
+      "AND withdrawn_at IS NULL AND owner_suppressed_at IS NULL"
+    ))
+    conn.execute(text(
+      "CREATE INDEX IF NOT EXISTS ix_goal_dependencies_pending_delivery "
+      "ON goal_dependencies (waiting_chat_id, id) WHERE resolved_at IS NOT NULL "
+      "AND result_disposition IS NULL AND withdrawn_at IS NULL "
+      "AND owner_suppressed_at IS NULL"
+    ))
+
+
+def _retire_legacy_claim_notice_carriers(eng) -> None:
+  """One-time retirement of proven terminal claim wakes, not peer receipts.
+
+  A transfer can share the claim-notice kind, so only the current terminal
+  revision is authoritative. Repeated execution is safe if ledger recording
+  was interrupted after this transaction committed.
+  """
+  from sqlalchemy import JSON, bindparam, inspect, text
+
+  # Partial historical schemas without these sources cannot hold old carriers.
+  if not {"agent_work_claims", "agent_coordination_messages", "chats"} <= set(
+      inspect(eng).get_table_names()):
+    return
+
+  with eng.begin() as conn:
+    terminal = conn.execute(text(
+      "SELECT n.id, n.to_chat_id, n.send_id, n.delivery, c.revision "
+      "FROM agent_coordination_messages n JOIN agent_work_claims c "
+      "ON n.from_run_id = ('work-claim:' || c.id) "
+      "WHERE c.completed_at IS NOT NULL OR c.released_at IS NOT NULL"
+    )).mappings().all()
+    terminal_ids = set()
+    chat_ids = set()
+    for notice in terminal:
+      if notice["send_id"] != f"revision:{notice['revision']}":
+        continue
+      terminal_ids.add(notice["id"])
+      if notice["to_chat_id"]:
+        chat_ids.add(notice["to_chat_id"])
+      if notice["delivery"] == "interrupt":
+        conn.execute(text(
+          "UPDATE agent_coordination_messages SET delivery='next_turn' "
+          "WHERE id=:id AND delivery='interrupt'"
+        ), {"id": notice["id"]})
+
+    # The saved note stays readable on the next authorized turn. Only its
+    # stale wake reservation is removed; peer cursors are never advanced.
+    update_pending = text(
+      "UPDATE chats SET pending_messages=:pending WHERE id=:chat_id"
+    ).bindparams(bindparam("pending", type_=JSON))
+    for chat_id in chat_ids:
+      pending = conn.execute(text(
+        "SELECT pending_messages FROM chats WHERE id=:chat_id"
+      ), {"chat_id": chat_id}).scalar_one_or_none()
+      if isinstance(pending, str):
+        pending = json.loads(pending)
+      if not isinstance(pending, list) or not pending:
+        continue
+      saved = {row["id"]: row for row in conn.execute(text(
+        "SELECT id, to_chat_id, delivery FROM agent_coordination_messages "
+        "WHERE to_chat_id=:chat_id"
+      ), {"chat_id": chat_id}).mappings()}
+
+      def obsolete(message):
+        if not isinstance(message, dict) or not (
+          message.get("kind") == "peer_message" and message.get("hidden") is True
+          and isinstance(message.get("peer_message_through"), dict)
+        ):
+          return False
+        content = message.get("content")
+        if not isinstance(content, str):
+          return False
+        _, marker, tail = content.partition("<agent_coordination>")
+        if not marker:
+          return False
+        encoded, close, _ = tail.partition("</agent_coordination>")
+        if not close:
+          return False
+        try:
+          data = json.loads(encoded)
+          entries = data["messages"]
+        except (ValueError, TypeError, KeyError):
+          return False
+        if not isinstance(entries, list) or not entries or data.get("self_chat_id") != chat_id:
+          return False
+        ids = [item.get("id") for item in entries if isinstance(item, dict)]
+        if len(ids) != len(entries) or any(not isinstance(value, str) for value in ids):
+          return False
+        if ids[-1] != message["peer_message_through"].get("id"):
+          return False
+        retired = False
+        for identity in ids:
+          note = saved.get(identity)
+          if note is None or note["to_chat_id"] != chat_id:
+            return False
+          if identity in terminal_ids:
+            retired = True
+          elif note["delivery"] == "interrupt":
+            return False
+        return retired
+
+      kept = [message for message in pending if not obsolete(message)]
+      if len(kept) != len(pending):
+        conn.execute(update_pending, {"chat_id": chat_id, "pending": kept})
+
+
+def _enforce_unique_live_claim_follows(eng) -> None:
+  """A Goal may have one live subscription to each claim acquisition."""
+  from sqlalchemy import inspect, text
+
+  if "goal_dependencies" not in inspect(eng).get_table_names():
+    return
+  live = ("target_kind = 'claim_acquisition' "
+          "AND result_disposition IS NULL AND withdrawn_at IS NULL")
+  with eng.begin() as conn:
+    # Before this index only the owner fence prevented a second live follow
+    # of one acquisition, so an owner database may already hold duplicates.
+    # Keep one per Goal (an owed result first, then the newest) and withdraw
+    # the rest exactly as Stop following would; never fail the upgrade.
+    groups = conn.execute(text(
+      "SELECT waiting_goal_id, target_acquisition_id FROM goal_dependencies "
+      f"WHERE {live} GROUP BY waiting_goal_id, target_acquisition_id "
+      "HAVING count(*) > 1"
+    )).all()
+    for goal_id, acquisition_id in groups:
+      rows = conn.execute(text(
+        "SELECT id FROM goal_dependencies "
+        f"WHERE {live} AND waiting_goal_id = :goal AND target_acquisition_id = :acq "
+        "ORDER BY CASE WHEN resolved_at IS NULL THEN 1 ELSE 0 END, created_at DESC, id DESC"
+      ), {"goal": goal_id, "acq": acquisition_id}).scalars().all()
+      for row_id in rows[1:]:
+        conn.execute(text(
+          "UPDATE goal_dependencies SET withdrawn_at = CURRENT_TIMESTAMP, "
+          "result_disposition = 'withdrawn' WHERE id = :id"
+        ), {"id": row_id})
+    conn.execute(text(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_goal_dependencies_live_claim_acquisition "
+      "ON goal_dependencies (waiting_goal_id, target_acquisition_id) "
+      "WHERE target_kind = 'claim_acquisition' "
+      "AND result_disposition IS NULL AND withdrawn_at IS NULL"
+    ))
+
+
+def _allow_core_contribution_review_runs(eng) -> None:
+  """Allow app-less review runs without weakening app-scoped request identity."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "contribution_review_runs" not in inspector.get_table_names():
+    return
+  columns = {c["name"]: c for c in inspector.get_columns("contribution_review_runs")}
+  needs_rebuild = (
+    eng.dialect.name == "sqlite"
+    and (not columns["app_id"]["nullable"] or not columns["app_nonce"]["nullable"])
+  )
+  if needs_rebuild:
+    # SQLite cannot drop NOT NULL. Keep the original table definition and all
+    # explicit indexes/triggers, changing only the two ownership columns.
+    raw = eng.raw_connection()
+    cursor = raw.cursor()
+    foreign_keys = cursor.execute("PRAGMA foreign_keys").fetchone()[0]
+    try:
+      cursor.execute("PRAGMA foreign_keys=OFF")
+      cursor.execute("BEGIN IMMEDIATE")
+      original = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='contribution_review_runs'"
+      ).fetchone()[0]
+      changed = original
+      for name, width in (("app_id", "INTEGER"), ("app_nonce", "VARCHAR(64)")):
+        if columns[name]["nullable"]:
+          continue
+        changed, count = re.subn(
+          rf'("{name}"|\b{name}\b)(\s+{re.escape(width)})\s+NOT\s+NULL',
+          r'\1\2', changed, count=1, flags=re.IGNORECASE,
+        )
+        if count != 1:
+          raise RuntimeError(f"Cannot identify review-run {name} column")
+      objects = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE tbl_name='contribution_review_runs' "
+        "AND type IN ('index','trigger') AND sql IS NOT NULL"
+      ).fetchall()
+      names = ", ".join(
+        '"' + row[1].replace('"', '""') + '"'
+        for row in cursor.execute("PRAGMA table_info(contribution_review_runs)")
+      )
+      cursor.execute(
+        "CREATE TABLE contribution_review_runs__core_0097 ("
+        + changed.partition("(")[2]
+      )
+      cursor.execute(
+        f"INSERT INTO contribution_review_runs__core_0097 ({names}) "
+        f"SELECT {names} FROM contribution_review_runs"
+      )
+      cursor.execute("DROP TABLE contribution_review_runs")
+      cursor.execute(
+        "ALTER TABLE contribution_review_runs__core_0097 "
+        "RENAME TO contribution_review_runs"
+      )
+      for (sql,) in objects:
+        cursor.execute(sql)
+      raw.commit()
+    except BaseException:
+      raw.rollback()
+      raise
+    finally:
+      cursor.execute(f"PRAGMA foreign_keys={int(foreign_keys)}")
+      cursor.close()
+      raw.close()
+  with eng.begin() as conn:
+    if eng.dialect.name != "sqlite":
+      for name in ("app_id", "app_nonce"):
+        if not columns[name]["nullable"]:
+          conn.execute(text(
+            f"ALTER TABLE contribution_review_runs ALTER COLUMN {name} DROP NOT NULL"
+          ))
+    if "options_json" not in columns:
+      conn.execute(text(
+        "ALTER TABLE contribution_review_runs ADD COLUMN options_json JSON NULL"
+      ))
+    conn.execute(text(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_contribution_review_runs_core_request "
+      "ON contribution_review_runs (owner_id, request_id) WHERE app_id IS NULL"
+    ))
+
+
+def _add_run_end_reason(eng) -> None:
+  """Record why a run was interrupted; historical rows stay unexplained (NULL)."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chat_runs" not in inspector.get_table_names():
+    return
+  if "end_reason" not in {c["name"] for c in inspector.get_columns("chat_runs")}:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE chat_runs ADD COLUMN end_reason VARCHAR(32)"))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -6663,6 +7097,16 @@ _SCHEMA_MIGRATIONS = (
   # Released to instances under this id; kept unique and appended after
   # main's ledger so it runs once wherever it has not run.
   ("0086_goal_execution_identity", _goal_execution_identity),
+  ("0089_wait_result_receipts", _add_wait_result_receipts),
+  ("0090_goal_dependencies", _add_goal_dependencies),
+  ("0091_saved_decision_cards", _add_saved_decision_cards),
+  ("0092_transfer_notice_revision", _add_transfer_notice_revision),
+  ("0093_pending_goal_dependency_indexes", _index_pending_goal_dependencies),
+  ("0094_retire_legacy_claim_notice_carriers", _retire_legacy_claim_notice_carriers),
+  ("0095_unique_live_claim_follows", _enforce_unique_live_claim_follows),
+  ("0096_app_accepted_consent", _add_app_accepted_consent),
+  ("0097_core_contribution_review_runs", _allow_core_contribution_review_runs),
+  ("0098_run_end_reason", _add_run_end_reason),
 )
 
 

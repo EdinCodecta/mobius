@@ -8,12 +8,19 @@
 //     silently undo it, in every tab: that mark lives in localStorage, which
 //     is shared by the browser, and the sign-in itself (a token written to the
 //     same localStorage) is shared too;
+//     except a sign-out the Möbius phone app took over: the workspace handed
+//     it to the app (MobiusNative.signOut), the app showed its own start
+//     screen, and signing in to the app again is the deliberate way back, so
+//     inside the app that mark must not ask for another tap. A hand-off that
+//     failed keeps the ordinary mark, since the app is still signed in;
 //   - this tab already went to mobius.you and came back without signing in
 //     (Back button, a failed round trip): that mark is per tab, in
 //     sessionStorage, and the card is the way to retry.
 // A completed sign-in clears both marks.
 
 const SIGNED_OUT_KEY = 'mobius_signed_out'
+// The SIGNED_OUT_KEY value for a sign-out the phone app took over.
+const HANDED_TO_APP = 'app'
 const REDIRECTED_KEY = 'mobius_sign_in_redirected'
 const PROBE_KEY = 'mobius_sign_in_probe'
 // Set when a credential expires and cleared by the login card; an automatic
@@ -32,8 +39,10 @@ function browserStores() {
   return { local: browserStore('localStorage'), session: browserStore('sessionStorage') }
 }
 
-export function markExplicitSignOut(stores = browserStores()) {
-  try { stores.local?.setItem(SIGNED_OUT_KEY, '1') } catch { /* private mode: card is the safe default */ }
+export function markExplicitSignOut(stores = browserStores(), { handedToApp = false } = {}) {
+  try {
+    stores.local?.setItem(SIGNED_OUT_KEY, handedToApp ? HANDED_TO_APP : '1')
+  } catch { /* private mode: card is the safe default */ }
   // An earlier expiry no longer describes why the card is showing.
   try { stores.session?.removeItem(EXPIRED_KEY) } catch { /* ignore */ }
 }
@@ -64,6 +73,7 @@ function storageAcceptsWrites(storage) {
 export function shouldRedirectToMobiusSignIn({
   authMode,
   standalone = false,
+  appOwnsSignOut = false,
   stores = browserStores(),
 }) {
   if (authMode !== 'mobius' || standalone) return false
@@ -72,7 +82,9 @@ export function shouldRedirectToMobiusSignIn({
   const { local, session } = stores
   if (!local || !session || !storageAcceptsWrites(local) || !storageAcceptsWrites(session)) return false
   try {
-    return !local.getItem(SIGNED_OUT_KEY) && !session.getItem(REDIRECTED_KEY)
+    const signedOut = local.getItem(SIGNED_OUT_KEY)
+    const signOutHolds = !!signedOut && !(appOwnsSignOut && signedOut === HANDED_TO_APP)
+    return !signOutHolds && !session.getItem(REDIRECTED_KEY)
   } catch {
     return false
   }

@@ -320,12 +320,10 @@ async def test_stalled_delegation_wake_cannot_block_other_recovery(
   import app.contribution_autopilot as autopilot_module
   import app.contribution_autopilot_recovery as autopilot_recovery_module
   import app.delegations as delegations_module
-  import app.routes.github as github_module
   import app.runtime_supervisors as supervisors_module
 
   broadcast = SystemBroadcast()
   startup_recovered = asyncio.Event()
-  attached_recovered = asyncio.Event()
   lease_recovered = asyncio.Event()
   blocker_recovered = asyncio.Event()
   wake_started = asyncio.Event()
@@ -348,9 +346,6 @@ async def test_stalled_delegation_wake_cannot_block_other_recovery(
 
   async def recover_unstarted():
     startup_recovered.set()
-
-  async def recover_attached(*_args, **_kwargs):
-    attached_recovered.set()
 
   async def wake_parents(**_kwargs):
     wake_started.set()
@@ -382,9 +377,6 @@ async def test_stalled_delegation_wake_cannot_block_other_recovery(
     delegations_module, "reconcile_unstarted_delegations", recover_unstarted,
   )
   monkeypatch.setattr(
-    github_module, "reconcile_attached_contribution_work", recover_attached,
-  )
-  monkeypatch.setattr(
     delegations_module, "wake_parents_for_completed_delegations", wake_parents,
   )
   monkeypatch.setattr(autopilot_module, "sweep_expired_leases", sweep)
@@ -394,7 +386,6 @@ async def test_stalled_delegation_wake_cannot_block_other_recovery(
   await supervisors._start_chat_supervisors()
   await asyncio.wait_for(wake_started.wait(), timeout=1)
   await asyncio.wait_for(startup_recovered.wait(), timeout=1)
-  await asyncio.wait_for(attached_recovered.wait(), timeout=1)
   await asyncio.wait_for(lease_recovered.wait(), timeout=1)
   await asyncio.wait_for(blocker_recovered.wait(), timeout=1)
 
@@ -426,3 +417,64 @@ async def test_boot_file_cache_reclaim_runs_off_the_event_loop_and_failure_stays
   assert [data_dir for data_dir, _thread in calls] == ["/tmp"]
   assert calls[0][1] != loop_thread
   await supervisors.stop()
+
+
+@pytest.mark.asyncio
+async def test_capacity_tick_releases_accumulated_cache_after_the_boot_pass(
+  monkeypatch,
+):
+  """The whole point of the periodic release is that it rides the existing
+  capacity tick, off the event loop, and skips the first tick because boot
+  just advised the same paths. Without this the wiring could be deleted and
+  every file_cache unit test would still pass."""
+  import app.broadcast as broadcast_module
+  import app.capacity_monitor as capacity_module
+  import app.chat as chat_module
+  import app.chat_writer as chat_writer_module
+  import app.file_cache as file_cache_module
+  import app.resource_pressure as pressure_module
+  import app.runtime_supervisors as supervisors_module
+  from app.config import get_settings
+
+  broadcast = SystemBroadcast()
+  events = []
+  release_threads = []
+  loop_thread = threading.get_ident()
+
+  async def no_chats(*_args, **_kwargs):
+    return chat_module.ContinuationSweepResult()
+
+  def capacity_tick(*_args, **_kwargs):
+    events.append("tick")
+    return {"alerted": False, "notification_id": None, "tier": None, "snapshot": {}}
+
+  def release(data_dir):
+    events.append(data_dir)
+    release_threads.append(threading.get_ident())
+    return None
+
+  monkeypatch.setattr(broadcast_module, "get_system_broadcast", lambda: broadcast)
+  monkeypatch.setattr(supervisors_module, "SessionLocal", _EmptySession)
+  monkeypatch.setattr(supervisors_module, "CAPACITY_MONITOR_INTERVAL_SECS", 0)
+  monkeypatch.setattr(chat_module, "sweep_reset_parks", no_chats)
+  monkeypatch.setattr(capacity_module, "run_capacity_tick", capacity_tick)
+  monkeypatch.setattr(
+    pressure_module, "resource_status",
+    lambda *_a, **_k: {"pressure": {"disk": {"state": "normal"}}},
+  )
+  monkeypatch.setattr(
+    chat_writer_module, "rearm_transcript_conversion", lambda *_a: False,
+  )
+  monkeypatch.setattr(file_cache_module, "reclaim_accumulated_cache", release)
+
+  supervisors = _supervisors()
+  await supervisors._start_chat_supervisors()
+  for _ in range(200):
+    if len(events) >= 3:
+      break
+    await asyncio.sleep(0.01)
+  await supervisors.stop()
+
+  data_dir = get_settings().data_dir
+  assert events[:3] == ["tick", "tick", data_dir]
+  assert release_threads[0] != loop_thread

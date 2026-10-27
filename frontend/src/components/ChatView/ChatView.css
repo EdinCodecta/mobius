@@ -453,11 +453,37 @@
   pointer-events: none;
   transition: opacity 0.15s ease, visibility 0s linear 0.15s;
 }
+/* A reply's row is its own line under the reply, not an overlay in the
+   conversation gap: it keeps its space while hidden and while the reply is
+   still streaming, so settling, revealing or pinning it never moves the
+   transcript, and it always sits the same distance below the reply's last
+   line (its fixed height comes from .chat__msg-meta). Pulled left by the
+   copy button's padding so the glyph lines up with the reply's text. */
+.chat__msg-meta--start {
+  display: flex;
+  width: fit-content;
+  align-self: flex-start;
+  margin: 6px 0 0 -5px;
+  padding-top: 0;
+}
+/* Actions first, then the quiet time, reading from the reply's edge. */
+.chat__msg-meta--start .chat__ts { order: 1; margin-left: 4px; }
 .chat__msg-meta--visible {
   opacity: 1;
   visibility: visible;
   pointer-events: auto;
   transition-delay: 0s;
+}
+/* With a mouse, hovering a reply reveals its row; touch keeps the tap reveal
+   above, and owner messages keep tap only. Only the latest reply keeps its
+   row visible (ChatView). */
+@media (hover: hover) and (pointer: fine) {
+  .chat__reply:hover > .chat__msg-meta {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transition-delay: 0s;
+  }
 }
 .chat__ts {
   font-size: 11px;
@@ -470,7 +496,8 @@
    available (this is a plain tap target — never a press/hold interception,
    see chatUiPolish.test), but a single tap reveals a quiet ghost button
    beside the timestamp when one is present. */
-.chat__msg-copy {
+.chat__msg-copy,
+.chat__msg-retry {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -487,15 +514,20 @@
   opacity: 0.7;
   transition: opacity 140ms ease, color 140ms ease, background 140ms ease;
 }
-.chat__msg-copy:active { transform: scale(0.94); }
+.chat__msg-copy:active,
+.chat__msg-retry:active { transform: scale(0.94); }
+.chat__msg-retry:disabled { cursor: default; opacity: 0.4; transform: none; }
 .chat__msg-copy--copied { color: var(--accent); opacity: 1; }
-.chat__msg-copy:focus-visible {
+.chat__msg-copy--failed { color: var(--danger); opacity: 1; }
+.chat__msg-copy:focus-visible,
+.chat__msg-retry:focus-visible {
   outline: 2px solid var(--accent); /* CONTRACT: vivid accent ring for keyboard focus */
   outline-offset: -2px;
   opacity: 1;
 }
 @media (hover: hover) and (pointer: fine) {
-  .chat__msg-copy:hover {
+  .chat__msg-copy:hover,
+  .chat__msg-retry:hover:not(:disabled) {
     background: var(--surface-2); /* CONTRACT: secondary opaque fill */
     color: var(--text);
   }
@@ -2402,6 +2434,7 @@
 
 .chat__foot .queued,
 .chat__foot .side-question,
+.chat__foot .upload-folder-prompt,
 .chat__foot .chat__history-strip,
 .chat__foot .connection-status,
 .chat__foot .chat__attach-tray,
@@ -3260,17 +3293,6 @@
   align-items: center;
   gap: 7px;
   min-width: 0;
-}
-
-.composer-popover__row-attention {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  flex-shrink: 0;
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1.4;
-  color: var(--warning, #d8922f);
 }
 
 .composer-popover__row-sub {
@@ -4480,6 +4502,8 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 }
 
 .chat__goal-history {
+  width: 100%;
+  min-width: 0;
   --lifecycle-tone: var(--green);
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr);
@@ -4502,6 +4526,8 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 
 /* What started an answer sits above its first line. */
 .chat__answer-cause {
+  width: 100%;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -4827,6 +4853,35 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
   text-overflow: ellipsis;
 }
 
+/* Files attached to a queued message. A message that is only a picture has no
+   text, so this is the whole row; with text it sits after it. */
+.queued__files {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 50%;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted); /* CONTRACT: low-contrast text on opaque fill */
+}
+
+.queued__files--only {
+  flex: 1;
+  max-width: none;
+}
+
+.queued__files svg {
+  flex-shrink: 0;
+}
+
+.queued__files-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* The queued message open in the chat box (ChatInputBar's history strip says
    "Editing queued message N of M"). The row stays in place, tinted, and its
    pencil becomes a quiet label so the owner can see where the edit will land. */
@@ -4983,3 +5038,48 @@ details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 .chat__goal-execution li { display: flex; flex-direction: column; gap: 2px; padding: 6px 0; font-size: 12px; overflow-wrap: anywhere; }
 .chat__goal-helper-question { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; padding-left: 8px; border-left: 1px solid var(--border-light); }
 .chat__goal-execution .chat__goal-helper-question p { margin: 0; white-space: pre-wrap; color: var(--text); }
+
+.chat__dependency-backlinks, .qcard__related-work {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.chat__dependency-backlinks { margin: 8px 0; }
+.chat__dependency-backlinks a { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
+.chat__dependency-backlinks ul { margin: 8px 0; padding-left: 20px; }
+.chat__dependency-backlinks summary, .qcard__related-work > summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+.chat__dependency-backlinks summary::-webkit-details-marker,
+.qcard__related-work > summary::-webkit-details-marker { display: none; }
+.chat__dependency-backlinks summary:focus-visible,
+.qcard__related-work > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.qcard__related-work { margin: 10px 0; }
+
+/* Dependency navigation keeps the same small type in the rail and transcript. */
+.chat__dependency-link {
+  display: inline-block;
+  align-self: flex-start;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 3px 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  overflow-wrap: anywhere;
+}
+.chat__dependency-link:hover { color: var(--accent); }
+.chat__dependency-backlinks a:focus-visible,
+.chat__dependency-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+.chat__dependency-history-detail { margin: 6px 0 0 38px; font-size: 12px; }
+
+.chat__dependency-actions { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.chat__dependency-stop { display: flex; flex-direction: column; gap: 4px; }
+button.chat__dependency-link { cursor: pointer; background: none; border: 0; text-align: left; }
+button.chat__dependency-link:disabled { cursor: default; opacity: .55; }

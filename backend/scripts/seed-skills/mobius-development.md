@@ -30,6 +30,17 @@ owns activation and restarts, and `contributing` owns public GitHub actions.
   rows: never read or write it directly; `transcript_rows` readers serve an
   unconverted chat from it themselves. Read `TRANSCRIPT_STORAGE_DESIGN.md`
   before changing chat persistence.
+- **Local platform commits.** Updates carry local commits as labelled units
+  and retire a unit's unchanged files once the release merges its pull
+  request. Contribute records that itself; when you open a pull request for a
+  local platform commit any other way, run
+  `python3 backend/scripts/platform_overlay.py mark <commit> pending-pr:#<N>`.
+  Mark work the owner wants kept even after upstream merges a version of it
+  `owner-choice:local`. Settings does not list retired files yet; each update
+  that retired some (Apply, the agent repair path, or a parked conflict) pins
+  the commit holding the old copies at
+  `refs/mobius/platform-set-aside/retired-<time>-<release>` (the three most
+  recently retired stay).
 - **Owner-input cards.** Card access is deliberately uniform: any authenticated
   participant that can read a Q&A, Restart, or sealed-input card may answer it
   through that card's ordinary endpoint. The chat access check and exact card
@@ -82,12 +93,16 @@ reason to hide or skip validation. Inside Möbius:
 
 - run `scripts/test.sh --fast` for the cheap hermetic contracts and
   `scripts/wt-pytest.sh <focused tests>` for the changed behavior;
-- keep memory bounded: the container shares one memory limit with every
-  running chat. Build the shell only through `npm run build` (it caps the heap
+- keep resources bounded: the container shares one cgroup quota — about 4
+  CPUs, 1000 process ids, and one ~4 GB memory limit, whatever `nproc`
+  reports — with every running chat and helper, so aggregate concurrency
+  counts, not just one process's memory. Build the shell only through
+  `npm run build` (it caps the heap
   and takes the build lock); never call `vite` directly. Frontend tests run one
   worker by default (`MOBIUS_TEST_CONCURRENCY`; most workers need about 100 MB,
-  component-rendering workers up to about 550 MB); raise it only when nothing
-  else is running, and never run test suites in parallel. A component test that
+  component-rendering workers reach about 900 MB, so three nearly fill a
+  4 GB container); raise it to at most 2, only when no other chat is running,
+  and never run test suites in parallel. A component test that
   renders through Vite creates its server with `createSsrRenderServer` from
   `frontend/src/lib/__tests__/ssrRenderServer.mjs`, never with `createServer`
   directly;
