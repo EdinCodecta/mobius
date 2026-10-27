@@ -96,6 +96,11 @@ MANAGED_EXACT_ROUTES = frozenset({
   ("POST", "/api/instance/v1/railway/connect/start"),
   ("POST", "/api/instance/v1/railway/plan/refresh"),
 })
+# The only managed read that takes a query: the opt-in inventory extensions,
+# each spelled exactly ``<name>=1`` in canonical order.
+MANAGED_QUERY_ROUTES = {
+  ("GET", "/api/instance/v1/railway"): frozenset({"region_options", "workspace_ids"}),
+}
 MANAGED_RAILWAY_INSTANCE_WRITES = (
   ("PATCH", re.compile(rf"/api/instance/v1/railway/instances/{MANAGED_INSTANCE_ID}")),
   ("PATCH", re.compile(
@@ -111,8 +116,8 @@ MANAGED_USER_AGENT = "mobius-managed-deployment/1"
 # 1 = pre-/managed broker; 2 = /managed upstream-proxy routes present;
 # 3 = standalone web search endpoint; 4 = flat gateway wire for Codex web.run;
 # 5 = account review routes; 6 = shared access; 7 = recipient invitation response;
-# 8 = native push relay routes.
-BROKER_ROUTE_EPOCH = 8
+# 8 = native push relay routes; 9 = Railway inventory read options.
+BROKER_ROUTE_EPOCH = 9
 
 # Declarative public forwarding policy. Callers never supply a target URL,
 # audience, or arbitrary upstream path. Contribution and community routes are
@@ -207,18 +212,25 @@ def _community_scope(method: str, route_path: str, query: str) -> str | None:
     "/v1/community/apps", "/v1/community/publications",
   }:
     return None
-  pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
   allowed = (
     {"q", "limit", "offset"}
     if route_path == "/v1/community/apps"
     else {"limit", "offset"}
   )
+  return scope if _canonical_query_pairs(query, allowed) is not None else None
+
+
+def _canonical_query_pairs(
+  query: str, allowed: set[str] | frozenset[str],
+) -> list[tuple[str, str]] | None:
+  """A query naming only allowed keys, each once, exactly as urlencode orders it."""
+  pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
   keys = [key for key, _value in pairs]
   if any(key not in allowed for key in keys) or len(keys) != len(set(keys)):
     return None
   if urllib.parse.urlencode(sorted(pairs)) != query:
     return None
-  return scope
+  return pairs
 
 
 def _request_body_limit(*, is_unix: bool, method: str, path: str) -> int:
@@ -449,7 +461,13 @@ def _managed_upstream_path(method: str, path: str) -> str | None:
   """Map only declared instance API families; callers never choose an origin."""
   if not path.startswith(MANAGED_PREFIX):
     return None
-  upstream = path.removeprefix(MANAGED_PREFIX)
+  upstream, separator, query = path.removeprefix(MANAGED_PREFIX).partition("?")
+  if separator:
+    allowed = MANAGED_QUERY_ROUTES.get((method, upstream))
+    pairs = _canonical_query_pairs(query, allowed) if allowed else None
+    if not pairs or any(value != "1" for _key, value in pairs):
+      return None
+    return upstream + "?" + query
   if (
     any(character in upstream for character in "?#%\\")
     or "//" in upstream
