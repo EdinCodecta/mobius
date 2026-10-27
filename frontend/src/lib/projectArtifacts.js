@@ -89,19 +89,30 @@ export function resultDisplayName(project, artifact) {
 }
 
 // What a freshly opened project shows first: its main result when one has been
-// built, otherwise that result's source file. The main result is the first one
-// the project type declares as a preview, else the first result. A project with
-// no results opens on its overview.
+// built, otherwise that result's source file. The main result is the first
+// declared preview that is registered, in declaration order, else the first
+// result. A project with no results opens on its overview.
 export function projectEntryTarget(project) {
   const artifacts = Array.isArray(project?.artifacts) ? project.artifacts : []
   if (!artifacts.length) return null
-  const declared = new Set((project?.template?.previews || []).map(row => row?.id).filter(Boolean))
-  const main = artifacts.find(row => declared.has(row?.id)) || artifacts[0]
+  const byId = new Map(artifacts.map(row => [row?.id, row]))
+  const main = (project?.template?.previews || [])
+    .map(preview => byId.get(preview?.id))
+    .find(Boolean) || artifacts[0]
   if (main?.has_output) return { kind: 'result', artifactId: main.id }
   if (typeof main?.source === 'string' && main.source && !main.source_missing) {
     return { kind: 'file', path: main.source }
   }
   return null
+}
+
+// Any source change can leave a built result out of date, whichever surface
+// (owner or collaborator) saw it, so results refresh beside the source's views.
+export function refreshSourceViews(client, source, artifactsKey) {
+  return Promise.all([
+    source.invalidate(client),
+    client.invalidateQueries({ queryKey: artifactsKey, exact: true }),
+  ])
 }
 
 export function artifactPreviewKind(artifact) {

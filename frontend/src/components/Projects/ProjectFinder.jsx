@@ -24,7 +24,8 @@ import Trash2 from 'lucide-react/dist/esm/icons/trash-2.mjs'
 import ProjectChangeDiff, { ChangeLineCounts, ProjectFileDiff } from './ProjectChangeDiff.jsx'
 import { api, jsonOrThrow } from '../../api/client.js'
 import { assembleProjectHtmlPreview } from '../../lib/projectPreview.js'
-import { artifactTypeForFile } from '../../lib/projectArtifacts.js'
+import { artifactTypeForFile, refreshSourceViews } from '../../lib/projectArtifacts.js'
+import { projectQueries } from '../../hooks/queries.js'
 import { lineNumbersFor, windowedCode } from '../../lib/codeWindow.js'
 import {
   addProjectCsvColumn,
@@ -158,8 +159,6 @@ export default function ProjectFinder({
     invalidate: client => Promise.all([
       client.invalidateQueries({ queryKey: ['projects', 'files', projectId] }),
       client.invalidateQueries({ queryKey: ['projects', 'git', projectId] }),
-      // A source change can leave a built result out of date.
-      client.invalidateQueries({ queryKey: ['projects', 'artifacts', projectId] }),
     ]),
   }), [fileSource, projectId])
   const readOnly = !!source.readOnly
@@ -548,7 +547,7 @@ export default function ProjectFinder({
     let delay = PROJECT_CHANGES_ACTIVE_MS
     const handleChanges = async (changes, truncated = false) => {
       if (!active || (!truncated && (!changes || changes.length === 0))) return false
-      await source.invalidate(queryClient)
+      await refreshSourceViews(queryClient, source, projectQueries.keys.artifacts(projectId))
       const selectedNow = liveFileRef.current?.selected
       if (
         selectedNow
@@ -692,8 +691,8 @@ export default function ProjectFinder({
 
   // ── File mutations ──────────────────────────────────────────────────────────
   const refetchWorkspace = useCallback(async () => {
-    await source.invalidate(queryClient)
-  }, [source, queryClient])
+    await refreshSourceViews(queryClient, source, projectQueries.keys.artifacts(projectId))
+  }, [source, queryClient, projectId])
 
   async function refreshOutputAfterSourceChange(changedPath) {
     if (!onSourceChanged) return

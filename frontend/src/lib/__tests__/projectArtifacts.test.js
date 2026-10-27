@@ -158,3 +158,36 @@ test('a fresh project opens on its main result when built, else on that result\'
   assert.equal(projectEntryTarget({ template, artifacts: [{ ...fresh, source_missing: true }] }), null)
   assert.equal(projectEntryTarget({ template, artifacts: [] }), null)
 })
+
+test('the main result follows declared preview order, not registry order', async () => {
+  const { projectEntryTarget } = await import('../projectArtifacts.js')
+  const template = { previews: [{ id: 'primary' }, { id: 'secondary' }] }
+  const artifacts = [
+    { id: 'secondary', source: 'appendix.tex', has_output: true },
+    { id: 'primary', source: 'main.tex', has_output: true },
+  ]
+  assert.deepEqual(projectEntryTarget({ template, artifacts }), { kind: 'result', artifactId: 'primary' })
+  assert.deepEqual(projectEntryTarget({ template: { previews: [{ id: 'gone' }] }, artifacts }), { kind: 'result', artifactId: 'secondary' })
+})
+
+test('a collaborator source change refreshes a mounted, settled result to out of date', async () => {
+  const { QueryClient, QueryObserver } = await import('@tanstack/react-query')
+  const { refreshSourceViews } = await import('../projectArtifacts.js')
+  const client = new QueryClient()
+  const key = ['projects', 'artifacts', 'shared-7']
+  let server = [{ id: 'site', status: 'ok', has_output: true, out_of_date: false }]
+  const observer = new QueryObserver(client, { queryKey: key, queryFn: async () => server, staleTime: Infinity })
+  const unsubscribe = observer.subscribe(() => {})
+  try {
+    await client.fetchQuery({ queryKey: key, queryFn: async () => server })
+    assert.equal(observer.getCurrentResult().data[0].out_of_date, false)
+    server = [{ ...server[0], out_of_date: true }]
+    // The shared surface's own invalidator refreshes only its files and Git.
+    const sharedSource = { invalidate: c => c.invalidateQueries({ queryKey: ['shared-project', 'shared-7', 'files'] }) }
+    await refreshSourceViews(client, sharedSource, key)
+    assert.equal(observer.getCurrentResult().data[0].out_of_date, true)
+  } finally {
+    unsubscribe()
+    client.clear()
+  }
+})
