@@ -145,6 +145,9 @@ because `/data/platform` is the persistent served clone. The baked
 - A bad import keeps the edited tree from serving. Boot import-probes the
   persistent clone and falls back to the baked backend, leaving the local tree
   intact for repair. Always run `python3 -m py_compile <file>` before a restart.
+  A commit that imports but crashes or hangs while the server starts is set
+  aside the same way after two such boots in a row; `/data/logs/platform-boot.jsonl`
+  records an `admit` refusal. A new commit or an approved restart tries it again.
 - A local fix is persistent but not upstream. Startup preserves installed source and local changes without fetching newer
   code. Explicit updates reconcile local changes onto the reviewed release;
   they can still conflict, and another installation will not receive a local fix. Ask
