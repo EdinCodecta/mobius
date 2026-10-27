@@ -802,9 +802,12 @@ run its accepted code in a hidden, inert frame while the block is near the
 viewport, so the block can show current status and an in-place Confirm. It is
 an execution capability, not an HTTP permission: the app keeps its ordinary
 app token and server grants, so this is not a read-only sandbox. Its contract
-requires read-only module startup and session hydration; the app may act only
-after an explicit owner event (`activate`, `confirm`, `cancel`) and must check
-it again itself. The review copy says so: after the owner presses Confirm the
+requires read-only module startup and session hydration, and the app may cause
+an effect only after the owner's explicit `confirm`, which it must check again
+itself. `activate` and `cancel` are effect-free requests to prepare or
+withdraw a confirmation; that is why an unacknowledged `confirm` survives a
+document reload as a recovery hold while an unacknowledged `activate` or
+`cancel` does not. The review copy says so: after the owner presses Confirm the
 app can act, for example publish a change. Omission is no grant; existing
 owners are never auto-granted it, and declaring it is a reviewable widening.
 
