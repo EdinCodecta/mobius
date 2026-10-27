@@ -685,7 +685,7 @@ async def run_build(project_id: str, artifact_id: str) -> None:
     started = time.monotonic()
     # Taken before the builder reads the tree, so an edit made during the
     # build leaves the new output marked out of date.
-    built_fingerprint = await asyncio.to_thread(source_fingerprint, root)
+    built_fingerprint = await asyncio.to_thread(source_fingerprint, root)  # unsettled: read-only (source file metadata)
     _write_status(project_id, artifact_id, status="building", duration_ms=None)
     _publish_build_event(project_id, artifact_id, "building")
 
