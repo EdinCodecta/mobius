@@ -685,11 +685,15 @@ fi
 # `pointer: none` and silently drops every `@media (hover: hover)` desktop
 # style from captures. At desktop widths, launch the session's browser through
 # the Blink-settings wrapper that restores desktop pointer capabilities. An
-# already-running session keeps its launch flags; the fix applies whenever the
-# session's browser (re)starts.
+# already-running session keeps its launch flags, so verify its capabilities
+# after startup and recycle it when they do not match the requested width.
 # The daemon resolves the executable from its own working directory, so the
 # wrapper path must be absolute.
 WRAPPER_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/chrome-desktop-pointer.sh"
+if [ "$VIEWPORT_WIDTH" -lt 1024 ] && [ "${AGENT_BROWSER_EXECUTABLE_PATH:-}" = "$WRAPPER_PATH" ]; then
+  export AGENT_BROWSER_EXECUTABLE_PATH="${MOBIUS_SCREENSHOT_REAL_BROWSER:-}"
+  unset MOBIUS_SCREENSHOT_REAL_BROWSER
+fi
 if [ "$VIEWPORT_WIDTH" -ge 1024 ] && [ -x "$WRAPPER_PATH" ] \
     && [ "${AGENT_BROWSER_EXECUTABLE_PATH:-}" != "$WRAPPER_PATH" ]; then
   REAL_BROWSER="${AGENT_BROWSER_EXECUTABLE_PATH:-}"
@@ -737,24 +741,6 @@ if [ "$CURRENT_PAGE" -eq 0 ]; then
   if ! browser_set_viewport_retry; then
     recover_singleton_contention
     die "browser did not become ready for viewport configuration"
-  fi
-
-  # The session's browser may predate the desktop-pointer wrapper (any raw
-  # agent-browser call relaunches it without the wrapper env). A browser that
-  # still reports `hover: none` at a desktop viewport would silently drop every
-  # `@media (hover: hover)` style from this capture, so recycle it once; the
-  # re-exec relaunches through the wrapper.
-  if [ -n "${MOBIUS_SCREENSHOT_REAL_BROWSER:-}" ]; then
-    BROWSER_PHASE="desktop pointer capabilities"
-    HOVER_STATE="$(browser_eval_retry "matchMedia('(hover: hover)').matches" || true)"
-    if [ "$HOVER_STATE" != "true" ]; then
-      if [ "$SCREENSHOT_RECOVERY_COUNT" -eq 0 ]; then
-        restart_capture_once \
-          || die "browser lacks desktop pointer capabilities and could not be recycled"
-      else
-        echo "agent-screenshot.sh: browser still reports hover:none at a desktop viewport; hover-dependent styles will be missing from this capture" >&2
-      fi
-    fi
   fi
 
 # A retained test profile can start under an older service worker that handles
@@ -903,9 +889,39 @@ esac
 # public app hosts have their own entry shapes, but still receive controller
 # detachment + cache-busted navigation.
 SHELL_SETTLED_EXPR=""
-PUBLIC_APP_PAGE="$(browser_eval_retry \
-  "document.querySelector('body > iframe#app') !== null && document.querySelector('body > #status') !== null" \
+# Check pointer capabilities with the existing page-shape probe to keep the
+# capture within its command budget on slow servers.
+BROWSER_PHASE="page and pointer capabilities"
+PAGE_STATE="$(browser_eval_retry \
+  "[document.querySelector('body > iframe#app') !== null && document.querySelector('body > #status') !== null, matchMedia('(hover: hover)').matches]" \
   || true)"
+read -r PUBLIC_APP_PAGE HOVER_STATE <<<"$(printf '%s' "$PAGE_STATE" | python3 -c '
+import json, sys
+try:
+  values = json.load(sys.stdin)
+  assert isinstance(values, list) and len(values) == 2
+  assert all(isinstance(value, bool) for value in values)
+  print(*(str(value).lower() for value in values))
+except (ValueError, AssertionError):
+  print("unknown unknown")
+')"
+if [ "$PUBLIC_APP_PAGE" = unknown ]; then
+  die "browser could not verify page and pointer capabilities"
+fi
+EXPECTED_HOVER=false
+if [ "$VIEWPORT_WIDTH" -ge 1024 ] && [ -n "${MOBIUS_SCREENSHOT_REAL_BROWSER:-}" ]; then
+  EXPECTED_HOVER=true
+fi
+if { [ "$VIEWPORT_WIDTH" -lt 1024 ] && [ "$HOVER_STATE" = true ]; } || \
+   { [ "$EXPECTED_HOVER" = true ] && [ "$HOVER_STATE" = false ]; }; then
+  if [ "$CURRENT_PAGE" -eq 1 ]; then
+    die "current page uses pointer capabilities for a different viewport; open the page again before capturing"
+  elif [ "$SCREENSHOT_RECOVERY_COUNT" -eq 0 ]; then
+    restart_capture_once || die "browser pointer capabilities could not be reset"
+  else
+    die "browser pointer capabilities do not match the requested viewport"
+  fi
+fi
 case "$ROUTE" in
   /apps/*) : ;;
   *)
