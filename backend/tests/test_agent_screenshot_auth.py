@@ -45,16 +45,17 @@ def _fixture_script(tmp_path: Path) -> Path:
   """
   root = tmp_path / "fixture"
   script = root / "backend" / "scripts" / SCRIPT.name
-  script.parent.mkdir(parents=True)
+  script.parent.mkdir(parents=True, exist_ok=True)
   shutil.copy2(SCRIPT, script)
   shutil.copy2(SESSION_RESET, script.with_name(SESSION_RESET.name))
+  shutil.copy2(SCRIPT.with_name("chrome-desktop-pointer.sh"), script.with_name("chrome-desktop-pointer.sh"))
   app = root / "backend" / "app"
-  app.mkdir()
+  app.mkdir(exist_ok=True)
   (app / "__init__.py").touch()
   process_owner = SCRIPT.parents[1] / "app" / "browser_processes.py"
   shutil.copy2(process_owner, app / process_owner.name)
   dist = root / "frontend" / "dist"
-  dist.mkdir(parents=True)
+  dist.mkdir(parents=True, exist_ok=True)
   (dist / "index.html").write_text(
     f'<script type="module" src="/assets/{SHELL_ENTRY}"></script>',
     encoding="utf-8",
@@ -107,6 +108,9 @@ def _fake_browser(tmp_path: Path) -> tuple[Path, Path]:
     "fi\n"
     "case \"$1\" in\n"
     "  open)\n"
+    "    if [ ! -f \"$FAKE_POINTER_STATE\" ]; then\n"
+    "      case \"${AGENT_BROWSER_EXECUTABLE_PATH:-}\" in *chrome-desktop-pointer.sh) echo true ;; *) echo false ;; esac > \"$FAKE_POINTER_STATE\"\n"
+    "    fi\n"
     "    if [ -n \"${FAKE_FIRST_OPEN_DELAY:-}\" ] && [ ! -e \"$FAKE_FIRST_OPEN_MARKER\" ]; then\n"
     "      : > \"$FAKE_FIRST_OPEN_MARKER\"\n"
     "      python3 -c 'import sys, time; time.sleep(float(sys.argv[1]))' \"$FAKE_FIRST_OPEN_DELAY\"\n"
@@ -146,9 +150,10 @@ def _fake_browser(tmp_path: Path) -> tuple[Path, Path]:
     "  eval)\n"
     "    if [ \"$2\" = \"--stdin\" ]; then cat > \"$FAKE_BROWSER_STDIN_LOG\"; exit 0; fi\n"
     "    case \"$2\" in\n"
-    "      *body\\ \\>\\ iframe#app*) printf '%s\\n' \"${FAKE_PUBLIC_APP:-false}\" ;;\n"
+    "      *body\\ \\>\\ iframe#app*) printf '[%s,%s]\\n' \"${FAKE_PUBLIC_APP:-false}\" \"$(cat \"$FAKE_POINTER_STATE\" 2>/dev/null || echo false)\" ;;\n"
     "      */api/owner/timezone*) printf '%s\\n' \"$FAKE_AUTH_OUTPUT\" ;;\n"
     "      *src.split*) python3 -c 'import json,os; print(json.dumps(os.environ[\"FAKE_LOADED_ASSET\"]))' ;;\n"
+    "      *matchMedia*hover*) cat \"$FAKE_POINTER_STATE\" ;;\n"
     "      *serviceWorker*) printf '%s\\n' true ;;\n"
     "      *) printf '%s\\n' true ;;\n"
     "    esac\n"
@@ -240,11 +245,12 @@ def _run_helper(
       "from pathlib import Path\n"
       "with Path(sys.argv[1]).with_suffix('.resets').open('a') as log:\n"
       "  log.write(sys.argv[1] + '\\n')\n"
+      "Path(sys.argv[1]).with_suffix('.pointer').unlink(missing_ok=True)\n"
     )
   output = tmp_path / "shot.png"
   browser_log = tmp_path / "browser.log"
   browser_profile = tmp_path / "browser-profile"
-  browser_profile.mkdir()
+  browser_profile.mkdir(exist_ok=True)
   if existing_output is not None:
     output.write_bytes(existing_output)
   if profile_lock_target is not None:
@@ -280,6 +286,7 @@ def _run_helper(
     ),
     "FAKE_LOADED_ASSET": loaded_asset or SHELL_ENTRY,
     "FAKE_BROWSER_LOG": str(browser_log),
+    "FAKE_POINTER_STATE": str(tmp_path / "browser-profile.pointer"),
     "FAKE_BROWSER_IDENTITY_LOG": str(tmp_path / "browser-identity.log"),
     "FAKE_CAPTURE_LOCK_INHERITED": str(tmp_path / "capture-lock-inherited"),
     "FAKE_SCREENSHOT_MARKER": str(marker),
@@ -1599,3 +1606,31 @@ def test_recovery_attempt_inherits_the_original_capture_deadline(tmp_path: Path)
   recovered = {value for value in seen if value != "1"}
   assert len(recovered) == 1
   assert started + 90 <= int(recovered.pop()) <= int(time.time()) + 90
+
+
+def test_desktop_then_phone_capture_resets_pointer_capabilities(tmp_path: Path):
+  desktop, _, _, _ = _run_helper(
+    tmp_path, auth_ok=True, viewport_width=1200, record_resets=True,
+    extra_env={"AGENT_BROWSER_EXECUTABLE_PATH": "/bin/true"},
+  )
+  assert desktop.returncode == 0, desktop.stderr
+  assert (tmp_path / "browser-profile.pointer").read_text().strip() == "true"
+  phone, _, _, _ = _run_helper(tmp_path, auth_ok=True, record_resets=True)
+  assert phone.returncode == 0, phone.stderr
+  assert (tmp_path / "browser-profile.pointer").read_text().strip() == "false"
+  assert (tmp_path / "browser-profile.resets").read_text().count("\n") == 1
+
+
+def test_current_page_pointer_mismatch_preserves_open_session(tmp_path: Path):
+  desktop, _, _, _ = _run_helper(
+    tmp_path, auth_ok=True, viewport_width=1200, record_resets=True,
+    extra_env={"AGENT_BROWSER_EXECUTABLE_PATH": "/bin/true"},
+  )
+  assert desktop.returncode == 0, desktop.stderr
+  phone, _, _, _ = _run_helper(
+    tmp_path, auth_ok=True, current_page=True, record_resets=True,
+  )
+  assert phone.returncode != 0
+  assert "pointer capabilities for a different viewport" in phone.stderr
+  assert (tmp_path / "browser-profile.pointer").read_text().strip() == "true"
+  assert not (tmp_path / "browser-profile.resets").exists()
