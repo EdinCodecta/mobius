@@ -3465,6 +3465,12 @@ def _publish_reviewed_screenshots(
       "screenshots cannot be sent from here. Nothing was sent.",
       code="screenshot_update_unsupported", record_patch=record_patch,
     )
+  try:
+    # The entries come from the app-writable record: check their shape and
+    # bytes before anything reads them.
+    contribution_screenshots.verify(diff_path.with_suffix(".json"), screenshots)
+  except ContributionSubmitError as exc:
+    raise _git_ops._merge_error_patch(exc, record_patch) from exc
   _check_screenshot_body(
     body, screenshots, upstream_repo=upstream_repo, login=login,
     branch=branch, record_patch=record_patch,
@@ -3496,6 +3502,14 @@ def _publish_reviewed_screenshots(
     resolved = contribution_screenshots.resolve_body(
       body, screenshots, assets_repo=assets_repo, commit=commit, branch=branch,
     )
+    # The early check guessed the fork's name; a renamed fork links longer.
+    if len(resolved.encode("utf-8")) > GITHUB_BODY_MAX_BYTES:
+      raise ContributionSubmitError(
+        f"The screenshots were uploaded to {assets_repo}, but with their "
+        "links this description exceeds GitHub's size limit. Ask the agent "
+        "to shorten it. The code was not sent.",
+        code="screenshot_body_too_large",
+      )
   except ContributionSubmitError as exc:
     raise _git_ops._merge_error_patch(exc, record_patch) from exc
   record_patch = _git_ops._record_patch_with(record_patch, {
@@ -3935,6 +3949,13 @@ def _submit_prepared_pr(
       except (ContributionSubmitError, subprocess.TimeoutExpired, OSError):
         return None
 
+    if same_repo_submission:
+      # Before anything is uploaded, including screenshots.
+      try:
+        _git_ops._assert_upstream_push_permission(repo, upstream_repo)
+      except ContributionSubmitError as exc:
+        raise _git_ops._merge_error_patch(exc, record_patch) from exc
+
     screenshot_repo = None
     screenshots = contribution_screenshots.plan_entries(plan)
     if screenshots:
@@ -3947,10 +3968,6 @@ def _submit_prepared_pr(
       )
 
     if same_repo_submission:
-      try:
-        _git_ops._assert_upstream_push_permission(repo, upstream_repo)
-      except ContributionSubmitError as exc:
-        raise _git_ops._merge_error_patch(exc, record_patch) from exc
       push_remote = f"https://github.com/{upstream_repo}.git"
       published_repo = upstream_repo
       record_patch = _git_ops._record_patch_with(record_patch, {

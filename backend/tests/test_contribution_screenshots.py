@@ -717,3 +717,79 @@ def test_a_fence_closes_only_on_its_own_character_and_length():
 def test_a_same_line_triple_backtick_span_is_not_a_fence():
   body = "```example```\n![a](screenshot:x.png)"
   assert shots.references(body) == ["x.png"]
+
+
+# --- App-writable storage and agent-supplied paths ------------------------------
+
+
+def test_storing_and_pruning_never_follow_a_linked_folder(tmp_path):
+  record_path = tmp_path / "records" / "greet.json"
+  record_path.parent.mkdir()
+  victim = tmp_path / "victim"
+  victim.mkdir()
+  (victim / "keep.txt").write_text("not ours\n")
+  shots.blob_dir(record_path).symlink_to(victim)
+
+  shots.prune(record_path, [])
+  assert (victim / "keep.txt").exists()
+  assert not shots.blob_dir(record_path).is_symlink()
+
+  shots.blob_dir(record_path).symlink_to(victim)
+  _stage(record_path, _items(tmp_path), BODY)
+  assert sorted(p.name for p in victim.iterdir()) == ["keep.txt"]
+  assert shots.blob_dir(record_path).is_dir() and not shots.blob_dir(record_path).is_symlink()
+
+
+def test_a_linked_screenshot_source_is_refused(tmp_path):
+  items = _items(tmp_path)
+  link = tmp_path / "link.png"
+  link.symlink_to(items[0]["path"])
+  items[0]["path"] = str(link)
+  with pytest.raises(ContributionSubmitError, match="not a link"):
+    shots.read(items, BODY)
+
+
+def test_a_screenshot_source_outside_the_data_and_temporary_folders_is_refused(tmp_path, monkeypatch):
+  items = _items(tmp_path)
+  monkeypatch.setattr(shots.tempfile, "gettempdir", lambda: str(tmp_path / "elsewhere"))
+  with pytest.raises(ContributionSubmitError, match="data or temporary folder"):
+    shots.read(items, BODY)
+
+
+def test_a_malformed_listed_screenshot_is_refused_not_a_crash(fork):
+  with pytest.raises(ContributionSubmitError) as raised:
+    shots.check_references([{"sha256": "1" * 64}], BODY)
+  assert raised.value.status_code == 422
+  with pytest.raises(ContributionSubmitError) as raised:
+    shots.verify(fork["record_path"], ["after.png"])
+  assert raised.value.code == "screenshot_changed"
+  with pytest.raises(ContributionSubmitError) as raised:
+    _send_screenshots(fork, screenshots=[{"sha256": "1" * 64}])
+  assert raised.value.code == "screenshot_changed"
+  assert raised.value.record_patch == {"k": "v"}
+
+
+def test_a_renamed_fork_whose_links_overflow_the_description_is_refused(fork, monkeypatch):
+  from app import github_contributions
+  long_fork = "octocat/" + "p" * 90
+  monkeypatch.setattr(github_contributions, "_ensure_owner_fork_remote", lambda *_: long_fork)
+  monkeypatch.setattr(github_contributions.contribution_screenshots, "publish", lambda *a, **k: "b" * 40)
+  # Fits with the guessed fork name, not with the real one.
+  guessed = shots.resolve_body(
+    BODY, fork["entries"], assets_repo="octocat/project", commit="0" * 64, branch="fix/header",
+  )
+  body = BODY + "x" * (65_536 - len(guessed.encode()) - 10)
+  with pytest.raises(ContributionSubmitError) as raised:
+    _send_screenshots(fork, body=body)
+  assert raised.value.code == "screenshot_body_too_large"
+  assert raised.value.record_patch == {"k": "v"}
+
+
+def test_a_shared_repository_without_push_permission_uploads_nothing(submit, monkeypatch):
+  def refused(*_a):
+    raise ContributionSubmitError("You cannot push to this repository.")
+
+  monkeypatch.setattr("app.github_contribution_git._assert_upstream_push_permission", refused)
+  with pytest.raises(ContributionSubmitError, match="cannot push"):
+    submit["send"]("octo-org/project")
+  assert not any(event[0] == "upload" for event in submit["events"] if isinstance(event, tuple))

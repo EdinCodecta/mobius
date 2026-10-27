@@ -2131,7 +2131,10 @@ async def contribution_screenshot(
     entries = contribution_screenshots.plan_entries(
       plan if isinstance(plan, dict) else {},
     )
-    entry = next((item for item in entries if item.get("name") == name), None)
+    entry = next(
+      (item for item in entries if isinstance(item, dict) and item.get("name") == name),
+      None,
+    )
     if entry is None:
       raise HTTPException(status_code=404, detail="Screenshot not found.")
     try:

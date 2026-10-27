@@ -18,7 +18,9 @@ before the branch is pushed.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -28,6 +30,7 @@ from urllib.parse import quote
 
 import httpx
 
+from app.config import get_settings
 from app.contribution_errors import ContributionSubmitError
 from app.github_contribution_git import _git, _git_env, _run_cmd
 from app.manifest_identity import RAW_GITHUB_HOST
@@ -69,6 +72,15 @@ PublicReader = Callable[[str], "bytes | None"]
 def blob_dir(record_path: Path) -> Path:
   """Where one record's approved image bytes live, beside its record."""
   return record_path.with_name(f"{record_path.stem}.screenshots")
+
+
+def _own_blob_dir(record_path: Path) -> Path:
+  """``blob_dir``, never through a link: the folder sits in app-writable
+  storage, and writing or pruning through a link would reach its target."""
+  folder = blob_dir(record_path)
+  if folder.is_symlink():
+    folder.unlink()
+  return folder
 
 
 def _outside_code(body: str, rewrite: Callable[[str], str]) -> str:
@@ -134,7 +146,7 @@ def store(record_path: Path, payloads: list[bytes]) -> None:
   """Keep checked image bytes beside the record, under their digests."""
   if not payloads:
     return
-  folder = blob_dir(record_path)
+  folder = _own_blob_dir(record_path)
   folder.mkdir(parents=True, exist_ok=True)
   for data in payloads:
     # Rewritten every time, so restaging repairs a damaged stored copy.
@@ -143,6 +155,11 @@ def store(record_path: Path, payloads: list[bytes]) -> None:
 
 def check_references(entries: list[dict], body: str) -> None:
   """Refuse a description whose screenshot references and attachments differ."""
+  if not all(
+    isinstance(entry, dict) and NAME.fullmatch(str(entry.get("name") or ""))
+    for entry in entries
+  ):
+    raise _refuse("A listed screenshot is malformed. Attach the screenshots again.")
   named = {entry["name"] for entry in entries}
   referenced = references(body)
   unknown = sorted(set(referenced) - named)
@@ -159,21 +176,44 @@ def check_references(entries: list[dict], body: str) -> None:
     )
 
 
+def _readable_source(path: Path) -> Path | None:
+  """The file's real path when it is not itself a link and lies under the
+  data or temporary folder, outside the stored credentials; otherwise None."""
+  data_dir = Path(get_settings().data_dir).resolve()
+  real = path.resolve()
+  roots = (data_dir, Path(tempfile.gettempdir()).resolve())
+  if (
+    path.is_symlink()
+    or real.is_relative_to(data_dir / "cli-auth")
+    or not any(real.is_relative_to(root) for root in roots)
+  ):
+    return None
+  return real
+
+
 def _read_png(path: Path, name: str) -> bytes:
   if not path.is_absolute():
     raise _refuse(f"Screenshot {name} needs an absolute file path.")
   try:
-    if not path.is_file():
-      raise _refuse(f"Screenshot {name} is not a file: {path}.")
-    size = path.stat().st_size
-    if size > MAX_BYTES:
+    real = _readable_source(path)
+    if real is None:
       raise _refuse(
-        f"Screenshot {name} is larger than {MAX_BYTES // (1024 * 1024)} MB. "
-        "Crop it to the change."
+        f"Screenshot {name} must be a file in the data or temporary folder, "
+        "not a link."
       )
-    data = path.read_bytes()
+    # Non-blocking, so a named pipe is refused rather than waited on.
+    fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+      if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+        raise _refuse(f"Screenshot {name} is not a file: {path}.")
+      data = handle.read(MAX_BYTES + 1)
   except OSError as exc:
     raise _refuse(f"Screenshot {name} could not be read: {exc.strerror}.") from exc
+  if len(data) > MAX_BYTES:
+    raise _refuse(
+      f"Screenshot {name} is larger than {MAX_BYTES // (1024 * 1024)} MB. "
+      "Crop it to the change."
+    )
   if not data.startswith(_PNG_MAGIC):
     raise _refuse(f"Screenshot {name} is not a PNG image.")
   return data
@@ -182,10 +222,10 @@ def _read_png(path: Path, name: str) -> bytes:
 def prune(record_path: Path, keep: list[dict]) -> None:
   """Drop stored images the record no longer lists. Run after the record is
   written, so a failed stage never removes an image the old record needs."""
-  folder = blob_dir(record_path)
+  folder = _own_blob_dir(record_path)
   if not folder.is_dir():
     return
-  wanted = {f"{entry['sha256']}.png" for entry in keep}
+  wanted = {f"{entry.get('sha256')}.png" for entry in keep}
   for child in folder.iterdir():
     # Only files staging wrote; anything else in the folder is left alone.
     if child.name not in wanted and child.is_file():
@@ -206,7 +246,7 @@ def approved_bytes(record_path: Path, entry: dict) -> bytes:
   The record is app-writable, so Send re-checks what staging enforced rather
   than trusting the listed name.
   """
-  sha = str(entry.get("sha256") or "")
+  sha = str(entry.get("sha256") or "") if isinstance(entry, dict) else ""
   if not _SHA256.fullmatch(sha) or not NAME.fullmatch(str(entry.get("name") or "")):
     raise ContributionSubmitError(
       "A screenshot in this contribution has no valid fingerprint. Ask the "
