@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from app.capacity import remeasure_domains
+from app.settled import run_settled
 
 log = logging.getLogger(__name__)
 
@@ -122,7 +123,9 @@ async def _preview_agent_sessions(data_dir: str) -> dict:
 async def _clear_agent_sessions(data_dir: str) -> dict:
   from app.provider_session_retention import clear_stale_sessions
 
-  result = await asyncio.to_thread(
+  # Clears run under the cleanup lock; a cancelled request must not release
+  # it while its thread is still deleting, so each step settles first.
+  result = await run_settled(
     clear_stale_sessions, data_dir, max_age_days=SESSION_KEEP_DAYS,
     in_use=lambda: _sessions_in_use(_alive_chat_ids_from_thread()),
   )
@@ -153,7 +156,7 @@ async def _clear_agent_browsers(data_dir: str) -> dict:
   from app.browser_profiles import clear_closed_chat_profiles
 
   chats, alive = _browser_inputs()
-  result = await asyncio.to_thread(
+  result = await run_settled(
     clear_closed_chat_profiles, data_dir, chats, alive, still_in_use=_still_in_use,
   )
   return {"bytes": result["bytes"], "items": result["profiles"]}
@@ -190,7 +193,7 @@ async def run_cleanup(target_id: str, data_dir: str | Path) -> dict:
   async with _CLEANUP_LOCK:
     outcome = await target.clear(str(data_dir))
     try:
-      await asyncio.to_thread(remeasure_domains, data_dir, list(target.domains))
+      await run_settled(remeasure_domains, data_dir, list(target.domains))
     except Exception:
       # The files are already gone; report the clear even if sizing failed.
       log.warning("re-measure after %s cleanup failed", target_id, exc_info=True)
