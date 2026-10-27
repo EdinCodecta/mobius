@@ -191,6 +191,17 @@ def _readable_source(path: Path) -> Path | None:
   return real
 
 
+def _read_bounded(path: Path) -> bytes | None:
+  """At most ``MAX_BYTES + 1`` bytes of a regular file that is not a link,
+  or None for anything else. Non-blocking, so a named pipe is refused rather
+  than waited on; bounded, so a huge file is never read whole."""
+  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+  with os.fdopen(fd, "rb") as handle:
+    if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+      return None
+    return handle.read(MAX_BYTES + 1)
+
+
 def _read_png(path: Path, name: str) -> bytes:
   if not path.is_absolute():
     raise _refuse(f"Screenshot {name} needs an absolute file path.")
@@ -201,14 +212,11 @@ def _read_png(path: Path, name: str) -> bytes:
         f"Screenshot {name} must be a file in the data or temporary folder, "
         "not a link."
       )
-    # Non-blocking, so a named pipe is refused rather than waited on.
-    fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, "rb") as handle:
-      if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-        raise _refuse(f"Screenshot {name} is not a file: {path}.")
-      data = handle.read(MAX_BYTES + 1)
+    data = _read_bounded(real)
   except OSError as exc:
     raise _refuse(f"Screenshot {name} could not be read: {exc.strerror}.") from exc
+  if data is None:
+    raise _refuse(f"Screenshot {name} is not a file: {path}.")
   if len(data) > MAX_BYTES:
     raise _refuse(
       f"Screenshot {name} is larger than {MAX_BYTES // (1024 * 1024)} MB. "
@@ -255,10 +263,14 @@ def approved_bytes(record_path: Path, entry: dict) -> bytes:
     )
   path = blob_dir(record_path) / f"{sha}.png"
   try:
-    data = path.read_bytes()
+    data = _read_bounded(path) or b""
   except OSError:
     data = b""
-  if hashlib.sha256(data).hexdigest() != sha or not data.startswith(_PNG_MAGIC):
+  if (
+    len(data) > MAX_BYTES
+    or hashlib.sha256(data).hexdigest() != sha
+    or not data.startswith(_PNG_MAGIC)
+  ):
     raise ContributionSubmitError(
       f"Screenshot {entry.get('name')} is missing or changed since it was "
       "prepared. Ask the agent to prepare it again. Nothing was sent.",

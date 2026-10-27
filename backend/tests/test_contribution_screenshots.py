@@ -793,3 +793,37 @@ def test_a_shared_repository_without_push_permission_uploads_nothing(submit, mon
   with pytest.raises(ContributionSubmitError, match="cannot push"):
     submit["send"]("octo-org/project")
   assert not any(event[0] == "upload" for event in submit["events"] if isinstance(event, tuple))
+
+
+def _replace_stored(fork, make) -> None:
+  stored = shots.blob_dir(fork["record_path"]) / f"{fork['entries'][0]['sha256']}.png"
+  stored.unlink()
+  make(stored)
+
+
+def test_an_oversized_stored_image_is_refused_without_reading_it_whole(fork, monkeypatch):
+  _replace_stored(fork, lambda path: path.write_bytes(_png(1) + b"\0" * shots.MAX_BYTES))
+  reads = []
+  original = shots._read_bounded
+  monkeypatch.setattr(shots, "_read_bounded", lambda path: reads.append(len(original(path))) or original(path))
+  with pytest.raises(ContributionSubmitError) as raised:
+    shots.verify(fork["record_path"], fork["entries"][:1])
+  assert raised.value.code == "screenshot_changed"
+  assert reads == [shots.MAX_BYTES + 1]
+
+
+def test_a_stored_image_replaced_by_a_named_pipe_is_refused_without_blocking(fork):
+  import os
+  _replace_stored(fork, lambda path: os.mkfifo(path))
+  with pytest.raises(ContributionSubmitError) as raised:
+    shots.verify(fork["record_path"], fork["entries"][:1])
+  assert raised.value.code == "screenshot_changed"
+
+
+def test_a_stored_image_replaced_by_a_link_is_refused(fork, tmp_path):
+  real = tmp_path / "real.png"
+  real.write_bytes(_png(1))
+  _replace_stored(fork, lambda path: path.symlink_to(real))
+  with pytest.raises(ContributionSubmitError) as raised:
+    shots.verify(fork["record_path"], fork["entries"][:1])
+  assert raised.value.code == "screenshot_changed"
