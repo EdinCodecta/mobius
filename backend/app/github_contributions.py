@@ -74,6 +74,10 @@ log = logging.getLogger(__name__)
 _PREPARED_PR_ACTIONS = frozenset(("pr", "pr_update"))
 # GitHub counts description characters, not UTF-8 bytes.
 GITHUB_BODY_MAX_CHARS = 65_536
+# The chat review card stopped being a publication surface in #1741. Claims
+# and signed receipts written before that still name it; their exact action
+# resumes under the Contribute control that remains.
+RETIRED_CHAT_REVIEW_SUBMITTER = "chat-review-card"
 
 
 def _exact_reviewed_pr_text(record: dict) -> tuple[str, str]:
@@ -1432,7 +1436,7 @@ def _claim_record(
     allow_personal_resume
     and record.get("status") == "submitting"
     and expected_action in _PREPARED_PR_ACTIONS
-    and record.get("submitter") == submitter
+    and record.get("submitter") in (submitter, RETIRED_CHAT_REVIEW_SUBMITTER)
   )
   if (
     record.get("status") != "prepared"

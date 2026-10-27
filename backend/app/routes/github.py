@@ -120,6 +120,7 @@ from app.github_contribution_git import (
 from app.storage_io import atomic_write
 from app.github_contributions import (
   ContributionSubmitError,
+  RETIRED_CHAT_REVIEW_SUBMITTER,
   _CONTRIBUTION_ID,
   _require_github_access_principal,
   _validate_submit_app,
@@ -279,12 +280,20 @@ def _cleanup_durable_complete_attempt(
 
 
 def _personal_action_identity_matches(prior: object, current: dict) -> bool:
-  """Match v11 actions and narrowly migrate v10 Autopilot run identities."""
+  """Match v11 actions and narrowly migrate older recorded identities.
+
+  v10 Autopilot actions carried a run id, and actions recorded before #1741
+  named the retired chat review card as submitter. Neither changes what the
+  action publishes.
+  """
   if prior == current:
     return True
+  if not isinstance(prior, dict):
+    return False
+  if prior.get("submitter") == RETIRED_CHAT_REVIEW_SUBMITTER:
+    return {key: value for key, value in prior.items() if key != "submitter"} == current
   if (
     current.get("action") != "autopilot_update"
-    or not isinstance(prior, dict)
     or prior.get("action") != "autopilot_update"
     or not str(prior.get("run_id") or "")
   ):
@@ -702,7 +711,7 @@ def _personal_resume_allowed(
     return False
   current = _read_record(record_path)
   patch = receipt.get("record_patch")
-  if receipt.get("action_input") != action_input:
+  if not _personal_action_identity_matches(receipt.get("action_input"), action_input):
     raise HTTPException(
       status_code=409,
       detail="Another exact publication attempt still needs reconciliation.",
