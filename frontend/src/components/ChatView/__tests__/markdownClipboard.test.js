@@ -1,4 +1,4 @@
-import { test } from 'node:test'
+import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { marked } from 'marked'
@@ -13,6 +13,13 @@ import {
   unwrapEnclosingStructure,
 } from '../markdownClipboard.js'
 import { renderedReplyClipboard } from '../messageCopy.js'
+import React from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
+
+const vite = await createSsrRenderServer()
+const { BlockToken } = await vite.ssrLoadModule('/src/components/ChatView/markdown/blocks.jsx')
+after(() => vite.close())
 
 function text(value) {
   return { nodeType: 3, nodeValue: value, textContent: value, parentNode: null }
@@ -324,8 +331,38 @@ test('a selection across list items keeps their rendered numbers', () => {
 })
 
 test('rendered ordered list items carry their own number for copy', () => {
-  const blocks = readFileSync(new URL('../markdown/blocks.jsx', import.meta.url), 'utf8')
-  assert.match(blocks, /<li key=\{i\} className="md-list-item" value=\{token\.ordered \? start \+ i : undefined\}>/)
+  const render = source => renderToStaticMarkup(
+    React.createElement(BlockToken, { token: marked.lexer(source)[0] }),
+  )
+  const ordered = render('3. three\n4. four')
+  assert.match(ordered, /<li class="md-list-item" value="3">/)
+  assert.match(ordered, /<li class="md-list-item" value="4">/)
+  assert.doesNotMatch(render('- bullet'), /value=/)
+})
+
+test('a heading ending in a "#" run keeps it through a Markdown round trip', () => {
+  for (const [tag, words, html] of [
+    ['h2', 'Ticket #', '<h2>Ticket #</h2>'],
+    ['h3', 'Use C ##', '<h3>Use C ##</h3>'],
+    ['h1', '#', '<h1>#</h1>'],
+  ]) {
+    const copied = markdownFromFragment(element(tag, [text(words)]))
+    assert.equal(marked.parse(copied).trim(), html, copied)
+  }
+  assert.equal(markdownFromFragment(element('h2', [text('C# notes')])), '## C# notes')
+})
+
+test('a marker after a non-breaking or other Unicode space still escapes', () => {
+  for (const space of ['\u00a0', '\u2003', ' \u00a0']) {
+    for (const marker of ['# x', '- x', '1. x']) {
+      const copied = markdownFromFragment(element('p', [text(`${space}${marker}`)]))
+      assert.doesNotMatch(marked.parse(copied), /<(h1|ul|ol)/, JSON.stringify(copied))
+    }
+    const afterBreak = markdownFromFragment(element('p', [
+      element('strong', [text('T')]), element('br'), text(space), text('- x'),
+    ]))
+    assert.doesNotMatch(marked.parse(afterBreak), /<ul/, JSON.stringify(afterBreak))
+  }
 })
 
 test('composer prefers Markdown unless paste-without-formatting was requested', () => {

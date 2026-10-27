@@ -34,7 +34,8 @@ function tagOf(node) {
  * readable: inline delimiters and table pipes anywhere, block and setext
  * markers only at a line start, `_` only off a word boundary, `&` only where
  * it would form an entity. "well-known", "1. item" mid-sentence, and
- * "A & B" copy unchanged.
+ * "A & B" copy unchanged. Copy trimming strips every Unicode space, so any
+ * non-newline whitespace counts as indentation before a marker.
  *
  * `linePrefix` is what already precedes the text on its output line (only
  * indentation or digits), or null when the text continues a line, as after
@@ -52,8 +53,8 @@ function escapeMarkdownText(text, linePrefix = '') {
   // so no line-start rule matches before it.
   const prefix = linePrefix ?? '\0'
   return `${prefix}${inline}`
-    .replace(/(^|\n)([ \t]*)([#>+=-])/g, '$1$2\\$3')
-    .replace(/(^|\n)([ \t]*\d+)([.)])(?=\s|$)/g, '$1$2\\$3')
+    .replace(/(^|\n)([^\S\n]*)([#>+=-])/g, '$1$2\\$3')
+    .replace(/(^|\n)([^\S\n]*\d+)([.)])(?=\s|$)/g, '$1$2\\$3')
     .slice(prefix.length)
 }
 
@@ -71,7 +72,7 @@ function joinChildren(node, serialize, adjoin = out => out) {
   let out = ''
   for (const child of childrenOf(node)) {
     const lineTail = out.slice(out.lastIndexOf('\n') + 1)
-    const part = serialize(child, /^[ \t]*\d*$/.test(lineTail) ? lineTail : null)
+    const part = serialize(child, /^[^\S\n]*\d*$/.test(lineTail) ? lineTail : null)
     if (!part) continue
     out = adjoin(out, part)
     if (out && !out.endsWith('\n') && BLOCK_TAGS.has(tagOf(child))) out += '\n'
@@ -252,7 +253,11 @@ function markdownNode(node, linePrefix = '') {
     return classHas(node, 'md-math-block') ? `$$\n${tex}\n$$\n\n` : `$${tex}$`
   }
 
-  if (/^h[1-6]$/.test(tag)) return `${'#'.repeat(Number(tag[1]))} ${childMarkdown().trim()}\n\n`
+  if (/^h[1-6]$/.test(tag)) {
+    // A trailing "#" run after a space would close the heading and vanish.
+    const content = childMarkdown().trim().replace(/(^|\s)(#+)$/, '$1\\$2')
+    return `${'#'.repeat(Number(tag[1]))} ${content}\n\n`
+  }
   if (tag === 'p') return `${childMarkdown().trim()}\n\n`
   if (tag === 'strong' || tag === 'b') return `**${childMarkdown()}**`
   if (tag === 'em' || tag === 'i') return `_${childMarkdown()}_`
