@@ -1,8 +1,8 @@
-/* Running chats lead the memory section; estimates stay separate from Stop. */
+/* Running chats and their Stop controls. */
 import { useId, useRef, useState } from 'react'
 import StatusDot from '../../ui/StatusDot.jsx'
 import ResourceConfirmDrawer from './ResourceConfirmDrawer.jsx'
-import { GROUP_COPY, formatBytes, memoryGroupLabel, runningTurnTitle } from './storageMemoryPresentation.js'
+import { GROUP_COPY, runningTurnTitle } from './storageMemoryPresentation.js'
 
 function StopConfirmation({ turn, phase, error, cancelRef, onCancel, onConfirm }) {
   const stopping = phase === 'stopping'
@@ -56,20 +56,7 @@ function RunningTurnRow({ turn, onStop, onOpenChat }) {
   )
 }
 
-function MemoryBreakdown({ memory }) {
-  if (!memory?.groups?.length) return null
-  return (
-    <details className="storage-memory__memory-details">
-      <summary>What is using memory?</summary>
-      <dl className="storage-memory__memory-use">
-        {memory.groups.map(group => <div key={group.label}><dt>{memoryGroupLabel(group.label)}</dt><dd className="storage-memory__size">≈ {formatBytes(group.bytes)}</dd></div>)}
-      </dl>
-      <p className="storage-memory__note">Estimates by group, not what Stop will free. They can differ from the total above.</p>
-    </details>
-  )
-}
-
-export default function RunningNow({ memory, running, onStop, onOpenChat }) {
+export default function RunningNow({ running, onStop, onOpenChat }) {
   const [stoppedTitle, setStoppedTitle] = useState('')
   const headingRef = useRef(null)
   async function stop(turn) {
@@ -89,7 +76,6 @@ export default function RunningNow({ memory, running, onStop, onOpenChat }) {
       {stoppedTitle && <p className="storage-memory__note" role="status">Stopped “{stoppedTitle}”. Your messages stay.</p>}
       {running.length ? <ul className="storage-memory__turns">{running.map(turn => <RunningTurnRow key={turn.chat_id} turn={{ ...turn, title: runningTurnTitle(turn.title) }} onStop={stop} onOpenChat={onOpenChat} />)}</ul>
         : <p className="storage-memory__empty">No agents running</p>}
-      <MemoryBreakdown memory={memory} />
     </section>
   )
 }

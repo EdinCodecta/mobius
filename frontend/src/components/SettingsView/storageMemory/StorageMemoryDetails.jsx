@@ -1,9 +1,9 @@
-/* The expandable part of Storage and Memory: clear, running now, and kept. */
+/* The expandable part of Storage and Memory: clear, running now, kept, and the memory breakdown. */
 import { useRef, useState } from 'react'
 import CleanupRow from './CleanupRow.jsx'
 import KeptStorageDialog from './KeptStorageDialog.jsx'
 import RunningNow from './RunningNow.jsx'
-import { GROUP_COPY, formatBytes, keptTotal } from './storageMemoryPresentation.js'
+import { GROUP_COPY, formatBytes, keptTotal, memoryGroupLabel } from './storageMemoryPresentation.js'
 
 function GroupHead({ group, children }) {
   const copy = GROUP_COPY[group]
@@ -36,6 +36,20 @@ function KeptSummary({ kept, onOpenApp, inertBoundaryRef }) {
   )
 }
 
+// Estimates close the box: they explain memory, they are not an action.
+function MemoryBreakdown({ memory }) {
+  if (!memory?.groups?.length) return null
+  return (
+    <details className="storage-memory__group storage-memory__memory-details">
+      <summary>What is using memory?</summary>
+      <dl className="storage-memory__memory-use">
+        {memory.groups.map(group => <div key={group.label}><dt>{memoryGroupLabel(group.label)}</dt><dd className="storage-memory__size">≈ {formatBytes(group.bytes)}</dd></div>)}
+      </dl>
+      <p className="storage-memory__note">Estimates by group, not what Stop will free. They can differ from the total above.</p>
+    </details>
+  )
+}
+
 export default function StorageMemoryDetails({ id, resources, onOpenApp, onOpenChat, inertBoundaryRef }) {
   const { overview } = resources
   return (
@@ -46,8 +60,9 @@ export default function StorageMemoryDetails({ id, resources, onOpenApp, onOpenC
           ? <ul className="storage-memory__items">{overview.cleanable.map(item => <CleanupRow key={item.target} item={item} resources={resources} />)}</ul>
           : <p className="storage-memory__note">Sizes appear after the first measurement.</p>}
       </section>
-      <RunningNow memory={overview.memory} running={overview.running} onStop={resources.stopTurn} onOpenChat={onOpenChat} />
+      <RunningNow running={overview.running} onStop={resources.stopTurn} onOpenChat={onOpenChat} />
       <KeptSummary kept={overview.kept} onOpenApp={onOpenApp} inertBoundaryRef={inertBoundaryRef} />
+      <MemoryBreakdown memory={overview.memory} />
     </div>
   )
 }

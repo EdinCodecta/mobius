@@ -24,11 +24,13 @@ const render = (Component, extra = {}) => renderToStaticMarkup(createElement(Com
 test('running work leads the optional memory accounting and has explicit navigation and Stop', () => {
   const html = render(Details, { onOpenChat: () => {} })
   assert.ok(html.indexOf('A running example') < html.indexOf('What is using memory?'))
+  const kept = html.indexOf('Kept to run Möbius')
+  assert.ok(kept >= 0 && kept < html.indexOf('What is using memory?'), 'the memory breakdown closes the details')
+  assert.match(html, /<details class="storage-memory__group storage-memory__memory-details">/)
   assert.match(html, /1 turn/)
   assert.match(html, /Open chat: A running example/)
   assert.match(html, /Stop turn: A running example/)
   assert.match(html, /Estimates by group, not what Stop will free/)
-  assert.match(html, /<details class="storage-memory__memory-details">/)
   const turn = html.match(/class="storage-memory__turn-main"[\s\S]*?<\/li>/)[0]
   assert.doesNotMatch(turn, /331 MB|511 MB/)
 })

@@ -102,7 +102,7 @@
 /* Running work owns the controls; process estimates are secondary detail. */
 .storage-memory__count { flex: none; color: var(--muted); font-size: 12px; line-height: 20px; font-variant-numeric: tabular-nums; }
 .storage-memory__turns { list-style: none; padding: 0; margin: 8px 0 0; }
-.storage-memory__turn { padding: 12px 0; border-top: 1px solid var(--border); }
+.storage-memory__turn { padding: 12px 0; border-top: 1px solid var(--border-light, var(--border)); }
 .storage-memory__turn:first-child { border-top: 0; }
 .storage-memory__turn-main { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 14px; align-items: start; }
 .storage-memory__turn-name { font-size: 14px; font-weight: 500; line-height: 1.5; overflow-wrap: anywhere; }
@@ -113,7 +113,8 @@
 .storage-memory__chat-link { display: inline-flex; align-items: center; min-height: 44px; min-width: 44px; padding: 4px 0; border: 0; background: none; color: var(--accent); font: inherit; font-size: 12.5px; cursor: pointer; }
 .storage-memory__chat-link:focus-visible, .storage-memory__memory-details summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
 .storage-memory__empty { margin: 0; padding: 14px 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
-.storage-memory__memory-details { margin-top: 4px; border-top: 1px solid var(--border); }
+.storage-memory__memory-details.storage-memory__group { padding-block: 4px; }
+.storage-memory__memory-details[open] { padding-bottom: 14px; }
 .storage-memory__memory-details summary { color: var(--accent); font-size: 12.5px; cursor: pointer; min-height: 44px; padding-block: 12px; }
 .storage-memory__memory-use { display: grid; margin: 8px 0 4px; font-size: 13px; }
 .storage-memory__memory-use div {
