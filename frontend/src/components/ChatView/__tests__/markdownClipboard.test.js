@@ -10,7 +10,9 @@ import {
   markdownFromFragment,
   plainTextFromFragment,
   queueClipboardTextUndoably,
+  unwrapEnclosingStructure,
 } from '../markdownClipboard.js'
+import { renderedReplyClipboard } from '../messageCopy.js'
 
 function text(value) {
   return { nodeType: 3, nodeValue: value, textContent: value, parentNode: null }
@@ -184,14 +186,14 @@ test('a selection inside one nested bullet copies just its text', () => {
       element('li', [text('')], { value: '2' }),
     ], {}, ['md-list']),
   ])
-  assert.equal(markdownFromFragment(tree), selected)
-  assert.equal(plainTextFromFragment(tree), selected)
+  assert.equal(markdownFromFragment(unwrapEnclosingStructure(tree)), selected)
+  assert.equal(plainTextFromFragment(unwrapEnclosingStructure(tree)), selected)
 
   const cell = fragment([element('table', [element('tbody', [
     element('tr', [element('td', [text('only '), element('strong', [text('this')])])]),
   ])])])
-  assert.equal(markdownFromFragment(cell), 'only **this**')
-  assert.equal(plainTextFromFragment(cell), 'only this')
+  assert.equal(markdownFromFragment(unwrapEnclosingStructure(cell)), 'only **this**')
+  assert.equal(plainTextFromFragment(unwrapEnclosingStructure(cell)), 'only this')
 })
 
 test('layout wrappers and copy-ignored chrome do not keep enclosing structure', () => {
@@ -202,8 +204,8 @@ test('layout wrappers and copy-ignored chrome do not keep enclosing structure', 
     ])])], {}, ['md-table-wrap']),
     element('p', [text('')]),
   ])
-  assert.equal(markdownFromFragment(tableTail), 'st cell')
-  assert.equal(plainTextFromFragment(tableTail), 'st cell')
+  assert.equal(markdownFromFragment(unwrapEnclosingStructure(tableTail)), 'st cell')
+  assert.equal(plainTextFromFragment(unwrapEnclosingStructure(tableTail)), 'st cell')
 
   // A drag from one item to the start of the next item's code block: the
   // cloned language label is chrome, not selected text.
@@ -216,8 +218,76 @@ test('layout wrappers and copy-ignored chrome do not keep enclosing structure', 
       ]),
     ], {}, ['md-code-wrap'])], { value: '2' }),
   ])])
-  assert.equal(markdownFromFragment(codeTail), 'One')
-  assert.equal(plainTextFromFragment(codeTail), 'One')
+  assert.equal(markdownFromFragment(unwrapEnclosingStructure(codeTail)), 'One')
+  assert.equal(plainTextFromFragment(unwrapEnclosingStructure(codeTail)), 'One')
+})
+
+test('a whole one-item list or one-cell table keeps its structure', () => {
+  const numbered = element('ol', [element('li', [text('Do this')], { value: '1' })])
+  const bullet = element('ul', [element('li', [text('note')])])
+  const table = element('table', [element('tbody', [
+    element('tr', [element('th', [text('only')])]),
+  ])])
+  assert.equal(markdownFromFragment(numbered), '1. Do this')
+  assert.equal(plainTextFromFragment(numbered), '1. Do this')
+  assert.equal(markdownFromFragment(bullet), '- note')
+  assert.equal(plainTextFromFragment(bullet), '- note')
+  assert.equal(markdownFromFragment(table), '| only |\n| --- |')
+  assert.equal(plainTextFromFragment(table), 'only')
+})
+
+test('whole-reply Copy keeps a one-item list and a one-cell table', () => {
+  function reply(blocks) {
+    const row = {
+      dataset: { key: 'row-1' },
+      querySelectorAll: selector => blocks.filter((_, i) => selector === `[data-markdown-block="${i}"]`),
+    }
+    for (const block of blocks) block.closest = () => row
+    return { querySelectorAll: () => [row] }
+  }
+  const list = element('div', [element('ol', [element('li', [text('Do this')], { value: '1' })])])
+  assert.deepEqual(
+    renderedReplyClipboard(reply([list]), ['row-1'], [{ message: 0, block: 0, markdown: '1. Do this' }]),
+    { markdown: '1. Do this', plainText: '1. Do this' },
+  )
+  const bullet = element('div', [element('ul', [element('li', [text('note')])])])
+  assert.equal(renderedReplyClipboard(reply([bullet]), ['row-1'],
+    [{ message: 0, block: 0, markdown: '- note' }]).plainText, '- note')
+  const table = element('div', [element('table', [element('tbody', [
+    element('tr', [element('th', [text('only')])]),
+  ])])], {}, ['md-table-wrap'])
+  assert.equal(renderedReplyClipboard(reply([table]), ['row-1'],
+    [{ message: 0, block: 0, markdown: '| only |\n| --- |' }]).plainText, 'only')
+  // Unwrapped, the table would still read "only": the list cases above are
+  // the ones whose marker a wrongly unwrapped whole reply loses.
+})
+
+test('line-start escapes apply only at real line starts, not after inline formatting', () => {
+  assert.equal(markdownFromFragment(element('p', [
+    element('strong', [text('Term')]), text(' - desc'),
+  ])), '**Term** - desc')
+  assert.equal(markdownFromFragment(element('p', [
+    element('code', [text('x')]), text(' # c'),
+  ])), '`x` # c')
+  assert.equal(markdownFromFragment(element('p', [
+    element('strong', [text('Step')]), text(' 2. go'),
+  ])), '**Step** 2. go')
+  // Real line starts still escape: the paragraph start, after a line break,
+  // after a newline inside the text, and digits split from their dot.
+  assert.equal(markdownFromFragment(element('p', [text(' - a')])), '\\- a')
+  assert.equal(markdownFromFragment(element('p', [
+    element('strong', [text('Term')]), element('br'), text('- next'),
+  ])), '**Term**  \n\\- next')
+  assert.equal(markdownFromFragment(element('p', [
+    element('strong', [text('Term')]), text(' a\n# b'),
+  ])), '**Term** a\n\\# b')
+  assert.equal(markdownFromFragment(element('p', [text('1'), text('. go')])), '1\\. go')
+  for (const tree of [
+    element('p', [element('strong', [text('Term')]), text(' - desc')]),
+    element('p', [element('strong', [text('Step')]), text(' 2. go')]),
+  ]) {
+    assert.doesNotMatch(marked.parse(markdownFromFragment(tree)), /<(ul|ol|li)/)
+  }
 })
 
 test('a list rendered from zero keeps its zero', () => {
@@ -392,6 +462,61 @@ function copySelectionFixture({ endsOutside = false, startsInAttachment = false 
   }
   return { event, written }
 }
+
+function listSelectionFixture({ whole }) {
+  // A block that is one numbered item, selected whole or only inside it.
+  const block = element('ol', [element('li', [text('Do this')], { value: '1' })])
+  const overlap = {
+    collapsed: false,
+    setStart: () => {},
+    setEnd: () => {},
+    toString: () => (whole ? 'Do this' : 'this'),
+    cloneContents: () => fragment([
+      element('ol', [element('li', [text(whole ? 'Do this' : 'this')], { value: '1' })]),
+    ]),
+    commonAncestorContainer: block,
+  }
+  const doc = {
+    createRange: () => ({
+      selectNodeContents: () => {},
+      cloneRange: () => overlap,
+      toString: () => 'Do this',
+    }),
+  }
+  block.ownerDocument = doc
+  block.contains = () => false
+  const range = {
+    startContainer: block,
+    endContainer: block,
+    intersectsNode: node => node === block,
+    toString: () => overlap.toString(),
+  }
+  doc.getSelection = () => ({ rangeCount: 1, isCollapsed: false, getRangeAt: () => range })
+  const root = {
+    ownerDocument: doc,
+    contains: node => node === block,
+    querySelectorAll: selector => (selector === '[data-markdown-block]' ? [block] : []),
+  }
+  const written = {}
+  const event = {
+    currentTarget: root,
+    clipboardData: { setData: (type, value) => { written[type] = value } },
+    preventDefault() {},
+  }
+  return { event, written }
+}
+
+test('a whole one-item list block keeps its marker; a selection inside it does not', () => {
+  const whole = listSelectionFixture({ whole: true })
+  assert.equal(copyMarkdownSelection(whole.event, () => '1. Do this'), true)
+  assert.equal(whole.written['text/markdown'], '1. Do this')
+  assert.equal(whole.written['text/plain'], '1. Do this')
+
+  const partial = listSelectionFixture({ whole: false })
+  assert.equal(copyMarkdownSelection(partial.event, () => '1. Do this'), true)
+  assert.equal(partial.written['text/markdown'], 'this')
+  assert.equal(partial.written['text/plain'], 'this')
+})
 
 test('a selection contained in one message copies its Markdown source', () => {
   const { event, written } = copySelectionFixture({ endsOutside: false })

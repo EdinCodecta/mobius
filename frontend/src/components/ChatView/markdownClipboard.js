@@ -34,9 +34,13 @@ function tagOf(node) {
  * readable: inline delimiters and table pipes anywhere, block and setext
  * markers only at a line start, `_` only off a word boundary, `&` only where
  * it would form an entity. "well-known", "1. item" mid-sentence, and
- * "A & B" copy unchanged. */
-function escapeMarkdownText(text) {
-  return String(text || '')
+ * "A & B" copy unchanged.
+ *
+ * `linePrefix` is what already precedes the text on its output line (only
+ * indentation or digits), or null when the text continues a line, as after
+ * "**Term**"; then only lines after its own newlines start a line. */
+function escapeMarkdownText(text, linePrefix = '') {
+  const inline = String(text || '')
     .replace(/\\/g, '\\\\')
     .replace(/[`*[\]~<|]/g, '\\$&')
     .replace(/_/g, (match, offset, value) => (
@@ -44,8 +48,13 @@ function escapeMarkdownText(text) {
         ? match : '\\_'
     ))
     .replace(/&(?=#?\w+;)/g, '\\&')
+  // A NUL stands in for mid-line text: it is neither indentation nor a digit,
+  // so no line-start rule matches before it.
+  const prefix = linePrefix ?? '\0'
+  return `${prefix}${inline}`
     .replace(/(^|\n)([ \t]*)([#>+=-])/g, '$1$2\\$3')
     .replace(/(^|\n)([ \t]*\d+)([.)])(?=\s|$)/g, '$1$2\\$3')
+    .slice(prefix.length)
 }
 
 const BLOCK_TAGS = new Set([
@@ -55,11 +64,14 @@ const BLOCK_TAGS = new Set([
 
 /** Join serialized children, starting a block on its own line when it follows
  * inline text in the same parent (a list item's text and its nested list).
- * `adjoin` may adjust the text so far before a part is appended. */
+ * Each child learns what precedes it on its line, or null mid-line (see
+ * escapeMarkdownText). `adjoin` may adjust the text so far before a part is
+ * appended. */
 function joinChildren(node, serialize, adjoin = out => out) {
   let out = ''
   for (const child of childrenOf(node)) {
-    const part = serialize(child)
+    const lineTail = out.slice(out.lastIndexOf('\n') + 1)
+    const part = serialize(child, /^[ \t]*\d*$/.test(lineTail) ? lineTail : null)
     if (!part) continue
     out = adjoin(out, part)
     if (out && !out.endsWith('\n') && BLOCK_TAGS.has(tagOf(child))) out += '\n'
@@ -92,11 +104,12 @@ function listItemsOf(node) {
     .filter(({ item }) => hasSelectedContent(item))
 }
 
-/** A selection inside one list item or one table cell is just that text:
- * strip the list and table structure that only encloses it. Structure stays
- * when the selection really spans several items or cells, and a quote keeps
- * its quote marker. */
-function unwrapEnclosingStructure(node) {
+/** A partial selection inside one list item or one table cell is just that
+ * text: strip the list and table structure that only encloses it. Structure
+ * stays when the selection really spans several items or cells, and a quote
+ * keeps its quote marker. Only partial selections unwrap: a whole block that
+ * is a one-item list or a one-cell table keeps its structure. */
+export function unwrapEnclosingStructure(node) {
   let current = node
   for (;;) {
     const tag = tagOf(current)
@@ -221,12 +234,12 @@ function tableMarkdown(node) {
 
 /** Serialize the selected rendered fragment back into equivalent Markdown. */
 export function markdownFromFragment(node) {
-  return markdownNode(unwrapEnclosingStructure(node)).trim()
+  return markdownNode(node).trim()
 }
 
-function markdownNode(node) {
+function markdownNode(node, linePrefix = '') {
   if (!node) return ''
-  if (node.nodeType === TEXT_NODE) return escapeMarkdownText(node.nodeValue ?? node.textContent)
+  if (node.nodeType === TEXT_NODE) return escapeMarkdownText(node.nodeValue ?? node.textContent, linePrefix)
   if (node.nodeType === DOCUMENT_FRAGMENT_NODE) return markdownChildren(node)
   if (node.nodeType !== ELEMENT_NODE || ignoredElement(node)) return ''
 
@@ -267,7 +280,7 @@ function markdownNode(node) {
     const alt = node.getAttribute?.('alt') || ''
     // Rendered media URLs may carry short-lived authorization. Never copy a
     // transformed DOM URL; whole-block copies use the original source instead.
-    return alt ? escapeMarkdownText(alt) : ''
+    return alt ? escapeMarkdownText(alt, linePrefix) : ''
   }
   if (tag === 'blockquote') {
     const value = childMarkdown().trim()
@@ -294,7 +307,7 @@ function plainList(node, ordered) {
 
 /** Serialize the same fragment as readable, formatting-free text. */
 export function plainTextFromFragment(node) {
-  return plainNode(unwrapEnclosingStructure(node)).trim()
+  return plainNode(node).trim()
 }
 
 function plainNode(node) {
@@ -394,10 +407,11 @@ function selectedMarkdownPayload(root, selection, markdownForBlock) {
     const overlap = rangeInsideNode(range, block)
     if (!overlap) continue
     covered += overlap.toString()
-    const fragment = cloneRangeWithContext(overlap, block)
     const fullRange = block.ownerDocument.createRange()
     fullRange.selectNodeContents(block)
     const selectedAllRenderedText = overlap.toString() === fullRange.toString()
+    const clone = cloneRangeWithContext(overlap, block)
+    const fragment = selectedAllRenderedText ? clone : unwrapEnclosingStructure(clone)
     const raw = selectedAllRenderedText ? markdownForBlock(block) : ''
     const markdownPart = raw?.trim() || markdownFromFragment(fragment)
     const plainPart = plainTextFromFragment(fragment)
