@@ -444,7 +444,11 @@ most 16384.
   `badges` `{label (40), tone}` with tone `success|attention|danger|accent|neutral`;
   up to 12 `items` `{title, intent, facts? (up to 4), badges?, action?}`;
   `action` `{label (40), intent}`; `inline` (default `true`; `false` is a
-  link-only snapshot without actions); `expand_label` (40); `height` (240-640,
+  link-only snapshot without actions); `expand` (default `true`; only the
+  JSON boolean `false` turns it off: no "Show details here" and no inline
+  app view ever, and an action opens the app at its intent like a link;
+  passive sessions and their Confirm are unaffected. Use it when every item
+  already links to its own entry in the app); `expand_label` (40); `height` (240-640,
   default 480; a non-number is ignored). `href` is kept only for an
   uncredentialed `https:` URL. Text is validated, never truncated: a field
   over its limit (in parentheses) is invalid, so its fact, badge, item or

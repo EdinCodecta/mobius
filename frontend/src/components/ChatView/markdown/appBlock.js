@@ -92,6 +92,9 @@ export function appBlockFromToken(token) {
     // `"interaction": "inline"` asks for a passive session (see appBlockSession.js);
     // the host grants it only to an admitted app, otherwise the block is static.
     session: inline && value.interaction === 'inline',
+    // `"expand": false` (only the JSON boolean) offers no inline app view:
+    // actions open the app at their intent instead. Sessions are unaffected.
+    expand: value.expand !== false,
     facts: blockFacts(value.facts, APP_BLOCK_LIMITS.facts),
     badges: blockBadges(value.badges),
     // Invalid items and actions are dropped; they never widen another field.
