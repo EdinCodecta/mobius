@@ -34,7 +34,7 @@ export function RetiredLocalCopies({ copies }) {
   return (
     <section className="urm__retired">
       <h3>Local copies that will be replaced</h3>
-      <p>These changes were merged into Möbius, so the update uses the released version. A snapshot of your old copies is saved on the server; the three most recent snapshots are kept.</p>
+      <p>These changes were merged into Möbius, so the update uses the released version. Your old copies stay in the server’s history, so they can be recovered.</p>
       <ul>{copies.map(copy => <li key={copy.path}>
         <code>{copy.path}</code> · from <a href={copy.url} target="_blank" rel="noopener noreferrer">#{copy.pr}</a>
       </li>)}</ul>
