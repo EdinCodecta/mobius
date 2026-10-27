@@ -454,10 +454,11 @@
   transition: opacity 0.15s ease, visibility 0s linear 0.15s;
 }
 /* A reply's row is its own line under the reply, not an overlay in the
-   conversation gap: it keeps its space while hidden, so revealing or pinning
-   it never moves the transcript, and it always sits the same distance below
-   the reply's last line. Pulled left by the copy button's padding so the
-   glyph lines up with the reply's text. */
+   conversation gap: it keeps its space while hidden and while the reply is
+   still streaming, so settling, revealing or pinning it never moves the
+   transcript, and it always sits the same distance below the reply's last
+   line (its fixed height comes from .chat__msg-meta). Pulled left by the
+   copy button's padding so the glyph lines up with the reply's text. */
 .chat__msg-meta--start {
   display: flex;
   width: fit-content;

@@ -52,6 +52,8 @@ function renderReply(messages, props = {}) {
     })))
 }
 const metaRows = html => html.match(/class="chat__msg-meta[ "]/g) || []
+// The reply's action row alone: an error card carries its own Copy.
+const actionRow = html => html.slice(html.indexOf('class="chat__msg-meta'))
 
 test('a settled reply ends with exactly one start-edge action row holding Copy', () => {
   const html = renderReply([turn])
@@ -74,13 +76,20 @@ test('a hidden action row is not also hidden from assistive technology', () => {
   assert.doesNotMatch(row, /aria-hidden/)
 })
 
-test('a streaming reply has no action row yet', () => {
-  assert.equal(metaRows(renderReply([turn], { isStreaming: true })).length, 0)
+test('a streaming reply already reserves its action row, empty until it settles', () => {
+  // Settling must fill the line, not add one: a followed transcript would
+  // grow and jump at the end of every turn (streaming-cursor.spec).
+  const html = renderReply([turn], { isStreaming: true, metaVisible: true, onTryAgain: () => {} })
+  assert.equal(metaRows(html).length, 1)
+  assert.match(html, /<div class="chat__msg-meta chat__msg-meta--start chat__msg-meta--visible"><\/div>/,
+    'no time, Copy or Try again while the reply is still being written')
 })
 
-test('a reply with no prose offers no Copy', () => {
-  const toolsOnly = { role: 'assistant', id: 'run', blocks: [{ type: 'tool', name: 'Bash' }] }
-  assert.equal(metaRows(renderReply([toolsOnly])).length, 0)
+test('a reply with no prose offers no Copy but keeps its time', () => {
+  const toolsOnly = { role: 'assistant', id: 'run', ts: turn.ts, blocks: [{ type: 'tool', name: 'Bash' }] }
+  const row = actionRow(renderReply([toolsOnly]))
+  assert.doesNotMatch(row, /aria-label="Copy message"/)
+  assert.match(row, /<time class="chat__ts">/)
 })
 
 test('reply Copy takes the answer after the last activity, not the progress notes', () => {
@@ -151,7 +160,8 @@ test('a progress note followed by real work is not the answer; the card it ends 
   })
   assert.deepEqual(summary([{ role: 'assistant', blocks: narration }]),
     { answer: '', failed: false }, 'a note with no card after it copies nothing')
-  assert.equal(metaRows(renderReply([{ role: 'assistant', id: 'run', blocks: narration }])).length, 0)
+  assert.doesNotMatch(actionRow(renderReply([{ role: 'assistant', id: 'run', blocks: narration }])),
+    /aria-label="Copy message"/)
 })
 
 test('thinking and closing bookkeeping after the answer keep it', () => {
@@ -183,8 +193,8 @@ test('folded bookkeeping after the answer keeps it after a reload', () => {
       { type: 'tool', tool: 'mcp__mobius_control__checkpoint_chat', status: 'done' }),
   ] }
   assert.equal(replyAnswerText([reloaded]), 'The build is clean.')
-  assert.equal(metaRows(renderReply([reloaded])).length, 1,
-    'the reloaded reply keeps its action row')
+  assert.match(actionRow(renderReply([reloaded])), /aria-label="Copy message"/,
+    'the reloaded reply keeps its Copy')
   assert.equal(replyAnswerText([{ ...reloaded, blocks: [...reloaded.blocks, question] }]),
     'The build is clean.', 'a card after folded bookkeeping does not replace the answer')
 })
@@ -272,7 +282,8 @@ test('a reply ending on a failure card leaves recovery to that card', () => {
   )
   assert.deepEqual(summary([parked]), { answer: '', failed: true },
     'the provider’s echo of the limit is the error, not an answer')
-  assert.equal(metaRows(renderReply([parked], { onTryAgain: () => {}, onResume: () => {} })).length, 0)
+  const row = actionRow(renderReply([parked], { onTryAgain: () => {}, onResume: () => {} }))
+  assert.doesNotMatch(row, /aria-label="(Copy message|Try again)"/)
 })
 
 test('a stopped reply copies only the answer it was still writing, never Try again', () => {
@@ -301,8 +312,7 @@ test('an error card that cannot recover leaves Try again to the latest reply', (
     { type: 'tool', name: 'Bash' },
     { type: 'error', message: 'The provider returned an error.' },
   )
-  const row = html => html.slice(html.indexOf('class="chat__msg-meta'))
-  const bare = row(renderReply([providerError], latest))
+  const bare = actionRow(renderReply([providerError], latest))
   assert.match(bare, /aria-label="Try again"/)
   assert.doesNotMatch(bare, /aria-label="Copy message"/,
     'no answer, so the row has nothing to copy (the error card copies its own message)')
@@ -311,7 +321,7 @@ test('an error card that cannot recover leaves Try again to the latest reply', (
     { type: 'text', content: 'The board is up to' },
     { type: 'error', message: 'The provider returned an error.' },
   )
-  const html = row(renderReply([partial], latest))
+  const html = actionRow(renderReply([partial], latest))
   assert.match(html, /aria-label="Copy message"/)
   assert.match(html, /aria-label="Try again"/)
 })
@@ -321,8 +331,8 @@ test('a resumable error card owns recovery only where it can act', () => {
     { type: 'tool', name: 'Bash' },
     { type: 'error', message: 'The agent stopped before finishing this turn.', resumable: true },
   )
-  assert.equal(metaRows(renderReply([stopped], { onTryAgain: () => {}, onResume: () => {} })).length, 0,
-    'its Resume is the way on')
+  assert.doesNotMatch(actionRow(renderReply([stopped], { onTryAgain: () => {}, onResume: () => {} })),
+    /aria-label="Try again"/, 'its Resume is the way on')
   assert.match(renderReply([stopped], { onTryAgain: () => {} }), /aria-label="Try again"/,
     'without a Resume path the card offers nothing, so Try again does')
 })

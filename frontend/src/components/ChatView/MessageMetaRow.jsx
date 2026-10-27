@@ -1,6 +1,6 @@
 /* MessageMetaRow keeps a message's time and actions in one revealable row:
-   beside an owner message's bubble, or at a reply's start edge
-   (`side="start"`), where the latest reply can also offer Try again.
+   beside an owner message's bubble, or on its own line at a reply's start
+   edge (`side="start"`), where the latest reply can also offer Try again.
    `copy(button)` returns the clipboard payload (see MessageCopyButton). */
 import MessageCopyButton from './MessageCopyButton.jsx'
 import MessageRetryButton from './MessageRetryButton.jsx'
@@ -14,7 +14,9 @@ export default function MessageMetaRow({
   side = 'end',
   visible,
 }) {
-  if (!timestamp && !copy && !onTryAgain) return null
+  // A reply's start row is a line of its own, so it renders even with nothing
+  // to show yet (a streaming reply); the overlay row beside a bubble does not.
+  if (side !== 'start' && !timestamp && !copy) return null
 
   // CSS visibility owns hiding: a hidden row leaves the focus order and the
   // accessibility tree, and a hover-revealed one rejoins both.

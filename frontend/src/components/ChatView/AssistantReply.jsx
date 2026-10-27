@@ -1,5 +1,6 @@
 /* One reply owns live/saved source rows, continuous prose, its final References,
-   and the one action row at its end. */
+   and the one action row at its end: its time, Copy of its answer, and Try
+   again where offered. */
 import { Fragment, memo, useMemo, useContext } from 'react'
 import MsgContent from './MsgContent.jsx'
 import MessageSources from './MessageSources.jsx'
@@ -92,10 +93,9 @@ function AssistantReply({
   })
   const tryAgain = outcome && onTryAgain && !cardOwnsRecovery
     ? () => onTryAgain(metaKey) : undefined
-  const hasActions = !!(answerText || tryAgain)
   return <PeerTimelineContext.Provider value={displayTimeline}><li
     className="chat__reply"
-    onClick={hasActions && onRevealMeta ? event => onRevealMeta(event, metaKey) : undefined}
+    onClick={outcome && onRevealMeta ? event => onRevealMeta(event, metaKey) : undefined}
     // The whole active reply is the current response: activity presentation may
     // move its live tools into an earlier row than the streaming one.
     data-current-response={activeRowIndex >= 0 ? 'true' : undefined}
@@ -151,15 +151,17 @@ function AssistantReply({
       refs={sourceRows.flatMap(row => row.message.source_ref ? [row.message.source_ref] : [])}
       disclosureKey={`${rows[lastVisibleRow].key}:references`}
     />}
-    {hasActions && <MessageMetaRow
-      timestamp={presentationRows[0].message.ts}
+    {/* Mounted while streaming too, empty: settling fills the reserved line
+        instead of adding one under a followed transcript. */}
+    <MessageMetaRow
+      timestamp={outcome ? presentationRows[0].message.ts : null}
       copy={answerText ? button => renderedReplyClipboard(
         button.closest('.chat__reply'), rows.map(row => row.key), outcome.parts,
       ) : undefined}
       onTryAgain={tryAgain}
       side="start"
       visible={metaVisible}
-    />}
+    />
   </li></PeerTimelineContext.Provider>
 }
 
