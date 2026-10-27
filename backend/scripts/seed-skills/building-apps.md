@@ -444,7 +444,11 @@ most 16384.
   `badges` `{label (40), tone}` with tone `success|attention|danger|accent|neutral`;
   up to 12 `items` `{title, intent, facts? (up to 4), badges?, action?}`;
   `action` `{label (40), intent}`; `inline` (default `true`; `false` is a
-  link-only snapshot without actions); `expand_label` (40); `height` (240-640,
+  link-only snapshot without actions); `expand` (default `true`; only the
+  JSON boolean `false` turns it off: no "Show details here" and no inline
+  app view ever, and an action opens the app at its intent like a link;
+  passive sessions and their Confirm are unaffected. Use it when every item
+  already links to its own entry in the app); `expand_label` (40); `height` (240-640,
   default 480; a non-number is ignored). `href` is kept only for an
   uncredentialed `https:` URL. Text is validated, never truncated: a field
   over its limit (in parentheses) is invalid, so its fact, badge, item or
@@ -497,20 +501,34 @@ reports state.
 the agent read can steer them, and a hidden instance mounts just because the
 block scrolled into view. Use an intent only to look up your own data for
 display. Never act, publish, or change state because of an intent at startup
-or on `app-block-init`; act only on an owner `app-block-action`, and check
-that request against your own data first.
+or on `app-block-init`; act only on an owner `confirm`, and check that
+request against your own data first.
 
-`props.blockSession` is `{sessionId, generation, actions, checkpoint, retain,
-recoveryError, subscribe(cb), setState(state)}`, where `actions` is
-`[{key, intent, label}]` and `key` is the action's intent. The host also posts
+`props.blockSession` is `{sessionId, generation, actions, items, checkpoint,
+retain, recoveryError, subscribe(cb), setState(state)}`, where `actions` is
+`[{key, intent, label}]` and `key` is the action's intent, and `items` is
+`[{intent}]`: the block's item intents in card order, after the host's
+validation and deduplication (an empty array when the block lists no items).
+Like `actions[].intent`, `items` is agent-printed and untrusted: it tells a
+single block-level action which records the card shows, but re-verify every
+intent against your own data before you build a confirmation, and build that
+confirmation list from your data, never from the block. The host also posts
 window messages; read them with `subscribe` or a `message` listener that checks
 `event.source === window.parent`:
 
-- `{type:'moebius:app-block-init', sessionId, generation, actions, checkpoint,
-  retain, recoveryError}` when the session envelope changes.
+- `{type:'moebius:app-block-init', sessionId, generation, actions, items,
+  checkpoint, retain, recoveryError}` when the session envelope changes.
 - `{type:'moebius:app-block-action', sessionId, generation, key, event, nonce}`,
   `event` one of `activate | confirm | cancel`. Each reader click sends one
   event; the host sends no other event until you acknowledge that `nonce`.
+  **Only `confirm` may cause an effect** (publish, write, send, spend).
+  `activate` asks you to prepare: read, then report `confirming` with the
+  exact list, or say why nothing can be done. `cancel` withdraws a
+  confirmation. Neither may change anything outside your document. The host
+  relies on this: a `confirm` still unacknowledged when the document reloads
+  is held for recovery, while an unacknowledged `activate` or `cancel` is
+  simply discarded and the controls come back. An action that needs no list
+  still goes through `confirming`.
 
 A message for another session or document `generation`, or for a module without
 the export, is stopped before any app listener sees it. A reload or app update
@@ -682,7 +700,7 @@ Do not copy a generic auto-recovery callback that writes from inside `storage.on
 - **Carry intent onto any recovery write that can queue** by passing the original `conflictContext` with the fresh version guard, so a recovery that conflicts again still has the intent it needs.
 - **Queued is not accepted.** A `durability: "queued"` result is not server acceptance, and a separate `pendingCount()` check cannot prove it; only `durability === 'synced'` confirms the write.
 
-**Any view the agent might write to externally MUST `subscribe()`, not load-on-mount.** A current-session draft, today's log, an inbox — anything the Möbius agent populates from a chat turn while the app sits open — has to use `window.mobius.storage.subscribe(path, cb)` so it repaints when that storage changes under it. A view that only reads once in its mount effect leaves the owner staring at a blank panel after the agent writes. If a view genuinely can't subscribe, tell the owner up front they must reopen or refresh to see agent-written entries — and never claim the shell remounts a mini-app when your turn ends, because there is no such guarantee (the iframe stays in the LRU cache).
+**A view showing externally-written data MUST re-read, not load-once-on-mount — and `subscribe()` alone is not the re-read.** A subscription fires on this app's own `set`/`remove` and when its own queued writes sync; a write made from *outside* the running app (an agent chat turn, a cron job) never reaches an open view through `subscribe()` by itself — there is no server push. For a current-session draft, today's log, an inbox — anything the Möbius agent populates while the app sits open — keep the `subscribe()` *and* re-read with `get()` when the view becomes visible plus a modest interval while visible: a `get()` whose server value changed notifies the path's subscribers, so the same callback repaints. A view that only reads once in its mount effect leaves the owner staring at a blank panel after the agent writes. If a view genuinely can't do this, tell the owner up front they must reopen or refresh to see agent-written entries — and never claim the shell remounts a mini-app when your turn ends, because there is no such guarantee (the iframe stays in the LRU cache).
 
 ### The `.json`-no-envelope trap (silent data loss)
 
@@ -1065,10 +1083,21 @@ useEffect(() => {
 ## Pausing work while the app is hidden
 
 The shell keeps recently used apps loaded but hidden so switching back is
-instant. A hidden app frame's `document.hidden` stays `false` unless the whole
-browser tab is hidden, so a timer gated only on `document.hidden` keeps
-polling, animating, or playing audio for an app nobody can see. Gate that work
-on the runtime's combined signal instead:
+instant. While an app is hidden, its frame reads as a hidden page the standard
+way (`document.hidden`, `document.visibilityState`, and `visibilitychange` on
+the way out and back), so engines and libraries that follow the Page Visibility
+API pause themselves. The frame also pauses the app's sound: it suspends every
+Web Audio context and pauses playing `<audio>`/`<video>` elements — including
+media that begins on its own while hidden, such as autoplay or a clip that was
+still loading — holds any `resume()` or `play()` the app calls while hidden, and
+on return resumes exactly what it paused, never what the app paused itself (nor
+an element the app removed from the page while hidden). A held `resume()` or
+`play()` resolves right away: it reports that the request was accepted, not that
+audio is playing, and a later failure when it actually starts on return is not
+surfaced — so don't treat that resolution as proof sound is audible.
+
+Timers keep running, so pause polling, animation, and game clocks yourself and
+catch up on return:
 
 ```jsx
 useEffect(() => {
@@ -1087,7 +1116,32 @@ useEffect(() => {
 tab is visible. `onVisibilityChange(cb)` calls `cb(visible)` immediately and on
 every change, and returns an unsubscribe function. A Store app that may run on
 an older Möbius checks `window.mobius.runtimeFeatures?.frameVisibility` and
-otherwise falls back to `document.hidden` with `visibilitychange`.
+otherwise falls back to `document.hidden` with `visibilitychange`; on those
+hosts, pause the app's own sound as well.
+
+Playback the owner starts deliberately and expects to keep hearing (a podcast,
+read-aloud, music) keeps playing while the app is hidden if the app opens a
+shell media session for it. The drawer then shows a now-playing control:
+
+```js
+const send = (message) => window.parent.postMessage(
+  { type: 'moebius:media-session', sessionId: 'episode-42', ...message },
+  window.location.origin,
+)
+send({ event: 'open', title: 'Episode 42', playbackState: 'playing' })
+send({ event: 'update', playbackState: 'paused' }) // 'loading' | 'playing' | 'paused'
+send({ event: 'close' })                            // playback ended
+// The drawer's controls arrive as
+// { type: 'moebius:media-control', sessionId, action: 'play' | 'pause' | 'stop' }.
+```
+
+The page still reads as hidden while such playback continues. Documents the
+app embeds in its own child iframes are separate pages: forward the visibility
+to them yourself. For the same reason, `<audio>`/`<video>` inside an open
+shadow root isn't reached — the frame's scan doesn't cross shadow boundaries
+and `play` events don't escape them — so pause shadow-DOM media yourself from
+`onVisibilityChange` as well. Plain (light-DOM) elements and `new Audio()` are
+handled for you.
 
 ---
 

@@ -77,18 +77,36 @@ MAX_CONTRIBUTION_BODY = 3_000_000
 log = logging.getLogger("mobius.identity_broker")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$")
 INSTANCE_RE = re.compile(r"^mob_[A-Za-z0-9_-]{3,160}$")
-MANAGED_INSTANCE_RE = re.compile(r"^mob_[A-Za-z0-9_-]{3,80}$")
+MANAGED_INSTANCE_ID = r"mob_[A-Za-z0-9_-]{3,80}"
+MANAGED_INSTANCE_RE = re.compile(rf"^{MANAGED_INSTANCE_ID}$")
 OAUTH_STATE_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 MANAGED_PREFIX = "/managed"
+# Railway management is read-only from an instance apart from a few reviewed
+# writes. Creating, retrying, deleting, resizing, recovering and disconnecting
+# deployments reach every deployment the owner has, so they belong to the
+# owner's own account session on the website and are never forwarded here.
 MANAGED_UPSTREAM_POLICIES = (
   ("/api/instance/v1/identity", frozenset({"GET", "POST", "PATCH"})),
-  ("/api/instance/v1/railway", frozenset({"GET", "POST", "PATCH", "DELETE"})),
+  ("/api/instance/v1/railway", frozenset({"GET"})),
   ("/api/instance/v1/container-replacement", frozenset({"GET", "POST"})),
 )
 MANAGED_EXACT_ROUTES = frozenset({
   ("GET", "/api/instance/v1/agent"),
   ("POST", "/api/instance/v1/agent/trial"),
+  ("POST", "/api/instance/v1/railway/connect/start"),
+  ("POST", "/api/instance/v1/railway/plan/refresh"),
 })
+# The only managed read that takes a query: the opt-in inventory extensions,
+# each spelled exactly ``<name>=1`` in canonical order.
+MANAGED_QUERY_ROUTES = {
+  ("GET", "/api/instance/v1/railway"): frozenset({"region_options", "workspace_ids"}),
+}
+MANAGED_RAILWAY_INSTANCE_WRITES = (
+  ("PATCH", re.compile(rf"/api/instance/v1/railway/instances/{MANAGED_INSTANCE_ID}")),
+  ("PATCH", re.compile(
+    rf"/api/instance/v1/railway/instances/{MANAGED_INSTANCE_ID}/updates"
+  )),
+)
 MANAGED_USER_AGENT = "mobius-managed-deployment/1"
 
 # Monotonic marker read (without importing this module) by the frozen launcher
@@ -98,8 +116,8 @@ MANAGED_USER_AGENT = "mobius-managed-deployment/1"
 # 1 = pre-/managed broker; 2 = /managed upstream-proxy routes present;
 # 3 = standalone web search endpoint; 4 = flat gateway wire for Codex web.run;
 # 5 = account review routes; 6 = shared access; 7 = recipient invitation response;
-# 8 = native push relay routes.
-BROKER_ROUTE_EPOCH = 8
+# 8 = native push relay routes; 9 = Railway inventory read options.
+BROKER_ROUTE_EPOCH = 9
 
 # Declarative public forwarding policy. Callers never supply a target URL,
 # audience, or arbitrary upstream path. Contribution and community routes are
@@ -194,18 +212,25 @@ def _community_scope(method: str, route_path: str, query: str) -> str | None:
     "/v1/community/apps", "/v1/community/publications",
   }:
     return None
-  pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
   allowed = (
     {"q", "limit", "offset"}
     if route_path == "/v1/community/apps"
     else {"limit", "offset"}
   )
+  return scope if _canonical_query_pairs(query, allowed) is not None else None
+
+
+def _canonical_query_pairs(
+  query: str, allowed: set[str] | frozenset[str],
+) -> list[tuple[str, str]] | None:
+  """A query naming only allowed keys, each once, exactly as urlencode orders it."""
+  pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
   keys = [key for key, _value in pairs]
   if any(key not in allowed for key in keys) or len(keys) != len(set(keys)):
     return None
   if urllib.parse.urlencode(sorted(pairs)) != query:
     return None
-  return scope
+  return pairs
 
 
 def _request_body_limit(*, is_unix: bool, method: str, path: str) -> int:
@@ -436,7 +461,13 @@ def _managed_upstream_path(method: str, path: str) -> str | None:
   """Map only declared instance API families; callers never choose an origin."""
   if not path.startswith(MANAGED_PREFIX):
     return None
-  upstream = path.removeprefix(MANAGED_PREFIX)
+  upstream, separator, query = path.removeprefix(MANAGED_PREFIX).partition("?")
+  if separator:
+    allowed = MANAGED_QUERY_ROUTES.get((method, upstream))
+    pairs = _canonical_query_pairs(query, allowed) if allowed else None
+    if not pairs or any(value != "1" for _key, value in pairs):
+      return None
+    return upstream + "?" + query
   if (
     any(character in upstream for character in "?#%\\")
     or "//" in upstream
@@ -444,6 +475,11 @@ def _managed_upstream_path(method: str, path: str) -> str | None:
   ):
     return None
   if (method, upstream) in MANAGED_EXACT_ROUTES:
+    return upstream
+  if any(
+    method == allowed and pattern.fullmatch(upstream)
+    for allowed, pattern in MANAGED_RAILWAY_INSTANCE_WRITES
+  ):
     return upstream
   if (method, upstream) in {
     ("POST", "/api/instance/v1/browser-access/grants"),

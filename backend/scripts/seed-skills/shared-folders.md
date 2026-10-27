@@ -35,6 +35,7 @@ Two shared folders can have the same name, for example one on each device. Then 
 - Keep `write` content exact. Use `--overwrite` only when the owner asked to replace that file; its old version goes to the bin.
 - If a change answers `timeout` or `offline`, it may still have happened. Check with `info` or `ls` before trying it again. `busy` means nothing changed; try again shortly.
 - `original_kept` or `changed_during_move`: the file was copied but the original stayed, so both exist. Tell the owner; don't retry.
+- `changed_during_write`: the file changed while you replaced it, so nothing was written; the version before that change is in the bin. Read the file again and tell the owner before writing.
 - A refusal is an answer, not a bug. Relay its fix in plain words:
   - `offline`: Möbius is not open in that browser. Ask the owner to open it there.
   - `needs_permission`: the owner taps **Reconnect** in Settings → Shared folders (**Pick again** for a folder from the phone app).

@@ -577,6 +577,7 @@ def test_managed_proxy_owns_credentials_and_rejects_other_targets(broker):
   for method, path in (
     ("GET", "/managed/api/instance/v1/agent"),
     ("POST", "/managed/api/instance/v1/agent/trial"),
+    ("GET", "/managed/api/instance/v1/railway?region_options=1&workspace_ids=1"),
   ):
     response = broker.proxy(
       method=method, path=path, body=b"", headers={},
@@ -1689,3 +1690,72 @@ def test_shared_inbox_broker_exposes_only_exact_response_route():
   for method, suffix in (("GET", ""), ("DELETE", ""), ("POST", "/other"),
                          ("POST", "?subject=other"), ("POST", "/../grants")):
     assert broker_module._managed_upstream_path(method, "/managed" + path + suffix) is None
+
+
+@pytest.mark.parametrize("method, path", [
+  ("POST", "/api/instance/v1/railway/instances"),
+  ("POST", "/api/instance/v1/railway/instances/mob_example/retry"),
+  ("DELETE", "/api/instance/v1/railway/instances/mob_example"),
+  ("PATCH", "/api/instance/v1/railway/instances/mob_example/compute"),
+  ("PATCH", "/api/instance/v1/railway/instances/mob_example/storage"),
+  ("POST", "/api/instance/v1/railway/instances/mob_example/recovery"),
+  ("POST", "/api/instance/v1/railway/instances/mob_example/confirm-absent"),
+  ("POST", "/api/instance/v1/railway/workspace"),
+  ("POST", "/api/instance/v1/railway/disconnect"),
+  ("PATCH", "/api/instance/v1/railway/instances/mob_example/updates/extra"),
+])
+def test_broker_never_forwards_owner_only_deployment_actions(method, path):
+  # These reach every deployment the owner has; only the owner's own account
+  # session on the website may take them, so an instance cannot ask for them.
+  assert broker_module._managed_upstream_path(method, "/managed" + path) is None
+
+
+@pytest.mark.parametrize("method, path", [
+  ("GET", "/api/instance/v1/railway"),
+  ("GET", "/api/instance/v1/railway/instances/mob_example/metrics"),
+  ("GET", "/api/instance/v1/railway/instances/mob_example/recovery/status"),
+  ("POST", "/api/instance/v1/railway/connect/start"),
+  ("POST", "/api/instance/v1/railway/plan/refresh"),
+  ("PATCH", "/api/instance/v1/railway/instances/mob_example"),
+  ("PATCH", "/api/instance/v1/railway/instances/mob_example/updates"),
+])
+def test_broker_keeps_reads_and_reviewed_deployment_writes(method, path):
+  assert broker_module._managed_upstream_path(method, "/managed" + path) == path
+
+
+@pytest.mark.parametrize("region_options, workspace_ids", [
+  (False, True), (True, False), (True, True),
+])
+def test_broker_forwards_every_railway_inventory_option_identity_sends(
+  region_options, workspace_ids,
+):
+  from app.routes.identity import _railway_inventory_query
+
+  path = "/api/instance/v1/railway" + _railway_inventory_query(
+    include_region_options=region_options, include_workspace_ids=workspace_ids,
+  )
+  assert "?" in path
+  assert broker_module._managed_upstream_path("GET", "/managed" + path) == path
+  assert broker_module.BROKER_ROUTE_EPOCH >= 9
+
+
+@pytest.mark.parametrize("method, path", [
+  ("GET", "/api/instance/v1/railway?"),
+  ("GET", "/api/instance/v1/railway?next=evil"),
+  ("GET", "/api/instance/v1/railway?region_options=1&next=evil"),
+  ("GET", "/api/instance/v1/railway?region_options=1&region_options=1"),
+  ("GET", "/api/instance/v1/railway?workspace_ids=1&region_options=1"),
+  ("GET", "/api/instance/v1/railway?region_options=1&"),
+  ("GET", "/api/instance/v1/railway?region_options"),
+  ("GET", "/api/instance/v1/railway?region_options=0"),
+  ("GET", "/api/instance/v1/railway?region_options=%31"),
+  ("GET", "/api/instance/v1/railway?region_options=1#x"),
+  ("GET", "/api/instance/v1/railway/?region_options=1"),
+  ("GET", "/api/instance/v1/railway/instances/mob_example/metrics?region_options=1"),
+  ("GET", "/api/instance/v1/identity?region_options=1"),
+  ("GET", "/api/instance/v1/agent?workspace_ids=1"),
+  ("POST", "/api/instance/v1/railway/plan/refresh?region_options=1"),
+  ("PATCH", "/api/instance/v1/railway?region_options=1"),
+])
+def test_broker_refuses_every_other_managed_query(method, path):
+  assert broker_module._managed_upstream_path(method, "/managed" + path) is None
