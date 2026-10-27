@@ -72,8 +72,8 @@ _PERSONAL_PUBLIC_INPUT_FIELDS = (
 log = logging.getLogger(__name__)
 
 _PREPARED_PR_ACTIONS = frozenset(("pr", "pr_update"))
-# GitHub refuses a pull request description larger than this.
-GITHUB_BODY_MAX_BYTES = 65_536
+# GitHub counts description characters, not UTF-8 bytes.
+GITHUB_BODY_MAX_CHARS = 65_536
 
 
 def _exact_reviewed_pr_text(record: dict) -> tuple[str, str]:
@@ -104,7 +104,7 @@ def _exact_reviewed_pr_text(record: dict) -> tuple[str, str]:
     not isinstance(body, str)
     or not body.strip()
     or "\x00" in body
-    or len(body.encode("utf-8")) > GITHUB_BODY_MAX_BYTES
+    or len(body) > GITHUB_BODY_MAX_CHARS
   ):
     raise ContributionSubmitError(
       "This prepared PR has a body GitHub cannot publish exactly. Ask the "
@@ -3429,7 +3429,7 @@ def _check_screenshot_body(
   longest = contribution_screenshots.resolve_body(
     body, screenshots, assets_repo=likely_repo, commit="0" * 64, branch=branch,
   )
-  if len(longest.encode("utf-8")) > GITHUB_BODY_MAX_BYTES:
+  if len(longest) > GITHUB_BODY_MAX_CHARS:
     raise ContributionSubmitError(
       "With its screenshot links, this description exceeds GitHub's size "
       "limit. Ask the agent to shorten it. Nothing was sent.",
@@ -3503,7 +3503,7 @@ def _publish_reviewed_screenshots(
       body, screenshots, assets_repo=assets_repo, commit=commit, branch=branch,
     )
     # The early check guessed the fork's name; a renamed fork links longer.
-    if len(resolved.encode("utf-8")) > GITHUB_BODY_MAX_BYTES:
+    if len(resolved) > GITHUB_BODY_MAX_CHARS:
       raise ContributionSubmitError(
         f"The screenshots were uploaded to {assets_repo}, but with their "
         "links this description exceeds GitHub's size limit. Ask the agent "

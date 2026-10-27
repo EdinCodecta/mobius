@@ -385,12 +385,13 @@ def _send_screenshots(fork, **overrides):
   )
 
 
-def test_an_oversized_pinned_body_is_refused_before_any_upload(fork, monkeypatch):
+@pytest.mark.parametrize("padding", ["x", "é"])
+def test_an_oversized_pinned_body_is_refused_before_any_upload(fork, monkeypatch, padding):
   from app import github_contributions
   monkeypatch.setattr(github_contributions, "_ensure_owner_fork_remote", lambda *_: pytest.fail("forked"))
   with pytest.raises(ContributionSubmitError) as raised:
     # Within the limit as written, over it once both links are pinned.
-    _send_screenshots(fork, body=BODY + "x" * (65_500 - len(BODY)))
+    _send_screenshots(fork, body=BODY + padding * (65_500 - len(BODY)))
   assert raised.value.code == "screenshot_body_too_large"
 
 
@@ -419,6 +420,25 @@ def test_send_pins_the_body_and_remembers_the_upload(fork, monkeypatch):
   assert assets_repo == "octocat/project"
   assert "screenshot:" not in body
   assert patch == {"k": "v", "last_submit_screenshots": {"repo": "octocat/project", "commit": "b" * 40}}
+
+
+@pytest.mark.parametrize("fork_name", ["project", "p" * 90])
+def test_screenshot_body_limit_counts_characters_before_and_after_upload(fork, monkeypatch, fork_name):
+  from app import github_contributions
+  assets_repo = f"octocat/{fork_name}"
+  monkeypatch.setattr(github_contributions, "_ensure_owner_fork_remote", lambda *_: assets_repo)
+  monkeypatch.setattr(shots, "publish", lambda *a, **k: "b" * 40)
+  guessed = shots.resolve_body(
+    BODY, fork["entries"], assets_repo="octocat/project", commit="0" * 64, branch="fix/header",
+  )
+  actual = shots.resolve_body(
+    BODY, fork["entries"], assets_repo=assets_repo, commit="b" * 40, branch="fix/header",
+  )
+  # The normal fork fills the early check; a renamed fork fills the final one.
+  body = BODY + "é" * (65_536 - max(len(guessed), len(actual)))
+  resolved, _, hosted_in = _send_screenshots(fork, body=body)
+  assert hosted_in == assets_repo
+  assert len(resolved) <= 65_536 < len(resolved.encode("utf-8"))
 
 
 def test_the_image_route_is_never_cached(staging, tmp_path, client, owner_token):
@@ -769,7 +789,8 @@ def test_a_malformed_listed_screenshot_is_refused_not_a_crash(fork):
   assert raised.value.record_patch == {"k": "v"}
 
 
-def test_a_renamed_fork_whose_links_overflow_the_description_is_refused(fork, monkeypatch):
+@pytest.mark.parametrize("padding", ["x", "é"])
+def test_a_renamed_fork_whose_links_overflow_the_description_is_refused(fork, monkeypatch, padding):
   from app import github_contributions
   long_fork = "octocat/" + "p" * 90
   monkeypatch.setattr(github_contributions, "_ensure_owner_fork_remote", lambda *_: long_fork)
@@ -778,7 +799,7 @@ def test_a_renamed_fork_whose_links_overflow_the_description_is_refused(fork, mo
   guessed = shots.resolve_body(
     BODY, fork["entries"], assets_repo="octocat/project", commit="0" * 64, branch="fix/header",
   )
-  body = BODY + "x" * (65_536 - len(guessed.encode()) - 10)
+  body = BODY + padding * (65_536 - len(guessed) - 10)
   with pytest.raises(ContributionSubmitError) as raised:
     _send_screenshots(fork, body=body)
   assert raised.value.code == "screenshot_body_too_large"
