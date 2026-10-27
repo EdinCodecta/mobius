@@ -638,6 +638,75 @@ PY
 fi
 read -r VIEWPORT_WIDTH VIEWPORT_HEIGHT VIEWPORT_PIXEL_RATIO <<<"$NORMALIZED_VIEWPORT"
 
+# Fail fast when the container lacks the headroom a Chromium launch and render
+# need, instead of dying mid-capture with a generic failure (observed: capture
+# death at ~57 MiB free of the cgroup cap). memory.current counts reclaimable
+# page cache, so inactive_file is added back before comparing.
+MIN_FREE_MEMORY_MB="${MOBIUS_SCREENSHOT_MIN_FREE_MB:-150}"
+AVAILABLE_MEMORY_MB="$(python3 - <<'PY'
+from pathlib import Path
+
+def read_int(path: str) -> int | None:
+  try:
+    text = Path(path).read_text().strip()
+  except OSError:
+    return None
+  return None if text == "max" else int(text)
+
+limit = read_int("/sys/fs/cgroup/memory.max")
+current = read_int("/sys/fs/cgroup/memory.current")
+if limit is not None and current is not None:
+  reclaimable = 0
+  try:
+    for line in Path("/sys/fs/cgroup/memory.stat").read_text().splitlines():
+      if line.startswith("inactive_file "):
+        reclaimable = int(line.split()[1])
+        break
+  except OSError:
+    pass
+  print((limit - current + reclaimable) // 1048576)
+else:
+  for line in Path("/proc/meminfo").read_text().splitlines():
+    if line.startswith("MemAvailable:"):
+      print(int(line.split()[1]) // 1024)
+      break
+PY
+)" || AVAILABLE_MEMORY_MB=""
+if [ -n "$AVAILABLE_MEMORY_MB" ] \
+    && [ "$AVAILABLE_MEMORY_MB" -lt "$MIN_FREE_MEMORY_MB" ]; then
+  die "only ${AVAILABLE_MEMORY_MB} MiB of memory headroom remains (need ${MIN_FREE_MEMORY_MB} MiB to render a capture safely); finish or stop the memory-heavy work first, or lower MOBIUS_SCREENSHOT_MIN_FREE_MB deliberately"
+fi
+OUTPUT_DISK_FREE_MB="$(df -Pm "$(dirname "$OUT")" 2>/dev/null | awk 'NR==2 {print $4}')"
+if [ -n "$OUTPUT_DISK_FREE_MB" ] && [ "$OUTPUT_DISK_FREE_MB" -lt 20 ]; then
+  die "only ${OUTPUT_DISK_FREE_MB} MB free on the output volume; free disk space before capturing"
+fi
+
+# Headless Chromium has no pointing device, so it reports `hover: none` /
+# `pointer: none` and silently drops every `@media (hover: hover)` desktop
+# style from captures. At desktop widths, launch the session's browser through
+# the Blink-settings wrapper that restores desktop pointer capabilities. An
+# already-running session keeps its launch flags; the fix applies whenever the
+# session's browser (re)starts.
+# The daemon resolves the executable from its own working directory, so the
+# wrapper path must be absolute.
+WRAPPER_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/chrome-desktop-pointer.sh"
+if [ "$VIEWPORT_WIDTH" -ge 1024 ] && [ -x "$WRAPPER_PATH" ] \
+    && [ "${AGENT_BROWSER_EXECUTABLE_PATH:-}" != "$WRAPPER_PATH" ]; then
+  REAL_BROWSER="${AGENT_BROWSER_EXECUTABLE_PATH:-}"
+  if [ -z "$REAL_BROWSER" ]; then
+    CONFIG_PATH="${AGENT_BROWSER_CONFIG:-/app/agent-browser-config.json}"
+    if [ -f "$CONFIG_PATH" ]; then
+      REAL_BROWSER="$(python3 -c \
+        'import json, sys; print(json.load(open(sys.argv[1])).get("executablePath", ""))' \
+        "$CONFIG_PATH" 2>/dev/null)" || REAL_BROWSER=""
+    fi
+  fi
+  if [ -n "$REAL_BROWSER" ] && [ -x "$REAL_BROWSER" ]; then
+    export MOBIUS_SCREENSHOT_REAL_BROWSER="$REAL_BROWSER"
+    export AGENT_BROWSER_EXECUTABLE_PATH="$WRAPPER_PATH"
+  fi
+fi
+
 # One chat can host parallel agents, but its browser commands target one
 # persistent profile. Serialize the complete navigation/capture transaction so
 # two helpers cannot interleave routes, viewport changes, or output ownership.
@@ -668,6 +737,24 @@ if [ "$CURRENT_PAGE" -eq 0 ]; then
   if ! browser_set_viewport_retry; then
     recover_singleton_contention
     die "browser did not become ready for viewport configuration"
+  fi
+
+  # The session's browser may predate the desktop-pointer wrapper (any raw
+  # agent-browser call relaunches it without the wrapper env). A browser that
+  # still reports `hover: none` at a desktop viewport would silently drop every
+  # `@media (hover: hover)` style from this capture, so recycle it once; the
+  # re-exec relaunches through the wrapper.
+  if [ -n "${MOBIUS_SCREENSHOT_REAL_BROWSER:-}" ]; then
+    BROWSER_PHASE="desktop pointer capabilities"
+    HOVER_STATE="$(browser_eval_retry "matchMedia('(hover: hover)').matches" || true)"
+    if [ "$HOVER_STATE" != "true" ]; then
+      if [ "$SCREENSHOT_RECOVERY_COUNT" -eq 0 ]; then
+        restart_capture_once \
+          || die "browser lacks desktop pointer capabilities and could not be recycled"
+      else
+        echo "agent-screenshot.sh: browser still reports hover:none at a desktop viewport; hover-dependent styles will be missing from this capture" >&2
+      fi
+    fi
   fi
 
 # A retained test profile can start under an older service worker that handles
