@@ -657,51 +657,110 @@ def test_a_request_card_left_open_never_approves_an_app_reusing_the_id(client, a
   assert client.post("/api/keys/requests", headers=newcomer_auth, json=ASK).json()["status"] == "pending"
 
 
-def test_a_delayed_secret_delete_never_removes_the_key_of_an_app_reusing_the_id(client, auth, db, vault, monkeypatch):
+async def _as_app(route, app_id, principal, db):
+  """One app-token call that acts for the app: save, delete, or ask."""
+  from fastapi import HTTPException
+  from app.routes import app_secrets_compat
+  from app.routes import keys as keys_routes
+  try:
+    if route == "save":
+      await app_secrets_compat.put_secret(
+        app_id, "api_key", app_secrets_compat.SecretWrite(value="late-value"), db=db, principal=principal,
+      )
+    elif route == "delete":
+      await app_secrets_compat.delete_secret(app_id, "api_key", db=db, principal=principal)
+    else:
+      await keys_routes.request_key(body=ASK, principal=principal, db=db)
+  except HTTPException as exc:
+    return exc.status_code
+  return 200
+
+
+@pytest.mark.parametrize("route", ["save", "delete", "ask"])
+@pytest.mark.parametrize("reused", ["before_the_lookup", "while_waiting_for_the_lock"])
+def test_an_app_token_never_acts_for_an_app_reusing_its_id(client, auth, db, vault, pushes, route, reused):
+  """The app's token was authenticated, then the app was purged and its id
+  reused: before the route looked the app up, or while it waited for the
+  app's lock. Either way the call is refused, and the newcomer's key and
+  requests are untouched."""
   import asyncio
   from app import fs_locks
   from app.deps import Principal
-  from app.routes import app_secrets_compat
-  from fastapi import HTTPException
   app = _app(db, "leaving")
-  app_id, nonce = app.id, app.token_nonce
+  app_id = app.id
+  principal = Principal(owner=db.query(models.Owner).first(), app_id=app_id,
+                        app_instance_id=app.token_nonce, scope="app")
   asyncio.run(key_vault.store_app_key(app_id, "api_key", "old-apps-value"))
-  owner = db.query(models.Owner).first()
-  release = key_vault.release_app_key
+
+  async def reuse_the_id():
+    await key_vault.forget_app(app_id)
+    db.delete(app)
+    db.commit()
+    _app(db, "newcomer", app_id)
+    await key_vault.store_app_key(app_id, "api_key", "newcomers-value")
 
   async def scenario():
-    purge_holds_lock, purged = asyncio.Event(), asyncio.Event()
-
-    async def delayed_release(*args):
-      await purged.wait()                  # the delete was authorized, then stalled
-      return await release(*args)
-    monkeypatch.setattr(key_vault, "release_app_key", delayed_release)
+    if reused == "before_the_lookup":
+      await reuse_the_id()
+      return await _as_app(route, app_id, principal, db)
+    purge_holds_lock = asyncio.Event()
 
     async def purge():
       async with fs_locks.app_storage_lock(app_id):
         purge_holds_lock.set()
-        await asyncio.sleep(0.05)
-        await key_vault.forget_app(app_id)
-        db.delete(app)
-        db.commit()
-        _app(db, "newcomer", app_id)
-        await key_vault.store_app_key(app_id, "api_key", "newcomers-value")
-      purged.set()
+        await asyncio.sleep(0.05)          # the call found its app and waits here
+        await reuse_the_id()
 
-    async def delete():
+    async def call():
       await purge_holds_lock.wait()
-      principal = Principal(owner=owner, app_id=app_id, app_instance_id=nonce, scope="app")
-      try:
-        await app_secrets_compat.delete_secret(app_id, "api_key", db=db, principal=principal)
-      except HTTPException as exc:
-        return exc.status_code
-      return 204
+      return await _as_app(route, app_id, principal, db)
 
-    return (await asyncio.gather(purge(), delete()))[1]
+    return (await asyncio.gather(purge(), call()))[1]
 
   assert asyncio.run(scenario()) == 404
   [kept] = vault.list_keys()
   assert vault.reveal(kept["name"], ("owner", "")) == "newcomers-value"
+  assert vault.list_requests() == []
+
+
+def test_a_borrow_whose_body_outlives_the_app_never_uses_the_newcomers_grant(client, auth, db, vault):
+  """The token is checked before the body arrives. If the app is purged and
+  its id reused meanwhile, the borrow is refused, not sent with the grant the
+  owner gave the newcomer."""
+  import asyncio
+  from fastapi import HTTPException
+  from starlette.requests import Request
+  from app.deps import Principal
+  from app.routes import keys as keys_routes
+  app = _app(db, "leaving")
+  app_id = app.id
+  principal = Principal(owner=db.query(models.Owner).first(), app_id=app_id,
+                        app_instance_id=app.token_nonce, scope="app")
+  path = "/api/keys/use/shared/api.example.com/v1/x"
+
+  async def body_arrives_after_reuse():
+    await key_vault.forget_app(app_id)
+    db.delete(app)
+    db.commit()
+    _app(db, "newcomer", app_id)
+    vault.put_key("shared", {"value": DUMMY, "inject": ASK["inject"],
+                             "grants": {"apps": [app_id], "agents": False, "sites": [SITE]}})
+    return {"type": "http.request", "body": b"{}", "more_body": False}
+
+  request = Request({
+    "type": "http", "method": "POST", "path": path, "raw_path": path.encode(),
+    "query_string": b"", "headers": [(b"content-type", b"application/json")],
+  }, body_arrives_after_reuse)
+
+  async def borrow():
+    try:
+      await keys_routes.use_key("shared", "api.example.com", "v1/x", request, principal=principal, db=db)
+    except HTTPException as exc:
+      return exc.status_code
+    return 200
+
+  assert asyncio.run(borrow()) == 404
+  assert [e for e in vault.usage() if e["caller"].startswith("app")] == []
 
 
 def test_approving_an_app_never_sends_a_shared_key_to_new_sites(client, auth, db, vault):

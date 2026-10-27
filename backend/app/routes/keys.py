@@ -25,6 +25,7 @@ from app.deps import (
   Principal, get_current_owner, get_principal, is_owner_input_principal,
   reject_cross_site, require_installation_owner_control,
 )
+from app.resource_access import authorized_app_nonce, recheck_app_identity
 
 
 def _installation_owner(principal: Principal = Depends(get_principal)) -> None:
@@ -193,10 +194,11 @@ async def request_key(
     raise HTTPException(404, "App not found.")
   payload = {k: body[k] for k in ("key", "reason", "sites", "inject") if k in body}
   payload["app_name"] = app.name
-  # Queued under the app's lock: a request left behind by a removed app would
-  # otherwise grant its key to an unrelated app that reuses the id.
+  # Queued under the app's lock, for the installation the token names: a
+  # request left behind by a removed app would otherwise grant its key to an
+  # unrelated app that reuses the id.
   try:
-    async with key_vault.for_live_app(app.id, app.token_nonce):
+    async with key_vault.for_live_app(app.id, authorized_app_nonce(principal, app)):
       answer = await _relay("POST", "/requests", payload, caller=f"app:{app.id}")
   except key_vault.AppGone:
     raise HTTPException(404, "App not found.") from None
@@ -220,6 +222,7 @@ async def request_key(
 async def use_key(
   name: str, host: str, path: str, request: Request,
   principal: Principal = Depends(get_principal),
+  db: Session = Depends(get_db),
 ) -> Response:
   """Send one HTTPS request with a key the caller may use but never sees."""
   caller = _caller(principal)
@@ -233,6 +236,10 @@ async def use_key(
   body = await request.body()
   if len(body) > MAX_USE_BODY:
     raise HTTPException(413, "The request body is too large.")
+  if principal.app_id is not None:
+    # The vault knows apps by id. A body still arriving when the app is purged
+    # and its id reused must not be sent with the replacement's grant.
+    recheck_app_identity(db, principal.app_id, principal.app_instance_id)
   headers = [
     (k, v) for k, v in request.headers.items()
     if k.lower() not in _DROPPED_REQUEST_HEADERS

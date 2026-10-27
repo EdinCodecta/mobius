@@ -116,7 +116,7 @@ export default function KeysSection({ focusRef, attention = false, onOpenKey, on
 
       {pending.map(request => (
         <KeyRequest
-          key={request.id}
+          key={requestFormKey(request)}
           request={request}
           keyRecord={keys.find(key => key.name === request.key)}
           names={names}
@@ -148,6 +148,15 @@ export default function KeysSection({ focusRef, attention = false, onOpenKey, on
       )}
     </section>
   )
+}
+
+/**
+ * Each pending request gets its own form, and so its own typed value. A request
+ * replacing another (an app that reused a removed app's id) keeps the id, the
+ * app and key, but not the ticket, so nothing typed for the old one is sent.
+ */
+export function requestFormKey(request) {
+  return `${request.id}:${request.ticket}`
 }
 
 function requestAppName(request, names) {

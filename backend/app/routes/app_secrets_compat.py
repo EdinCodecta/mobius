@@ -27,6 +27,7 @@ from app.deps import (
   reject_cross_site,
   require_nondelegated_owner_or_app_control,
 )
+from app.resource_access import authorized_app_nonce
 
 router = APIRouter(prefix="/api/apps", tags=["app-secrets (deprecated)"])
 
@@ -79,7 +80,7 @@ async def put_secret(
 ):
   app = _authorize_app(db, principal, app_id)
   try:
-    async with key_vault.for_live_app(app_id, app.token_nonce):
+    async with key_vault.for_live_app(app_id, authorized_app_nonce(principal, app)):
       await key_vault.store_app_key(app_id, name, body.value)
   except key_vault.AppGone:
     raise HTTPException(status_code=404, detail="App not found.") from None
@@ -136,7 +137,7 @@ async def delete_secret(
     # Under the app's lock and its authorized installation, as for a save: a
     # delete delayed past a purge must not remove the key of the app that
     # reused the id.
-    async with key_vault.for_live_app(app_id, app.token_nonce):
+    async with key_vault.for_live_app(app_id, authorized_app_nonce(principal, app)):
       released = await key_vault.release_app_key(app_id, name)
   except key_vault.AppGone:
     raise HTTPException(status_code=404, detail="App not found.") from None
