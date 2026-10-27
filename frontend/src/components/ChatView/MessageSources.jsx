@@ -1,4 +1,4 @@
-import { useId, useRef } from 'react'
+import { memo, useId, useRef } from 'react'
 import { ChevronDown } from '@openai/apps-sdk-ui/components/Icon'
 import useMessageSources from './hooks/useMessageSources.js'
 import {
@@ -21,7 +21,7 @@ function sourceMark(host) {
 // source indices; the link metadata is read when this disclosure first opens.
 // A just-completed live answer already has the same bounded metadata in its
 // tool blocks, so it can expand without an unnecessary round trip.
-export default function MessageSources({
+function MessageSources({
   chatId,
   groups,
   refs,
@@ -118,3 +118,21 @@ export default function MessageSources({
     </section>
   )
 }
+
+// Pagination rebuilds reply groups around unchanged historical messages. The
+// source hook serializes every block group, so skip that work when its actual
+// inputs (rather than the freshly allocated wrapper arrays) are unchanged.
+// Absent inputs mean "none", exactly as the hook reads them. That only keeps
+// a stale local caller from crashing; the update gate is what catches one.
+export function sameMessageSourcesProps(previous, next) {
+  if (previous.chatId !== next.chatId || previous.disclosureKey !== next.disclosureKey) return false
+  return sameItems(previous.groups, next.groups) && sameItems(previous.refs, next.refs)
+}
+
+function sameItems(previous, next) {
+  const before = previous || []
+  const after = next || []
+  return before.length === after.length && before.every((item, index) => item === after[index])
+}
+
+export default memo(MessageSources, sameMessageSourcesProps)

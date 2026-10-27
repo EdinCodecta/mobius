@@ -44,8 +44,12 @@ primitive that makes the no-clobber verdict possible — is a porcelain we
 get for free without a libgit2 binding to pin and maintain.
 
 CONCURRENCY: callers MUST hold `fs_locks.source_dir_lock(<source_dir>)`
-around every entry point here, so explicit apply cannot race the installer's
-merge on the same repo. This module does not take the
+around every entry point that reads or writes an app repository, so explicit
+apply cannot race the installer's merge on the same repo. The exceptions are
+the staging functions (`stage_fetch`, `stage_clone`), which write only a
+private staging repository and must run with no app lock held; their local
+counterparts (`import_staged`, `adopt_clone`) need the lock. This module does
+not take the
 lock itself — the lock is keyed on the source dir, which only the caller
 knows, and nesting lock acquisition inside would hide the ordering the
 rest of install.py reasons about.
@@ -62,10 +66,14 @@ import logging
 import os
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import tempfile
+import threading
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Callable, Iterable, Iterator
 
@@ -103,10 +111,39 @@ _EXCLUDE_END = "# END MOBIUS MANAGED IGNORE RULES"
 _GIT_NAME = "Mobius"
 _GIT_EMAIL = "mobius@localhost"
 
-# Subprocess timeout. App repos are tiny (one source file plus a couple
-# of scripts), so any git op that runs longer than this is wedged, not
-# slow.
+# The ceiling for local Git commands, which may run under app locks.
 _GIT_TIMEOUT = 30
+# Git reaches the network only in ``_transfer``, which never runs under an app
+# lock or in a live app repository. A healthy slow download may therefore take
+# minutes; a stalled one still fails once it stays below the low-speed limit.
+_GIT_TRANSFER_TIMEOUT = 600
+_GIT_LOW_SPEED_LIMIT = 1024  # bytes per second
+_GIT_LOW_SPEED_TIME = 60  # seconds
+# The last transferred candidate. Keeping it on a private ref protects it from
+# garbage collection between preview and install; no managed branch moves.
+FETCHED_REF = "refs/mobius/fetched"
+
+
+class GitTransferFailed(RuntimeError):
+  """A Git network transfer failed: the host, the network or the repository.
+
+  ``transient`` says whether the same transfer may later succeed unchanged: a
+  timeout or a dropped connection may, a missing ref or repository, refused
+  credentials, a name that does not exist or a full disk will not.
+  """
+
+  def __init__(self, message: str, *, transient: bool = True) -> None:
+    super().__init__(message)
+    self.transient = transient
+
+
+class GitTransferTimeout(GitTransferFailed):
+  """A Git transfer exceeded its wall-clock ceiling."""
+
+
+class HistoryIncomplete(RuntimeError):
+  """A shallow app repository hides the merge base an update needs."""
+
 
 # Contribute records a reviewed change as a Git object in the repository that
 # owns the live source.  The pending ref proves the reviewed diff came from a
@@ -141,15 +178,24 @@ class ReconciliationReceipt:
   compatible_paths: tuple[str, ...] = ()
   unresolved_conflict_paths: tuple[str, ...] = ()
   provenance_refs_used: tuple[str, ...] = ()
+  # Ancillary conflicts kept locally, dropping the incoming edit.
+  kept_local_paths: tuple[str, ...] = ()
+  # Local copies of merged pull requests the release replaced (see
+  # ``without_retired_units``). The Review preview API returns them as
+  # ``retired_paths`` before the owner applies, and the Settings update review
+  # lists them.
+  retired_paths: tuple["RetiredPath", ...] = ()
 
-  def as_dict(self) -> dict[str, list[str]]:
+  def as_dict(self) -> dict[str, list]:
     return {
+      "retired_paths": [item.as_dict() for item in self.retired_paths],
       "proven_present": list(self.proven_present),
       "local_only_paths": list(self.local_only_paths),
       "new_upstream_paths": list(self.new_upstream_paths),
       "compatible_paths": list(self.compatible_paths),
       "unresolved_conflict_paths": list(self.unresolved_conflict_paths),
       "provenance_refs_used": list(self.provenance_refs_used),
+      "kept_local_paths": list(self.kept_local_paths),
     }
 
 
@@ -185,6 +231,11 @@ class MergeResult:
   reconciliation: ReconciliationReceipt = field(
     default_factory=ReconciliationReceipt,
   )
+  # The local commit an update actually merged: the requested one, or a
+  # commit on it setting merged work aside. A resolver must start from it, or
+  # the retired conflicts would return. The platform updater's one merge
+  # (``_final_tree_merge``) always sets it; bare merges leave it None.
+  local_oid: str | None = None
 
 
 @dataclass(frozen=True)
@@ -381,6 +432,9 @@ def _git_env(
   env["GCM_INTERACTIVE"] = "Never"
   env["GIT_ASKPASS"] = "/bin/false"
   env["SSH_ASKPASS"] = "/bin/false"
+  quarantine = _OBJECT_QUARANTINE.get()
+  if quarantine and quarantine[0] == str(Path(repo).resolve()):
+    env["GIT_OBJECT_DIRECTORY"], env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = quarantine[1:]
   if read_only:
     # Read-only status/provenance checks must not refresh the durable index or
     # leave an optional lock behind. Mandatory locks for ordinary write paths
@@ -389,12 +443,50 @@ def _git_env(
   return env
 
 
+# (repository, temporary object store, the repository's own object store)
+# while ``quarantined_objects`` is active in this context.
+_OBJECT_QUARANTINE: ContextVar[tuple[str, str, str] | None] = ContextVar(
+  "app_git_object_quarantine", default=None,
+)
+
+
+@contextmanager
+def quarantined_objects(source_dir: str | Path) -> Iterator[None]:
+  """Let a read-only caller run planners that write trees and commits.
+
+  Git calls on ``source_dir`` inside the block still read every object of the
+  repository, but the objects they create go to a temporary store deleted on
+  exit, so nothing is added to the repository. Refs must not move inside it.
+  """
+  repo = Path(source_dir).resolve()
+  common = _run(repo, "rev-parse", "--git-common-dir").stdout.strip()
+  objects = (repo / common / "objects").resolve()
+  with tempfile.TemporaryDirectory(prefix="mobius-quarantine-") as tmp:
+    token = _OBJECT_QUARANTINE.set((str(repo), tmp, str(objects)))
+    try:
+      yield
+    finally:
+      _OBJECT_QUARANTINE.reset(token)
+
+
+def ref_file_size(source_dir: str | Path, ref: str, path: str) -> int | None:
+  """One file's size at ``ref`` without reading it, or None when it has none."""
+  proc = _run(Path(source_dir), "cat-file", "-s", f"{ref}:{path}", check=False, read_only=True)
+  return int(proc.stdout.strip()) if proc.returncode == 0 else None
+
+
+def ref_file(source_dir: str | Path, ref: str, path: str) -> bytes | None:
+  """One file's bytes at ``ref``, or None when ``ref`` has no file there."""
+  return _ref_blob(Path(source_dir), ref, path, read_only=True)
+
+
 def _run(
   repo: Path,
   *args: str,
   check: bool = True,
   read_only: bool = False,
   timeout: int = _GIT_TIMEOUT,
+  env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
   """Runs `git -C <repo> <args>` with the fixed Mobius identity.
 
@@ -412,10 +504,28 @@ def _run(
     "-C", str(repo),
     *args,
   ]
-  return subprocess.run(
-    cmd, capture_output=True, text=True, timeout=timeout,
-    check=check, env=_git_env(repo, read_only=read_only),
-  )
+  with subprocess.Popen(
+    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    start_new_session=True,
+    env={**_git_env(repo, read_only=read_only), **(env or {})},
+  ) as process:
+    try:
+      stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+      # Git removes its locks on SIGTERM; stop transport children with it.
+      try:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+          process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+          os.killpg(process.pid, signal.SIGKILL)
+          process.communicate()
+      except ProcessLookupError:
+        pass  # The whole group exited on its own in the meantime.
+      raise
+    if check and process.returncode:
+      raise subprocess.CalledProcessError(process.returncode, cmd, stdout, stderr)
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 
 def _run_with_index(
@@ -622,6 +732,79 @@ def _refresh_ignore_rules(
     )
 
 
+def ignore_migration_paths(
+  source_dir: str | Path, accepted: str, tree: str | None = None,
+) -> set[str]:
+  """Paths that differ from ``accepted`` only through managed-ignore migration.
+
+  The read-only mirror of ``_refresh_ignore_rules``, which apply runs before
+  every snapshot: a synthetic repo's ``.gitignore`` rewritten to the managed
+  rules, a stale managed ``.gitignore`` dropped from a real-origin repo, and
+  managed runtime paths untracked. ``tree`` is the candidate to compare, or
+  ``None`` for the worktree, where untracking leaves files in place, so any
+  change to a managed runtime path there is part of the migration too.
+  """
+  repo = Path(source_dir)
+  before = _ref_blob(repo, accepted, ".gitignore", read_only=True)
+  if tree is None:
+    gitignore = repo / ".gitignore"
+    after = gitignore.read_bytes() if gitignore.is_file() else None
+  else:
+    after = _ref_blob(repo, tree, ".gitignore", read_only=True)
+  paths: set[str] = set()
+  if before != after and (
+    after == _GITIGNORE.encode("utf-8")
+    or (
+      after is None and before is not None
+      and _looks_like_managed_gitignore(before.decode("utf-8", "replace"))
+    )
+  ):
+    paths.add(".gitignore")
+  if tree is not None:
+    untracked = [_run(
+      repo, "diff", "--name-only", "--no-renames", "-z", "--diff-filter=D",
+      accepted, tree, "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+    )]
+  else:
+    # Apply untracks these runtime paths, so whatever they hold in the
+    # worktree (changed, or new under older ignore rules) never reaches it.
+    untracked = [
+      _run(
+        repo, "diff", "--name-only", "--no-renames", "-z", accepted,
+        "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+      ),
+      _run(
+        repo, "ls-files", "--others", "--exclude-standard", "-z",
+        "--", *_MANAGED_RUNTIME_PATHS, check=False, read_only=True,
+      ),
+    ]
+  for proc in untracked:
+    if proc.returncode == 0:
+      paths.update(path for path in proc.stdout.split("\0") if path)
+  return paths
+
+
+def worktree_diff_paths(source_dir: str | Path, ref: str) -> set[str] | None:
+  """Paths whose worktree differs from ``ref``, untracked included, read-only.
+
+  Ignored files are left out, as apply never commits them. ``None`` when Git
+  cannot answer. Unlike a snapshot, this never touches ignore rules or any
+  index, so read-only views can use it.
+  """
+  repo = Path(source_dir)
+  diff = _run(
+    repo, "diff", "--name-only", "--no-renames", "-z", ref, "--",
+    check=False, read_only=True,
+  )
+  untracked = _run(
+    repo, "ls-files", "--others", "--exclude-standard", "-z",
+    check=False, read_only=True,
+  )
+  if diff.returncode or untracked.returncode:
+    return None
+  return {path for path in (diff.stdout + untracked.stdout).split("\0") if path}
+
+
 def is_repo(source_dir: str | Path) -> bool:
   """Whether `source_dir` already holds a git repo."""
   return (Path(source_dir) / ".git").exists()
@@ -717,7 +900,8 @@ def preview_merge_refs(
     )
     if left_oid is None or right_oid is None or common.returncode != 0:
       return None
-    object_dir = (Path(common.stdout.strip()) / "objects").resolve()
+    common_dir = Path(common.stdout.strip()).resolve()
+    object_dir = (common_dir / "objects").resolve()
     if not object_dir.is_dir() or "\n" in str(object_dir):
       return None
     with tempfile.TemporaryDirectory(prefix="mobius-merge-preview-") as tmp:
@@ -726,10 +910,19 @@ def preview_merge_refs(
       alternates = proof_repo / ".git" / "objects" / "info" / "alternates"
       alternates.parent.mkdir(parents=True, exist_ok=True)
       alternates.write_text(f"{object_dir}\n", encoding="utf-8")
+      # A shallow source hides grafted-away parents behind its boundary file,
+      # which alternates do not carry; without the copy, merge-tree fails on
+      # the missing parent and every shallow repo's preview reads as broken.
+      shallow = common_dir / "shallow"
+      if shallow.is_file():
+        shutil.copyfile(shallow, proof_repo / ".git" / "shallow")
       return merge_refs(
         proof_repo, left_oid, right_oid, read_only=True,
       )
-  except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):
+  except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+    # Callers render None as a generic "review unavailable"; keep the real
+    # reason reachable through the server log.
+    log.warning("merge preview failed for %s (%s..%s): %s", repo, left, right, exc)
     return None
 
 
@@ -764,17 +957,18 @@ def _canonical_diff(
   head_sha: str,
   *,
   read_only: bool = False,
+  env: dict[str, str] | None = None,
 ) -> bytes | None:
   """The byte-exact diff shape Contribute hashes before a PR can be sent."""
   try:
     proc = subprocess.run(
       [
         "git", "-c", "core.quotePath=false", "-C", str(repo),
-        "diff", "--no-ext-diff", "--no-color", "--binary", "--full-index",
+        "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--full-index",
         "--src-prefix=a/", "--dst-prefix=b/", f"{base_sha}..{head_sha}",
       ],
       capture_output=True, timeout=_GIT_TIMEOUT, check=False,
-      env=_git_env(repo, read_only=read_only),
+      env=env if env is not None else _git_env(repo, read_only=read_only),
     )
   except (OSError, subprocess.SubprocessError):
     return None
@@ -2090,80 +2284,6 @@ def _landed_equivalent_changes(repo: Path) -> list[EquivalentChange]:
   return _equivalent_changes(repo, _EQUIVALENCE_LANDED_PREFIX)
 
 
-def fetch_origin_commit(
-  source_dir: str | Path,
-  commit_sha: str,
-  *,
-  depth: int | None = None,
-) -> str:
-  """Fetch one immutable origin commit without moving any local ref.
-
-  Publication handoff verification needs GitHub's merge commit in the live app
-  object database before it can prove that the reviewed change really landed.
-  Importing the object without FETCH_HEAD or a branch update keeps that proof
-  read-only with respect to the app's source and updater-owned refs.
-  """
-  repo = Path(source_dir)
-  requested = str(commit_sha or "").lower()
-  if not _HEX_OID.fullmatch(requested):
-    raise ValueError("invalid origin commit")
-  if origin_url(repo) is None:
-    raise RuntimeError("source repository has no origin")
-  fetch_args = ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"]
-  if depth is not None:
-    fetch_args.extend(("--depth", str(depth)))
-  _run(repo, *fetch_args, "origin", requested)
-  fetched = _resolve_commit(repo, requested)
-  if fetched != requested:
-    raise RuntimeError("origin returned a different commit")
-  return fetched
-
-
-def fetch_origin_ref(
-  source_dir: str | Path,
-  ref: str,
-  *,
-  depth: int = 1,
-) -> str:
-  """Fetch one named or immutable origin ref without moving managed branches.
-
-  Update discovery and review need one immutable candidate commit, but must not
-  advance ``main`` or ``upstream`` before the owner accepts it. ``FETCH_HEAD``
-  is intentionally transient Git metadata; callers hold the per-app source
-  lock while fetching and reading the returned object id.
-  """
-  repo = Path(source_dir)
-  requested = str(ref or "")
-  immutable = requested.lower() if _HEX_OID.fullmatch(requested.lower()) else None
-  if immutable is None:
-    if (
-      not requested
-      or requested.startswith("-")
-      or "\\" in requested
-      or "\n" in requested
-      or "\r" in requested
-    ):
-      raise ValueError("invalid origin ref")
-    valid = _run(
-      repo, "check-ref-format", "--branch", requested, check=False,
-      read_only=True,
-    )
-    if valid.returncode != 0:
-      raise ValueError("invalid origin ref")
-  if origin_url(repo) is None:
-    raise RuntimeError("source repository has no origin")
-  _run(
-    repo, "fetch", "--quiet", "--no-tags", "--depth", str(depth),
-    "origin", immutable or requested,
-  )
-  fetched = _resolve_commit(repo, "FETCH_HEAD")
-  if fetched is None:
-    raise RuntimeError("origin ref did not resolve to a commit")
-  if immutable is not None and fetched != immutable:
-    raise RuntimeError("origin returned a different commit")
-  return fetched
-
-
 def verify_landed_equivalent_change(
   source_dir: str | Path,
   *,
@@ -2493,6 +2613,7 @@ def _superseded_drafts(repo: Path) -> list[SupersededDraft]:
 
 def without_superseded_drafts(
   source_dir: str | Path, local: str, upstream: str,
+  *, protected: Iterable[str] = (),
 ) -> str:
   """Return ``local``, or a commit on it with merged contributions' drafts set aside.
 
@@ -2501,7 +2622,14 @@ def without_superseded_drafts(
   once integrated, removing a draft a resolver kept would revert the merged
   version); the local tree provably contains the exact draft; and removing it
   merges cleanly (local work built on the draft stays with the resolver, as
-  before). Upstream's version then arrives from the release side of the merge.
+  before); removing it changes none of the ``protected`` paths, which the
+  owner chose to keep local (an ``owner-choice:local`` unit touched them);
+  and ``upstream`` still differs from the shared base on every restored path
+  the merging commit changed (a merge this update also reverts would
+  otherwise just drop the local draft). A restored path the merge left alone
+  is a file reviewers dropped from the pull request; it returns to the base
+  as before.
+  Upstream's version then arrives from the release side of the merge.
   The result's parent is ``local``, so merge bases and other witnesses hold.
   """
   repo = Path(source_dir)
@@ -2510,6 +2638,7 @@ def without_superseded_drafts(
   shared = _run(repo, "merge-base", local, upstream, check=False).stdout.strip()
   if tip is None or tree is None or not shared:
     return local
+  protected = set(protected)
   set_aside = 0
   for draft in _superseded_drafts(repo):
     if (
@@ -2526,6 +2655,11 @@ def without_superseded_drafts(
       continue
     if removed.status != "clean" or not removed.merged_tree_oid:
       continue
+    changed = _tree_changes(repo, tree, removed.merged_tree_oid)
+    if protected and not protected.isdisjoint(changed):
+      continue
+    if _release_reverts_merge(repo, draft.upstream_sha, shared, upstream, changed):
+      continue
     tree = removed.merged_tree_oid
     set_aside += 1
   if not set_aside:
@@ -2534,6 +2668,23 @@ def without_superseded_drafts(
     repo, "commit-tree", tree, "-p", tip,
     "-m", "Set aside local drafts of merged contributions",
   ).stdout.strip()
+
+
+def _release_reverts_merge(
+  repo: Path, merge: str, shared: str, upstream: str, paths: Iterable[str],
+) -> bool:
+  """Whether ``upstream`` leaves a path of ``paths`` that ``merge`` itself
+  changed exactly as ``shared`` had it: the merge was reverted or undone.
+
+  Judged per path, and only on the merging commit's own paths
+  (``merge^..merge``), as ``without_retired_units`` does.
+  """
+  merged = (endpoint_diff_paths(repo, f"{merge}^", merge) or set()) & set(paths)
+  if not merged:
+    return False
+  released = _path_entries(repo, upstream, merged)
+  based = _path_entries(repo, shared, merged)
+  return any(released.get(path) == based.get(path) for path in merged)
 
 
 def retire_landed_equivalent_changes(
@@ -2557,6 +2708,15 @@ def retire_landed_equivalent_changes(
         if ref:
           _run(repo, "update-ref", "-d", ref, check=False)
       retired += 1
+  # Likewise a merged-contribution witness: once its merge is integrated it is
+  # in every shared base and can never retire anything again; nor can one for
+  # another repository.
+  for contribution in _merged_contributions(repo):
+    if not contribution.for_platform_release or ref_is_ancestor(
+      repo, contribution.merge_sha, integrated_upstream,
+    ) is True:
+      proc = _run(repo, "update-ref", "-d", contribution.ref, check=False)
+      retired += int(proc.returncode == 0)
   return retired
 
 
@@ -2640,151 +2800,293 @@ def has_origin(source_dir: str | Path) -> bool:
   return origin_url(source_dir) is not None
 
 
-def clone_upstream(
-  source_dir: str | Path, repo_url: str, ref: str, *, depth: int = 1,
-) -> str:
-  """Clone a real upstream repo and check out local ``main`` at ``ref``.
+@dataclass(frozen=True)
+class Staged:
+  """A private repository holding one commit transferred from ``url``."""
 
-  This is the REAL-origin install variant of `record_upstream`: instead of
-  synthesizing an installer-owned `upstream` branch from fetched bytes, it keeps
-  the app repository's own origin and makes the resolved repository commit the
-  pristine upstream. Named refs use Git's ordinary clone path. Immutable
-  40/64-character commit ids are fetched directly because ``git clone
-  --branch`` does not accept an object id. Either way, the installed baseline
-  is a real catalog commit an update can fetch from and a local fix can be
-  pushed against as a PR. Local edits then commit onto ``main``.
+  path: Path
+  sha: str
+  url: str
+  # The origin branch the commit came from, when the ref named a branch.
+  branch: str | None = None
 
-  `source_dir` may already exist as an empty directory. The clone is built in a
-  sibling temp directory first and moved into place after success, so a failed
-  clone leaves the caller free to fall back to the synthetic `record_upstream`
-  path without a half-created `.git`.
 
-  Returns:
-    The checked-out HEAD sha.
+# Neither the transfer nor the import may start background maintenance that
+# outlives the staging directory or the app's source lock.
+_NO_AUTO_GC = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
+
+
+def same_origin(left: str | None, right: str | None) -> bool:
+  """Whether two Git remote URLs name the same repository."""
+  normalize = lambda value: value.rstrip("/").removesuffix(".git").lower()
+  return bool(left and right) and normalize(left) == normalize(right)
+
+
+def _is_shallow(repo: Path) -> bool:
+  return _run(
+    repo, "rev-parse", "--is-shallow-repository", read_only=True,
+  ).stdout.strip() == "true"
+
+
+# Failures, in Git's untranslated text, that a later identical fetch repeats.
+_PERMANENT_FETCH_ERROR = re.compile(
+  r"couldn't find remote ref|not our ref|repository\b.*\bnot found"
+  r"|does not appear to be a git repository|authentication failed"
+  r"|could not read (?:username|password)|returned error: 40[134]\b"
+  r"|no space left on device|disk quota exceeded",
+  re.IGNORECASE,
+)
+_DNS_RECHECK_TIMEOUT = 5  # seconds
+_UNRESOLVED_HOST = re.compile(r"could not resolve host: ([^\s']+)", re.IGNORECASE)
+
+
+def _transient_fetch_error(stderr: str) -> bool:
+  """Whether a failed fetch may succeed unchanged later; anything unknown may.
+
+  Git reports every resolver failure alike, so the host is looked up again:
+  as for connectors, only a resolver that could not answer (``EAI_AGAIN``) is
+  temporary, while a name that does not exist stays missing.
+  """
+  if _PERMANENT_FETCH_ERROR.search(stderr):
+    return False
+  unresolved = _UNRESOLVED_HOST.search(stderr)
+  if unresolved is None:
+    return True
+  answers: list[bool] = []
+
+  def lookup() -> None:
+    try:
+      socket.getaddrinfo(unresolved.group(1), None)
+    except socket.gaierror as exc:
+      answers.append(exc.errno == socket.EAI_AGAIN)
+    except (OSError, UnicodeError):
+      pass
+
+  # A resolver too slow to answer is itself a temporary failure.
+  lookup_thread = threading.Thread(target=lookup, daemon=True)
+  lookup_thread.start()
+  lookup_thread.join(_DNS_RECHECK_TIMEOUT)
+  return answers[0] if answers else True
+
+
+def _transfer(
+  stage: Path, url: str, ref: str, *, unshallow: bool,
+) -> tuple[str, str | None]:
+  """Fetch ``ref`` from ``url`` into ``stage``; Git's only network command.
+
+  ``stage`` is always a private staging repository, never a live app
+  repository, and no app lock is held: a slow transfer delays only its own
+  request. A full commit id is fetched exactly; a name prefers the branch and
+  falls back to the tag, as ``git clone --branch`` did. Returns the commit and
+  the branch it came from, if any.
+  """
+  requested = str(ref or "")
+  immutable = requested.lower() if _HEX_OID.fullmatch(requested.lower()) else None
+  if immutable is None and (
+    not requested
+    or requested.startswith("-")
+    or any(char in requested for char in "\\\n\r")
+    or _run(
+      stage, "check-ref-format", "--branch", requested, check=False,
+    ).returncode != 0
+  ):
+    raise ValueError("invalid origin ref")
+  sources = (
+    [immutable] if immutable
+    else [f"refs/heads/{requested}", f"refs/tags/{requested}"]
+  )
+  for source in sources:
+    try:
+      _run(
+        stage, *_NO_AUTO_GC,
+        "-c", f"http.lowSpeedLimit={_GIT_LOW_SPEED_LIMIT}",
+        "-c", f"http.lowSpeedTime={_GIT_LOW_SPEED_TIME}",
+        "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+        *(["--unshallow"] if unshallow else []),
+        "--end-of-options", url, f"+{source}:{FETCHED_REF}",
+        # The tag fallback and the failure's classification read Git's
+        # untranslated error text.
+        timeout=_GIT_TRANSFER_TIMEOUT, env={"LC_ALL": "C"},
+      )
+      break
+    except subprocess.TimeoutExpired as exc:
+      raise GitTransferTimeout(
+        f"it ran longer than {_GIT_TRANSFER_TIMEOUT} seconds"
+      ) from exc
+    except subprocess.CalledProcessError as exc:
+      if source == sources[-1] or "couldn't find remote ref" not in exc.stderr:
+        lines = (exc.stderr or "").strip().splitlines()
+        raise GitTransferFailed(
+          lines[-1] if lines else f"git exited with status {exc.returncode}",
+          transient=_transient_fetch_error(exc.stderr or ""),
+        ) from exc
+  fetched = _resolve_commit(stage, FETCHED_REF)
+  if fetched is None:
+    raise RuntimeError("origin ref did not resolve to a commit")
+  if immutable is not None and fetched != immutable:
+    raise RuntimeError("origin returned a different commit")
+  return fetched, requested if source == f"refs/heads/{requested}" else None
+
+
+def _record_origin_branch(repo: Path, staged: Staged) -> None:
+  """Keep ``origin/<branch>`` where ``git fetch origin`` would have left it.
+
+  Source status and Contribute compare an app with its last-fetched origin.
+  """
+  if staged.branch:
+    _run(repo, "update-ref", f"refs/remotes/origin/{staged.branch}", staged.sha)
+
+
+def _staging_dir(root: Path, prefix: str) -> Path:
+  root.mkdir(parents=True, exist_ok=True)
+  return Path(tempfile.mkdtemp(prefix=prefix, dir=root))
+
+
+def stage_fetch(source_dir: str | Path, url: str, ref: str, root: Path) -> Staged:
+  """Transfer ``ref`` for an existing app repo without touching that repo.
+
+  The bare staging repository borrows the live objects through alternates, so
+  Git negotiates with everything the app already has and downloads only new
+  objects. A legacy shallow repo's boundary is copied and completed here, so
+  the later local import gives it full history.
   """
   repo = Path(source_dir)
-  if repo.exists() and not repo.is_dir():
-    raise RuntimeError(f"source_dir exists and is not a directory: {repo}")
-  repo.parent.mkdir(parents=True, exist_ok=True)
-  clone_parent = repo.parent
-  with tempfile.TemporaryDirectory(
-    prefix=f".{repo.name}.clone-", dir=clone_parent,
-  ) as tmp:
-    clone_dir = Path(tmp) / "repo"
-    immutable_ref = ref.lower() if _HEX_OID.fullmatch(ref.lower()) else None
-    if immutable_ref is not None:
-      # A pinned catalog URL should create the same real-origin repository as
-      # a branch install, not fall back to an unrelated synthetic history.
-      # Initialize first so the exact object can be fetched without asking
-      # clone's --branch parser to treat an oid as a branch name.
-      cmd = ["git", "init", "-q"]
-      if len(immutable_ref) == 64:
-        cmd.append("--object-format=sha256")
-      cmd.append(str(clone_dir))
-      subprocess.run(
-        cmd, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
-        check=True, env=_git_env(repo),
+  git_dir = Path(_run(
+    repo, "rev-parse", "--path-format=absolute", "--git-common-dir",
+    read_only=True,
+  ).stdout.strip())
+  object_format = _run(
+    repo, "rev-parse", "--show-object-format", read_only=True,
+  ).stdout.strip()
+  stage = _staging_dir(root, "fetch-")
+  try:
+    _run(stage, "init", "-q", "--bare", f"--object-format={object_format}")
+    (stage / "objects" / "info" / "alternates").write_text(
+      f"{git_dir / 'objects'}\n", encoding="utf-8",
+    )
+    unshallow = (git_dir / "shallow").is_file()
+    if unshallow:
+      shutil.copyfile(git_dir / "shallow", stage / "shallow")
+    sha, branch = _transfer(stage, url, ref, unshallow=unshallow)
+    return Staged(stage, sha, url, branch)
+  except BaseException:
+    shutil.rmtree(stage, ignore_errors=True)
+    raise
+
+
+def import_staged(source_dir: str | Path, staged: Staged) -> str:
+  """Copy one staged commit into the app repo; local only, under its lock.
+
+  The repository must still have the origin the transfer came from. Only
+  objects, ``FETCHED_REF`` and the shallow marker change. The import is
+  proportional to the download, so it shares the transfer ceiling.
+  """
+  repo = Path(source_dir)
+  if not same_origin(origin_url(repo), staged.url):
+    raise SourceTreeChanged(
+      "the app's Git origin is not the repository this update came from"
+    )
+  try:
+    _run(
+      repo, *_NO_AUTO_GC, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+      *(["--unshallow"] if _is_shallow(repo) else []),
+      str(staged.path), f"+{FETCHED_REF}:{FETCHED_REF}",
+      timeout=_GIT_TRANSFER_TIMEOUT,
+    )
+  except subprocess.TimeoutExpired as exc:
+    raise GitTransferTimeout(
+      f"it ran longer than {_GIT_TRANSFER_TIMEOUT} seconds"
+    ) from exc
+  if _resolve_commit(repo, staged.sha) != staged.sha:
+    raise RuntimeError("staged commit did not import")
+  _record_origin_branch(repo, staged)
+  return staged.sha
+
+
+def present_commit(source_dir: str | Path, ref: str) -> str | None:
+  """``ref`` when it is a full commit id already present with full history."""
+  repo = Path(source_dir)
+  commit = str(ref or "").lower()
+  if not _HEX_OID.fullmatch(commit) or _is_shallow(repo):
+    return None
+  return commit if _resolve_commit(repo, commit, read_only=True) == commit else None
+
+
+def stage_clone(url: str, ref: str, root: Path) -> Staged:
+  """Build a complete real-origin app checkout privately, with no lock held.
+
+  ``main`` and ``upstream`` start at the resolved catalog commit, so the
+  installed baseline is a real commit an update can fetch from and a local
+  fix can be pushed against. A 64-character commit id implies a SHA-256
+  repository. ``adopt_clone`` moves the result into place under the locks.
+  """
+  stage = _staging_dir(root, "clone-")
+  try:
+    sha256 = len(ref) == 64 and _HEX_OID.fullmatch(ref.lower())
+    _run(stage, "init", "-q", *(["--object-format=sha256"] if sha256 else []))
+    _run(stage, "remote", "add", "origin", url)
+    # Catalog repos are untrusted content. Check out any tracked symlink as a
+    # plain file holding the link text, never a real filesystem symlink that
+    # could point outside the app directory. Set before the first checkout.
+    _run(stage, "config", "core.symlinks", "false")
+    sha, branch = _transfer(stage, url, ref, unshallow=False)
+    staged = Staged(stage, sha, url, branch)
+    _record_origin_branch(stage, staged)
+    if branch:
+      # Source status reads the remote's default branch through origin/HEAD.
+      _run(
+        stage, "symbolic-ref", "refs/remotes/origin/HEAD",
+        f"refs/remotes/origin/{branch}",
       )
-      _run(clone_dir, "remote", "add", "origin", repo_url)
-      remote_ref = fetch_origin_commit(
-        clone_dir, immutable_ref, depth=depth,
-      )
-    else:
-      cmd = [
-        "git",
-        "-c", f"user.name={_GIT_NAME}",
-        "-c", f"user.email={_GIT_EMAIL}",
-        # core.symlinks=false: check out any tracked symlink as a PLAIN FILE
-        # (the link text as content), never a real filesystem symlink. Catalog
-        # repos are untrusted content; a materialized symlink (e.g. `static` ->
-        # outside the app dir, or `index.jsx` -> /data/service-token.txt) would
-        # escape the containment the fetched-source path enforces via
-        # _assert_within — that guard is skipped for the cloned tree, so the
-        # non-symlink checkout is what keeps the clone inside its own dir.
-        "-c", "core.symlinks=false",
-        "clone", "-q",
-        "--depth", str(depth),
-        "--branch", ref,
-        repo_url,
-        str(clone_dir),
-      ]
-      subprocess.run(
-        cmd, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
-        check=True, env=_git_env(repo),
-      )
-      remote_ref = f"origin/{ref}"
-      _run(clone_dir, "rev-parse", "--verify", remote_ref)
-    # Keep later checkouts under the same safety policy as clone's first
-    # checkout instead of relying on a process-local ``git -c`` forever. On
-    # the immutable path this is set BEFORE its first checkout.
-    _run(clone_dir, "config", "core.symlinks", "false")
-    _run(clone_dir, "branch", "-f", UPSTREAM_BRANCH, remote_ref)
-    _run(clone_dir, "checkout", "-q", "-B", LOCAL_BRANCH, remote_ref)
+    _run(stage, "branch", "-f", UPSTREAM_BRANCH, sha)
+    # Writing a large working tree is proportional to the download.
+    _run(
+      stage, "checkout", "-q", "-B", LOCAL_BRANCH, sha,
+      timeout=_GIT_TRANSFER_TIMEOUT,
+    )
     # Keep the app's OWN .gitignore committed (it travels upstream), but layer
     # Möbius's managed-artifact ignores locally via .git/info/exclude so a
-    # later `git add -A` never tracks generated per-install files (static/,
-    # the static-asset manifest, init-cron.sh, *.bak, the compiled/id trees).
-    # A committed catalog .gitignore rarely lists these; without this, the
-    # first commit pollutes `main` and — since record_upstream preserves the
-    # on-disk .gitignore — never self-heals (the card-099 orphan-cron class).
-    _refresh_ignore_rules(clone_dir)
-    sha = _run(clone_dir, "rev-parse", "HEAD").stdout.strip()
-    repo.mkdir(parents=True, exist_ok=True)
-    existing = list(repo.iterdir())
-    if existing:
-      raise RuntimeError(f"source_dir is not empty: {repo}")
-    for child in clone_dir.iterdir():
-      shutil.move(str(child), str(repo / child.name))
-    return sha
+    # later `git add -A` never tracks generated per-install files.
+    _refresh_ignore_rules(stage)
+    return staged
+  except BaseException:
+    shutil.rmtree(stage, ignore_errors=True)
+    raise
 
 
-def fetch_upstream(
-  source_dir: str | Path,
-  ref: str,
-  *,
-  trusted_origin_adoption: bool = False,
-  verify: Callable[[str], None] | None = None,
-) -> FetchUpstreamResult:
-  """Fetch `origin/<ref>` and advance local `upstream` to that real commit.
+def adopt_clone(staged: Staged, source_dir: str | Path) -> Callable[[], None]:
+  """Move a staged clone into an empty ``source_dir``; local, under the locks.
 
-  This is the cloned-app update analogue of `record_upstream`: the catalog's
-  complete git tree is fetched from the real remote, then the installer-owned
-  `upstream` branch is moved to the fetched remote-tracking commit.
-  Depth-1 fetches can leave the previous upstream behind a shallow boundary;
-  when that happens, unshallow so Git can prove ancestry and the existing merge
-  path can compute a real merge base.
-
-  ``trusted_origin_adoption`` is the narrow legacy-adoption exception. The
-  caller must first prove that this repo's configured origin is the trusted
-  package identity. Rebinding an old synthetic ``upstream`` is safe only when
-  the fetched origin has the exact same complete tree as local ``main``: that
-  proof guarantees moving the ref cannot change any installed byte. Shared
-  history alone is insufficient because it also describes a genuine remote
-  rollback or force-push, which must stay on the conservative fallback path.
-
-  Returns:
-    The fetched commit and any trusted equal-tree adoption proof.
+  Returns the undo, which moves the checkout back and resets it to the staged
+  commit, so a rolled-back install pass can adopt it again without another
+  transfer.
   """
-  repo = Path(source_dir)
-  _run(repo, "fetch", "--depth", "1", "origin", ref)
-  # A branch/tag fetch updates ``origin/<ref>``.  Fetching an immutable commit
-  # oid does not create that remote-tracking name; Git records the exact fetched
-  # commit only in FETCH_HEAD.  Store updates are commonly review-bound to a
-  # commit-pinned raw URL, so resolve that shape through FETCH_HEAD rather than
-  # falling back to a synthetic upstream with unrelated history.
-  remote_ref = (
-    "FETCH_HEAD"
-    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", ref)
-    else f"origin/{ref}"
-  )
-  sha = _run(repo, "rev-parse", "--verify", remote_ref).stdout.strip()
-  if verify is not None:
-    verify(sha)
-  return promote_upstream(
-    repo,
-    sha,
-    trusted_origin_adoption=trusted_origin_adoption,
-  )
+  repo = Path(source_dir).resolve()
+  if repo.exists() and not repo.is_dir():
+    raise RuntimeError(f"source_dir exists and is not a directory: {repo}")
+  repo.mkdir(parents=True, exist_ok=True)
+  if any(repo.iterdir()):
+    raise RuntimeError(f"source_dir is not empty: {repo}")
+  moved: list[str] = []
+
+  def undo() -> None:
+    for name in reversed(moved):
+      shutil.move(str(repo / name), str(staged.path / name))
+    moved.clear()
+    _run(
+      staged.path, "checkout", "-q", "-f", "-B", LOCAL_BRANCH, staged.sha,
+      timeout=_GIT_TRANSFER_TIMEOUT,
+    )
+    _run(staged.path, "clean", "-q", "-ffdx", timeout=_GIT_TRANSFER_TIMEOUT)
+
+  try:
+    for child in list(staged.path.iterdir()):
+      shutil.move(str(child), str(repo / child.name))
+      moved.append(child.name)
+  except BaseException:
+    undo()
+    raise
+  return undo
 
 
 def _release_continues(repo: Path, previous: str, fetched: str) -> bool:
@@ -2822,10 +3124,7 @@ def promote_upstream(
     repo, "rev-parse", "--verify", UPSTREAM_BRANCH, check=False,
   )
   previous_sha = previous.stdout.strip() if previous.returncode == 0 else ""
-  # A depth-one fetch can re-graft even an unchanged tip. Repair based on the
-  # relationship the installer actually needs (local main ↔ fetched tip), not
-  # only on whether the remote SHA string changed.
-  _restore_shallow_history_if_needed(repo, LOCAL_BRANCH, fetched_ref)
+  require_merge_history(repo, LOCAL_BRANCH, fetched_ref)
   equal_local_adoption = (
     trusted_origin_adoption
     and ref_trees_equal(repo, LOCAL_BRANCH, fetched_ref)
@@ -3257,6 +3556,12 @@ def commit_replay(
 
 OVERLAY_UNIT_TRAILER = "Mobius-Overlay-Unit"
 OVERLAY_DISPOSITION_TRAILER = "Mobius-Disposition"
+# The original local commits a re-emitted unit carries; a record, not a proof.
+OVERLAY_SOURCE_TRAILER = "Mobius-Overlay-Source"
+# Another unit that also shaped every path of this commit, as
+# ``<slug>=<disposition>``. A re-emitted chain gives a path only to its owner's
+# commit, so this keeps the other contributors' claims for retirement.
+OVERLAY_ALSO_TRAILER = "Mobius-Overlay-Also"
 # Uncommitted working edits ride through an update as this transient unit and
 # return to the working tree afterwards.
 OVERLAY_WORKING_UNIT = "working-tree"
@@ -3264,16 +3569,781 @@ OVERLAY_WORKING_UNIT = "working-tree"
 
 def overlay_message(
   subject: str, *, unit: str, disposition: str, body: str = "",
+  sources: Iterable[str] = (), also: Iterable[tuple[str, str]] = (),
 ) -> str:
-  """A commit message carrying the overlay unit and disposition trailers."""
+  """A commit message carrying the overlay unit and disposition trailers.
+
+  ``also`` lists ``(slug, disposition)`` of other units that shaped the paths.
+  """
   parts = [subject.strip()]
   if body.strip():
     parts.append(body.strip())
-  parts.append(
-    f"{OVERLAY_UNIT_TRAILER}: {unit}\n"
-    f"{OVERLAY_DISPOSITION_TRAILER}: {disposition}"
+  trailers = [
+    f"{OVERLAY_UNIT_TRAILER}: {unit}",
+    f"{OVERLAY_DISPOSITION_TRAILER}: {disposition}",
+  ]
+  sources = tuple(sources)
+  if sources:
+    trailers.append(f"{OVERLAY_SOURCE_TRAILER}: {' '.join(sources)}")
+  trailers.extend(
+    f"{OVERLAY_ALSO_TRAILER}: {slug}={disposition}" for slug, disposition in also
   )
+  parts.append("\n".join(trailers))
   return "\n\n".join(parts) + "\n"
+
+
+# ── Overlay units ────────────────────────────────────────────────────────────
+#
+# A unit is one intent of local platform work: the commits sharing a
+# ``Mobius-Overlay-Unit`` slug, a labelled integration merge, or one untagged
+# commit. Each changed path belongs to the last unit that touched it, so units
+# partition the local delta; every unit also records all the paths it touched.
+# An update re-emits that delta as one commit per unit on the release
+# (``unit_chain``), so the next update still knows which change each path
+# carries and can retire a unit whose pull request merged upstream
+# (``set_aside_merged_work``) instead of re-merging a stale local copy.
+# No contributor marked ``owner-choice:local`` is ever retired; the chain names
+# the other contributors on the owner's commit (``Mobius-Overlay-Also``) so
+# that guard survives later updates.
+
+# Agents change a commit's disposition without rewriting history: the newest
+# ``Mobius-Disposition:`` note in this ref wins over the commit's trailer.
+OVERLAY_NOTES_REF = "refs/notes/mobius-overlay"
+# Contribute's offline witness of the exact bytes a merged platform pull
+# request carried; see ``record_merged_contribution``.
+MERGED_CONTRIBUTION_PREFIX = "refs/mobius/merged-contributions"
+# The repository platform releases come from. A witness for a pull request in
+# any other repository (a test fork) never retires anything: its number says
+# nothing about this release.
+PLATFORM_RELEASE_REPO = "mobius-os/mobius"
+# Updaters before unit chains squashed the whole delta into this one unit and
+# named the local tip it replaced, which ``overlay_units`` follows back.
+LEGACY_OVERLAY_UNIT = "platform-local-tree"
+_LEGACY_UNATTRIBUTED_UNIT = "legacy-unattributed"
+_LEGACY_SOURCE = re.compile(
+  r"^Previous local source: ([0-9a-f]{40}|[0-9a-f]{64})[ \t]*$", re.M,
+)
+_LEGACY_EXPANSION_DEPTH = 8
+_OVERLAY_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+_OVERLAY_DISPOSITION = re.compile(
+  r"^(?:local-only|owner-choice:local|wip|pending-pr:#([1-9][0-9]{0,8}))$",
+)
+# Upstream squash-merges end their subject with the pull request number.
+_PR_SUBJECT_SUFFIX = re.compile(r"\(#([1-9][0-9]{0,8})\)\s*$")
+_MAX_OVERLAY_SOURCES = 16
+_OVERLAY_TRAILER_LINE = re.compile(
+  rf"^(?:{OVERLAY_UNIT_TRAILER}|{OVERLAY_DISPOSITION_TRAILER}|"
+  rf"{OVERLAY_SOURCE_TRAILER}|{OVERLAY_ALSO_TRAILER}|Previous local source):.*$\n?",
+  re.M,
+)
+
+
+def _last_trailer(lines: str, key: str) -> str:
+  """``key``'s last value in ``lines``: a commit's trailer block, or a note.
+
+  Callers pass only a commit's parsed trailer block (``%(trailers)``), never
+  its whole message, so a body line quoting a trailer sets nothing. A
+  disposition note holds nothing but the trailer line, which Git's own
+  parser would read as a title, so notes are read line by line.
+  """
+  values = re.findall(rf"^{re.escape(key)}:[ \t]*(\S.*?)[ \t]*$", lines, re.M)
+  return values[-1] if values else ""
+
+
+def _valid_disposition(value: str) -> str:
+  return value if _OVERLAY_DISPOSITION.fullmatch(value) else ""
+
+
+@dataclass(frozen=True)
+class _OverlayCommit:
+  sha: str
+  message: str
+  note: str
+  paths: tuple[str, ...]
+  # The message's trailer block as Git parses it; the only place labels live.
+  trailers: str = ""
+
+  @property
+  def subject(self) -> str:
+    return self.message.partition("\n")[0].strip()
+
+  @property
+  def slug(self) -> str:
+    tagged = _last_trailer(self.trailers, OVERLAY_UNIT_TRAILER)
+    if _OVERLAY_SLUG.fullmatch(tagged):
+      return tagged
+    words = re.sub(r"[^a-z0-9]+", "-", self.subject.lower())[:40].strip("-")
+    return f"c-{self.sha[:8]}" + (f"-{words}" if words else "")
+
+  @property
+  def noted_disposition(self) -> str:
+    return _valid_disposition(_last_trailer(self.note, OVERLAY_DISPOSITION_TRAILER))
+
+  @property
+  def tagged_disposition(self) -> str:
+    return _valid_disposition(_last_trailer(self.trailers, OVERLAY_DISPOSITION_TRAILER))
+
+  @property
+  def sources(self) -> tuple[str, ...]:
+    carried = _last_trailer(self.trailers, OVERLAY_SOURCE_TRAILER).split()
+    return tuple(s for s in carried if _HEX_OID.fullmatch(s)) or (self.sha,)
+
+  @property
+  def also(self) -> tuple[tuple[str, str], ...]:
+    """The other units this commit records as shaping its paths."""
+    found = []
+    for value in re.findall(
+      rf"^{OVERLAY_ALSO_TRAILER}:[ \t]*(\S+)[ \t]*$", self.trailers, re.M,
+    ):
+      slug, _, disposition = value.partition("=")
+      if (
+        _OVERLAY_SLUG.fullmatch(slug) and slug != OVERLAY_WORKING_UNIT
+        and disposition != "wip" and _valid_disposition(disposition)
+      ):
+        found.append((slug, disposition))
+    return tuple(found)
+
+
+@dataclass(frozen=True)
+class OverlayUnit:
+  """One intent of local work and the changed paths it owns."""
+
+  slug: str
+  disposition: str  # local-only | pending-pr:#N | owner-choice:local
+  pr: int | None
+  subject: str
+  body: str
+  commits: tuple[str, ...]  # walked commits, oldest first
+  paths: tuple[str, ...]  # changed paths this unit was the last to touch
+  sources: tuple[str, ...] = ()  # original local commits, for the record
+  # Every changed path this unit contributed to, owned or not. A path several
+  # units shaped is retired only when all of them may retire.
+  touched: tuple[str, ...] = ()
+
+  def message(self, also: Iterable[tuple[str, str]] = ()) -> str:
+    return overlay_message(
+      self.subject, unit=self.slug, disposition=self.disposition,
+      body=self.body, sources=self.sources, also=also,
+    )
+
+
+def _overlay_commits(
+  repo: Path, tip: str, exclude: Iterable[str],
+) -> list[_OverlayCommit]:
+  """The local commits of ``tip`` outside ``exclude``, oldest first.
+
+  History is walked along first parents. A merge carrying an overlay trailer
+  or disposition note (an integration merge bringing in a PR branch) is one
+  commit whose paths are its first-parent diff; the commits it imported are
+  not listed separately. An unlabelled merge is not itself listed: the
+  commits it imported through its other parents are, walked the same way.
+  """
+  exclude = list(exclude)
+  proc = _run(
+    repo, "log", "--reverse", "--first-parent", "--diff-merges=first-parent",
+    "--no-renames", f"--notes={OVERLAY_NOTES_REF}",
+    "--format=%x1e%H%x1f%P%x1f%(trailers:only,unfold)%x1f%B%x1f%N%x1f",
+    "--name-only", "-z", tip, "--not", *exclude, "--",
+  )
+  commits = []
+  for record in proc.stdout.split("\x1e")[1:]:
+    sha, parents, trailers, message, note, names = (
+      record.split("\x1f", 5) + [""] * 5
+    )[:6]
+    first, *imported = parents.split() or [""]
+    labelled = _OverlayCommit(sha.strip(), message, note, (), trailers)
+    if imported and not (
+      _OVERLAY_SLUG.fullmatch(_last_trailer(trailers, OVERLAY_UNIT_TRAILER))
+      or labelled.tagged_disposition or labelled.noted_disposition
+    ):
+      seen = [*exclude, first]
+      for parent in imported:
+        commits.extend(_overlay_commits(repo, parent, seen))
+        seen.append(parent)
+      continue
+    paths = tuple(dict.fromkeys(
+      name.lstrip("\n") for name in names.split("\0") if name.strip("\n")
+    ))
+    commits.append(replace(labelled, paths=paths))
+  return commits
+
+
+# ``(commit, slug, paths, owns)``: ``commit`` (None for unattributed legacy
+# paths) contributed to ``paths`` as unit ``slug``, and owns them unless it
+# only guards them.
+_Claim = tuple[_OverlayCommit | None, str, tuple[str, ...], bool]
+
+
+def _legacy_guard_slug(squash: _OverlayCommit) -> str:
+  """The unit of one noted legacy squash's guard.
+
+  Every legacy squash carries the slug ``platform-local-tree``, so nested
+  squashes would otherwise share one unit and one disposition, letting an
+  older inner note override an outer one. Each noted squash is its own
+  intent over its own paths.
+  """
+  return f"{LEGACY_OVERLAY_UNIT}-{squash.sha[:12]}"
+
+
+def _commit_claims(
+  repo: Path, commit: _OverlayCommit, paths: tuple[str, ...],
+  exclude: list[str], depth: int = 1,
+) -> list[_Claim]:
+  """The claims one walked commit makes, expanding a legacy squash."""
+  if commit.slug != LEGACY_OVERLAY_UNIT:
+    return [(commit, commit.slug, paths, True)]
+  claims: list[_Claim] = []
+  # The squash's own trailer is always the default ``local-only``; only a
+  # disposition someone noted on it is an explicit choice, and it keeps
+  # guarding every path the squash carried after expansion hands ownership
+  # back to the commits it replaced.
+  noted = commit.noted_disposition
+  if noted and noted != "wip":
+    claims.append((commit, _legacy_guard_slug(commit), paths, False))
+  return claims + _expand_legacy_squash(repo, commit, paths, exclude, depth)
+
+
+def _expand_legacy_squash(
+  repo: Path, squash: _OverlayCommit, paths: tuple[str, ...],
+  exclude: list[str], depth: int,
+) -> list[_Claim]:
+  """Attribute a legacy squash's paths to the local commits it replaced.
+
+  Each path is claimed, in order, by every commit that touched it in the
+  squash's ``Previous local source``, following earlier squashes the same
+  way, so the last one owns it and the earlier ones still count as its
+  contributors. Paths no commit explains stay together under
+  ``legacy-unattributed``. This only labels history: the chain built from it
+  is proved to equal the merged tree.
+  """
+  found = _LEGACY_SOURCE.search(squash.message)
+  previous = _resolve_commit(repo, found.group(1)) if found else None
+  if previous is None or depth > _LEGACY_EXPANSION_DEPTH:
+    return [(None, _LEGACY_UNATTRIBUTED_UNIT, paths, True)]
+  walked = _overlay_commits(repo, previous, exclude)
+  wanted = set(paths)
+  explained = {path for commit in walked for path in commit.paths}
+  loose = tuple(path for path in paths if path not in explained)
+  claims: list[_Claim] = (
+    [(None, _LEGACY_UNATTRIBUTED_UNIT, loose, True)] if loose else []
+  )
+  for commit in walked:
+    owned = tuple(path for path in commit.paths if path in wanted)
+    if owned:
+      claims.extend(_commit_claims(repo, commit, owned, exclude, depth + 1))
+  return claims
+
+
+def overlay_units(
+  source_dir: str | Path, local: str, upstream: str,
+  *, official: str = "refs/remotes/origin/main",
+) -> list[OverlayUnit]:
+  """Partition the local commits ``upstream`` lacks into units.
+
+  ``paths`` partition the delta by last touch; ``touched`` lists every path a
+  unit contributed to. A unit whose paths later units all took over is still
+  returned for its ``touched`` paths. The transient ``working-tree`` unit is
+  excluded: its paths belong to no unit. A legacy ``platform-local-tree``
+  squash is expanded back into the commits it replaced, so an overlay
+  squashed by an older updater (including late edits squashed at boot by an
+  older image) regains its unit identity; a disposition noted on one squash
+  itself stays a contributor over that squash's paths, as its own
+  ``platform-local-tree-<sha>`` unit.
+
+  A unit's disposition is the newest one noted on its commits; failing that,
+  ``owner-choice:local`` if any of its commits or a later commit's
+  ``Mobius-Overlay-Also`` records it (a default ``local-only`` trailer on a
+  newer commit never drops an owner's choice); else the newest recorded.
+  """
+  repo = Path(source_dir)
+  exclude = [upstream, *([official] if _resolve_commit(repo, official) else [])]
+  claims = [
+    claim for commit in _overlay_commits(repo, local, exclude)
+    for claim in _commit_claims(repo, commit, commit.paths, exclude)
+  ]
+  owner: dict[str, str] = {}
+  groups: dict[str, list[_OverlayCommit]] = {}
+  touched: dict[str, set[str]] = {}
+  # Dispositions other commits recorded for a unit that shaped their paths.
+  recorded: dict[str, list[str]] = {}
+  for commit, slug, paths, owns in claims:
+    if slug == OVERLAY_WORKING_UNIT or (commit and commit.tagged_disposition == "wip"):
+      for path in paths:
+        owner.pop(path, None)
+      continue
+    members = groups.setdefault(slug, [])
+    if commit is not None:
+      members.append(commit)
+    touched.setdefault(slug, set()).update(paths)
+    for path in paths if owns else ():
+      owner[path] = slug
+    for other, disposition in commit.also if commit else ():
+      groups.setdefault(other, [])
+      touched.setdefault(other, set()).update(paths)
+      recorded.setdefault(other, []).append(disposition)
+  units = []
+  for slug, members in groups.items():
+    paths = tuple(sorted(path for path, unit in owner.items() if unit == slug))
+    if not touched.get(slug):
+      continue
+    labelled = [
+      *reversed([c.tagged_disposition for c in members]),
+      *reversed(recorded.get(slug, [])),
+    ]
+    disposition = next((
+      d for d in [
+        *reversed([c.noted_disposition for c in members]),
+        *(["owner-choice:local"] if "owner-choice:local" in labelled else []),
+        *labelled,
+      ] if d
+    ), "local-only")
+    pr = _OVERLAY_DISPOSITION.fullmatch(disposition).group(1)
+    first = members[0] if members else None
+    units.append(OverlayUnit(
+      slug=slug, disposition=disposition, pr=int(pr) if pr else None,
+      subject=(
+        first.subject if first
+        else "Local platform changes from before overlay units"
+      ),
+      body=(
+        _OVERLAY_TRAILER_LINE.sub("", first.message.partition("\n")[2]).strip()
+        if first else ""
+      ),
+      commits=tuple(c.sha for c in members),
+      paths=paths,
+      sources=tuple(dict.fromkeys(
+        s for c in members for s in c.sources
+      ))[-_MAX_OVERLAY_SOURCES:],
+      touched=tuple(sorted(touched[slug])),
+    ))
+  return units
+
+
+def _tree_changes(repo: Path, left: str, right: str) -> dict[str, tuple[str, str]]:
+  """``{path: (mode, oid)}`` turning ``left`` into ``right``; mode ``0`` deletes."""
+  proc = _run(repo, "diff-tree", "-r", "-z", "--no-renames", left, right)
+  fields = proc.stdout.split("\0")
+  changes = {}
+  for header, path in zip(fields[0::2], fields[1::2]):
+    _old_mode, mode, _old_oid, oid, _status = header.lstrip(":").split(" ", 4)
+    changes[path] = ("0", "0" * len(oid)) if int(mode, 8) == 0 else (mode, oid)
+  return changes
+
+
+def _index_info(changes: dict[str, tuple[str, str]], paths: Iterable[str]) -> str:
+  return "".join(f"{changes[p][0]} {changes[p][1]}\t{p}\0" for p in paths)
+
+
+def unit_chain(
+  source_dir: str | Path, target: str, tree: str, units: Iterable[OverlayUnit],
+  *, resolution: OverlayUnit,
+) -> str:
+  """Commit ``tree`` on ``target`` as one labelled commit per unit.
+
+  Each unit's commit sets the paths it owns to ``tree``'s bytes; a unit with
+  nothing left to change (retired, or already upstream) emits no commit.
+  Changed paths no unit owns, such as a resolver's additions or a path a
+  stray working-edits commit took from its owner, go into ``resolution``. A
+  path other units also touched is committed with those units named in
+  ``Mobius-Overlay-Also`` trailers, one commit per distinct set, resolution
+  included, so their dispositions still guard it after the original commits
+  are gone.
+  Raises ``RuntimeError`` unless the chain's tip tree is exactly ``tree``;
+  callers then fall back to one commit.
+  """
+  repo = Path(source_dir)
+  units = list(units)
+  remaining = _tree_changes(repo, target, tree)
+  changes = dict(remaining)
+  shaped_by: dict[str, set[tuple[str, str]]] = {}
+  for unit in units:
+    for path in unit.touched:
+      shaped_by.setdefault(path, set()).add((unit.slug, unit.disposition))
+  plan = []
+  for unit in [*units, resolution]:
+    by_also: dict[tuple[tuple[str, str], ...], list[str]] = {}
+    owned = unit.paths if unit is not resolution else sorted(remaining)
+    for path in owned:
+      if remaining.pop(path, None):
+        also = tuple(sorted(
+          c for c in shaped_by.get(path, ()) if c[0] != unit.slug
+        ))
+        by_also.setdefault(also, []).append(path)
+    plan.extend((unit.message(also), paths) for also, paths in by_also.items())
+  tip = target
+  with tempfile.TemporaryDirectory(prefix="mobius-unit-chain-") as tmp:
+    index = Path(tmp) / "index"
+    _run_with_index(repo, index, "read-tree", target)
+    for message, paths in plan:
+      _run_with_index(
+        repo, index, "update-index", "-z", "--index-info",
+        input=_index_info(changes, paths),
+      )
+      written = _run_with_index(repo, index, "write-tree").stdout.strip()
+      tip = _run(
+        repo, "commit-tree", written, "-p", tip, "-m", message,
+      ).stdout.strip()
+  if _tree_oid(repo, tip) != _tree_oid(repo, tree):
+    raise RuntimeError("the unit chain does not reproduce the merged tree")
+  return tip
+
+
+def overlay_evidence_fingerprint(source_dir: str | Path) -> str:
+  """Identity of the refs that change what an update sets aside, or "".
+
+  Disposition notes, merged-contribution witnesses and superseded drafts move
+  without moving any branch, so the reviewed update plan and the status cache
+  key on this too. Empty when none exist.
+  """
+  proc = _run(
+    Path(source_dir), "for-each-ref", "--format=%(refname) %(objectname)",
+    OVERLAY_NOTES_REF, MERGED_CONTRIBUTION_PREFIX, _SUPERSEDED_DRAFT_PREFIX,
+    check=False,
+  )
+  listing = proc.stdout.strip()
+  return hashlib.sha256(listing.encode("utf-8")).hexdigest() if listing else ""
+
+
+def mark_overlay_disposition(
+  source_dir: str | Path, commit: str, disposition: str,
+) -> str:
+  """Record a disposition for one local commit's unit without rewriting it."""
+  repo = Path(source_dir)
+  sha = _resolve_commit(repo, commit)
+  if sha is None:
+    raise ValueError(f"unknown commit: {commit}")
+  if disposition == "wip" or not _valid_disposition(disposition):
+    raise ValueError(
+      "disposition must be local-only, owner-choice:local or pending-pr:#<N>",
+    )
+  _run(
+    repo, "notes", f"--ref={OVERLAY_NOTES_REF}", "add", "-f",
+    "-m", f"{OVERLAY_DISPOSITION_TRAILER}: {disposition}", sha,
+  )
+  return sha
+
+
+@dataclass(frozen=True)
+class RetiredPath:
+  """A local copy set aside because the pull request carrying it merged.
+
+  ``proof`` is ``merged-contribution`` when the local bytes are exactly what
+  the reviewed head of the PR carried (Contribute's witness), or
+  ``pending-pr`` when they are still the ones the unit marked for that PR
+  last wrote.
+  """
+
+  path: str
+  pr: int
+  unit: str | None
+  proof: str
+
+  def as_dict(self) -> dict:
+    return {"path": self.path, "pr": self.pr, "unit": self.unit, "proof": self.proof}
+
+
+# Witness metadata version. Only this version is read; a ref under
+# ``MERGED_CONTRIBUTION_PREFIX`` in any other form is not a witness, so it
+# retires nothing and nothing here deletes it. (Pre-release builds wrote a
+# version 1 whose tree was the staging source, not the reviewed head;
+# ``backfill_merged_contribution_refs`` migrates those.)
+_MERGED_CONTRIBUTION_FORMAT = 2
+
+
+@dataclass(frozen=True)
+class _MergedContribution:
+  ref: str
+  number: int
+  repo: str  # GitHub ``owner/name``; "" for an unreadable witness
+  merge_sha: str | None
+  paths: tuple[str, ...]
+  metadata: dict = field(default_factory=dict, compare=False)
+
+  @property
+  def for_platform_release(self) -> bool:
+    return bool(self.merge_sha) and self.repo.lower() == PLATFORM_RELEASE_REPO
+
+
+_GITHUB_REPO_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def record_merged_contribution(
+  source_dir: str | Path,
+  *,
+  number: int,
+  repo_slug: str,
+  head_sha: str,
+  merge_sha: str,
+  paths: Iterable[str],
+  contribution_id: str = "",
+) -> str | None:
+  """Record that PR ``number`` of ``repo_slug`` merged as ``merge_sha``.
+
+  ``head_sha`` is the reviewed head the PR carried; the witness commit takes
+  its tree (and keeps it reachable as its parent), so the updater can prove
+  offline that a local file still holds exactly the bytes the PR carried.
+  ``paths`` are the reviewed files. ``merge_sha`` is GitHub's merge commit;
+  it need not be fetched yet, because the updater acts only once a release
+  contains it. Returns the ref, or None when the reviewed head is not in this
+  repository or an input is invalid. Recording the same witness again leaves
+  the ref as it is, so a re-run backfill does not move the overlay evidence
+  a reviewed update plan is bound to; anything else at the ref is replaced.
+  """
+  repo = Path(source_dir)
+  head = _resolve_commit(repo, head_sha) if head_sha else None
+  tree = _tree_oid(repo, head) if head else None
+  merge = str(merge_sha or "").strip().lower()
+  files = sorted({
+    p for p in paths if isinstance(p, str) and p and "\n" not in p and "\0" not in p
+  })
+  if (
+    not isinstance(number, int) or number <= 0 or tree is None or not files
+    or not _HEX_OID.fullmatch(merge) or not _GITHUB_REPO_SLUG.fullmatch(repo_slug)
+  ):
+    return None
+  metadata = {
+    "version": _MERGED_CONTRIBUTION_FORMAT,
+    "number": number,
+    "repo": repo_slug,
+    "merge_sha": merge,
+    "head_sha": head,
+    "paths": files,
+    "contribution_id": str(contribution_id)[:128],
+  }
+  ref = f"{MERGED_CONTRIBUTION_PREFIX}/{number}"
+  if any(
+    existing.ref == ref and existing.metadata == metadata
+    for existing in _merged_contributions(repo)
+  ):
+    return ref
+  anchor = _run(
+    repo, "commit-tree", tree, "-p", head,
+    "-m", json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+  ).stdout.strip()
+  _run(repo, "update-ref", ref, anchor)
+  return ref
+
+
+def _merged_contributions(repo: Path) -> list[_MergedContribution]:
+  listing = _run(
+    repo, "for-each-ref", "--format=%(refname)%00%(contents)%1e",
+    MERGED_CONTRIBUTION_PREFIX, check=False,
+  )
+  found = []
+  for record in listing.stdout.split("\x1e"):
+    ref, _, message = record.strip("\n").partition("\0")
+    try:
+      metadata = json.loads(message)
+    except ValueError:
+      continue
+    if (
+      not isinstance(metadata, dict)
+      or metadata.get("version") != _MERGED_CONTRIBUTION_FORMAT
+      or not metadata.get("head_sha")
+    ):
+      continue
+    number = metadata.get("number")
+    merge = str(metadata.get("merge_sha") or "")
+    paths = metadata.get("paths")
+    slug = metadata.get("repo")
+    if not isinstance(number, int) or number <= 0 or not isinstance(paths, list):
+      continue
+    found.append(_MergedContribution(
+      ref=ref, number=number, repo=slug if isinstance(slug, str) else "",
+      merge_sha=merge if _HEX_OID.fullmatch(merge) else None,
+      paths=tuple(p for p in paths if isinstance(p, str) and p),
+      metadata=metadata,
+    ))
+  return found
+
+
+def _pr_merge_commits(repo: Path, revisions: str) -> dict[int, str]:
+  """``{N: commit}`` for first-parent commits whose subject ends in ``(#N)``."""
+  proc = _run(
+    repo, "log", "--first-parent", "-z", "--format=%H %s", revisions, "--",
+    check=False,
+  )
+  merged: dict[int, str] = {}
+  for entry in proc.stdout.split("\0"):
+    sha, _, subject = entry.strip("\n").partition(" ")
+    found = _PR_SUBJECT_SUFFIX.search(subject)
+    if found:
+      merged.setdefault(int(found.group(1)), sha)
+  return merged
+
+
+def _path_entries(repo: Path, treeish: str, paths: Iterable[str]) -> dict[str, str]:
+  """``{path: "mode oid"}`` for the listed files present in ``treeish``."""
+  wanted = sorted(set(paths))
+  entries = {}
+  for start in range(0, len(wanted), 500):
+    chunk = wanted[start:start + 500]
+    proc = _run(
+      repo, "ls-tree", "-r", "-z", "--full-tree", treeish, "--", *chunk,
+      env={"GIT_LITERAL_PATHSPECS": "1"},
+    )
+    listed = set(chunk)
+    for line in proc.stdout.split("\0"):
+      meta, _, path = line.partition("\t")
+      if path in listed:
+        mode, _type, oid = meta.split(" ")
+        entries[path] = f"{mode} {oid}"
+  return entries
+
+
+def set_aside_merged_work(
+  source_dir: str | Path, local: str, upstream: str,
+) -> tuple[str, tuple[RetiredPath, ...]]:
+  """Return ``local``, or a commit on it with merged pull requests' local work set aside.
+
+  The one retirement planner: Review, Apply, the resolver handoff and the
+  status summary all call it, so what status counts and Review returns is
+  what Apply does. Superseded drafts are set aside first
+  (``without_superseded_drafts``), never changing a path an
+  ``owner-choice:local`` unit touched; then unchanged copies of merged pull
+  requests retire (``without_retired_units``). The result descends from
+  ``local``, so everything set aside stays recoverable and merge bases hold.
+
+  Unit labels only add retirement and owner-choice protection on top of the
+  superseded-draft step that predates them. If labelling fails, no owner's
+  choice is known and no unit can retire, but superseded drafts are still set
+  aside exactly as before units existed; if retirement fails, the drafts set
+  aside so far are kept and every local copy stays for the resolver.
+  """
+  try:
+    units = overlay_units(source_dir, local, upstream)
+  except Exception:
+    log.warning("could not label local overlay units", exc_info=True)
+    return without_superseded_drafts(source_dir, local, upstream), ()
+  drafted = without_superseded_drafts(source_dir, local, upstream, protected={
+    path for unit in units if unit.disposition == "owner-choice:local"
+    for path in (*unit.touched, *unit.paths)
+  })
+  try:
+    return without_retired_units(source_dir, drafted, upstream, units)
+  except Exception:
+    log.warning("could not retire merged local copies", exc_info=True)
+    return drafted, ()
+
+
+def without_retired_units(
+  source_dir: str | Path, local: str, upstream: str, units: Iterable[OverlayUnit],
+) -> tuple[str, tuple[RetiredPath, ...]]:
+  """Return ``local``, or a commit on it with merged pull requests' copies retired.
+
+  A path is retired, taking ``upstream``'s bytes, only when one claim on it
+  holds all of:
+  - the PR's merge is newly brought by this update (an ancestor of
+    ``upstream`` but not of the shared base, as for superseded drafts, so a
+    later resolver's choice to keep local is never reverted). For a
+    merged-contribution witness that is its recorded merge commit in
+    ``PLATFORM_RELEASE_REPO``; for a ``pending-pr:#N`` unit, the first-parent
+    release commit whose subject ends in ``(#N)``;
+  - that merge commit changed the path, so a wrong claim retires nothing else,
+    and ``upstream`` still differs there from the shared base (a merge this
+    update also reverts leaves the local change to the ordinary merge);
+  - the local bytes are exactly the ones handed to the PR: what its reviewed
+    head carried (merged-contribution), or what the ``pending-pr:#N`` unit
+    last wrote (pending-pr);
+  - no unit that contributed to the path is ``owner-choice:local``, and under
+    a pending-pr proof every contributor is a ``pending-pr:#M`` unit this
+    update merges, since that unit's bytes may include another unit's earlier
+    edit. The reviewed head's bytes are the PR's own, so whatever other units
+    shaped them was handed over with it.
+  The result's parent is ``local``, so the retired bytes stay recoverable.
+  """
+  repo = Path(source_dir)
+  tip = _resolve_commit(repo, local)
+  shared = _run(repo, "merge-base", local, upstream, check=False).stdout.strip()
+  if tip is None or not shared:
+    return local, ()
+  units = list(units)
+  owners = {path: unit for unit in units for path in unit.paths}
+  contributors: dict[str, list[OverlayUnit]] = {}
+  for unit in units:
+    for path in unit.touched or unit.paths:
+      contributors.setdefault(path, []).append(unit)
+  merged_prs = _pr_merge_commits(repo, f"{shared}..{upstream}")
+  # path -> claims, tried in order: (PR, merge commit, proof, tree-ish holding
+  # the handed-over bytes).
+  claims: dict[str, list[tuple[int, str, str, str]]] = {}
+  for contribution in _merged_contributions(repo):
+    merge = contribution.merge_sha
+    if not (
+      contribution.for_platform_release
+      and ref_is_ancestor(repo, merge, upstream) is True
+      and ref_is_ancestor(repo, merge, shared) is False
+    ):
+      continue
+    for path in contribution.paths:
+      claims.setdefault(path, []).append(
+        (contribution.number, merge, "merged-contribution", contribution.ref),
+      )
+  # The owning unit last wrote the local bytes, so its claim is tried first.
+  for unit, paths in [
+    *((u, u.paths) for u in units), *((u, u.touched) for u in units),
+  ]:
+    if unit.pr in merged_prs and unit.commits:
+      claim = (unit.pr, merged_prs[unit.pr], "pending-pr", unit.commits[-1])
+      for path in paths:
+        if claim not in claims.setdefault(path, []):
+          claims[path].append(claim)
+
+  def may_retire(unit: OverlayUnit, proof: str) -> bool:
+    if unit.disposition == "owner-choice:local":
+      return False
+    return proof == "merged-contribution" or unit.pr in merged_prs
+
+  if not claims:
+    return local, ()
+  local_entries = _path_entries(repo, tip, claims)
+  upstream_entries = _path_entries(repo, upstream, claims)
+  shared_entries = _path_entries(repo, shared, claims)
+  held: dict[str, dict[str, str]] = {}
+  changed_by: dict[str, set[str]] = {}
+  retired = []
+  for path, options in sorted(claims.items()):
+    if local_entries.get(path) == upstream_entries.get(path):
+      continue
+    # The release leaves the path as the shared base had it (the PR merged
+    # and was reverted, or a later change undid it): taking its version
+    # would only drop the local change, which the ordinary merge keeps.
+    if upstream_entries.get(path) == shared_entries.get(path):
+      continue
+    for pr, merge, proof, holder in options:
+      if not all(may_retire(unit, proof) for unit in contributors.get(path, ())):
+        continue
+      if merge not in changed_by:
+        changed_by[merge] = endpoint_diff_paths(repo, f"{merge}^", merge) or set()
+      if holder not in held:
+        held[holder] = _path_entries(repo, holder, [
+          p for p, listed in claims.items() if any(c[3] == holder for c in listed)
+        ])
+      if path in changed_by[merge] and local_entries.get(path) == held[holder].get(path):
+        unit = owners.get(path)
+        retired.append(RetiredPath(path, pr, unit.slug if unit else None, proof))
+        break
+  if not retired:
+    return local, ()
+  changes = {
+    item.path: tuple(upstream_entries[item.path].split(" "))
+    if item.path in upstream_entries else ("0", "0" * len(tip))
+    for item in retired
+  }
+  with tempfile.TemporaryDirectory(prefix="mobius-retire-") as tmp:
+    index = Path(tmp) / "index"
+    _run_with_index(repo, index, "read-tree", tip)
+    _run_with_index(
+      repo, index, "update-index", "-z", "--index-info",
+      input=_index_info(changes, changes),
+    )
+    tree = _run_with_index(repo, index, "write-tree").stdout.strip()
+  prs = ", ".join(f"#{n}" for n in sorted({item.pr for item in retired}))
+  commit = _run(
+    repo, "commit-tree", tree, "-p", tip,
+    "-m", f"Retire local copies of merged pull requests {prs}",
+  ).stdout.strip()
+  return commit, tuple(retired)
 
 
 def remove_overlay_worktree(source_dir: str | Path, worktree: str | Path) -> None:
@@ -3299,43 +4369,44 @@ def local_diverged_from(source_dir: str | Path, base_commit: str) -> bool:
   return proc.returncode != 0
 
 
-def _restore_shallow_history_if_needed(
+def require_merge_history(
   source_dir: str | Path,
   left: str = LOCAL_BRANCH,
   right: str = UPSTREAM_BRANCH,
 ) -> None:
-  """Restore remote history when a shallow graft may hide a merge base.
+  """Refuse a merge whose base a legacy shallow boundary may hide.
 
-  Depth-one app fetches can make ``main`` and ``upstream`` appear unrelated
-  even though both came from the same origin. The update verdict and the
-  resolver's real merge both require that base, so they self-heal at their
-  entry points. A failed/offline fetch raises without moving refs or the
-  working tree. If unshallowing proves the histories are genuinely unrelated,
-  return normally: the merge seam handles that valid legacy-adoption shape
-  with Git's empty-base semantics.
+  Local only: callers complete history before taking locks (see
+  ``install.fetch_app_commit``). Without a shallow boundary, a missing merge
+  base is a genuine fact that the merge seam handles itself.
   """
   repo = Path(source_dir)
-  shallow_raw = _run(repo, "rev-parse", "--git-path", "shallow").stdout.strip()
-  shallow_path = Path(shallow_raw)
-  if not shallow_path.is_absolute():
-    shallow_path = repo / shallow_path
-  if not shallow_path.is_file():
+  if (
+    not _is_shallow(repo)
+    or not ref_exists(repo, left)
+    or not ref_exists(repo, right)
+    or _run(repo, "merge-base", left, right, check=False).stdout.strip()
+  ):
     return
-  if not ref_exists(repo, left) or not ref_exists(repo, right):
-    return
-  base = _run(repo, "merge-base", left, right, check=False)
-  if base.returncode == 0 and base.stdout.strip():
-    return
-  if not has_origin(repo):
-    raise RuntimeError(
-      f"no merge base between {left} and {right} in shallow repo without origin"
-    )
-  fetched = _run(
-    repo, "fetch", "--unshallow", "--no-tags", "origin", check=False,
+  raise HistoryIncomplete(
+    f"the app's Git history is incomplete (no merge base between {left} and "
+    f"{right}); retry when the app's source is reachable"
   )
-  if fetched.returncode != 0:
-    detail = fetched.stderr.strip() or fetched.stdout.strip()
-    raise RuntimeError(f"failed to restore app git history: {detail}")
+
+
+def origin_branch(source_dir: str | Path) -> str | None:
+  """The last-fetched origin branch, preferring ``main`` and ``master``."""
+  branches = [
+    name for name in _run(
+      Path(source_dir), "for-each-ref", "--format=%(refname:lstrip=3)",
+      "refs/remotes/origin/", read_only=True,
+    ).stdout.split()
+    if name != "HEAD"
+  ]
+  for preferred in ("main", "master"):
+    if preferred in branches:
+      return preferred
+  return branches[0] if branches else None
 
 
 def merge_upstream(
@@ -3363,7 +4434,7 @@ def merge_upstream(
   """
   repo = Path(source_dir)
   ensure_repo(repo)
-  _restore_shallow_history_if_needed(repo)
+  require_merge_history(repo)
   ordinary_base = _run(
     repo, "merge-base", LOCAL_BRANCH, UPSTREAM_BRANCH, check=False,
   ).stdout.strip()
@@ -3524,6 +4595,13 @@ def read_ref_tree(source_dir: str | Path, ref: str) -> dict[str, bytes]:
   return read_merged_tree(repo, tree_oid)
 
 
+def read_ref_subtree(source_dir: str | Path, ref: str, path: str) -> dict[str, bytes]:
+  """Read every file under directory `path` at `ref`, keyed repo-relative."""
+  repo = Path(source_dir)
+  tree_oid = _run(repo, "rev-parse", f"{ref}:{path}").stdout.strip()
+  return {f"{path}/{rel}": data for rel, data in read_merged_tree(repo, tree_oid).items()}
+
+
 def materialize_tree(
   source_dir: str | Path,
   tree_oid: str,
@@ -3533,7 +4611,7 @@ def materialize_tree(
 
   Catalog repositories are untrusted input. Paths are confined to
   ``target_dir`` and Git symlinks are written as plain files containing their
-  link text, matching ``clone_upstream``'s ``core.symlinks=false`` policy.
+  link text, matching ``stage_clone``'s ``core.symlinks=false`` policy.
   Submodules and other non-blob entries are rejected.
   """
   repo = Path(source_dir)
@@ -3646,7 +4724,7 @@ def start_conflict_merge(
   repo = Path(source_dir)
   ensure_repo(repo)
   if merge_base is None:
-    _restore_shallow_history_if_needed(repo, local_branch, upstream_branch)
+    require_merge_history(repo, local_branch, upstream_branch)
   local_sha = head_sha(repo, local_branch)
   upstream_sha = head_sha(repo, upstream_branch)
   if _run(repo, "status", "--porcelain").stdout.strip():
@@ -3779,13 +4857,66 @@ _APP_VERSION_RE = re.compile(
 
 
 def read_blob(source_dir: str | Path, ref: str, rel: str) -> bytes | None:
-  """Raw bytes of `rel` at `ref`, or None if the path is absent there."""
+  """Raw blob bytes of `rel` at `ref`, or None for absent/non-file paths."""
   repo = Path(source_dir)
   proc = subprocess.run(
-    ["git", "-C", str(repo), "cat-file", "-p", f"{ref}:{rel}"],
+    ["git", "-C", str(repo), "cat-file", "blob", f"{ref}:{rel}"],
     capture_output=True, timeout=_GIT_TIMEOUT, check=False, env=_git_env(repo),
   )
   return proc.stdout if proc.returncode == 0 else None
+
+
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_REGULAR_FILE_MODES = frozenset({b"100644", b"100755"})
+
+
+def read_committed_file(
+  source_dir: str | Path,
+  commit: str,
+  rel: str,
+  *,
+  max_bytes: int,
+  timeout: float = 5,
+) -> bytes | None:
+  """Bytes of one regular file in an exact accepted commit, or None.
+
+  Reads only Git's object database, so uncommitted worktree edits, symlinks,
+  and other non-regular tree entries can never reach the caller. ``commit``
+  must be a full object id (an accepted ``source_commit``), not a moving ref.
+  """
+  if not isinstance(commit, str) or not _COMMIT_SHA_RE.fullmatch(commit):
+    return None
+  repo = Path(source_dir)
+  env = _git_env(repo, read_only=True)
+  try:
+    listing = subprocess.run(
+      ["git", "--literal-pathspecs", "-C", str(repo),
+       "ls-tree", "-l", "-z", commit, "--", rel],
+      capture_output=True, timeout=timeout, check=False, env=env,
+    )
+    if listing.returncode != 0:
+      return None
+    meta, tab, name = listing.stdout.removesuffix(b"\0").partition(b"\t")
+    fields = meta.split()
+    if (
+      not tab
+      or name != rel.encode()
+      or len(fields) != 4
+      or fields[0] not in _REGULAR_FILE_MODES
+      or fields[1] != b"blob"
+      or not fields[3].isdigit()
+      or int(fields[3]) > max_bytes
+    ):
+      return None
+    blob = subprocess.run(
+      ["git", "-C", str(repo), "cat-file", "blob", fields[2].decode("ascii")],
+      capture_output=True, timeout=timeout, check=False, env=env,
+    )
+  except (OSError, subprocess.SubprocessError, UnicodeError):
+    return None
+  if blob.returncode != 0 or len(blob.stdout) > max_bytes:
+    return None
+  return blob.stdout
 
 
 # Sentinels for the structural JSON merge: a key that is absent on a side, and
@@ -3972,32 +5103,38 @@ class BenignResolution:
   APP_VERSION taken from upstream); `tree_oid` is the merge-tree oid it was built
   from, so the caller can read exec bits off the same tree the clean-merge path
   uses (`read_tree_exec_paths`) rather than approximating from a branch.
+  `kept_local` names conflicting paths outside the package that keep the
+  local version as is.
   """
   tree: dict[str, bytes]
   tree_oid: str
+  kept_local: tuple[str, ...] = ()
 
 
 def resolve_benign_conflict(
   source_dir: str | Path, conflict_paths: list[str],
   *, merge_base: str | None = None,
+  package_paths: set[str] | None = None,
+  incoming: str = UPSTREAM_BRANCH,
 ) -> BenignResolution | None:
-  """Full merged source tree with every BENIGN conflict auto-resolved, or None
-  when any conflicting file carries a genuine overlap.
+  """Reconcile package conflicts or keep local ancillary paths, else None.
 
-  Call only after `merge_upstream` verdicted a conflict. We PROVE each conflict
-  is benign rather than assume it: JSON manifests get a structural three-way
-  merge (serialization drift and disjoint edits reconcile; true overlap does
-  not), and other source files get the narrow APP_VERSION-only line resolution.
-  If every conflicting file resolves, we return the whole merged tree
-  (non-conflict files carry their clean three-way merge; conflicting files carry
-  the reconciled result). If any file still carries a real clash we return None
-  and the caller falls back to the owner-resolver flow. Fail-safe by
-  construction: a genuine local edit is never silently dropped, because a
-  residual conflict aborts the whole attempt.
+  Call after a merge with ``incoming`` reports a conflict. Try each narrow
+  per-file merge first (structural JSON or APP_VERSION-only line resolution).
+  Residual conflicts outside ``package_paths`` retain local bytes/deletions;
+  package conflicts still need the owner-resolver flow. The returned tree
+  includes all clean merges, and ``kept_local`` reports dropped upstream edits.
+  The caller must establish source completeness before accepting kept paths.
 
   Pass ``merge_base`` when the caller's merge verdict used an explicit base
   (a recorded previous release unrelated to the installed history), so this
   proof reasons from the same base.
+
+  An entry ending in ``/`` protects every path below that directory.
+  If the per-file merge fails, a path outside ``package_paths`` can keep its
+  local version, including a local deletion of a base file. Synthetic conflict
+  paths absent from both local and base trees need the resolver. None protects
+  every path.
   """
   repo = Path(source_dir)
   if not conflict_paths:
@@ -4013,7 +5150,7 @@ def resolve_benign_conflict(
   if merge_base is not None:
     args.extend(("--merge-base", merge_base))
   proc = _run(
-    repo, *args, LOCAL_BRANCH, UPSTREAM_BRANCH, check=False,
+    repo, *args, LOCAL_BRANCH, incoming, check=False,
   )
   if proc.returncode != 1:
     return None
@@ -4031,27 +5168,44 @@ def resolve_benign_conflict(
   base_ref = merge_base
   if base_ref is None:
     base_proc = _run(
-      repo, "merge-base", LOCAL_BRANCH, UPSTREAM_BRANCH, check=False,
+      repo, "merge-base", LOCAL_BRANCH, incoming, check=False,
     )
     base_ref = base_proc.stdout.strip() if base_proc.returncode == 0 else ""
   if not base_ref:
     return None
-  resolved: dict[str, bytes] = {}
+  resolved: dict[str, bytes | None] = {}
+  kept_local: list[str] = []
   for rel in merge_conflicts:
     ours = read_blob(repo, LOCAL_BRANCH, rel)
-    theirs = read_blob(repo, UPSTREAM_BRANCH, rel)
-    # A deletion on either side is not a benign shape; leave it to the owner.
-    if ours is None or theirs is None:
-      return None
-    merged = _resolve_benign_conflict_file(
-      rel, read_blob(repo, base_ref, rel), ours, theirs,
+    theirs = read_blob(repo, incoming, rel)
+    base = read_blob(repo, base_ref, rel)
+    merged = (
+      _resolve_benign_conflict_file(rel, base, ours, theirs)
+      if ours is not None and theirs is not None else None
     )
-    if merged is None:
+    if merged is not None:
+      resolved[rel] = merged
+    elif (
+      package_paths is not None
+      and not any(
+        rel == path or (path.endswith("/") and rel.startswith(path))
+        for path in package_paths
+      )
+      and (ours is not None or base is not None)
+    ):
+      resolved[rel] = ours
+      kept_local.append(rel)
+    else:
       return None
-    resolved[rel] = merged
   full = read_merged_tree(repo, tree_oid)
-  full.update(resolved)
-  return BenignResolution(tree=full, tree_oid=tree_oid)
+  for rel, data in resolved.items():
+    if data is None:
+      full.pop(rel, None)
+    else:
+      full[rel] = data
+  return BenignResolution(
+    tree=full, tree_oid=tree_oid, kept_local=tuple(kept_local),
+  )
 
 
 # Smells

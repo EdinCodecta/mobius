@@ -55,6 +55,7 @@ from app.frontend_assets import (
   live_frontend_dir,
   resolve_frontend_dir,
 )
+from app.managed_paths import SERVED_STATIC_DIR
 from app.memory_observability import record_memory_checkpoint
 from app.runtime_provenance import (
   protected_runtime_status,
@@ -79,6 +80,7 @@ from app import activity, models, tracing
 # wrapped imports in lifespan() below.
 from app.routes import (
   admin_router, agent_coordination_router, apps_router, app_services_router,
+  app_consent_router,
   app_tools_router,
   auth_router, browser_access_router,
   app_chat_router,
@@ -98,6 +100,7 @@ from app.routes import (
   media_router,
   local_services_router, notifications_router, notify_router, proxy_router, push_router,
   screen_control_router,
+  shared_folders_router,
   public_apps_router,
   public_storage_router,
   secrets_router, self_reminders_router, settings_router, skills_router,
@@ -314,6 +317,13 @@ async def lifespan(app):
   record_memory_checkpoint("startup_frontend_watcher_started")
   if database_boot.serviceable:
     await supervisors.start_database_services()
+    # Like cron mutation and restoration, the retry never runs in the test
+    # runtime, where it would reach other tests' HTTP doubles.
+    if (
+      startup_context.bootstrap_retry is not None
+      and os.environ.get("MOBIUS_TEST_RUNTIME") != "1"
+    ):
+      supervisors.retry_bootstrap_apps(startup_context.bootstrap_retry)
     from app.saved_secure_inputs import recover_interrupted
     await recover_interrupted()
     from app.startup import _capture_platform_activation_snapshot
@@ -342,11 +352,13 @@ async def lifespan(app):
       setup_task.cancel()
       await asyncio.gather(setup_task, return_exceptions=True)
     record_memory_checkpoint("shutdown_begin")
-    try:
-      from app.public_app_transport import close_public_fetch_clients
-      await close_public_fetch_clients()
-    except Exception as exc:
-      _log.error("public fetch client shutdown failed: %s", exc, exc_info=True)
+    from app.public_app_transport import close_public_fetch_clients
+    from app.routes.proxy import close_proxy_clients
+    for close_clients in (close_public_fetch_clients, close_proxy_clients):
+      try:
+        await close_clients()
+      except Exception as exc:
+        _log.error("outbound fetch client shutdown failed: %s", exc, exc_info=True)
     # Preserve the final partial request-error windows across graceful restarts.
     # This is one bounded batch append, not one write per response.
     activity.flush_request_errors()
@@ -434,7 +446,7 @@ async def _parent_is_file_handler(_request: Request, exc: ParentIsFile):
 # but FastAPI buffers the WHOLE body for Pydantic-parsed endpoints (e.g. a
 # create with a huge jsx_source) before validation — an unbounded body there
 # could OOM the memory-tight host (Codex review round-9 #4, round-10 #5). The
-# cap sits ABOVE every legitimate route limit (storage 50 MB, uploads 20 MB) so
+# cap sits ABOVE legitimate route limits (including chat uploads at 50 MiB) so
 # it only ever stops abuse.
 _MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
 
@@ -1020,6 +1032,7 @@ app.add_middleware(_RequestErrorTelemetryMiddleware)
 app.include_router(auth_router)
 app.include_router(apps_router)
 app.include_router(app_services_router)
+app.include_router(app_consent_router)
 app.include_router(storage_router)
 app.include_router(fs_router)
 app.include_router(projects_router)
@@ -1043,6 +1056,7 @@ app.include_router(connectors_public_router)
 app.include_router(app_chat_router)
 app.include_router(notify_router)
 app.include_router(screen_control_router)
+app.include_router(shared_folders_router)
 app.include_router(proxy_router)
 app.include_router(public_storage_router)
 app.include_router(public_apps_router)
@@ -1485,16 +1499,29 @@ def _resolve_asset_file(asset_path: str) -> Path | None:
     pass
   roots.append(_baked_dir / "assets")  # per-request corruption/boot floor
   for root in roots:
-    try:
-      root_r = root.resolve()
-      target = (root_r / asset_path).resolve()
-    except OSError:
-      continue
-    if target == root_r or root_r not in target.parents:
-      continue  # the dir itself, or a `..` traversal escaping the root
-    if target.is_file():
+    target = _contained_file(root, asset_path)
+    if target is not None:
       return target
   return None
+
+
+def _contained_file(root: Path, rel_path: str) -> Path | None:
+  """Return the existing file ``rel_path`` names strictly inside ``root``.
+
+  Every public static lookup joins a request-controlled path to a directory,
+  and Starlette has already percent-decoded it (``..%2f`` arrives as ``../``).
+  Resolving both sides and requiring ``root`` as an ancestor is what keeps an
+  unauthenticated request from reading arbitrary files such as the signing key.
+  The directory itself, an escape, and a miss all return None.
+  """
+  try:
+    root_r = root.resolve()
+    target = (root_r / rel_path).resolve()
+  except (OSError, ValueError):
+    return None
+  if target == root_r or root_r not in target.parents:
+    return None
+  return target if target.is_file() else None
 
 
 # Root-served worker scripts: `sw.js` caches the shell, `sw-push.js` owns Web
@@ -1735,7 +1762,7 @@ def _serve_app_static_asset(
   if not source_dir:
     raise HTTPException(status_code=404, detail="Not found.")
 
-  root = (Path(source_dir) / "static").resolve()
+  root = (Path(source_dir) / SERVED_STATIC_DIR).resolve()
   try:
     target = (root / (asset_path or "index.html")).resolve()
   except OSError:
@@ -1947,16 +1974,14 @@ if _baked_dir.is_dir() or _live_dir.is_dir():
         headers={"Cache-Control": "no-cache, must-revalidate"},
       )
 
-    file = static_dir / path
-    if not file.is_file() and static_dir != _baked_dir and path != "index.html":
+    file = _contained_file(static_dir, path)
+    if file is None and static_dir != _baked_dir and path != "index.html":
       # A complete live build can still omit an image-installed vendor asset,
       # or a new public file until that build refreshes. Pick the baked copy
       # before response policy so executable fallbacks cannot bypass the cache
       # and Range invariants enforced below.
-      baked = _baked_dir / path
-      if baked.is_file():
-        file = baked
-    if file.is_file() and path != "index.html":
+      file = _contained_file(_baked_dir, path)
+    if file is not None and path != "index.html":
       # The service worker MUST be served with `Cache-Control:
       # no-cache` so the browser revalidates it on every page load.
       # Without this header the browser caches sw.js by HTTP

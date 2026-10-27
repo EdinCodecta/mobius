@@ -180,7 +180,7 @@ def test_wake_enabled_exact_goal_helper_owns_handoff(db, chat, monkeypatch):
   from app import delegations
   _add_goal_run(db, chat)
   monkeypatch.setattr(delegations, "_self_resuming_helper_rows", lambda *_: [
-    (SimpleNamespace(parent_root_run_id="goal-run"), "running"),
+    (SimpleNamespace(id="helper-id", parent_root_run_id="goal-run", goal_id="goal-run"), "running"),
   ])
   response = get_writer().submit(PromotePending(
     chat_id=chat.id, run_token="not-needed", ending_run_token="goal-run",
@@ -198,7 +198,7 @@ def test_helper_from_an_earlier_attempt_of_this_goal_keeps_its_handoff(db, chat,
                         started_at=datetime(2000, 1, 1)))
   db.commit()
   monkeypatch.setattr(delegations, "_self_resuming_helper_rows", lambda *_: [
-    (SimpleNamespace(parent_root_run_id="middle-root"), "running"),
+    (SimpleNamespace(id="helper-id", parent_root_run_id="middle-root", goal_id="goal-run"), "running"),
   ])
   response = get_writer().submit(PromotePending(
     chat_id=chat.id, run_token="not-needed", ending_run_token="goal-run",
@@ -268,6 +268,11 @@ def test_goal_settlement_preserves_delegation_authority(db, chat, state):
     delegation.app_id = app.id
   db.add(delegation)
   db.commit()
+  if state == "read-only":
+    # Production retires old read helpers before any boot/recovery admission.
+    from app.delegations import interrupt_legacy_read_helpers
+    assert interrupt_legacy_read_helpers(db)[0] == 1
+    assert delegation.interrupted_at is not None
   response = get_writer().submit(PromotePending(
     chat_id=chat.id, run_token="provisional", ending_run_token="goal-run",
   )).result(timeout=5)
@@ -312,9 +317,12 @@ async def test_second_unhanded_ending_preserves_goal_and_records_durable_recover
   db.expire_all()
   assert db.get(models.ChatGoal, "goal-run").status == "open"
   assert db.get(models.ChatRun, token).status == "failed"
-  assert any(block.get("code") == "goal_settlement_unfinished"
-             for message in transcript_rows.history(db.get(models.Chat, chat.id))
-             for block in message.get("blocks") or [])
+  notice = next(block for message in transcript_rows.history(db.get(models.Chat, chat.id))
+                for block in message.get("blocks") or []
+                if block.get("code") == "goal_settlement_unfinished")
+  assert notice["resumable"] is True
+  assert notice["message"] == "Work interrupted. Your progress is saved. This Goal is unfinished. Resume to continue."
+  assert "automatic settlement" not in notice["message"].lower()
 
 
 def test_resource_and_restart_recovery_cannot_reset_the_settlement_budget(db, chat):
@@ -344,7 +352,7 @@ def test_unknown_recovery_history_stays_closed_without_claiming_an_attempt(db, c
   db.commit()
   assert recovery_attempted(db, run, reason="goal_settlement") is True
   assert "after one recovery attempt" not in GOAL_SETTLEMENT_UNFINISHED_MESSAGE
-  assert "cannot safely continue" in GOAL_SETTLEMENT_UNFINISHED_MESSAGE
+  assert "This Goal is unfinished. Resume to continue." in GOAL_SETTLEMENT_UNFINISHED_MESSAGE
 
 
 @pytest.mark.asyncio
@@ -379,16 +387,16 @@ def _complete(db, result="Verified: checks green"):
 
   goal = db.get(models.ChatGoal, "goal-run")
   return update_goal_record(
-    db, db.get(models.ChatRun, "goal-run"), goal, goal.revision, complete=result,
+    db, db.get(models.ChatRun, "goal-run"), goal, goal.revision, complete=True,
   )
 
 
 @pytest.mark.parametrize("outcome", ["met", "expired", "failed"])
-def test_verified_completion_takes_delivery_of_its_fired_wait(db, chat, outcome):
+def test_verified_completion_retires_its_fired_wait_without_provider_receipt(db, chat, outcome):
   """The running turn saw the outcome its Wait was watching for.
 
   The Wait's resume could only be delivered after this turn; the verified
-  completion is that delivery, so no resume later wakes the finished Goal.
+  completion retires it, so no resume later wakes the finished Goal.
   """
   from app import chat_waits
 
@@ -400,9 +408,14 @@ def test_verified_completion_takes_delivery_of_its_fired_wait(db, chat, outcome)
   wait.status = outcome
   db.commit()
 
+  run = db.get(models.ChatRun, "goal-run")
+  run.provider_execution_admitted = True
+  run.admitted_wait_results_json = [wait.id]
+  db.commit()
   assert _complete(db)["status"] == "completed"
   db.expire_all()
-  assert db.get(models.ChatWait, wait.id).resume_delivered_at is not None
+  assert db.get(models.ChatWait, wait.id).resume_delivered_at is None
+  assert db.get(models.ChatWait, wait.id).result_disposition == "retired_by_goal_outcome"
 
 
 def test_an_armed_wait_does_not_block_completion_and_keeps_watching(db, chat):
@@ -470,11 +483,16 @@ def test_completion_withdraws_the_queued_resume_of_its_fired_wait(db, chat):
   }, {"role": "user", "content": "Owner follow-up", "ts": 2, "cid": "owner-1"}]
   db.commit()
 
+  run = db.get(models.ChatRun, "goal-run")
+  run.provider_execution_admitted = True
+  run.admitted_wait_results_json = [wait.id]
+  db.commit()
   assert _complete(db)["status"] == "completed"
   asyncio.run(settle_after_goal_completion(chat.id))
 
   db.expire_all()
-  assert db.get(models.ChatWait, wait.id).resume_delivered_at is not None
+  assert db.get(models.ChatWait, wait.id).resume_delivered_at is None
+  assert db.get(models.ChatWait, wait.id).result_disposition == "retired_by_goal_outcome"
   assert [m["cid"] for m in db.get(models.Chat, chat.id).pending_messages] == [
     "owner-1",
   ]
@@ -570,3 +588,151 @@ def test_stop_retires_a_legacy_goal_handoff_without_resending_it(db, chat):
   assert cleared == {"cleared": 2, "cleared_cids": ["owner-1"]}
   db.expire_all()
   assert db.get(models.Chat, chat.id).pending_messages == [wait_result]
+
+
+def test_successor_goal_gets_its_own_settlement_after_prior_goal_settled_in_same_turn(db, chat):
+  from app.chat_writer import PromoteRunToGoal
+  from app.goals import update_goal_record
+  from app.continuations import recovery_attempted
+  _add_goal_run(db, chat, plan=None)
+  first = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="first-settlement", ending_run_token="goal-run",
+  )).result(timeout=5)
+  token_a = first["promoted"]["_run_token"]
+  db.expire_all()
+  run = db.get(models.ChatRun, token_a)
+  run.provider_execution_admitted = True
+  db.commit()
+  goal_a = db.get(models.ChatGoal, "goal-run")
+  update_goal_record(db, run, goal_a, goal_a.revision, complete=True)
+  promoted = get_writer().submit(PromoteRunToGoal(
+    chat_id=chat.id, run_token=token_a, objective="Independent Goal B",
+  )).result(timeout=5)
+  db.expire_all()
+  run = db.get(models.ChatRun, token_a)
+  assert run.goal_id == promoted["goal_id"] != goal_a.id
+  assert run.continuation_json["goal_id"] == goal_a.id
+  assert recovery_attempted(db, run, reason="goal_settlement") is False
+  second = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="second-settlement", ending_run_token=token_a,
+  )).result(timeout=5)
+  assert second.get("settlement_error") is None
+  token_b = second["promoted"]["_run_token"]
+  db.expire_all()
+  settlement_b = db.get(models.ChatRun, token_b)
+  assert settlement_b.goal_id == promoted["goal_id"]
+  assert recovery_attempted(db, settlement_b, reason="goal_settlement") is True
+  # Restart and resource recovery of B do not create another B allowance.
+  for reason in ("restart", "clean_recovery"):
+    recovered = models.ChatRun(id="b-" + reason, chat_id=chat.id,
+      status="running", goal_id=settlement_b.goal_id,
+      continuation_json={"reason": reason, "goal_id": settlement_b.goal_id,
+                         "supersedes_run_token": token_b})
+    db.add(recovered); db.flush()
+    assert recovery_attempted(db, recovered, reason="goal_settlement") is True
+
+
+@pytest.mark.parametrize("old_status", ["open", "stopped", "missing", "foreign"])
+def test_unproven_goal_change_never_resets_settlement_budget(db, chat, old_status):
+  from app.continuations import recovery_attempted
+  current = models.ChatGoal(id="B", chat_id=chat.id, objective="B")
+  run = models.ChatRun(id="rebound", chat_id=chat.id, status="running", goal_id="B",
+    continuation_json={"reason": "goal_settlement", "goal_id": "A"})
+  db.add_all([current, run])
+  if old_status != "missing":
+    parent_chat = chat.id
+    if old_status == "foreign":
+      db.add(create_chat(id="foreign-chat", title="Foreign", messages=[])); db.flush()
+      parent_chat = "foreign-chat"
+    db.add(models.ChatGoal(id="A", chat_id=parent_chat, objective="A",
+      status="completed" if old_status == "foreign" else old_status))
+  db.commit()
+  assert recovery_attempted(db, run, reason="goal_settlement") is True
+
+
+@pytest.mark.parametrize("reason", ["restart", "clean_recovery", "manual"])
+def test_explicit_goalless_continuation_cannot_spend_new_goals_settlement(db, chat, reason):
+  from app.continuations import recovery_attempted
+  goal = models.ChatGoal(id="new", chat_id=chat.id, objective="New work")
+  run = models.ChatRun(id="promoted-goalless", chat_id=chat.id, status="running", goal_id=goal.id,
+    continuation_json={"reason": reason, "goal_id": None})
+  db.add_all([goal, run]); db.commit()
+  assert recovery_attempted(db, run, reason="goal_settlement") is False
+
+
+@pytest.mark.parametrize("predecessor", ["same-goal", "missing", "goalless"])
+def test_null_recovery_snapshot_cannot_hide_same_goal_or_broken_settlement_history(db, chat, predecessor):
+  from app.continuations import recovery_attempted
+  goal = models.ChatGoal(id="B", chat_id=chat.id, objective="B")
+  run = models.ChatRun(id="current", chat_id=chat.id, goal_id=goal.id,
+    continuation_json={"reason": "restart", "goal_id": None, "supersedes_run_token": "prior"})
+  db.add_all([goal, run])
+  if predecessor != "missing":
+    db.add(models.ChatRun(id="prior", chat_id=chat.id,
+      goal_id=goal.id if predecessor == "same-goal" else None,
+      continuation_json={"reason": "goal_settlement", "goal_id": goal.id}
+                        if predecessor == "same-goal" else None))
+  db.commit()
+  assert recovery_attempted(db, run, reason="goal_settlement") is (predecessor != "goalless")
+
+
+@pytest.mark.parametrize("follow_kind", ["held_by_peer", "transferred_recovery"])
+@pytest.mark.parametrize("release", [False, True])
+def test_claim_follow_incidents_wait_without_banner_then_deliver_exact_goal_once(
+  db, chat, monkeypatch, follow_kind, release,
+):
+  """Oct-11 transferred executor and Oct-12 watcher retain real handoff ownership."""
+  import asyncio
+  from app import chat as chat_mod, goal_dependencies
+  from app.agent_work_claims import claim_work, finish_work
+  from app.chat_writer import AdmitProviderExecution, AcknowledgeProviderSuccess
+  _add_goal_run(db, chat)
+  owner = models.Owner(username="claim-incident-owner", hashed_password="unused")
+  peer = create_chat(id="incident-source", title="Watch the platform update", messages=[])
+  db.add_all([owner, peer])
+  db.add(models.ChatGoal(id="source-goal", chat_id=peer.id, objective="Host repair"))
+  db.add(models.ChatRun(id="source-run", root_run_id="source-run", chat_id=peer.id,
+    goal_id="source-goal", status="running", provider="codex"))
+  db.commit()
+  key = "platform:recovery:exact-action"
+  if follow_kind == "held_by_peer":
+    claim_work(db, owner_id=owner.id, chat_id=peer.id, run_id="source-run",
+      work_key=key, summary="Repair host")
+    result = claim_work(db, owner_id=owner.id, chat_id=chat.id, run_id="goal-run",
+      work_key=key, summary="Follow repair")
+    assert result["state"] == "held_by_peer"
+  else:
+    claim_work(db, owner_id=owner.id, chat_id=chat.id, run_id="goal-run",
+      work_key=key, summary="Repair host")
+    claim_work(db, owner_id=owner.id, chat_id=peer.id, run_id="source-run",
+      work_key=key, summary="Repair host", expected_owner_chat_id=chat.id,
+      takeover_reason="Accepted responsibility for the host repair decision")
+  dependency = db.query(models.GoalDependency).filter_by(waiting_goal_id="goal-run").one()
+  response = get_writer().submit(PromotePending(chat_id=chat.id, run_token="must-not-settle",
+    ending_run_token="goal-run", ending_status="completed")).result(timeout=5)
+  assert response["promoted"] is None
+  assert db.get(models.ChatRun, "must-not-settle") is None
+  assert not any("goal_settlement_unfinished" in str(message)
+    for message in transcript_rows.history(chat))
+  # The real terminal drain closes the physical attempt after the handoff
+  # predicate returns without settlement. Preserve that boundary in this test.
+  from app.chat_writer import FinishRun
+  get_writer().submit(FinishRun(chat_id=chat.id, run_token="goal-run",
+    terminal_status="completed")).result(timeout=5)
+  finish_work(db, owner_id=owner.id, chat_id=peer.id, work_key=key,
+    outcome="Verified repair" if not release else "Owner chose not to perform repair", release=release)
+  db.refresh(dependency)
+  assert dependency.outcome_json["kind"] == ("released" if release else "completed")
+  scheduled = []
+  monkeypatch.setattr(chat_mod, "_schedule_continuation", lambda **kw: scheduled.append(kw))
+  assert asyncio.run(goal_dependencies.deliver_dependency(dependency.id))
+  db.expire_all()
+  carrier = db.get(models.ChatRun, "dependency-resume-" + dependency.id)
+  assert carrier.goal_id == "goal-run" and len(scheduled) == 1
+  get_writer().submit(AdmitProviderExecution(chat_id=chat.id, run_token=carrier.id,
+    dependency_results=(dependency.id,))).result(timeout=5)
+  get_writer().submit(AcknowledgeProviderSuccess(chat_id=chat.id, run_token=carrier.id,
+    dependency_results=(dependency.id,))).result(timeout=5)
+  assert not asyncio.run(goal_dependencies.deliver_dependency(dependency.id))
+  db.refresh(dependency)
+  assert dependency.received_run_id == carrier.id and len(scheduled) == 1

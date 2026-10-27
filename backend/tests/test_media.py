@@ -1,10 +1,50 @@
+import subprocess
+import sys
+import tempfile
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image
+import pytest
+from PIL import Image, PngImagePlugin
 
-import app.routes.media as media_routes
 from app.config import agent_scratch_root, get_settings
+from app.image_previews import display_image_preview, preview_cache_path
+
+
+@pytest.mark.parametrize("icons_first", [False, True])
+def test_preview_pixel_limit_does_not_depend_on_icon_import_order(icons_first):
+  code = "from PIL import Image; "
+  if icons_first:
+    code += "import app.icon_assets; "
+  code += (
+    "Image.MAX_IMAGE_PIXELS = None; "
+    "import app.image_previews; "
+    "assert Image.MAX_IMAGE_PIXELS == 32_000_000"
+  )
+  subprocess.run([sys.executable, "-c", code], check=True, timeout=30)
+
+
+def test_decompression_bomb_preview_is_refused_before_decode(tmp_path, monkeypatch):
+  source = tmp_path / "compressed.png"
+  Image.new("1", (9000, 9000)).save(source)
+
+  def forbidden_load(self, *args, **kwargs):
+    pytest.fail("An oversized preview must be refused before decoding")
+
+  monkeypatch.setattr(PngImagePlugin.PngImageFile, "load", forbidden_load)
+  assert display_image_preview(source, tmp_path) is None
+  assert not preview_cache_path(source, tmp_path).exists()
+
+
+def test_phone_photo_above_icon_pixel_limit_still_gets_a_preview(tmp_path):
+  source = tmp_path / "phone.png"
+  Image.new("1", (7300, 5480)).save(source)
+  with pytest.warns(Image.DecompressionBombWarning):
+    preview = display_image_preview(source, tmp_path)
+  assert preview is not None
+  with Image.open(preview) as image:
+    assert image.format == "WEBP"
+    assert max(image.size) == 1024
 
 
 def _write_chat_image(chat_id: str, subdir: str, filename: str, data: bytes) -> None:
@@ -160,53 +200,18 @@ def test_serve_chat_media_rejects_directory(client, auth, chat):
   assert response.status_code == 404
 
 
-def test_serve_agent_tmp_image_with_chat_scoped_token(
-  client, auth, chat, tmp_path, monkeypatch,
-):
-  monkeypatch.setattr(media_routes, "_AGENT_TMP_ROOT", tmp_path)
-  source = tmp_path / "renders" / "preview.png"
-  source.parent.mkdir()
-  source.write_bytes(b"temporary-image-bytes")
+def test_global_tmp_files_have_no_chat_preview_route(client, auth, chat):
+  # A /tmp path is shared and mutable, so it cannot prove what a chat viewed.
+  # Views preview their chat-owned snapshot under /media instead.
+  with tempfile.NamedTemporaryFile(dir="/tmp", suffix=".png") as image:
+    image.write(b"\x89PNG\r\n\x1a\nanother chat's render")
+    image.flush()
+    response = client.get(
+      f"/api/chats/{chat.id}/tmp-images/{Path(image.name).name}",
+      params={"token": _media_token(client, auth, chat.id)},
+    )
 
-  response = client.get(
-    f"/api/chats/{chat.id}/tmp-images/renders/preview.png",
-    params={"token": _media_token(client, auth, chat.id)},
-  )
-
-  assert response.status_code == 200
-  assert response.content == b"temporary-image-bytes"
-  assert response.headers["content-type"] == "image/png"
-  assert response.headers["cache-control"] == "private, no-store"
-
-
-def test_serve_agent_tmp_image_rejects_non_images(
-  client, auth, chat, tmp_path, monkeypatch,
-):
-  monkeypatch.setattr(media_routes, "_AGENT_TMP_ROOT", tmp_path)
-  source = tmp_path / "not-an-image.txt"
-  source.write_text("private temporary text", encoding="utf-8")
-
-  response = client.get(
-    f"/api/chats/{chat.id}/tmp-images/not-an-image.txt",
-    headers=auth,
-  )
-
-  assert response.status_code == 415
-
-
-def test_serve_agent_tmp_image_rejects_symlink_escape(
-  client, auth, chat, tmp_path, monkeypatch,
-):
-  monkeypatch.setattr(media_routes, "_AGENT_TMP_ROOT", tmp_path)
-  link = tmp_path / "outside.png"
-  link.symlink_to("/etc/hosts")
-
-  response = client.get(
-    f"/api/chats/{chat.id}/tmp-images/outside.png",
-    headers=auth,
-  )
-
-  assert response.status_code == 400
+  assert response.status_code == 404
 
 
 def test_serve_agent_scratch_image_from_same_chat_with_media_token(

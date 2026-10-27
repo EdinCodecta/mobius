@@ -3,22 +3,20 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 import { upsertTerminalErrorItem } from '../streamReducers.js'
 import { ownsRecoveryAction } from '../recoveryCard.js'
 import { isProviderLimitPause, pauseTiming } from '../resetTime.js'
 
-const vite = await createServer({
-  appType: 'custom',
-  logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui'] },
-})
+const vite = await createSsrRenderServer()
 const { default: ErrorCard } = await vite.ssrLoadModule(
   '/src/components/ChatView/ErrorCard.jsx',
 )
 const { default: MsgContent } = await vite.ssrLoadModule(
   '/src/components/ChatView/MsgContent.jsx',
+)
+const { default: MessageCopyButton } = await vite.ssrLoadModule(
+  '/src/components/ChatView/MessageCopyButton.jsx',
 )
 
 after(() => vite.close())
@@ -436,7 +434,9 @@ test('continuations render as product markers, not user bubbles', () => {
   assert.match(continuationCard, /Retry check due — trying the provider again/)
   assert.match(msgContent, /onClick=\{onResume\}/,
     'Resume delegates the lifecycle action instead of manufacturing owner text')
-  assert.match(chatView, /chat__msg--\$\{continuationMarker \? 'marker' : msg\.role\}/,
+  assert.match(chatView, /const markerRow = isContinuationMessage\(msg\)/,
+    'continuation rows are marker rows')
+  assert.match(chatView, /chat__msg--\$\{markerRow \? 'marker' : msg\.role\}/,
     'the row shell must not inherit owner-user alignment')
   assert.match(chatView, /supersedeResumedPauseBlocks\(messages,/,
     'a completed continuation replaces its stale actionable pause in the render projection')
@@ -641,3 +641,19 @@ for (const kind of ['memory', 'storage', 'model_capacity', 'restart']) {
     })
   }
 }
+
+test('an error card’s Copy hands its button the raw error message', () => {
+  // MessageCopyButton reads its payload at tap time through `read(button)`;
+  // a card still passing the old `text` prop threw on tap and copied nothing.
+  const message = 'Provider returned 500: upstream reset'
+  const found = []
+  const walk = node => {
+    if (Array.isArray(node)) return node.forEach(walk)
+    if (!node || typeof node !== 'object') return
+    if (node.type === MessageCopyButton) found.push(node.props)
+    walk(node.props?.children)
+  }
+  walk(ErrorCard({ block: { type: 'error', message } }))
+  assert.equal(found.length, 1)
+  assert.deepEqual(found[0].read({}), { plainText: message })
+})

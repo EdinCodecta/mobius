@@ -28,8 +28,10 @@ import select
 import signal
 import subprocess
 import stat
+import sys
 import textwrap
 import threading
+import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -305,11 +307,11 @@ def test_local_edit_preserved_across_update(clone_env):
   served = (platform / "backend/app/main.py").read_text()
   assert "LINE_A = 111" in served  # local edit
   assert "LINE_C = 333" in served  # upstream edit
-  # One commit carries the final local tree on the exact target, regardless of
-  # how many historical local commits produced it.
+  # Each local unit lands as one commit carrying its final bytes on the exact
+  # target, regardless of how many historical local commits produced it.
   assert _parents(platform, res.new_sha) == [target]
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "keep line A local",
   ]
   assert pu.recorded_upstream_sha(platform) == target
   assert res.overlay["mode"] == "net"
@@ -332,7 +334,7 @@ def test_net_merge_omits_local_change_already_present_upstream(clone_env):
 
   assert res.status == "updated"
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "local keep",
   ]
   assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'keep'\n"
 
@@ -470,7 +472,7 @@ def test_contributed_squash_uses_provenance_for_both_histories(clone_env):
   assert "LINE_A = 'LOCAL FOLLOWUP'" in served
   assert "LINE_C = 9001" in served
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "local followup",
   ]
   assert res.overlay["mode"] == "net"
   assert pre not in _git(platform, "rev-list", "HEAD").stdout.split()
@@ -564,9 +566,13 @@ def test_partial_provenance_parks_only_the_genuine_conflict(clone_env):
   assert pu.continue_platform_overlay_update(platform) == "prepared"
   assert _finish_prepared(platform) == "replayed"
 
-  assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
-  ]
+  # main.py, which the reviewed change also shaped, is committed apart from
+  # foo.py and names that unit, so it still guards the file next update.
+  assert _overlay_subjects(platform, target) == ["later local edits"] * 2
+  assert "Mobius-Overlay-Also: " in _git(
+    platform, "log", "-1", "--format=%B", f"{target}..HEAD",
+    "--", "backend/app/main.py",
+  ).stdout
   served = (platform / "backend/app/main.py").read_text()
   assert "LINE_A = 'LOCAL FOLLOWUP'" in served and "LINE_C = 9001" in served
   assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'RESOLVED'\n"
@@ -843,6 +849,7 @@ def test_resolver_refuses_unstaged_final_bytes_without_losing_them(clone_env):
   assert "LINE_A = 'FINAL'" in (platform / "backend/app/main.py").read_text()
   assert (platform / "notes.txt").read_text() == "resolved with context\n"
   assert _overlay_subjects(platform, target) == [
+    "local edit",
     "Reconcile local platform source with reviewed upstream",
   ]
 
@@ -1822,7 +1829,7 @@ def test_original_dirty_edit_conflicting_with_resolution_parks_again(clone_env):
   _git(replay, "add", "backend/app/foo.py")
   assert pu.continue_platform_overlay_update(platform) == "updated"
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "local edit",
   ]
   assert "LINE_A = 'BOTH'" in (platform / "backend/app/main.py").read_text()
   assert (platform / "backend/app/foo.py").read_text() == (
@@ -1895,7 +1902,7 @@ def test_uncommitted_edits_stay_uncommitted_across_a_parked_conflict(clone_env):
 
   target = _git(platform, "rev-parse", "origin/main").stdout.strip()
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "local edit",
   ]
   assert "LINE_A = 'BOTH'" in (platform / "backend/app/main.py").read_text()
   assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'DIRTY AGAIN'\n"
@@ -1968,7 +1975,7 @@ def test_dirty_resolution_merges_with_a_late_commit(clone_env):
 
   assert pu.continue_platform_overlay_update(platform) == "updated"
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "late commit",
   ]
   assert _git(platform, "show", "HEAD:backend/app/late.py").stdout == "LATE = True\n"
   assert "LINE_A = 'RESOLVED'" in (platform / "backend/app/main.py").read_text()
@@ -2121,7 +2128,7 @@ def test_a_multi_commit_unit_that_landed_as_one_review_is_dropped(clone_env):
   assert res.status == "updated", res
   assert res.overlay["mode"] == "net"
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "keep",
   ]
   assert (platform / "backend/app/bar.py").read_text() == "VALUE = 'keep'\n"
   assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'release'\n"
@@ -2149,7 +2156,7 @@ def test_a_whitespace_different_change_is_not_mistaken_for_the_review(clone_env)
   assert res.status == "updated", res
   assert res.overlay["mode"] == "net"
   assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
+    "respaced",
   ]
   assert "LINE_A =  'X'" in (platform / "backend/app/main.py").read_text()
 
@@ -4432,7 +4439,7 @@ def test_hash_only_lock_update_needs_no_image_from_preview_to_boot(
   assert pu.swap_in_prepared_update(cutover=True, repo=platform) is True
   pu.settle_prepared_update_for_this_image(platform)
   assert pu.recorded_upstream_sha(platform) == target
-  assert pu.release_packages_missing_from_image(platform) is None
+  assert _official_newer_gap(platform) is None
   assert pu.image_input_drift(platform) == []
 
 
@@ -4458,8 +4465,77 @@ def test_lock_update_the_image_may_not_install_still_needs_an_image(
   # Served on the old image anyway, the release is refused and reported.
   _git(platform, "merge", "-q", "--ff-only", target)
   pu._set_upstream(platform, target)
-  assert "newer release" in pu.release_packages_missing_from_image(platform)
+  assert "newer release" in _official_newer_gap(platform)
   assert pu.image_input_drift(platform) == ["backend/requirements.lock"]
+
+
+def _official_newer_gap(repo: Path, image: str | None = None) -> str | None:
+  """What an image without ``check-packages`` refuses at boot: any gap with an
+  input from a newer official release (``restart_util.image_package_verdict``)."""
+  gap = pu.python_package_gap(repo, image)
+  return pu.describe_package_gap(gap) if gap and gap["origin"] == "official_newer" else None
+
+
+def _shallow_seed_at(tmp_path, origin, sha: str) -> Path:
+  """A served checkout as an image seeds it: one commit deep, nothing fetched
+  since, so it holds neither a newer image's commit nor its history."""
+  seed = tmp_path / f"seed-{sha[:8]}"
+  _git(tmp_path, "init", "-q", str(seed))
+  _git(seed, "fetch", "-q", "--depth", "1", f"file://{origin}", sha)
+  _git(seed, "checkout", "-q", "-B", "main", "FETCH_HEAD")
+  _git(seed, "update-ref", "refs/remotes/origin/main", sha)
+  _git(seed, "branch", "-f", "upstream", sha)
+  return seed
+
+
+def _image_built_from(monkeypatch, tmp_path, platform, sha: str) -> None:
+  """Run as the image built from ``sha``: its package inputs and lineage."""
+  monkeypatch.setattr(pu, "_build_info", lambda: {
+    "sha": sha,
+    "image_inputs": {
+      path: hashlib.sha256(
+        _git(platform, "show", f"{sha}:{path}").stdout.encode(),
+      ).hexdigest()
+      for path in pu._PYTHON_DEPENDENCY_INPUTS
+    },
+  })
+  lineage = tmp_path / f"lineage-{sha[:8]}"
+  lineage.write_text(_git(platform, "rev-list", sha).stdout)
+  monkeypatch.setenv("MOBIUS_IMAGE_LINEAGE_PATH", str(lineage))
+
+
+def test_container_only_upgrade_across_a_package_release_boots_on_a_shallow_seed(
+  clone_env, monkeypatch, tmp_path,
+):
+  """A newer image under its older release's source is a container-only
+  upgrade, even when the checkout never fetched the image's commit."""
+  origin, _ = clone_env
+  platform, base, target, _ = _lock_only_update(
+    clone_env, _IMAGE_LOCK.replace("package-a==1", "package-a==2"),
+  )
+  seed = _shallow_seed_at(tmp_path, origin, base)
+  _image_built_from(monkeypatch, tmp_path, platform, target)
+
+  assert _official_newer_gap(seed, target) is None
+
+  # Without the image's recorded lineage the seed cannot order the two.
+  monkeypatch.setenv("MOBIUS_IMAGE_LINEAGE_PATH", str(tmp_path / "absent"))
+  assert "newer release" in _official_newer_gap(seed, target)
+
+
+def test_image_rollback_under_a_newer_package_release_is_still_refused(
+  clone_env, monkeypatch, tmp_path,
+):
+  """The lineage proves only ancestry: an older image never serves source
+  from a release it does not descend from."""
+  origin, _ = clone_env
+  platform, base, target, _ = _lock_only_update(
+    clone_env, _IMAGE_LOCK.replace("package-a==1", "package-a==2"),
+  )
+  seed = _shallow_seed_at(tmp_path, origin, target)
+  _image_built_from(monkeypatch, tmp_path, platform, base)
+
+  assert "newer release" in _official_newer_gap(seed, base)
 
 
 @pytest.mark.asyncio
@@ -6162,10 +6238,12 @@ def test_entrypoint_settles_guards_and_probes_before_any_served_code_runs():
   order = [
     0,
     branch.index("if ! _platform_boot guard 2>&1; then"),
-    branch.index("if _platform_import_probe; then"),
+    branch.index("if _platform_servable; then"),
     branch.index("elif _platform_boot revert"),
   ]
   assert order == sorted(order)
+  # Served means it imports and was not set aside for never finishing its start.
+  assert "_platform_import_probe && _platform_boot admit 2>&1" in script
   assert "reconcile_clone_sync" not in body
   assert "cd /app/platform-baked/backend" in script
 
@@ -6330,6 +6408,333 @@ def test_a_local_requirements_edit_does_not_hide_a_newer_release_lock(clone_env)
   _record_image_inputs(platform, old_lock)
   with pytest.raises(pu.BootTransactionError, match="newer release"):
     pu.settle_prepared_update_for_this_image(platform)
+
+
+def _image_behind_a_release_pin(platform: Path, origin: Path, monkeypatch, installed):
+  """The source took an official release's newer agent SDK pin, and the
+  running image installs an older one (or none)."""
+  _with_python_inputs(platform, origin)
+  old_image = _served_sha(platform)
+  old_lock = (platform / "backend/requirements.lock").read_bytes()
+  newer = _advance_origin(origin, edits={
+    "backend/requirements.lock": "fastapi==1\nclaude-agent-sdk==0.2.165\n",
+  })
+  pu._fetch(platform)
+  _git(platform, "merge", "-q", "--ff-only", newer)
+  pu._set_upstream(platform, newer)
+  _boot_image(old_image)
+  _record_image_inputs(platform, old_lock)
+  monkeypatch.setattr(pu, "_installed_version", {"fastapi": "1", **installed}.get)
+  return newer
+
+
+def test_package_gap_names_package_versions_and_fix_release(clone_env, monkeypatch):
+  origin, platform = clone_env
+  newer = _image_behind_a_release_pin(
+    platform, origin, monkeypatch, {"claude-agent-sdk": "0.2.161"},
+  )
+
+  gap = pu.python_package_gap(platform)
+
+  assert gap["packages"] == [{
+    "name": "claude-agent-sdk", "declared": "==0.2.165",
+    "installed": "0.2.161", "kind": "version", "origin": "official_newer",
+  }]
+  assert gap["origin"] == "official_newer" and gap["declared_by"] == newer
+  assert gap["fix"] == {"action": "replace_container", "target_sha": newer}
+  assert gap["blocking"] is False
+  reason = pu.describe_package_gap(gap)
+  assert "newer release" in reason
+  assert "claude-agent-sdk: source declares ==0.2.165, this image has 0.2.161" in reason
+  assert f"Replace the container with release {newer[:12]}" in reason
+
+
+def test_version_only_gap_warns_but_does_not_refuse_restart(clone_env, monkeypatch):
+  """The same source already runs on this image; refusing its boot would
+  leave the instance unable to restart even to load a fix."""
+  origin, platform = clone_env
+  _image_behind_a_release_pin(platform, origin, monkeypatch, {"claude-agent-sdk": "0.2.161"})
+
+  assert pu.settle_prepared_update_for_this_image(platform) == "none"
+
+
+def test_missing_distribution_still_refuses(clone_env, monkeypatch):
+  origin, platform = clone_env
+  _image_behind_a_release_pin(platform, origin, monkeypatch, {})
+
+  assert pu.python_package_gap(platform)["blocking"] is True
+  with pytest.raises(
+    pu.BootTransactionError, match="claude-agent-sdk: source declares ==0.2.165, this image does not have it",
+  ):
+    pu.settle_prepared_update_for_this_image(platform)
+
+
+def test_a_local_missing_package_beside_an_official_version_bump_does_not_block(
+  clone_env, monkeypatch,
+):
+  """Each shortfall keeps its input's provenance: a distribution only a local
+  declaration adds never blocks, nor is it blamed on the official release."""
+  origin, platform = clone_env
+  newer = _image_behind_a_release_pin(
+    platform, origin, monkeypatch, {"claude-agent-sdk": "0.2.161"},
+  )
+  local = _local_commit(platform, edits={
+    "backend/requirements.txt": "fastapi\nlocally-added\n",
+  })
+
+  gap = pu.python_package_gap(platform)
+
+  assert {item["name"]: (item["kind"], item["origin"]) for item in gap["packages"]} == {
+    "claude-agent-sdk": ("version", "official_newer"),
+    "locally-added": ("missing", "local"),
+  }
+  assert gap["blocking"] is False
+  assert gap["fix"] == {"action": "replace_container", "target_sha": newer, "commit": local}
+  reason = pu.describe_package_gap(gap)
+  release_part, local_part = reason.split(" A local change ")
+  assert "claude-agent-sdk" in release_part and "locally-added" not in release_part
+  assert "locally-added" in local_part and f"Revert local commit {local[:12]}" in local_part
+  assert pu.settle_prepared_update_for_this_image(platform) == "none"
+
+
+def test_a_local_package_gap_names_the_local_commit_and_never_refuses(clone_env, monkeypatch):
+  origin, platform = clone_env
+  _with_python_inputs(platform, origin)
+  image = _served_sha(platform)
+  image_lock = (platform / "backend/requirements.lock").read_bytes()
+  local = _local_commit(platform, edits={
+    "backend/requirements.lock": "fastapi==1\nlocally-added==1\n",
+  })
+  _boot_image(image)
+  _record_image_inputs(platform, image_lock)
+  monkeypatch.setattr(pu, "_installed_version", {"fastapi": "1"}.get)
+
+  gap = pu.python_package_gap(platform)
+
+  assert gap["origin"] == "local" and gap["blocking"] is False
+  assert gap["fix"] == {"action": "revert_local_declaration", "commit": local}
+  assert [item["kind"] for item in gap["packages"]] == ["missing"]
+  assert pu.settle_prepared_update_for_this_image(platform) == "none"
+
+
+def test_status_reports_the_verdict_restart_admission_acts_on(clone_env, monkeypatch):
+  """Status and restart admission share ``restart_util.image_package_verdict``:
+  an image without ``check-packages`` refuses any official-newer gap, and one
+  with it answers for itself."""
+  from app import restart_util
+
+  origin, platform = clone_env
+  _image_behind_a_release_pin(platform, origin, monkeypatch, {"claude-agent-sdk": "0.2.161"})
+
+  blocker = pu.platform_status(platform)["restart_blocker"]
+  assert blocker["packages"][0]["name"] == "claude-agent-sdk"
+  assert blocker["blocking"] is True
+
+  baked = {**blocker, "blocking": False}
+  monkeypatch.setattr(restart_util, "image_boot_checks_packages", lambda: True)
+  monkeypatch.setattr(restart_util, "_baked_package_verdict", lambda root: (True, baked))
+  assert pu.platform_status(platform)["restart_blocker"] == baked
+
+
+def test_restart_blocker_is_recomputed_after_a_live_install(clone_env, monkeypatch, tmp_path):
+  """The cached verdict is keyed by installed distributions, so a live
+  ``pip install`` that closes the gap shows on the next status read."""
+  import site
+
+  from app import restart_util
+
+  _origin, platform = clone_env
+  site_dir = tmp_path / "site-packages"
+  site_dir.mkdir()
+  monkeypatch.setattr(site, "getsitepackages", lambda: [str(site_dir)])
+  monkeypatch.setattr(site, "getusersitepackages", lambda: str(tmp_path / "no-user-site"))
+  verdicts = []
+  monkeypatch.setattr(
+    restart_util, "image_package_verdict",
+    lambda root: verdicts.append(root) or (True, None, True),
+  )
+  pu._RESTART_BLOCKER_CACHE.clear()
+
+  pu.restart_blocker(platform)
+  pu.restart_blocker(platform)
+  assert len(verdicts) == 1
+
+  (site_dir / "claude_agent_sdk-0.2.165.dist-info").mkdir()
+  os.utime(site_dir, ns=(1, site_dir.stat().st_mtime_ns + 1))
+  pu.restart_blocker(platform)
+  assert len(verdicts) == 2
+
+
+def test_a_strict_stand_in_for_a_failed_image_check_is_not_kept(clone_env, monkeypatch):
+  """When the image's own check fails or times out, the strict rule stands
+  in for that read only briefly: the next read after it expires asks the
+  image again, as restart admission would, instead of showing the stand-in
+  until something else changes."""
+  from app import restart_util
+
+  origin, platform = clone_env
+  _image_behind_a_release_pin(platform, origin, monkeypatch, {"claude-agent-sdk": "0.2.161"})
+  answers = [None]
+  monkeypatch.setattr(restart_util, "image_boot_checks_packages", lambda: True)
+  monkeypatch.setattr(restart_util, "_baked_package_verdict", lambda root: answers[-1])
+  clock = [1000.0]
+  monkeypatch.setattr(pu.time, "monotonic", lambda: clock[0])
+  pu._RESTART_BLOCKER_CACHE.clear()
+
+  stand_in = pu.restart_blocker(platform)
+  assert stand_in["blocking"] is True  # the strict rule, for now
+  assert restart_util.image_package_verdict(platform).settled is False
+  answers.append((True, {**stand_in, "blocking": False}))
+  assert pu.restart_blocker(platform)["blocking"] is True  # still within its window
+
+  clock[0] += pu._UNSETTLED_BLOCKER_SECONDS
+  assert pu.restart_blocker(platform)["blocking"] is False
+  clock[0] += 3600
+  answers.append(None)
+  assert pu.restart_blocker(platform)["blocking"] is False  # a settled answer keeps
+
+
+def test_concurrent_status_reads_share_one_image_check(clone_env, monkeypatch):
+  """Status polls on a stale cache wait for the one running image check
+  instead of each starting its own subprocess."""
+  import threading
+
+  from app import restart_util
+
+  _origin, platform = clone_env
+  entered = threading.Event()
+  release = threading.Event()
+  calls = []
+
+  def slow_verdict(root):
+    calls.append(root)
+    entered.set()
+    release.wait(5)
+    return True, None, True
+
+  monkeypatch.setattr(restart_util, "image_package_verdict", slow_verdict)
+  pu._RESTART_BLOCKER_CACHE.clear()
+  readers = [threading.Thread(target=pu.restart_blocker, args=(platform,)) for _ in range(3)]
+  readers[0].start()
+  assert entered.wait(5)
+  for reader in readers[1:]:
+    reader.start()
+  release.set()
+  for reader in readers:
+    reader.join(5)
+
+  assert len(calls) == 1
+
+
+@pytest.mark.parametrize("declared,installed,kind", [
+  (">=3", "2", "version"),
+  (">=2", "2.1", None),
+  ("~=2.0", "2.9", None),
+  ("==2.*", "2.3", None),
+  ("==2.*", "3.0", "version"),
+  ("", "1", None),
+  ("==1", None, "missing"),
+  ("@https://example.invalid/pkg.whl", "1", "unsupported"),
+])
+def test_package_gap_judges_declarations_by_their_version_range(
+  clone_env, monkeypatch, declared, installed, kind,
+):
+  """A range, ``~=`` or wildcard is judged by what it admits; one this check
+  cannot judge is never assumed satisfied."""
+  _origin, platform = clone_env
+  _with_python_inputs(platform, _origin)
+  image = _served_sha(platform)
+  image_lock = (platform / "backend/requirements.lock").read_bytes()
+  _local_commit(platform, edits={"backend/requirements.lock": f"fastapi==1\npkg{declared}\n"})
+  _boot_image(image)
+  _record_image_inputs(platform, image_lock)
+  monkeypatch.setattr(pu, "_installed_version", {"fastapi": "1", "pkg": installed}.get)
+
+  gap = pu.python_package_gap(platform)
+
+  kinds = {item["name"]: item["kind"] for item in (gap or {}).get("packages", [])}
+  assert kinds.get("pkg") == kind
+
+
+def test_package_gap_holds_every_declaration_and_reports_unnamed_ones(
+  clone_env, monkeypatch,
+):
+  """Repeated declarations all constrain a package (a later ``Pkg<4`` cannot
+  drop ``pkg>=3``), and a dependency line naming no package is reported as
+  unverifiable rather than skipped."""
+  _origin, platform = clone_env
+  _with_python_inputs(platform, _origin)
+  image = _served_sha(platform)
+  image_lock = (platform / "backend/requirements.lock").read_bytes()
+  _local_commit(platform, edits={
+    "backend/requirements.lock": "fastapi==1\npkg>=3\nPkg<4\n-e ./local-package\n",
+  })
+  _boot_image(image)
+  _record_image_inputs(platform, image_lock)
+  monkeypatch.setattr(pu, "_installed_version", {"fastapi": "1", "pkg": "2"}.get)
+
+  gap = pu.python_package_gap(platform)
+
+  assert {item["name"]: (item["declared"], item["kind"]) for item in gap["packages"]} == {
+    "pkg": (">=3,<4", "version"),
+    "-e ./local-package": (None, "unsupported"),
+  }
+  reason = pu.describe_package_gap(gap)
+  assert "-e ./local-package: a declaration this check cannot verify" in reason
+  assert "pkg: source declares >=3,<4, this image has 2" in reason
+
+
+def test_package_gap_counts_only_declarations_for_this_interpreter(clone_env, monkeypatch):
+  """A marker excluding this interpreter declares nothing here: split pins
+  give the applicable one alone, and a package declared only for another
+  platform is not missing."""
+  _origin, platform = clone_env
+  _with_python_inputs(platform, _origin)
+  image = _served_sha(platform)
+  image_lock = (platform / "backend/requirements.lock").read_bytes()
+  here = f"{sys.version_info.major}.{sys.version_info.minor}"
+  _local_commit(platform, edits={"backend/requirements.lock": (
+    f"fastapi==1\npkg==1 ; python_version < '{here}'\n"
+    f"pkg==2 ; python_version >= '{here}' --hash=sha256:aa\n"
+    "elsewhere==1 ; sys_platform == 'no-such-platform'\n"
+    "repeated>=1\nrepeated<3 ; os_name == 'posix' or os_name != 'posix'\n"
+  )})
+  _boot_image(image)
+  _record_image_inputs(platform, image_lock)
+  monkeypatch.setattr(pu, "_installed_version", {"fastapi": "1", "pkg": "2", "repeated": "3"}.get)
+
+  gap = pu.python_package_gap(platform)
+
+  assert [(item["name"], item["declared"], item["kind"]) for item in gap["packages"]] == [
+    ("repeated", ">=1,<3", "version"),
+  ]
+
+
+def test_an_uncommitted_local_gap_says_to_revert_the_edit():
+  gap = {
+    "packages": [{"name": "pkg", "declared": "==2", "installed": None,
+                  "kind": "missing", "origin": "local"}],
+    "inputs": ["backend/requirements.lock"], "origin": "local", "declared_by": None,
+    "fix": {"action": "revert_local_declaration", "commit": None}, "blocking": False,
+  }
+
+  reason = pu.describe_package_gap(gap)
+
+  assert "Revert the uncommitted edit or wait for its release." in reason
+
+
+def test_a_gap_without_a_known_release_names_none():
+  gap = {
+    "packages": [{"name": "pkg", "declared": "==2", "installed": "1",
+                  "kind": "version", "origin": "official_newer"}],
+    "inputs": ["backend/requirements.lock"], "origin": "official_newer", "declared_by": None,
+    "fix": {"action": "replace_container", "target_sha": None}, "blocking": False,
+  }
+
+  reason = pu.describe_package_gap(gap)
+
+  assert "Replace the container with a release that includes them (Settings" in reason
+  assert "local commit" not in reason
 
 
 def test_the_boot_protocol_can_only_advance_with_a_new_image():
@@ -7850,7 +8255,26 @@ def test_update_rolls_back_when_it_breaks_a_local_edits_own_test(clone_env):
   origin, platform = clone_env
   _release_with_test_runner(origin, platform)
   pre = _local_commit(platform, edits=_LOCAL_VOICE, msg="local voice")
-  # Text-clean and import-clean: only running the local code shows the break.
+  # Text-clean, import-clean and every name still resolves: only running the
+  # local code shows the break.
+  _advance_origin(origin, edits={"backend/app/store.py": "MESSAGES = ['goodbye']\n"},
+                  msg="change store contents")
+
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "rolled_back"
+  assert _served_sha(platform) == pre
+  assert "test_last_reads_the_store" in pu._read_rolled_back_flag()["error"]
+  assert (platform / "backend/app/store.py").read_text() == _STORE_PY
+
+
+def test_update_rolls_back_when_a_local_edit_uses_a_name_the_release_moved(clone_env):
+  origin, platform = clone_env
+  _release_with_test_runner(origin, platform)
+  # No local tests: only reading the edited file shows the moved name.
+  pre = _local_commit(platform, edits={
+    "backend/app/voice.py": _LOCAL_VOICE["backend/app/voice.py"],
+  }, msg="local voice without tests")
   _advance_origin(origin, edits={"backend/app/store.py": "LEGACY = ['hello']\n"},
                   msg="rename store field")
 
@@ -7858,7 +8282,7 @@ def test_update_rolls_back_when_it_breaks_a_local_edits_own_test(clone_env):
 
   assert res.status == "rolled_back"
   assert _served_sha(platform) == pre
-  assert "test_last_reads_the_store" in pu._read_rolled_back_flag()["error"]
+  assert "backend/app/voice.py:3 uses app.store.MESSAGES" in pu._read_rolled_back_flag()["error"]
   assert (platform / "backend/app/store.py").read_text() == _STORE_PY
 
 
@@ -7912,7 +8336,7 @@ def test_reviewed_prepare_checks_local_tests_without_touching_served_checkout(cl
   _release_with_test_runner(origin, platform)
   pre = _local_commit(platform, edits=_LOCAL_VOICE, msg="local voice")
   target = _advance_origin(origin, edits={
-    "backend/app/store.py": "LEGACY = ['hello']\n" if breaks else _STORE_PY + "OTHER = 1\n",
+    "backend/app/store.py": "MESSAGES = ['goodbye']\n" if breaks else _STORE_PY + "OTHER = 1\n",
   })
   pu._fetch(platform)
   # A concurrent working edit is not part of the frozen reviewed snapshot.
@@ -7946,7 +8370,7 @@ def test_prepare_retains_limits_of_local_test_evidence(clone_env, monkeypatch, m
   if mode == "missing_runner":
     changes["scripts/wt-pytest.sh"] = "exit 78\n"
   elif mode == "collection":
-    changes["backend/app/store.py"] = "raise ImportError('no dependency')\n"
+    changes["backend/app/store.py"] = _STORE_PY + "raise ImportError('no dependency')\n"
     # Collection imports store; a collection error is not a failed test id.
     pre = _local_commit(platform, edits={
       "backend/tests/test_voice.py": "from app import store\n" + _LOCAL_VOICE["backend/tests/test_voice.py"],
@@ -7990,19 +8414,19 @@ def test_local_runner_requires_comparable_executed_test_ids(tmp_path, baseline, 
   tests.mkdir(parents=True)
   test = tests / "test_local.py"
   test.write_text(baseline)
-  before = lt.run(tmp_path, ["tests/test_local.py"])
+  before = lt.run(tmp_path, ["backend/tests/test_local.py"])
   test.write_text(candidate)
   # Avoid Python's same-second bytecode cache affecting this tiny fixture.
   import shutil
   shutil.rmtree(tests / "__pycache__", ignore_errors=True)
-  after = lt.run(tmp_path, ["tests/test_local.py"])
-  report = lt.compare(["tests/test_local.py"], before, after)
+  after = lt.run(tmp_path, ["backend/tests/test_local.py"])
+  report = lt.compare(["backend/tests/test_local.py"], before, after)
   assert report["status"] == expected
 
 
 def test_local_runner_rejects_missing_files_and_exit_report_disagreement(tmp_path):
   from app import local_change_tests as lt
-  assert lt.run(tmp_path, ["tests/missing.py"]).unavailable
+  assert lt.run(tmp_path, ["backend/tests/missing.py"]).unavailable
   report = tmp_path / "report.xml"
   report.write_text('<testsuite tests="1" failures="0" errors="0" skipped="0">'
                     '<testcase classname="tests.test_a" name="test_a"/></testsuite>')
@@ -8052,7 +8476,7 @@ def test_local_runner_timeout_kills_descendants_and_removes_runtime(tmp_path):
     'mktemp -d "$TMPDIR/runtime.XXXXXX" > runtime-path\n'
     'sleep 60 &\necho $! > child-pid\nwait\n'
   )
-  result = lt.run(tmp_path, ["tests/test_local.py"], timeout=1)
+  result = lt.run(tmp_path, ["backend/tests/test_local.py"], timeout=1)
   assert "timed out" in result.unavailable
   assert not Path((tmp_path / "runtime-path").read_text().strip()).exists()
   pid = int((tmp_path / "child-pid").read_text().strip())
@@ -8066,7 +8490,7 @@ def test_local_runner_unavailable_output_is_not_retained(tmp_path):
   (tmp_path / "backend/tests").mkdir(parents=True)
   (tmp_path / "backend/tests/test_local.py").touch()
   (tmp_path / "scripts/wt-pytest.sh").write_text('echo private-local-data; exit 78\n')
-  result = lt.run(tmp_path, ["tests/test_local.py"])
+  result = lt.run(tmp_path, ["backend/tests/test_local.py"])
   assert result.unavailable == "local tests produced no report (exit 78)"
 
 
@@ -8113,3 +8537,679 @@ def test_image_activation_preserves_late_nested_repository_without_false_incoher
   assert _git(nested, "rev-parse", "HEAD").stdout == nested_head
   assert (nested / "owner.txt").read_text() == "independent owner work\n"
   assert (nested / "uncommitted.txt").read_text() == "do not discard\n"
+
+
+# --- Overlay units: identity across updates and retirement of merged PRs ----
+
+_FOO_DRAFT = "VALUE = 'draft'\n"
+_FOO_MERGED = "VALUE = 'merged'\n"
+
+
+def _unit_message(subject: str, unit: str, disposition: str = "local-only") -> str:
+  return app_git.overlay_message(subject, unit=unit, disposition=disposition)
+
+
+def _draft_pr_unit(platform: Path, origin: Path) -> str:
+  """A local draft marked for PR #77, unrelated local work, and a release that
+  merged a rewritten #77."""
+  _local_commit(platform, edits={"backend/app/foo.py": _FOO_DRAFT},
+                msg=_unit_message("Draft foo", "foo-draft", "pending-pr:#77"))
+  _local_commit(platform, edits={"backend/app/local.py": "LOCAL = 1\n"},
+                msg="local feature")
+  return _advance_origin(origin, edits={"backend/app/foo.py": _FOO_MERGED},
+                         msg="Rewrite foo (#77)")
+
+
+def test_diverged_update_emits_one_commit_per_unit_and_retires_a_merged_pr(clone_env):
+  origin, platform = clone_env
+  target = _draft_pr_unit(platform, origin)
+  pu._fetch(platform)
+  assert app_git.merge_refs(platform, "main", target).status == "conflict"
+  preview = pu.platform_update_preview(platform)
+  assert preview["conflict_paths"] == []
+  assert preview["retired_paths"] == [{
+    "path": "backend/app/foo.py", "pr": 77, "unit": "foo-draft", "proof": "pending-pr",
+  }]
+
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "updated", res
+  assert (platform / "backend/app/foo.py").read_text() == _FOO_MERGED
+  assert (platform / "backend/app/local.py").read_text() == "LOCAL = 1\n"
+  # The retired unit emits nothing; the other unit keeps its own commit.
+  assert _overlay_subjects(platform, target) == ["local feature"]
+  assert [item.path for item in res.reconciliation.retired_paths] == ["backend/app/foo.py"]
+  [pinned] = _retired_pins(platform)
+  assert pinned.endswith(f"-{target[:8]}")
+  assert _git(platform, "show", f"{pinned}:backend/app/foo.py").stdout == _FOO_DRAFT
+  assert pinned in pu.platform_status(platform)["recovery_refs"]
+
+
+def _retired_pins(platform: Path) -> list[str]:
+  return _git(
+    platform, "for-each-ref", "--format=%(refname)", f"{pu._SET_ASIDE_PREFIX}/retired-*",
+  ).stdout.split()
+
+
+def test_the_agent_repair_path_pins_the_copies_it_retires(clone_env):
+  origin, platform = clone_env
+  target = _draft_pr_unit(platform, origin)
+  pu._fetch(platform)
+  served = _served_sha(platform)
+  plan = _apply_plan(served, target, platform)
+  plan.pop("repo")
+
+  pu.park_update_for_agent(**plan, repo=platform)
+
+  [pinned] = _retired_pins(platform)
+  assert _git(platform, "rev-parse", pinned).stdout.strip() == served
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _retired_pins(platform) == [pinned]
+
+
+def test_a_failed_prepare_pins_nothing_and_a_prepared_one_pins_once(
+  clone_env, monkeypatch,
+):
+  origin, platform = clone_env
+  target = _draft_pr_unit(platform, origin)
+  pu._fetch(platform)
+  served = _served_sha(platform)
+  plan = _apply_plan(served, target, platform)
+  plan.pop("repo")
+
+  with monkeypatch.context() as failing:
+    def broken(*_args, **_kwargs):
+      raise pu.PlatformUpdateError("local tests failed")
+    failing.setattr(pu, "_prepare", broken)
+    with pytest.raises(pu.PlatformUpdateError):
+      pu.prepare_reviewed_update(**plan, repo=platform)
+  assert _retired_pins(platform) == []
+
+  assert pu.prepare_reviewed_update(**plan, repo=platform)["state"] == "prepared"
+  [pinned] = _retired_pins(platform)
+  assert _git(platform, "show", f"{pinned}:backend/app/foo.py").stdout == _FOO_DRAFT
+
+
+def test_owner_choice_local_unit_is_never_retired_and_the_resolver_keeps_it(clone_env):
+  origin, platform = clone_env
+  _draft_pr_unit(platform, origin)
+  draft = _git(platform, "rev-parse", "main~1").stdout.strip()
+  app_git.mark_overlay_disposition(platform, draft, "owner-choice:local")
+
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "conflict" and res.conflict_paths == ["backend/app/foo.py"]
+  parked = pu._read_conflict_flag()["overlay"]
+  assert parked["units"] == {"backend/app/foo.py": "foo-draft"}
+  assert parked["unit_intent"]["foo-draft"]["disposition"] == "owner-choice:local"
+  assert "left" not in parked
+  message = pu._platform_conflict_resolver_message(res.target_sha, res.conflict_paths, parked)
+  assert (
+    "- `foo-draft` (Draft foo): backend/app/foo.py. "
+    "The owner chose to keep this local: preserve it."
+  ) in message
+
+
+def test_retired_copies_leave_only_the_residual_conflict_for_the_resolver(clone_env):
+  origin, platform = clone_env
+  _local_commit(platform, edits={"backend/app/foo.py": _FOO_DRAFT},
+                msg=_unit_message("Draft foo", "foo-draft", "pending-pr:#77"))
+  served = _local_commit(platform, edits={
+    "backend/app/main.py": _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'LOCAL'"),
+  }, msg="local line A")
+  target = _advance_origin(origin, edits={
+    "backend/app/foo.py": _FOO_MERGED,
+    "backend/app/main.py": _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'UPSTREAM'"),
+  }, msg="Rewrite foo (#77)")
+  pu._fetch(platform)
+  assert sorted(app_git.merge_refs(platform, served, target).conflict_paths) == [
+    "backend/app/foo.py", "backend/app/main.py",
+  ]
+  # Review predicts exactly what Apply parks.
+  assert pu.platform_update_preview(platform)["conflict_paths"] == ["backend/app/main.py"]
+
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "conflict" and res.conflict_paths == ["backend/app/main.py"]
+  parked = pu._read_conflict_flag()["overlay"]
+  assert parked["served"] == served
+  assert _git(platform, "rev-parse", f"{parked['left']}^").stdout.strip() == served
+  assert parked["units"] == {"backend/app/main.py": "c-" + served[:8] + "-local-line-a"}
+  worktree = Path(parked["worktree"])
+  assert (worktree / "backend/app/foo.py").read_text() == _FOO_MERGED
+  (worktree / "backend/app/main.py").write_text(
+    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'BOTH'"),
+  )
+  _git(worktree, "add", "backend/app/main.py")
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "replayed"
+  assert (platform / "backend/app/foo.py").read_text() == _FOO_MERGED
+  assert "LINE_A = 'BOTH'" in (platform / "backend/app/main.py").read_text()
+  assert _overlay_subjects(platform, target) == ["local line A"]
+
+
+def test_old_image_late_edit_squash_is_split_back_into_units_on_next_update(
+  clone_env, monkeypatch,
+):
+  """A unit chain prepared by new code boots on an older image, which squashes
+  late edits into one commit; the next update recovers their unit."""
+  origin, platform = clone_env
+  _local_commit(platform, edits={"backend/app/alpha.py": "A = 1\n"},
+                msg=_unit_message("Add alpha", "alpha"))
+  target = _advance_origin(origin, edits={
+    "backend/app/main.py": _MAIN_PY.replace("LINE_C = 3", "LINE_C = 33"),
+  })
+  pu._fetch(platform)
+  plan = _apply_plan(_served_sha(platform), target, platform)
+  plan.pop("repo")
+  assert pu.prepare_reviewed_update(**plan, repo=platform)["state"] == "prepared"
+  _local_commit(platform, edits={"backend/app/late.py": "LATE = 1\n"},
+                msg=_unit_message("Late beta", "late-beta"))
+  with monkeypatch.context() as old_image:
+    old_image.setattr(pu, "_net_overlay_commit", pu._single_overlay_commit)
+    assert _finish_prepared(platform) == "replayed"
+  assert _overlay_subjects(platform, target) == [
+    "Add alpha", "Reconcile local platform source with reviewed upstream",
+  ]
+
+  newer = _advance_origin(origin, edits={
+    "backend/app/main.py": _MAIN_PY.replace("LINE_C = 3", "LINE_C = 333"),
+  })
+  res = pu.reconcile_clone(platform)
+
+  assert res.status == "updated", res
+  assert _overlay_subjects(platform, newer) == ["Add alpha", "Late beta"]
+  assert "Mobius-Overlay-Unit: late-beta" in _git(
+    platform, "log", "-1", "--format=%B",
+  ).stdout
+  assert (platform / "backend/app/late.py").read_text() == "LATE = 1\n"
+
+
+def test_status_reports_local_overlay_size_and_what_the_next_update_retires(clone_env):
+  origin, platform = clone_env
+  _draft_pr_unit(platform, origin)
+  pu._fetch(platform)
+
+  overlay = pu.platform_status(platform)["local_overlay"]
+
+  assert overlay["release_sha"] == pu.recorded_upstream_sha(platform)
+  assert (overlay["files"], overlay["unit_count"], overlay["large"]) == (2, 2, False)
+  assert {unit["slug"] for unit in overlay["units"]} >= {"foo-draft"}
+  assert overlay["retirable"] == {"files": 1, "prs": [77]}
+  assert overlay["computed_for"][0] == _served_sha(platform)
+
+
+def test_status_overlay_follows_a_disposition_mark_without_a_new_commit(clone_env):
+  origin, platform = clone_env
+  _draft_pr_unit(platform, origin)
+  pu._fetch(platform)
+  assert pu.platform_status(platform)["local_overlay"]["retirable"]["files"] == 1
+
+  draft = _git(platform, "rev-parse", "HEAD^").stdout.strip()
+  app_git.mark_overlay_disposition(platform, draft, "owner-choice:local")
+  overlay = pu.platform_status(platform)["local_overlay"]
+
+  assert overlay["retirable"] == {"files": 0, "prs": []}
+  assert {u["slug"]: u["disposition"] for u in overlay["units"]}["foo-draft"] == (
+    "owner-choice:local"
+  )
+
+
+def test_status_overlay_follows_a_newly_recorded_merge_witness(clone_env):
+  origin, platform = clone_env
+  draft = _local_commit(platform, edits={"backend/app/foo.py": _FOO_DRAFT},
+                        msg="Draft foo")
+  _local_commit(platform, edits={"backend/app/local.py": "LOCAL = 1\n"},
+                msg="local feature")
+  merge = _advance_origin(origin, edits={"backend/app/foo.py": _FOO_MERGED},
+                          msg="Rewrite foo (#77)")
+  pu._fetch(platform)
+  assert pu.platform_status(platform)["local_overlay"]["retirable"]["files"] == 0
+  reviewed = pu.platform_update_preview(platform)
+
+  app_git.record_merged_contribution(
+    platform, number=77, repo_slug=app_git.PLATFORM_RELEASE_REPO,
+    head_sha=draft, merge_sha=merge, paths=["backend/app/foo.py"],
+  )
+
+  assert pu.platform_status(platform)["local_overlay"]["retirable"] == {
+    "files": 1, "prs": [77],
+  }
+  # Apply would now retire a file Review never showed, so that review is stale.
+  with pytest.raises(pu.PlatformUpdateError, match="update_plan_invalid"):
+    pu._validate_update_plan(
+      platform, plan_id=reviewed["plan_id"],
+      current_sha=reviewed["current_sha"], target_sha=reviewed["target_sha"],
+    )
+  fresh = pu.platform_update_preview(platform)
+  assert fresh["plan_id"] != reviewed["plan_id"]
+  assert [item["path"] for item in fresh["retired_paths"]] == ["backend/app/foo.py"]
+  pu._validate_update_plan(
+    platform, plan_id=fresh["plan_id"],
+    current_sha=fresh["current_sha"], target_sha=fresh["target_sha"],
+  )
+
+
+# --- A stalled update is surfaced and resumable ------------------------------
+
+_HOURS = 3600
+
+
+def _parked_update(platform: Path, *, chat_id: str | None = None, hours_ago: float = 10):
+  """An update parked for its resolver ``hours_ago``, with nothing touched since."""
+  worktree = platform.parent / "candidate"
+  _git(platform, "worktree", "add", "--detach", "-q", str(worktree), "HEAD")
+  blob = _git(worktree, "rev-parse", "HEAD:backend/app/main.py").stdout.strip()
+  subprocess.run(  # leave the file unmerged, as a parked conflict does
+    ["git", "-C", str(worktree), "update-index", "--index-info"], check=True, text=True,
+    input="".join(f"100644 {blob} {stage}\tbackend/app/main.py\n" for stage in (1, 2, 3)),
+  )
+  target = _served_sha(platform)
+  then = time.time() - hours_ago * _HOURS
+  pu._write_conflict_flag(target, ["backend/app/main.py"], chat_id, overlay={
+    "mode": "net", "worktree": str(worktree), "target": target,
+    "parked_at": pu.datetime.fromtimestamp(then, pu.timezone.utc).isoformat(),
+  })
+  index = worktree / _git(worktree, "rev-parse", "--git-path", "index").stdout.strip()
+  for path in (pu.CONFLICT_FLAG, index):
+    os.utime(path, (then, then))
+  return worktree, index, then
+
+
+def test_parked_at_is_written_once_and_preserved(clone_env):
+  """A re-park of the same update (another conflict on continue, a restart
+  under the resolver) keeps when it first waited; another target starts over."""
+  _origin, platform = clone_env
+  target = "a" * 40
+  pu._write_conflict_flag(target, ["x"], overlay={"mode": "net", "parked_at": "2026-01-01T09:00:00+00:00"})
+
+  assert pu._parked_at(target) == "2026-01-01T09:00:00+00:00"
+  assert pu._parked_at("b" * 40) != "2026-01-01T09:00:00+00:00"
+
+  local = _local_commit(platform, edits={"backend/app/main.py":
+    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'LOCAL'")})
+  assert local
+  pu.CONFLICT_FLAG.unlink()
+  _advance_origin(_origin, edits={"backend/app/main.py":
+    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'UPSTREAM'")})
+  first = pu.reconcile_clone(platform).overlay["parked_at"]
+  assert pu._read_conflict_flag()["overlay"]["parked_at"] == first
+  assert pu.reconcile_clone(platform).overlay["parked_at"] == first
+
+
+def test_stall_detected_after_threshold_without_progress(clone_env, db):
+  _origin, platform = clone_env
+  _worktree, _index, then = _parked_update(platform)
+  pending = pu.unfinished_update(platform)
+
+  assert pu.detect_update_stall(db, pending, repo=platform, now=then + 5 * _HOURS) is None
+  stalled = pu.detect_update_stall(db, pending, repo=platform, now=then + 7 * _HOURS)
+
+  assert stalled["reason"] == "resolver_missing"
+  assert stalled["idle_hours"] == 7.0
+  assert stalled["remaining_paths"] == ["backend/app/main.py"]
+  assert stalled["actions"] == ["resume", "retry", "cancel"]
+
+
+def test_a_detected_stall_persists_across_reads(clone_env, db):
+  """Reading which files are still unmerged must not rewrite the candidate's
+  index: its mtime is a progress signal, so a status poll would otherwise
+  clear the stall it reports and start a new episode."""
+  _origin, platform = clone_env
+  _worktree, index, then = _parked_update(platform)
+  pending = pu.unfinished_update(platform)
+  before = index.stat().st_mtime_ns
+
+  first = pu.detect_update_stall(db, pending, repo=platform)
+  second = pu.detect_update_stall(db, pending, repo=platform)
+
+  assert first and second and first["episode"] == second["episode"]
+  assert second["remaining_paths"] == ["backend/app/main.py"]
+  assert index.stat().st_mtime_ns == before
+
+
+def test_an_app_chat_bound_as_resolver_counts_as_missing(clone_env, db):
+  """Like resume, the stall reader never treats an app-created chat as the
+  update's resolver."""
+  from app import models
+  from app.chat_writer import create_chat
+
+  _origin, platform = clone_env
+  app = models.App(
+    slug="stall-resolver-app", source_dir="/tmp/mobius-tests/stall-resolver-app",
+    name="studio", description="t", jsx_source="export default () => null",
+  )
+  db.add(app)
+  db.commit()
+  _worktree, _index, then = _parked_update(platform, chat_id="app-chat")
+  db.add(create_chat(id="app-chat", title="t", messages=[], created_by_app_id=app.id))
+  db.commit()
+
+  stalled = pu.detect_update_stall(
+    db, pu.unfinished_update(platform), repo=platform, now=then + 7 * _HOURS,
+  )
+
+  assert stalled["reason"] == "resolver_missing" and stalled["resolver_chat_id"] is None
+
+
+def test_worktree_change_resets_stall(clone_env, db):
+  _origin, platform = clone_env
+  _worktree, index, then = _parked_update(platform)
+  pending = pu.unfinished_update(platform)
+  before = pu.detect_update_stall(db, pending, repo=platform, now=then + 7 * _HOURS)
+
+  later = then + 3 * _HOURS
+  os.utime(index, (later, later))  # the resolver staged part of an answer
+
+  assert pu.detect_update_stall(db, pending, repo=platform, now=then + 7 * _HOURS) is None
+  after = pu.detect_update_stall(db, pending, repo=platform, now=later + 7 * _HOURS)
+  assert after["episode"] != before["episode"]
+
+
+def test_an_idle_resolver_stalls_but_one_waiting_on_the_owner_does_not(clone_env, db):
+  from app import models
+  from app.chat_writer import create_chat
+
+  _origin, platform = clone_env
+  _worktree, _index, then = _parked_update(platform, chat_id="resolver-1")
+  db.add(create_chat(id="resolver-1", title="Resolve platform update conflict",
+                     messages=[], pending_messages=[], provider="claude"))
+  db.commit()
+  db.query(models.Chat).filter(models.Chat.id == "resolver-1").update({
+    models.Chat.updated_at: pu.datetime.fromtimestamp(then, pu.timezone.utc).replace(tzinfo=None),
+  })
+  db.commit()
+  pending = pu.unfinished_update(platform)
+
+  stalled = pu.detect_update_stall(db, pending, repo=platform, now=then + 7 * _HOURS)
+  assert stalled["reason"] == "resolver_idle"
+  assert stalled["resolver_chat_id"] == "resolver-1"
+
+  db.query(models.Chat).filter(models.Chat.id == "resolver-1").update({
+    models.Chat.pending_question_id: "q-1",
+  })
+  db.commit()
+  assert pu.detect_update_stall(db, pending, repo=platform, now=then + 7 * _HOURS) is None
+
+
+def test_a_finish_whose_restart_is_refused_stalls_at_once(clone_env, db):
+  pending = {"target_sha": "a" * 40, "stage": "finish", "action": "restart", "cancellable": True}
+  blocker = {"blocking": True}
+
+  stalled = pu.detect_update_stall(db, pending, blocker=blocker, now=time.time())
+
+  assert stalled["reason"] == "restart_blocked"
+  assert stalled["actions"] == ["cancel"]
+  assert pu.detect_update_stall(db, pending, blocker={"blocking": False}) is None
+
+
+def test_a_refused_restart_is_not_a_stall_while_its_container_replacement_runs(
+  clone_env, db, monkeypatch,
+):
+  """A replacement bound to the update is its progress, and the new image is
+  what closes the package gap."""
+  pending = {"target_sha": "a" * 40, "stage": "finish", "action": "replace", "cancellable": False}
+  monkeypatch.setattr(pu, "read_prepared_update", lambda: {"operation": {"id": "op-1"}})
+
+  assert pu.detect_update_stall(db, pending, blocker={"blocking": True}) is None
+
+  monkeypatch.setattr(pu, "read_prepared_update", lambda: {"operation": None})
+  assert pu.detect_update_stall(db, pending, blocker={"blocking": True})["reason"] == "restart_blocked"
+
+
+def test_status_names_a_stalled_update(clone_env, db):
+  _origin, platform = clone_env
+  _parked_update(platform)
+  status = {"unfinished_update": pu.unfinished_update(platform), "restart_blocker": None}
+
+  enriched = pu.with_update_stall(db, status)
+
+  assert enriched["unfinished_update"]["stalled"]["reason"] == "resolver_missing"
+
+
+@pytest.mark.asyncio
+async def test_stall_notification_fires_once_per_episode(
+  clone_env, db, owner_token, monkeypatch, tmp_path,
+):
+  """One bell row per stall; new progress that stalls again notifies again."""
+  from app import models, push
+  from app.database import SessionLocal
+
+  _origin, platform = clone_env
+  monkeypatch.setattr(pu, "STALL_NOTIFIED_PATH", tmp_path / ".stall-notified")
+  _worktree, index, then = _parked_update(platform)
+  sent = []
+
+  async def record(session, owner_id, **kwargs):
+    # Stands in for delivery: the durable bell row only, never a push.
+    sent.append(kwargs)
+    session.add(models.Notification(
+      id=kwargs["notification_id"], owner_id=owner_id,
+      source_type=kwargs["source_type"], title=kwargs["title"], body=kwargs["body"],
+    ))
+    session.commit()
+
+  monkeypatch.setattr(push, "notify_owner_async", record)
+
+  first = await pu.notify_update_stall_once(SessionLocal, platform)
+  assert first and first.startswith("platform-stall-")
+  assert await pu.notify_update_stall_once(SessionLocal, platform) is None
+  assert len(sent) == 1 and sent[0]["source_type"] == "platform_stall"
+  # No resolver chat to open, so it links to Settings, as its text says.
+  assert sent[0]["target"] == "/shell/?settings"
+  assert len(sent[0]["source_type"]) <= 16
+
+  later = then + _HOURS  # progress, then idle past the threshold again
+  os.utime(index, (later, later))
+  second = await pu.notify_update_stall_once(SessionLocal, platform)
+  assert second and second != first
+  assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_idle_resolver_notification_opens_the_chat_it_names(
+  clone_env, db, owner_token, monkeypatch, tmp_path,
+):
+  """The alert links the resolver chat, so its text says to open that chat,
+  and names Settings only for the actions that live there."""
+  from app import models, push
+  from app.chat_writer import create_chat
+  from app.database import SessionLocal
+
+  _origin, platform = clone_env
+  monkeypatch.setattr(pu, "STALL_NOTIFIED_PATH", tmp_path / ".stall-notified")
+  _worktree, _index, then = _parked_update(platform, chat_id="resolver-1")
+  db.add(create_chat(id="resolver-1", title="Resolve platform update conflict",
+                     messages=[], pending_messages=[], provider="claude"))
+  db.commit()
+  db.query(models.Chat).filter(models.Chat.id == "resolver-1").update({
+    models.Chat.updated_at: pu.datetime.fromtimestamp(then, pu.timezone.utc).replace(tzinfo=None),
+  })
+  db.commit()
+  sent = []
+
+  async def record(session, owner_id, **kwargs):
+    sent.append(kwargs)
+    session.add(models.Notification(
+      id=kwargs["notification_id"], owner_id=owner_id,
+      source_type=kwargs["source_type"], title=kwargs["title"], body=kwargs["body"],
+    ))
+    session.commit()
+
+  monkeypatch.setattr(push, "notify_owner_async", record)
+
+  assert await pu.notify_update_stall_once(SessionLocal, platform)
+  assert sent[0]["target"] == "/shell/?chat=resolver-1"
+  assert sent[0]["body"].startswith("Its resolver chat stopped before finishing. Open it to continue")
+  assert "Open Settings" not in sent[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_marker_only_finish_notifies_once_across_passes(
+  clone_env, db, owner_token, monkeypatch, tmp_path,
+):
+  """Without a prepared record the finish comes from the activation marker;
+  its stall episode must not change as supervisor passes go by."""
+  from app import models, push
+  from app.database import SessionLocal
+
+  _origin, platform = clone_env
+  monkeypatch.setattr(pu, "STALL_NOTIFIED_PATH", tmp_path / ".stall-notified")
+  monkeypatch.setattr(pu, "restart_blocker", lambda repo: {"blocking": True})
+  official = _git(platform, "rev-parse", "HEAD").stdout.strip()
+  pu.RESTART_NEEDED_FLAG.write_text(json.dumps({
+    "version": 2, "target_sha": official, "upstream_sha": official,
+    "paths": ["Dockerfile"], "image_paths": ["Dockerfile"],
+  }), encoding="utf-8")
+  pending = pu.unfinished_update(platform)
+  assert pending["stage"] == "finish" and pu.read_prepared_update() is None
+  sent = []
+
+  async def record(session, owner_id, **kwargs):
+    sent.append(kwargs)
+    session.add(models.Notification(
+      id=kwargs["notification_id"], owner_id=owner_id,
+      source_type=kwargs["source_type"], title=kwargs["title"], body=kwargs["body"],
+    ))
+    session.commit()
+
+  monkeypatch.setattr(push, "notify_owner_async", record)
+
+  # Settings hides the pause while any container replacement runs, so the
+  # bell stays quiet then too.
+  async def replacing():
+    return True
+
+  monkeypatch.setattr(pu, "_container_replacement_active", replacing)
+  assert await pu.notify_update_stall_once(SessionLocal, platform) is None
+  assert sent == []
+
+  async def idle():
+    return False
+
+  monkeypatch.setattr(pu, "_container_replacement_active", idle)
+
+  now = time.time()
+  episodes = [
+    pu.detect_update_stall(db, pending, blocker={"blocking": True}, repo=platform,
+                           now=now + offset)["episode"]
+    for offset in (0, _HOURS)
+  ]
+  assert episodes[0] == episodes[1]
+
+  first = await pu.notify_update_stall_once(SessionLocal, platform)
+  monkeypatch.setattr(pu.time, "time", lambda: now + 2 * _HOURS)
+  assert first and await pu.notify_update_stall_once(SessionLocal, platform) is None
+  assert len(sent) == 1
+  # This finish needs a new container, so the alert points at replacing it.
+  assert pending["action"] == "replace"
+  assert "choose Finish update to replace the container" in sent[0]["body"]
+  assert sent[0]["target"] == "/shell/?settings"
+
+
+@pytest.mark.asyncio
+async def test_resume_restarts_the_idle_bound_resolver(clone_env, db, monkeypatch):
+  from app.chat_writer import create_chat
+
+  _origin, platform = clone_env
+  worktree, _index, _then = _parked_update(platform, chat_id="resolver-1")
+  db.add(create_chat(id="resolver-1", title="Resolve platform update conflict",
+                     messages=[], pending_messages=[], provider="claude"))
+  db.commit()
+  started = []
+
+  async def fake_start(**kwargs):
+    started.append(kwargs)
+    return True
+
+  monkeypatch.setattr("app.chat_start.start_programmatic_chat_turn", fake_start)
+
+  result = await pu.resume_platform_conflict_resolver(db, platform)
+
+  assert result == {"chat_id": "resolver-1", "created": False, "started": True}
+  assert started[0]["chat_id"] == "resolver-1"
+  assert "backend/app/main.py" in started[0]["content"]
+  assert str(worktree) in started[0]["content"]
+  assert "continue_platform_overlay_update" in started[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_resume_of_an_older_updaters_conflict_repeats_its_abandon_instructions(
+  clone_env, db, monkeypatch,
+):
+  """A conflict an older updater recorded is abandoned and reviewed again,
+  never continued in a candidate it does not have."""
+  from app.chat_writer import create_chat
+
+  _origin, platform = clone_env
+  target = _served_sha(platform)
+  pu._write_conflict_flag(target, ["backend/app/main.py"], "resolver-old")
+  db.add(create_chat(id="resolver-old", title="Resolve platform update conflict",
+                     messages=[], pending_messages=[], provider="claude"))
+  db.commit()
+  started = []
+
+  async def fake_start(**kwargs):
+    started.append(kwargs)
+    return True
+
+  monkeypatch.setattr("app.chat_start.start_programmatic_chat_turn", fake_start)
+
+  await pu.resume_platform_conflict_resolver(db, platform)
+
+  content = started[0]["content"]
+  assert "abandon_platform_overlay_update" in content
+  assert "continue_platform_overlay_update" not in content
+  assert "recorded by an older updater" in content
+
+
+@pytest.mark.asyncio
+async def test_resume_opens_a_new_resolver_when_the_bound_chat_has_no_model(
+  clone_env, db, monkeypatch,
+):
+  """A system turn needs an explicitly selected model; without one, Resume
+  opens a new resolver (which gets the background-agent model) instead of
+  failing."""
+  from app.chat_start import ProgrammaticChatModelRequired
+  from app.chat_writer import create_chat
+
+  _origin, platform = clone_env
+  _parked_update(platform, chat_id="resolver-no-model")
+  db.add(create_chat(id="resolver-no-model", title="Resolve platform update conflict",
+                     messages=[], pending_messages=[], provider="claude"))
+  db.commit()
+
+  async def refuse(**kwargs):
+    raise ProgrammaticChatModelRequired("no explicitly selected model")
+
+  async def fake_spawn(session, paths, target_sha, overlay=None):
+    return {"chat_id": "new-resolver", "created": True, "started": True}
+
+  monkeypatch.setattr("app.chat_start.start_programmatic_chat_turn", refuse)
+  monkeypatch.setattr(pu, "spawn_platform_conflict_chat", fake_spawn)
+
+  result = await pu.resume_platform_conflict_resolver(db, platform)
+
+  assert result == {"chat_id": "new-resolver", "created": True, "started": True}
+  assert pu._read_conflict_flag()["chat_id"] == "new-resolver"
+
+
+@pytest.mark.asyncio
+async def test_resume_recreates_a_missing_resolver_and_rebinds_the_update(
+  clone_env, db, monkeypatch,
+):
+  _origin, platform = clone_env
+  _parked_update(platform, chat_id="deleted-resolver")
+  calls = []
+
+  async def fake_spawn(session, paths, target_sha, overlay=None):
+    calls.append((paths, target_sha, overlay["mode"]))
+    return {"chat_id": "new-resolver", "created": True, "started": True}
+
+  monkeypatch.setattr(pu, "spawn_platform_conflict_chat", fake_spawn)
+
+  result = await pu.resume_platform_conflict_resolver(db, platform)
+
+  assert result["chat_id"] == "new-resolver" and result["created"] is True
+  assert calls == [(["backend/app/main.py"], _served_sha(platform), "net")]
+  assert pu._read_conflict_flag()["chat_id"] == "new-resolver"

@@ -14,6 +14,10 @@ on:
         description: Prove per-message transcripts survive a real Host worker round trip to the previous release (disposable hosted runner)
         type: boolean
         default: false
+      mixed_upgrade_proof:
+        description: Prove Settings refuses a pinned image plus helper upgrade and the operator path cuts it over (disposable hosted runner)
+        type: boolean
+        default: false
   pull_request:
     # True PR stacks target the upstream branch directly beneath them. Run the
     # same suite for every layer so the chain is reviewable in parallel; main's
@@ -57,6 +61,35 @@ jobs:
           # No image build, publication, live-host credentials, or remote Docker.
           sudo git config --global --add safe.directory '*'
           sudo env MOBIUS_RELEASE_REPLAY=1 scripts/test-host-helper.sh "$PREVIOUS" "$TARGET"
+
+  mixed-upgrade-proof:
+    # Installs root-owned units, builds an image and replaces containers:
+    # never on PR/merge events or a self-hosted runner, never with live-host
+    # credentials.
+    if: github.event_name == 'workflow_dispatch' && inputs.mixed_upgrade_proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Make room for the target image build
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Settings refuses an image plus helper span; the operator path cuts it over
+        env:
+          PREVIOUS: f6e61ae4240c10daf7ece40a74bb14eca4d43f87
+          TARGET: 6bac85f6834ad0507eae8dc12b2dcbdbcbe65193
+        run: |
+          # The proof requires an exact root-owned checkout, never broad Git trust.
+          sudo cp -a "$GITHUB_WORKSPACE" /root/mixed-upgrade-proof
+          sudo chown -R root:root /root/mixed-upgrade-proof
+          sudo chmod -R go-w /root/mixed-upgrade-proof
+          sudo /root/mixed-upgrade-proof/scripts/test-mixed-host-upgrade.sh "$PREVIOUS" "$TARGET"
 
   transcript-host-proof:
     # Installs root-owned units and replaces containers: never on PR/merge
@@ -212,6 +245,17 @@ jobs:
         run: |
           ruff check app tests
           mypy
+      - name: Verify recovery timer and queued-request dispatch on real systemd
+        run: sudo env GITHUB_ACTIONS=true python3 scripts/test-rebuild-recovery-units.py
+      - name: Prove rebuild recovery against disposable Docker and the real ledger
+        # Root is needed for the Host's root-trusted receipt checks. This runs
+        # only on GitHub-hosted runners, uses unique local images/projects, and
+        # never reaches a production daemon or registry.
+        run: >-
+          sudo env PATH="$PATH" GITHUB_ACTIONS=true
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT"
+          MOBIUS_DOCKER_RECOVERY_PROOF=1
+          python3 scripts/test-rebuild-recovery-docker.py
       - name: Audit locked Python runtime dependencies
         working-directory: backend
         run: pip-audit --strict --disable-pip -r requirements.lock
@@ -283,20 +327,53 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  backend-all-unconverted:
+    # The first boot after an update serves chats the previous release wrote
+    # last, so none of them is converted. MOBIUS_TEST_ALL_UNCONVERTED=1 makes
+    # every commit leave every chat that way (tests/conftest.py). The suites
+    # that read and write transcripts across that boundary (transcripts, chat
+    # routes, run supervisors, delegations) run here, about a minute of tests
+    # in parallel with the shards rather than a second full suite. A fixed
+    # file list, not a shard, so every run covers the same tests.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/backend-env
+      - name: Run the transcript boundary suites with every chat unconverted
+        working-directory: backend
+        env:
+          MOBIUS_TEST_ALL_UNCONVERTED: '1'
+        run: >-
+          pytest -q -n auto --dist worksteal
+          tests/test_transcript_*.py
+          tests/test_helper_transcripts.py
+          tests/test_chat_transcript_compact.py
+          tests/test_chats.py
+          tests/test_chats_stream_steer.py
+          tests/test_runtime_supervisors.py
+          tests/test_writer_supervisor.py
+          tests/test_delegations.py
+          tests/test_core_delegation_*.py
+
   backend:
     # The required backend check. It fails unless every backend job passed (a
     # skipped or cancelled dependency must not read as success), then applies
     # the coverage floor to the combined shards.
     if: always()
-    needs: [backend-checks, backend-tests]
+    needs: [backend-checks, backend-tests, backend-all-unconverted]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Require every backend job
-        if: needs.backend-checks.result != 'success' || needs.backend-tests.result != 'success'
+        if: >-
+          needs.backend-checks.result != 'success'
+          || needs.backend-tests.result != 'success'
+          || needs.backend-all-unconverted.result != 'success'
         run: |
           echo "backend-checks: ${{ needs.backend-checks.result }}"
           echo "backend-tests: ${{ needs.backend-tests.result }}"
+          echo "backend-all-unconverted: ${{ needs.backend-all-unconverted.result }}"
           exit 1
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -342,8 +419,10 @@ jobs:
         # @tanstack/react-query (via hooks/queries.js). Without
         # node_modules the loader can't resolve the bare specifier
         # and the whole test suite fails on ERR_MODULE_NOT_FOUND.
+        # Install scripts stay off: no dependency needs one on Linux, and a
+        # hijacked release would otherwise run code here on install.
         working-directory: frontend
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Audit frontend runtime dependencies
         working-directory: frontend
         run: |
@@ -379,6 +458,8 @@ jobs:
           npm run test:coverage
       - name: Run static app packager tests
         run: npm run test:packager
+      - name: Run dependency safety check tests
+        run: node --test 'scripts/dependency-safety/*.test.mjs'
       - name: Install browser harness deps
         # The harness imports Playwright helpers even though it does not launch
         # a browser. Install the root lockfile instead of relying on the
@@ -628,10 +709,21 @@ jobs:
         with:
           node-version: 24
           cache: 'npm'
-          cache-dependency-path: package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
 
       - name: Install test deps
-        run: npm ci
+        # Browsers come from the next step, so no package needs its install script.
+        run: npm ci --ignore-scripts
+
+      - name: Install frontend deps for component specs
+        # Some specs mount real components through Vite from frontend/node_modules.
+        # Playwright loads every spec in every shard, so one unresolved import
+        # fails the whole suite before any test runs. The test container seeds
+        # from `git archive HEAD`, so this host-only tree never reaches it.
+        working-directory: frontend
+        run: npm ci --ignore-scripts
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium

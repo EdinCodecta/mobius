@@ -10,7 +10,11 @@ import pytest
 from app import chat_queue, chat_waits, chat_writer, models
 from app.database import SessionLocal
 from app.platform_restart import activation_notice
-from tests.test_platform_restart_cards import _install, _submit
+# These scenarios use the same card helpers and must inherit their hermetic
+# source preflight, rather than importing the live platform during a fake action.
+from tests.test_platform_restart_cards import (
+  _install, _submit, isolated_restart_source,
+)
 
 
 def _activation_command(chat_id, wait_id, root_id, **kw):
@@ -35,9 +39,10 @@ def test_answer_while_publisher_finishes_keeps_b_behind_activation(monkeypatch):
   _submit(chat_writer.ResolvePlatformRestartCard(
     chat_id="queue-publisher", question_id=qid, selected_option_id="restart-id",
   ))
-  async def finish(chat_id, token, status):
+  async def finish(chat_id, token, status, end_reason=None):
     await chat_writer.await_ack(chat_writer.get_writer().submit(chat_writer.FinishRun(
       chat_id=chat_id, run_token=token, terminal_status=status,
+      end_reason=end_reason,
     )))
   with SessionLocal() as db:
     result = asyncio.run(chat_queue.drain_and_release(
@@ -54,6 +59,8 @@ def test_answer_while_publisher_finishes_keeps_b_behind_activation(monkeypatch):
     assert [m["content"] for m in chat.pending_messages] == ["B"]
     assert db.get(models.ChatRun, "must-not-start-b") is None
     assert db.get(models.ChatWait, wait_id).status == "armed"
+    parked = db.get(models.ChatRun, run_id)
+    assert (parked.status, parked.end_reason) == ("interrupted", "activation")
 
 
 @pytest.mark.parametrize("wait_status", ["armed", "met", "failed", "expired"])

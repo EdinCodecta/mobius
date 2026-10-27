@@ -24,6 +24,7 @@ CHAT_WAIT_SWEEP_INTERVAL_SECS = 30.0
 DELEGATION_STARTUP_RECOVERY_INTERVAL_SECS = 60.0
 DELEGATION_WAKE_RECOVERY_INTERVAL_SECS = 60.0
 AUTOPILOT_LEASE_RECOVERY_INTERVAL_SECS = 60.0
+REPAIR_CHECKOUT_GC_INTERVAL_SECS = 60 * 60
 # Capacity monitor: sample /data headroom every tick; recompute the (more
 # expensive) per-domain attribution walk only every Nth tick unless pressure is
 # present, so the monitor never amplifies the disk pressure it watches.
@@ -40,6 +41,11 @@ PROVIDER_SESSION_RETENTION_BACKLOG_INTERVAL_SECS = 5 * 60
 OOM_WATCHDOG_FAST_INTERVAL_SECS = 2.0
 OOM_WATCHDOG_SLOW_INTERVAL_SECS = 20.0
 OOM_WATCHDOG_FAST_WINDOW_SECS = 180.0
+# A heavy WebGL page can grow by gigabytes within a minute.
+BROWSER_REAPER_INTERVAL_SECS = 30.0
+# Chat browsers may hold this share of the container memory limit; the server
+# and agent processes need the rest.
+BROWSER_MEMORY_SHARE = 0.4
 REQUIRED_DATABASE_SUPERVISORS = frozenset({
   "wedged-marker-sweep",
   "reset-park-sweep",
@@ -86,6 +92,8 @@ class RuntimeSupervisors:
     self._frontend_handler = None
     self._database_services_started = False
     self._database_services_error: str | None = None
+    from app.app_update_batches import AppUpdateBatches
+    self.app_updates = AppUpdateBatches(settings.data_dir)
 
   def _spawn(self, name: str, coroutine) -> None:
     self._tasks[name] = asyncio.create_task(
@@ -127,12 +135,54 @@ class RuntimeSupervisors:
 
     self._spawn("boot-file-cache-reclaim", reclaim())
 
+  def retry_bootstrap_apps(self, outcome) -> None:
+    """Keep retrying default apps that failed only transiently at boot."""
+    from app.bootstrap import retry_bootstrap_apps
+    self._spawn("bootstrap-apps-retry", retry_bootstrap_apps(outcome))
+
   async def start_process_services(self) -> None:
     """Start services that are safe without a serviceable database."""
     await self._start_frontend_watcher()
     from app.connect_outbound import supervise_outbound_connects
     self._spawn("connect-outbound", supervise_outbound_connects())
     self._spawn("oom-watchdog", self._oom_watchdog_loop())
+    self._spawn("browser-reaper", self._browser_reaper_loop())
+
+  async def _browser_reaper_loop(self) -> None:
+    """Close agent browsers left by turns that died with an earlier process.
+
+    Its first pass starts at boot alongside other supervisors. A browser
+    outliving a killed server may hold memory across restarts; this sweep
+    runs concurrently with chat resumption, not as a startup barrier.
+    """
+    from app import chat, memory_observability
+
+    while True:
+      try:
+        # No container limit means no OOM cliff to guard.
+        limit = memory_observability.cgroup_memory_snapshot().get("limit_bytes")
+        await chat.reap_unowned_browsers(
+          memory_budget_bytes=int(limit * BROWSER_MEMORY_SHARE) if limit else None,
+        )
+      except asyncio.CancelledError:
+        raise
+      except Exception as exc:
+        self.log.error("agent-browser reaper failed: %s", exc, exc_info=True)
+      await asyncio.sleep(BROWSER_REAPER_INTERVAL_SECS)
+
+  async def _repair_checkout_gc_loop(self) -> None:
+    """Collect retired repair checkouts at boot and hourly without a review Wait."""
+    from app.contribution_review_repair_actions import sweep_checkout_receipts_once
+    from app.settled import run_settled
+
+    while True:
+      try:
+        await run_settled(sweep_checkout_receipts_once)
+      except asyncio.CancelledError:
+        raise
+      except Exception as exc:
+        self.log.error("repair checkout GC failed: %s", exc, exc_info=True)
+      await asyncio.sleep(REPAIR_CHECKOUT_GC_INTERVAL_SECS)
 
   async def _oom_watchdog_loop(self) -> None:
     """Record a durable diagnostic whenever the cgroup loses a process to OOM.
@@ -211,6 +261,8 @@ class RuntimeSupervisors:
           "required runtime supervisors were not started: "
           + ", ".join(sorted(missing))
         )
+      # Settles any batch a stopped server left running, then admits new ones.
+      await self.app_updates.start()
       self._database_services_started = True
       self._database_services_error = None
     except Exception as exc:
@@ -353,22 +405,25 @@ class RuntimeSupervisors:
             raise
           except Exception as exc:
             self.log.error("chat-wait sweep failed: %s", exc, exc_info=True)
+          try:
+            from app.goal_dependencies import deliver_pending_dependencies
+            await deliver_pending_dependencies()
+          except asyncio.CancelledError:
+            raise
+          except Exception as exc:
+            self.log.error("dependency delivery sweep failed: %s", exc, exc_info=True)
       finally:
         system_broadcast.unsubscribe(events)
 
     async def delegation_startup_recovery_loop():
-      # Startup admission and source-attached work have their own repair path;
-      # neither can be delayed by a stalled parent wake or SQLite lease sweep.
-      from app.delegations import (
-        reconcile_unstarted_delegations,
-      )
-      from app.routes.github import reconcile_attached_contribution_work
+      # Startup admission has its own repair path; it cannot be delayed by a
+      # stalled parent wake or SQLite lease sweep.
+      from app.delegations import reconcile_unstarted_delegations
 
       while True:
         await asyncio.sleep(DELEGATION_STARTUP_RECOVERY_INTERVAL_SECS)
         try:
           await reconcile_unstarted_delegations()
-          await reconcile_attached_contribution_work()
         except asyncio.CancelledError:
           raise
         except Exception as exc:
@@ -477,8 +532,27 @@ class RuntimeSupervisors:
         run_capacity_tick,
       )
       from app.config import get_settings
+      from app.file_cache import reclaim_accumulated_cache
 
       data_dir = get_settings().data_dir
+
+      async def release_accumulated_cache() -> None:
+        # Railway meters page cache as memory, and turn-end cleanup waits for
+        # the turn to end; release what long turns keep hot in the meantime.
+        try:
+          advice = await asyncio.to_thread(reclaim_accumulated_cache, data_dir)
+        except Exception:
+          self.log.debug("periodic file cache advice failed", exc_info=True)
+          return
+        if not advice or not advice["observed_drop_bytes"]:
+          # Silence is the signal that nothing reclaimable accumulated; a pass
+          # that keeps achieving nothing should not read as if it worked.
+          return
+        self.log.info(
+          "periodic file cache advice: container file cache %d -> %d bytes",
+          advice["file_cache_before_bytes"], advice["file_cache_after_bytes"],
+        )
+
       tick = 0
       while True:
         try:
@@ -495,7 +569,7 @@ class RuntimeSupervisors:
                 await push.notify_owner_async(
                   notification_db,
                   owner_row[0],
-                  title="Storage capacity alert",
+                  title="Möbius storage is running low",
                   body=result["body"],
                   source_type="capacity",
                   notification_id=notification_id,
@@ -526,8 +600,27 @@ class RuntimeSupervisors:
           raise
         except Exception as exc:
           self.log.error("capacity monitor failed: %s", exc, exc_info=True)
+        # Boot's own pass advises these same paths once the server is ready,
+        # so the first tick would only repeat it seconds later.
+        if tick:
+          await release_accumulated_cache()
         tick += 1
         await asyncio.sleep(CAPACITY_MONITOR_INTERVAL_SECS)
+
+    async def platform_update_watch_loop():
+      # An unfinished update whose resolver stopped stays parked silently
+      # until the owner opens Settings; tell them once per stall episode.
+      from app.platform_update import notify_update_stall_once
+
+      await asyncio.sleep(300)
+      while True:
+        try:
+          await notify_update_stall_once(SessionLocal)
+        except asyncio.CancelledError:
+          raise
+        except Exception as exc:
+          self.log.error("platform update watch failed: %s", exc, exc_info=True)
+        await asyncio.sleep(60 * 60)
 
     async def provider_session_retention_loop():
       # Codex rollout JSONL is resumable context, not permanent owner data.
@@ -590,9 +683,13 @@ class RuntimeSupervisors:
     self._spawn("agent-scratch-retention", agent_scratch_loop())
     self._spawn("provider-session-retention", provider_session_retention_loop())
     self._spawn("capacity-monitor", capacity_monitor_loop())
+    self._spawn("repair-checkout-gc", self._repair_checkout_gc_loop())
+    self._spawn("platform-update-watch", platform_update_watch_loop())
 
   async def stop(self) -> None:
     """Cancel and observe every task, then stop external watcher resources."""
+    # First, so each running update settles while the owners it uses still run.
+    await self.app_updates.stop()
     tasks = list(self._tasks.values())
     for task in tasks:
       task.cancel()

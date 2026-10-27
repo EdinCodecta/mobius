@@ -1,5 +1,7 @@
 """Routes for chat CRUD operations."""
 
+import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -13,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import Text, case, cast, func
+from sqlalchemy import JSON, Text, case, cast, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,6 +33,7 @@ from app import (
   questions,
   schemas,
   secure_inputs,
+  side_questions,
 )
 from app.chat_visibility import (
   coerce_agent_settings,
@@ -39,7 +42,6 @@ from app.chat_visibility import (
 )
 from app.chat_event_sink import active_sink_assistant_message_id
 from app.chat_activity import chat_activity_page
-from app.chat_context import recent_chat_summary_order
 from app.chat_waits import (
   outstanding_wait_chat_ids,
   outstanding_waits_for_chat,
@@ -50,6 +52,7 @@ from app.chat import (
   _finish_run,
   bump_run_generation,
   is_chat_running,
+  is_chat_busy,
   mark_chat_deleted,
   recover_chat_generation,
   stop_chat_for,
@@ -74,7 +77,7 @@ from app.chat_titles import (
 )
 from app.database import get_db
 from app.delegations import background_helper_chat_ids, serialize_background_helpers
-from app.goal_plans import presented_goal, presented_deferred_goals
+from app.goal_plans import presented_goal, presented_deferred_goals, presented_dependency_goals
 from app.helper_transcripts import read_helper_conversation
 from app.memory_observability import record_memory_checkpoint_once
 from app.owner_input import OwnerInputKind
@@ -533,6 +536,9 @@ def _chat_message_matches_key(
   if not isinstance(message, dict):
     return False
   target = str(key)
+  if target.startswith("question:"):
+    return any(isinstance(block, dict) and block.get("type") == "question" and block.get("question_id") == target[9:]
+               for block in message.get("blocks") or [])
   message_id = message.get("id")
   if message_id is not None and str(message_id) == target:
     return True
@@ -546,6 +552,49 @@ def _chat_message_matches_key(
   return f"{role}-{index}" == target
 
 
+def _question_anchor_index(messages, anchor_key):
+  """Locate the nested card without hydrating every historical message.
+
+  Converted transcripts search nested JSON in storage and return one scalar
+  coordinate. Legacy bodies are already resident; live overlays stay dominant.
+  """
+  from app.chat_transcript import MaterializedHistory
+  if not isinstance(messages, MaterializedHistory) or messages.history.legacy is not None:
+    return next((index for index, message in enumerate(messages)
+      if _chat_message_matches_key(message, index, anchor_key)), None)
+  if messages.live is not None and _chat_message_matches_key(messages.live, 0, anchor_key):
+    return messages.live_index if messages.live_index >= 0 else len(messages.history)
+  db = messages.history.db
+  row = models.ChatMessage
+  question_id = anchor_key[len("question:"):]
+  if db.bind.dialect.name == "sqlite":
+    blocks = func.json_each(case(
+      (func.json_type(row.body, "$.blocks") == "array", func.json_extract(row.body, "$.blocks")),
+      else_="[]",
+    )).table_valued("value", "type")
+    body = case((blocks.c.type == "object", blocks.c.value), else_="{}")
+    match = select(1).select_from(blocks).where(
+      func.json_extract(body, "$.type") == "question",
+      func.json_extract(body, "$.question_id") == question_id,
+    ).exists()
+  else:
+    saved_blocks = cast(row.body, JSON)["blocks"]
+    blocks = func.json_array_elements(case(
+      (func.json_typeof(saved_blocks) == "array", saved_blocks),
+      else_=func.json_build_array(),
+    )).table_valued("value")
+    match = select(1).select_from(blocks).where(
+      blocks.c.value.op("->>")("type") == "question",
+      blocks.c.value.op("->>")("question_id") == question_id,
+    ).exists()
+  query = db.query(row.seq).filter(row.chat_id == messages.chat.id,
+    row.seq < len(messages.history), match)
+  if messages.live is not None and messages.live_index >= 0:
+    query = query.filter(row.seq != messages.live_index)
+  found = query.order_by(row.seq).first()
+  return found[0] if found is not None else None
+
+
 def _chat_detail_window(
   messages: list,
   *,
@@ -557,21 +606,22 @@ def _chat_detail_window(
   """Select one authoritative detail window and report anchor coverage."""
   total = len(messages)
   if anchor_key is not None:
-    anchor_index = next((
+    is_question = anchor_key.startswith("question:")
+    anchor_index = (_question_anchor_index(messages, anchor_key) if is_question else next((
       index for index, message in enumerate(metadata if metadata is not None else messages)
       if _chat_message_matches_key(message, index, anchor_key)
-    ), None)
+    ), None))
     if anchor_index is not None:
-      # Exact restoration is one atomic snapshot: keep one predecessor above
-      # the saved row, then carry the current tail. Without that small amount
+      # Keep one predecessor above the saved row. Without that small amount
       # of real scroll range, a row that becomes first in the cold window can
       # only sit at the list's 8px top padding; a saved positive viewport
       # offset is clamped even though the requested row was found. The reader
       # then returns to the right message at the wrong vertical position.
-      # A page ceiling here would still silently discard the exact address the
-      # caller asked us to preserve.
+      # A bounded following range is enough to expose the requested row without
+      # hydrating every later turn in a long-running chat.
       start = max(0, anchor_index - 1)
-      return messages[start:], start, True
+      end = min(total, anchor_index + limit) if is_question else total
+      return messages[start:end], start, True
     start = max(0, total - limit)
     return messages[start:], start, False
   if before is not None:
@@ -643,6 +693,7 @@ def _chat_detail_response(
   from app.goal_plans import terminal_goal_summaries_by_message_index
   summaries_by_index = terminal_goal_summaries_by_message_index(
     db, chat.id, coordinates, message_start=start, message_end=start + len(page),
+    include_foreign_context=expose_session,
   )
   # Insert read-side lifecycle blocks before activity compaction. The completion
   # call then ends its stretch, and later prose/tools cannot drag the card down.
@@ -690,6 +741,7 @@ def _chat_detail_response(
   )
   page = project_messages_for_detail(
     page,
+    chat_id=chat.id,
     fetchable_tool_output_ids=fetchable_tool_ids,
     live_message=live_message,
   )
@@ -705,6 +757,7 @@ def _chat_detail_response(
   from app.chat_media_dimensions import project_message_image_dimensions
   page = project_message_image_dimensions(
     page,
+    db=db,
     chat_id=chat.id,
     data_dir=get_settings().data_dir,
   )
@@ -722,6 +775,24 @@ def _chat_detail_response(
       projected_message["wait_summaries"] = summaries
       next_page[relative_index] = projected_message
     page = next_page
+  from app.goal_dependencies import (source_dependency_backlinks,
+    terminal_dependency_summaries_by_message_index)
+  question_ids = {block.get("question_id") for message in page
+    for block in (message.get("blocks") or []) if isinstance(block, dict) and block.get("type") == "question"}
+  backlinks = source_dependency_backlinks(db, chat.id, question_ids=question_ids) if expose_session else {}
+  dependency_summaries = terminal_dependency_summaries_by_message_index(
+    db, chat.id, coordinates, message_start=start, message_end=start + len(page),
+    include_foreign_context=expose_session)
+  if backlinks or dependency_summaries:
+    page = [{**message,
+      **({"blocks": [{**block, "needed_by": backlinks[block["question_id"]]}
+        if isinstance(block, dict) and block.get("type") == "question" and block.get("question_id") in backlinks
+        else block for block in message["blocks"]]} if backlinks and isinstance(message.get("blocks"), list)
+        and any(isinstance(block, dict) and block.get("type") == "question"
+          and block.get("question_id") in backlinks for block in message["blocks"]) else {}),
+      **({"wait_summaries": [*message.get("wait_summaries", []), *dependency_summaries[start + index]]}
+        if start + index in dependency_summaries else {}),
+    } for index, message in enumerate(page)]
   from app.continuations import recovery_reasons_by_message_index
   recovery_reasons = recovery_reasons_by_message_index(
     db, chat.id, coordinates, message_start=start, message_end=start + len(page),
@@ -759,7 +830,7 @@ def _chat_detail_response(
   active_goal_objective = (
     running_goal_objective(db, chat.id) if running else None
   )
-  goal = presented_goal(db, chat.id)
+  goal = presented_goal(db, chat.id, include_foreign_context=expose_session)
   run_id, run_status, runtime_revision = _latest_run_snapshot(db, chat.id)
   response = {
     "id": chat.id,
@@ -937,6 +1008,7 @@ def list_chats(
       "shell_chat_list_first_response",
       chat_count=len(chats),
     )
+  dependency_goals = presented_dependency_goals(db, (chat.id for chat in chats))
   deferred_goals = presented_deferred_goals(db, (chat.id for chat in chats))
   result = []
   for chat in chats:
@@ -953,7 +1025,7 @@ def list_chats(
       waits=waits,
       helper_count=1 if chat.id in helper_chat_ids else 0,
       park=park,
-      goal=deferred_goals.get(chat.id),
+      goal=deferred_goals.get(chat.id) or dependency_goals.get(chat.id),
     )
     result.append(_owner_chat_summary(
       chat,
@@ -996,9 +1068,10 @@ def mark_chat_failure_seen(
   return Response(status_code=204)
 
 
-# Chats whose titles are searchable but whose message text is not yet: the
-# previous release wrote them and they are not converted. Additive to the
-# result list, which stays the response body.
+# Drawer chats whose titles are searchable but whose message text is not yet:
+# the previous release wrote them and they await conversion
+# (chat_search.unindexed_chat_count). Additive to the result list, which stays
+# the response body.
 SEARCH_UNINDEXED_HEADER = "X-Search-Unindexed-Chats"
 
 
@@ -1019,7 +1092,7 @@ def search_chats(
   mark matches with private-use sentinels U+E000/U+E001; the drawer converts
   them to highlight marks.
   """
-  response.headers[SEARCH_UNINDEXED_HEADER] = str(transcript_rows.unconverted_count(db))
+  response.headers[SEARCH_UNINDEXED_HEADER] = str(chat_search.unindexed_chat_count(db))
   query = q.strip()
   if not query:
     return []
@@ -1587,11 +1660,7 @@ async def patch_chat(
       and latest_message.get("from_provider") == (chat.provider or "claude")
     )
     if provider_changing:
-      if (
-        is_chat_running(chat_id)
-        or chat.pending_messages
-        or has_nonterminal_run(db, chat_id)
-      ):
+      if is_chat_busy(db, chat):
         raise HTTPException(
           status_code=409,
           detail="Chat is busy — finish or stop the current turn before switching.",
@@ -1617,7 +1686,7 @@ async def patch_chat(
       # problem at pick-time.
       from app.providers import get_provider
       candidate = get_provider(target_provider)
-      auth_error = await run_in_threadpool(
+      auth_error = await run_in_threadpool(  # unsettled: read-only (provider sign-in check)
         candidate.check_auth, get_app_settings().data_dir
       )
       if auth_error is not None:
@@ -1793,10 +1862,11 @@ def get_chat(
   of the first message in this page) and `total` (total message count).
 
   `anchor` is a durable rendered-row key used when restoring an older reading
-  position. If found, the response contains that row through the current tail
-  from one authoritative snapshot and reports `requested_anchor_found=true`;
-  `limit` is intentionally ignored. If it is absent, the ordinary latest page
-  is returned with `requested_anchor_found=false`.
+  position. If found, the response includes a predecessor when available and reports
+  `requested_anchor_found=true`. A `question:` anchor returns at most `limit`
+  messages starting at the matched row; other anchors extend through the tail,
+  ignoring `limit`. Both use one authoritative snapshot. If no row matches the
+  anchor, the ordinary latest page returns `requested_anchor_found=false`.
   """
   if principal.scope == "app":
     raise HTTPException(status_code=403, detail="App token is not valid here.")
@@ -1843,6 +1913,7 @@ def get_chat_runtime(
     chat_id,
     principal,
     load_fields=(
+      models.Chat.deleted_at,
       models.Chat.pending_messages,
       models.Chat.pending_question_id,
       models.Chat.active_assistant_message_id,
@@ -1862,7 +1933,7 @@ def get_chat_runtime(
     "recovery_run_id": _recovery_run_id(db, chat.id),
     "continuation_wait": continuation_wait_for_chat(db, chat.id),
     "active_goal_objective": running_goal_objective(db, chat.id),
-    "goal": presented_goal(db, chat.id),
+    "goal": presented_goal(db, chat.id, include_foreign_context=principal.scope != "chat_embed"),
     "pending_messages": list(chat.pending_messages or []),
     "pending_question_id": _open_question_id_for(chat),
     "updated_at": chat.updated_at.isoformat() if chat.updated_at else None,
@@ -2020,6 +2091,7 @@ def get_chat_activity_detail(
   )
   projected = project_messages_for_detail(
     [detail_message],
+    chat_id=chat.id,
     fetchable_tool_output_ids=fetchable_tool_ids,
   )[0]["blocks"]
   return {
@@ -2271,55 +2343,27 @@ def get_chat_agent_context(
   instance. All the underlying builders are pure/read-only.
   """
   from app import memory
-  from app.chat import (
-    _build_app_context,
-    _build_app_report_block,
-    _chat_settings_dict,
-    _custom_system_prompt,
-    _latest_compaction_brief,
-    _read_skill_text,
-  )
+  from app.agent_context import assemble_agent_context
   from app.compaction import load_full_digest
-  from app.providers import get_skill_origin
-  from app.system_prompts import prompt_for_chat
 
   chat = get_active_chat_or_404(db, chat_id)
   data_dir = get_settings().data_dir
-  overrides = _chat_settings_dict(chat)
-  custom = _custom_system_prompt(overrides)
-  system_prompt = prompt_for_chat(
-    chat,
-    custom if custom else _read_skill_text(),
-    db,
-    persist=False,
-  )
-  app_context_block, _env = _build_app_context(db, chat_id, data_dir)
-  app_report_block = _build_app_report_block(db, chat_id, data_dir)
-  compaction_brief = _latest_compaction_brief(chat)
+  parts = assemble_agent_context(db, chat, data_dir)
   chat_digest = load_full_digest(data_dir, chat_id)
   chat_summary_metadata = memory.load_chat_summary_metadata(data_dir, chat_id)
-  ordered_chat_ids = recent_chat_summary_order(db)
-  recent_chat_block = memory.build_memory_block(
-    data_dir,
-    ordered_chat_ids=ordered_chat_ids,
-  )
-  recent_chats = recent_chat_block.text or None
   return {
-    "system_prompt": system_prompt,
-    "system_prompt_source": (
-      "snapshot" if chat.system_prompt_snapshot_id
-      else ("custom_preview" if custom else "skill_preview")
-    ),
-    "system_prompt_origin": "custom" if custom else get_skill_origin(),
+    "system_prompt": parts.system_prompt,
+    "system_prompt_source": parts.system_prompt_source,
+    "system_prompt_origin": parts.system_prompt_origin,
     # `memory_block` remains as a compatibility alias for an older shell. The
     # owner-facing name is now precise: this is only bounded recent-chat
     # continuity, never knowledge-graph memory.
-    "recent_chats": recent_chats,
-    "recent_chat_entries": recent_chat_block.entries,
-    "memory_block": recent_chats,
-    "app_context": app_context_block,
-    "app_report": app_report_block,
-    "compaction_brief": compaction_brief,
+    "recent_chats": parts.recent_chats,
+    "recent_chat_entries": parts.recent_chat_entries,
+    "memory_block": parts.recent_chats,
+    "app_context": parts.app_context,
+    "app_report": parts.app_report,
+    "compaction_brief": parts.compaction_brief,
     # The title fallback keeps the first layer useful before the first settled
     # turn publishes its note. Once published, expose the one-line summary
     # itself so the owner can inspect all three summary layers together.
@@ -2327,6 +2371,32 @@ def get_chat_agent_context(
     "chat_summary": chat_summary_metadata["summary"],
     "chat_digest": chat_digest,
   }
+
+
+@router.get("/{chat_id}/context-sizes")
+def get_chat_context_sizes(
+  chat_id: str,
+  _: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+):
+  """Estimated tokens of each part Möbius adds to this chat's context.
+
+  Backs the composer's ``/context`` panel. It reads the same parts as
+  ``agent-context`` but returns only their sizes, so opening the panel never
+  downloads the prompt texts. No model is called. The panel takes the total
+  and the window from the chat's usage reading and shows the remainder as the
+  conversation plus the provider's own instructions and tools.
+
+  The sizes describe what Möbius would assemble now, not a replay of what the
+  session received: one-time first-turn injections are not re-counted, and a
+  part that changed since (a new skill, a fresh summary) shows its current
+  size. They are estimates for seeing what dominates, not an audit.
+  """
+  from app.agent_context import assemble_agent_context, context_part_sizes
+
+  chat = get_active_chat_or_404(db, chat_id)
+  parts = assemble_agent_context(db, chat, get_settings().data_dir)
+  return {"parts": context_part_sizes(parts)}
 
 
 @router.get("/{chat_id}/usage")
@@ -2545,14 +2615,12 @@ async def delete_chat(
           # a reorder held this boundary and waited to commit.
           from app.chat_waits import stage_cancel_waits_for_chat
           from app.agent_work_claims import stage_release_claims_for_chat
+          from app.decision_cards import stage_delete_decisions
+          stage_delete_decisions(db, chat)
           stage_cancel_waits_for_chat(db, chat_id)
           released_claims = stage_release_claims_for_chat(db, chat_id)
-          # A deleted follower no longer owns a Goal that should receive exact-
-          # action notices. Retire its interests with the tombstone so one stale
-          # recipient cannot poison fanout to healthy followers.
-          db.query(models.AgentWorkInterest).filter(
-            models.AgentWorkInterest.chat_id == chat_id,
-          ).delete(synchronize_session=False)
+          from app.goal_dependencies import stage_retire_chat_dependencies
+          stage_retire_chat_dependencies(db, chat_id)
           chat.deleted_at = now_naive_utc()
           recovery_notification_id = stage_recovery_notification(
             db,
@@ -2604,18 +2672,16 @@ async def delete_chat(
           chat_id,
         )
   # Destructive cleanup has settled before releasing transition ownership.
-  # The tombstone and releases are already durable. Notify/wake followers as a
-  # best-effort delivery layer; failure cannot roll back an owner-requested
+  # The tombstone and releases are already durable. Nudge exact-Goal delivery as a
+  # best-effort layer; failure cannot roll back an owner-requested
   # deletion, and the released claim itself remains reclaimable by exact key.
   if released_claims:
-    from app.agent_coordination import notify_settled_claims
+    from app.goal_dependencies import deliver_pending_dependencies
     try:
-      await notify_settled_claims(
-        db, owner_id=owner.id, sender_chat_id=chat_id, settled=released_claims,
-      )
+      await deliver_pending_dependencies()
     except Exception:
       log.exception(
-        "Chat %s was deleted but claim followers were not notified", chat_id,
+        "Chat %s was deleted but claim dependencies were not nudged", chat_id,
       )
   # The current chat has just entered its recovery window and therefore cannot
   # be selected when this existing lifecycle boundary reclaims older tombstones.
@@ -2801,11 +2867,8 @@ async def _compact_chat_locked(
     raise HTTPException(
       status_code=409, detail="This chat already uses that provider."
     )
-  if (
-    is_chat_running(chat_id)
-    or chat.pending_messages
-    or has_running_run(db, chat_id)
-  ):
+  # A provider handoff deliberately supersedes parked continuations.
+  if is_chat_busy(db, chat, run_statuses=("running",)):
     raise HTTPException(
       status_code=409,
       detail="Chat is busy — finish or stop the current turn before switching.",
@@ -2947,6 +3010,15 @@ async def compact_chat(
   tagged so ``patch_chat`` accepts it exactly once as the handoff proof. New
   provider switches use the atomic ``/provider-switch`` route.
   """
+  if body is not None and body.recovery_id is not None and body.batch_id is None:
+    raise HTTPException(422, "Continue compaction requires a new batch request identity.")
+  if body is not None and body.batch_id is not None:
+    from app.manual_compaction import compact_batch
+    from app.compaction import CompactionError
+    try:
+      return await compact_batch(chat_id, body, db)
+    except CompactionError as exc:
+      raise HTTPException(422, str(exc)) from exc
   from app.chat_queue import get_transition_lock
   from app.chat_continuity import note_path, recovery_source
   from app.chat_notes import extract_full_digest
@@ -2969,11 +3041,7 @@ async def compact_chat(
           "provider; its provider can't be switched."
         ),
       )
-    if (
-      is_chat_running(chat_id)
-      or chat.pending_messages
-      or has_nonterminal_run(db, chat_id)
-    ):
+    if is_chat_busy(db, chat):
       raise HTTPException(
         status_code=409,
         detail="Chat is busy — finish or stop the current turn before compacting.",
@@ -3042,6 +3110,145 @@ async def compact_chat(
         "command": f"POST /api/chats/{chat_id}/compact",
         "stored": result.get("stored"),
       }
+
+
+@router.get("/{chat_id}/compact-progress")
+def get_compaction_progress(
+  chat_id: str,
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+  db: Session = Depends(get_db),
+):
+  """Read saved manual preparation; observing it never starts provider work."""
+  from app.manual_compaction import latest_progress
+  return {"progress": latest_progress(db, get_active_chat_or_404(db, chat_id))}
+
+
+@router.post("/{chat_id}/compact-stop", dependencies=[Depends(reject_cross_site)])
+async def stop_manual_compaction(
+  chat_id: str,
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+  db: Session = Depends(get_db),
+):
+  """Cancel context preparation only, leaving queued input and session intact."""
+  from app.runner_registry import RunnerKind, registry
+  get_active_chat_or_404(db, chat_id)
+  db.close()
+  handle = registry.get_handle(chat_id, RunnerKind.COMPACTION)
+  if handle is not None:
+    registry.bump_generation(chat_id)
+    if not await handle.stop():
+      raise HTTPException(503, "Preparation is still stopping; no new batch was started.")
+  return {"ok": True}
+
+
+class SideQuestionAsk(BaseModel):
+  question: str = Field(min_length=1, max_length=side_questions.MAX_QUESTION_CHARS)
+
+
+class SideQuestionKeep(BaseModel):
+  # Client-minted identity: a retried add returns the row it already stored.
+  cid: str = Field(min_length=1, max_length=128)
+  question: str = Field(min_length=1, max_length=side_questions.MAX_QUESTION_CHARS)
+  # answer_side_question bounds its answers the same way, so a card that was
+  # shown can always be added.
+  answer: str = Field(min_length=1, max_length=side_questions.MAX_ANSWER_CHARS)
+  # Matches FORKABLE_PROVIDERS: only a provider whose fork can run tool-less.
+  provider: Literal["claude", "codex"]
+
+
+# How often the ``/btw`` route checks whether its client is still there.
+_SIDE_QUESTION_DISCONNECT_POLL_SECS = 1.0
+
+
+@router.post("/{chat_id}/btw", dependencies=[Depends(reject_cross_site)])
+async def ask_chat_side_question(
+  chat_id: str,
+  body: SideQuestionAsk,
+  request: Request,
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+  db: Session = Depends(get_db),
+):
+  """Answer a ``/btw`` question from a temporary copy of this chat.
+
+  The copy forks the chat's provider session with no tools and is never
+  saved, so asking neither interrupts a running turn nor joins the queue, and
+  nothing reaches the transcript unless the owner adds the answer through
+  ``POST /side-questions``. One question runs per chat at a time.
+  """
+  chat = get_active_chat_or_404(db, chat_id)
+  try:
+    plan = side_questions.plan_side_question(
+      db, chat, body.question, get_settings().data_dir,
+    )
+  except side_questions.SideQuestionError as exc:
+    raise HTTPException(exc.status_code, exc.message) from exc
+  # The fork can take minutes; it must not hold a database connection.
+  db.close()
+  # Closing the card aborts the browser request, but an ASGI disconnect does
+  # not cancel this handler by itself. Watch for it and cancel the fork — its
+  # CancelledError path kills the fork's process group — so a closed card
+  # frees the chat's one side-question slot instead of running the fork out
+  # to its timeout.
+  answer_task = asyncio.create_task(
+    side_questions.answer_side_question(plan, get_settings().data_dir),
+  )
+  try:
+    while True:
+      done, _pending = await asyncio.wait(
+        {answer_task}, timeout=_SIDE_QUESTION_DISCONNECT_POLL_SECS,
+      )
+      if done:
+        break
+      if await request.is_disconnected():
+        raise HTTPException(
+          499, "The side question was closed before it was answered.",
+        )
+    answer = answer_task.result()
+  except side_questions.SideQuestionError as exc:
+    raise HTTPException(exc.status_code, exc.message) from exc
+  finally:
+    if not answer_task.done():
+      answer_task.cancel()
+      with contextlib.suppress(asyncio.CancelledError):
+        await answer_task
+  return {
+    "question": answer.question,
+    "answer": answer.answer,
+    "provider": answer.provider,
+  }
+
+
+@router.post("/{chat_id}/side-questions", dependencies=[Depends(reject_cross_site)])
+async def keep_chat_side_question(
+  chat_id: str,
+  body: SideQuestionKeep,
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+  db: Session = Depends(get_db),
+):
+  """Add a side question's answer to the transcript ("Add to chat").
+
+  It never starts a turn; the agent receives it at the start of its next
+  successful one. Refused while a question card waits for the owner.
+  """
+  from app.chat_writer import AppendSideQuestion, await_ack, get_writer
+
+  get_active_chat_or_404(db, chat_id)
+  db.close()
+  try:
+    result = await await_ack(get_writer().submit(AppendSideQuestion(
+      chat_id=chat_id,
+      cid=body.cid,
+      question=body.question.strip(),
+      answer=body.answer.strip(),
+      provider=body.provider,
+    )))
+  except Exception:
+    raise HTTPException(503, "Could not add the side question; try again.")
+  if result.get("status") == "conflict":
+    raise HTTPException(
+      409, "Answer the open question first, then add the side question.",
+    )
+  return {"stored": result.get("stored")}
 
 
 # An app that opens a chat ABOUT one of its dated reports passes the report's
@@ -3137,12 +3344,19 @@ class AppChatStart(AppChatCreate):
 
 
 class AppChatPatch(BaseModel):
+  title: str | None = Field(default=None, max_length=500)
+  owner_visible: bool | None = None
   system_prompt: str | None = Field(default=None, max_length=20000)
   model: str | None = Field(default=None, max_length=256)
   effort: schemas.AgentEffort | None = None
   provider: str | None = None
   scope: str | None = Field(default=None, max_length=_CHAT_SCOPE_MAX)
   scope_label: str | None = Field(default=None, max_length=_CHAT_SCOPE_LABEL_MAX)
+
+  @field_validator("title")
+  @classmethod
+  def _validate_title(cls, value: str | None) -> str | None:
+    return _clean_app_chat_text(value, 500, "title")
 
   @field_validator("scope")
   @classmethod
@@ -3264,6 +3478,10 @@ def _app_chat_summary(chat: models.Chat, usage: dict) -> dict:
   return {
     "id": chat.id,
     "title": chat.title,
+    "title_locked": bool(chat.title_locked),
+    "owner_visible": bool(
+      _coerce_agent_settings(chat.agent_settings_json).get("owner_visible"),
+    ),
     "created_by_app_id": chat.created_by_app_id,
     "created_at": chat.created_at.isoformat() if chat.created_at else None,
     "updated_at": chat.updated_at.isoformat() if chat.updated_at else None,
@@ -3271,6 +3489,9 @@ def _app_chat_summary(chat: models.Chat, usage: dict) -> dict:
     "has_messages": bool(chat.has_messages),
     # A saved owner-input card is waiting: the app can show that its chat
     # needs the owner without reading the transcript.
+    # Identity lets companions replace stale status controls; it exposes no
+    # card contents or answers and grants no additional card access.
+    "pending_question_id": chat.pending_question_id,
     "awaiting_owner": bool(chat.pending_question_id),
     # An agent turn is live now; an app shows this rather than guessing.
     "running": is_chat_running(chat.id),
@@ -3288,11 +3509,9 @@ def _app_chat_started(chat: models.Chat, db: Session) -> bool:
   goal = presented_goal(db, chat.id)
   return bool(
     chat.has_messages
-    or chat.pending_messages
     or chat.pending_question_id
     or chat.session_id
-    or is_chat_running(chat.id)
-    or has_nonterminal_run(db, chat.id)
+    or is_chat_busy(db, chat)
     or (goal and goal.get("status") in {"active", "paused", "completed", "cannot_complete", "cancelled"})
   )
 
@@ -3597,6 +3816,9 @@ async def patch_app_chat(
 ):
   """Updates runtime metadata for a chat owned by the calling app.
 
+  A nonblank title locks the chosen name; owner_visible controls drawer
+  visibility without changing app ownership. Null fields leave state unchanged.
+
   An embedded app may configure its custom base prompt while the chat is still
   empty. Once the first turn starts, the complete platform + installed-app prompt
   is immutable for that chat; changing it requires a new chat.
@@ -3610,6 +3832,8 @@ async def patch_app_chat(
 
   async with get_transition_lock(chat_id):
     chat = get_active_chat_for_principal(db, chat_id, principal)
+    previous_title = chat.title
+    previously_visible = visible_in_owner_drawer(chat)
     if body.system_prompt is not None:
       if (
         chat.system_prompt_snapshot_id
@@ -3649,11 +3873,9 @@ async def patch_app_chat(
         # the creating app may still correct an empty chat's provider before
         # its first turn. Once work starts, the lifecycle gate below pins it.
         if (
-          is_chat_running(chat_id)
-          or chat.pending_messages
-          or chat.has_messages
+          chat.has_messages
           or chat.session_id
-          or has_nonterminal_run(db, chat_id)
+          or is_chat_busy(db, chat)
         ):
           raise HTTPException(
             status_code=409,
@@ -3676,6 +3898,10 @@ async def patch_app_chat(
         body = body.model_copy(update={"model": selection["model"]})
         chat.provider = body.provider
         chat.session_id = None
+    if body.title is not None:
+      # An explicit app rename has the same title lock as an app-named chat.
+      chat.title = body.title
+      chat.title_locked = True
     _merge_app_chat_settings(
       chat,
       system_prompt=body.system_prompt,
@@ -3683,10 +3909,18 @@ async def patch_app_chat(
       effort=body.effort,
       scope=body.scope,
       scope_label=body.scope_label,
+      owner_visible=body.owner_visible,
     )
     chat.updated_at = datetime.now(UTC)
     db.commit()
     db.refresh(chat)
+    # Publish only committed presentation changes, never inferred run/card state.
+    if chat.title != previous_title:
+      get_system_broadcast().publish(renamed_event(chat))
+    if visible_in_owner_drawer(chat) != previously_visible:
+      get_system_broadcast().publish({
+        "type": "chat_visibility_changed", "chatId": str(chat.id),
+      })
     return {
       "ok": True,
       "id": chat.id,

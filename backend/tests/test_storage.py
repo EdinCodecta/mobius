@@ -1,9 +1,12 @@
 """Storage API: tests for both envelope and inner-object PUT forms."""
 
+import asyncio
+import gc
 import hashlib
 import json
 from pathlib import Path
 import subprocess
+import tracemalloc
 
 import pytest
 
@@ -125,6 +128,23 @@ def test_put_binary_accepts_raw_bytes(client, auth, owner_token):
 
   r = client.get(f"/api/storage/apps/{app_id}/blob.bin", headers=auth)
   assert r.content == data
+
+
+def test_put_binary_accepts_fragmented_stream(client, auth, owner_token):
+  """The shared body reader keeps streamed storage bytes in order."""
+  app_id = _make_app(client, owner_token)
+  chunks = [b"\x00a", b"", b"\xff", b"tail"]
+  response = client.put(
+    f"/api/storage/apps/{app_id}/fragmented.bin",
+    content=iter(chunks),
+    headers={**auth, "Content-Type": "application/octet-stream"},
+  )
+  assert response.status_code == 204, response.text
+  stored = client.get(
+    f"/api/storage/apps/{app_id}/fragmented.bin", headers=auth,
+  )
+  assert stored.status_code == 200
+  assert stored.content == b"".join(chunks)
 
 
 def test_put_text_rejects_inner_object(client, auth, owner_token):
@@ -654,6 +674,237 @@ async def test_read_capped_body_rejects_oversize():
   with pytest.raises(HTTPException) as exc:
     await read_capped_body(req, cap=16)
   assert exc.value.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_fresh_single_byte_fragments_use_bounded_memory():
+  """Retaining every fresh fragment used ~129 MiB for a 1 MiB upload."""
+  from starlette.requests import Request
+  from app.storage_io import read_capped_body
+
+  size = 1024 * 1024
+  received = 0
+
+  async def receive():
+    nonlocal received
+    received += 1
+    # bytes(bytearray(...)) allocates a fresh source bytes object each time.
+    # Measuring inside receive includes that source allocation in the peak.
+    return {
+      "type": "http.request",
+      "body": bytes(bytearray(b"x")) if received <= size else b"",
+      "more_body": received <= size,
+    }
+
+  assert bytes(bytearray(b"x")) is not bytes(bytearray(b"x"))
+  request = Request({"type": "http", "headers": []}, receive)
+  gc.collect()
+  tracemalloc.start()
+  try:
+    body = await read_capped_body(request, cap=size)
+    _current, peak = tracemalloc.get_traced_memory()
+  finally:
+    tracemalloc.stop()
+  assert body == b"x" * size
+  assert received == size + 1
+  assert peak < 8 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_rejects_declared_oversize_without_receiving():
+  from fastapi import HTTPException
+  from starlette.requests import Request
+  from app.storage_io import read_capped_body
+
+  async def receive():
+    pytest.fail("oversize Content-Length must reject before receive")
+
+  request = Request(
+    {"type": "http", "headers": [(b"content-length", b"5")]}, receive,
+  )
+  with pytest.raises(HTTPException) as error:
+    await read_capped_body(request, cap=4, too_large="custom limit")
+  assert error.value.status_code == 413
+  assert error.value.detail == "custom limit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared", [b"bogus", b"1", b"4"])
+async def test_read_capped_body_checks_actual_stream_even_with_bad_length(declared):
+  from fastapi import HTTPException
+  from starlette.requests import Request
+  from app.storage_io import read_capped_body
+
+  messages = iter([
+    {"type": "http.request", "body": b"ab", "more_body": True},
+    {"type": "http.request", "body": b"cde", "more_body": False},
+  ])
+
+  async def receive():
+    return next(messages)
+
+  request = Request(
+    {"type": "http", "headers": [(b"content-length", declared)]},
+    receive,
+  )
+  with pytest.raises(HTTPException) as error:
+    await read_capped_body(request, cap=4)
+  assert error.value.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_accepts_exact_cap_despite_lying_length():
+  from starlette.requests import Request
+  from app.storage_io import read_capped_body
+
+  messages = iter([
+    {"type": "http.request", "body": b"ab", "more_body": True},
+    {"type": "http.request", "body": b"cd", "more_body": False},
+  ])
+
+  async def receive():
+    return next(messages)
+
+  request = Request(
+    {"type": "http", "headers": [(b"content-length", b"1")]}, receive,
+  )
+  assert await read_capped_body(request, cap=4) == b"abcd"
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_propagates_disconnect_and_cancellation():
+  from starlette.requests import ClientDisconnect, Request
+  from app.storage_io import read_capped_body
+
+  async def disconnected():
+    return {"type": "http.disconnect"}
+
+  request = Request({"type": "http", "headers": []}, disconnected)
+  with pytest.raises(ClientDisconnect):
+    await read_capped_body(request, cap=4)
+
+  async def cancelled():
+    raise asyncio.CancelledError()
+
+  request = Request({"type": "http", "headers": []}, cancelled)
+  with pytest.raises(asyncio.CancelledError):
+    await read_capped_body(request, cap=4)
+
+
+@pytest.fixture
+def body_copies(monkeypatch):
+  """Record read_capped_body's buffer growth and final copy, in order."""
+  from app import storage_io
+
+  events = []
+
+  class Buffer(bytearray):
+    def extend(self, chunk):
+      events.append(("extend", len(self) + len(chunk)))
+      super().extend(chunk)
+
+    def __bytes__(self):
+      events.append(("copy", len(self)))
+      return bytes(memoryview(self))
+
+  monkeypatch.setattr(storage_io, "bytearray", Buffer, raising=False)
+  return events
+
+
+def _streamed_request(chunks, headers=()):
+  from starlette.requests import Request
+
+  messages = iter([
+    {"type": "http.request", "body": chunk, "more_body": index < len(chunks) - 1}
+    for index, chunk in enumerate(chunks)
+  ])
+
+  async def receive():
+    return next(messages)
+
+  return Request({"type": "http", "headers": list(headers)}, receive)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [
+  [], [(b"content-length", b"1")], [(b"content-length", b"6")],
+  [(b"transfer-encoding", b"chunked")],
+], ids=["no-length", "understated", "overstated", "chunked"])
+async def test_read_capped_body_admits_received_growth_before_each_buffer_copy(
+  body_copies, headers,
+):
+  from app.storage_io import read_capped_body
+
+  def admit(size):
+    body_copies.append(("admit", size))
+
+  request = _streamed_request([b"ab", b"", b"cde"], headers)
+  assert await read_capped_body(request, cap=8, admit_growth=admit) == b"abcde"
+  # Charged from bytes actually received, never from the length header; the
+  # final copy follows a charge that already covers it.
+  assert body_copies == [
+    ("admit", 2), ("extend", 2), ("admit", 5), ("extend", 5), ("copy", 5),
+  ]
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_refused_growth_buffers_nothing_more(body_copies):
+  from fastapi import HTTPException
+  from app.storage_io import read_capped_body
+
+  def admit(size):
+    if size > 2:
+      raise HTTPException(413, "budget")
+
+  request = _streamed_request([b"ab", b"cde"])
+  with pytest.raises(HTTPException) as refused:
+    await read_capped_body(request, cap=8, admit_growth=admit)
+  assert refused.value.detail == "budget"
+  assert body_copies == [("extend", 2)]
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_byte_cap_precedes_growth_admission(body_copies):
+  from fastapi import HTTPException
+  from app.storage_io import read_capped_body
+
+  admitted = []
+  request = _streamed_request([b"ab", b"cde"])
+  with pytest.raises(HTTPException) as refused:
+    await read_capped_body(request, cap=4, too_large="cap", admit_growth=admitted.append)
+  assert refused.value.detail == "cap"
+  assert admitted == [2] and body_copies == [("extend", 2)]
+
+  async def never():
+    pytest.fail("declared oversize must reject before receive")
+
+  from starlette.requests import Request
+  declared = Request({"type": "http", "headers": [(b"content-length", b"5")]}, never)
+  with pytest.raises(HTTPException):
+    await read_capped_body(declared, cap=4, admit_growth=admitted.append)
+  assert admitted == [2]
+
+
+@pytest.mark.asyncio
+async def test_read_capped_body_missing_length_http2_body_is_not_bodyless():
+  from starlette.requests import Request
+  from app.storage_io import read_capped_body
+
+  sent = []
+
+  async def receive():
+    if not sent:
+      sent.append(True)
+      return {"type": "http.request", "body": b'{"x":1}', "more_body": False}
+    return {"type": "http.disconnect"}
+
+  admitted = []
+  request = Request({
+    "type": "http", "method": "POST", "path": "/echo", "headers": [],
+    "query_string": b"", "http_version": "2",
+  }, receive)
+  assert await read_capped_body(request, 1024, admit_growth=admitted.append) == b'{"x":1}'
+  assert admitted == [7]
 
 
 def test_large_text_read_roundtrips(client, auth, owner_token):
@@ -1925,3 +2176,103 @@ def test_overlong_path_name_is_rejected_without_creating_folders(
   assert r.status_code == 400
   listing = client.get(f"/api/storage/apps-list/{app_id}/", headers=auth).json()
   assert [entry["name"] for entry in listing["entries"]] == []
+
+
+@pytest.mark.parametrize("raw", [
+  b'{"value":NaN}', b'{"value":Infinity}', b'{"value":-Infinity}',
+  b'{"value":1e309}', b'{"value":"\\ud800"}',
+])
+def test_content_listing_isolates_json_that_cannot_be_emitted_as_utf8(
+  client, auth, owner_token, raw,
+):
+  app_id = _make_app(client, owner_token)
+  root = Path(get_settings().data_dir) / "apps" / str(app_id) / "records"
+  root.mkdir(parents=True)
+  (root / "a-invalid.json").write_bytes(raw)
+  (root / "b-healthy.json").write_text('{"value":"healthy"}')
+  (root / "c-next.json").write_text('{"value":"next"}')
+
+  url = f"/api/storage/apps-list/{app_id}/records?include_content=true&limit=2"
+  response = client.get(url, headers=auth)
+  assert response.status_code == 200
+  page = response.json()
+  assert [entry["name"] for entry in page["entries"]] == [
+    "a-invalid.json", "b-healthy.json",
+  ]
+  assert "content" not in page["entries"][0]
+  assert page["entries"][1]["content"] == {"value": "healthy"}
+  assert page["next_cursor"]
+  remaining = client.get(
+    url + "&cursor=" + page["next_cursor"], headers=auth,
+  ).json()
+  assert remaining["entries"][0]["content"] == {"value": "next"}
+  assert remaining["next_cursor"] is None
+
+
+def test_inline_storage_read_version_belongs_to_returned_bytes(
+  client, auth, owner_token, monkeypatch,
+):
+  app_id = _make_app(client, owner_token)
+  url = f"/api/storage/apps/{app_id}/race.json"
+  assert client.put(url, json={"value": "original"}, headers=auth).status_code == 204
+  target = Path(get_settings().data_dir) / "apps" / str(app_id) / "race.json"
+  original_token = storage_routes.file_version_token(target)
+  serve = storage_routes._serve_file
+
+  def serve_then_replace(*args, **kwargs):
+    response = serve(*args, **kwargs)
+    storage_routes.atomic_write(target, '{"value":"concurrent"}')
+    return response
+
+  monkeypatch.setattr(storage_routes, "_serve_file", serve_then_replace)
+  response = client.get(url, headers=auth)
+  assert response.status_code == 200
+  assert response.json() == {"value": "original"}
+  assert response.headers["etag"] == original_token
+  stale_save = client.put(
+    url, json={"value": "stale edit"},
+    headers={**auth, "If-Match": response.headers["etag"]},
+  )
+  assert stale_save.status_code == 412
+  assert json.loads(target.read_text()) == {"value": "concurrent"}
+
+
+@pytest.mark.parametrize("range_header", [None, "bytes=0-3", "bytes=0-1,4-5"])
+def test_streamed_storage_read_pins_version_through_replacement(
+  client, auth, owner_token, monkeypatch, range_header,
+):
+  from starlette.responses import FileResponse
+
+  app_id = _make_app(client, owner_token)
+  url = f"/api/storage/apps/{app_id}/race.bin"
+  original = b"original binary data"
+  assert client.put(
+    url, content=original,
+    headers={**auth, "Content-Type": "application/octet-stream"},
+  ).status_code == 204
+  target = Path(get_settings().data_dir) / "apps" / str(app_id) / "race.bin"
+  original_token = storage_routes.file_version_token(target)
+  serve = FileResponse.__call__
+
+  async def replace_before_streaming(response, scope, receive, send):
+    storage_routes.atomic_write(target, b"concurrent binary data")
+    await serve(response, scope, receive, send)
+
+  monkeypatch.setattr(FileResponse, "__call__", replace_before_streaming)
+  response = client.get(
+    url, headers={**auth, **({"Range": range_header} if range_header else {})},
+  )
+  assert response.headers["etag"] == original_token
+  if range_header is None:
+    assert response.status_code == 200
+    assert response.content == original
+  elif "," not in range_header:
+    assert response.status_code == 206
+    assert response.content == original[:4]
+    assert response.headers["content-range"] == f"bytes 0-3/{len(original)}"
+  else:
+    assert response.status_code == 206
+    assert b"\r\nor\r\n" in response.content
+    assert b"\r\nin\r\n" in response.content
+  assert int(response.headers["content-length"]) == len(response.content)
+  assert target.read_bytes() == b"concurrent binary data"

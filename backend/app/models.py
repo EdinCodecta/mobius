@@ -13,8 +13,10 @@ you'd otherwise add a column for, use per-app storage at
 separate encrypted app-secrets API.
 """
 
+import logging
 import secrets
 import json
+import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import (
@@ -22,9 +24,10 @@ from sqlalchemy import (
   Index, LargeBinary, String, Text, UniqueConstraint, event, false, or_, text,
   true,
 )
+from sqlalchemy import inspect as sa_inspect
 
 from sqlalchemy.types import TypeDecorator
-from sqlalchemy.orm import column_property, deferred, relationship, validates
+from sqlalchemy.orm import column_property, deferred, relationship
 
 from app.database import Base
 from app.shell_install_pass import ShellInstallPassGrant
@@ -34,6 +37,8 @@ from app.tool_output_storage import CompressedToolOutputText
 
 CONTINUATION_RUN_STATUSES = ("parked", "resume_pending")
 NONTERMINAL_RUN_STATUSES = ("running", *CONTINUATION_RUN_STATUSES)
+# Parks that wait for this installation's own memory or storage headroom.
+RESOURCE_PARK_REASONS = frozenset({"memory", "storage"})
 
 
 class Owner(Base):
@@ -178,6 +183,17 @@ class ChatLiveAssistant(Base):
     String(64), ForeignKey("chats.id", ondelete="CASCADE"), primary_key=True,
   )
   snapshot = Column(JSON, nullable=True)
+
+
+class ChatCompactionDraft(Base):
+  """Source-bound manual compaction progress, never an automatic work queue."""
+
+  __tablename__ = "chat_compaction_drafts"
+  id = Column(String(64), primary_key=True)
+  chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
+  state = Column(JSON, nullable=False)
+  created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
+  updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
 
 
 class Chat(Base):
@@ -356,6 +372,7 @@ class ChatGoal(Base):
   checkpoint = Column(Text, nullable=True)
   next_action = Column(Text, nullable=True)
   result = Column(Text, nullable=True)
+  completion_run_id = Column(String(64), nullable=True, index=True)
   created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(UTC))
   completed_at = Column(DateTime, nullable=True)
 
@@ -404,6 +421,14 @@ class ChatRun(Base):
   # ambiguous even with no transcript output. NULL preserves that ambiguity
   # for pre-admission-ledger runs upgraded from an older backend.
   provider_execution_admitted = Column(Boolean, nullable=True, default=False)
+  # The exact ordinary Wait result set verified at provider entry. Success
+  # cannot receipt a result that fired after this immutable prompt snapshot.
+  admitted_wait_results_json = Column(JSON, nullable=True, default=None)
+  # Exact dependency results admitted to this physical provider run.
+  admitted_dependency_results_json = Column(JSON, nullable=True, default=None)
+  # Proof that an owner send, rather than crash recovery, displaced this
+  # never-entered Wait carrier. Its exact Goal can safely retry once.
+  owner_superseded_by_run_id = Column(String(64), nullable=True, default=None)
   # Browser initiator, retained across physical recovery and delegation. NULL
   # means an ordinary local/owner run, never an implicit shared grant.
   # Upgraded databases may also keep a retired, unused browser_grant_epoch.
@@ -446,12 +471,8 @@ class ChatRun(Base):
   # question checkpoint. Explicit /goal starts mint a new identity; genuine
   # continuations inherit it.
   goal_id = Column(String(64), nullable=True, index=True, default=None)
-  # Frozen pre-0059 snapshots retained for upgrade/backup history only.
-  # Runtime plans and outcomes live solely on ChatGoal.
-  goal_plan_json = Column(JSON, nullable=True, default=None)
-  goal_plan_revision = Column(
-    Integer, nullable=False, default=0, server_default="0"
-  )
+  # Historical plan columns remain in existing databases, but have no runtime
+  # mapping: plans and outcomes live solely on ChatGoal.
   # App that initiated this turn under the app-attributed-chat contract
   # (077 §1). NULL = an ordinary owner-driven turn. Reserved now so the
   # attribution lands on the run row, not retrofitted later.
@@ -491,6 +512,11 @@ class ChatRun(Base):
   # non-parked run and on rows created before this column existed.
   parked_until = Column(DateTime, nullable=True, default=None)
   park_reason = Column(String(32), nullable=True, default=None)
+  # Why an "interrupted" run ended (RUN_END_REASONS below). Observational
+  # only: no lifecycle decision reads it, so it can explain a run without
+  # changing what "interrupted" means to Goals, Waits or question parking.
+  # NULL on other statuses and on rows interrupted before 0098_run_end_reason.
+  end_reason = Column(String(32), nullable=True, default=None)
   # One-shot platform-authored intent identity for a planned restart. It only
   # authorizes replay when the frozen supervisor's root-owned boot ledger binds
   # the same nonce + exact run id to the current boot.
@@ -525,16 +551,18 @@ class Delegation(Base):
   physical execution state remains authoritative in ``ChatRun``. This row
   stores the immutable intent/policy needed to attach retries, constrain the
   SDK runner, and relate the child back to its parent logical run. Ordinary
-  status is derived from the child run; source-attached work adds only the
-  narrow pre-run accepted/needs-review state needed for deferred startup.
+  status is derived from the child run; retired source-attached work rows
+  keep only their stored pre-run outcome.
   """
 
   __tablename__ = "delegations"
   __table_args__ = (
-    UniqueConstraint(
-      "parent_root_run_id", "task_key",
-      name="uq_delegations_parent_root_task",
-    ),
+    Index("uq_delegations_goal_root_task", "parent_root_run_id", "goal_id",
+          "task_key", unique=True, sqlite_where=text("goal_id IS NOT NULL"),
+          postgresql_where=text("goal_id IS NOT NULL")),
+    Index("uq_delegations_no_goal_root_task", "parent_root_run_id",
+          "task_key", unique=True, sqlite_where=text("goal_id IS NULL"),
+          postgresql_where=text("goal_id IS NULL")),
   )
 
   id = Column(String(64), primary_key=True)
@@ -548,6 +576,9 @@ class Delegation(Base):
   # audit history can outlive an unusual run-row repair without orphaning the
   # child chat or weakening the idempotency key.
   parent_root_run_id = Column(String(64), nullable=False, index=True)
+  # Immutable ownership snapshot at spawn; nested helpers inherit this ID.
+  # NULL legacy ambiguity must never attach to a later Goal.
+  goal_id = Column(String(64), nullable=True, index=True)
   # Snapshot the spawning physical run's browser initiator. A logical Goal can
   # span later physical turns with different human participants.
   # Upgraded databases may also keep a retired, unused browser_grant_epoch.
@@ -595,27 +626,50 @@ class Delegation(Base):
   # (The retired parent_woken_at/result_incorporated_at timestamp columns stay
   # in the table unmapped because a baked fallback platform may still map them.)
   incorporated_run_id = Column(String(64), nullable=True, default=None)
-  # A source-attached job (currently contribution preparation) belongs to the
-  # owner-facing source chat without fabricating a ChatRun there. The stable
-  # work id makes retries attach; the explicit intent supports a small durable
-  # projection without parsing task keys. ``source_work_active_chat_id`` is a
-  # nullable unique lease: terminal reconciliation clears it, so at most one
-  # source-attached worker can reserve a chat across concurrent requests.
+  # Retired: source-attached contribution preparation jobs, started from the
+  # chat Changes panel, belonged to the source chat without a ChatRun there.
+  # Nothing creates them any more; the columns stay mapped so stored history
+  # keeps its status projection, stays out of generic startup and parent-wake
+  # paths, and still names its project roots for source-chat discovery.
   source_work_id = Column(String(64), nullable=True, unique=True, index=True)
   source_work_intent = Column(String(32), nullable=True, default=None)
   source_work_context_app_id = Column(
     Integer, ForeignKey("apps.id"), nullable=True, index=True
   )
-  # Source work can be accepted while its owner chat is still changing. This
-  # compact server-derived envelope is revalidated once the source settles;
-  # only the pre-start ``accepted``/``retrying``/``needs_review`` override
-  # lives here.
   source_work_envelope = Column(JSON, nullable=True, default=None)
   source_work_status = Column(String(32), nullable=True, default=None)
   source_work_result = Column(Text, nullable=True, default=None)
   source_work_active_chat_id = Column(
     String(64), nullable=True, unique=True, index=True
   )
+
+
+class DelegationQuestion(Base):
+  """One helper's correlated question to its parent; immutable after insert.
+
+  A physical child run may ask at most once (``asking_run_id`` is unique), so
+  a retried ask returns this same receipt. ``answer_run_id`` is reserved up
+  front: the parent's answer starts exactly that deterministic continuation
+  run, so the run's existence is the durable proof the question was answered
+  and a retried answer can only attach to it. Whether the question is still
+  open is derived from the child's runs (see ``delegations.open_question``),
+  never stored. Rows reference their Delegation by value, like
+  ``Delegation.parent_root_run_id``, so a fallback platform that does not map
+  this table can still purge delegations.
+  """
+
+  __tablename__ = "delegation_questions"
+
+  id = Column(String(64), primary_key=True)
+  delegation_id = Column(String(64), nullable=False, index=True)
+  child_chat_id = Column(String(64), nullable=False)
+  # Logical root of the asking run; restart continuations keep it.
+  root_run_id = Column(String(64), nullable=False)
+  asking_run_id = Column(String(64), nullable=False, unique=True)
+  answer_run_id = Column(String(64), nullable=False, unique=True)
+  question = Column(Text, nullable=False)
+  options_json = Column(JSON, nullable=False, default=list)
+  created_at = Column(DateTime, nullable=False, default=lambda: now_naive_utc())
 
 
 class ChatWait(Base):
@@ -683,10 +737,13 @@ class ChatWait(Base):
   last_checked_at = Column(DateTime, nullable=True, default=None)
   met_at = Column(DateTime, nullable=True, default=None)
   cancelled_at = Column(DateTime, nullable=True, default=None)
-  # Retry latch for the resume, stamped after the wake turn starts or queues.
-  # At-least-once across a crash between transactions, matching delegations:
-  # a redelivered result beats a silently lost one.
+  # Ordinary results are acknowledged only by a successful exact-Goal run.
+  # Activation retains its separate scheduling receipt. Old ambiguous latches
+  # are preserved as legacy_consumed, never invented provider receipts.
   resume_delivered_at = Column(DateTime, nullable=True, default=None)
+  result_disposition = Column(String(32), nullable=True, default=None)
+  result_disposed_at = Column(DateTime, nullable=True, default=None)
+  received_run_id = Column(String(64), nullable=True, default=None)
   created_at = Column(DateTime, nullable=False, default=lambda: now_naive_utc())
 
 
@@ -883,6 +940,37 @@ def _append_agent_lifecycle_run_tombstone(_mapper, connection, run) -> None:
   ))
 
 
+# Every way a run can end as "interrupted". Keep this the single vocabulary so
+# a report can group by it.
+RUN_END_REASONS = frozenset((
+  "owner_input",          # turn ended to wait on a saved owner card
+  "activation",           # turn ended for an approved restart/activation
+  "restart_drain",        # a planned restart drained the live turn
+  "server_restart",       # the server stopped mid-turn (found on boot)
+  "superseded",           # a new turn started while this row was still open
+  "provider_switch",      # a provider handoff retired the run
+  "dependency_withdrawn", # its Goal dependency result was withdrawn
+  "chat_deleted",         # the chat was deleted mid-turn
+  "recovered",            # the turn wedged and was closed by recovery
+))
+
+
+def _warn_unexplained_interruption(_mapper, _connection, run) -> None:
+  """Make a new interrupted path that forgot its reason visible in the log.
+
+  Only the transition counts: rows interrupted before end_reason existed stay
+  NULL and may still be updated for unrelated reasons without a warning.
+  """
+  if run.status != "interrupted" or run.end_reason in RUN_END_REASONS:
+    return
+  if sa_inspect(run).attrs.status.history.has_changes():
+    logging.getLogger(__name__).warning(
+      "run %s interrupted without a known end_reason (%r)", run.id, run.end_reason,
+    )
+
+
+event.listen(ChatRun, "before_insert", _warn_unexplained_interruption)
+event.listen(ChatRun, "before_update", _warn_unexplained_interruption)
 event.listen(ChatRun, "after_insert", _append_agent_lifecycle_run_update)
 event.listen(ChatRun, "after_update", _append_agent_lifecycle_run_update)
 event.listen(ChatRun, "before_delete", _append_agent_lifecycle_run_tombstone)
@@ -1238,6 +1326,10 @@ class App(Base):
   # Server-derived, versioned capability contract reviewed at install time.
   # Null is a legitimate legacy state for apps installed before contracts.
   capability_contract = Column(JSON, nullable=True, default=None)
+  # What the owner accepted at first open (app_consent.py): the accepted rows
+  # plus who/when/how. Null means not yet accepted. Only Store-installed apps
+  # are gated on it; the rest keep their present behaviour.
+  accepted_consent = Column(JSON, nullable=True, default=None)
   # First-class project types contributed by this installed app. The installer
   # stores the validated manifest declaration verbatim enough for project
   # creation to snapshot it; existing projects never read this live value.
@@ -1555,6 +1647,10 @@ class AgentWorkClaim(Base):
   )
 
   id = Column(String(64), primary_key=True)
+  # Stable through transfer, new on reacquisition. Revision is ownership state,
+  # not acquisition identity.
+  acquisition_id = Column(String(64), nullable=True, index=True,
+                          default=lambda: uuid.uuid4().hex)
   owner_id = Column(Integer, ForeignKey("owner.id", ondelete="CASCADE"),
                     nullable=False, index=True)
   work_key = Column(String(256), nullable=False)
@@ -1571,6 +1667,7 @@ class AgentWorkClaim(Base):
   notification_revision = Column(
     Integer, nullable=False, default=1, server_default="1"
   )
+  transfer_notice_revision = Column(Integer, nullable=True)
   claimed_at = Column(DateTime, nullable=False, default=now_naive_utc)
   updated_at = Column(DateTime, nullable=False, default=now_naive_utc)
   released_at = Column(DateTime, nullable=True)
@@ -1579,7 +1676,7 @@ class AgentWorkClaim(Base):
 
 
 class AgentWorkInterest(Base):
-  """A Goal following work that another chat currently owns."""
+  """Non-waking audit history of the retired chat-wide claim follow."""
 
   __tablename__ = "agent_work_interests"
   __table_args__ = (
@@ -1600,6 +1697,63 @@ class AgentWorkInterest(Base):
   goal_id = Column(String(64), nullable=False, index=True)
   created_at = Column(DateTime, nullable=False, default=now_naive_utc)
   resolved_at = Column(DateTime, nullable=True)
+
+
+class SavedDecisionCard(Base):
+  """Safe identity and disposition of one saved Q&A/approval, never secrets.
+
+  Source retention removes this row; subscribed outcomes survive independently.
+  """
+  __tablename__ = "saved_decision_cards"
+  chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), primary_key=True)
+  question_id = Column(String(64), primary_key=True)
+  source_goal_id = Column(String(64), nullable=True)
+  family = Column(String(16), nullable=False)
+  summary = Column(Text, nullable=False)
+  outcome_json = Column(JSON, nullable=True)
+  resolved_at = Column(DateTime, nullable=True)
+
+
+class GoalDependency(Base):
+  """One Goal's durable subscription to an exact external acquisition/card.
+
+  Legacy interests remain only in AgentWorkInterest as non-waking history.
+  """
+
+  __tablename__ = "goal_dependencies"
+  __table_args__ = (
+    UniqueConstraint("waiting_goal_id", "target_key", name="uq_goal_dependency_target"),
+    Index("ix_goal_dependencies_owed", "waiting_goal_id", "resolved_at", "result_disposition"),
+    Index("ix_goal_dependencies_source", "target_kind", "target_acquisition_id", "resolved_at"),
+    Index("uq_goal_dependencies_live_claim_acquisition", "waiting_goal_id",
+          "target_acquisition_id", unique=True,
+          sqlite_where=text("target_kind = 'claim_acquisition' AND result_disposition IS NULL AND withdrawn_at IS NULL"),
+          postgresql_where=text("target_kind = 'claim_acquisition' AND result_disposition IS NULL AND withdrawn_at IS NULL")),
+  )
+
+  id = Column(String(64), primary_key=True)
+  waiting_goal_id = Column(String(64), nullable=False, index=True)
+  waiting_chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
+  created_by_run_id = Column(String(64), nullable=True)
+  # Unused, but still mapped: create_all runs before migrations, so dropping
+  # it would build new goal_dependencies tables without the column and a
+  # rolled-back previous release (which maps it) would report a schema gap.
+  task_id = Column(String(64), nullable=True)
+  target_kind = Column(String(32), nullable=False)
+  target_key = Column(String(160), nullable=False)
+  target_claim_id = Column(String(64), nullable=True, index=True)
+  target_acquisition_id = Column(String(64), nullable=True)
+  target_chat_id = Column(String(64), nullable=True)
+  target_question_id = Column(String(64), nullable=True)
+  outcome_json = Column(JSON, nullable=True)
+  resolved_at = Column(DateTime, nullable=True)
+  result_disposition = Column(String(32), nullable=True)
+  result_disposed_at = Column(DateTime, nullable=True)
+  received_run_id = Column(String(64), nullable=True)
+  withdrawn_at = Column(DateTime, nullable=True)
+  # Temporary self-follow suppression on transfer, never a user withdrawal.
+  owner_suppressed_at = Column(DateTime, nullable=True)
+  created_at = Column(DateTime, nullable=False, default=now_naive_utc)
 
 
 class ProjectPresence(Base):
@@ -1757,6 +1911,31 @@ class PushSubscription(Base):
   p256dh = Column(Text, nullable=False)
   auth = Column(Text, nullable=False)
   created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+
+
+class PushDevice(Base):
+  """A phone running the Möbius mobile app that receives native push.
+
+  The shell registers the FCM token from ``MobiusNative.registerPush()``
+  through ``PUT /api/push/devices`` on every load. Like a ``PushSubscription``,
+  a device receives every owner notification. Delivery goes through the
+  mobius.you push relay (``app.push_relay``), so this installation holds no
+  FCM credential. A token the relay reports invalid is deleted.
+
+  This is a new table, so ``create_all`` adds it to existing installations.
+  """
+
+  __tablename__ = "push_devices"
+
+  id = Column(String(64), primary_key=True)
+  owner_id = Column(
+    Integer, ForeignKey("owner.id", ondelete="CASCADE"), nullable=False,
+    index=True,
+  )
+  token = Column(Text, nullable=False, unique=True)
+  # Changes on every registration, so cleanup after a send can tell whether
+  # the phone registered again while that send was in flight.
+  registered_at = Column(DateTime, nullable=False, default=now_naive_utc)
 
 
 class Notification(Base):
@@ -2068,6 +2247,8 @@ class ContributionAutopilot(Base):
     String(64), ForeignKey("chats.id"), nullable=True, default=None
   )
   rounds_used = Column(Integer, nullable=False, default=0)
+  # Retired: follow-up has no round budget. Kept only because existing
+  # databases declare it NOT NULL; nothing reads it.
   max_rounds = Column(Integer, nullable=False, default=5)
   # Consecutive non-productive rounds (stale/failed); 2 in a row auto-escalates.
   consecutive_failures = Column(Integer, nullable=False, default=0)
@@ -2091,18 +2272,27 @@ class ContributionReviewRun(Base):
   """
   __tablename__ = "contribution_review_runs"
   id = Column(String(64), primary_key=True)
-  app_id = Column(Integer, ForeignKey("apps.id"), nullable=False, index=True)
+  app_id = Column(Integer, ForeignKey("apps.id"), nullable=True, index=True)
   owner_id = Column(Integer, ForeignKey("owner.id"), nullable=False)
   request_id = Column(String(64), nullable=False)
   mode = Column(String(24), nullable=False)
   github_actor_id = Column(String(64), nullable=False)
-  app_nonce = Column(String(64), nullable=False)
+  app_nonce = Column(String(64), nullable=True)
+  options_json = Column(JSON, nullable=True)
   targets_json = Column(JSON, nullable=False)
   outcomes_json = Column(JSON, nullable=False, default=dict)
   chat_id = Column(String(64), ForeignKey("chats.id"), nullable=False)
   revision = Column(Integer, nullable=False, default=0)
   created_at = Column(DateTime, default=lambda: now_naive_utc())
-  __table_args__ = (UniqueConstraint("app_id", "request_id"),)
+  __table_args__ = (
+    UniqueConstraint("app_id", "request_id"),
+    Index(
+      "uq_contribution_review_runs_core_request",
+      "owner_id", "request_id", unique=True,
+      sqlite_where=text("app_id IS NULL"),
+      postgresql_where=text("app_id IS NULL"),
+    ),
+  )
 
 
 class ProjectSourceCopy(Base):

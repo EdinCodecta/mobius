@@ -214,12 +214,25 @@ const value = await store.get('state.json')       // parsed JSON or null
 await store.set('state.json', nextValue)          // value itself; no envelope
 ```
 
+**JSON documents go to keys ending `.json`** — the body IS the document, no
+envelope. Writing a JSON object to any other extension is rejected with a 400
+(text files take a raw `text/*` body or the `{"content": "..."}` envelope), so
+a wrong extension silently loses nothing only because the server refuses it:
+name the key `.json` from the start.
+
 Handle storage failure visibly and keep a usable in-memory fallback. Subscribe
-when an already-open app must repaint after agent or cross-frame writes:
+so the open app repaints after its own writes from other views:
 
 ```js
 const unsubscribe = store.subscribe('state.json', setValue)
 ```
+
+A subscription fires for this app's own `set`/`remove` and when its own queued
+writes sync — **not** for a write made outside the running app (an agent chat
+turn, a cron job). A view showing externally-written data must re-read with
+`get()` when it becomes visible, plus a modest interval while visible; the
+re-read also notifies subscribers when the server value changed (see
+`building-apps.md`).
 
 Do not probe guessed keys. If records are split across keys, keep an explicit
 index or use `store.list()` for best-known display. If behavior depends on
@@ -228,6 +241,11 @@ defaults, or deleting records—switch to `building-apps.md` and use
 `store.listWithStatus()`; `complete: false` means unavailable or partial, not
 empty. Do not use `localStorage`, IndexedDB, native `alert`/`confirm`/`prompt`,
 or owner credentials.
+
+Hidden apps stay loaded. Möbius pauses their sound and reports the page as
+hidden, but timers keep running: pause polling, animation, and game clocks
+while `window.mobius.visible` is false and resume them from
+`window.mobius.onVisibilityChange(cb)` (see `building-apps.md`).
 
 ### 5. Verify the rendered app without exploring the whole shell
 
@@ -288,6 +306,9 @@ Run validation once:
 ```bash
 python "$SCRIPTS_DIR/validate-app.py" /data/apps/<slug>
 ```
+
+`INCONCLUSIVE` (exit 3) or an apply `build_stalled` means the machine was too
+busy to finish the build, not a source error: retry later instead of editing.
 
 Do not run `git add` or `git commit`. `apply_app` owns every accepted source
 commit and leaves later edits as an unpublished draft until the next apply.

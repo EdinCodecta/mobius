@@ -116,9 +116,11 @@ test('an implicit home tab does not engage the single-pane tab strip', () => {
 })
 
 test('the canonical workspace snapshot survives a closed PWA relaunch', () => {
+  assert.match(shell, /const workspaceStorage = isSharedBrowserAccess \? sharedWorkspaceStorage : ownerStore\(\)/)
+  assert.match(shell, /const tabStorage = isSharedBrowserAccess \? sharedWorkspaceStorage : sessionStore\(\)/)
   assert.match(
     shell,
-    /useWorkspaceSession\(\{\s*storage: isSharedBrowserAccess \? sharedWorkspaceStorage : localStorage,\s*legacyStorage: sharedBrowserAccess \? null : sessionStorage,\s*\}\)/,
+    /useWorkspaceSession\(\{\s*storage: workspaceStorage,\s*legacyStorage: sharedBrowserAccess \? null : tabStorage,\s*\}\)/,
     'owner durability and one-time migration remain canonical; guest storage is separate',
   )
   assert.doesNotMatch(
@@ -201,13 +203,13 @@ test('genuine hidden failures have durable red drawer attention while restart pa
   assert.match(shell, /invalidateShellListCache\('chats'\)\.then\(refreshChats\)/)
   assert.match(shell, /api\.chats\.markFailureSeen/)
   assert.match(drawer, /needsOwnerInput[\s\S]*streaming[\s\S]*waiting[\s\S]*failed[\s\S]*building/)
-  assert.match(drawer, /className="drawer__failure-dot"/)
-  assert.match(drawer, /aria-label="Latest run failed"/)
+  assert.match(drawer, /<DrawerStatusMarker/)
+  // Accessible marker names and recovery/failure precedence are mounted in dependencyPresentation.test.js.
   const failureRule = drawerCss.match(/\.drawer__failure-dot\s*\{[\s\S]*?\}/)?.[0] || ''
   assert.match(failureRule, /border-radius:\s*50%/)
   assert.match(failureRule, /background:\s*var\(--danger\)/)
   assert.doesNotMatch(failureRule, /transform:/)
-  assert.match(drawer, /recovery \? \([\s\S]*?className="drawer__recovery-icon"/)
+  assert.match(drawer, /recoveryLabel, failed, building, attentionDot/)
   const recoveryRule = drawerCss.match(/\.drawer__recovery-icon\s*\{[\s\S]*?\}/)?.[0] || ''
   assert.match(recoveryRule, /border:/)
   assert.doesNotMatch(recoveryRule, /--danger/)
@@ -723,7 +725,7 @@ test('one held drawer-row gesture resolves menu, reorder, or workspace drag', ()
   assert.equal((paneStrip.match(/data-drag-key=\{dragKey\}/g) || []).length, 1,
     'the tab button is the one drag source')
   assert.match(drawerCss, /\.drawer__row \.drawer__item\[data-drag-key\]\s*\{[\s\S]*?touch-action:\s*pan-y pinch-zoom/)
-  assert.match(drawerCss, /\.drawer__row \.drawer__item\[data-pinned-key\]\s*\{[\s\S]*?touch-action:\s*pinch-zoom/)
+  assert.doesNotMatch(drawerCss, /\.drawer__row \.drawer__item\[data-pinned-key\]\s*\{[\s\S]*?touch-action:\s*pinch-zoom/)
   assert.match(dragBinding, /touchTabMoveIntent\(dx, dy\)/)
   assert.doesNotMatch(
     dragBinding,
@@ -770,7 +772,7 @@ test('one held drawer-row gesture resolves menu, reorder, or workspace drag', ()
     /ctxListener = \(ev\) => \{[\s\S]*?preventDefault\(\)[\s\S]*?stopImmediatePropagation\(\)/,
     'touch contextmenu must not bypass the shared hold timer',
   )
-  assert.doesNotMatch(dragBinding, /addEventListener\('touchmove'/)
+  assert.match(dragBinding, /reserveHeldTouchPan\(srcEl\)/)
   assert.match(shell, /const drawerRowGesturesRef = useRef\(new Map\(\)\)/)
   assert.match(drawer, /const registry = drawerRowGesturesRef\.current[\s\S]*?registry\.set\(key, drawerGestureHandlerRef\)/)
   assert.doesNotMatch(drawer, /pinnedReorderIntent|heldDrawerRowIntent/,
@@ -902,7 +904,7 @@ test('chat drawer indicators distinguish owner input, active work, waiting, and 
   )
   assert.match(
     shell,
-    /ev\.type === 'chat_wait_changed'[\s\S]*?markChatRunReconcile\(ev\.chatId\)[\s\S]*?refreshChatRows\(ev\.chatId\)/,
+    /ev\.type === 'chat_wait_changed'[\s\S]*?markChatRunReconcile\(changedChatId\)[\s\S]*?refreshChatRows\(changedChatId\)/,
     'a wait change must refresh both the visible chat and durable drawer state',
   )
   assert.match(
@@ -925,27 +927,29 @@ test('chat drawer indicators distinguish owner input, active work, waiting, and 
     /ev\.type === 'chat_run_finished'[\s\S]*?invalidateChatChangesQueries\(queryClient, chatId\)/,
     'completion must refresh Changes even when its local card missed the active-to-idle transition',
   )
+  assert.match(
+    shell.slice(shell.indexOf("ev.type === 'chat_run_finished'"), shell.indexOf("ev.type === 'shell_rebuilt'")),
+    /projectChatLookup[\s\S]*?dispatchEvent\(new CustomEvent\('mobius:project-change'/,
+    'a project agent run completion must refresh an open project file without waiting for its backed-off cursor poll',
+  )
   assert.doesNotMatch(
-    shell.slice(shell.indexOf("ev.type === 'chat_run_finished'"), shell.indexOf("ev.type === 'delegation_changed'")),
+    shell.slice(shell.indexOf("ev.type === 'chat_run_finished'"), shell.indexOf("ev.type === 'shell_rebuilt'")),
     /markChatOwnerInput\(chatId, \{ kind: null, questionId: null \}\)/,
     'run completion must not erase an owner-input request that is still pending',
   )
-  assert.match(
+  assert.doesNotMatch(
     shell,
-    /ev\.type === 'delegation_changed'[\s\S]*?invalidateChatChangesQueries\(queryClient, chatId\)[\s\S]*?\['completed', 'failed', 'needs_review'\][\s\S]*?setAttentionChatIds/,
-    'source-attached completion must refresh its parent and mark hidden work for attention',
+    /ev\.type === 'delegation_changed'/,
+    'the retired attached-work status event has no publisher and no shell consumer',
   )
   assert.match(
     shell,
     /for \(const cid of visibleChatIds\) clearChatAttention\(cid\)/,
     'viewing a chat must clear its completion dot',
   )
-  assert.match(
-    drawer,
-    /ownerRequired \? \([\s\S]*?drawer__owner-input-dot[\s\S]*?: streaming \? \([\s\S]*?drawer__streaming-dot[\s\S]*?: waiting \? \([\s\S]*?drawer__waiting-icon[\s\S]*?: attentionDot \? \([\s\S]*?drawer__attention-dot/,
-    'owner input and active work must precede durable waiting and unseen completion',
-  )
-  assert.match(drawer, /drawer__attention-diamond drawer__owner-input-dot/)
+  assert.match(drawer, /<DrawerStatusMarker/, 'the single marker owner is mounted in each drawer row')
+  // Shape, accessible names and precedence are rendered behavior contracts in
+  // dependencyPresentation.test.js, rather than a second source-code copy.
   assert.doesNotMatch(
     drawer,
     /drawer__contribution-pending|chatFlags|pendingContribution/,
@@ -1418,8 +1422,13 @@ test('round4-3: the null-slot landing is passive and interactive New Chat uses C
   assert.match(chatView,
     /const provisionalNewChat = !!newChatSession[\s\S]*onSubmit=\{provisionalNewChat \? handleProvisionalNewChatSubmit : handleSubmit\}/,
     'the canonical composer owns both pre-allocation and ordinary Send')
+  // Big uploads may first pass the shared-folder prompt, which still hands
+  // every file to the same canonical owner.
   assert.match(chatView,
-    /pendingFiles=\{pendingFiles\}[\s\S]*onAddFiles=\{handleComposerAddFiles\}[\s\S]*onAttachClick=\{\(\) => attachTriggerRef\.current\?\.\(\)\}/,
+    /useSharedFolderUploadGate\(\{\s*chatId, addFiles: handleComposerAddFiles,/,
+    'the upload gate delegates to the canonical draft/file owner')
+  assert.match(chatView,
+    /pendingFiles=\{pendingFiles\}[\s\S]*onAddFiles=\{uploadGate\.addFiles\}[\s\S]*onAttachClick=\{\(\) => attachTriggerRef\.current\?\.\(\)\}/,
     'the canonical draft/file owner is available before allocation')
   assert.match(composerPopover, /\{onAttachClick && \(/,
     'the canonical New Chat Brain exposes Attach files')

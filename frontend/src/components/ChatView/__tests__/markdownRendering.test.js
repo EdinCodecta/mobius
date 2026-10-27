@@ -3,23 +3,19 @@ import assert from 'node:assert/strict'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { Marked } from 'marked'
-import { createServer } from 'vite'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { createSsrRenderServer } from '../../../lib/__tests__/ssrRenderServer.mjs'
 import { mathTokens } from '../markdown/mathTokens.js'
 
-const vite = await createServer({
-  appType: 'custom',
-  logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  // Inline markdown can reach the shared image-lightbox UI. Bundle its SDK UI
-  // dependency because that package intentionally uses extensionless ESM
-  // imports which native Node resolution cannot load during SSR.
-  ssr: { noExternal: ['@openai/apps-sdk-ui'] },
-})
+const vite = await createSsrRenderServer()
 const { default: InlineContent } = await vite.ssrLoadModule(
   '/src/components/ChatView/markdown/InlineContent.jsx',
 )
 const { BlockToken } = await vite.ssrLoadModule(
   '/src/components/ChatView/markdown/blocks.jsx',
+)
+const { StandardMarkdown, ProgressiveMarkdown } = await vite.ssrLoadModule(
+  '/src/components/ChatView/markdown/BlockRenderer.jsx',
 )
 
 after(() => vite.close())
@@ -57,4 +53,29 @@ test('escaped currency renders its dollar sign while real math stays math', () =
   assert.match(markup, /Revenue reached \$100M while/)
   assert.doesNotMatch(markup, /\\\$100M/)
   assert.match(markup, /md-math-inline/)
+})
+
+test('app blocks render only where the caller opts in, including nested containers', () => {
+  const priorWindow = globalThis.window
+  globalThis.window = { location: new URL('https://mobius.test/shell') }
+  try {
+    const fence = '```mobius-app\n' + JSON.stringify({ app: 'example', intent: 'open:a', title: 'Fix typo',
+      action: { label: 'Send', intent: 'send:a' } }) + '\n```'
+    const render = (Component, props) => renderToStaticMarkup(React.createElement(QueryClientProvider,
+      { client: new QueryClient() }, React.createElement(Component, { text: fence, ...props })))
+    for (const Component of [StandardMarkdown, ProgressiveMarkdown]) {
+      const plain = render(Component, {})
+      assert.match(plain, /<pre[^]*&quot;app&quot;:&quot;example&quot;/)
+      assert.doesNotMatch(plain, /md-app-block/)
+      const owned = render(Component, { allowAppBlocks: true })
+      assert.match(owned, /class="md-app-block"/)
+      assert.doesNotMatch(owned, /<pre/)
+    }
+    for (const nested of ['> ' + fence.split('\n').join('\n> '), '- item\n\n  ' + fence.split('\n').join('\n  ')]) {
+      assert.doesNotMatch(render(StandardMarkdown, { text: nested }), /md-app-block/)
+      assert.match(render(StandardMarkdown, { text: nested, allowAppBlocks: true }), /md-app-block/)
+    }
+  } finally {
+    globalThis.window = priorWindow
+  }
 })

@@ -3,13 +3,9 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { createServer } from 'vite'
+import { createSsrRenderServer } from './ssrRenderServer.mjs'
 
-const vite = await createServer({
-  appType: 'custom', logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, ws: false },
-  ssr: { noExternal: ['@openai/apps-sdk-ui'] },
-})
+const vite = await createSsrRenderServer()
 const { PlatformUpdatesView } = await vite.ssrLoadModule('/src/components/SettingsView/PlatformUpdates.jsx')
 after(() => vite.close())
 
@@ -57,4 +53,52 @@ test('the recovery status control is disabled while checking', () => {
   }))
   assert.match(html, /<button[^>]*disabled=""[^>]*>Checking recovery status…<\/button>/)
   assert.doesNotMatch(html, />(?:Review update|Cancel update|Keep this version|Withdraw request|Updating…)</)
+})
+
+test('a stalled update offers Resume and Retry beside Cancel', () => {
+  const platform = {
+    state: 'conflict', contained_upstream_sha: target, conflict_chat_id: 'resolver',
+    unfinished_update: { stage: 'resolve', action: 'replace', cancellable: true, stalled: {
+      reason: 'resolver_idle', idle_hours: 7, actions: ['resume', 'retry', 'cancel'],
+      resolver_chat_id: 'resolver', remaining_paths: ['backend/app/main.py'],
+    } },
+  }
+  const update = {
+    platform, cachedPlatform: null, rebuild: null, version: null, phase: 'idle',
+    busy: false, reconnecting: false, error: '', errorCode: '', checkResult: '',
+  }
+  const html = renderToStaticMarkup(createElement(PlatformUpdatesView, { update, onOpenChat: () => {} }))
+  assert.match(html, /Update paused for 7 h: resolver idle\./)
+  assert.match(html, /<button[^>]*>Resume<\/button>/)
+  assert.match(html, /<button[^>]*>Retry<\/button>/)
+  assert.match(html, /<button[^>]*>Cancel update<\/button>/)
+
+  const moving = { ...platform, unfinished_update: { ...platform.unfinished_update, stalled: undefined } }
+  const quiet = renderToStaticMarkup(createElement(PlatformUpdatesView, {
+    update: { ...update, platform: moving }, onOpenChat: () => {},
+  }))
+  assert.doesNotMatch(quiet, /Update paused|>Resume<|>Retry</)
+})
+
+test('Settings warns when the container installs older packages than the source declares', () => {
+  const platform = {
+    state: 'up_to_date', contained_upstream_sha: target,
+    restart_blocker: {
+      origin: 'official_newer', blocking: false, fix: { action: 'replace_container', target_sha: target },
+      packages: [{ name: 'pillow', declared: '==13.0', installed: '12.3', kind: 'version', origin: 'official_newer' }],
+    },
+  }
+  const update = {
+    platform, cachedPlatform: null, rebuild: null, version: null, phase: 'idle',
+    busy: false, reconnecting: false, error: '', errorCode: '', checkResult: '',
+  }
+  const html = renderToStaticMarkup(createElement(PlatformUpdatesView, { update, onOpenChat: () => {} }))
+  assert.match(html, /Container packages are behind the platform source/)
+  assert.match(html, /pillow \(source declares ==13\.0, container has 12\.3\)/)
+  assert.match(html, /A container update \(Finish update\) installs them\./)
+
+  const current = renderToStaticMarkup(createElement(PlatformUpdatesView, {
+    update: { ...update, platform: { ...platform, restart_blocker: null } }, onOpenChat: () => {},
+  }))
+  assert.doesNotMatch(current, /packages are behind/)
 })

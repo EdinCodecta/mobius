@@ -6,11 +6,13 @@
 import { del as idbDel } from 'idb-keyval'
 import * as setupSession from '../lib/setupSession.js'
 import { clearLatchedTokens } from '../lib/appToken.js'
+import { clearAppNavLocations } from '../lib/appNavLocationStore.js'
 import { clearOwnerDraftStorage } from '../lib/ownerDraftStorage.js'
 import { clearReadingPositions } from '../components/ChatView/scroll/readingPositions.js'
 import { clearDurableComposerDrafts } from '../components/ChatView/composerDraft.js'
 import { clearChatOutbox } from '../components/ChatView/chatOutbox.js'
 import { setActiveSharedBrowserGrantId, sharedBrowserCacheBuster } from '../lib/sharedBrowserWorkspace.js'
+import { notifyAppSignedOut } from '../lib/nativeSession.js'
 import {
   reportNetworkReachable,
   verifyConnectivity,
@@ -292,6 +294,8 @@ function clearOwnerClientState({ preserveChatOutbox }) {
   // harmless shell preferences, they must not survive logout/token expiry and
   // appear in a later owner's session on the same browser.
   clearOwnerDraftStorage()
+  // Where each app was (a search query, an open item) is owner app data too.
+  clearAppNavLocations()
   // Media token cache is per-owner (tokens carry the owner's epoch). Clear
   // on logout so a new session doesn't inherit stale media tokens.
   try {
@@ -306,6 +310,9 @@ function clearOwnerClientState({ preserveChatOutbox }) {
       : [clearChatOutbox()]),
     delDatabase('mobius-signals', 'signal queue').catch(() => {}),
     delDatabase('mobius-listings', 'directory listing cache').catch(() => {}),
+    // Folder permissions this owner granted must not carry over to a later
+    // owner signing in on the same browser.
+    delDatabase('mobius-shared-folders', 'shared folders').catch(() => {}),
     wipeSwCaches().catch(() => {}),
   ])
 }
@@ -330,6 +337,39 @@ export async function clearExpiredOwnerSession() {
   clearToken()
   try { sessionStorage.setItem('auth_expired', '1') } catch {}
   await clearOwnerClientState({ preserveChatOutbox: true })
+}
+
+// Whether a rejected owner credential was cancelled before its own expiry (for
+// example "sign out everywhere"), as opposed to simply timing out.
+function credentialEndedEarly(credential, now = Date.now()) {
+  try {
+    const encoded = String(credential || '').split('.')[1]
+    if (!encoded) return false
+    const normalized = encoded.replace(/-/g, '+').replace(/_/g, '/')
+    const payload = JSON.parse(atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=')))
+    const expiresAt = Number(payload?.exp) * 1000
+    return Number.isFinite(expiresAt) && expiresAt > now
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The one place the shell ends an owner session it found expired or revoked:
+ * retire the credential, then reload into the sign-in screen. The reload is
+ * deferred one tick so callers' error handling can settle first.
+ *
+ * Only a credential cancelled early is handed to the Möbius phone app (it
+ * signs its own account out, closes the page and shows its start screen). An
+ * ordinary timeout is not: the app's own sign-in outlives the workspace
+ * credential, so signing it out would only add a second sign-in.
+ */
+export async function endExpiredOwnerSession({ credential } = {}) {
+  await clearExpiredOwnerSession()
+  // A shared-browser guest is not the app's account holder.
+  if (!sharedBrowserEnabled && credentialEndedEarly(credential)
+      && await notifyAppSignedOut()) return
+  setTimeout(() => window.location.reload(), 100)
 }
 
 // Remove browser-local queues and mirrors after an explicit app-data wipe.
@@ -562,13 +602,11 @@ export async function apiFetch(path, options = {}) {
     // Keep accepted chat intent through an expired credential. Each record is
     // partitioned by owner+epoch and can only replay after a matching login;
     // explicit Settings logout still uses the default full wipe.
-    await clearExpiredOwnerSession()
-    // Defer reload one tick and throw a typed error so callers'
-    // try/catch/finally blocks run (stopping spinners) before the
-    // page goes away. Previously we returned a never-resolving
-    // promise, which left finally{} clauses dangling for the entire
-    // reload window — visible as stuck loading state.
-    setTimeout(() => window.location.reload(), 100)
+    await endExpiredOwnerSession({ credential: ownerTokenAtSend })
+    // Throw a typed error so callers' try/catch/finally blocks run (stopping
+    // spinners) before the page goes away. Previously we returned a
+    // never-resolving promise, which left finally{} clauses dangling for the
+    // entire reload window — visible as stuck loading state.
     throw new Error('AUTH_EXPIRED')
   }
 
@@ -803,9 +841,15 @@ export async function jsonOrThrow(response, label = 'Request failed') {
   }
   if (!response.ok) {
     const detail = body?.detail
-    const message = typeof detail === 'string'
+    const reason = typeof detail === 'string'
       ? detail
       : (detail?.message || `${label} (${response.status})`)
+    // A compile refusal's reason and location live in its sanitized
+    // diagnostic; the message alone only says that compilation failed.
+    const diagnostic = detail?.code === 'compile_failed' && typeof detail.stderr === 'string'
+      ? detail.stderr.trim()
+      : ''
+    const message = diagnostic ? `${reason}\n${diagnostic}` : reason
     const error = new Error(message)
     error.status = response.status
     error.detail = detail
@@ -944,13 +988,21 @@ export const api = {
     }),
     // In-place compaction: optional owner guidance shapes the fresh briefing;
     // omitting it preserves the bodyless route used by older clients.
-    compact: (chatId, { instructions = '', ...options } = {}) => apiFetch(
+    compact: (chatId, { instructions = '', batch_id, recovery_id, ...options } = {}) => apiFetch(
       `/chats/${encodeURIComponent(chatId)}/compact`,
       {
         ...options,
         method: 'POST',
-        ...(instructions ? { body: JSON.stringify({ instructions }) } : {}),
+        ...(instructions || batch_id || recovery_id
+          ? { body: JSON.stringify({ ...(instructions ? { instructions } : {}), batch_id, recovery_id }) }
+          : {}),
       },
+    ),
+    compactProgress: (chatId, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/compact-progress`, options,
+    ),
+    compactStop: (chatId, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/compact-stop`, { ...options, method: 'POST' },
     ),
     runtime: (chatId, options = {}) => apiFetch(
       `/chats/${encodeURIComponent(chatId)}/runtime`,
@@ -963,6 +1015,27 @@ export const api = {
     usage: (chatId, options = {}) => apiFetch(
       `/chats/${encodeURIComponent(chatId)}/usage`,
       options,
+    ),
+    // Estimated tokens of each part Möbius adds to the context (/context).
+    contextSizes: (chatId, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/context-sizes`,
+      options,
+    ),
+    // `/btw`: an answer from a temporary copy of the chat. The copy rereads the
+    // whole chat first, so it can take far longer than an ordinary read.
+    askSideQuestion: (chatId, question, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/btw`,
+      {
+        timeoutMs: 200_000,
+        ...options,
+        method: 'POST',
+        body: JSON.stringify({ question }),
+      },
+    ),
+    // "Add to chat" for a side question; `cid` makes a retried add idempotent.
+    keepSideQuestion: (chatId, payload, options = {}) => apiFetch(
+      `/chats/${encodeURIComponent(chatId)}/side-questions`,
+      { ...options, method: 'POST', body: JSON.stringify(payload) },
     ),
     goalPlan: (chatId, options = {}) => apiFetch(
       `/chats/${encodeURIComponent(chatId)}/goal-plan`,
@@ -1128,9 +1201,14 @@ export const api = {
     markOpened: (appId) => apiFetch(`/apps/${appId}/opened`, {
       method: 'POST',
     }),
-    markActivitySeen: (appId, activityVersion) => apiFetch(`/apps/${appId}/activity/seen`, {
+    // First-open consent: what a Store app asks for, and the owner's answer.
+    consent: (appId) => apiFetch(`/apps/${appId}/consent`),
+    acceptConsent: (appId, digest) => apiFetch(`/apps/${appId}/consent`, {
+      method: 'POST', body: JSON.stringify({ digest }),
+    }),
+    markActivitySeen: (appId, activityVersion, appCreatedAt) => apiFetch(`/apps/${appId}/activity/seen`, {
       method: 'POST',
-      body: JSON.stringify({ activity_version: activityVersion }),
+      body: JSON.stringify({ activity_version: activityVersion, app_created_at: appCreatedAt }),
     }),
     update: (appId, payload) => listAffectingMutation('apps', `/apps/${appId}`, {
       method: 'PATCH',
@@ -1157,7 +1235,7 @@ export const api = {
     // Wipes the app's runtime storage back to empty while KEEPING it
     // installed — distinct from `remove` (which tombstones the whole app).
     deleteData: (appId) => apiFetch(`/apps/${appId}/data`, { method: 'DELETE' }),
-    // Stable base URL. AppCanvas appends `?v=<app.updated_at>` so the
+    // Stable base URL. AppCanvas appends `?v=<app.frame_version>` so the
     // service worker can serve cached offline-capable apps cache-first while
     // app edits naturally become cache misses. The backend still sends ETags
     // for browser-cache revalidation on non-SW/cold paths.
@@ -1581,6 +1659,22 @@ export const api = {
       { method: 'DELETE' },
     ),
   },
+  sharedFolders: {
+    list: () => apiFetch('/shared-folders'),
+    report: (subscriptionId, body) => apiFetch(
+      `/shared-folders/devices/${encodeURIComponent(subscriptionId)}`,
+      { method: 'PUT', body: JSON.stringify(body) },
+    ),
+    respond: (body) => apiFetch('/shared-folders/responses', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+    // Stop on every device at once; no ids means every shared folder.
+    pause: (folderIds = null) => apiFetch('/shared-folders/pause', {
+      method: 'POST',
+      body: JSON.stringify(folderIds ? { folderIds } : {}),
+    }),
+  },
   events: {
     // `keepalive` lets the report sent as the page hides outlive the page
     // being frozen or unloaded; a lost "hidden" report would withhold pushes.
@@ -1661,70 +1755,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(plan),
     }),
-    conflictResolverChat: () => apiFetch('/platform/conflict-resolver-chat', {
+    conflictResolverChat: (body) => apiFetch('/platform/conflict-resolver-chat', {
       method: 'POST',
+      ...(body ? { body: JSON.stringify(body) } : {}),
     }),
     restart: () => apiFetch('/platform/restart', { method: 'POST' }),
-  },
-  // The chat card is a compact projection of the same reviewed ledger Contribute
-  // owns. Its direct action calls the same guarded routes as the app; the card
-  // never pushes or talks to GitHub itself.
-  contributions: {
-    forChat: (appId, chatId) => apiFetch(
-      `/github/contributions/${appId}/for-chat/${encodeURIComponent(chatId)}`,
-    ),
-    coverageForChat: (appId, chatId, paths) => apiFetch(
-      `/github/contributions/${appId}/for-chat/${encodeURIComponent(chatId)}/coverage`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ paths }),
-      },
-    ),
-    startWork: (appId, chatId, request) => apiFetch(
-      `/github/contributions/${appId}/for-chat/${encodeURIComponent(chatId)}/work`,
-      {
-        method: 'POST',
-        body: JSON.stringify(request),
-      },
-    ),
-    workHistory: (appId, chatId) => apiFetch(
-      `/github/contributions/${appId}/for-chat/${encodeURIComponent(chatId)}/work/history`,
-    ),
-    stopWork: (appId, chatId) => apiFetch(
-      `/github/contributions/${appId}/for-chat/${encodeURIComponent(chatId)}/work/stop`,
-      { method: 'POST' },
-    ),
-    publish: (appId, record, { autopilot = false } = {}) => {
-      const update = record?.action === 'pr_update'
-      const action = update ? 'update-existing' : 'submit'
-      return apiFetch(
-        `/github/contributions/${appId}/${encodeURIComponent(record.id)}/${action}`,
-        {
-          method: 'POST',
-          body: JSON.stringify(update ? {} : {
-            autopilot,
-            submitter: 'chat-review-card',
-            publication_stage: 'ready',
-          }),
-        },
-      )
-    },
-    publishStack: (appId, records) => {
-      const prepared = (Array.isArray(records) ? records : [])
-        .filter(record => record?.status === 'prepared')
-      const updating = prepared.length > 0
-        && prepared[0]?.action === 'pr_update'
-      return apiFetch(
-        `/github/contributions/${appId}/${updating ? 'update-stack' : 'submit-stack'}`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            record_ids: (records || []).map(record => record.id),
-            ...(updating ? {} : { publication_stage: 'ready' }),
-          }),
-        },
-      )
-    },
   },
   push: {
     vapidKey: () => apiFetch('/push/vapid-key'),
@@ -1736,5 +1771,18 @@ export const api = {
       method: 'DELETE',
       body: JSON.stringify(payload),
     }),
+    // Native push for the Möbius mobile app (lib/nativePush.js).
+    devices: {
+      register: (payload) => apiFetch('/push/devices', {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      }),
+      forget: (payload) => apiFetch('/push/devices', {
+        method: 'DELETE',
+        body: JSON.stringify(payload),
+        // Sign-out reloads the page right after; let the request finish.
+        keepalive: true,
+      }),
+    },
   },
 }

@@ -20,7 +20,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
-from app import contribution_config, contribution_runtime, fs_locks
+from app import contribution_config, contribution_runtime, fs_locks, settled
 from app.config import get_settings
 from app.contribution_broker import (
   CONTRIBUTION_PREFIX,
@@ -118,9 +118,7 @@ ANONYMOUS_CONTRIBUTION_OWNER = "mobius-os"
 class RelaySubmitIn(BaseModel):
   confirm_publication: Literal[True]
   public_identity: Literal["anonymous"] = "anonymous"
-  submitter: Literal["contribute-button", "chat-review-card"] = (
-    "contribute-button"
-  )
+  submitter: Literal["contribute-button"] = "contribute-button"
 
 
 class RelayWithdrawIn(BaseModel):
@@ -881,6 +879,15 @@ def _reviewed_public_metadata(record: dict) -> tuple[str, str]:
       "published.",
       code="relay_review_text_invalid",
     )
+  if plan.get("screenshots"):
+    # The bot cannot host images in the owner's fork; Send from the owner's
+    # own GitHub account carries them.
+    raise ContributionSubmitError(
+      "Screenshots can be sent only from your own GitHub account, not "
+      "through the Möbius bot. Connect GitHub, or ask the agent to prepare "
+      "this without screenshots. Nothing was published.",
+      code="relay_screenshots_unsupported",
+    )
   return (
     _validated_reviewed_title(plan.get("title")),
     _validated_reviewed_body(plan.get("body_draft")),
@@ -1068,7 +1075,7 @@ async def _settle_relay_equivalence(record: dict) -> None:
       if upstream_sha is None:
         return
     async with fs_locks.source_dir_lock(str(source_repo)):
-      await asyncio.to_thread(_settle_equivalence, record, upstream_sha)
+      await settled.run_settled(_settle_equivalence, record, upstream_sha)
   except Exception:
     log.warning(
       "terminal relay contribution equivalence settlement failed %s",
@@ -1952,8 +1959,8 @@ async def submit_through_mobius(
           await source_locks.enter_async_context(
             fs_locks.source_dir_lock(lock_path)
           )
-        await asyncio.to_thread(_assert_pending_equivalence_preflight, claimed)
-        _initial_merge, initial_payload = await asyncio.to_thread(
+        await settled.run_settled(_assert_pending_equivalence_preflight, claimed)
+        _initial_merge, initial_payload = await settled.run_settled(
           _relay_snapshot_payload, claimed, diff_path, record_id,
         )
 
@@ -2029,7 +2036,7 @@ async def submit_through_mobius(
           )
           claim_receipt_witness = str(claim_receipt.get("witness") or "")
           claimed = journaled
-          lock_paths = await asyncio.to_thread(
+          lock_paths = await asyncio.to_thread(  # unsettled: read-only (computes lock paths)
             _relay_source_lock_paths,
             claimed,
             include_installed_source=True,
@@ -2039,8 +2046,8 @@ async def submit_through_mobius(
               fs_locks.source_dir_lock(lock_path)
             )
 
-        await asyncio.to_thread(_assert_pending_equivalence_preflight, claimed)
-        merge, payload = await asyncio.to_thread(
+        await settled.run_settled(_assert_pending_equivalence_preflight, claimed)
+        merge, payload = await settled.run_settled(
           _relay_snapshot_payload, claimed, diff_path, record_id,
         )
         rebuilt_revision, rebuilt_request_sha = _request_revision(

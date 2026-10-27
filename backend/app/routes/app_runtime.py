@@ -13,11 +13,12 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app import activity, models, theme
+from app.app_capabilities import passive_block_module_digest
 from app.config import get_settings
 from app.database import get_db
 from app.deps import authorize_app_module_token, get_current_owner
 from app.http_caching import strip_range
-from app.net_utils import validate_url_safe
+from app.net_utils import MAX_REDIRECTS, pinned_client, validate_url_safe
 from app.resource_access import live_app, live_app_or_404
 
 
@@ -25,7 +26,6 @@ router = APIRouter()
 
 _DEVICE_ASSET_CAPABILITY = "device.asset-cache"
 _SPEECH_MODEL_CAPABILITY = "device.speech-models"
-_DEVICE_ASSET_MAX_REDIRECTS = 5
 _DEVICE_ASSET_USER_AGENT = "Mobius/1.0 (device asset relay)"
 
 
@@ -74,14 +74,16 @@ async def _open_device_asset_range(
 ) -> tuple[httpx.AsyncClient, httpx.Response, int | None]:
   """Open one exact public byte range without retaining it on the server."""
   current_url = url
-  client = httpx.AsyncClient(
-    follow_redirects=False,
+  client = pinned_client(
     timeout=httpx.Timeout(60.0, connect=20.0),
   )
   expected_end = offset + length - 1
   try:
-    for hop in range(_DEVICE_ASSET_MAX_REDIRECTS + 1):
-      pinned_url, host_header, sni_host = validate_url_safe(current_url)
+    for hop in range(MAX_REDIRECTS + 1):
+      # getaddrinfo blocks; resolve off the event loop.
+      pinned_url, host_header, sni_host = await asyncio.to_thread(
+        validate_url_safe, current_url,
+      )
       request = client.build_request(
         "GET",
         pinned_url,
@@ -106,7 +108,7 @@ async def _open_device_asset_range(
         await upstream.aclose()
         if not location:
           raise HTTPException(502, "Device asset redirect had no destination.")
-        if hop >= _DEVICE_ASSET_MAX_REDIRECTS:
+        if hop >= MAX_REDIRECTS:
           raise HTTPException(502, "Too many device asset redirects.")
         current_url = urljoin(current_url, location)
         if not _is_https_device_asset_url(current_url):
@@ -283,6 +285,11 @@ def _frame_etag(
   parts: list[str] = []
   if app.updated_at:
     parts.append(str(int(app.updated_at.timestamp() * 1_000_000)))
+  # The frame embeds its passive-session admission, so a revoked or changed
+  # admission must not revalidate as the cached frame.
+  passive = passive_block_module_digest(app)
+  if passive:
+    parts.append(f"p{passive[:16]}")
   if frame_rev is None:
     try:
       parts.append(hashlib.sha256(frame_path.read_bytes()).hexdigest()[:16])
@@ -316,7 +323,7 @@ def get_frame(
   changed. The service worker revalidates frame/module routes against
   the same ETag via `appCodeHandler` in `sw.js`; that cache is ungated
   and applies to every installed app.
-  SEPARATELY, `AppCanvas` appends `?v=<app.updated_at>` to the frame
+  SEPARATELY, `AppCanvas` appends `?v=<app.frame_version>` to the frame
   URL, which the SW keeps as its offline cache key (it strips only
   token/_/install, not `v`), so an app edit changes the SW key and
   forces a fresh load. `v` is purely a client/SW cache-buster — this
@@ -379,6 +386,10 @@ def get_frame(
   html = frame_path.read_text(encoding="utf-8")
 
   # Per-app server-side substitution of the app/chat ids the runtime needs.
+  html = html.replace(
+    "var _FRAME_PASSIVE_BLOCK_DIGEST = null",
+    f"var _FRAME_PASSIVE_BLOCK_DIGEST = {json.dumps(passive_block_module_digest(app))}",
+  )
   html = html.replace(
     "var _FRAME_APP_ID = 'unknown'",
     f"var _FRAME_APP_ID = {json.dumps(str(app_id))}",

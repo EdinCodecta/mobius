@@ -40,8 +40,8 @@ def resource(request, db, auth, monkeypatch):
       "app.routes.apps.reconcile_app_cron_supervision",
       lambda _: (0, [], True),
     )
-    monkeypatch.setattr("app.install.restore_app_skills", AsyncMock(return_value=[]))
-    monkeypatch.setattr("app.install.deactivate_app_skills", AsyncMock(return_value=[]))
+    monkeypatch.setattr("app.app_skills.restore_app_skills", AsyncMock(return_value=[]))
+    monkeypatch.setattr("app.app_skills.deactivate_app_skills", AsyncMock(return_value=[]))
     monkeypatch.setattr("app.routes.apps._drop_cron_only", lambda _: None)
   else:
     project_id = str(uuid4())
@@ -350,7 +350,7 @@ def test_retry_reads_completion_after_obtaining_lifecycle_lock(
     assert child_ids
     assert all(math.isfinite(current_run_generation(chat_id)) for chat_id in child_ids)
   else:
-    restore_skills = import_module("app.install").restore_app_skills
+    restore_skills = import_module("app.app_skills").restore_app_skills
     assert restore_skills.await_count == 1
 
 
@@ -413,7 +413,7 @@ def test_receipt_retry_repairs_lost_projection_without_replacing_a_live_run(
     },), {}))
   elif kind == "app":
     expected.append((({"type": "app_recovered", "appId": str(row.id)},), {}))
-    assert import_module("app.install").restore_app_skills.await_count == 1
+    assert import_module("app.app_skills").restore_app_skills.await_count == 1
   assert broadcast.publish.call_args_list == expected
   for chat_id in chat_ids:
     assert chat_mod.current_run_generation(chat_id) == generations[chat_id]
@@ -602,7 +602,7 @@ def test_recovery_waits_for_all_destructive_cleanup_before_starting_a_new_run(
   asyncio.run(race())
 
 
-def test_follower_delivery_is_after_cleanup_and_outside_project_and_chat_gates(
+def test_dependency_delivery_is_after_cleanup_and_outside_project_and_chat_gates(
   client, auth, db, chat, monkeypatch,
 ):
   import httpx
@@ -625,10 +625,8 @@ def test_follower_delivery_is_after_cleanup_and_outside_project_and_chat_gates(
     title_source="Before deletion",
   )).result(timeout=5)
   monkeypatch.setattr("app.agent_work_claims.stage_release_claims_for_chat", lambda *_: [
-    ReleasedClaim("claim-id", "test:cleanup-followers", 2, ["follower-id"]),
+    ReleasedClaim("claim-id", "test:cleanup-followers", 2),
   ])
-  monkeypatch.setattr("app.agent_coordination.send_work_claim_notice", lambda *_args, **_kwargs: None)
-  monkeypatch.setattr("app.agent_work_claims.acknowledge_notice", lambda *_args, **_kwargs: None)
 
   async def race():
     delivering = asyncio.Event()
@@ -641,7 +639,7 @@ def test_follower_delivery_is_after_cleanup_and_outside_project_and_chat_gates(
       delivering.set()
       await release_delivery.wait()
 
-    monkeypatch.setattr("app.agent_coordination.deliver_peer_recipients", deliver)
+    monkeypatch.setattr("app.goal_dependencies.deliver_pending_dependencies", deliver)
     async with httpx.AsyncClient(
       transport=httpx.ASGITransport(app=application), base_url="http://test",
     ) as ac:
