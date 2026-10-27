@@ -19,6 +19,8 @@ const settingsKey = ['settings']
 const providerUsageRootKey = ['settings', 'provider-usage']
 const providerUsageKey = (provider) => [...providerUsageRootKey, provider]
 const appsKey = ['apps']
+// Under the apps key, so any apps invalidation (an uninstall, a recover) refreshes it.
+const uninstalledAppsKey = ['apps', 'uninstalled']
 const chatAppArtifactsRootKey = ['chat-app-artifacts']
 const chatAppArtifactsKey = chatId => [
   ...chatAppArtifactsRootKey,
@@ -142,6 +144,20 @@ function useChatAppArtifactsQuery(chatId, { enabled = true } = {}) {
     queryFn: ({ signal }) => fetchChatAppArtifacts(chatId, { signal }),
     enabled: Boolean(enabled && chatId),
     staleTime: 0,
+  })
+}
+
+async function fetchUninstalledApps({ signal } = {}) {
+  const res = await api.apps.uninstalled({ signal })
+  const data = await jsonOrThrow(res, 'uninstalled apps fetch failed:')
+  return Array.isArray(data) ? data : []
+}
+
+function useUninstalledAppsQuery() {
+  return useQuery({
+    queryKey: uninstalledAppsKey,
+    queryFn: fetchUninstalledApps,
+    refetchOnMount: 'always',
   })
 }
 
@@ -577,6 +593,11 @@ export const appQueries = {
     fetch: fetchAppConsent,
     useQuery: useAppConsentQuery,
     invalidate: (queryClient, appId) => queryClient.invalidateQueries({ queryKey: ['app-consent', appId] }),
+  },
+  uninstalled: {
+    key: uninstalledAppsKey,
+    fetch: fetchUninstalledApps,
+    useQuery: useUninstalledAppsQuery,
   },
   list: {
     key: appsKey,

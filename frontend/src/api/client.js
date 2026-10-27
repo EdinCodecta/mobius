@@ -1130,6 +1130,9 @@ export const api = {
   },
   apps: {
     list: (options = {}) => apiFetch('/apps/', options),
+    // Apps in their 7-day recovery window, and the undo.
+    uninstalled: (options = {}) => apiFetch('/apps/uninstalled', options),
+    recover: (appId) => listAffectingMutation('apps', `/apps/${appId}/recover`, { method: 'POST' }),
     chatArtifacts: (chatId, options = {}) => apiFetch(
       `/apps/chat-artifacts/${encodeURIComponent(chatId)}`,
       options,

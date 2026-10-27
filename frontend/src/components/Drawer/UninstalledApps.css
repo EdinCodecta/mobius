@@ -1,0 +1,19 @@
+.uninstalled-apps { margin-top: 34px; padding-top: 22px; border-top: 1px solid var(--border-light); }
+.uninstalled-apps__head h2 { margin: 0; color: var(--text); font-size: 18px; font-weight: 600; letter-spacing: -0.02em; }
+.uninstalled-apps__head p { margin: 5px 0 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+.uninstalled-apps__list { list-style: none; margin: 16px 0 0; padding: 0; display: grid; gap: 10px; }
+.uninstalled-apps__row {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  padding: 12px 14px; border: 1px solid var(--border-light); border-radius: 13px; background: var(--surface);
+}
+.uninstalled-apps__info { min-width: 0; display: grid; gap: 3px; }
+.uninstalled-apps__info strong { color: var(--text); font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.uninstalled-apps__info span { color: var(--muted); font-size: 12.5px; }
+.uninstalled-apps__recover {
+  flex: 0 0 auto; min-height: 40px; padding: 8px 16px; border: 1px solid var(--accent); border-radius: 11px;
+  background: transparent; color: var(--text); font: inherit; font-size: 13px; font-weight: 650; cursor: pointer;
+}
+.uninstalled-apps__recover:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.uninstalled-apps__recover:disabled { opacity: .55; cursor: not-allowed; }
+.uninstalled-apps__recover:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.uninstalled-apps__error { margin: 12px 0 0; color: var(--danger, #f87171); font-size: 13px; }
