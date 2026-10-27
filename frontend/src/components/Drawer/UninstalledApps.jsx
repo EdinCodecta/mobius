@@ -24,7 +24,10 @@ export default function UninstalledApps() {
         setError(await recoverErrorMessage(response))
         return
       }
-      await appQueries.list.invalidate(queryClient)
+      await Promise.all([
+        appQueries.list.invalidate(queryClient),
+        appQueries.uninstalled.invalidate(queryClient),
+      ])
     } catch {
       setError('Could not reach Möbius. Try again.')
     } finally {

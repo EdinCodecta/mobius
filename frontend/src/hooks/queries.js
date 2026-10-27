@@ -19,8 +19,10 @@ const settingsKey = ['settings']
 const providerUsageRootKey = ['settings', 'provider-usage']
 const providerUsageKey = (provider) => [...providerUsageRootKey, provider]
 const appsKey = ['apps']
-// Under the apps key, so any apps invalidation (an uninstall, a recover) refreshes it.
-const uninstalledAppsKey = ['apps', 'uninstalled']
+// Its own root, not under ['apps']: that prefix has stream-owned defaults that
+// stop a list refetching on mount, and it is persisted to disk. This list must
+// be fresh every time the Apps screen opens.
+const uninstalledAppsKey = ['uninstalled-apps']
 const chatAppArtifactsRootKey = ['chat-app-artifacts']
 const chatAppArtifactsKey = chatId => [
   ...chatAppArtifactsRootKey,
@@ -157,6 +159,7 @@ function useUninstalledAppsQuery() {
   return useQuery({
     queryKey: uninstalledAppsKey,
     queryFn: fetchUninstalledApps,
+    staleTime: 0,
     refetchOnMount: 'always',
   })
 }
@@ -598,6 +601,7 @@ export const appQueries = {
     key: uninstalledAppsKey,
     fetch: fetchUninstalledApps,
     useQuery: useUninstalledAppsQuery,
+    invalidate: (queryClient) => queryClient.invalidateQueries({ queryKey: uninstalledAppsKey }),
   },
   list: {
     key: appsKey,

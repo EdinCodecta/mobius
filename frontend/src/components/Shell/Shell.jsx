@@ -4503,6 +4503,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       reason: 'deleted',
     })
     await refreshApps()
+    void appQueries.uninstalled.invalidate(queryClient)
   }
 
   // Wipes an app's stored data back to empty while KEEPING it installed —
