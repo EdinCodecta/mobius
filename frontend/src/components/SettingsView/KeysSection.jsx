@@ -53,7 +53,7 @@ function usersLine(key, names) {
 
 function siteLine(site) {
   const paths = site.paths.length === 1 && site.paths[0] === '/*' ? '' : ` ${site.paths.join(', ')}`
-  return `${site.host}${paths}`
+  return `${site.host}${paths} · ${site.methods.join(', ')}`
 }
 
 function sentAs(inject) {
@@ -115,7 +115,14 @@ export default function KeysSection({ focusRef, attention = false, onOpenKey, on
       )}
 
       {pending.map(request => (
-        <KeyRequest key={request.id} request={request} names={names} onAnswered={refresh} />
+        <KeyRequest
+          key={request.id}
+          request={request}
+          keyRecord={keys.find(key => key.name === request.key)}
+          names={names}
+          onAnswered={refresh}
+          onOpenKey={onOpenKey}
+        />
       ))}
 
       {data?.available && (
@@ -147,11 +154,12 @@ function requestAppName(request, names) {
   return request.app_name || appLabel(names, request.app)
 }
 
-function KeyRequest({ request, names, onAnswered }) {
+function KeyRequest({ request, keyRecord, names, onAnswered, onOpenKey }) {
   const [value, setValue] = useState('')
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   const isNew = !request.key_exists
+  const outside = isNew ? [] : (request.outside_sites || [])
   const appName = requestAppName(request, names)
 
   async function answer(kind) {
@@ -175,8 +183,12 @@ function KeyRequest({ request, names, onAnswered }) {
         <strong>{appName}</strong> wants to use {isNew ? 'a new key' : 'your key'} <strong>{request.key}</strong>
       </p>
       {request.reason && <p className="settings-keys__muted">{request.reason}</p>}
-      {request.sites.length > 0 && (
-        <p className="settings-keys__muted">On {request.sites.map(siteLine).join(', ')}</p>
+      {isNew ? (
+        request.sites.length > 0 && (
+          <p className="settings-keys__muted">On {request.sites.map(siteLine).join('; ')}</p>
+        )
+      ) : (
+        <KeyRequestSites request={request} keyRecord={keyRecord} onOpenKey={onOpenKey} />
       )}
       {isNew && (
         <input
@@ -196,10 +208,36 @@ function KeyRequest({ request, names, onAnswered }) {
           Deny
         </button>
         <button type="button" className="settings__btn settings__btn--sm" onClick={() => answer('approve')} disabled={Boolean(busy) || (isNew && !value)}>
-          {busy === 'approve' ? 'Allowing…' : 'Allow'}
+          {busy === 'approve' ? 'Allowing…' : outside.length > 0 ? 'Allow on its current sites' : 'Allow'}
         </button>
       </div>
     </div>
+  )
+}
+
+/**
+ * An existing key's sites are shared by everyone who may use it, so allowing
+ * one app never changes them: the card says where the key works and what
+ * the app asked for beyond that.
+ */
+function KeyRequestSites({ request, keyRecord, onOpenKey }) {
+  const sites = keyRecord?.grants?.sites || []
+  const outside = request.outside_sites || []
+  return (
+    <>
+      <p className="settings-keys__muted">
+        {sites.length > 0
+          ? `It can use it only where this key already works: ${sites.map(siteLine).join('; ')}`
+          : 'This key has no sites yet, so it can’t be used anywhere until you add one.'}
+      </p>
+      {outside.length > 0 && (
+        <p className="settings-keys__muted">
+          It also asks for {outside.map(siteLine).join('; ')}. Allow leaves that out. Adding a site
+          on the key’s page lets every app and agent that uses this key send it there too.{' '}
+          <button type="button" className="settings-keys__link" onClick={() => onOpenKey(request.key)}>Open key</button>
+        </p>
+      )}
+    </>
   )
 }
 
@@ -335,6 +373,9 @@ function KeyDetail({ keyRecord: key, onDeleted }) {
       <section className="settings__section settings-keys-card">
         <SitesRows keyRecord={key} setGrants={setGrants} busy={busy} />
       </section>
+      <p className="settings-keys__muted settings-keys-page__note">
+        Every app and agent that can use this key can send it to these sites.
+      </p>
 
       <SentAs keyRecord={key} save={save} busy={busy} />
 

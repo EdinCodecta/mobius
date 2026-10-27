@@ -285,6 +285,45 @@ def host_matches(pattern: str, host: str) -> bool:
   return host == pattern
 
 
+def _pattern_within(pattern: str, allowed: str) -> bool:
+  """Whether every path ``pattern`` matches is matched by ``allowed`` too.
+
+  Matching the narrower pattern's text against the wider one is exact when
+  the wider one uses only ``*``: its literal characters must then meet the
+  narrower pattern's literal characters, and every wildcard of the narrower
+  pattern falls inside one of its ``*``. A ``?`` there is compared only as
+  the same text.
+  """
+  return pattern == allowed or ("?" not in allowed and fnmatch.fnmatchcase(pattern, allowed))
+
+
+def sites_outside(sites: list[dict], requested: list[dict]) -> list[dict]:
+  """The part of ``requested`` that ``sites`` do not already allow.
+
+  Each entry is a host with methods that all lack the same paths, so the
+  owner sees exactly what an approval leaves out.
+  """
+  outside = []
+  for want in requested:
+    by_paths: dict[tuple, list[str]] = {}
+    for method in want["methods"]:
+      missing = tuple(
+        path for path in want["paths"]
+        if not any(
+          host_matches(site["host"], want["host"]) and method in site["methods"]
+          and any(_pattern_within(path, allowed) for allowed in site["paths"])
+          for site in sites
+        )
+      )
+      if missing:
+        by_paths.setdefault(missing, []).append(method)
+    outside += [
+      {"host": want["host"], "methods": methods, "paths": list(paths)}
+      for paths, methods in by_paths.items()
+    ]
+  return outside
+
+
 def site_allows(grants: dict, host: str, method: str, path: str) -> str | None:
   """Return None when some site rule allows the request, else the reason."""
   hosts = [s for s in grants.get("sites") or [] if host_matches(s["host"], host)]
@@ -788,20 +827,30 @@ class Vault:
     return {"status": "pending", "key": name, "id": request_id, "created": True}
 
   def list_requests(self) -> list[dict]:
+    """Open requests; ``outside_sites`` is what an existing key would not allow."""
     with self._lock:
       requests = [dict(item) for item in self._requests.values()]
       for item in requests:
-        item["key_exists"] = item["key"] in self._records
+        record = self._records.get(item["key"])
+        item["key_exists"] = record is not None
+        item["outside_sites"] = (
+          sites_outside(record["grants"]["sites"], item["sites"]) if record else []
+        )
     return sorted(requests, key=lambda item: item["created_at"], reverse=True)
 
   def approve_request(self, request_id: str, body: dict) -> dict:
     """Grant the app; create the key first when the owner supplies its value.
 
-    The owner confirms the sites in the same answer: they are added to the
-    key's own sites, which every grantee shares. The answer names the
-    request's ``ticket``: a request id is the app id and key name, so a
-    request card left open while its app was purged would otherwise approve
-    the same ask from an unrelated app that reused the id.
+    A new key starts with the sites the owner confirms (the request's by
+    default). An existing key keeps its own sites: they are shared by every
+    app and agent that may use the key, so approving one app never widens
+    them. The app may use the key only where it already works; the answer's
+    ``outside`` lists what it asked for beyond that, which only the owner's
+    own edit of the key's sites can add.
+
+    The answer names the request's ``ticket``: a request id is the app id and
+    key name, so a request card left open while its app was purged would
+    otherwise approve the same ask from an unrelated app that reused the id.
     """
     with self._lock:
       request = self._requests.get(request_id)
@@ -810,28 +859,28 @@ class Vault:
       if body.get("ticket") != request.get("ticket"):
         raise VaultError(409, "That request changed since it was shown; review it again.")
       name = request["key"]
-      sites = body.get("sites", request["sites"])
-      if not isinstance(sites, list) or len(sites) > MAX_SITES:
-        raise VaultError(400, f"Choose at most {MAX_SITES} sites.")
-      sites = [validate_site(site) for site in sites]
       existing = self._records.get(name)
-      grants = dict(existing["grants"]) if existing else {"apps": [], "agents": False, "sites": []}
-      merged = {(s["host"], tuple(s["methods"]), tuple(s["paths"])): s for s in grants["sites"]}
-      for site in sites:
-        merged.setdefault((site["host"], tuple(site["methods"]), tuple(site["paths"])), site)
-      grants = {
-        **grants,
-        "apps": sorted(set(grants["apps"]) | {request["app"]}),
-        "sites": list(merged.values()),
-      }
-      put = {"grants": grants, "inject": body.get("inject") or (existing or request)["inject"]}
-      if body.get("value") is not None:
-        put["value"] = body["value"]
+      if existing is not None:
+        if any(body.get(field) is not None for field in ("value", "inject", "sites")):
+          raise VaultError(
+            409, f"{name} already exists, and approving only lets the app use it as it is. "
+            "Review the request again, and change the key itself on its page.",
+          )
+        grants = {**existing["grants"], "apps": sorted(set(existing["grants"]["apps"]) | {request["app"]})}
+        put = {"grants": grants, "inject": existing["inject"]}
+        outside = sites_outside(existing["grants"]["sites"], request["sites"])
+      else:
+        sites = body.get("sites", request["sites"])
+        if not isinstance(sites, list) or len(sites) > MAX_SITES:
+          raise VaultError(400, f"Choose at most {MAX_SITES} sites.")
+        grants = {"apps": [request["app"]], "agents": False, "sites": [validate_site(s) for s in sites]}
+        put = {"grants": grants, "inject": body.get("inject") or request["inject"], "value": body.get("value")}
+        outside = []
       result = self.put_key(name, put)
       self._requests.pop(request_id, None)
       self._save_requests()
     self.log_usage(name, "owner", "-", "-", "-", f"granted app:{request['app']}")
-    return {**result, "granted": request["app"]}
+    return {**result, "granted": request["app"], "outside": outside}
 
   def deny_request(self, request_id: str) -> dict:
     with self._lock:

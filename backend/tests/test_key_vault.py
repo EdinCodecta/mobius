@@ -150,14 +150,39 @@ def test_approving_a_new_key_creates_it_and_grants_only_that_app(vault):
     vault.authorize("maps", ("app", "10"), "GET", "maps.example.com", "/v1/route")
 
 
-def test_approving_an_existing_key_adds_the_app_and_owner_confirmed_sites(vault):
-  request = vault.request_access(9, {**ASK, "key": "echo"})
-  vault.approve_request(request["id"], {"sites": [], "ticket": _ticket(vault, request["id"])})
+def test_approving_an_existing_key_adds_only_the_app(vault):
+  """The key's sites are every grantee's: approving one app never widens them."""
+  asked = {**ASK, "key": "echo", "sites": [
+    {"host": "echo.example.com", "methods": ["GET", "DELETE"], "paths": ["/anything/x*", "/other"]},
+    ASK["sites"][0],
+  ]}
+  request = vault.request_access(9, asked)
+  [card] = vault.list_requests()
+  outside = [
+    {"host": "echo.example.com", "methods": ["DELETE"], "paths": ["/anything/x*", "/other"]},
+    {"host": "echo.example.com", "methods": ["GET"], "paths": ["/other"]},
+    {"host": "maps.example.com", "methods": ["GET"], "paths": ["/v1/*"]},
+  ]
+  assert card["outside_sites"] == outside
+  ticket = _ticket(vault, request["id"])
+  for change in ({"sites": asked["sites"]}, {"value": "other"}, {"inject": ASK["inject"]}):
+    with pytest.raises(kv.VaultError, match="already exists"):
+      vault.approve_request(request["id"], {**change, "ticket": ticket})
+  assert vault.approve_request(request["id"], {"ticket": ticket})["outside"] == outside
   [record] = [k for k in vault.list_keys() if k["name"] == "echo"]
-  assert record["grants"]["apps"] == [WEATHER, 9]
-  assert [s["host"] for s in record["grants"]["sites"]] == ["echo.example.com"]
+  assert record["grants"] == _grants(apps=[WEATHER, 9])
   assert record["inject"] == HEADER_SLOT  # the app cannot change how the key is sent
   assert vault.reveal("echo", ("owner", "")) == DUMMY
+  vault.authorize("echo", ("app", "9"), "GET", "echo.example.com", "/anything/x")
+  with pytest.raises(kv.VaultError, match="not an allowed site"):
+    vault.authorize("echo", ("app", "9"), "GET", "maps.example.com", "/v1/route")
+
+
+def test_a_narrower_path_is_within_a_wider_one_only_when_every_match_is():
+  within = kv._pattern_within
+  assert within("/v1/*", "/v1/*") and within("/v1/a*", "/v1/*") and within("/v1/x", "/*")
+  assert not within("/v1/*", "/v1/a*") and not within("/v2/x", "/v1/*")
+  assert not within("/v1/*", "/v1/?")   # a ? matches one character, not any text
 
 
 def test_an_approval_answers_only_the_request_it_was_shown(vault):

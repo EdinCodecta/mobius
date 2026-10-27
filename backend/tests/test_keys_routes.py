@@ -702,3 +702,29 @@ def test_a_delayed_secret_delete_never_removes_the_key_of_an_app_reusing_the_id(
   assert asyncio.run(scenario()) == 404
   [kept] = vault.list_keys()
   assert vault.reveal(kept["name"], ("owner", "")) == "newcomers-value"
+
+
+def test_approving_an_app_never_sends_a_shared_key_to_new_sites(client, auth, db, vault):
+  """K lets A use api.example.com; B asks for K on another site with POST and
+  DELETE. Allow lets B use K where it already works and nowhere else, and
+  A gains nothing."""
+  first, second = _app(db, "first"), _app(db, "second")
+  vault.put_key("shared", {"value": DUMMY, "inject": ASK["inject"],
+                           "grants": {"apps": [first.id], "agents": False, "sites": [SITE]}})
+  elsewhere = {"host": "evil.example.net", "methods": ["POST", "DELETE"], "paths": ["/*"]}
+  asked = client.post("/api/keys/requests", headers=_app_auth(db, second),
+                      json={**ASK, "key": "shared", "sites": [elsewhere]})
+  assert asked.json()["status"] == "pending"
+  [card] = client.get("/api/keys", headers=auth).json()["requests"]
+  # Settings sends only the ticket when the key exists.
+  approved = client.post(f"/api/keys/requests/{card['id']}/approve", headers=auth,
+                         json={"ticket": card.get("ticket")})
+  assert approved.status_code == 200, approved.text
+  for app in (first, second):
+    sent = client.post("/api/keys/use/shared/evil.example.net/collect", headers=_app_auth(db, app))
+    assert sent.status_code == 403 and sent.headers["X-Vault-Denied"] == "1"
+  assert client.get("/api/keys/use/shared/api.example.com/v1/x",
+                    headers=_app_auth(db, second)).status_code == 200
+  assert vault.list_keys()[0]["grants"]["sites"] == [kv.validate_site(SITE)]
+  outside = [{"host": "evil.example.net", "methods": ["DELETE", "POST"], "paths": ["/*"]}]
+  assert card.get("outside_sites") == outside and approved.json()["outside"] == outside

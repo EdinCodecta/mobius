@@ -20,10 +20,15 @@ Status: draft for review.
    server reads the app's identity from the token, never from the request.
    The answer is `granted`, `pending` or `denied`; asking again is how the app
    checks, and only a new request notifies the owner.
-2. **Approve.** The owner sees the app's name, reason and requested sites in
-   Settings › Keys, enters the value when the key is new, confirms the sites,
-   and approves or denies. The app cannot change how an existing key is sent.
-   Granting the app from the key editor settles its request too.
+2. **Approve.** The owner sees the app's name, reason and requested sites,
+   methods and paths in Settings › Keys, and approves or denies. A new key
+   gets its value and the requested sites. An existing key stays as it is:
+   its sites are shared by every app and agent that may use it, so approving
+   one app never widens them, and the app can use the key only where it
+   already works. The card lists anything the app asked for beyond that; only
+   the owner's own edit of the key's sites adds it. Sites bound to each grant
+   are a planned follow-up. Granting the app from the key editor settles its
+   request too.
 3. **Borrow.** The app sends an ordinary request to
    `/api/keys/use/<key>/<host>/<path>?<query>` with its app token. The server
    attests the caller as `app:<id>`, drops Möbius credentials and routing
