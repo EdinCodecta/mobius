@@ -504,3 +504,40 @@ def test_wiping_an_apps_data_erases_its_own_secrets_but_not_borrowed_keys(client
   assert "token" not in keys
   assert keys["lent"]["grants"]["apps"] == [app.id]
   assert not (Path(get_settings().data_dir) / "app-secrets" / str(app.id)).exists()
+
+
+def test_adding_a_key_never_replaces_one_with_the_same_name(client, auth, db, vault):
+  app = _app(db, "holder")
+  vault.put_key("shared", {"value": DUMMY, "inject": ASK["inject"],
+                           "grants": {"apps": [app.id], "agents": False, "sites": [SITE]}})
+  added = client.put("/api/keys/shared", headers=auth, json={
+    "value": "other", "inject": ASK["inject"],
+    "grants": {"apps": [], "agents": True, "sites": []}, "create_only": True,
+  })
+  assert added.status_code == 409
+  [kept] = vault.list_keys()
+  assert vault.reveal("shared", ("owner", "")) == DUMMY and kept["grants"]["apps"] == [app.id]
+
+
+def test_a_settings_save_from_a_stale_page_is_refused(client, auth, db, vault):
+  import asyncio
+  app = _app(db, "purged")
+  vault.put_key("shared", {"value": DUMMY, "inject": ASK["inject"],
+                           "grants": {"apps": [app.id], "agents": False, "sites": [SITE]}})
+  [page] = client.get("/api/keys", headers=auth).json()["keys"]
+  asyncio.run(key_vault.forget_app(app.id))
+  saved = client.put("/api/keys/shared", headers=auth, json={
+    "inject": page["inject"], "grants": {**page["grants"], "agents": True},
+    "revision": page["revision"],
+  })
+  assert saved.status_code == 409
+  assert vault.list_keys()[0]["grants"]["apps"] == []
+
+
+def test_a_multi_line_secret_moves_into_the_vault(client, auth, db, vault):
+  import asyncio
+  app = _app(db, "pem")
+  pem = "-----BEGIN PRIVATE KEY-----\nMIIBVQIBADANBg\n-----END PRIVATE KEY-----"
+  _legacy_secret(app.id, "service_key", pem)
+  assert asyncio.run(key_vault.import_legacy_app_secrets({app.id})) == {f"{app.id}/service_key": "service_key"}
+  assert vault.reveal("service_key", ("owner", "")) == pem

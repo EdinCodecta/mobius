@@ -107,7 +107,10 @@ def main(argv: list[str] | None = None) -> int:
       grants["agents"] = True
     if args.no_agents:
       grants["agents"] = False
-    status, _ = _call("PUT", f"/keys/{args.name}", {"value": value, "inject": inject, "grants": grants})
+    body = {"value": value, "inject": inject, "grants": grants}
+    if existing:
+      body["revision"] = existing.get("revision", 0)
+    status, _ = _call("PUT", f"/keys/{args.name}", body)
   except OSError:
     return 4
   return 0 if status == 200 else 4

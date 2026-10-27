@@ -31,7 +31,9 @@ Status: draft for review.
    the key's sites, adds the key and sends it.
 
 Approving, denying and changing keys is refused to apps, shared-browser
-guests and delegated helpers. App ids can be reused after a purge, so purging
+guests and delegated helpers. An edit carries the revision of the key it was
+made from, and the vault refuses it if the key changed since, so a stale page
+cannot write back old grants. App ids can be reused after a purge, so purging
 an app removes it from every grant and request.
 
 ## Where it lives
@@ -59,18 +61,23 @@ The vault's use path keeps its earlier rules: HTTPS on port 443 only, one
 injection slot (a header with an optional prefix, or a query parameter),
 default-deny site/method/path globs on the decoded path with dot segments,
 encoded slashes and empty segments refused first, public-address DNS pinning,
-no redirects, identity encoding and redaction of echoed values. The server
+no redirects, identity encoding and redaction of echoed values. A destination
+given as a NAT64 address must embed a public IPv4 address. A value with line
+breaks (a PEM file, JSON credentials) can be stored and read but is never sent
+in a header. The server
 serves answers with a sandboxing CSP, `nosniff`, `no-store` and no cookies.
 Bodies are buffered (10 MiB up, 20 MiB down).
 
 ## What replaced the per-app secret store
 
-`/api/apps/{id}/secrets`, its encryption module and the
-`permissions.job_secret_read` manifest grant are gone. A manifest that still
-declares the grant is refused with a pointer to the handshake. An app's model
-provider names its vault key in `model_provider.secret_name`; the platform
-reads that key at turn launch while the owner's grant to the app stands
-(logged as `platform:app-<id>`).
+The per-app store's encryption module and the
+`permissions.job_secret_read` manifest grant are gone; `/api/apps/{id}/secrets`
+survives for one release only as the adapter described under *Transition*. A
+manifest that still declares the grant is refused with a pointer to the
+handshake. An app's model provider names its vault key in
+`model_provider.secret_name`; the platform reads that key at turn launch
+(logged as `platform:app-<id>`) when it is the app's own key, or when the
+owner granted it to the app and its sites allow `POST <base_url>/responses`.
 
 **Upgrade.** Once per server start, after the vault answers, values in
 `/data/app-secrets/<id>/<name>` move into the vault (`import_legacy_app_secrets`):
@@ -82,8 +89,9 @@ first free name (`api.key` → `api-key`, then `app<id>-api-key`, then
 numbered), so distinct old names never merge, simultaneous saves never leave
 two keys for one secret, and no existing key is overwritten. Model providers and the adapter below find a
 secret by that origin, not by its vault name. Once the owner or an agent
-stores a new value in such a key, the origin is cleared: the key is the
-owner's, and the app only borrows it like any other. Wiping an app's data or
+stores a new value in such a key, its origin and the app's own grant are
+cleared: the key is the owner's, and the app uses it only if the owner grants
+it. An app holds at most 16 keys of its own, as in the per-app store. Wiping an app's data or
 purging the app erases its own keys (a key the owner shared with other apps
 stays for them), as the per-app store did. A ledger
 (`.vault-import.json`) next to the old files means a key the owner deletes is

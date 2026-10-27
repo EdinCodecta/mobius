@@ -225,6 +225,7 @@ def test_query_slot_replaces_any_caller_supplied_parameter():
 
 @pytest.mark.parametrize("answers", [
   ["127.0.0.1"], ["10.0.0.5"], ["169.254.169.254"], ["8.8.8.8", "192.168.1.1"], ["::1"],
+  ["64:ff9b::7f00:1"], ["64:ff9b::a9fe:a9fe"],   # NAT64 of loopback and link-local
 ])
 def test_destinations_resolving_to_non_public_addresses_are_refused(monkeypatch, answers):
   monkeypatch.setattr(kv.socket, "getaddrinfo", lambda *a, **k: [
@@ -241,6 +242,11 @@ def test_public_destination_is_pinned_to_the_resolved_address(monkeypatch):
   connection = kv.open_pinned_connection("echo.example.com", 5)
   assert connection._pinned_address == "93.184.215.14"
   assert connection.host == "echo.example.com"
+  # A NAT64 address of a public IPv4 host is pinned as given.
+  monkeypatch.setattr(kv.socket, "getaddrinfo", lambda *a, **k: [
+    (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("64:ff9b::5db8:d70e", 443, 0, 0)),
+  ])
+  assert kv.resolve_public_address("echo.example.com") == "64:ff9b::5db8:d70e"
 
 
 def test_redaction_covers_common_echo_encodings():
@@ -450,7 +456,7 @@ def test_an_owner_value_ends_the_apps_ownership_of_the_key(vault):
   vault.put_key("OPENAI_API_KEY", {"value": "owners-real-key", "inject": record["inject"],
                                    "grants": record["grants"]})
   [record] = [k for k in vault.list_keys() if k["name"] == "OPENAI_API_KEY"]
-  assert record["origin"] is None and record["grants"]["apps"] == [9]
+  assert record["origin"] is None and record["grants"]["apps"] == []
   # The app can neither delete nor replace it; its next save is a key of its own.
   assert vault.release_owned(9, "OPENAI_API_KEY") is None
   assert vault.save_owned(9, "OPENAI_API_KEY", "app-chosen") == {
@@ -533,3 +539,84 @@ def test_only_one_vault_runs_on_a_folder(tmp_path):
   finally:
     os.close(fd)
   os.close(kv.hold_single_instance_lock(tmp_path / "store"))
+
+
+STORE_KEY = Path(__file__).parents[1] / "scripts" / "store-key.py"
+
+
+def _run_store_key(monkeypatch, vault, args, value):
+  import io
+  spec = importlib.util.spec_from_file_location("mobius_store_key", STORE_KEY)
+  store_key = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(store_key)
+  short_dir = Path(tempfile.mkdtemp(prefix="kvs-"))
+  handler = type("StoreKeyVault", (kv.VaultHandler,), {"vault": vault})
+  server = kv.VaultServer(str(short_dir / kv.SOCKET_NAME), handler)
+  threading.Thread(target=server.serve_forever, daemon=True).start()
+  try:
+    monkeypatch.setattr(store_key, "VAULT_SOCKET", short_dir / kv.SOCKET_NAME)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"value": value})))
+    return store_key.main(args)
+  finally:
+    server.shutdown()
+    server.server_close()
+    shutil.rmtree(short_dir, ignore_errors=True)
+
+
+def test_a_name_an_app_took_first_never_lends_it_the_owners_value(monkeypatch, vault):
+  """An app saves a dummy under the name the owner will use; when an agent
+  later stores the owner's real key there (store-key.py keeps the existing
+  grants), the app must not be able to borrow the owner's value."""
+  vault.save_owned(9, "OPENAI_API_KEY", "app-dummy")
+  site = "api.openai.com:POST:/v1/*"
+  assert _run_store_key(monkeypatch, vault, ["OPENAI_API_KEY", "--site", site], "owners-real-key") == 0
+  with pytest.raises(kv.VaultError, match="may not use"):
+    vault.authorize("OPENAI_API_KEY", ("app", "9"), "POST", "api.openai.com", "/v1/responses")
+  _, value = vault.authorize("OPENAI_API_KEY", ("agent", "c1"), "POST", "api.openai.com", "/v1/responses")
+  assert value == "owners-real-key"
+
+
+def test_an_app_holds_at_most_sixteen_keys_of_its_own(vault):
+  for n in range(kv.MAX_OWNED_PER_APP):
+    vault.save_owned(9, f"secret{n}", DUMMY)
+  with pytest.raises(kv.VaultError, match="at most 16") as refused:
+    vault.save_owned(9, "one-more", DUMMY)
+  assert refused.value.status == 413
+  assert vault.save_owned(9, "secret0", "replaced")["created"] is False
+  assert vault.save_owned(10, "secret0", DUMMY)["created"] is True
+
+
+def test_an_edit_from_a_stale_copy_is_refused(vault):
+  [echo] = vault.list_keys()
+  stale = {"inject": HEADER_SLOT, "grants": echo["grants"], "revision": echo["revision"]}
+  # The app is purged while the owner's page still shows it.
+  vault.forget_app(WEATHER)
+  with pytest.raises(kv.VaultError, match="changed since") as refused:
+    vault.put_key("echo", stale)
+  assert refused.value.status == 409
+  assert vault.list_keys()[0]["grants"]["apps"] == []
+  [echo] = vault.list_keys()
+  vault.put_key("echo", {"inject": HEADER_SLOT, "grants": {**echo["grants"], "agents": False},
+                         "revision": echo["revision"]})
+  # A key deleted meanwhile is not recreated from the stale page either.
+  [echo] = vault.list_keys()
+  vault.revoke_key("echo")
+  with pytest.raises(kv.VaultError, match="changed since"):
+    vault.put_key("echo", {"value": "again", "inject": HEADER_SLOT, "revision": echo["revision"]})
+
+
+def test_values_with_line_breaks_are_kept_but_never_sent_in_a_header(vault):
+  pem = "-----BEGIN PRIVATE KEY-----\nMIIBVQIBADANBg\n-----END PRIVATE KEY-----"
+  vault.put_key("pem", {"value": pem, "inject": HEADER_SLOT, "grants": _grants()})
+  assert vault.reveal("pem", ("agent", "c1")) == pem
+  with pytest.raises(kv.VaultError, match="line breaks") as refused:
+    vault.authorize("pem", ("app", str(WEATHER)), "GET", "echo.example.com", "/anything/x")
+  assert refused.value.status == 400
+  vault.put_key("pem", {"inject": {"type": "query", "name": "key"}, "grants": _grants()})
+  assert vault.authorize("pem", ("app", str(WEATHER)), "GET", "echo.example.com", "/anything/x")[1] == pem
+
+
+def test_usage_counts_cover_the_whole_log(vault):
+  for _ in range(600):
+    vault.log_usage("echo", "agent", "GET", "echo.example.com", "/anything/x", "used")
+  assert vault.list_keys()[0]["uses"] == 600

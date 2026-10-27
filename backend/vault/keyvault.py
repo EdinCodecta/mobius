@@ -67,6 +67,8 @@ METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 MIN_VALUE_LENGTH = 1
 MAX_VALUE_LENGTH = 8192
 MAX_KEYS = 200
+# What the per-app secret store allowed; apps' own keys keep that bound.
+MAX_OWNED_PER_APP = 16
 MAX_SITES = 50
 MAX_LIST = 100
 MAX_REQUEST_BYTES = 10 * 1024 * 1024
@@ -75,6 +77,9 @@ MAX_ADMIN_BYTES = 256 * 1024
 MAX_REQUESTS = 200
 MAX_REASON = 300
 UPSTREAM_TIMEOUT_SECS = 60
+# Synthesizes IPv6 addresses for IPv4 hosts; the embedded IPv4 is the real
+# destination, so it must be public too.
+NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 USAGE_ROTATE_BYTES = 512 * 1024
 REDACTED = b"[redacted by key vault]"
 # The slot may never name a header that frames or routes the request.
@@ -117,8 +122,8 @@ def validate_value(value) -> str:
     raise VaultError(400, "The key value can't be empty.")
   if len(value) > MAX_VALUE_LENGTH:
     raise VaultError(400, "The key value is too long.")
-  if any(ch in value for ch in "\r\n\x00"):
-    raise VaultError(400, "The key value cannot contain line breaks.")
+  if "\x00" in value:
+    raise VaultError(400, "The key value cannot contain NUL characters.")
   return value
 
 
@@ -312,7 +317,10 @@ def resolve_public_address(host: str) -> str:
   addresses = []
   for info in infos:
     address = ipaddress.ip_address(info[4][0])
-    if not address.is_global or address.is_multicast:
+    reached = address
+    if address.version == 6 and address in NAT64_PREFIX:
+      reached = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+    if not reached.is_global or reached.is_multicast:
       raise VaultError(403, f"{host} resolves to a non-public address")
     addresses.append(str(address))
   if not addresses:
@@ -539,6 +547,7 @@ class Vault:
         "grants": record["grants"],
         "created_at": record["created_at"],
         "updated_at": record["updated_at"],
+        "revision": record.get("revision", 0),
         "origin": record.get("origin"),
         **stats.get(name, {"uses": 0, "denied": 0, "last_used": None}),
       }
@@ -549,13 +558,17 @@ class Vault:
     """Create or update a key.
 
     ``create_only`` refuses an occupied name atomically, so a caller choosing a
-    free name can never overwrite another key. ``origin`` records the app and
-    the app's own secret name a key was created for. It is set at creation and
-    an update never moves it to another app. A new value from anyone but that
-    app's own save (``save_owned``, which states the same origin) clears it:
-    once the owner or an agent supplies the value, the key is the owner's, and
-    the app can no longer replace it, delete it or send it to a host of its
-    choosing as its own.
+    free name can never overwrite another key. ``revision``, when given, must
+    equal the key's current revision (bumped by every change), so an edit
+    made from a stale copy, such as a grant to an app that has since been
+    purged, is refused instead of written back.
+
+    ``origin`` records the app and the app's own secret name a key was created
+    for. It is set at creation and an update never moves it to another app. A
+    new value from anyone but that app's own save (``save_owned``, which states
+    the same origin) clears it and withdraws the app's grant, which it gave
+    itself by creating the key: once the owner or an agent supplies the value,
+    the key is the owner's, and the app uses it only if the owner grants it.
     """
     validate_name(name)
     inject = validate_inject(body.get("inject"))
@@ -565,6 +578,10 @@ class Vault:
       existing = self._records.get(name)
       if existing is not None and body.get("create_only"):
         raise VaultError(409, f"A key named {name} already exists.")
+      if body.get("revision") is not None and (
+        existing is None or body["revision"] != existing.get("revision", 0)
+      ):
+        raise VaultError(409, f"{name} changed since it was loaded; review it again.")
       if existing is None and len(self._records) >= MAX_KEYS:
         raise VaultError(400, f"The vault holds at most {MAX_KEYS} keys.")
       if body.get("value") is not None:
@@ -573,6 +590,11 @@ class Vault:
         sealed = {"nonce": existing["nonce"], "sealed": existing["sealed"]}
       else:
         raise VaultError(400, "A new key needs a value.")
+      kept_origin = existing.get("origin") if existing else origin
+      if existing is not None and body.get("value") is not None and origin != kept_origin:
+        if kept_origin:
+          grants["apps"] = [a for a in grants["apps"] if a != kept_origin["app"]]
+        kept_origin = None
       now = _now()
       self._records[name] = {
         **sealed,
@@ -580,10 +602,8 @@ class Vault:
         "grants": grants,
         "created_at": existing["created_at"] if existing else now,
         "updated_at": now,
+        "revision": existing.get("revision", 0) + 1 if existing else 1,
       }
-      kept_origin = existing.get("origin") if existing else origin
-      if existing is not None and body.get("value") is not None and origin != kept_origin:
-        kept_origin = None
       if kept_origin:
         self._records[name]["origin"] = kept_origin
       self._save()
@@ -602,8 +622,9 @@ class Vault:
     The key ``app_id`` created for ``secret_name`` and still holds is
     replaced; otherwise a new key is created at the first free name (plain,
     then app-scoped, then numbered), granted to the app and the owner's
-    agents, sent as a bearer token, with no sites yet. Doing both under the
-    vault's lock means simultaneous saves can never leave two keys for one
+    agents, sent as a bearer token, with no sites yet. An app holds at most
+    ``MAX_OWNED_PER_APP`` such keys, as in the per-app store. Doing both under
+    the vault's lock means simultaneous saves can never leave two keys for one
     app secret.
     """
     origin = validate_origin({"app": app_id, "name": secret_name})
@@ -614,6 +635,10 @@ class Vault:
           self.put_key(name, {"value": value, "inject": record["inject"],
                               "grants": record["grants"], "origin": origin})
           return {"name": name, "created": False}
+      owned = sum(1 for r in self._records.values()
+                  if (r.get("origin") or {}).get("app") == app_id and app_id in r["grants"]["apps"])
+      if owned >= MAX_OWNED_PER_APP:
+        raise VaultError(413, f"An app may store at most {MAX_OWNED_PER_APP} secrets.")
       for name in owned_name_candidates(app_id, secret_name):
         if name not in self._records:
           self.put_key(name, {
@@ -653,6 +678,11 @@ class Vault:
     )
     return {"name": name, "deleted": deleted}
 
+  @staticmethod
+  def _touch(record: dict) -> None:
+    record["updated_at"] = _now()
+    record["revision"] = record.get("revision", 0) + 1
+
   def _release_locked(self, name: str, app_id: int) -> bool:
     """Withdraw ``app_id`` from its own key; delete the key unless shared.
 
@@ -662,7 +692,7 @@ class Vault:
     others = [a for a in record["grants"]["apps"] if a != app_id]
     if others:
       record["grants"]["apps"] = others
-      record["updated_at"] = _now()
+      self._touch(record)
     else:
       del self._records[name]
     return not others
@@ -821,6 +851,7 @@ class Vault:
       for name in keys:
         grants = self._records[name]["grants"]
         grants["apps"] = [a for a in grants["apps"] if a != app_id]
+        self._touch(self._records[name])
       requests = [rid for rid, item in self._requests.items() if item["app"] == app_id]
       for rid in requests:
         del self._requests[rid]
@@ -852,7 +883,10 @@ class Vault:
       reason = site_allows(record["grants"], host, method, path)
       if reason:
         raise VaultError(403, reason)
-      return dict(record["inject"]), self._open(name, record)
+      value = self._open(name, record)
+      if record["inject"]["type"] == "header" and any(ch in value for ch in "\r\n"):
+        raise VaultError(400, f"{name} has line breaks, so it can't be sent in a header.")
+      return dict(record["inject"]), value
 
   # -- usage log (never values) ----------------------------------------------
 
@@ -885,6 +919,11 @@ class Vault:
         os.close(fd)
 
   def usage(self, *, key: str | None = None, limit: int = 100) -> list[dict]:
+    entries = [e for e in self._usage_entries() if key is None or e.get("key") == key]
+    return list(reversed(entries))[:max(1, min(limit, 500))]
+
+  def _usage_entries(self) -> list[dict]:
+    """Every logged entry, oldest first (the log is bounded by rotation)."""
     entries = []
     for path in (self.usage_path.with_suffix(".1.jsonl"), self.usage_path):
       try:
@@ -893,16 +932,14 @@ class Vault:
         continue
       for line in lines:
         try:
-          entry = json.loads(line)
+          entries.append(json.loads(line))
         except ValueError:
           continue
-        if key is None or entry.get("key") == key:
-          entries.append(entry)
-    return list(reversed(entries))[:max(1, min(limit, 500))]
+    return entries
 
   def usage_stats(self) -> dict:
     stats: dict[str, dict] = {}
-    for entry in reversed(self.usage(limit=500)):
+    for entry in self._usage_entries():
       item = stats.setdefault(entry["key"], {"uses": 0, "denied": 0, "last_used": None})
       if entry["outcome"] == "used":
         item["uses"] += 1
@@ -913,8 +950,8 @@ class Vault:
 
 
 # ---------------------------------------------------------------------------
-# The vault socket: one HTTP server on a mode-0600 Unix socket, spoken to only
-# by the Möbius server, which attests every caller.
+# The vault socket: one HTTP server on a mode-0600 Unix socket, spoken to by
+# the Möbius server, which attests every caller, and same-user owner tools.
 # ---------------------------------------------------------------------------
 
 USE_PATH_RE = re.compile(r"^/use/([^/]+)/([^/]+)(/.*)?$")

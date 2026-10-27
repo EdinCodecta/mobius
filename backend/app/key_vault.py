@@ -474,8 +474,11 @@ async def supervise_key_vault() -> None:
         "--data", str(vault_dir()),
         "--parent", str(os.getpid()),
         stdin=asyncio.subprocess.DEVNULL, stdout=output, stderr=output,
-        # A minimal environment: the vault needs nothing of the server's.
-        env={"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"},
+        # A minimal environment: only the trust store settings TLS needs.
+        env={
+          "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",
+          **{k: os.environ[k] for k in ("SSL_CERT_FILE", "SSL_CERT_DIR") if k in os.environ},
+        },
       )
     try:
       code = await process.wait()

@@ -67,6 +67,8 @@ function recordFor(key, changes = {}) {
   return {
     inject: changes.inject || key.inject,
     grants: { ...key.grants, ...(changes.grants || {}) },
+    // The vault refuses a save made from a stale copy of the key.
+    revision: key.revision,
     ...(changes.value ? { value: changes.value } : {}),
   }
 }
@@ -250,6 +252,7 @@ function useSaveKey(name) {
       return true
     } catch (err) {
       setError(err.message)
+      await queryClient.invalidateQueries({ queryKey: KEYS_QUERY })
       return false
     } finally {
       setBusy(false)
@@ -602,7 +605,7 @@ function NewKey({ onCreated }) {
         ? [{ host: host.trim().toLowerCase(), methods: DEFAULT_METHODS, paths: ['/*'] }]
         : []
       await jsonOrThrow(await api.keys.put(name, {
-        value, inject: BEARER, grants: { apps: [], agents: true, sites },
+        value, inject: BEARER, grants: { apps: [], agents: true, sites }, create_only: true,
       }), 'Add key')
       await queryClient.invalidateQueries({ queryKey: KEYS_QUERY })
       onCreated(name)

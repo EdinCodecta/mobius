@@ -102,7 +102,9 @@ async def put_key(
   principal: Principal = Depends(get_principal),
   db: Session = Depends(get_db),
 ) -> dict:
-  allowed = {k: body[k] for k in ("value", "inject", "grants") if k in body}
+  allowed = {
+    k: body[k] for k in ("value", "inject", "grants", "revision", "create_only") if k in body
+  }
   result = await _relay("PUT", f"/keys/{quote(name, safe='')}", allowed)
   if "value" in allowed and not result.get("created") and _is_agent(principal):
     # Agents may set keys up, but silently swapping one could point every
