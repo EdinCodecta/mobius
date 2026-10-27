@@ -713,6 +713,34 @@ async def list_apps(
   ))
 
 
+@router.get("/uninstalled", response_model=list[schemas.UninstalledAppOut])
+def list_uninstalled_apps(
+  _: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+):
+  """Apps still in their recovery window, soonest to expire first.
+
+  Recover one with ``POST /{app_id}/recover``. A tombstone past the window is
+  not listed even before the purge that deletes it for good.
+  """
+  cutoff = now_naive_utc() - APP_SOFT_DELETE_TTL
+  rows = (
+    db.query(models.App.id, models.App.name, models.App.slug, models.App.version,
+             models.App.deleted_at)
+    .filter(models.App.deleted_at.isnot(None), models.App.deleted_at >= cutoff)
+    .order_by(models.App.deleted_at)
+    .all()
+  )
+  return [
+    schemas.UninstalledAppOut(
+      id=row.id, name=row.name, slug=row.slug, version=row.version,
+      deleted_at=row.deleted_at.replace(tzinfo=UTC),
+      expires_at=(row.deleted_at + APP_SOFT_DELETE_TTL).replace(tzinfo=UTC),
+    )
+    for row in rows
+  ]
+
+
 @router.get(
   "/chat-artifacts/{chat_id}",
   response_model=list[schemas.ChatAppArtifactOut],

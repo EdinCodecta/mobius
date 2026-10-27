@@ -207,6 +207,17 @@ class AppUpdate(BaseModel):
     return value
 
 
+class UninstalledAppOut(BaseModel):
+  """An app in its recovery window: uninstalled, not yet deleted for good."""
+
+  id: int
+  name: str
+  slug: str
+  version: str | None = None
+  deleted_at: datetime
+  expires_at: datetime
+
+
 class AppOut(BaseModel):
   id: int
   name: str
