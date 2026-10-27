@@ -6350,7 +6350,12 @@ def _platform_conflict_resolver_message(
     return opening + _conflict_units_guidance(overlay) + (
       "The running platform is untouched. Resolve all marked files together "
       f"in the isolated candidate at `{overlay.get('worktree')}`.\n\n"
-      + review + "Then run `cd /data/platform/backend && "
+      + (review + "Then run " if review else (
+        "Preserve the intended local behavior and the incoming upstream "
+        "behavior. A file's tests belong with the side whose code you keep. "
+        "Stage the resolved files, run the tests covering them from the "
+        "candidate (`scripts/wt-pytest.sh <tests>`), then run "
+      )) + "`cd /data/platform/backend && "
       "python3 -c \"from app.platform_update import "
       "continue_platform_overlay_update as c; print(c())\"`. It commits "
       "your answer on the reviewed release and runs the same startup check "
