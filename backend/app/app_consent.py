@@ -79,6 +79,8 @@ _FLAGS = (
    "Can manage the mobius.you sign-in link and identity."),
   ("railway_manage", "railway_manage", "Manage Railway deployments",
    "Can manage deployments on your Railway account."),
+  ("helper_activity_read", "helper_activity_read", "Read helper activity",
+   "Can read the status and results of every helper agent."),
 )
 
 

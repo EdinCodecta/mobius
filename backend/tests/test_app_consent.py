@@ -182,6 +182,14 @@ def test_every_contract_permission_has_a_row():
           "identity_manage", "railway_manage", "job_secret_read"} <= ids
 
 
+def test_helper_activity_read_has_a_non_critical_row():
+  rows = app_consent.rows_from_contract(_contract(helper_activity_read=True))
+  assert [(r["id"], r["title"], r["critical"]) for r in rows] == [
+    ("helper_activity_read", "Read helper activity", False),
+  ]
+  assert "helper_activity_read" in app_consent.HANDLED_DATA_KEYS
+
+
 def test_acceptance_stores_rows_and_survives_a_rewording(db, monkeypatch):
   contract = _contract(github_access=True)
   app = _app(db, "snapshot", contract=contract)
