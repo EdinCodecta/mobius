@@ -16,7 +16,8 @@ function toBase64(bytes) {
 
 /**
  * Folders are nested plain objects; a file is { bytes, type?, modified? }.
- * `revoke(id)` makes the app lose a folder, as when the owner moves it away.
+ * `revoke(id)` makes the app lose a folder, as when the owner moves it away;
+ * `deleteFolder(id)` removes the folder itself, so the app finds nothing there.
  */
 export class FakeNativeBridge {
   constructor() {
@@ -60,6 +61,10 @@ export class FakeNativeBridge {
     this.forgotten.push(id)
     this.folders.delete(id)
     return null
+  }
+
+  deleteFolder(id) {
+    this.folders.delete(id)
   }
 
   resolve(id, path) {

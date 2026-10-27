@@ -277,12 +277,16 @@ export function createNativeFolder(bridge, nativeId) {
   }
 }
 
-/** Whether the app can still open the folder, without asking the owner anything. */
+/**
+ * Whether the app can still open the folder, without asking the owner anything.
+ * Only the folder's own entry counts as access: a folder deleted on the phone
+ * answers not_found, and that or any other failure the app reports needs Pick again.
+ */
 export async function nativeFolderPermission(bridge, nativeId) {
   if (!bridge) return 'denied'
   try {
     const result = await bridge.folderEntry(nativeId, '')
-    return result?.error?.code === 'needs_permission' ? 'denied' : 'granted'
+    return result && !result.error ? 'granted' : 'denied'
   } catch {
     // The bridge itself failed; the next command reports what is wrong.
     return 'granted'
