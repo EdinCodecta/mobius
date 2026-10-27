@@ -49,6 +49,9 @@ test('artifactStatus and pill map the four states, unknown reads as idle', () =>
   assert.equal(artifactStatus(null), 'idle')
   assert.equal(artifactStatusPill({ status: 'ok' }).variant, 'ok')
   assert.equal(artifactStatusPill({ status: 'error' }).variant, 'error')
+  assert.equal(artifactStatusPill({ status: 'idle' }, { building: true }).label, 'Building…', 'pressing Build shows progress at once')
+  assert.equal(artifactStatusPill({ status: 'ok', type_name: 'PDF' }, { justBuilt: true }).label, 'PDF ready · Open')
+  assert.deepEqual(artifactStatusPill({ status: 'ok', out_of_date: true }, { justBuilt: true }), { label: 'Out of date', variant: 'stale' })
   assert.equal(isBuilding({ status: 'building' }), true)
   assert.equal(isBuilding({ status: 'ok' }), false)
 })
@@ -97,7 +100,7 @@ test('artifact presentation comes from the provider contract, not builder ids', 
   assert.equal(artifactTypeName(custom), 'Poster')
   assert.equal(artifactPreviewKind(custom), 'image')
   assert.equal(artifactEntryPath(custom), 'render/final.png')
-  assert.equal(artifactTypeName({ builder: 'latex' }), 'Artifact')
+  assert.equal(artifactTypeName({ builder: 'latex' }), 'Result')
 })
 
 test('artifact icons use only declared transport plus the platform App type', () => {
@@ -133,4 +136,25 @@ test('build-status event detection reads plausible id field names leniently', ()
   assert.equal(buildEventProjectId({}), null)
   assert.equal(buildEventArtifactId({ artifactId: 'site' }), 'site')
   assert.equal(buildEventArtifactId({ artifact_id: 'doc' }), 'doc')
+})
+
+test('a standalone result is named for its project, then its type or its own name', async () => {
+  const { resultDisplayName } = await import('../projectArtifacts.js')
+  const pdf = { id: 'document', name: 'Document', type_name: 'PDF' }
+  assert.equal(resultDisplayName({ name: 'Thesis', artifacts: [pdf] }, pdf), 'Thesis · PDF')
+  const part = { id: 'part-1', name: 'Part 1', type_name: 'PDF' }
+  assert.equal(resultDisplayName({ name: 'Thesis', artifacts: [pdf, part] }, part), 'Thesis · Part 1')
+  assert.equal(resultDisplayName(null, part), 'Part 1')
+})
+
+test('a fresh project opens on its main result when built, else on that result\'s source', async () => {
+  const { projectEntryTarget } = await import('../projectArtifacts.js')
+  const template = { previews: [{ id: 'document' }] }
+  const extra = { id: 'notes', source: 'notes.tex', has_output: true }
+  const built = { id: 'document', source: 'main.tex', has_output: true }
+  assert.deepEqual(projectEntryTarget({ template, artifacts: [extra, built] }), { kind: 'result', artifactId: 'document' })
+  const fresh = { id: 'document', source: 'main.tex', has_output: false }
+  assert.deepEqual(projectEntryTarget({ template, artifacts: [extra, fresh] }), { kind: 'file', path: 'main.tex' })
+  assert.equal(projectEntryTarget({ template, artifacts: [{ ...fresh, source_missing: true }] }), null)
+  assert.equal(projectEntryTarget({ template, artifacts: [] }), null)
 })
