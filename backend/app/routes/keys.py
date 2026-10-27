@@ -74,6 +74,14 @@ def _caller(principal: Principal) -> str:
   return "owner" if is_owner_input_principal(principal) else "agent"
 
 
+def _app_ids(grants) -> list[int]:
+  """The app ids a save grants; the vault itself refuses malformed grants."""
+  apps = grants.get("apps") if isinstance(grants, dict) else None
+  if not isinstance(apps, list):
+    return []
+  return [a for a in apps if isinstance(a, int) and not isinstance(a, bool) and a >= 1]
+
+
 # -- the owner's view ---------------------------------------------------------
 
 @router.get("", dependencies=owner_only)
@@ -105,7 +113,20 @@ async def put_key(
   allowed = {
     k: body[k] for k in ("value", "inject", "grants", "revision", "create_only") if k in body
   }
-  result = await _relay("PUT", f"/keys/{quote(name, safe='')}", allowed)
+  installations = body.get("installations")
+  try:
+    async with key_vault.for_granted_apps(
+      name, _app_ids(allowed.get("grants")),
+      installations if isinstance(installations, dict) else {},
+    ):
+      result = await _relay("PUT", f"/keys/{quote(name, safe='')}", allowed)
+  except key_vault.AppGone as gone:
+    raise HTTPException(
+      409, f"App {gone.args[0]} is not the installation you chose; it may have been "
+      "removed or replaced. Reload and choose it again.",
+    ) from None
+  except key_vault.VaultUnavailable as exc:
+    raise HTTPException(503, str(exc)) from exc
   if "value" in allowed and not result.get("created") and _is_agent(principal):
     # Agents may set keys up, but silently swapping one could point every
     # grantee at another account, so the owner hears about each replacement.
@@ -136,7 +157,7 @@ async def reveal_key(name: str, principal: Principal = Depends(get_principal)) -
 
 @router.post("/requests/{request_id}/approve", dependencies=[*owner_only, Depends(reject_cross_site)])
 async def approve_request(request_id: str, body: dict = Body(default={})) -> dict:
-  allowed = {k: body[k] for k in ("value", "inject", "sites") if k in body}
+  allowed = {k: body[k] for k in ("value", "inject", "sites", "ticket") if k in body}
   return await _relay("POST", f"/requests/{quote(request_id, safe='')}/approve", allowed)
 
 

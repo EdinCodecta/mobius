@@ -259,6 +259,41 @@ async def for_live_app(app_id: int, expected_nonce: str | None = None):
     yield
 
 
+@contextlib.asynccontextmanager
+async def for_granted_apps(key_name: str, app_ids: list[int], installations: dict):
+  """Hold the lock of every app a save of ``key_name`` grants, and confirm
+  each app it newly grants is the installation the owner chose.
+
+  An app id alone cannot name an app: one removed after the owner's page
+  loaded can be reused by an unrelated app, and the key's revision does not
+  change when the removed app held no grant on it. So a new grant names its
+  app's installation (``installations``: id to the app's non-secret
+  ``storage_generation``). A grant the key already holds stays valid: app
+  removal withdraws it under the same lock before the id is freed.
+  """
+  from app import fs_locks, models
+  from app.app_compile_contract import app_storage_generation
+  from app.database import SessionLocal
+  async with contextlib.AsyncExitStack() as locks:
+    wanted = sorted(set(app_ids))
+    for app_id in wanted:
+      await locks.enter_async_context(fs_locks.app_storage_lock(app_id))
+    if wanted:
+      key = next((k for k in (await vault_call("GET", "/keys"))["keys"] if k["name"] == key_name), None)
+      added = set(wanted) - set(key["grants"]["apps"] if key else [])
+      with SessionLocal() as db:
+        live = {
+          app.id: app_storage_generation(app.token_nonce)
+          for app in db.query(models.App).filter(
+            models.App.id.in_(added), models.App.deleted_at.is_(None),
+          )
+        }
+      for app_id in sorted(added):
+        if app_id not in live or installations.get(str(app_id)) != live[app_id]:
+          raise AppGone(app_id)
+    yield
+
+
 async def store_app_key(app_id: int, name: str, value: str) -> str:
   """Save ``value`` as ``app_id``'s own secret ``name``; return the vault name.
 

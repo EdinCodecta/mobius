@@ -26,7 +26,8 @@ function useAppNames() {
   const appsQuery = appQueries.list.useQuery()
   const apps = (appsQuery.data || [])
     .filter(app => Number.isInteger(app.id))
-    .map(app => ({ id: app.id, name: app.name || app.slug || `App ${app.id}` }))
+    // The installation, because a removed app's id can be reused.
+    .map(app => ({ id: app.id, name: app.name || app.slug || `App ${app.id}`, installation: app.storage_generation }))
     .sort((a, b) => a.name.localeCompare(b.name))
   return { apps, names: Object.fromEntries(apps.map(app => [app.id, app.name])) }
 }
@@ -70,6 +71,7 @@ function recordFor(key, changes = {}) {
     // The vault refuses a save made from a stale copy of the key.
     revision: key.revision,
     ...(changes.value ? { value: changes.value } : {}),
+    ...(changes.installations ? { installations: changes.installations } : {}),
   }
 }
 
@@ -157,7 +159,7 @@ function KeyRequest({ request, names, onAnswered }) {
     setError('')
     try {
       const response = kind === 'approve'
-        ? await api.keys.approve(request.id, isNew ? { value } : {})
+        ? await api.keys.approve(request.id, { ticket: request.ticket, ...(isNew ? { value } : {}) })
         : await api.keys.deny(request.id)
       await jsonOrThrow(response, kind === 'approve' ? 'Allow' : 'Deny')
       onAnswered()
@@ -267,6 +269,10 @@ function KeyDetail({ keyRecord: key, onDeleted }) {
   const grantedApps = key.grants?.apps || []
   const ungranted = apps.filter(app => !grantedApps.includes(app.id))
   const setGrants = grants => save(recordFor(key, { grants }))
+  const grantApp = app => save(recordFor(key, {
+    grants: { apps: [...grantedApps, app.id] },
+    installations: { [app.id]: app.installation },
+  }))
 
   return (
     <div className="settings-keys-page">
@@ -311,7 +317,10 @@ function KeyDetail({ keyRecord: key, onDeleted }) {
             <select
               className="settings-keys__select"
               value=""
-              onChange={e => e.target.value && setGrants({ apps: [...grantedApps, Number(e.target.value)] })}
+              onChange={e => {
+                const app = ungranted.find(item => item.id === Number(e.target.value))
+                if (app) grantApp(app)
+              }}
               disabled={busy}
               aria-label="Let an app use this key"
             >

@@ -98,8 +98,9 @@ def pushes(monkeypatch):
   return sent
 
 
-def _app(db, slug):
+def _app(db, slug, app_id=None):
   app = models.App(
+    id=app_id,
     source_dir=f"/tmp/mobius-tests/{slug}", name=slug.title(), slug=slug, description="test",
     jsx_source="export default function App() { return null }",
     compiled_path=f"/tmp/{slug}.js",
@@ -141,7 +142,7 @@ def test_handshake_from_request_to_use_without_seeing_the_value(client, auth, db
   [request] = client.get("/api/keys", headers=auth).json()["requests"]
   assert request["app"] == weather.id and request["app_name"] == "Weather"
   assert client.post(f"/api/keys/requests/{request['id']}/approve", headers=auth,
-                     json={"value": DUMMY}).status_code == 200
+                     json={"value": DUMMY, "ticket": request["ticket"]}).status_code == 200
   assert client.post("/api/keys/requests", headers=app_auth, json=ASK).json()["status"] == "granted"
 
   used = client.post(
@@ -541,3 +542,163 @@ def test_a_multi_line_secret_moves_into_the_vault(client, auth, db, vault):
   _legacy_secret(app.id, "service_key", pem)
   assert asyncio.run(key_vault.import_legacy_app_secrets({app.id})) == {f"{app.id}/service_key": "service_key"}
   assert vault.reveal("service_key", ("owner", "")) == pem
+
+
+# -- an app id is not an installation ------------------------------------------
+
+def _purge(db, app):
+  """The aged-tombstone purge: the app's grants go, then its id is freed."""
+  import asyncio
+  asyncio.run(key_vault.forget_app(app.id))
+  db.delete(app)
+  db.commit()
+
+
+def test_a_grant_chosen_on_a_stale_page_never_reaches_an_app_reusing_the_id(client, auth, db, vault):
+  vault.put_key("shared", {"value": DUMMY, "inject": ASK["inject"],
+                           "grants": {"apps": [], "agents": False, "sites": [SITE]}})
+  chosen = _app(db, "chosen")
+  # The owner's page: the key, and the apps it offers to grant.
+  [page] = client.get("/api/keys", headers=auth).json()["keys"]
+  offered = {a["id"]: a["storage_generation"] for a in client.get("/api/apps/", headers=auth).json()}
+  app_id = chosen.id
+  # The chosen app had no grant, so its purge leaves the key's revision alone.
+  _purge(db, chosen)
+  newcomer = _app(db, "newcomer", app_id)
+  saved = client.put("/api/keys/shared", headers=auth, json={
+    "inject": page["inject"], "grants": {**page["grants"], "apps": [app_id]},
+    "revision": page["revision"], "installations": {str(app_id): offered[app_id]},
+  })
+  assert saved.status_code == 409
+  assert vault.list_keys()[0]["grants"]["apps"] == []
+  use = client.get("/api/keys/use/shared/api.example.com/v1/x", headers=_app_auth(db, newcomer))
+  assert use.status_code == 403
+
+
+def test_a_new_grant_names_the_installation_the_owner_chose(client, auth, db, vault):
+  vault.put_key("shared", {"value": DUMMY, "inject": ASK["inject"],
+                           "grants": {"apps": [], "agents": False, "sites": [SITE]}})
+  weather = _app(db, "weather")
+  [page] = client.get("/api/keys", headers=auth).json()["keys"]
+  grant = {"inject": page["inject"], "grants": {**page["grants"], "apps": [weather.id]}}
+  assert client.put("/api/keys/shared", headers=auth, json=grant).status_code == 409
+  [listed] = [a for a in client.get("/api/apps/", headers=auth).json() if a["id"] == weather.id]
+  saved = client.put("/api/keys/shared", headers=auth, json={
+    **grant, "installations": {str(weather.id): listed["storage_generation"]},
+  })
+  assert saved.status_code == 200, saved.text
+  assert client.get("/api/keys/use/shared/api.example.com/v1/x",
+                    headers=_app_auth(db, weather)).status_code == 200
+  # A grant the key already holds needs no installation to keep.
+  [page] = client.get("/api/keys", headers=auth).json()["keys"]
+  kept = client.put("/api/keys/shared", headers=auth, json={
+    "inject": page["inject"], "grants": {**page["grants"], "agents": True},
+    "revision": page["revision"],
+  })
+  assert kept.status_code == 200 and vault.list_keys()[0]["grants"]["apps"] == [weather.id]
+
+
+def test_a_grant_waiting_on_app_removal_is_refused(client, auth, db, vault):
+  """A grant checked before the app's purge waits for the purge's lock, then
+  is checked again against the app that now has the id."""
+  import asyncio
+  from fastapi import HTTPException
+  from app import fs_locks
+  from app.app_compile_contract import app_storage_generation
+  from app.deps import Principal
+  from app.routes import keys as keys_routes
+  vault.put_key("shared", {"value": DUMMY, "inject": ASK["inject"],
+                           "grants": {"apps": [], "agents": False, "sites": [SITE]}})
+  app = _app(db, "racing")
+  app_id, installation = app.id, app_storage_generation(app.token_nonce)
+  [page] = vault.list_keys()
+  principal = Principal(owner=db.query(models.Owner).first(), app_id=None)
+  body = {"inject": page["inject"], "grants": {**page["grants"], "apps": [app_id]},
+          "revision": page["revision"], "installations": {str(app_id): installation}}
+
+  async def scenario():
+    purge_holds_lock = asyncio.Event()
+
+    async def purge():
+      async with fs_locks.app_storage_lock(app_id):
+        purge_holds_lock.set()
+        await asyncio.sleep(0.05)          # the grant is queued on the lock now
+        await key_vault.forget_app(app_id)
+        db.delete(app)
+        db.commit()
+        _app(db, "newcomer", app_id)
+
+    async def grant():
+      await purge_holds_lock.wait()
+      try:
+        await keys_routes.put_key("shared", body, principal=principal, db=db)
+      except HTTPException as exc:
+        return exc.status_code
+      return 200
+
+    return (await asyncio.gather(purge(), grant()))[1]
+
+  assert asyncio.run(scenario()) == 409
+  assert vault.list_keys()[0]["grants"]["apps"] == []
+
+
+def test_a_request_card_left_open_never_approves_an_app_reusing_the_id(client, auth, db, vault):
+  asker = _app(db, "asker")
+  assert client.post("/api/keys/requests", headers=_app_auth(db, asker), json=ASK).status_code == 200
+  [card] = client.get("/api/keys", headers=auth).json()["requests"]
+  app_id = asker.id
+  _purge(db, asker)
+  newcomer = _app(db, "newcomer", app_id)
+  newcomer_auth = _app_auth(db, newcomer)
+  assert client.post("/api/keys/requests", headers=newcomer_auth, json=ASK).json()["id"] == card["id"]
+  stale = client.post(f"/api/keys/requests/{card['id']}/approve", headers=auth,
+                      json={"value": DUMMY, "ticket": card.get("ticket")})
+  assert stale.status_code == 409
+  assert client.post("/api/keys/requests", headers=newcomer_auth, json=ASK).json()["status"] == "pending"
+
+
+def test_a_delayed_secret_delete_never_removes_the_key_of_an_app_reusing_the_id(client, auth, db, vault, monkeypatch):
+  import asyncio
+  from app import fs_locks
+  from app.deps import Principal
+  from app.routes import app_secrets_compat
+  from fastapi import HTTPException
+  app = _app(db, "leaving")
+  app_id, nonce = app.id, app.token_nonce
+  asyncio.run(key_vault.store_app_key(app_id, "api_key", "old-apps-value"))
+  owner = db.query(models.Owner).first()
+  release = key_vault.release_app_key
+
+  async def scenario():
+    purge_holds_lock, purged = asyncio.Event(), asyncio.Event()
+
+    async def delayed_release(*args):
+      await purged.wait()                  # the delete was authorized, then stalled
+      return await release(*args)
+    monkeypatch.setattr(key_vault, "release_app_key", delayed_release)
+
+    async def purge():
+      async with fs_locks.app_storage_lock(app_id):
+        purge_holds_lock.set()
+        await asyncio.sleep(0.05)
+        await key_vault.forget_app(app_id)
+        db.delete(app)
+        db.commit()
+        _app(db, "newcomer", app_id)
+        await key_vault.store_app_key(app_id, "api_key", "newcomers-value")
+      purged.set()
+
+    async def delete():
+      await purge_holds_lock.wait()
+      principal = Principal(owner=owner, app_id=app_id, app_instance_id=nonce, scope="app")
+      try:
+        await app_secrets_compat.delete_secret(app_id, "api_key", db=db, principal=principal)
+      except HTTPException as exc:
+        return exc.status_code
+      return 204
+
+    return (await asyncio.gather(purge(), delete()))[1]
+
+  assert asyncio.run(scenario()) == 404
+  [kept] = vault.list_keys()
+  assert vault.reveal(kept["name"], ("owner", "")) == "newcomers-value"

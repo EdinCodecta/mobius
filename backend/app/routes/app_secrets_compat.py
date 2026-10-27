@@ -131,9 +131,15 @@ async def delete_secret(
   db: Session = Depends(get_db), principal: Principal = Depends(get_principal),
 ):
   """Delete the app's key, or only its grant when other apps share the key."""
-  _authorize_app(db, principal, app_id)
+  app = _authorize_app(db, principal, app_id)
   try:
-    released = await key_vault.release_app_key(app_id, name)
+    # Under the app's lock and its authorized installation, as for a save: a
+    # delete delayed past a purge must not remove the key of the app that
+    # reused the id.
+    async with key_vault.for_live_app(app_id, app.token_nonce):
+      released = await key_vault.release_app_key(app_id, name)
+  except key_vault.AppGone:
+    raise HTTPException(status_code=404, detail="App not found.") from None
   except key_vault.VaultUnavailable as exc:
     raise HTTPException(503, str(exc)) from exc
   except key_vault.VaultRefused as exc:

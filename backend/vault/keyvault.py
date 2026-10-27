@@ -781,7 +781,7 @@ class Vault:
       self._requests[request_id] = {
         "id": request_id, "app": app_id, "app_name": str(body.get("app_name") or "")[:100],
         "key": name, "reason": reason, "sites": sites, "inject": inject,
-        "status": "pending", "created_at": _now(),
+        "status": "pending", "created_at": _now(), "ticket": secrets.token_hex(8),
       }
       self._save_requests()
     self.log_usage(name, f"app:{app_id}", "-", "-", "-", "requested")
@@ -798,12 +798,17 @@ class Vault:
     """Grant the app; create the key first when the owner supplies its value.
 
     The owner confirms the sites in the same answer: they are added to the
-    key's own sites, which every grantee shares.
+    key's own sites, which every grantee shares. The answer names the
+    request's ``ticket``: a request id is the app id and key name, so a
+    request card left open while its app was purged would otherwise approve
+    the same ask from an unrelated app that reused the id.
     """
     with self._lock:
       request = self._requests.get(request_id)
       if request is None:
         raise VaultError(404, "That request is gone.")
+      if body.get("ticket") != request.get("ticket"):
+        raise VaultError(409, "That request changed since it was shown; review it again.")
       name = request["key"]
       sites = body.get("sites", request["sites"])
       if not isinstance(sites, list) or len(sites) > MAX_SITES:

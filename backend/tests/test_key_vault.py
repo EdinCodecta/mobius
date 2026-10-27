@@ -132,11 +132,16 @@ def test_asking_is_idempotent_and_reports_creation_once(vault):
   assert listed["app"] == 9 and listed["key_exists"] is False and listed["reason"] == "Show traffic"
 
 
+def _ticket(vault, request_id):
+  return next(r["ticket"] for r in vault.list_requests() if r["id"] == request_id)
+
+
 def test_approving_a_new_key_creates_it_and_grants_only_that_app(vault):
   request = vault.request_access(9, ASK)
+  ticket = _ticket(vault, request["id"])
   with pytest.raises(kv.VaultError, match="needs a value"):
-    vault.approve_request(request["id"], {})
-  vault.approve_request(request["id"], {"value": DUMMY})
+    vault.approve_request(request["id"], {"ticket": ticket})
+  vault.approve_request(request["id"], {"value": DUMMY, "ticket": ticket})
   assert vault.list_requests() == []
   assert vault.request_access(9, ASK)["status"] == "granted"
   inject, value = vault.authorize("maps", ("app", "9"), "GET", "maps.example.com", "/v1/route")
@@ -147,12 +152,24 @@ def test_approving_a_new_key_creates_it_and_grants_only_that_app(vault):
 
 def test_approving_an_existing_key_adds_the_app_and_owner_confirmed_sites(vault):
   request = vault.request_access(9, {**ASK, "key": "echo"})
-  vault.approve_request(request["id"], {"sites": []})
+  vault.approve_request(request["id"], {"sites": [], "ticket": _ticket(vault, request["id"])})
   [record] = [k for k in vault.list_keys() if k["name"] == "echo"]
   assert record["grants"]["apps"] == [WEATHER, 9]
   assert [s["host"] for s in record["grants"]["sites"]] == ["echo.example.com"]
   assert record["inject"] == HEADER_SLOT  # the app cannot change how the key is sent
   assert vault.reveal("echo", ("owner", "")) == DUMMY
+
+
+def test_an_approval_answers_only_the_request_it_was_shown(vault):
+  shown = vault.request_access(9, ASK)
+  ticket = _ticket(vault, shown["id"])
+  vault.forget_app(9)                       # purged; the id goes to another app
+  again = vault.request_access(9, ASK)
+  assert again["id"] == shown["id"]
+  for body in ({"value": DUMMY, "ticket": ticket}, {"value": DUMMY}):
+    with pytest.raises(kv.VaultError, match="changed since it was shown"):
+      vault.approve_request(shown["id"], body)
+  assert vault.request_access(9, ASK)["status"] == "pending"
 
 
 def test_denied_requests_stay_denied_without_new_requests(vault):
@@ -390,7 +407,9 @@ def test_owner_operations_and_handshake_over_the_socket(client):
   asked = client.post("/requests", json=ASK, headers={"X-Vault-Caller": "app:9"}).json()
   assert asked["status"] == "pending"
   assert [r["id"] for r in client.get("/requests").json()["requests"]] == [asked["id"]]
-  approved = client.post(f"/requests/{asked['id']}/approve", json={"value": "maps-dummy-key"})
+  [listed] = client.get("/requests").json()["requests"]
+  approved = client.post(f"/requests/{asked['id']}/approve",
+                         json={"value": "maps-dummy-key", "ticket": listed["ticket"]})
   assert approved.json()["granted"] == 9
   assert client.delete("/keys/second").status_code == 200
   assert client.delete("/keys/second").status_code == 404
