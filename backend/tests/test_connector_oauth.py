@@ -899,6 +899,9 @@ def test_callback_rejects_unknown_and_reused_code(client, auth, db, provider):
   sealed_refresh = oauth.refresh_token_encrypted
   assert sealed_access is not None and sealed_refresh is not None
 
+  # The sealed state is expiring, not single-use, so this replay reaches the
+  # token endpoint; the provider's one-use code rejects it. What is pinned here
+  # is that a rejected exchange leaves the stored grant intact.
   replayed = client.get("/api/connectors/oauth/callback", params=params)
   assert "failed" in replayed.text
   assert provider.issued == 1

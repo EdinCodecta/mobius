@@ -104,6 +104,8 @@ test.describe('handleStop sync-ordering (Ticket 034 R1)', () => {
       live.running = true
       const message = { role: 'user', content: body.content, cid: body.cid, ts: 12342 + ordinaryMessageHits }
       if (!firstMessage) firstMessage = message
+      // Accepted rows belong to the server transcript any later detail read returns.
+      live.messages.push(message)
       return route.fulfill({
         status: 202,
         contentType: 'application/json',
@@ -203,6 +205,7 @@ test.describe('handleStop sync-ordering (Ticket 034 R1)', () => {
     expect(stopReleased).toBe(false)
     await stream.emit({ type: 'text', content: ' terminal chunk' })
     await stream.finish()
+    live.messages.push({ role: 'assistant', content: 'streaming response... terminal chunk' })
     await expect(surface.locator('.chat__scroll')).toContainText('terminal chunk')
     await expect(surface.locator('.chat__mic')).toBeVisible()
     await expect(stop).toHaveCount(0)
