@@ -126,6 +126,13 @@ When the backend is slow or CPU-bound, `profile` samples every thread in-process
 (py-spy cannot attach inside the container) and ranks the busy app frames and
 stacks. It occupies one worker for the window, and one profile runs at a time.
 
+Exercising owner-input cards programmatically (for a test, never to answer for
+the owner): while a card is open, posting a chat message returns 409
+`pending_question_open` — that is the designed gate, not a bug. The two-step is
+to answer the card at `POST /api/chats/<id>/question-answers` with its
+`question_id`, which records the answer but does **not** resume the paused
+turn, and then `POST` a chat message to start the next turn.
+
 ---
 
 ## Backend edits — restart to load, hand off persistence
