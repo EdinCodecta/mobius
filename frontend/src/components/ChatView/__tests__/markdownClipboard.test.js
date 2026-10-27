@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { marked } from 'marked'
 import {
   assistantClipboardText,
   copyMarkdownSelection,
@@ -112,11 +113,149 @@ test('code serialization preserves inline delimiters and fenced language', () =>
 })
 
 test('partial plain text cannot turn into Markdown structure after trimming', () => {
-  const tree = element('p', [text('# heading > quote - item 1. item <tag> &copy;')])
+  const tree = element('p', [text('# heading > quote - item 1. item <tag> &copy; *x* [y]')])
   assert.equal(
     markdownFromFragment(tree),
-    '\\# heading \\> quote \\- item 1\\. item \\<tag\\> \\&copy;',
+    '\\# heading > quote - item 1. item \\<tag> \\&copy; \\*x\\* \\[y\\]',
   )
+  assert.equal(markdownFromFragment(element('p', [text('1. first\n- second\n> third')])),
+    '1\\. first\n\\- second\n\\> third', 'block markers are escaped at each line start')
+})
+
+test('ordinary prose punctuation copies without needless escapes', () => {
+  const prose = 'well-known, A & B, snake_case, wow! 3.5 (see step 2) done!'
+  assert.equal(markdownFromFragment(element('p', [text(prose)])), prose)
+  assert.equal(markdownFromFragment(element('p', [text('_lead and trail_')])),
+    '\\_lead and trail\\_', 'an underscore at a word boundary could still mean emphasis')
+})
+
+test('copied prose cannot form an image, a table, or a setext heading', () => {
+  assert.equal(markdownFromFragment(element('p', [
+    text('Wow!'),
+    element('a', [text('link')], { href: 'https://example.org' }),
+  ])), 'Wow\\![link](https://example.org)')
+  assert.equal(markdownFromFragment(element('p', [text('a|b\n:---|---:\nx|y')])),
+    'a\\|b\n:---\\|---:\nx\\|y')
+  assert.equal(markdownFromFragment(element('p', [text('title\n===')])), 'title\n\\===')
+
+  // The "!" may end a wrapper, or copy-ignored chrome may sit between it and
+  // the link: what matters is the serialized adjacency.
+  const link = () => element('a', [text('link')], { href: 'https://example.org' })
+  assert.equal(markdownFromFragment(element('p', [element('span', [text('Wow!')]), link()])),
+    'Wow\\![link](https://example.org)')
+  assert.equal(markdownFromFragment(element('p', [
+    text('Wow!'), element('button', [text('Copy')]), link(),
+  ])), 'Wow\\![link](https://example.org)')
+  assert.doesNotMatch(marked.parse(markdownFromFragment(element('p', [
+    element('span', [text('!')]), link(),
+  ]))), /<img/)
+  const slashBang = marked.parse(markdownFromFragment(element('p', [text('a\\!'), link()])))
+  assert.doesNotMatch(slashBang, /<img/, 'a literal backslash before "!" does not hide it')
+  assert.match(slashBang, /a\\!<a href/)
+
+  const cellWithPipe = element('table', [element('tbody', [
+    element('tr', [element('th', [text('a|b')]), element('th', [element('code', [text('c|d')])])]),
+  ])])
+  assert.equal(markdownFromFragment(cellWithPipe), '| a\\|b | `c\\|d` |\n| --- | --- |',
+    'a pipe in a cell is escaped once, whether it came from text or code')
+})
+
+test('table cells keep code pipes and their backslashes through a GFM round trip', () => {
+  for (const code of ['c|d', 'two\\\\|slashes']) {
+    const table = element('table', [element('tbody', [
+      element('tr', [element('th', [text('a|b')]), element('th', [element('code', [text(code)])])]),
+      element('tr', [element('td', [text('x')]), element('td', [text('y')])]),
+    ])])
+    const html = marked.parse(markdownFromFragment(table))
+    assert.match(html, /<table>/, `${code} keeps the table`)
+    assert.ok(html.includes(`<code>${code}</code>`), `${code} keeps its exact code text: ${html}`)
+    assert.ok(html.includes('<th>a|b</th>'))
+  }
+})
+
+test('a selection inside one nested bullet copies just its text', () => {
+  // Dragging to the end of a bullet's last line also reaches the start of the
+  // next top-level item, so the clone carries both list shells and an empty
+  // trailing item.
+  const selected = 'Only this nested bullet, with a well-known hyphenated word.'
+  const tree = fragment([
+    element('ol', [
+      element('li', [element('ul', [element('li', [text(selected)])])], { value: '1' }),
+      element('li', [text('')], { value: '2' }),
+    ], {}, ['md-list']),
+  ])
+  assert.equal(markdownFromFragment(tree), selected)
+  assert.equal(plainTextFromFragment(tree), selected)
+
+  const cell = fragment([element('table', [element('tbody', [
+    element('tr', [element('td', [text('only '), element('strong', [text('this')])])]),
+  ])])])
+  assert.equal(markdownFromFragment(cell), 'only **this**')
+  assert.equal(plainTextFromFragment(cell), 'only this')
+})
+
+test('layout wrappers and copy-ignored chrome do not keep enclosing structure', () => {
+  // A drag from inside the last table cell to the start of the next block.
+  const tableTail = fragment([
+    element('div', [element('table', [element('tbody', [
+      element('tr', [element('td', [text('st cell')])]),
+    ])])], {}, ['md-table-wrap']),
+    element('p', [text('')]),
+  ])
+  assert.equal(markdownFromFragment(tableTail), 'st cell')
+  assert.equal(plainTextFromFragment(tableTail), 'st cell')
+
+  // A drag from one item to the start of the next item's code block: the
+  // cloned language label is chrome, not selected text.
+  const codeTail = fragment([element('ol', [
+    element('li', [text('One')], { value: '1' }),
+    element('li', [element('div', [
+      element('pre', [
+        element('span', [text('js')], {}, ['md-code-lang']),
+        element('code', [text('')], {}, ['language-js']),
+      ]),
+    ], {}, ['md-code-wrap'])], { value: '2' }),
+  ])])
+  assert.equal(markdownFromFragment(codeTail), 'One')
+  assert.equal(plainTextFromFragment(codeTail), 'One')
+})
+
+test('a list rendered from zero keeps its zero', () => {
+  const tree = element('ol', [
+    element('li', [text('zero')], { value: '0' }),
+    element('li', [text('one')], { value: '1' }),
+  ])
+  assert.equal(markdownFromFragment(tree), '0. zero\n1. one')
+})
+
+test('a selection across list items keeps their rendered numbers', () => {
+  const tree = fragment([
+    element('ol', [
+      element('li', [text('Third')], { value: '3' }),
+      element('li', [
+        text('Fourth'),
+        element('ul', [element('li', [text('detail a')]), element('li', [text('detail b')])]),
+      ], { value: '4' }),
+      element('li', [text(' ')], { value: '5' }),
+    ]),
+  ])
+  assert.equal(markdownFromFragment(tree), [
+    '3. Third',
+    '4. Fourth',
+    '   - detail a',
+    '   - detail b',
+  ].join('\n'))
+  assert.equal(plainTextFromFragment(tree), [
+    '3. Third',
+    '4. Fourth',
+    '   - detail a',
+    '   - detail b',
+  ].join('\n'))
+})
+
+test('rendered ordered list items carry their own number for copy', () => {
+  const blocks = readFileSync(new URL('../markdown/blocks.jsx', import.meta.url), 'utf8')
+  assert.match(blocks, /<li key=\{i\} className="md-list-item" value=\{token\.ordered \? start \+ i : undefined\}>/)
 })
 
 test('composer prefers Markdown unless paste-without-formatting was requested', () => {
