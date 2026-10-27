@@ -2,7 +2,7 @@ import { stripAugmentation } from './msgText.js'
 import { isContinuationMessage, isSideQuestionMessage } from './chatRuntimeState.js'
 import { isAgentWorkBlock } from './activityGrouping.js'
 import { bareControlName } from './toolActivityLabel.js'
-import { repairInterleavedQuestionText } from './streamReducers.js'
+import { renderedBlockEntries, repairInterleavedQuestionText } from './streamReducers.js'
 import { markdownClipboardHtml, plainTextFromFragment } from './markdownClipboard.js'
 import { markdownRangeSource } from './markdown/steerMarkdownRange.js'
 
@@ -78,8 +78,9 @@ function questionCopyText(block) {
  *  copies the question card it ended on, or nothing.
  *
  *  `parts` locate each answer block as rendered: `message` indexes the given
- *  rows and `block` indexes the same repaired blocks MsgContent renders as
- *  `data-markdown-block`, so Copy can read the text the owner sees.
+ *  rows and `block` is the rendered position MsgContent gives it as
+ *  `data-markdown-block` (renderedBlockEntries), so Copy reads the text the
+ *  owner sees.
  *
  *  A failed reply's card owns recovery (Try now, Resume), so the reply offers
  *  no Try again of its own. Its answer is only prose still being written when
@@ -96,7 +97,7 @@ export function replyOutcome(messages) {
     if (msg.hidden || isSystemRow(msg)) return
     const blocks = repairInterleavedQuestionText(Array.isArray(msg.blocks) && msg.blocks.length
       ? msg.blocks : [{ type: 'text', content: msg.content, markdown_range: msg.markdown_range }])
-    blocks.forEach((block, index) => {
+    renderedBlockEntries(blocks).forEach(({ item: block, idx: index }) => {
       if (block?.type === 'error') {
         failed = true
         if (block.message?.trim()) errorMessages.add(block.message.trim())

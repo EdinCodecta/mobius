@@ -243,6 +243,7 @@ import {
 import {
   clearFailedSendAttempt,
   coordinateFailedSendRecovery,
+  sendAttemptIsDurable,
   settleFailedSendConfirmation,
 } from './sendAttemptRecovery.js'
 import {
@@ -1590,6 +1591,15 @@ export default function ChatView({
     pendingQueue.pendingMessagesRef,
     reconcileFailedSendAttempt,
   ])
+  // A send that never took the draft (a reply's Try again) has no
+  // failed-attempt record to reconcile. Once the transcript shows its cid
+  // landed, its "couldn't confirm" banner is stale.
+  const settleDetachedSendConfirmation = useCallback(async (cid, banner) => {
+    await fetchMessages({ force: true, expectedFailedAttempt: null })
+    if (sendAttemptIsDurable({ cid }, messagesRef.current, pendingQueue.pendingMessagesRef.current)) {
+      setSendFailure(current => (current === banner ? null : current))
+    }
+  }, [fetchMessages, messagesRef, pendingQueue.pendingMessagesRef, setSendFailure])
 
   // Active-turn runtime reconciliation. The SSE stream is authoritative for
   // assistant output, but queued-message affordances depend on the durable
@@ -3198,8 +3208,7 @@ export default function ChatView({
     // A send the owner triggers from elsewhere (a reply's Try again) carries
     // its own text and cid: the composer's draft is not its payload, so the
     // send neither clears it, nor restores the sent text into it on failure,
-    // nor reads or writes the failed-attempt record that belongs to that draft
-    // (an unclear failure then only refreshes the transcript).
+    // nor reads or writes the failed-attempt record that belongs to that draft.
     const takesComposerDraft = opts.fromComposer !== false
     const composerFileSnapshot = usesComposerFiles ? [...pendingFiles] : []
     const attachments = Array.isArray(opts.attachments)
@@ -3287,6 +3296,10 @@ export default function ChatView({
       return takesComposerDraft
         ? sendFailureMessage(err, { online })
         : detachedSendFailureMessage(err, { online })
+    }
+    function settleUnconfirmedSend(failedAttempt, banner) {
+      if (takesComposerDraft) void settleAmbiguousSendConfirmation(failedAttempt)
+      else void settleDetachedSendConfirmation(cid, banner)
     }
 
     function revealPendingQuestion() {
@@ -3591,12 +3604,9 @@ export default function ChatView({
           }
           restoreComposerAfterFailedSend()
         }
-        setSendFailure(modelSelectionBlocked
-          ? null
-          : failureMessage(err))
-        if (!keepQueued && isAmbiguousSendFailure(err)) {
-          void settleAmbiguousSendConfirmation(failedAttempt)
-        }
+        const banner = modelSelectionBlocked ? null : failureMessage(err)
+        setSendFailure(banner)
+        if (!keepQueued && isAmbiguousSendFailure(err)) settleUnconfirmedSend(failedAttempt, banner)
         if (modelSelectionBlocked) {
           setModelSelectionRequest(request => request + 1)
         } else if (pendingQuestionBlocked) {
@@ -3828,12 +3838,9 @@ export default function ChatView({
           return next
         })
       }
-      setSendFailure(modelSelectionBlocked
-        ? null
-        : failureMessage(err))
-      if (!keepQueued && isAmbiguousSendFailure(err)) {
-        void settleAmbiguousSendConfirmation(failedAttempt)
-      }
+      const banner = modelSelectionBlocked ? null : failureMessage(err)
+      setSendFailure(banner)
+      if (!keepQueued && isAmbiguousSendFailure(err)) settleUnconfirmedSend(failedAttempt, banner)
       if (modelSelectionBlocked) {
         setModelSelectionRequest(request => request + 1)
         onStreamEndRef.current?.({ continues: false })
@@ -3868,6 +3875,7 @@ export default function ChatView({
     commitMessages,
     fetchMessages,
     settleAmbiguousSendConfirmation,
+    settleDetachedSendConfirmation,
     clearFiles,
     restoreFiles,
     releaseFiles,
@@ -6058,7 +6066,9 @@ export default function ChatView({
       // The latest reply keeps its actions in view; earlier ones reveal on demand.
       metaVisible={last || visibleMessageMetaKey === group.rows[0].key}
       onRevealMeta={showMessageMeta}
-      onTryAgain={last && !turnActive && !hasPendingQuestion ? handleTryAgain : undefined}
+      // A queued message is already the next turn; Try again would only queue behind it.
+      onTryAgain={last && !turnActive && !hasPendingQuestion
+        && pendingQueue.pendingMessages.length === 0 ? handleTryAgain : undefined}
       suppressedQuestionKeys={showActiveAssistantSurface ? streamItemQuestionKeys : null}
       sealedSteerAssistant={active ? sealedSteerAssistant : sealedAssistantBeforeSteer(messages, group.start)}
     />

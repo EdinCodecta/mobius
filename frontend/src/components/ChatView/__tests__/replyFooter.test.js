@@ -226,6 +226,37 @@ test('Copy locates the answer blocks MsgContent renders, after its duplicate-tex
   assert.deepEqual(parts, [{ message: 1, block: 1, markdown: 'Review result' }])
 })
 
+test('Copy numbers answer blocks as they render, past deliverables and a card’s tool twin', () => {
+  // MsgContent renders neither a deliverables block in place nor the tool
+  // call a question or Restart card already shows, so later text blocks carry
+  // a smaller `data-markdown-block` than their raw position. Copy must read
+  // the element that shows its answer, not a neighbour.
+  const replies = [
+    [
+      { type: 'tool', tool: 'Bash', input: { command: 'ls' }, output: 'x' },
+      { type: 'generated_files', files: [{ name: 'report.csv', size: 9, mime_type: 'text/csv' }] },
+      { type: 'text', content: 'The report is attached.' },
+    ],
+    [
+      { type: 'tool', tool: 'AskUserQuestion', input: {} },
+      { type: 'question', question_id: 'merge', questions: [{ question: 'Merge?', options: [{ label: 'Yes' }] }] },
+      { type: 'text', content: 'Merged as asked.' },
+      { type: 'text', content: 'Nothing else changed.' },
+    ],
+  ]
+  for (const blocks of replies) {
+    const message = { role: 'assistant', id: 'run', ts: turn.ts, blocks }
+    const { parts } = replyOutcome([message])
+    const html = renderReply([message])
+    assert.ok(parts.length > 0)
+    for (const part of parts) {
+      const rendered = html.split(`data-markdown-block="${part.block}"`)[1]?.split('data-markdown-block=')[0]
+      assert.ok(rendered?.includes(part.markdown),
+        `block ${part.block} renders “${part.markdown}”`)
+    }
+  }
+})
+
 // Caller eligibility, the real retry click/draft path, and footer flow geometry
 // run in tests/hidden-reply-continuity.spec.mjs against the painted ChatView.
 
