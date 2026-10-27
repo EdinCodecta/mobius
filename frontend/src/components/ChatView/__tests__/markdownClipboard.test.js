@@ -518,6 +518,78 @@ test('a whole one-item list block keeps its marker; a selection inside it does n
   assert.equal(partial.written['text/plain'], 'this')
 })
 
+function multiBlockSelectionFixture(parts) {
+  // Each part is one rendered block: its full text, the text the selection
+  // covers in it, and the clone of that covered range.
+  const blocks = parts.map(({ full, selected, clone }) => {
+    const block = element('div')
+    const overlap = {
+      collapsed: false,
+      setStart: () => {},
+      setEnd: () => {},
+      toString: () => selected,
+      cloneContents: () => fragment([clone]),
+      commonAncestorContainer: block,
+    }
+    block.ownerDocument = {
+      createRange: () => ({
+        selectNodeContents: () => {},
+        cloneRange: () => overlap,
+        toString: () => full,
+      }),
+    }
+    block.contains = () => false
+    return block
+  })
+  const range = {
+    startContainer: blocks[0],
+    endContainer: blocks[blocks.length - 1],
+    intersectsNode: node => blocks.includes(node),
+    toString: () => parts.map(part => part.selected).join('\n'),
+  }
+  const doc = { getSelection: () => ({ rangeCount: 1, isCollapsed: false, getRangeAt: () => range }) }
+  const root = {
+    ownerDocument: doc,
+    contains: node => blocks.includes(node),
+    querySelectorAll: selector => (selector === '[data-markdown-block]' ? blocks : []),
+  }
+  const written = {}
+  const event = {
+    currentTarget: root,
+    clipboardData: { setData: (type, value) => { written[type] = value } },
+    preventDefault() {},
+  }
+  return { event, written, blocks }
+}
+
+test('a selection reaching another block keeps the list or table it cuts through', () => {
+  // A whole paragraph, then the first item of a two-item list.
+  const intoList = multiBlockSelectionFixture([
+    { full: 'Steps:', selected: 'Steps:', clone: element('p', [text('Steps:')]) },
+    {
+      full: 'Do thisThen that',
+      selected: 'Do this',
+      clone: element('ol', [element('li', [text('Do this')], { value: '1' })]),
+    },
+  ])
+  const sources = new Map([[intoList.blocks[0], 'Steps:']])
+  assert.equal(copyMarkdownSelection(intoList.event, block => sources.get(block) || ''), true)
+  assert.equal(intoList.written['text/markdown'], 'Steps:\n\n1. Do this')
+  assert.equal(intoList.written['text/plain'], 'Steps:\n\n1. Do this')
+
+  // One table cell, then the start of the next paragraph.
+  const fromCell = multiBlockSelectionFixture([
+    {
+      full: 'ab',
+      selected: 'b',
+      clone: element('table', [element('tbody', [element('tr', [element('td', [text('b')])])])]),
+    },
+    { full: 'Next words', selected: 'Next', clone: element('p', [text('Next')]) },
+  ])
+  assert.equal(copyMarkdownSelection(fromCell.event, () => ''), true)
+  assert.equal(fromCell.written['text/markdown'], '| b |\n| --- |\n\nNext')
+})
+
 test('a selection contained in one message copies its Markdown source', () => {
   const { event, written } = copySelectionFixture({ endsOutside: false })
   assert.equal(copyMarkdownSelection(event, () => '**Hello**'), true)

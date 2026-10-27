@@ -403,15 +403,20 @@ function selectedMarkdownPayload(root, selection, markdownForBlock) {
   const markdown = []
   const plain = []
   let covered = ''
-  for (const block of blocks) {
-    const overlap = rangeInsideNode(range, block)
-    if (!overlap) continue
+  const overlaps = blocks
+    .map(block => ({ block, overlap: rangeInsideNode(range, block) }))
+    .filter(({ overlap }) => overlap)
+  for (const { block, overlap } of overlaps) {
     covered += overlap.toString()
     const fullRange = block.ownerDocument.createRange()
     fullRange.selectNodeContents(block)
     const selectedAllRenderedText = overlap.toString() === fullRange.toString()
     const clone = cloneRangeWithContext(overlap, block)
-    const fragment = selectedAllRenderedText ? clone : unwrapEnclosingStructure(clone)
+    // Only a selection wholly inside one block is "just this item's text"; a
+    // selection reaching another block keeps the list or table it cuts through.
+    const fragment = overlaps.length === 1 && !selectedAllRenderedText
+      ? unwrapEnclosingStructure(clone)
+      : clone
     const raw = selectedAllRenderedText ? markdownForBlock(block) : ''
     const markdownPart = raw?.trim() || markdownFromFragment(fragment)
     const plainPart = plainTextFromFragment(fragment)
