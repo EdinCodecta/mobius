@@ -36,7 +36,7 @@ function themeVar(name) {
 
 export default function StatusDot({ color, children, className }) {
   // Wrap a literal CSS variable name in var() so callers can
-  // write `color="--green"` rather than `color="var(--green)"`.
+  // write `color="--green-text"` rather than `color="var(--green)"`.
   // Anything else (literal hex, named color, currentColor) passes
   // through unchanged.
   const resolved = color
