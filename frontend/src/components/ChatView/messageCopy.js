@@ -66,8 +66,8 @@ function questionCopyText(block) {
   ].filter(Boolean).join('\n')).filter(Boolean).join('\n\n')
 }
 
-/** What a reply's actions work from: its answer, and whether it ended on a
- *  failure card (an error, a usage limit, a stop) instead of finishing.
+/** What a reply's actions work from: its answer, and the failure card (an
+ *  error, a usage limit, a stop) it ended on instead of finishing, if any.
  *
  *  A turn interleaves short progress notes with tool and thinking activity;
  *  the answer is the last run of prose, read across every visible row of the
@@ -82,22 +82,28 @@ function questionCopyText(block) {
  *  `data-markdown-block` (renderedBlockEntries), so Copy reads the text the
  *  owner sees.
  *
- *  A failed reply's card owns recovery (Try now, Resume), so the reply offers
- *  no Try again of its own. Its answer is only prose still being written when
- *  it failed: a note followed by more work was narration, not an answer, and
- *  a provider's text that repeats the error message is the error itself. */
+ *  A failed reply's answer is only prose still being written when it failed:
+ *  a note followed by more work was narration, not an answer, and a
+ *  provider's text that repeats the error message is the error itself.
+ *
+ *  `endingError` is the error card rendered last in the reply's last visible
+ *  row, the only place a card can own recovery (`ownsRecoveryAction`). */
 export function replyOutcome(messages) {
   let parts = []
   let workedSinceRun = false
   let realWorkSinceRun = false
   let endingQuestion = null
   let failed = false
+  let endingError = null
   const errorMessages = new Set()
   messages.forEach((msg, message) => {
-    if (msg.hidden || isSystemRow(msg)) return
+    if (msg.hidden) return
+    endingError = null
+    if (isSystemRow(msg)) return
     const blocks = repairInterleavedQuestionText(Array.isArray(msg.blocks) && msg.blocks.length
       ? msg.blocks : [{ type: 'text', content: msg.content, markdown_range: msg.markdown_range }])
     renderedBlockEntries(blocks).forEach(({ item: block, idx: index }) => {
+      endingError = block?.type === 'error' ? block : null
       if (block?.type === 'error') {
         failed = true
         if (block.message?.trim()) errorMessages.add(block.message.trim())
@@ -131,7 +137,7 @@ export function replyOutcome(messages) {
     const question = endingQuestion && questionCopyText(endingQuestion)
     parts = question ? [{ markdown: question }] : []
   }
-  return { answer: parts.map(part => part.markdown).join('\n\n'), failed, parts }
+  return { answer: parts.map(part => part.markdown).join('\n\n'), endingError, parts }
 }
 
 function renderedTextBlock(replyElement, rowKey, block) {

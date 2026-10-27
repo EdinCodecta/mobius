@@ -14,7 +14,7 @@ export default function MessageMetaRow({
   side = 'end',
   visible,
 }) {
-  if (!timestamp && !copy) return null
+  if (!timestamp && !copy && !onTryAgain) return null
 
   // CSS visibility owns hiding: a hidden row leaves the focus order and the
   // accessibility tree, and a hover-revealed one rejoins both.

@@ -56,7 +56,7 @@ test.describe('reply footer', () => {
     test(`a ${state} conversation does not offer Try again on its settled reply`, async ({ page }) => {
       const f = await mountReplyFooter(page, BASE, { [state]: true })
       // Copy remains: this checks ChatView's caller policy, not the child's
-      // existing suppression of actions on a streaming/failed reply.
+      // own suppression on a streaming reply or one whose card owns recovery.
       await expect(f.replies.last().getByRole('button', { name: 'Copy message' })).toBeVisible()
       await expect(f.surface.getByRole('button', { name: 'Try again', includeHidden: true })).toHaveCount(0)
     })

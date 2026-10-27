@@ -5,6 +5,7 @@ import MsgContent from './MsgContent.jsx'
 import MessageSources from './MessageSources.jsx'
 import MessageMetaRow from './MessageMetaRow.jsx'
 import { renderedReplyClipboard, replyOutcome } from './messageCopy.js'
+import { ownsRecoveryAction } from './recoveryCard.js'
 import { carryDurableBlockState, streamItemsToAssistantPayload } from './streamPromotion.js'
 import { projectSteerContinuationMessage } from './steerContinuity.js'
 import { mergeProjectedActivity } from './peerTimeline.js'
@@ -79,9 +80,22 @@ function AssistantReply({
 
   const lastVisibleRow = rows.findLastIndex(row => !row.message.hidden)
   const metaKey = presentationRows[0].key
+  // An error card that owns recovery already offers Try now or Resume. Any
+  // other failure (a plain provider error) leaves Try again as the way on.
+  const cardOwnsRecovery = ownsRecoveryAction({
+    block: outcome?.endingError,
+    // endingError is by definition the last row's last rendered entry.
+    entryIndex: 0,
+    lastEntryIndex: 0,
+    isLastMessage: isLastMsg,
+    canResume: !!messageProps.onResume,
+  })
+  const tryAgain = outcome && onTryAgain && !cardOwnsRecovery
+    ? () => onTryAgain(metaKey) : undefined
+  const hasActions = !!(answerText || tryAgain)
   return <PeerTimelineContext.Provider value={displayTimeline}><li
     className="chat__reply"
-    onClick={answerText && onRevealMeta ? event => onRevealMeta(event, metaKey) : undefined}
+    onClick={hasActions && onRevealMeta ? event => onRevealMeta(event, metaKey) : undefined}
     // The whole active reply is the current response: activity presentation may
     // move its live tools into an earlier row than the streaming one.
     data-current-response={activeRowIndex >= 0 ? 'true' : undefined}
@@ -137,12 +151,12 @@ function AssistantReply({
       refs={sourceRows.flatMap(row => row.message.source_ref ? [row.message.source_ref] : [])}
       disclosureKey={`${rows[lastVisibleRow].key}:references`}
     />}
-    {answerText && <MessageMetaRow
+    {hasActions && <MessageMetaRow
       timestamp={presentationRows[0].message.ts}
-      copy={button => renderedReplyClipboard(
+      copy={answerText ? button => renderedReplyClipboard(
         button.closest('.chat__reply'), rows.map(row => row.key), outcome.parts,
-      )}
-      onTryAgain={outcome.failed || !onTryAgain ? undefined : () => onTryAgain(metaKey)}
+      ) : undefined}
+      onTryAgain={tryAgain}
       side="start"
       visible={metaVisible}
     />}

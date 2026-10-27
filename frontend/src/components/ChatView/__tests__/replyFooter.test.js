@@ -26,8 +26,8 @@ const { PeerTimelineContext } = await vite.ssrLoadModule('/src/components/ChatVi
 const { replyOutcome } = await vite.ssrLoadModule('/src/components/ChatView/messageCopy.js')
 const replyAnswerText = messages => replyOutcome(messages).answer
 const summary = messages => {
-  const { answer, failed } = replyOutcome(messages)
-  return { answer, failed }
+  const { answer, endingError } = replyOutcome(messages)
+  return { answer, failed: !!endingError }
 }
 
 const turn = {
@@ -272,7 +272,7 @@ test('a reply ending on a failure card leaves recovery to that card', () => {
   )
   assert.deepEqual(summary([parked]), { answer: '', failed: true },
     'the provider’s echo of the limit is the error, not an answer')
-  assert.equal(metaRows(renderReply([parked], { onTryAgain: () => {} })).length, 0)
+  assert.equal(metaRows(renderReply([parked], { onTryAgain: () => {}, onResume: () => {} })).length, 0)
 })
 
 test('a stopped reply copies only the answer it was still writing, never Try again', () => {
@@ -288,9 +288,51 @@ test('a stopped reply copies only the answer it was still writing, never Try aga
     { type: 'error', message: 'The agent stopped before finishing this turn.', resumable: true },
   )
   assert.deepEqual(summary([partial]), { answer: 'The board is up to', failed: true })
-  const html = renderReply([partial], { metaVisible: true, onTryAgain: () => {} })
+  const html = renderReply([partial], { metaVisible: true, onTryAgain: () => {}, onResume: () => {} })
   assert.match(html, /aria-label="Copy message"/)
   assert.doesNotMatch(html, /aria-label="Try again"/)
+})
+
+test('an error card that cannot recover leaves Try again to the latest reply', () => {
+  // Only a resumable tail card owns recovery (ownsRecoveryAction); a plain
+  // provider error shows neither Try now nor Resume.
+  const latest = { metaVisible: true, onTryAgain: () => {}, onResume: () => {} }
+  const providerError = failedReply(
+    { type: 'tool', name: 'Bash' },
+    { type: 'error', message: 'The provider returned an error.' },
+  )
+  const row = html => html.slice(html.indexOf('class="chat__msg-meta'))
+  const bare = row(renderReply([providerError], latest))
+  assert.match(bare, /aria-label="Try again"/)
+  assert.doesNotMatch(bare, /aria-label="Copy message"/,
+    'no answer, so the row has nothing to copy (the error card copies its own message)')
+  assert.match(bare, /<time class="chat__ts">/)
+  const partial = failedReply(
+    { type: 'text', content: 'The board is up to' },
+    { type: 'error', message: 'The provider returned an error.' },
+  )
+  const html = row(renderReply([partial], latest))
+  assert.match(html, /aria-label="Copy message"/)
+  assert.match(html, /aria-label="Try again"/)
+})
+
+test('a resumable error card owns recovery only where it can act', () => {
+  const stopped = failedReply(
+    { type: 'tool', name: 'Bash' },
+    { type: 'error', message: 'The agent stopped before finishing this turn.', resumable: true },
+  )
+  assert.equal(metaRows(renderReply([stopped], { onTryAgain: () => {}, onResume: () => {} })).length, 0,
+    'its Resume is the way on')
+  assert.match(renderReply([stopped], { onTryAgain: () => {} }), /aria-label="Try again"/,
+    'without a Resume path the card offers nothing, so Try again does')
+})
+
+test('an error card above a later row does not end the reply', () => {
+  const later = { role: 'assistant', id: 'later', ts: turn.ts, kind: 'compaction', blocks: [] }
+  const { endingError } = replyOutcome([failedReply(
+    { type: 'error', message: 'Interrupted', resumable: true },
+  ), later])
+  assert.equal(endingError, null)
 })
 
 test('an error the reply recovered from does not count as failing', () => {
