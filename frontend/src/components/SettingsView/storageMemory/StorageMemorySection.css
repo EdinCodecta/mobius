@@ -31,11 +31,28 @@
 .storage-memory__toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
 .storage-memory__toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
 
+/* Details toggle and sync share one row that stays put when details open.
+   The refresh icon's right edge lines up with the meters above. */
+.storage-memory__controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.storage-memory__sync { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.storage-memory__sync-label { color: var(--muted); font-size: 12px; line-height: 1.5; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.storage-memory__refresh {
+  position: relative; display: inline-grid; place-items: center; flex: none; width: 32px; height: 32px; padding: 0;
+  border: 1px solid var(--border); border-radius: 8px; background: none; color: var(--muted); cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+/* 44px touch target around the 32px visible button. */
+.storage-memory__refresh::before { content: ""; position: absolute; inset: -6px; }
+.storage-memory__refresh:hover:not(:disabled) { color: var(--text); border-color: var(--muted); }
+.storage-memory__refresh:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.storage-memory__refresh:disabled { cursor: default; }
+.storage-memory__refresh[aria-busy="true"] svg { animation: storage-memory-spin 0.9s linear infinite; }
+@keyframes storage-memory-spin { to { transform: rotate(360deg); } }
+
 /* Details: three bands split by edge-to-edge rules, so each group reads as
    its own part of the box without nesting cards. */
 .storage-memory__details { display: grid; margin-top: -2px; }
-.storage-memory__group,
-.storage-memory__footer { margin-inline: calc(-1 * var(--storage-memory-inset)); padding: 16px var(--storage-memory-inset); border-top: 1px solid var(--border); }
+.storage-memory__group { margin-inline: calc(-1 * var(--storage-memory-inset)); padding: 16px var(--storage-memory-inset); border-top: 1px solid var(--border); }
 .storage-memory__group-head { display: flex; align-items: flex-start; gap: 12px; }
 /* Settings buttons pin to the top (align-self: flex-start); the size shares
    their 32px line so both stay level beside a wrapping helper. */
@@ -95,7 +112,7 @@
 .storage-memory__turn-meta .status-dot { font-size: inherit; font-weight: 400; color: var(--muted); }
 .storage-memory__chat-link { display: inline-flex; align-items: center; min-height: 44px; min-width: 44px; padding: 4px 0; border: 0; background: none; color: var(--accent); font: inherit; font-size: 12.5px; cursor: pointer; }
 .storage-memory__chat-link:focus-visible, .storage-memory__memory-details summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
-.storage-memory__empty { display: grid; gap: 4px; padding: 16px 0; font-size: 13px; }
+.storage-memory__empty { margin: 0; padding: 14px 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
 .storage-memory__memory-details { margin-top: 4px; border-top: 1px solid var(--border); }
 .storage-memory__memory-details summary { color: var(--accent); font-size: 12.5px; cursor: pointer; min-height: 44px; padding-block: 12px; }
 .storage-memory__memory-use { display: grid; margin: 8px 0 4px; font-size: 13px; }
@@ -107,9 +124,8 @@
 .storage-memory__memory-use dt { color: var(--muted); }
 .storage-memory__memory-use dd { margin: 0; }
 
-.storage-memory__footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: calc(-1 * var(--storage-memory-bottom)); }
-.storage-memory__freshness { display: grid; gap: 2px; }
-.storage-memory__footer > .settings__btn { margin-left: auto; }
+/* The last band sits flush on the box's bottom edge, like the rules above it. */
+.storage-memory__details > :last-child { margin-bottom: calc(-1 * var(--storage-memory-bottom)); }
 .storage-memory__notice { padding: 12px 14px; border-radius: 8px; border-left: 3px solid var(--color-text-warning, #b45309); font-size: 13px; background: var(--color-background-warning-soft-alpha, rgba(245, 158, 11, .12)); }
 .storage-memory__notice p { margin: 4px 0 0; font-size: 12.5px; line-height: 1.5; }
 .storage-memory__notice--danger { border-left-color: var(--danger); background: var(--color-background-danger-soft-alpha, rgba(248, 113, 113, .12)); }
@@ -136,10 +152,11 @@
 @container settings (max-width: 420px) {
   .storage-memory__item { grid-template-columns: minmax(0, 1fr) auto auto; }
   .storage-memory__memory-use div { grid-template-columns: minmax(0, 1fr) auto; }
-  .storage-memory__footer, .storage-memory-kept__contribute { flex-wrap: wrap; }
+  .storage-memory-kept__contribute { flex-wrap: wrap; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .storage-memory__fill, .storage-memory__toggle svg,
   .storage-memory__drawer, .storage-memory__drawer-inner { transition: none; }
+  .storage-memory__refresh[aria-busy="true"] svg { animation: none; }
 }

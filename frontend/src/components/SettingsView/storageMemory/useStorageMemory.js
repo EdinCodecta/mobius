@@ -6,13 +6,11 @@ export default function useStorageMemory({ active }) {
   const [overview, setOverview] = useState(null)
   const [error, setError] = useState('')
   const [measuring, setMeasuring] = useState(false)
-  const [checkedAt, setCheckedAt] = useState(null)
 
   const load = useCallback(async ({ refresh = false } = {}) => {
     if (refresh) setMeasuring(true)
     try {
       setOverview(await api.resources.overview({ refresh }))
-      setCheckedAt(new Date().toISOString())
       setError('')
     } catch (err) {
       setError(err?.message || 'Storage and memory are unavailable right now.')
@@ -30,7 +28,6 @@ export default function useStorageMemory({ active }) {
   const clear = useCallback(async (target) => {
     const result = await api.resources.runCleanup(target)
     setOverview(result.resources)
-    setCheckedAt(new Date().toISOString())
     setError('')
     return result
   }, [])
@@ -55,7 +52,6 @@ export default function useStorageMemory({ active }) {
     overview,
     error,
     measuring,
-    checkedAt,
     measure: () => load({ refresh: true }),
     preview,
     clear,

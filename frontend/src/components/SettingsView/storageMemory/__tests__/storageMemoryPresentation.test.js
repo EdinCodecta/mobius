@@ -2,8 +2,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
-  CLEANUP_COPY, GROUP_COPY, boxStatus, formatBytes, keptDescription, keptTotal, measuredLabel, memoryMeter,
-  previewSentence, resultSentence, storageMeter, memoryCheckedLabel, memoryGroupLabel, runningTurnTitle, storedSize, resourceWarning,
+  CLEANUP_COPY, GROUP_COPY, boxStatus, formatBytes, keptDescription, keptTotal, memoryMeter,
+  previewSentence, resultSentence, storageMeter, syncedLabel, memoryGroupLabel, runningTurnTitle, storedSize, resourceWarning,
 } from '../storageMemoryPresentation.js'
 
 test('sizes use the decimal units the storage alert and hosts use', () => {
@@ -57,14 +57,16 @@ test('the result says what was freed, what is free now, and any skip', () => {
   )
 })
 
-test('measurement age reads plainly', () => {
+test('sync age reads as a short relative time', () => {
   const now = Date.parse('2026-10-26T15:30:00Z')
-  assert.equal(measuredLabel('2026-10-26T15:30:00+00:00', now), 'Folder sizes: just measured')
-  assert.equal(measuredLabel('2026-10-26T15:18:00+00:00', now), 'Folder sizes: 12m ago')
-  assert.equal(measuredLabel(null, now), 'Folder sizes not measured yet')
-  assert.equal(memoryCheckedLabel('2026-10-26T15:30:00Z', now), 'Memory: just checked')
-  assert.equal(memoryCheckedLabel('2026-10-26T15:18:00Z', now), 'Memory: checked 12m ago')
-  assert.equal(memoryCheckedLabel(null, now), 'Memory not checked yet')
+  assert.equal(syncedLabel({ measuredAt: '2026-10-26T15:30:00+00:00' }, now), 'Synced just now')
+  assert.equal(syncedLabel({ measuredAt: '2026-10-26T15:29:00Z' }, now), 'Synced 1m ago')
+  assert.equal(syncedLabel({ measuredAt: '2026-10-26T14:50:00Z' }, now), 'Synced 40m ago')
+  assert.equal(syncedLabel({ measuredAt: '2026-10-26T12:30:00Z' }, now), 'Synced 3h ago')
+  assert.equal(syncedLabel({ measuredAt: '2026-10-25T15:00:00Z' }, now), 'Synced 1d ago')
+  assert.equal(syncedLabel({ measuredAt: null }, now), 'Not synced yet')
+  assert.equal(syncedLabel({ measuredAt: '2026-10-26T15:00:00Z', measuring: true }, now), 'Syncing…')
+  assert.equal(syncedLabel({ measuredAt: '2026-10-26T15:00:00Z', failed: true }, now), 'Sync failed')
 })
 
 test('every Clear group promises chats, apps and app data stay', () => {

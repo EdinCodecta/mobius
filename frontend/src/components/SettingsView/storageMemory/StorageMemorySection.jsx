@@ -1,9 +1,9 @@
 /* Settings box that shows storage and memory and frees space without an agent. */
 import { useEffect, useRef, useState } from 'react'
-import { ChevronDown } from '@openai/apps-sdk-ui/components/Icon'
+import { ArrowRotateCw, ChevronDown } from '@openai/apps-sdk-ui/components/Icon'
 import StorageMemoryDetails from './StorageMemoryDetails.jsx'
 import useStorageMemory from './useStorageMemory.js'
-import { boxStatus, memoryMeter, resourceWarning, storageMeter } from './storageMemoryPresentation.js'
+import { boxStatus, memoryMeter, resourceWarning, storageMeter, syncedLabel } from './storageMemoryPresentation.js'
 import './StorageMemorySection.css'
 
 function ResourceMeter({ meter }) {
@@ -35,6 +35,31 @@ function ResourceNotice({ resources, warning, onReveal }) {
     <div className={`storage-memory__notice storage-memory__notice--${warning.tone}`}>
       <strong>{warning.title}</strong><p>{warning.description}</p>
       <div className="storage-memory__notice-actions">{warning.actions.map(action => <button key={action.group} type="button" className="storage-memory__chat-link" onClick={() => onReveal(action.group)}>{action.label}</button>)}</div>
+    </div>
+  )
+}
+
+// Re-renders on a slow tick so "Synced 3m ago" keeps counting while open.
+function useMinuteClock() {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 30_000)
+    return () => clearInterval(timer)
+  }, [])
+  return now
+}
+
+function SyncControl({ resources }) {
+  const now = useMinuteClock()
+  const { overview, measuring, error } = resources
+  const label = syncedLabel({ measuredAt: overview?.measured_at, measuring, failed: Boolean(error) }, now)
+  return (
+    <div className="storage-memory__sync">
+      <span className="storage-memory__sync-label">{label}</span>
+      <button type="button" className="storage-memory__refresh" onClick={resources.measure} disabled={measuring}
+        aria-label="Refresh storage and memory" title="Refresh storage and memory" aria-busy={measuring}>
+        <ArrowRotateCw width={16} height={16} aria-hidden="true" />
+      </button>
     </div>
   )
 }
@@ -80,16 +105,19 @@ export function StorageMemorySectionView({ resources, focusRequest, onOpenApp, o
         ? <ResourceMeter meter={memoryMeter(overview.memory)} />
         : <p className="storage-memory__note">Memory reading unavailable right now.</p>)}
       {overview && (
-        <button
-          type="button"
-          className="storage-memory__toggle"
-          aria-expanded={expanded}
-          aria-controls="storage-memory-details"
-          onClick={() => setExpanded(open => !open)}
-        >
-          <span>{expanded ? 'Hide details' : 'Show details'}</span>
-          <ChevronDown width={16} height={16} aria-hidden="true" />
-        </button>
+        <div className="storage-memory__controls">
+          <button
+            type="button"
+            className="storage-memory__toggle"
+            aria-expanded={expanded}
+            aria-controls="storage-memory-details"
+            onClick={() => setExpanded(open => !open)}
+          >
+            <span>{expanded ? 'Hide details' : 'Show details'}</span>
+            <ChevronDown width={16} height={16} aria-hidden="true" />
+          </button>
+          <SyncControl resources={resources} />
+        </div>
       )}
       {expanded && overview && <div ref={detailsRef}><StorageMemoryDetails id="storage-memory-details" resources={resources} onOpenApp={onOpenApp} onOpenChat={onOpenChat} inertBoundaryRef={inertBoundaryRef} /></div>}
     </section>

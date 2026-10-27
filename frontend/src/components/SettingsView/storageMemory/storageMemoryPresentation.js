@@ -174,13 +174,11 @@ export function resultSentence(cleanup, storage) {
   return `${freed}${free}${cleanup.note ? ` ${cleanup.note}` : ''}`
 }
 
-export function measuredLabel(measuredAt, now = Date.now()) {
+/** The refresh row's freshness: folder sizes are the slowest reading to go stale. */
+export function syncedLabel({ measuredAt, measuring = false, failed = false }, now = Date.now()) {
+  if (measuring) return 'Syncing…'
+  if (failed) return 'Sync failed'
   const relative = measuredAt ? formatRelativeTime(measuredAt, now) : ''
-  if (!relative) return 'Folder sizes not measured yet'
-  return `Folder sizes: ${relative === 'now' ? 'just measured' : relative}`
-}
-
-export function memoryCheckedLabel(checkedAt, now = Date.now()) {
-  const relative = checkedAt ? formatRelativeTime(checkedAt, now) : ''
-  return relative ? `Memory: ${relative === 'now' ? 'just checked' : `checked ${relative}`}` : 'Memory not checked yet'
+  if (!relative) return 'Not synced yet'
+  return `Synced ${relative === 'now' ? 'just now' : relative}`
 }

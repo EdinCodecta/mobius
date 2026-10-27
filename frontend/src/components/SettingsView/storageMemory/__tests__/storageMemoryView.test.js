@@ -18,7 +18,7 @@ const overview = {
   kept: [{ id: 'apps', bytes: 190e6, label: 'Apps' }],
   running: [{ chat_id: 'example', title: 'A running example' }],
 }
-const resources = { overview, checkedAt: '2026-10-27T08:00:00Z', measuring: false, error: '', stopTurn: () => {} }
+const resources = { overview, measuring: false, error: '', stopTurn: () => {} }
 const render = (Component, extra = {}) => renderToStaticMarkup(createElement(Component, { resources, ...extra }))
 
 test('running work leads the optional memory accounting and has explicit navigation and Stop', () => {
@@ -41,13 +41,25 @@ test('closed confirmations are inert and their buttons are not approval', () => 
   assert.match(html, /only ones older than 2 days clear/)
 })
 
-test('empty work still explains background memory and leaves the breakdown available', () => {
+test('empty work shows one quiet line and leaves the breakdown available', () => {
   const html = render(Details, { resources: { ...resources, overview: { ...overview, running: [] } } })
   assert.match(html, /0 turns/)
-  assert.match(html, /No agent turns running/)
-  assert.match(html, /Möbius and other processes still use memory/)
+  assert.match(html, /<p class="storage-memory__empty">No agents running<\/p>/)
+  assert.doesNotMatch(html, /No agent turns running|still use memory/)
   assert.match(html, /What is using memory/)
   assert.doesNotMatch(html, /Stop turn:/)
+})
+
+test('the details toggle and refresh share one always-visible row', () => {
+  const collapsed = render(StorageMemorySectionView)
+  const row = collapsed.match(/<div class="storage-memory__controls">[\s\S]*?<\/button><\/div><\/div>/)[0]
+  assert.match(row, /Show details/)
+  assert.match(row, /<span class="storage-memory__sync-label">Synced /)
+  assert.match(row, /aria-label="Refresh storage and memory"/)
+  assert.doesNotMatch(render(Details), /Measure again|storage-memory__footer/)
+  const busy = render(StorageMemorySectionView, { resources: { ...resources, measuring: true } })
+  assert.match(busy, /Syncing…/)
+  assert.match(busy, /aria-label="Refresh storage and memory"[^>]*disabled=""|disabled=""[^>]*aria-label="Refresh storage and memory"/)
 })
 
 test('both collapsed meters express used capacity and expose pause information', () => {

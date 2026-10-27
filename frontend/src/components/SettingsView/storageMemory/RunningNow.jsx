@@ -88,7 +88,7 @@ export default function RunningNow({ memory, running, onStop, onOpenChat }) {
       </div>
       {stoppedTitle && <p className="storage-memory__note" role="status">Stopped “{stoppedTitle}”. Your messages stay.</p>}
       {running.length ? <ul className="storage-memory__turns">{running.map(turn => <RunningTurnRow key={turn.chat_id} turn={{ ...turn, title: runningTurnTitle(turn.title) }} onStop={stop} onOpenChat={onOpenChat} />)}</ul>
-        : <div className="storage-memory__empty"><strong>No agent turns running</strong><p className="storage-memory__note">Möbius and other processes still use memory.</p></div>}
+        : <p className="storage-memory__empty">No agents running</p>}
       <MemoryBreakdown memory={memory} />
     </section>
   )

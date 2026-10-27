@@ -14,16 +14,13 @@ function install(t) {
   return renderHook(useStorageMemory, { active: false })
 }
 
-test('successful reads record freshness and failed remeasurement preserves the prior snapshot', async t => {
+test('a failed remeasurement preserves the prior snapshot', async t => {
   const { result } = install(t)
   await result.current.measure()
   assert.equal(result.current.overview, snapshot)
-  assert.ok(result.current.checkedAt)
-  const checkedAt = result.current.checkedAt
   api.resources.overview = async () => { throw new Error('Disk reading failed') }
   await result.current.measure()
   assert.equal(result.current.overview, snapshot)
-  assert.equal(result.current.checkedAt, checkedAt)
   assert.equal(result.current.error, 'Disk reading failed')
   assert.equal(result.current.measuring, false)
   api.resources.overview = async () => snapshot
@@ -36,7 +33,6 @@ test('a failed first reading stays absent and can be retried', async t => {
   api.resources.overview = async () => { throw new Error('Unavailable') }
   await result.current.measure()
   assert.equal(result.current.overview, null)
-  assert.equal(result.current.checkedAt, null)
   api.resources.overview = async () => snapshot
   await result.current.measure()
   assert.equal(result.current.overview, snapshot)
@@ -50,7 +46,6 @@ test('cleanup uses its returned reading and clears an earlier measurement error'
   const outcome = await result.current.clear('agent_sessions')
   assert.equal(outcome.cleanup.bytes, 684)
   assert.equal(result.current.overview, snapshot)
-  assert.ok(result.current.checkedAt)
   assert.equal(result.current.error, '')
 })
 
@@ -80,11 +75,9 @@ test('Settings asks the server to refuse when typed messages are queued, then re
 test('successful Stop followed by a failed read leaves a visible stale-reading error', async t => {
   const { result } = install(t)
   await result.current.measure()
-  const checkedAt = result.current.checkedAt
   api.resources.overview = async () => { throw new Error('Memory reading failed') }
   await result.current.stopTurn('example')
   assert.equal(result.current.overview, snapshot)
-  assert.equal(result.current.checkedAt, checkedAt)
   assert.equal(result.current.error, 'Memory reading failed')
 })
 

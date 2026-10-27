@@ -1,9 +1,9 @@
-/* The expandable part of Storage and Memory: clear, running now, kept, and measure. */
+/* The expandable part of Storage and Memory: clear, running now, and kept. */
 import { useRef, useState } from 'react'
 import CleanupRow from './CleanupRow.jsx'
 import KeptStorageDialog from './KeptStorageDialog.jsx'
 import RunningNow from './RunningNow.jsx'
-import { GROUP_COPY, formatBytes, keptTotal, measuredLabel, memoryCheckedLabel } from './storageMemoryPresentation.js'
+import { GROUP_COPY, formatBytes, keptTotal } from './storageMemoryPresentation.js'
 
 function GroupHead({ group, children }) {
   const copy = GROUP_COPY[group]
@@ -37,7 +37,7 @@ function KeptSummary({ kept, onOpenApp, inertBoundaryRef }) {
 }
 
 export default function StorageMemoryDetails({ id, resources, onOpenApp, onOpenChat, inertBoundaryRef }) {
-  const { overview, measuring } = resources
+  const { overview } = resources
   return (
     <div id={id} className="storage-memory__details">
       <section className="storage-memory__group" data-resource-group="clear" tabIndex={-1} aria-label={GROUP_COPY.clear.title}>
@@ -48,15 +48,6 @@ export default function StorageMemoryDetails({ id, resources, onOpenApp, onOpenC
       </section>
       <RunningNow memory={overview.memory} running={overview.running} onStop={resources.stopTurn} onOpenChat={onOpenChat} />
       <KeptSummary kept={overview.kept} onOpenApp={onOpenApp} inertBoundaryRef={inertBoundaryRef} />
-      <div className="storage-memory__footer">
-        <span className="storage-memory__note storage-memory__freshness">
-          <span>{resources.error ? 'Previous memory reading' : memoryCheckedLabel(resources.checkedAt)}</span>
-          <span>{measuring ? 'Measuring folder sizes…' : measuredLabel(overview.measured_at)}</span>
-        </span>
-        <button type="button" className="settings__btn settings__btn--outline settings__btn--sm" onClick={resources.measure} disabled={measuring}>
-          {measuring ? 'Measuring…' : 'Measure again'}
-        </button>
-      </div>
     </div>
   )
 }
