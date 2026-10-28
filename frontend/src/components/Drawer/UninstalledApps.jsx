@@ -1,9 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client.js'
 import { appQueries } from '../../hooks/queries.js'
 import AppIcon from '../AppIcon.jsx'
-import { expiryLabel, expiryTone, recoverErrorMessage, removedLabel } from './uninstalledApps.js'
+import { expiryCountdown, recoverErrorMessage, removedLabel } from './uninstalledApps.js'
 import './UninstalledApps.css'
 
 // Apps that were uninstalled but are still in their recovery window. Hidden
@@ -13,8 +13,23 @@ export default function UninstalledApps() {
   const { data: rows = [] } = appQueries.uninstalled.useQuery()
   const [busyId, setBusyId] = useState(null)
   const [error, setError] = useState('')
+  const [now, setNow] = useState(() => Date.now())
 
-  if (rows.length === 0) return null
+  // A row leaves the list the moment its countdown reaches zero, the same
+  // instant the server starts refusing to recover it.
+  const live = rows
+    .map(row => ({ row, countdown: expiryCountdown(row.expires_at, now) }))
+    .filter(entry => entry.countdown)
+  const nextChange = Math.min(...live.map(entry => entry.countdown.nextChangeIn))
+
+  // Wake once, when the soonest label changes: at most a few times a day.
+  useEffect(() => {
+    if (!Number.isFinite(nextChange)) return undefined
+    const timer = setTimeout(() => setNow(Date.now()), nextChange)
+    return () => clearTimeout(timer)
+  }, [now, nextChange])
+
+  if (live.length === 0) return null
 
   async function recover(row) {
     setBusyId(row.id)
@@ -40,7 +55,7 @@ export default function UninstalledApps() {
     <section className="uninstalled-apps" aria-labelledby="uninstalled-apps-title">
       <div className="uninstalled-apps__head">
         <h2 id="uninstalled-apps-title">
-          Recently uninstalled <span className="uninstalled-apps__count">{rows.length}</span>
+          Recently uninstalled <span className="uninstalled-apps__count">{live.length}</span>
         </h2>
         <p>
           You can recover an uninstalled app, with its data, for 7 days. After that it is
@@ -48,8 +63,8 @@ export default function UninstalledApps() {
         </p>
       </div>
       <ul className="uninstalled-apps__list">
-        {rows.map(row => {
-          const tone = expiryTone(row.expires_at)
+        {live.map(({ row, countdown }) => {
+          const { tone } = countdown
           return (
             <li className="uninstalled-apps__row" key={row.id}>
               <AppIcon
@@ -69,7 +84,7 @@ export default function UninstalledApps() {
                 <span>{removedLabel(row.deleted_at)}</span>
               </div>
               <span className={`uninstalled-apps__expiry${tone ? ` is-${tone}` : ''}`}>
-                {expiryLabel(row.expires_at)}
+                {countdown.label}
               </span>
               <button
                 type="button"
