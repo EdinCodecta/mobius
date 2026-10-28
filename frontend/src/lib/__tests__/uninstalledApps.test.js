@@ -46,6 +46,7 @@ test('the section lists each uninstalled app with a Recover button, and is absen
   assert.match(html, /Kanban/)
   assert.match(html, /aria-label="Recover News"/)
   assert.match(html, /aria-label="Recover Kanban"/)
-  assert.match(html, /recover an app for 7 days/)
+  assert.match(html, /recover an uninstalled app, with its data, for 7 days/)
+  assert.doesNotMatch(html, /permission/)
   assert.doesNotMatch(html, /for good/)
 })
