@@ -482,11 +482,18 @@ async def list_community_apps(
   q: str = Query(default="", max_length=160),
   limit: int = Query(default=50, ge=1, le=100),
   offset: int = Query(default=0, ge=0, le=10_000),
+  sort: Literal["updated", "trending", "installs"] = "updated",
   _: models.Owner = Depends(get_owner_or_app_with_manage_apps),
 ) -> JSONResponse:
+  """List community apps, newest update first or as a registry ranking.
+
+  Install counts stay in the registry; a ranking returns only the order of
+  apps that clear its public minimum. The registry echoes `sort`, so a client
+  can tell a ranking from an older registry that ignored the parameter.
+  """
   return await _request(
     "GET", f"{COMMUNITY_PREFIX}/apps",
-    params={"q": q, "limit": limit, "offset": offset},
+    params={"q": q, "limit": limit, "offset": offset, "sort": sort},
   )
 
 
