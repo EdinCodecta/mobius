@@ -1,8 +1,8 @@
 // Another browser's folders each say what agents can do with that folder, not what its browser is doing.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { otherFolderStatus } from '../sharedFolderLabels.js'
-import { groupByDevice } from '../useOtherDeviceFolders.js'
+import { otherFolderStatus } from '../../../components/SettingsView/sharedFolderLabels.js'
+import { groupByDevice } from '../../../components/SettingsView/useOtherDeviceFolders.js'
 
 const device = { id: 'laptop', label: 'Chrome on Windows' }
 const folder = (id, state, online = true) => ({ id, name: id, state, online, device })
