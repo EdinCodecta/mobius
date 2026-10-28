@@ -1130,6 +1130,8 @@ export const api = {
   },
   apps: {
     list: (options = {}) => apiFetch('/apps/', options),
+    // Apps in their 7-day recovery window (undo with `recover`, below).
+    uninstalled: (options = {}) => apiFetch('/apps/uninstalled', options),
     chatArtifacts: (chatId, options = {}) => apiFetch(
       `/apps/chat-artifacts/${encodeURIComponent(chatId)}`,
       options,

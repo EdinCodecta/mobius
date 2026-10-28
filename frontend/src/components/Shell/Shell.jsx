@@ -14,6 +14,7 @@ import {
   SettingsNavIcon,
 } from '../navigationIcons.js'
 import Drawer from '../Drawer/Drawer.jsx'
+import { refreshUninstalledForSystemEvent } from '../Drawer/uninstalledAppsEvents.js'
 import {
   copyChatSettings as copyNewChatSettings,
   withCopiedSettings,
@@ -3183,10 +3184,12 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       }
       void chatAppArtifactQueries.invalidateAll(queryClient)
       void invalidateShellListCache('apps')
+      void refreshUninstalledForSystemEvent(queryClient, ev)
     } else if (ev.type === 'app_recovered') {
       if (ev.appId) confirmAppRecovered(ev.appId)
       void chatAppArtifactQueries.invalidateAll(queryClient)
       void invalidateShellListCache('apps').then(refreshApps)
+      void refreshUninstalledForSystemEvent(queryClient, ev)
     } else if (
       ev.type === 'app_updated'
       || ev.type === 'app_created'
