@@ -69,3 +69,12 @@ def test_the_list_carries_a_small_icon_and_colours_for_the_row(client, auth, db)
   assert listed["Iconic"]["icon_data_url"].startswith(prefix)
   icon = Image.open(io.BytesIO(base64.b64decode(listed["Iconic"]["icon_data_url"][len(prefix):])))
   assert icon.size == (64, 64)  # a thumbnail, not the stored 256px artwork
+
+
+def test_the_list_runs_from_the_oldest_removal_to_the_newest(client, auth):
+  names = ["First", "Second", "Third"]
+  ids = [create_local_app(client, auth, name=name)["id"] for name in names]
+  # Removed in a different order from how they were installed.
+  for app_id in (ids[1], ids[2], ids[0]):
+    assert client.delete(f"/api/apps/{app_id}", headers=auth).status_code == 204
+  assert [row["name"] for row in _listed(client, auth)] == ["Second", "Third", "First"]
