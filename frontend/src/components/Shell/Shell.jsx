@@ -19,7 +19,6 @@ import {
   withCopiedSettings,
   startChatFromCommand as startNewChatFromCommand,
 } from './newChatCommand.js'
-import AppCanvas from '../AppCanvas/AppCanvas.jsx'
 import NotificationCenter from '../NotificationBell/NotificationCenter.jsx'
 import {
   api, apiFetch, jsonOrThrow, probeDeletion, clearAppRuntimeData,
@@ -64,12 +63,7 @@ import {
   projectQueries,
   settingsQueries,
 } from '../../hooks/queries.js'
-import ProjectCopyImport from '../Projects/ProjectCopyImport.jsx'
 import { consumeProjectCopyRequest, clearProjectCopyRequest } from '../../lib/projectCopies.js'
-import ProjectsDirectory from '../Projects/ProjectsDirectory.jsx'
-import ProjectWorkspace from '../Projects/ProjectWorkspace.jsx'
-import AppSourceWorkspace from '../Projects/AppSourceWorkspace.jsx'
-import ArtifactWorkspace from '../Projects/ArtifactWorkspace.jsx'
 import { defaultProjectName } from '../Projects/ProjectTypeIcon.jsx'
 import { buildEventProjectId, isArtifactBuildEvent } from '../../lib/projectArtifacts.js'
 import {
@@ -242,6 +236,15 @@ const CHAT_ROW_REFRESH_BATCH_MS = 250
 // Shown once per account, so it stays out of the main bundle.
 const WalkthroughOverlay = lazy(() => import('../Walkthrough/WalkthroughOverlay.jsx'))
 const SettingsView = lazy(() => import('../SettingsView/SettingsView.jsx'))
+// Surfaces a chat-only launch never paints stay off the startup path: an app
+// pane, the Projects launcher, and per-project workspaces. Each loads on first
+// render; the service worker's precache makes later first opens local.
+const AppCanvas = lazy(() => import('../AppCanvas/AppCanvas.jsx'))
+const ProjectsDirectory = lazy(() => import('../Projects/ProjectsDirectory.jsx'))
+const ProjectWorkspace = lazy(() => import('../Projects/ProjectWorkspace.jsx'))
+const AppSourceWorkspace = lazy(() => import('../Projects/AppSourceWorkspace.jsx'))
+const ArtifactWorkspace = lazy(() => import('../Projects/ArtifactWorkspace.jsx'))
+const ProjectCopyImport = lazy(() => import('../Projects/ProjectCopyImport.jsx'))
 
 // Capture the incoming fragment before navigation normalizes the URL; consume
 // the tab-scoped one-shot carry if identity sign-in redirected through /shell/.
@@ -1277,6 +1280,12 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     || projection.visibleLeaves.some(id => workspace.panes[id]?.activeTabKey === PROJECTS_KEY)
   const projectsPaned = workspaceChromeActive ? visibleTabRects.get(PROJECTS_KEY) : null
   const projectsFullBleed = !projectsPaned && fullBleedKey === PROJECTS_KEY
+  // The launcher is rendered (and so downloaded) only once it is first shown,
+  // then stays mounted like before.
+  const [projectsDirectoryMounted, setProjectsDirectoryMounted] = useState(false)
+  if (!projectsDirectoryMounted && (projectsVisibleAsTab || projectsPaned)) {
+    setProjectsDirectoryMounted(true)
+  }
   // focusedActiveKey / fullBleedKey / visible ids are derived once by
   // deriveContentVisibility above: focusedActiveKey drives the AppCanvas
   // focused-pane-only `active` prop (insets + immersive holder); fullBleedKey is
@@ -4597,7 +4606,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       closeHistoryDismiss={closeHistoryDismiss}
       unregisterHistoryDismiss={unregisterHistoryDismiss}
     >
-    {projectCopyUrl && <ProjectCopyImport key={projectCopyUrl} url={projectCopyUrl} onImported={acceptProjectCopy} onClose={closeProjectCopy} />}
+    {projectCopyUrl && <Suspense fallback={null}><ProjectCopyImport key={projectCopyUrl} url={projectCopyUrl} onImported={acceptProjectCopy} onClose={closeProjectCopy} /></Suspense>}
     <div
       ref={shellRootRef}
       // Stable shell geometry only. Beat-local custom properties live on the header
@@ -4972,6 +4981,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
               label="app"
               recoveryKey={`app:${id}`}
             >
+            <Suspense fallback={null}>
             <AppCanvas
               appId={id}
               // Focused-pane-only: gates safe-area insets + the immersive holder
@@ -5016,6 +5026,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
               shellShortcuts={appFrameShortcutBindings(app, shellFrameShortcuts)}
               onShellShortcut={runShellShortcut}
             />
+            </Suspense>
             </ErrorBoundary>
           </div>
           )
@@ -5236,6 +5247,8 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 ? () => dispatchWorkspace({ type: 'FOCUS', paneId: projectsPaned.paneId })
                 : undefined}
             >
+              {projectsDirectoryMounted && (
+              <Suspense fallback={null}>
               <ProjectsDirectory
                 projects={projects}
                 templates={projectTemplates}
@@ -5252,6 +5265,8 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 onColor={setProjectColor}
                 onDelete={deleteProject}
               />
+              </Suspense>
+              )}
             </div>
           )
         })()}
@@ -5293,6 +5308,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 ? () => dispatchWorkspace({ type: 'FOCUS', paneId: paned.paneId })
                 : undefined}
             >
+              <Suspense fallback={null}>
               {sourceApp ? (
                 <AppSourceWorkspace
                   app={sourceApp}
@@ -5312,6 +5328,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                   onRenameEnd={() => setProjectRenameId(null)}
                 />
               )}
+              </Suspense>
             </div>
           )
         })}
@@ -5353,6 +5370,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 ? () => dispatchWorkspace({ type: 'FOCUS', paneId: paned.paneId })
                 : undefined}
             >
+              <Suspense fallback={null}>
               {sourceApp ? (
                 <AppSourceWorkspace
                   app={sourceApp}
@@ -5367,6 +5385,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                   artifactId={parsed.artifactId}
                 />
               )}
+              </Suspense>
             </div>
           )
         })}

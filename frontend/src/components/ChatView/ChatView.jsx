@@ -11,7 +11,9 @@ import { usePeerTimeline, PeerTimelineRows } from './PeerTimeline.jsx'
 import { PeerTimelineContext } from './peerTimelineContext.js'
 import { consumeChatChanges, subscribeChatChanges } from '../../lib/chatChangesNavigation.js'
 import {
+  lazy,
   startTransition,
+  Suspense,
   useState,
   useRef,
   useEffect,
@@ -85,16 +87,10 @@ import CompactionProgress from './CompactionProgress.jsx'
 import useCompactCommands from './hooks/useCompactCommands.js'
 import { chatCommandRejection, mobiusChatCommand } from './slashCommands.js'
 import { hasSendablePayload } from './composerSubmission.js'
-import AgentContextInspector from './AgentContextInspector.jsx'
-import ContextPanel from './ContextPanel.jsx'
 import SideQuestionCard from './SideQuestionCard.jsx'
 import SharedFolderUploadPrompt from './SharedFolderUploadPrompt.jsx'
 import useSharedFolderUploadGate from './useSharedFolderUploadGate.js'
 import useSideQuestion from './hooks/useSideQuestion.js'
-import ChatSummaryViewer from './ChatSummaryViewer.jsx'
-import ChatDiffViewer from './ChatDiffViewer.jsx'
-import ChatUsageInspector from './ChatUsageInspector.jsx'
-import ChatNetworkInspector from './ChatNetworkInspector.jsx'
 import ComposerPopover from './ComposerPopover.jsx'
 import BrainUsageButton from './BrainUsageButton.jsx'
 import ConnectionStatus from './ConnectionStatus.jsx'
@@ -277,6 +273,15 @@ import {
   progressRailViewModel,
 } from './goalProgress.js'
 import './ChatView.css'
+
+// Inspectors and side panels that open only on request stay off the startup
+// path and load on first open.
+const AgentContextInspector = lazy(() => import('./AgentContextInspector.jsx'))
+const ContextPanel = lazy(() => import('./ContextPanel.jsx'))
+const ChatSummaryViewer = lazy(() => import('./ChatSummaryViewer.jsx'))
+const ChatDiffViewer = lazy(() => import('./ChatDiffViewer.jsx'))
+const ChatUsageInspector = lazy(() => import('./ChatUsageInspector.jsx'))
+const ChatNetworkInspector = lazy(() => import('./ChatNetworkInspector.jsx'))
 
 
 const STOP_RETRY_DELAYS_MS = [0, 250, 700, 1200]
@@ -6110,6 +6115,7 @@ export default function ChatView({
       >
         {buildPhaseStatus}
       </div>
+      <Suspense fallback={null}>
       {!embedded && showInspector && (
         <AgentContextInspector
           chatId={chatId}
@@ -6152,6 +6158,7 @@ export default function ChatView({
           onClose={() => setShowUsage(false)}
         />
       )}
+      </Suspense>
       {showEmpty && (
         <div className="chat__empty-wrap">
           {embedded ? (
