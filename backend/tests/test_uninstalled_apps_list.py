@@ -41,7 +41,7 @@ def test_an_app_past_its_window_and_live_apps_are_not_listed(client, auth, db):
   assert _listed(client, auth) == []
 
 
-def test_the_list_is_owner_only(client):
+def test_the_list_needs_a_signed_in_owner_or_an_app_that_manages_apps(client):
   assert client.get("/api/apps/uninstalled").status_code in (401, 403)
 
 
@@ -78,3 +78,18 @@ def test_the_list_runs_from_the_oldest_removal_to_the_newest(client, auth):
   for app_id in (ids[1], ids[2], ids[0]):
     assert client.delete(f"/api/apps/{app_id}", headers=auth).status_code == 204
   assert [row["name"] for row in _listed(client, auth)] == ["Second", "Third", "First"]
+
+
+def test_the_list_says_where_each_app_came_from_so_the_store_can_match_its_pages(client, auth, db):
+  app = create_local_app(client, auth, name="From the store")
+  row = db.get(models.App, app["id"])
+  row.manifest_url = "https://raw.githubusercontent.com/mobius-os/app-demo/main#manifest-id=demo"
+  row.package_id = "app.example.demo"
+  db.commit()
+  assert client.delete(f"/api/apps/{app['id']}", headers=auth).status_code == 204
+  [listed] = _listed(client, auth)
+  assert listed["manifest_url"].endswith("#manifest-id=demo")
+  assert listed["package_id"] == "app.example.demo"
+  assert listed["source_manifest"] == {
+    "id": "demo", "url": "https://raw.githubusercontent.com/mobius-os/app-demo/main/mobius.json",
+  }

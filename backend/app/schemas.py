@@ -221,6 +221,17 @@ class UninstalledAppOut(BaseModel):
   icon_data_url: str | None = None
   background_color: str | None = None
   theme_color: str | None = None
+  # Where the app came from, so the Store can tell which of its pages is this app.
+  manifest_url: str | None = None
+  package_id: str | None = None
+
+  @computed_field
+  @property
+  def source_manifest(self) -> AppSourceManifest | None:
+    if not self.manifest_url:
+      return None
+    url, manifest_id = requested_manifest_source(self.manifest_url)
+    return None if manifest_id is None else AppSourceManifest(id=manifest_id, url=url)
 
 
 class AppOut(BaseModel):
