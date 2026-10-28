@@ -199,7 +199,7 @@ class _Provider:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("owner_input", "attribution"), [
-  (True, "Owner wrote:"), (False, "Participant wrote:"),
+  (True, "Owner wrote"), (False, "Participant wrote"),
 ])
 async def test_the_answer_turn_reaches_the_agent_with_the_typed_reply_note(
   monkeypatch, db, owner_token, owner_input, attribution,
@@ -254,5 +254,5 @@ async def test_the_answer_turn_reaches_the_agent_with_the_typed_reply_note(
     remove_broadcast(chat.id)
 
   prompt = calls[0]["user_message"]
-  assert f"{attribution} can you explain that first?" in prompt
+  assert _wrote(attribution, "can you explain that first?") in prompt
   assert prompt.index(attribution) < prompt.index(content)
