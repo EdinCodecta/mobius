@@ -270,40 +270,35 @@
         }, 500);
       };
     })();</script>
-    <!-- Slow-boot progress line on the launch cover. It stays invisible for the
-         first 1.5s so an ordinary cached launch or controlled shell refresh
-         never flashes it. CanvasText follows the color-scheme the pre-paint
-         script set from the saved theme. -->
+    <!-- Slow-boot progress line on the launch cover, drawn as a pseudo-element
+         so #splash stays an empty slot (the standalone app host inserts its
+         loading mark there). It stays invisible for the first 1.5s so an
+         ordinary cached launch or controlled shell refresh never flashes it.
+         CanvasText follows the color-scheme the pre-paint script set from the
+         saved theme. -->
     <style data-mobius-launch-progress>
-      .mobius-launch-progress {
+      #splash::after {
+        content: '';
         position: absolute;
         top: env(safe-area-inset-top, 0px);
         left: 0;
-        right: 0;
-        height: 3px;
-        overflow: hidden;
-        opacity: 0;
-        animation: mobius-launch-progress-in .4s ease 1.5s forwards;
-      }
-      .mobius-launch-progress::before {
-        content: '';
-        position: absolute;
-        top: 0;
-        bottom: 0;
         width: 32%;
+        height: 3px;
         border-radius: 3px;
         background: CanvasText;
-        opacity: .45;
-        animation: mobius-launch-progress-sweep 1.6s cubic-bezier(.45, 0, .55, 1) 1.5s infinite;
+        opacity: 0;
         transform: translateX(-100%);
+        animation:
+          mobius-launch-progress-in .4s ease 1.5s forwards,
+          mobius-launch-progress-sweep 1.6s cubic-bezier(.45, 0, .55, 1) 1.5s infinite;
       }
-      @keyframes mobius-launch-progress-in { to { opacity: 1; } }
+      @keyframes mobius-launch-progress-in { to { opacity: .45; } }
       @keyframes mobius-launch-progress-sweep {
         from { transform: translateX(-100%); }
         to { transform: translateX(320%); }
       }
       @media (prefers-reduced-motion: reduce) {
-        .mobius-launch-progress::before {
+        #splash::after {
           width: 100%;
           transform: none;
           animation: mobius-launch-progress-pulse 2.4s ease-in-out 1.5s infinite;
@@ -318,10 +313,10 @@
   <!-- Theme bg comes from var(--bg), set by the pre-paint script above. -->
   <body style="margin:0;background:var(--bg,#0d0d0d)">
     <!-- Keep startup visually continuous with the saved theme without adding a
-         second brand mark after the device's native splash screen. The only
-         content is an artwork-free progress line that appears after a delay,
+         second brand mark after the device's native splash screen. Its only
+         decoration is the delayed, artwork-free progress line styled above,
          so a slow boot reads as working rather than frozen. -->
-    <div id="splash" aria-hidden="true" style="position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg,#0d0d0d);z-index:9999;transition:opacity .3s ease;contain:strict"><div class="mobius-launch-progress"></div></div>
+    <div id="splash" aria-hidden="true" style="position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg,#0d0d0d);z-index:9999;transition:opacity .3s ease;contain:strict"></div>
     <div id="root"></div>
     <script>
       // The embedded document must remain blank while its one-use capability
