@@ -289,6 +289,16 @@ async def borrowing_for(app_id: int, installation: str | None):
       _borrows_in_flight[app_id] = left
 
 
+def refuse_purge_while_borrowing(app_id: int) -> None:
+  """Raise while a borrow ``app_id`` started has not had its answer yet.
+
+  The purge holds the app's lock, so no new borrow can start; it checks this
+  before removing anything, and ``forget_app`` checks it again.
+  """
+  if _borrows_in_flight.get(int(app_id)):
+    raise RuntimeError(f"app {app_id} has a key borrow in flight; purge it later")
+
+
 @contextlib.asynccontextmanager
 async def for_granted_apps(key_name: str, app_ids: list[int], installations: dict):
   """Hold the lock of every app a save of ``key_name`` grants, and confirm
@@ -488,8 +498,7 @@ async def forget_app(app_id: int) -> None:
   (``borrowing_for``) may not have reached the vault yet; the purge is
   refused until it has its answer, and the next sweep retries it.
   """
-  if _borrows_in_flight.get(int(app_id)):
-    raise RuntimeError(f"app {app_id} has a key borrow in flight; purge it later")
+  refuse_purge_while_borrowing(app_id)
   await asyncio.to_thread(_remove_legacy_secrets, app_id)
   if _vault_ever_used():
     await vault_call("DELETE", f"/apps/{int(app_id)}")

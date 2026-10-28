@@ -316,6 +316,39 @@ def test_purge_after_ttl_hard_deletes(client, auth, db, bypass_url_validation, m
   assert forgotten == [app_id]
 
 
+def test_purge_waits_for_a_key_borrow_before_removing_anything(
+  client, auth, db, bypass_url_validation, monkeypatch,
+):
+  """A borrow the app started is still on its way to the vault, which knows
+  the app only by its reusable id. The sweep leaves the tombstone and its
+  storage intact, then purges once the borrow has its answer."""
+  from app import key_vault
+  monkeypatch.setattr(key_vault, "forget_app", lambda app_id: _noop())
+  app = _install(client, auth)
+  app_id = app["id"]
+  data_file = _seed_data(app_id)
+  assert client.delete(f"/api/apps/{app_id}", headers=auth).status_code == 204
+  row = db.query(models.App).filter(models.App.id == app_id).first()
+  row.deleted_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=8)
+  db.commit()
+
+  monkeypatch.setitem(key_vault._borrows_in_flight, app_id, 1)
+  client.get("/api/apps/", headers=auth)
+  db.expire_all()
+  assert db.query(models.App).filter(models.App.id == app_id).first() is not None
+  assert data_file.exists()
+
+  monkeypatch.delitem(key_vault._borrows_in_flight, app_id)
+  client.get("/api/apps/", headers=auth)
+  db.expire_all()
+  assert db.query(models.App).filter(models.App.id == app_id).first() is None
+  assert not data_file.exists()
+
+
+async def _noop():
+  return None
+
+
 def test_provider_app_purge_detaches_but_preserves_native_project(
   client, auth, db, bypass_url_validation,
 ):

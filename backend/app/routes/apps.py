@@ -510,6 +510,10 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
     raise RuntimeError(
       "active delegated work must quiesce before permanent app deletion"
     )
+  # A key borrow on its way to the vault must have its answer before the id
+  # is freed; refuse now rather than after storage is already gone.
+  from app import key_vault
+  key_vault.refuse_purge_while_borrowing(deleted_app_id)
   # Project recovery includes linked source, not only legacy imports. Provider
   # metadata alone is not ownership: native projects can detach safely.
   from app.project_retention import projects_using_app_files
@@ -539,7 +543,6 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
   purge_app_bundles(deleted_app_id)
   await asyncio.to_thread(_rmtree_strict, storage_dir)
   # The id can be reused after the purge, so no key grant may outlive it.
-  from app import key_vault
   await key_vault.forget_app(deleted_app_id)
   from app import service_preload
   from app.app_python_env import remove_app_envs
