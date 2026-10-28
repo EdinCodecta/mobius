@@ -133,7 +133,19 @@ def scoped_goal_context(db, goal, task_id=None, *, role="coordinator"):
 
 
 def _compact_json(payload):
-  return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+  """Serialize Goal data for a platform-owned <mobius_goal…> carrier.
+
+  JSON confines quotes and control characters, but not markup: a Goal value
+  containing a closing tag would end the carrier early and leave the rest
+  looking like instructions. Escaping <, > and & keeps it valid JSON that
+  decodes to the same values while making the boundary unforgeable.
+  """
+  return (
+    json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    .replace("<", "\\u003c")
+    .replace(">", "\\u003e")
+    .replace("&", "\\u0026")
+  )
 
 
 def unattached_goal_notice(db, run):
