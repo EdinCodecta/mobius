@@ -5,7 +5,7 @@
   background: var(--surface); border: 1px solid var(--border-light); color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: 0;
 }
 .uninstalled-apps__head p { margin: 5px 0 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
-.uninstalled-apps__list { list-style: none; margin: 16px 0 0; padding: 0; display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 380px), 1fr)); }
+.uninstalled-apps__list { list-style: none; margin: 16px 0 0; padding: 0; display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 440px), 1fr)); }
 .uninstalled-apps__row {
   display: flex; align-items: center; gap: 12px; min-width: 0;
   padding: 11px 12px; border: 1px solid var(--border-light); border-radius: 16px; background: var(--surface);
