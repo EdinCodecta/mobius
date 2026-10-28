@@ -43,8 +43,8 @@ export default function UninstalledApps() {
           Recently uninstalled <span className="uninstalled-apps__count">{rows.length}</span>
         </h2>
         <p>
-          Kept for 7 days, then deleted for good. Recovering an app brings back its data
-          and your earlier answer to its permission request.
+          You can recover an app for 7 days after uninstalling it, with its data and your
+          answer to its permission request. After that it is removed permanently.
         </p>
       </div>
       <ul className="uninstalled-apps__list">

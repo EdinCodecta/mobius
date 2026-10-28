@@ -1,12 +1,12 @@
 const DAY = 24 * 60 * 60 * 1000
 
-/** "6 days left" / "Under a day left" until an app is deleted for good. */
+/** "6 days left" / "1 day left": how long an uninstalled app can still be recovered. */
 export function expiryLabel(expiresAt, now = Date.now()) {
   const left = Date.parse(expiresAt) - now
   if (!Number.isFinite(left) || left <= 0) return 'Expiring now'
   const days = Math.floor(left / DAY)
   if (days >= 1) return `${days} ${days === 1 ? 'day' : 'days'} left`
-  return 'Under a day left'
+  return '1 day left'
 }
 
 /** How urgent the expiry is, for the pill's colour: '' | 'soon' | 'urgent'. */

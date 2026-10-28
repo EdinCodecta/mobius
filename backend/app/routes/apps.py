@@ -721,7 +721,7 @@ def list_uninstalled_apps(
   """Apps still in their recovery window, soonest to expire first.
 
   Recover one with ``POST /{app_id}/recover``. A tombstone past the window is
-  not listed even before the purge that deletes it for good.
+  not listed even before the purge that removes it permanently.
   """
   cutoff = now_naive_utc() - APP_SOFT_DELETE_TTL
   rows = (
