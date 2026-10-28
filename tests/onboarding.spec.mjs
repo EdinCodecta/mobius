@@ -133,8 +133,6 @@ test('installing an app installs it directly, with no check or confirmation firs
   expect(requests[0].path).toBe('install')
   expect(Object.keys(requests[0].body)).toEqual(['manifest_url'])
   await expect(page.getByRole('alertdialog')).toHaveCount(0)
-  // The other app waits while this one installs.
-  await expect(guide.getByRole('button', { name: 'Install Reflection' })).toHaveAttribute('aria-disabled', 'true')
   release()
 })
 

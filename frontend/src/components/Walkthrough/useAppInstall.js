@@ -1,38 +1,32 @@
 /* Install for the guide's app cards: one tap installs the app. The shell refreshes its own app list
    after an install, so the card turns to Installed on its own. An app asks what it may do the first
-   time it opens, not here.
-
-   One app is handled at a time: other Install buttons wait while an install is running. */
+   time it opens, not here. Each app tracks its own install, so several can run at once. */
 import { useCallback, useRef, useState } from 'react'
-import { installFromCatalog } from './walkthroughInstall.js'
+import { apiFetch } from '../../api/client.js'
+import { detailToMessage } from '../../lib/errorDetail.js'
 
 export function useAppInstall(catalog) {
   const [status, setStatus] = useState({})
-  const working = useRef(false)
-
-  const setOne = useCallback((id, value) => setStatus(current => {
-    const next = { ...current }
-    if (value) next[id] = value
-    else delete next[id]
-    return next
-  }), [])
+  const running = useRef(new Set())
 
   const install = useCallback(async id => {
     const item = catalog?.get(id)
-    if (!item?.manifest_url || working.current) return
-    working.current = true
-    setOne(id, { state: 'installing' })
+    if (!item?.manifest_url || running.current.has(id)) return
+    running.current.add(id)
+    setStatus(current => ({ ...current, [id]: { state: 'installing' } }))
+    let next
     try {
-      const result = await installFromCatalog(item.manifest_url)
-      setOne(id, { state: 'installed', warnings: result.warnings })
+      const response = await apiFetch('/apps/install', { method: 'POST', body: JSON.stringify({ manifest_url: item.manifest_url }), timeoutMs: 120_000 })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(detailToMessage(data.detail, 'The app could not be installed.'))
+      next = { state: 'installed', warnings: Array.isArray(data.warnings) ? data.warnings : [] }
     } catch (error) {
-      setOne(id, { state: 'error', error: error.message || 'The app could not be installed.' })
-    } finally {
-      working.current = false
+      next = { state: 'error', error: error.message || 'The app could not be installed.' }
     }
-  }, [catalog, setOne])
+    running.current.delete(id)
+    setStatus(current => ({ ...current, [id]: next }))
+  }, [catalog])
 
   const statusOf = useCallback(id => status[id] || null, [status])
-  const busy = Object.values(status).some(value => value.state === 'installing')
-  return { statusOf, install, busy }
+  return { statusOf, install }
 }

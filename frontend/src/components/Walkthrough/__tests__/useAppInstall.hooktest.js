@@ -52,17 +52,19 @@ test('an_app_missing_from_the_catalog_does_nothing', async () => {
   assert.equal(result.current.statusOf('unknown'), null)
 })
 
-test('a_second_app_cannot_start_while_the_first_is_installing', async () => {
+test('apps_install_independently_and_a_repeat_tap_is_ignored', async () => {
   let release
   const calls = stubServer({ hold: new Promise(resolve => { release = resolve }) })
   const { result } = renderHook(useAppInstall, CATALOG)
   const first = result.current.install('maps')
+  const repeat = result.current.install('maps')
+  const second = result.current.install('notes')
   await tick()
-  assert.equal(result.current.busy, true)
-  await result.current.install('notes')
-  assert.equal(calls.length, 1)
+  assert.equal(result.current.statusOf('maps').state, 'installing')
+  assert.equal(result.current.statusOf('notes').state, 'installing')
   release()
-  await first
-  assert.equal(result.current.busy, false)
+  await Promise.all([first, repeat, second])
+  assert.deepEqual(calls.map(call => call.body.manifest_url).sort(), [CATALOG.get('maps').manifest_url, CATALOG.get('notes').manifest_url].sort())
   assert.equal(result.current.statusOf('maps').state, 'installed')
+  assert.equal(result.current.statusOf('notes').state, 'installed')
 })

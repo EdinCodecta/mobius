@@ -161,7 +161,7 @@ export default function WalkthroughOverlay({ apps, activeAppId = null, onOpenApp
         {screen.content === 'theme' && <ThemeChangeDemo />}
         {screen.content === 'brain' && <AgentBrainFlow />}
         {screen.content === 'store' && <WalkthroughStore store={store} />}
-        {screen.content === 'group' && <WalkthroughAppGroup group={screen.group} store={store} statusOf={installer.statusOf} locked={installer.busy} onInstall={installer.install} />}
+        {screen.content === 'group' && <WalkthroughAppGroup group={screen.group} store={store} statusOf={installer.statusOf} onInstall={installer.install} />}
         {screen.content === 'connect' && <WalkthroughSetup />}
         {screen.content === 'finish' && <>
           <WalkthroughInstall />

@@ -101,7 +101,7 @@ export function useStoreCatalog(apps, wantedIds) {
   return useMemo(() => ({ apps, storeApp, catalog, catalogError, icons }), [apps, storeApp, catalog, catalogError, icons])
 }
 
-export function StoreAppCard({ app, store, status, locked = false, onInstall }) {
+export function StoreAppCard({ app, store, status, onInstall }) {
   const { id, name, blurb } = app
   const stateRef = useRef(null)
   // When Installed replaces the button the focus was on, it follows, so keyboard users keep their place.
@@ -120,7 +120,7 @@ export function StoreAppCard({ app, store, status, locked = false, onInstall }) 
     {installed
       ? <span className="wt-store-card__state" role="status" tabIndex={-1} ref={stateRef}><CheckIcon /> Installed</span>
       : /* aria-disabled, not disabled: the button keeps focus while the app installs, so focus can come back to it. */
-      <button type="button" className="wt-store-card__get" aria-label={`Install ${name}`} aria-disabled={!listed || busy || locked} onClick={() => { if (listed && !busy && !locked) onInstall(id) }}>{label}</button>}
+      <button type="button" className="wt-store-card__get" aria-label={`Install ${name}`} aria-disabled={!listed || busy} onClick={() => { if (listed && !busy) onInstall(id) }}>{label}</button>}
   </article>
 }
 
