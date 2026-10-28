@@ -118,9 +118,7 @@ ANONYMOUS_CONTRIBUTION_OWNER = "mobius-os"
 class RelaySubmitIn(BaseModel):
   confirm_publication: Literal[True]
   public_identity: Literal["anonymous"] = "anonymous"
-  submitter: Literal["contribute-button", "chat-review-card"] = (
-    "contribute-button"
-  )
+  submitter: Literal["contribute-button"] = "contribute-button"
 
 
 class RelayWithdrawIn(BaseModel):
@@ -880,6 +878,15 @@ def _reviewed_public_metadata(record: dict) -> tuple[str, str]:
       "This contribution has no reviewed relay title or body. Nothing was "
       "published.",
       code="relay_review_text_invalid",
+    )
+  if plan.get("screenshots"):
+    # The bot cannot host images in the owner's fork; Send from the owner's
+    # own GitHub account carries them.
+    raise ContributionSubmitError(
+      "Screenshots can be sent only from your own GitHub account, not "
+      "through the Möbius bot. Connect GitHub, or ask the agent to prepare "
+      "this without screenshots. Nothing was published.",
+      code="relay_screenshots_unsupported",
     )
   return (
     _validated_reviewed_title(plan.get("title")),

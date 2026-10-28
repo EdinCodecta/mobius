@@ -257,6 +257,7 @@ FastAPI app. `main.py` is the factory (CORS, rate limiting, routers, static serv
 | `app_git.py` | Per-app git repo (`/data/apps/<slug>/.git`): pristine `upstream` history + a local working branch |
 | `app_apply.py` | Explicitly validates, commits, compiles, and publishes one coherent mini-app source revision |
 | `storage_io.py` | Filesystem helpers for per-app + shared storage; lives apart from `routes/storage.py` so `install.py` can reuse it. Also owns `etag_matches()`, the If-Match CAS compare — RFC 9110-correct (wildcard, weak tags, multi-value) plus deliberate tolerance for a proxy content-encoding suffix (Caddy `encode` rewrites `"<tok>"` to `"<tok>-gzip"`; a strict compare would 412 every compressible CAS write) |
+| `storage_response.py` | Mutable-file responses pin an opened inode through streaming, so content, length and version headers stay consistent across atomic replacements. Linux descriptor aliases retain Starlette's bounded reads and byte-range support; offloaded path-send is disabled so descriptor lifetime stays with the response. |
 | `streaming.py` | `ClosingStreamingResponse`: closes a server-sent event generator as soon as ASGI abandons a send, so a dropped reader's resources go promptly (system notify and update-batch progress streams) |
 | `fs_locks.py` | In-process async locks serializing storage-tree / source-tree mutations against app uninstall |
 | `app_compile_contract.py` | Canonical self-contained mini-app compiler contract, dependency list, and runtime ABI |
@@ -279,6 +280,7 @@ FastAPI app. `main.py` is the factory (CORS, rate limiting, routers, static serv
 | `self_reminders.py` | Agent self-scheduling: append-only store of relational check-ins |
 | `theme.py` | Theme CSS management and HTML injection |
 | `push.py` | VAPID key management and Web Push delivery |
+| `push_relay.py` | Native push to the mobile app via the mobius.you relay (through the identity broker) |
 
 ### Recovery boundary
 
@@ -363,7 +365,7 @@ Each module exposes a `router`; registration is in `routes/__init__.py`.
 | `platform.py` | Owner-gated platform self-update: `GET /api/platform/status`, `POST /apply`, `POST /restart` (drives Settings → Updates; thin caller of `platform_update.py`) |
 | `notify.py` | System-event notifications to active broadcasts |
 | `notifications.py` | Push notification sending + history |
-| `push.py` | Web Push subscription management |
+| `push.py` | Web Push subscriptions and native push devices |
 | `theme.py` | `GET /api/theme` — effective theme CSS + bg with default fallback |
 | `settings.py` | Owner-level configuration |
 | `github.py` | GitHub connect status + read-only REST/GraphQL passthrough for in-product upstream contributions (pairs with `github_auth.py` + the `contributing.md` skill) |
@@ -524,6 +526,7 @@ The chat is large and self-contained; its hooks live beside it, not in `src/hook
 | `useOnlineStatus.js` | Connectivity verdict (page-side `/api/health` probe; feeds SW connectivity) |
 | `useProviderAuthStatus.js` | Provider auth status polling |
 | `usePushSubscription.js` | Web Push subscription after login |
+| `useNativePush.js` | Registers native push in the Möbius mobile app on load |
 | `queries.js` | TanStack Query setup + query definitions |
 
 ### App runtime, service worker, libs

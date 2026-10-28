@@ -66,18 +66,16 @@ export default function AppConsentPanel({ appId, appName, request }) {
     {request?.app_description && !isUpdate && <p className="app-consent__detail">{request.app_description}</p>}
     <div className="app-consent__section">
       <p className="app-consent__label">{isUpdate ? 'Newly requested' : 'Access requested'}</p>
-      {rows.length === 0
-        ? <p className="app-consent__empty">This app requests no special access.</p>
-        : <ul className="app-consent__list" tabIndex={0} aria-label={`Access ${name} requests`}>
-          {rows.map(row => <li className="app-consent__row" key={row.id}>
-            <div>
-              <strong>{row.title}{row.level ? ` (${row.level})` : ''}</strong>
-              <span>{row.text}</span>
-              {row.note && <span className="app-consent__note">{row.note}</span>}
-            </div>
-            {row.critical && <span className="app-consent__dot" role="img" aria-label="Critical: can change your Möbius" title="Critical: can change your Möbius" />}
-          </li>)}
-        </ul>}
+      <ul className="app-consent__list" tabIndex={0} aria-label={`Access ${name} requests`}>
+        {rows.map(row => <li className="app-consent__row" key={row.id}>
+          <div>
+            <strong>{row.title}{row.level ? ` (${row.level})` : ''}</strong>
+            <span>{row.text}</span>
+            {row.note && <span className="app-consent__note">{row.note}</span>}
+          </div>
+          {row.critical && <span className="app-consent__dot" role="img" aria-label="Critical: can change your Möbius" title="Critical: can change your Möbius" />}
+        </li>)}
+      </ul>
     </div>
     <p className="app-consent__meta">{request?.baseline}</p>
     {error && <p className="app-consent__error" role="alert">{error}</p>}

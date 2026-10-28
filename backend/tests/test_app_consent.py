@@ -182,6 +182,14 @@ def test_every_contract_permission_has_a_row():
           "identity_manage", "railway_manage", "job_secret_read"} <= ids
 
 
+def test_helper_activity_read_has_a_non_critical_row():
+  rows = app_consent.rows_from_contract(_contract(helper_activity_read=True))
+  assert [(r["id"], r["title"], r["critical"]) for r in rows] == [
+    ("helper_activity_read", "Read helper activity", False),
+  ]
+  assert "helper_activity_read" in app_consent.HANDLED_DATA_KEYS
+
+
 def test_acceptance_stores_rows_and_survives_a_rewording(db, monkeypatch):
   contract = _contract(github_access=True)
   app = _app(db, "snapshot", contract=contract)
@@ -533,6 +541,54 @@ def test_a_runtime_limit_change_changes_the_row_text():
   assert rows(2 * 1024 ** 3)["device.asset-cache"].endswith("max_bytes 2 GiB.")
 
 
+def _runtime_contract(**limits):
+  contract = _contract()
+  contract["runtime"] = {"media.camera.capture": {
+    "title": "Record video", "description": "Use a device camera.",
+    "limits": {"max_duration_ms": 60_000, "max_bytes": 128 * 1024 * 1024, **limits},
+    "reason": None,
+  }}
+  return contract
+
+
+def test_runtime_limits_are_part_of_the_accepted_answer(db):
+  app = _accepted(db, "camera", _runtime_contract())
+  assert app.accepted_consent["rows"] == [{
+    "id": "media.camera.capture", "rank": 1,
+    "limits": {"max_bytes": 128 * 1024 * 1024, "max_duration_ms": 60_000},
+  }]
+  assert app_consent.status(app) == "accepted"
+
+
+def test_raising_a_runtime_limit_asks_again_but_lowering_it_does_not(db):
+  app = _accepted(db, "camera-update", _runtime_contract())
+  app.capability_contract = _runtime_contract(max_duration_ms=30_000)
+  assert app_consent.status(app) == "accepted"
+  app.capability_contract = _runtime_contract(max_duration_ms=300_000)
+  assert app_consent.status(app) == "required"
+  assert [r["id"] for r in app_consent.needed_rows(app)] == ["media.camera.capture"]
+
+
+def test_changed_runtime_limits_change_the_digest_so_a_stale_accept_fails(db):
+  app = _app(db, "camera-stale", contract=_runtime_contract())
+  shown = app_consent.request_digest(app_consent.current_rows(app))
+  app.capability_contract = _runtime_contract(max_bytes=256 * 1024 * 1024)
+  assert not app_consent.accept(app, shown)
+  assert app.accepted_consent is None
+
+
+def test_an_answer_saved_without_runtime_limits_asks_once_more(db):
+  # Rows accepted before limits were recorded say nothing about the limits the
+  # owner saw, so they cannot cover any; one new answer records them.
+  app = _app(db, "camera-legacy", contract=_runtime_contract(), accepted={
+    "id": "legacy", "version": 1, "rows": [{"id": "media.camera.capture", "rank": 1}],
+    "digest": "", "at": "2026-10-21T12:00:00Z", "via": "owner",
+  })
+  assert app_consent.status(app) == "required"
+  assert app_consent.accept(app, app_consent.request_digest(app_consent.current_rows(app)))
+  assert app_consent.status(app) == "accepted"
+
+
 def test_installed_rows_use_the_installed_versions_templates():
   from app import schemas
 
@@ -689,3 +745,57 @@ def test_an_update_that_pauses_an_app_sets_its_new_skill_aside_until_accepted(
   digest = client.get(f"/api/apps/{app_id}/consent", headers=headers).json()["digest"]
   assert client.post(f"/api/apps/{app_id}/consent", json={"digest": digest}, headers=headers).status_code == 200
   assert live.read_bytes() == b"# v2\n"
+
+
+def test_an_app_that_asks_for_nothing_is_never_asked(client, owner_token, db):
+  app = _app(db, "plain", contract=_contract())
+  assert app_consent.status(app) == "accepted"
+  assert not app_consent.dormant(app)
+  headers = _owner_headers(client, owner_token)
+  assert client.post("/api/auth/app-token", json={"app_id": app.id}, headers=headers).status_code == 200
+  assert client.get(f"/api/apps/{app.id}/consent", headers=headers).json()["status"] == "accepted"
+  # An update that starts asking for something is asked, in full.
+  app.capability_contract = _contract(github_access=True)
+  assert app_consent.status(app) == "required"
+  assert [r["id"] for r in app_consent.needed_rows(app)] == ["github_access"]
+
+
+def test_an_update_that_starts_asking_notifies_even_when_nothing_was_accepted_before(
+  client, auth, owner_token, db, bypass_url_validation,
+):
+  import json as _json
+  from unittest.mock import patch
+
+  from app import models as m
+  from tests.test_app_skills import BASE, JSX, _fake_async_client, _skill_manifest
+
+  def serve(manifest):
+    responses = {BASE + "mobius.json": (200, _json.dumps(manifest).encode()),
+                 BASE + "index.jsx": (200, JSX.encode())}
+    return patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses))
+
+  plain = _skill_manifest(skills=[], source_files=[])
+  with serve(plain):
+    installed = client.post("/api/apps/install", headers=auth, json={"manifest_url": BASE + "mobius.json"})
+  app_id = installed.json()["id"]
+  assert not app_consent.dormant(db.get(m.App, app_id))  # it asks for nothing
+
+  wider = _skill_manifest(version="2.0.0", skills=[], source_files=[], permissions={
+    "cross_app_access": "none", "share_with_apps": "none", "github_access": True})
+  with serve(wider):
+    update = client.post("/api/apps/install", headers=auth, json={"manifest_url": BASE + "mobius.json"})
+    if update.status_code == 409:
+      update = client.post("/api/apps/install", headers=auth, json={
+        "manifest_url": BASE + "mobius.json",
+        "reviewed_capability_digest": update.json()["detail"]["preview"]["capability_digest"]})
+  assert update.status_code in (200, 201), update.text
+  assert app_consent.dormant(db.get(m.App, app_id))
+  note = db.query(m.Notification).filter(m.Notification.source_id == str(app_id)).one()
+  assert "needs your approval" in note.title
+
+
+def test_revoking_an_app_that_asks_for_nothing_reports_the_truth(client, owner_token, db):
+  app = _app(db, "nothing", contract=_contract())
+  response = client.delete(f"/api/apps/{app.id}/consent", headers=_owner_headers(client, owner_token))
+  assert response.status_code == 200
+  assert response.json()["status"] == "accepted"

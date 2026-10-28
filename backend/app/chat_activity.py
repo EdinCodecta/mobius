@@ -133,9 +133,12 @@ def _helper_row_events(
   events = []
   for row in rows:
     status, run, _result = derived_status(db, row, load_result=False)
-    if run is None and status == "completed":
-      # Without a run, a source-reported "completed" is not terminal evidence;
-      # of the no-run overrides only needs_review settles a helper.
+    if run is None and status == "completed" and row.source_work_id is None:
+      # Without a run, a reported "completed" is not terminal evidence; of the
+      # no-run overrides only needs_review settles a helper. Retired
+      # source-attached rows are the exception: nothing writes their stored
+      # outcome any more, so a no-run "completed" is the final, settled fact
+      # the old reconciler recorded, not a running helper.
       status = "starting"
     settled = status in (TERMINAL_DELEGATION_STATUSES | AWAITING_INPUT_DELEGATION_STATUSES)
     stable_id = running_helper_activity_id(row.id)

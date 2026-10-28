@@ -6892,6 +6892,101 @@ def _enforce_unique_live_claim_follows(eng) -> None:
     ))
 
 
+def _allow_core_contribution_review_runs(eng) -> None:
+  """Allow app-less review runs without weakening app-scoped request identity."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "contribution_review_runs" not in inspector.get_table_names():
+    return
+  columns = {c["name"]: c for c in inspector.get_columns("contribution_review_runs")}
+  needs_rebuild = (
+    eng.dialect.name == "sqlite"
+    and (not columns["app_id"]["nullable"] or not columns["app_nonce"]["nullable"])
+  )
+  if needs_rebuild:
+    # SQLite cannot drop NOT NULL. Keep the original table definition and all
+    # explicit indexes/triggers, changing only the two ownership columns.
+    raw = eng.raw_connection()
+    cursor = raw.cursor()
+    foreign_keys = cursor.execute("PRAGMA foreign_keys").fetchone()[0]
+    try:
+      cursor.execute("PRAGMA foreign_keys=OFF")
+      cursor.execute("BEGIN IMMEDIATE")
+      original = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='contribution_review_runs'"
+      ).fetchone()[0]
+      changed = original
+      for name, width in (("app_id", "INTEGER"), ("app_nonce", "VARCHAR(64)")):
+        if columns[name]["nullable"]:
+          continue
+        changed, count = re.subn(
+          rf'("{name}"|\b{name}\b)(\s+{re.escape(width)})\s+NOT\s+NULL',
+          r'\1\2', changed, count=1, flags=re.IGNORECASE,
+        )
+        if count != 1:
+          raise RuntimeError(f"Cannot identify review-run {name} column")
+      objects = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE tbl_name='contribution_review_runs' "
+        "AND type IN ('index','trigger') AND sql IS NOT NULL"
+      ).fetchall()
+      names = ", ".join(
+        '"' + row[1].replace('"', '""') + '"'
+        for row in cursor.execute("PRAGMA table_info(contribution_review_runs)")
+      )
+      cursor.execute(
+        "CREATE TABLE contribution_review_runs__core_0097 ("
+        + changed.partition("(")[2]
+      )
+      cursor.execute(
+        f"INSERT INTO contribution_review_runs__core_0097 ({names}) "
+        f"SELECT {names} FROM contribution_review_runs"
+      )
+      cursor.execute("DROP TABLE contribution_review_runs")
+      cursor.execute(
+        "ALTER TABLE contribution_review_runs__core_0097 "
+        "RENAME TO contribution_review_runs"
+      )
+      for (sql,) in objects:
+        cursor.execute(sql)
+      raw.commit()
+    except BaseException:
+      raw.rollback()
+      raise
+    finally:
+      cursor.execute(f"PRAGMA foreign_keys={int(foreign_keys)}")
+      cursor.close()
+      raw.close()
+  with eng.begin() as conn:
+    if eng.dialect.name != "sqlite":
+      for name in ("app_id", "app_nonce"):
+        if not columns[name]["nullable"]:
+          conn.execute(text(
+            f"ALTER TABLE contribution_review_runs ALTER COLUMN {name} DROP NOT NULL"
+          ))
+    if "options_json" not in columns:
+      conn.execute(text(
+        "ALTER TABLE contribution_review_runs ADD COLUMN options_json JSON NULL"
+      ))
+    conn.execute(text(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_contribution_review_runs_core_request "
+      "ON contribution_review_runs (owner_id, request_id) WHERE app_id IS NULL"
+    ))
+
+
+def _add_run_end_reason(eng) -> None:
+  """Record why a run was interrupted; historical rows stay unexplained (NULL)."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chat_runs" not in inspector.get_table_names():
+    return
+  if "end_reason" not in {c["name"] for c in inspector.get_columns("chat_runs")}:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE chat_runs ADD COLUMN end_reason VARCHAR(32)"))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -7010,6 +7105,8 @@ _SCHEMA_MIGRATIONS = (
   ("0094_retire_legacy_claim_notice_carriers", _retire_legacy_claim_notice_carriers),
   ("0095_unique_live_claim_follows", _enforce_unique_live_claim_follows),
   ("0096_app_accepted_consent", _add_app_accepted_consent),
+  ("0097_core_contribution_review_runs", _allow_core_contribution_review_runs),
+  ("0098_run_end_reason", _add_run_end_reason),
 )
 
 
