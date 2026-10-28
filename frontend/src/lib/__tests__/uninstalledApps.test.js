@@ -42,7 +42,8 @@ test('the pill turns amber under three days and red on the last day', () => {
 
 test('the next wake lands exactly when the label changes', () => {
   for (const offset of [6 * DAY + 3 * HOUR, DAY, DAY - 1, 20 * HOUR, 12 * HOUR, 8 * HOUR, 6 * HOUR, 5 * HOUR + 7 * MIN, HOUR, 42 * MIN, 400]) {
-    const { label: before, nextChangeIn } = expiryCountdown(at(offset), NOW)
+    const { label: before, changesAt } = expiryCountdown(at(offset), NOW)
+    const nextChangeIn = changesAt - NOW
     assert.ok(nextChangeIn > 0)
     assert.notEqual(label(offset - nextChangeIn), before)
     assert.ok(nextChangeIn <= offset)

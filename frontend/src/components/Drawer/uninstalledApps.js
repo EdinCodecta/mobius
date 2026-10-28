@@ -12,9 +12,9 @@ const LAST_DAY_STEPS = [[HOUR, '~1 hr'], [6 * HOUR, '~6 hrs'], [12 * HOUR, '~12 
  * `label` is "6 days left" … "1 day left" in whole days, then "~1 day left",
  * "~12 hrs left", "~6 hrs left" and "~1 hr left" on the last day. It is gone at
  * zero, the moment the server stops accepting a recover. `tone` colours the
- * pill: '' | 'soon' (under 3 days) | 'urgent' (the last day). `nextChangeIn`
- * is how many milliseconds until the label changes, so a view can wake exactly
- * then instead of polling.
+ * pill: '' | 'soon' (under 3 days) | 'urgent' (the last day). `changesAt` is
+ * the moment, in epoch milliseconds, when the label next changes, so a view can
+ * wake exactly then instead of polling.
  */
 export function expiryCountdown(expiresAt, now = Date.now()) {
   const left = Date.parse(expiresAt) - now
@@ -25,12 +25,12 @@ export function expiryCountdown(expiresAt, now = Date.now()) {
     return {
       label: `${days} ${days === 1 ? 'day' : 'days'} left`,
       tone,
-      nextChangeIn: left - days * DAY + 1,
+      changesAt: now + left - days * DAY + 1,
     }
   }
   const step = LAST_DAY_STEPS.findIndex(([limit]) => left <= limit)
   const below = step === 0 ? 0 : LAST_DAY_STEPS[step - 1][0]
-  return { label: `${LAST_DAY_STEPS[step][1]} left`, tone, nextChangeIn: left - below }
+  return { label: `${LAST_DAY_STEPS[step][1]} left`, tone, changesAt: now + left - below }
 }
 
 export function removedLabel(deletedAt) {

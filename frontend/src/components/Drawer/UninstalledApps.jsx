@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client.js'
 import { appQueries } from '../../hooks/queries.js'
+import useExpiryCountdowns from '../../hooks/useExpiryCountdowns.js'
 import AppIcon from '../AppIcon.jsx'
-import { expiryCountdown, recoverErrorMessage, removedLabel } from './uninstalledApps.js'
+import { recoverErrorMessage, removedLabel } from './uninstalledApps.js'
 import './UninstalledApps.css'
 
 // Apps that were uninstalled but are still in their recovery window. Hidden
@@ -13,21 +14,7 @@ export default function UninstalledApps() {
   const { data: rows = [] } = appQueries.uninstalled.useQuery()
   const [busyId, setBusyId] = useState(null)
   const [error, setError] = useState('')
-  const [now, setNow] = useState(() => Date.now())
-
-  // A row leaves the list the moment its countdown reaches zero, the same
-  // instant the server starts refusing to recover it.
-  const live = rows
-    .map(row => ({ row, countdown: expiryCountdown(row.expires_at, now) }))
-    .filter(entry => entry.countdown)
-  const nextChange = Math.min(...live.map(entry => entry.countdown.nextChangeIn))
-
-  // Wake once, when the soonest label changes: at most a few times a day.
-  useEffect(() => {
-    if (!Number.isFinite(nextChange)) return undefined
-    const timer = setTimeout(() => setNow(Date.now()), nextChange)
-    return () => clearTimeout(timer)
-  }, [now, nextChange])
+  const live = useExpiryCountdowns(rows)
 
   if (live.length === 0) return null
 
