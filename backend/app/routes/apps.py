@@ -725,8 +725,8 @@ def list_uninstalled_apps(
   """
   cutoff = now_naive_utc() - APP_SOFT_DELETE_TTL
   rows = (
-    db.query(models.App.id, models.App.name, models.App.slug, models.App.version,
-             models.App.deleted_at)
+    db.query(models.App)
+    .options(defer(models.App.jsx_source), defer(models.App.project_templates_json))
     .filter(models.App.deleted_at.isnot(None), models.App.deleted_at >= cutoff)
     .order_by(models.App.deleted_at)
     .all()
@@ -736,9 +736,18 @@ def list_uninstalled_apps(
       id=row.id, name=row.name, slug=row.slug, version=row.version,
       deleted_at=row.deleted_at.replace(tzinfo=UTC),
       expires_at=(row.deleted_at + APP_SOFT_DELETE_TTL).replace(tzinfo=UTC),
+      icon_data_url=_icon_data_url(row.effective_icon_png),
+      background_color=row.background_color, theme_color=row.theme_color,
     )
     for row in rows
   ]
+
+
+def _icon_data_url(png: bytes | None) -> str | None:
+  if not png:
+    return None
+  small = _downscale_icon(png, 64)
+  return "data:image/png;base64," + base64.b64encode(small).decode("ascii")
 
 
 @router.get(

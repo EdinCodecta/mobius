@@ -43,3 +43,29 @@ def test_an_app_past_its_window_and_live_apps_are_not_listed(client, auth, db):
 
 def test_the_list_is_owner_only(client):
   assert client.get("/api/apps/uninstalled").status_code in (401, 403)
+
+
+def test_the_list_carries_a_small_icon_and_colours_for_the_row(client, auth, db):
+  import base64
+  import io
+
+  from PIL import Image
+
+  plain = create_local_app(client, auth, name="Plain")
+  iconic = create_local_app(client, auth, name="Iconic")
+  buffer = io.BytesIO()
+  Image.new("RGBA", (256, 256), (200, 40, 40, 255)).save(buffer, format="PNG")
+  row = db.get(models.App, iconic["id"])
+  row.icon_png = buffer.getvalue()
+  row.background_color = "#112233"
+  db.commit()
+  for app in (plain, iconic):
+    assert client.delete(f"/api/apps/{app['id']}", headers=auth).status_code == 204
+
+  listed = {r["name"]: r for r in _listed(client, auth)}
+  assert listed["Plain"]["icon_data_url"] is None
+  assert listed["Iconic"]["background_color"] == "#112233"
+  prefix = "data:image/png;base64,"
+  assert listed["Iconic"]["icon_data_url"].startswith(prefix)
+  icon = Image.open(io.BytesIO(base64.b64decode(listed["Iconic"]["icon_data_url"][len(prefix):])))
+  assert icon.size == (64, 64)  # a thumbnail, not the stored 256px artwork

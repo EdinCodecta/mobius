@@ -216,6 +216,11 @@ class UninstalledAppOut(BaseModel):
   version: str | None = None
   deleted_at: datetime
   expires_at: datetime
+  # A small copy of the app's icon, sent here because the public icon route
+  # hides uninstalled apps on purpose.
+  icon_data_url: str | None = None
+  background_color: str | None = None
+  theme_color: str | None = None
 
 
 class AppOut(BaseModel):

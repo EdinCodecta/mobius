@@ -1,12 +1,19 @@
 const DAY = 24 * 60 * 60 * 1000
 
-/** "Deleted for good in 6 days" / "in under a day" / "today" for an expiry. */
+/** "6 days left" / "Under a day left" until an app is deleted for good. */
 export function expiryLabel(expiresAt, now = Date.now()) {
   const left = Date.parse(expiresAt) - now
-  if (!Number.isFinite(left) || left <= 0) return 'Deleted for good soon'
+  if (!Number.isFinite(left) || left <= 0) return 'Expiring now'
   const days = Math.floor(left / DAY)
-  if (days >= 1) return `Deleted for good in ${days} ${days === 1 ? 'day' : 'days'}`
-  return 'Deleted for good in under a day'
+  if (days >= 1) return `${days} ${days === 1 ? 'day' : 'days'} left`
+  return 'Under a day left'
+}
+
+/** How urgent the expiry is, for the pill's colour: '' | 'soon' | 'urgent'. */
+export function expiryTone(expiresAt, now = Date.now()) {
+  const left = Date.parse(expiresAt) - now
+  if (!Number.isFinite(left) || left < DAY) return 'urgent'
+  return left < 3 * DAY ? 'soon' : ''
 }
 
 export function removedLabel(deletedAt) {
