@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import vm from 'node:vm'
 
 const SOURCE = readFileSync(new URL('../../App.jsx', import.meta.url), 'utf8')
 const API_CLIENT = readFileSync(new URL('../../api/client.js', import.meta.url), 'utf8')
@@ -102,4 +103,130 @@ test('mobius.you sign-in stays on the viewed origin and owns a centered action',
   const buttonRule = LOGIN_CSS.match(/\.login__btn\s*\{[\s\S]*?\}/)?.[0] || ''
   assert.match(buttonRule, /width:\s*100%/)
   assert.match(buttonRule, /justify-content:\s*center/)
+})
+
+// The static boot document runs before React exists. Its inline scripts are
+// executed in a vm against a minimal fake DOM so the timing rules for the
+// boot-failure notice are exercised, not matched.
+const INDEX_BODY = INDEX_HTML.slice(INDEX_HTML.indexOf('<body'))
+const INLINE_SCRIPTS = [...INDEX_BODY.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1])
+const BOOT_SCRIPT = INLINE_SCRIPTS.find(source => source.includes('function checkBoot'))
+const ENTRY = 'https://mobius.test/assets/index.js'
+const PRELOAD = 'https://mobius.test/assets/client.js'
+
+function fakeElement(tagName, props = {}) {
+  return {
+    tagName,
+    style: {},
+    children: [],
+    isConnected: true,
+    setAttribute() {},
+    append(...nodes) { this.children.push(...nodes) },
+    addEventListener() {},
+    remove() { this.isConnected = false },
+    ...props,
+  }
+}
+
+// One page load with a controllable clock, network, and React mount.
+function bootPage() {
+  let now = 0
+  const timers = []
+  const settled = new Map()
+  const windowListeners = []
+  const alerts = []
+  const root = { mounted: false, hasChildNodes() { return this.mounted } }
+  const splash = fakeElement('DIV')
+  const entryScript = fakeElement('SCRIPT', { type: 'module', src: ENTRY })
+  const preloadLink = fakeElement('LINK', { href: PRELOAD })
+  const document = {
+    getElementById: id => (id === 'root' ? root : id === 'splash' && splash.isConnected ? splash : null),
+    querySelectorAll: () => [entryScript, preloadLink],
+    createElement: tag => fakeElement(tag.toUpperCase()),
+    body: { appendChild: node => alerts.push(node) },
+  }
+  const window = {
+    location: { pathname: '/shell/', href: 'https://mobius.test/shell/', reload() {} },
+    addEventListener: (type, fn, capture) => windowListeners.push({ type, fn, capture }),
+  }
+  const context = {
+    window,
+    document,
+    history: {},
+    performance: {
+      now: () => now,
+      getEntriesByName: url => (settled.has(url) ? [{ responseEnd: settled.get(url) }] : []),
+    },
+    setTimeout: (fn, ms) => timers.push({ at: now + ms, fn }),
+  }
+  vm.runInNewContext(BOOT_SCRIPT, context)
+
+  const advanceTo = (ms) => {
+    for (;;) {
+      timers.sort((a, b) => a.at - b.at)
+      if (!timers.length || timers[0].at > ms) break
+      const timer = timers.shift()
+      now = timer.at
+      timer.fn()
+    }
+    now = ms
+  }
+  return {
+    advanceTo,
+    finishDownload: (url, atMs) => settled.set(url, atMs),
+    mount: () => { root.mounted = true },
+    failEntryFetch: () => windowListeners
+      .filter(listener => listener.type === 'error' && listener.capture)
+      .forEach(listener => listener.fn({ target: entryScript })),
+    get failureShown() { return alerts.length > 0 },
+    get coverPresent() { return splash.isConnected },
+  }
+}
+
+test('a first visit still downloading its entry modules is not reported as a failed boot', () => {
+  const page = bootPage()
+  page.finishDownload(PRELOAD, 6_000)
+  page.advanceTo(30_000)
+  assert.equal(page.failureShown, false, 'bytes still arriving at 30s')
+  assert.equal(page.coverPresent, true)
+
+  page.finishDownload(ENTRY, 31_000)
+  page.advanceTo(31_200)
+  page.mount()
+  page.advanceTo(59_000)
+  assert.equal(page.failureShown, false)
+})
+
+test('entry modules that arrived but mounted nothing surface the reload notice', () => {
+  const page = bootPage()
+  page.finishDownload(ENTRY, 3_000)
+  page.finishDownload(PRELOAD, 3_000)
+  page.advanceTo(8_000)
+  assert.equal(page.failureShown, true)
+  assert.equal(page.coverPresent, false, 'the notice must not sit under the launch cover')
+})
+
+test('modules that just finished downloading get a mount grace before counting as broken', () => {
+  const page = bootPage()
+  page.finishDownload(PRELOAD, 2_000)
+  page.finishDownload(ENTRY, 7_900)
+  page.advanceTo(8_000)
+  assert.equal(page.failureShown, false)
+  page.advanceTo(12_000)
+  assert.equal(page.failureShown, true)
+})
+
+test('a failed entry module fetch surfaces the reload notice without waiting', () => {
+  const page = bootPage()
+  page.advanceTo(1_000)
+  page.failEntryFetch()
+  assert.equal(page.failureShown, true)
+})
+
+test('a download that never completes eventually offers the reload', () => {
+  const page = bootPage()
+  page.advanceTo(58_000)
+  assert.equal(page.failureShown, false)
+  page.advanceTo(62_000)
+  assert.equal(page.failureShown, true)
 })
