@@ -937,7 +937,8 @@ answer: `started`, `denied`, `disabled`, `unavailable`, or `stopped`; explain
 `denied` and `disabled` to the owner. If the phone cannot confirm that it
 stopped, `stop` rejects with code `stop_failed` and tracking stays on; say so
 rather than showing it off. Tracking keeps running after the owner
-leaves your app, until it is stopped or the phone app is closed.
+leaves your app, until it is stopped, the phone app is closed, or the owner
+signs out; signing out also erases positions the phone had not uploaded yet.
 
 ## Managed-app update events
 

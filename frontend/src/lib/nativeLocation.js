@@ -144,6 +144,18 @@ let retryTimer = null
 let retryDelay = RETRY_BASE_MS
 let uploadSize = UPLOAD_CHUNK
 
+// Every start, stop, live cadence change and sign-out takes the next turn. A
+// native answer that arrives after a newer turn began is stale: it never writes
+// state, and a stale start that left the phone recording after a newer stop is
+// stopped again. `wantTracking` is what the newest turn asked for.
+let turn = 0
+let wantTracking = false
+// Bumped when the owner's session ends, so an upload in flight at sign-out
+// cannot touch the cleared queue, and set so late deliveries are not queued for
+// whoever signs in next. Starting tracking again clears it.
+let sessionEpoch = 0
+let signedOut = false
+
 function setState(patch) {
   state = { ...state, ...patch }
 }
@@ -268,6 +280,7 @@ async function drain() {
         break
       }
       const chunk = queue.slice(0, uploadSize)
+      const epoch = sessionEpoch
       let res
       try {
         res = await apiFetch('/location/batch', {
@@ -275,10 +288,12 @@ async function drain() {
           body: JSON.stringify({ positions: chunk, device_id: getDeviceId() }),
         })
       } catch (err) {
+        if (epoch !== sessionEpoch) break
         setState({ lastError: String(err?.message || err) })
         scheduleRetry()
         break
       }
+      if (epoch !== sessionEpoch) break
       if (res.ok) {
         markDelivered(removeFromQueue(chunk))
         uploadSize = UPLOAD_CHUNK
@@ -320,21 +335,12 @@ async function putTrackingState(enabled, options) {
   }
 }
 
-async function fetchTrackingState() {
-  try {
-    const res = await apiFetch('/location/tracking')
-    if (!res.ok) return null
-    return await res.json()
-  } catch {
-    return null
-  }
-}
-
 // ---- public control surface -------------------------------------------------
 
 function bindListener() {
   if (listenerBound || typeof window === 'undefined') return
   window.addEventListener('mobius:location', (e) => {
+    if (signedOut) return
     const positions = e?.detail?.positions
     if (Array.isArray(positions)) enqueuePositions(positions)
   })
@@ -381,30 +387,50 @@ export async function setTrackingOptions(options) {
   if (!isNativeLocationAvailable()) return savedOptions()
   const merged = { ...savedOptions(), ...sanitizeOptions(options) }
   writeJSON(OPTIONS_KEY, merged)
-  await putTrackingState(state.enabled === true, merged)
   if (state.status === 'started') {
-    await callStartLocation({ ...DEFAULT_OPTIONS, ...merged })
+    const myTurn = ++turn
+    wantTracking = true
+    await callStartLocation({ ...DEFAULT_OPTIONS, ...merged }, myTurn)
   }
+  await putTrackingState(state.enabled === true, merged)
   return merged
+}
+
+// Best-effort native stop for a recording nobody wants any more (a stale start,
+// or sign-out). Never writes state.
+function stopNativeQuietly() {
+  try {
+    return Promise.resolve(window.MobiusNative.stopLocation()).catch(() => {})
+  } catch {
+    return Promise.resolve()
+  }
 }
 
 // The single place that calls MobiusNative.startLocation, so every result is
 // handled the same way. "started" marks this session as tracking; anything else
 // ("denied", "disabled", "unavailable", or a throw) leaves tracking stopped and
-// clears the flag, and the status drives the UI's explanation.
-async function callStartLocation(opts) {
+// clears the flag, and the status drives the UI's explanation. Returns null when
+// a newer turn superseded this one before the phone answered.
+async function callStartLocation(opts, myTurn) {
   let status
+  let error = null
   try {
     status = await window.MobiusNative.startLocation(opts)
   } catch (err) {
     status = 'denied'
-    setState({ lastError: String(err?.message || err) })
+    error = String(err?.message || err)
   }
+  if (myTurn !== turn) {
+    if (status === 'started' && !wantTracking) void stopNativeQuietly()
+    return null
+  }
+  if (error) setState({ lastError: error })
   if (status === 'started') {
     setSessionActive(true)
     setState({ status, available: true })
     return status
   }
+  wantTracking = false
   setSessionActive(false)
   const wasEnabled = state.enabled
   persistEnabled(false, null)
@@ -424,7 +450,12 @@ export async function startTracking(options = savedOptions()) {
     return 'unavailable'
   }
   const opts = { ...DEFAULT_OPTIONS, ...options }
-  const status = await callStartLocation(opts)
+  const myTurn = ++turn
+  wantTracking = true
+  signedOut = false
+  const status = await callStartLocation(opts, myTurn)
+  // A newer start or stop owns the outcome now.
+  if (status === null) return state.status ?? 'stopped'
   if (status === 'started') {
     persistEnabled(true, opts)
     void putTrackingState(true, opts)
@@ -441,12 +472,15 @@ export async function startTracking(options = savedOptions()) {
 // Tracking is recorded as off only once the phone confirms it stopped. If the
 // native stop fails, or answers that it is still recording, nothing is
 // changed — this phone keeps uploading what it records and every surface keeps
-// showing tracking on — and the call rejects with code `stop_failed`.
+// showing tracking on — and the call rejects with code `stop_failed`. A start
+// still waiting for the phone is superseded, and stopped if it ends up started.
 export async function stopTracking() {
   if (!isNativeLocationAvailable()) {
     setState({ status: 'unavailable', available: false })
     return 'unavailable'
   }
+  const myTurn = ++turn
+  wantTracking = false
   let status
   let failure = null
   try {
@@ -455,6 +489,8 @@ export async function stopTracking() {
   } catch (err) {
     failure = String(err?.message || err || 'The phone did not stop recording.')
   }
+  // A newer start owns the outcome now.
+  if (myTurn !== turn) return state.status ?? 'stopped'
   if (failure) {
     setState({ lastError: `Stopping failed: ${failure}` })
     const error = new Error('The phone could not confirm that tracking stopped.')
@@ -468,12 +504,49 @@ export async function stopTracking() {
   return status || 'stopped'
 }
 
+// The owner's session ended (sign-out or an expired credential): stop recording
+// and erase everything this phone kept for them — queued precise positions, the
+// delivered ring, the tracking flags and cadence, and the device id — so none of
+// it is uploaded under, or shown to, whoever signs in next. In-flight native
+// calls and uploads become stale. The server record is left alone: there is no
+// credential to update it with, and other surfaces may still show this phone's
+// last report until it next starts or stops. Returns once the native stop
+// settles, so callers can await it before reloading.
+export function endLocationSession() {
+  turn += 1
+  wantTracking = false
+  sessionEpoch += 1
+  signedOut = true
+  clearRetry()
+  uploadSize = UPLOAD_CHUNK
+  const recording = isNativeLocationAvailable()
+    && (state.enabled === true || state.status === 'started')
+  queue = []
+  delivered = []
+  for (const key of [QUEUE_KEY, DELIVERED_KEY, ENABLED_KEY, OPTIONS_KEY, DEVICE_KEY]) {
+    try { localStorage.removeItem(key) } catch { /* ignore */ }
+  }
+  setSessionActive(false)
+  setState({
+    enabled: false,
+    status: recording ? 'stopped' : state.status,
+    queueLength: 0,
+    queuePersisted: true,
+    lastError: null,
+    lastUploadAt: null,
+  })
+  return recording ? stopNativeQuietly() : Promise.resolve()
+}
+
 // ---- boot ---------------------------------------------------------------------
 //
 // Tracking is controlled only on the phone that tracks. The saved server
 // preference is a record of what that phone last did (other surfaces display
-// it); it never starts, stops, or re-paces a phone. So there is no polling of the
-// server here — a phone acts only on its owner's taps and on its own reload.
+// it); it never starts, stops, or re-paces a phone. So boot never reads the
+// server — a phone acts only on its owner's taps, its own reload, and its own
+// local record of whether it was the one tracking. The server state is
+// owner-wide, so treating it as this phone's history would let a freshly
+// opened phone mark another, still-recording phone as stopped.
 
 // Called once at shell boot. Registers the listener immediately, flushes any
 // queue left from a prior session, and — if tracking was on in this app session
@@ -508,8 +581,8 @@ export async function initLocationTracking() {
     await startTracking(savedOptions())
     return
   }
-  const server = await fetchTrackingState()
-  const storedOn = server ? server.enabled === true : readJSON(ENABLED_KEY, false) === true
+  // Only this phone's own mirror says whether *it* was left tracking.
+  const storedOn = readJSON(ENABLED_KEY, false) === true
   persistEnabled(false, null)
   if (storedOn) {
     setState({ status: 'stopped' })
