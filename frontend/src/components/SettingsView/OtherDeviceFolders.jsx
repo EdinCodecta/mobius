@@ -1,21 +1,15 @@
 /* Folders shared from your other browsers, one card per browser, each pausable from here. */
 import StatusDot from '../ui/StatusDot.jsx'
 import SharedFolderDeviceCard from './SharedFolderDeviceCard.jsx'
-import { folderCount, rightsLabel } from './sharedFolderLabels.js'
+import { folderCount, otherFolderStatus, rightsLabel } from './sharedFolderLabels.js'
 import '../ProviderAuth/ProviderAuth.css'
-
-function status(device, folder) {
-  if (!device.online) return { color: '--muted', label: 'Offline' }
-  if (folder.state === 'paused') return { color: '--muted', label: 'Paused' }
-  return { color: '--green', label: 'Ready' }
-}
 
 export default function OtherDeviceFolders({ devices, onPause }) {
   return devices.map(device => <OtherDevice key={device.id} device={device} onPause={onPause} />)
 }
 
 function OtherDevice({ device, onPause }) {
-  const pausable = device.online ? device.folders.filter(folder => folder.state === 'ready') : []
+  const pausable = device.folders.filter(folder => otherFolderStatus(folder).usable)
   const pauseAll = pausable.length > 1 && (
     <button
       type="button"
@@ -44,7 +38,7 @@ function OtherDevice({ device, onPause }) {
 }
 
 function OtherFolderRow({ device, folder, onPause }) {
-  const shown = status(device, folder)
+  const shown = otherFolderStatus(folder)
   return (
     <div className="provider-row shared-folders__other">
       <div className="provider-row__main">
@@ -55,7 +49,7 @@ function OtherFolderRow({ device, folder, onPause }) {
           <span className="provider-row__sub">{rightsLabel(folder)}</span>
           <StatusDot color={shown.color}>{shown.label}</StatusDot>
         </span>
-        {device.online && folder.state === 'ready' && (
+        {shown.usable && (
           <button
             type="button"
             className="settings__btn settings__btn--outline settings__btn--sm shared-folders__other-pause"
