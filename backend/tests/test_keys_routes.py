@@ -831,6 +831,124 @@ def test_an_app_is_never_purged_while_a_borrow_it_started_is_on_its_way_to_the_v
   assert db.query(models.App).filter(models.App.id == app_id).one().slug == "newcomer"
 
 
+def _paused_use_request(path):
+  from starlette.requests import Request
+
+  async def body():
+    return {"type": "http.request", "body": b"", "more_body": False}
+  return Request({
+    "type": "http", "method": "GET", "path": path, "raw_path": path.encode(),
+    "query_string": b"", "headers": [],
+  }, body)
+
+
+def test_a_cancelled_borrow_keeps_the_app_until_the_vault_has_answered(
+  client, auth, db, vault, monkeypatch,
+):
+  """The vault accepted a borrow and has not authorized it yet when its
+  caller is cancelled. The vault still acts on it, so the app stays unpurged
+  (its id unfreed) until the vault has answered, not merely until the caller
+  stopped waiting."""
+  import asyncio
+  import threading
+  from app import fs_locks
+  from app.deps import Principal
+  from app.routes import keys as keys_routes
+  monkeypatch.setattr(key_vault, "_borrows_in_flight", {})
+  vault.put_key("shared", {"value": DUMMY, "inject": ASK["inject"],
+                           "grants": {"apps": [], "agents": False, "sites": [SITE]}})
+  app = _app(db, "leaving")
+  app_id = app.id
+  principal = Principal(owner=db.query(models.Owner).first(), app_id=app_id,
+                        app_instance_id=app.token_nonce, scope="app")
+  accepted, authorize_now = threading.Event(), threading.Event()
+  authorize = vault.authorize
+
+  def paused_before_authorizing(*args, **kwargs):
+    accepted.set()
+    authorize_now.wait(10)
+    return authorize(*args, **kwargs)
+  monkeypatch.setattr(vault, "authorize", paused_before_authorizing)
+
+  async def purge_and_reuse_the_id():
+    async with fs_locks.app_storage_lock(app_id):
+      await key_vault.forget_app(app_id)
+      db.delete(app)
+      db.commit()
+      _app(db, "newcomer", app_id)
+      vault.put_key("shared", {"inject": ASK["inject"],
+                               "grants": {"apps": [app_id], "agents": False, "sites": [SITE]}})
+
+  async def scenario():
+    borrow = asyncio.create_task(keys_routes.use_key(
+      "shared", "api.example.com", "v1/x",
+      _paused_use_request("/api/keys/use/shared/api.example.com/v1/x"),
+      principal=principal,
+    ))
+    assert await asyncio.to_thread(accepted.wait, 10)
+    borrow.cancel()
+    for _ in range(5):
+      await asyncio.sleep(0)
+    try:
+      await purge_and_reuse_the_id()
+      purged_while_the_vault_held_it = True
+    except RuntimeError:
+      purged_while_the_vault_held_it = False
+    authorize_now.set()
+    try:
+      await borrow
+      caller_cancelled = False
+    except asyncio.CancelledError:
+      caller_cancelled = True
+    await purge_and_reuse_the_id()
+    return purged_while_the_vault_held_it, caller_cancelled
+
+  assert asyncio.run(scenario()) == (False, True)
+  # The leaving app holds no grant of its own, so the vault refused it.
+  assert [e["outcome"] for e in vault.usage() if e["caller"].startswith("app")] == ["denied"]
+  assert key_vault._borrows_in_flight == {}
+
+
+@pytest.mark.parametrize("may_have_reached_vault, purge_allowed", [
+  (True, False),
+  (False, True),
+])
+def test_a_borrow_the_vault_may_still_act_on_keeps_the_app_unpurged(
+  client, auth, db, monkeypatch, may_have_reached_vault, purge_allowed,
+):
+  """A relay that failed after its request may have reached the vault leaves
+  the vault able to act on it later, so the app stays unpurged for the rest
+  of this process. One that never connected releases the app at once."""
+  import asyncio
+  from fastapi import HTTPException
+  from app.deps import Principal
+  from app.routes import keys as keys_routes
+  monkeypatch.setattr(key_vault, "_borrows_in_flight", {})
+  app = _app(db, "leaving")
+  principal = Principal(owner=db.query(models.Owner).first(), app_id=app.id,
+                        app_instance_id=app.token_nonce, scope="app")
+
+  async def vault_fails(*args, **kwargs):
+    raise key_vault.VaultUnavailable(
+      "no answer", may_have_reached_vault=may_have_reached_vault,
+    )
+  monkeypatch.setattr(key_vault, "vault_use", vault_fails)
+
+  with pytest.raises(HTTPException) as failed:
+    asyncio.run(keys_routes.use_key(
+      "shared", "api.example.com", "v1/x",
+      _paused_use_request("/api/keys/use/shared/api.example.com/v1/x"),
+      principal=principal,
+    ))
+  assert failed.value.status_code == 503
+  try:
+    key_vault.refuse_purge_while_borrowing(app.id)
+    allowed = True
+  except RuntimeError:
+    allowed = False
+  assert allowed is purge_allowed
+
+
 def test_approving_an_app_never_sends_a_shared_key_to_new_sites(client, auth, db, vault):
   """K lets A use api.example.com; B asks for K on another site with POST and
   DELETE. Allow lets B use K where it already works and nowhere else, and

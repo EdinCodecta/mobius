@@ -31,6 +31,7 @@ from pathlib import Path
 
 import httpx
 
+from app import settled
 from app.config import get_settings
 
 
@@ -47,7 +48,16 @@ _USE_TIMEOUT_SECS = 75
 
 
 class VaultUnavailable(RuntimeError):
-  """The vault process is not answering on its socket."""
+  """The vault process is not answering on its socket.
+
+  ``may_have_reached_vault`` is False only when the request certainly never
+  got to the vault (it could not connect). Otherwise the vault may have
+  accepted it and may still act on it.
+  """
+
+  def __init__(self, message: str, *, may_have_reached_vault: bool = False) -> None:
+    super().__init__(message)
+    self.may_have_reached_vault = may_have_reached_vault
 
 
 class VaultRefused(RuntimeError):
@@ -133,8 +143,14 @@ async def vault_use(
       # would hide.
       request.url = request.url.copy_with(raw_path=target.encode("ascii"))
       return await client.send(request)
-  except (httpx.TransportError, OSError) as exc:
+  except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
     raise VaultUnavailable("The key vault is not running.") from exc
+  except (httpx.TransportError, OSError) as exc:
+    # The request may already be with the vault, which acts on it whether or
+    # not anyone is still waiting for the answer.
+    raise VaultUnavailable(
+      "The key vault did not answer.", may_have_reached_vault=True,
+    ) from exc
 
 
 # -- an app's own key names --------------------------------------------------
@@ -263,30 +279,70 @@ async def for_live_app(app_id: int, expected_nonce: str | None = None):
 _borrows_in_flight: dict[int, int] = {}
 
 
-@contextlib.asynccontextmanager
-async def borrowing_for(app_id: int, installation: str | None):
-  """Confirm under ``app_id``'s lock that ``installation`` (the token nonce
-  the app's token names) is still the app, then keep the app from being
-  forgotten until the block ends.
+def _vault_has_answered(error: BaseException | None) -> bool:
+  """Whether a finished relay leaves nothing the vault could still act on."""
+  if error is None:
+    return True
+  return isinstance(error, VaultUnavailable) and not error.may_have_reached_vault
 
-  The vault knows an app only by its reusable id, so a borrow checked here
-  must have its answer before the purge frees the id: otherwise it could
-  arrive after an unrelated app reused the id and be sent with that app's
-  grant. The lock is held only for the check, never across the relay, so
-  borrows run side by side and storage writes do not wait on a third party;
-  ``forget_app`` refuses while any borrow is still out.
+
+async def borrow(
+  app_id: int, installation: str | None, method: str, target: str, *,
+  caller: str, headers: list[tuple[str, str]], body: bytes | None,
+) -> httpx.Response:
+  """Relay an app's use request, keeping the app from being forgotten until
+  the vault can no longer act on it.
+
+  The check runs under ``app_id``'s lock: ``installation`` (the token nonce
+  the app's token names) must still be the app. The vault knows an app only
+  by its reusable id, so the purge must not free the id while the vault could
+  still authorize this request, or it could be sent with the grant of an
+  unrelated app that reuses the id. The lock is held only for the check, never
+  across the relay, so borrows run side by side and storage writes do not
+  wait on a third party; ``forget_app`` refuses while any borrow is out.
+
+  A borrow is out until the vault has answered. A cancelled caller does not
+  end it: the relay is settled first. When the relay fails after the request
+  may have reached the vault, the vault could still act on it, so the borrow
+  stays out for the rest of this process. The vault process ends with the
+  server, and a new one cannot start until it has, so the next process starts
+  with no such request left.
   """
   if not installation:
     raise AppGone(app_id)
   app_id = int(app_id)
   async with for_live_app(app_id, installation):
     _borrows_in_flight[app_id] = _borrows_in_flight.get(app_id, 0) + 1
+  answered = False
+
+  def after_cancel(task: asyncio.Future) -> None:
+    nonlocal answered
+    error = None if task.cancelled() else task.exception()
+    answered = not task.cancelled() and _vault_has_answered(error)
+    if error is not None:
+      settled.log_abandoned_failure(task, "Key borrow")
+
   try:
-    yield
+    response = await settled.settle(
+      vault_use(method, target, caller=caller, headers=headers, body=body),
+      what="Key borrow", abandoned=after_cancel,
+    )
+  except VaultUnavailable as exc:
+    answered = _vault_has_answered(exc)
+    raise
+  else:
+    answered = True
+    return response
   finally:
-    left = _borrows_in_flight.pop(app_id) - 1
-    if left:
-      _borrows_in_flight[app_id] = left
+    if answered:
+      left = _borrows_in_flight.pop(app_id) - 1
+      if left:
+        _borrows_in_flight[app_id] = left
+    else:
+      log.warning(
+        "app %s: a key borrow may still be with the vault; "
+        "its purge waits for this server process to end", app_id,
+      )
 
 
 def refuse_purge_while_borrowing(app_id: int) -> None:
@@ -495,7 +551,7 @@ async def forget_app(app_id: int) -> None:
   never used.
 
   The caller holds the app's lock. A borrow the app started before then
-  (``borrowing_for``) may not have reached the vault yet; the purge is
+  (``borrow``) may not have reached the vault yet; the purge is
   refused until it has its answer, and the next sweep retries it.
   """
   refuse_purge_while_borrowing(app_id)

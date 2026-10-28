@@ -40,9 +40,11 @@ guests and delegated helpers. An edit carries the revision of the key it was
 made from, and the vault refuses it if the key changed since, so a stale page
 cannot write back old grants. App ids can be reused after a purge, so purging
 an app removes it from every grant and request. A purge also waits until every
-borrow the app started has been answered: the vault knows the app only by its
-id, so a borrow still on its way could otherwise use the grant of an app that
-reuses the id.
+borrow the app started has been answered, even one whose caller gave up: the
+vault knows the app only by its id, so a borrow still on its way could
+otherwise use the grant of an app that reuses the id. A borrow whose answer
+never came back keeps the app until the server restarts, which ends the vault
+process and anything it was still doing.
 
 ## Where it lives
 

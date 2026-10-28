@@ -14,7 +14,6 @@ and relays.
 
 from __future__ import annotations
 
-import contextlib
 from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
@@ -243,13 +242,14 @@ async def use_key(
   ]
   # The vault knows apps by their reusable id. An app's borrow is checked once
   # its body has arrived, for the installation its token names, and the app
-  # cannot be purged (freeing the id) until the vault has answered it.
-  hold = (
-    key_vault.borrowing_for(principal.app_id, principal.app_instance_id)
-    if principal.app_id is not None else contextlib.nullcontext()
-  )
+  # cannot be purged (freeing the id) while the vault could still act on it.
   try:
-    async with hold:
+    if principal.app_id is not None:
+      upstream = await key_vault.borrow(
+        principal.app_id, principal.app_instance_id, request.method, target,
+        caller=caller, headers=headers, body=body or None,
+      )
+    else:
       upstream = await key_vault.vault_use(
         request.method, target, caller=caller, headers=headers, body=body or None,
       )
