@@ -16,10 +16,14 @@ export function expiryTone(expiresAt, now = Date.now()) {
   return left < 3 * DAY ? 'soon' : ''
 }
 
-export function removedLabel(deletedAt) {
+/** "Uninstalled on October 27": the month written out, and the year only when it is not this year. The
+ *  App Store's note on an uninstalled app's page writes its dates the same way. */
+export function removedLabel(deletedAt, now = new Date()) {
   const when = new Date(deletedAt)
   if (Number.isNaN(when.getTime())) return ''
-  return `Removed ${when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`
+  const options = { day: 'numeric', month: 'long' }
+  if (when.getFullYear() !== now.getFullYear()) options.year = 'numeric'
+  return `Uninstalled on ${when.toLocaleDateString(undefined, options)}`
 }
 
 /** The server's reason for a failed recover, in its own words when it gave one. */
