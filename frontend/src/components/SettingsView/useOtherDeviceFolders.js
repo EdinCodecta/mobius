@@ -11,6 +11,11 @@ async function fetchOtherFolders() {
   return folders.filter(folder => folder.device?.id !== here)
 }
 
+// The last answer, kept for the page's lifetime: the row and the page it opens
+// share it, so opening the page shows the folders at once and refreshes them
+// quietly rather than flashing a loading state.
+let lastAnswer = null
+
 /** One entry per browser, in the order the server lists their folders. */
 export function groupByDevice(folders) {
   const devices = folders.reduce((byId, folder) => {
@@ -24,12 +29,16 @@ export function groupByDevice(folders) {
 }
 
 /**
+ * `loaded` turns true once the first answer (or failure) has settled and stays
+ * true, so a later refresh updates the list quietly instead of blanking it.
+ *
  * Fetched when Settings shows it, when this browser's own folders change, and
  * when the owner comes back to the tab. Never on a timer: whether another
  * browser is online only matters while someone is looking.
  */
 export default function useOtherDeviceFolders(localFolders) {
-  const [folders, setFolders] = useState([])
+  const [folders, setFolders] = useState(lastAnswer ?? [])
+  const [loaded, setLoaded] = useState(lastAnswer !== null)
   const [refreshes, setRefreshes] = useState(0)
   const refresh = useCallback(() => setRefreshes(count => count + 1), [])
   const localKey = localFolders.map(folder => `${folder.id}:${folder.state}`).join(',')
@@ -37,8 +46,12 @@ export default function useOtherDeviceFolders(localFolders) {
   useEffect(() => {
     let current = true
     fetchOtherFolders()
-      .then(list => { if (current) setFolders(list) })
+      .then(list => {
+        lastAnswer = list
+        if (current) setFolders(list)
+      })
       .catch(() => {})
+      .finally(() => { if (current) setLoaded(true) })
     return () => { current = false }
   }, [localKey, refreshes])
 
@@ -57,5 +70,5 @@ export default function useOtherDeviceFolders(localFolders) {
   }, [refresh])
 
   const devices = useMemo(() => groupByDevice(folders), [folders])
-  return { folders, devices, pause }
+  return { folders, devices, loaded, pause }
 }

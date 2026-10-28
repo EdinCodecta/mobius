@@ -9,7 +9,12 @@
 }
 
 .shared-folders-summary > .settings__section-title { margin: 0 0 5px; }
-.shared-folders-summary .shared-folders-summary__row { margin-top: 12px; }
+.shared-folders-summary .shared-folders-summary__row {
+  margin-top: 12px;
+  /* The loaded row is two text lines plus padding; the placeholder is held to the same height so nothing below moves. */
+  box-sizing: border-box;
+  min-height: 70px;
+}
 
 .shared-folders-summary__icon {
   width: 34px;
@@ -405,4 +410,46 @@
   .shared-folders__prompt .settings__btn--sm {
     align-self: flex-start;
   }
+}
+
+/* Loading placeholders: the same boxes as the loaded rows, softly pulsing, so
+   the text appears once and nothing below it moves. */
+.shared-folders-skeleton__block {
+  /* --surface-2 vanishes on the card's own --surface, so lift it a little with the text colour. */
+  background: color-mix(in srgb, var(--text) 9%, var(--surface));
+  animation: shared-folders-pulse 1.6s ease-in-out infinite;
+}
+
+.shared-folders-skeleton__lines {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 9px;
+}
+
+.shared-folders-skeleton__line {
+  display: block;
+  height: 10px;
+  border-radius: 5px;
+}
+
+.shared-folders__devices + .shared-folders-skeleton,
+.shared-folders__adder + .shared-folders-skeleton {
+  margin-top: 16px;
+}
+
+.shared-folders-skeleton__folder {
+  display: grid;
+  gap: 9px;
+  padding: 14px 14px 16px 60px;
+  border-top: 1px solid var(--border-light);
+}
+
+@keyframes shared-folders-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shared-folders-skeleton__block { animation: none; opacity: 0.7; }
 }

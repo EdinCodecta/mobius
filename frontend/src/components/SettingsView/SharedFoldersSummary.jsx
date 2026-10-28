@@ -22,6 +22,22 @@ function summaryOf(state, devices) {
   }
 }
 
+function SummarySkeleton() {
+  return (
+    <section className="settings__section shared-folders-summary" aria-labelledby="settings-shared-folders-title">
+      <h2 className="settings__section-title" id="settings-shared-folders-title">Shared folders</h2>
+      <p className="settings__subtext settings__subtext--tight">Agents use files on your devices without uploading.</p>
+      <div className="settings__account-link shared-folders-summary__row shared-folders-skeleton" role="status" aria-busy="true" aria-label="Loading shared folders">
+        <span className="shared-folders-summary__icon shared-folders-skeleton__block" aria-hidden="true" />
+        <span className="shared-folders-skeleton__lines" aria-hidden="true">
+          <span className="shared-folders-skeleton__block shared-folders-skeleton__line" style={{ width: '46%' }} />
+          <span className="shared-folders-skeleton__block shared-folders-skeleton__line" style={{ width: '68%' }} />
+        </span>
+      </div>
+    </section>
+  )
+}
+
 export default function SharedFoldersSummary({ onOpen }) {
   if (isSharedBrowserAuth()) return null
   return <Summary onOpen={onOpen} />
@@ -29,9 +45,12 @@ export default function SharedFoldersSummary({ onOpen }) {
 
 function Summary({ onOpen }) {
   const state = useSharedFolders()
-  const { devices } = useOtherDeviceFolders(state.folders)
-  const { title, detail } = summaryOf(state, devices)
+  const { devices, loaded } = useOtherDeviceFolders(state.folders)
   const needsYou = needsYouCount(state.folders)
+  // The counts come from this browser and from the server; say nothing until
+  // both have answered, so the text appears once, final, instead of recounting.
+  if (state.status === 'loading' || !loaded) return <SummarySkeleton />
+  const { title, detail } = summaryOf(state, devices)
   return (
     <section className="settings__section shared-folders-summary" aria-labelledby="settings-shared-folders-title">
       <h2 className="settings__section-title" id="settings-shared-folders-title">Shared folders</h2>

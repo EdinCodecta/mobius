@@ -51,6 +51,7 @@ export default function SharedFoldersPage() {
       </p>
       <ThisBrowser state={state} report={report} pickForVisit={pickForVisit} />
       {notice && <Alert className="shared-folders__alert" color={notice.color} variant="soft" description={notice.text} />}
+      {!others.loaded && <DeviceSkeleton />}
       {others.devices.length > 0 && (
         <div className="shared-folders__devices">
           <OtherDeviceFolders devices={others.devices} onPause={others.pause} />
@@ -71,7 +72,7 @@ export default function SharedFoldersPage() {
 }
 
 function ThisBrowser({ state, report, pickForVisit }) {
-  if (state.status === 'loading') return <p className="settings__subtext">Loading…</p>
+  if (state.status === 'loading') return <DeviceSkeleton />
   if (state.status === 'restart') {
     return <p className="settings__notice">Restart Möbius to turn on shared folders. Use Restart under Updates in Settings.</p>
   }
@@ -100,6 +101,25 @@ function ThisBrowser({ state, report, pickForVisit }) {
         <FolderAdder state={state} report={report} pickForVisit={pickForVisit} />
       </div>
     </>
+  )
+}
+
+/** A browser card's shape, empty: the page keeps its size while the folders load. */
+function DeviceSkeleton() {
+  return (
+    <div className="shared-folders__device shared-folders-skeleton" role="status" aria-busy="true" aria-label="Loading folders">
+      <div className="shared-folders__device-head" aria-hidden="true">
+        <span className="shared-folders__device-icon shared-folders-skeleton__block" />
+        <span className="shared-folders-skeleton__lines">
+          <span className="shared-folders-skeleton__block shared-folders-skeleton__line" style={{ width: '40%' }} />
+          <span className="shared-folders-skeleton__block shared-folders-skeleton__line" style={{ width: '58%' }} />
+        </span>
+      </div>
+      <div className="shared-folders-skeleton__folder" aria-hidden="true">
+        <span className="shared-folders-skeleton__block shared-folders-skeleton__line" style={{ width: '34%' }} />
+        <span className="shared-folders-skeleton__block shared-folders-skeleton__line" style={{ width: '22%' }} />
+      </div>
+    </div>
   )
 }
 
