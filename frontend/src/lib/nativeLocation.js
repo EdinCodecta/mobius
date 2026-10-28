@@ -10,8 +10,9 @@
 //   - feature-detect `MobiusNative`;
 //   - start / stop / resume tracking and surface the OS status string. Only
 //     the phone app can change tracking; other devices can only view it;
-//   - receive `mobius:location` batches, dedupe them, and queue them durably in
-//     localStorage;
+//   - receive `mobius:location` batches, dedupe them, and queue them. The
+//     in-memory queue is authoritative for this document; localStorage is a
+//     best-effort copy so a reload or relaunch can still upload a backlog;
 //   - upload the queue to the backend in batches, retrying on failure, and drop
 //     positions from the queue only once the server has accepted them;
 //   - remember (on the server, mirrored in localStorage) whether the owner
@@ -55,6 +56,12 @@ const RETRY_MAX_MS = 60_000
 
 const DEFAULT_OPTIONS = { background: true, interval: 10000, distance: 0 }
 
+// The server's bounds for one fix (routes/location.py `Position`). A fix outside
+// them can never be stored, so it is dropped on arrival instead of poisoning an
+// upload.
+const TS_MIN_MS = 1_000_000_000_000
+const TS_MAX_MS = 4_102_444_800_000
+
 // ---- storage helpers (every access is defensive: private mode, quota, etc.) --
 
 function readJSON(key, fallback) {
@@ -68,12 +75,15 @@ function readJSON(key, fallback) {
   }
 }
 
+// Returns whether the value was saved. Out of quota or storage denied leaves
+// the in-memory state authoritative for this document; durability across
+// reloads is best-effort by contract.
 function writeJSON(key, value) {
   try {
     localStorage.setItem(key, JSON.stringify(value))
+    return true
   } catch {
-    // Out of quota or storage denied — tracking still works in memory for this
-    // session; durability across reloads is best-effort by contract.
+    return false
   }
 }
 
@@ -118,7 +128,10 @@ let state = {
   // A stored "on" without this session's flag is left over from a closed app.
   enabled: readJSON(ENABLED_KEY, false) === true && hasSessionActive(),
   status: null,        // last OS status string: started | denied | disabled | unavailable | stopped
-  queueLength: readJSON(QUEUE_KEY, []).length,
+  queueLength: 0,
+  // false when the last queue change could not be saved on the device, so a
+  // reload now would lose the not-yet-uploaded fixes.
+  queuePersisted: true,
   uploading: false,
   lastError: null,
   lastUploadAt: null,
@@ -129,6 +142,7 @@ let draining = false
 let drainRequested = false
 let retryTimer = null
 let retryDelay = RETRY_BASE_MS
+let uploadSize = UPLOAD_CHUNK
 
 function setState(patch) {
   state = { ...state, ...patch }
@@ -140,19 +154,23 @@ export function getLocationState() {
 
 // ---- queue ------------------------------------------------------------------
 
-function loadQueue() {
-  const q = readJSON(QUEUE_KEY, [])
-  return Array.isArray(q) ? q : []
+// The queue and the recently-delivered ring live in memory for the life of the
+// document and are copied to localStorage after every change. Uploads read only
+// the in-memory copy, so a storage failure can neither lose a fresh fix nor
+// resend an already accepted chunk.
+function loadStoredArray(key) {
+  const value = readJSON(key, [])
+  return Array.isArray(value) ? value : []
 }
 
-function saveQueue(queue) {
-  writeJSON(QUEUE_KEY, queue)
-  setState({ queueLength: queue.length })
-}
+let queue = loadStoredArray(QUEUE_KEY)
+let delivered = loadStoredArray(DELIVERED_KEY)
+setState({ queueLength: queue.length })
 
-function loadDelivered() {
-  const d = readJSON(DELIVERED_KEY, [])
-  return Array.isArray(d) ? d : []
+function setQueue(next) {
+  queue = next
+  const persisted = writeJSON(QUEUE_KEY, queue)
+  setState({ queueLength: queue.length, queuePersisted: persisted })
 }
 
 // Normalize a raw device position to exactly the fields the backend stores,
@@ -163,8 +181,9 @@ function normalizePosition(raw) {
   const lat = Number(raw.latitude)
   const lon = Number(raw.longitude)
   const ts = Number(raw.timestamp)
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null
-  if (!Number.isFinite(ts) || !Number.isInteger(ts)) return null
+  if (!Number.isFinite(lat) || lat < -90 || lat > 90) return null
+  if (!Number.isFinite(lon) || lon < -180 || lon > 180) return null
+  if (!Number.isInteger(ts) || ts < TS_MIN_MS || ts > TS_MAX_MS) return null
   const opt = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v))
   return {
     latitude: lat,
@@ -181,28 +200,24 @@ function normalizePosition(raw) {
 // already queued and what was recently delivered.
 function enqueuePositions(rawPositions) {
   if (!Array.isArray(rawPositions) || rawPositions.length === 0) return
-  const queue = loadQueue()
-  const delivered = new Set(loadDelivered())
-  const queued = new Set(queue.map((p) => p.timestamp))
-  let added = 0
+  const seen = new Set(delivered)
+  for (const p of queue) seen.add(p.timestamp)
+  const added = []
   for (const raw of rawPositions) {
     const pos = normalizePosition(raw)
-    if (!pos) continue
-    if (delivered.has(pos.timestamp) || queued.has(pos.timestamp)) continue
-    queued.add(pos.timestamp)
-    queue.push(pos)
-    added += 1
+    if (!pos || seen.has(pos.timestamp)) continue
+    seen.add(pos.timestamp)
+    added.push(pos)
   }
-  if (added === 0) return
+  if (added.length === 0) return
   // Keep the queue ordered by fix time, not arrival time.
-  queue.sort((a, b) => a.timestamp - b.timestamp)
-  saveQueue(queue)
+  setQueue(queue.concat(added).sort((a, b) => a.timestamp - b.timestamp))
   void drain()
 }
 
 function markDelivered(timestamps) {
   if (!timestamps.length) return
-  let delivered = loadDelivered().concat(timestamps)
+  delivered = delivered.concat(timestamps)
   if (delivered.length > DELIVERED_MAX) {
     delivered = delivered.slice(delivered.length - DELIVERED_MAX)
   }
@@ -225,8 +240,20 @@ function clearRetry() {
   retryDelay = RETRY_BASE_MS
 }
 
+function removeFromQueue(chunk) {
+  const timestamps = new Set(chunk.map((p) => p.timestamp))
+  // A concurrent enqueue may have appended while the request was in flight.
+  setQueue(queue.filter((p) => !timestamps.has(p.timestamp)))
+  return [...timestamps]
+}
+
 // Upload the queue in chunks, oldest first, removing each chunk only after the
 // server accepts it. Coalesces concurrent requests into one in-flight drain.
+//
+// Fixes are normalized to the server's bounds on arrival, so a rejected (422)
+// chunk is unexpected. It is bisected rather than dropped: the upload size
+// halves until the rejected fix is isolated and only that one is discarded;
+// the next accepted upload restores the full size.
 async function drain() {
   drainRequested = true
   if (draining) return
@@ -235,13 +262,12 @@ async function drain() {
   try {
     while (drainRequested) {
       drainRequested = false
-      let queue = loadQueue()
       if (queue.length === 0) { clearRetry(); break }
       if (typeof navigator !== 'undefined' && navigator.onLine === false) {
         scheduleRetry()
         break
       }
-      const chunk = queue.slice(0, UPLOAD_CHUNK)
+      const chunk = queue.slice(0, uploadSize)
       let res
       try {
         res = await apiFetch('/location/batch', {
@@ -254,21 +280,19 @@ async function drain() {
         break
       }
       if (res.ok) {
-        // Re-read: a concurrent enqueue may have appended while we were in flight.
-        const timestamps = new Set(chunk.map((p) => p.timestamp))
-        const remaining = loadQueue().filter((p) => !timestamps.has(p.timestamp))
-        saveQueue(remaining)
-        markDelivered([...timestamps])
+        markDelivered(removeFromQueue(chunk))
+        uploadSize = UPLOAD_CHUNK
         clearRetry()
         setState({ lastError: null, lastUploadAt: Date.now() })
         drainRequested = true // keep draining any remaining chunks
       } else if (res.status === 422) {
-        // The server rejected the whole chunk's shape. Dropping malformed fixes
-        // is correct: retrying forever would wedge the queue behind bad data.
-        const timestamps = new Set(chunk.map((p) => p.timestamp))
-        const remaining = loadQueue().filter((p) => !timestamps.has(p.timestamp))
-        saveQueue(remaining)
-        setState({ lastError: 'Some positions were rejected and dropped.' })
+        if (chunk.length > 1) {
+          uploadSize = Math.ceil(chunk.length / 2)
+        } else {
+          // This one fix can never be stored; retrying it would wedge the queue.
+          removeFromQueue(chunk)
+          setState({ lastError: 'A position was rejected and dropped.' })
+        }
         drainRequested = true
       } else {
         // 5xx / 429 / transient: keep the chunk and back off.
@@ -413,23 +437,35 @@ export async function startTracking(options = savedOptions()) {
 
 // Only the phone app can stop tracking: on any other device this changes
 // nothing (the phone that is tracking keeps tracking) and reports 'unavailable'.
+//
+// Tracking is recorded as off only once the phone confirms it stopped. If the
+// native stop fails, or answers that it is still recording, nothing is
+// changed — this phone keeps uploading what it records and every surface keeps
+// showing tracking on — and the call rejects with code `stop_failed`.
 export async function stopTracking() {
   if (!isNativeLocationAvailable()) {
     setState({ status: 'unavailable', available: false })
     return 'unavailable'
   }
+  let status
+  let failure = null
+  try {
+    status = await window.MobiusNative.stopLocation()
+    if (status === 'started') failure = 'The phone is still recording.'
+  } catch (err) {
+    failure = String(err?.message || err || 'The phone did not stop recording.')
+  }
+  if (failure) {
+    setState({ lastError: `Stopping failed: ${failure}` })
+    const error = new Error('The phone could not confirm that tracking stopped.')
+    error.code = 'stop_failed'
+    throw error
+  }
   setSessionActive(false)
   persistEnabled(false, null)
   void putTrackingState(false, savedOptions())
-  let status = 'stopped'
-  try {
-    status = await window.MobiusNative.stopLocation()
-  } catch {
-    // Treat a failed stop as stopped locally; we have already cleared the
-    // preference so no reload will re-arm it.
-  }
-  setState({ status })
-  return status
+  setState({ status: status || 'stopped', lastError: null })
+  return status || 'stopped'
 }
 
 // ---- boot ---------------------------------------------------------------------

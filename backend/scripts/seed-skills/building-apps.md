@@ -934,7 +934,9 @@ const { positions } = await res.json() // newest first, at most 5000
 reports the state, and `start`, `stop`, and `set-options` reject with code
 `unavailable`, so show the state read-only there. `status` is the phone's
 answer: `started`, `denied`, `disabled`, `unavailable`, or `stopped`; explain
-`denied` and `disabled` to the owner. Tracking keeps running after the owner
+`denied` and `disabled` to the owner. If the phone cannot confirm that it
+stopped, `stop` rejects with code `stop_failed` and tracking stays on; say so
+rather than showing it off. Tracking keeps running after the owner
 leaves your app, until it is stopped or the phone app is closed.
 
 ## Managed-app update events

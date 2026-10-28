@@ -41,19 +41,27 @@ async function loadPage({
   localEnabled = serverEnabled,
   session = {},
   startResult = 'started',
+  stopResult = 'stopped',
   native = true,
+  batch = () => new Response('{}', { status: 200 }),
+  storage = null,
 } = {}) {
-  const calls = { start: [], stop: 0, puts: [] }
+  const calls = { start: [], stop: 0, puts: [], batches: [] }
   const server = { enabled: serverEnabled, options: {} }
   const win = new EventTarget()
   if (native) {
     win.MobiusNative = {
       async startLocation(opts) { calls.start.push(opts); return startResult },
-      async stopLocation() { calls.stop += 1; return 'stopped' },
+      async stopLocation() {
+        calls.stop += 1
+        if (stopResult instanceof Error) throw stopResult
+        return stopResult
+      },
     }
   }
   const sessionStorage = new MemoryStorage(session)
-  const localStorage = new MemoryStorage(localEnabled ? { [ENABLED_KEY]: 'true' } : {})
+  const localStorage = storage
+    || new MemoryStorage(localEnabled ? { [ENABLED_KEY]: 'true' } : {})
   setGlobal('window', win)
   setGlobal('document', new EventTarget())
   setGlobal('localStorage', localStorage)
@@ -66,6 +74,11 @@ async function loadPage({
       server.enabled = body.enabled
       server.options = body.options
       return new Response('{}', { status: 200 })
+    }
+    if (path === '/location/batch') {
+      const body = JSON.parse(init.body)
+      calls.batches.push(body.positions)
+      return batch(body.positions)
     }
     if (path === '/location/tracking') {
       return Response.json({ enabled: server.enabled, options: server.options })
@@ -215,3 +228,101 @@ test('a reload in the same app session resumes even if the saved setting says of
   assert.equal(page.calls.start.length, 1)
   assert.equal(page.mod.getLocationState().enabled, true)
 })
+
+// ---- upload queue and stop confirmation --------------------------------------
+
+const T0 = 1_800_000_000_000
+const fix = (i, extra = {}) => ({ latitude: 43.85, longitude: 18.41, timestamp: T0 + i * 1000, ...extra })
+const deliver = (positions) => {
+  globalThis.window.dispatchEvent(Object.assign(new Event('mobius:location'), { detail: { positions } }))
+}
+const settle = async () => { for (let i = 0; i < 20; i += 1) await flush() }
+
+// localStorage that reads fine but refuses every write (quota full, or denied).
+class FullStorage extends MemoryStorage {
+  setItem() { throw new Error('QuotaExceededError') }
+}
+
+test('fixes still upload once each when the device cannot save the queue', async () => {
+  let accept = false
+  const page = await loadPage({
+    storage: new FullStorage(),
+    batch: () => new Response('{}', { status: accept ? 200 : 503 }),
+  })
+  await page.mod.initLocationTracking()
+  deliver([fix(1), fix(2)])
+  await settle()
+  // The upload failed, yet the fixes are still held for retry.
+  assert.equal(page.mod.getLocationState().queueLength, 2)
+  assert.equal(page.mod.getLocationState().queuePersisted, false)
+
+  accept = true
+  deliver([fix(3)])
+  await settle()
+  const uploaded = page.calls.batches.slice(1).flat().map((p) => p.timestamp)
+  assert.deepEqual(uploaded, [fix(1), fix(2), fix(3)].map((p) => p.timestamp))
+  assert.equal(page.mod.getLocationState().queueLength, 0)
+
+  // A re-delivered fix is not uploaded again.
+  const before = page.calls.batches.length
+  deliver([fix(3)])
+  await settle()
+  assert.equal(page.calls.batches.length, before)
+})
+
+test('fixes outside the server bounds are dropped on arrival', async () => {
+  const page = await loadPage()
+  await page.mod.initLocationTracking()
+  deliver([
+    fix(1, { latitude: 91 }),
+    fix(2, { longitude: -180.5 }),
+    { latitude: 1, longitude: 1, timestamp: 12345 },
+    fix(4),
+  ])
+  await settle()
+  assert.deepEqual(page.calls.batches.flat().map((p) => p.timestamp), [fix(4).timestamp])
+})
+
+test('a rejected upload drops only the fix the server refuses', async () => {
+  const bad = fix(3).timestamp
+  const page = await loadPage({
+    batch: (positions) => new Response('{}', {
+      status: positions.some((p) => p.timestamp === bad) ? 422 : 200,
+    }),
+  })
+  await page.mod.initLocationTracking()
+  deliver([1, 2, 3, 4, 5, 6].map((i) => fix(i)))
+  await settle()
+  const accepted = page.calls.batches
+    .filter((b) => !b.some((p) => p.timestamp === bad))
+    .flat().map((p) => p.timestamp)
+  assert.deepEqual(accepted.sort(), [1, 2, 4, 5, 6].map((i) => fix(i).timestamp))
+  // The refused fix was retried alone exactly once, then dropped.
+  assert.equal(page.calls.batches.filter((b) => b.length === 1 && b[0].timestamp === bad).length, 1)
+  assert.equal(page.mod.getLocationState().queueLength, 0)
+})
+
+for (const [label, stopResult] of [
+  ['the native stop fails', new Error('bridge gone')],
+  ['the phone says it is still recording', 'started'],
+]) {
+  test(`tracking stays on and Stop rejects when ${label}`, async () => {
+    const page = await loadPage({ stopResult })
+    await page.mod.initLocationTracking()
+    await page.mod.startTracking({ background: true })
+    page.calls.puts.length = 0
+
+    await assert.rejects(page.mod.stopTracking(), { code: 'stop_failed' })
+
+    const state = page.mod.getLocationState()
+    assert.equal(state.enabled, true)
+    assert.equal(state.status, 'started')
+    assert.match(state.lastError, /Stopping failed/)
+    assert.equal(page.sessionStorage.getItem(SESSION_ACTIVE_KEY), '1')
+    assert.deepEqual(page.calls.puts, [])
+    // Fixes the phone keeps recording are still uploaded.
+    deliver([fix(1)])
+    await settle()
+    assert.equal(page.calls.batches.flat().length, 1)
+  })
+}
