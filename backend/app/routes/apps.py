@@ -713,6 +713,44 @@ async def list_apps(
   ))
 
 
+@router.get("/uninstalled", response_model=list[schemas.UninstalledAppOut])
+def list_uninstalled_apps(
+  _: models.Owner = Depends(get_owner_or_app_with_manage_apps),
+  db: Session = Depends(get_db),
+):
+  """Apps still in their recovery window, oldest removal first.
+
+  Recover one with ``POST /{app_id}/recover``. A tombstone past the window is
+  not listed even before the purge that removes it permanently.
+  """
+  cutoff = now_naive_utc() - APP_SOFT_DELETE_TTL
+  rows = (
+    db.query(models.App)
+    .options(defer(models.App.jsx_source), defer(models.App.project_templates_json))
+    .filter(models.App.deleted_at.isnot(None), models.App.deleted_at >= cutoff)
+    .order_by(models.App.deleted_at)
+    .all()
+  )
+  return [
+    schemas.UninstalledAppOut(
+      id=row.id, name=row.name, slug=row.slug, version=row.version,
+      deleted_at=row.deleted_at.replace(tzinfo=UTC),
+      expires_at=(row.deleted_at + APP_SOFT_DELETE_TTL).replace(tzinfo=UTC),
+      icon_data_url=_icon_data_url(row.effective_icon_png),
+      background_color=row.background_color, theme_color=row.theme_color,
+      manifest_url=row.manifest_url, package_id=row.package_id,
+    )
+    for row in rows
+  ]
+
+
+def _icon_data_url(png: bytes | None) -> str | None:
+  if not png:
+    return None
+  small = _downscale_icon(png, 64)
+  return "data:image/png;base64," + base64.b64encode(small).decode("ascii")
+
+
 @router.get(
   "/chat-artifacts/{chat_id}",
   response_model=list[schemas.ChatAppArtifactOut],
