@@ -3183,10 +3183,12 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       }
       void chatAppArtifactQueries.invalidateAll(queryClient)
       void invalidateShellListCache('apps')
+      void appQueries.uninstalled.invalidate(queryClient)
     } else if (ev.type === 'app_recovered') {
       if (ev.appId) confirmAppRecovered(ev.appId)
       void chatAppArtifactQueries.invalidateAll(queryClient)
       void invalidateShellListCache('apps').then(refreshApps)
+      void appQueries.uninstalled.invalidate(queryClient)
     } else if (
       ev.type === 'app_updated'
       || ev.type === 'app_created'
@@ -4503,7 +4505,6 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       reason: 'deleted',
     })
     await refreshApps()
-    void appQueries.uninstalled.invalidate(queryClient)
   }
 
   // Wipes an app's stored data back to empty while KEEPING it installed —
