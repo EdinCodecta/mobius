@@ -51,6 +51,7 @@ import {
 import useRestartPending from '../../hooks/useRestartPending.js'
 import useDelayedConnectionNotice from '../../hooks/useDelayedConnectionNotice.js'
 import useOutboxDrain from '../../hooks/useOutboxDrain.js'
+import { useLocationBoot } from '../../hooks/useLocationTracking.js'
 import { ReachabilityPhase, getDeliveryReadySnapshot, setRestartPending, verifyConnectivity } from '../../lib/connectivityStore.js'
 import {
   authQueries,
@@ -971,6 +972,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // regardless of which view is open. Single-flight, so it composes with a
   // mounted chat's own reconnect reconcile without double-posting.
   useOutboxDrain()
+  // Re-arm native (mobile-app) location tracking after a reload in the same
+  // app session, and flush any positions queued while the page was gone.
+  useLocationBoot()
   const chatsLoadedRef = useRef(false)
   const knownExistingOffListChatIdsRef = useRef(new Set())
   // Always-current chats, for reading inside callbacks that may hold a stale

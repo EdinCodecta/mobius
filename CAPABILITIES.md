@@ -717,7 +717,7 @@ Add primitives only after a real app needs them. Likely families are:
 - `device.storage`, `device.asset-cache`
 - `files.open`, `files.save`
 - `clipboard.read`, `clipboard.write`
-- `location.current`, `location.watch`
+- `location.tracking` (phone app), `location.current`, `location.watch`
 - `notifications.request`, `share.open`
 - `device.midi`, `device.serial`, `device.bluetooth`
 - `display.fullscreen`, `display.wake_lock`
@@ -794,6 +794,26 @@ session API; the app remains responsible for presentation, interpretation, and
 licensing of the bytes. A `read` consumer sends `control('next')` after taking
 ownership of every `chunk` event, so neither message port accumulates a whole
 large package in memory.
+
+### Phone location tracking
+
+`location.tracking` controls the location recorder of the Möbius phone app,
+which exposes it only to the shell's top frame. The provider wraps the shell's
+single controller, so every app sees the same tracking state:
+
+```js
+await window.mobius.capabilities.invoke('location.tracking', { operation: 'start' })
+```
+
+Operations are `get`, `start`, `stop`, and `set-options` (`options.interval`
+in milliseconds, clamped to 1 second–1 hour, and `options.distance` in
+metres). Each returns `{available, enabled, status, options}`. Outside the
+phone app, `get` reports `available: false` and the other operations reject
+with `unavailable`. Requests are `active_frame`: only a visible app can change
+tracking. Once started, recording continues in the background under the
+operating system's location indicator; the phone uploads fixes to the owner's
+server, and an app reads them from `/api/location/positions` only with the
+reviewed `location_history_read` permission.
 
 ### Passive transcript sessions
 
