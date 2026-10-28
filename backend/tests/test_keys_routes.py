@@ -754,13 +754,81 @@ def test_a_borrow_whose_body_outlives_the_app_never_uses_the_newcomers_grant(cli
 
   async def borrow():
     try:
-      await keys_routes.use_key("shared", "api.example.com", "v1/x", request, principal=principal, db=db)
+      await keys_routes.use_key("shared", "api.example.com", "v1/x", request, principal=principal)
     except HTTPException as exc:
       return exc.status_code
     return 200
 
   assert asyncio.run(borrow()) == 404
   assert [e for e in vault.usage() if e["caller"].startswith("app")] == []
+
+
+def test_an_app_is_never_purged_while_a_borrow_it_started_is_on_its_way_to_the_vault(
+  client, auth, db, vault, monkeypatch,
+):
+  """A borrow passed every check and is on its way to the vault, which knows
+  the app only by its reusable id. Purging the app under its lock, reusing
+  the id and granting only the newcomer a key must not let the old borrow
+  arrive with the newcomer's grant: the purge waits its turn instead."""
+  import asyncio
+  from starlette.requests import Request
+  from app import fs_locks
+  from app.deps import Principal
+  from app.routes import keys as keys_routes
+  vault.put_key("shared", {"value": DUMMY, "inject": ASK["inject"],
+                           "grants": {"apps": [], "agents": False, "sites": [SITE]}})
+  app = _app(db, "leaving")
+  app_id = app.id
+  principal = Principal(owner=db.query(models.Owner).first(), app_id=app_id,
+                        app_instance_id=app.token_nonce, scope="app")
+  path = "/api/keys/use/shared/api.example.com/v1/x"
+  sending, resume = asyncio.Event(), asyncio.Event()
+  send_to_vault = key_vault.vault_use
+
+  async def paused_on_the_way_to_the_vault(*args, **kwargs):
+    sending.set()
+    await resume.wait()
+    return await send_to_vault(*args, **kwargs)
+  monkeypatch.setattr(key_vault, "vault_use", paused_on_the_way_to_the_vault)
+
+  async def body():
+    return {"type": "http.request", "body": b"", "more_body": False}
+
+  request = Request({
+    "type": "http", "method": "GET", "path": path, "raw_path": path.encode(),
+    "query_string": b"", "headers": [],
+  }, body)
+
+  async def purge_and_reuse_the_id():
+    async with fs_locks.app_storage_lock(app_id):
+      await key_vault.forget_app(app_id)
+      db.delete(app)
+      db.commit()
+      _app(db, "newcomer", app_id)
+      vault.put_key("shared", {"inject": ASK["inject"],
+                               "grants": {"apps": [app_id], "agents": False, "sites": [SITE]}})
+
+  async def scenario():
+    borrow = asyncio.create_task(
+      keys_routes.use_key("shared", "api.example.com", "v1/x", request, principal=principal),
+    )
+    await sending.wait()
+    try:
+      await purge_and_reuse_the_id()
+      purged_meanwhile = True
+    except RuntimeError:
+      purged_meanwhile = False
+    resume.set()
+    answer = await borrow
+    if not purged_meanwhile:
+      # Once the borrow has its answer, the purge goes through.
+      await purge_and_reuse_the_id()
+    return answer.status_code, purged_meanwhile
+
+  # The leaving app holds no grant of its own, so the vault refuses it.
+  assert asyncio.run(scenario()) == (403, False)
+  assert [e["outcome"] for e in vault.usage() if e["caller"].startswith("app")] == ["denied"]
+  assert db.query(models.App).filter(models.App.id == app_id).one().slug == "newcomer"
 
 
 def test_approving_an_app_never_sends_a_shared_key_to_new_sites(client, auth, db, vault):

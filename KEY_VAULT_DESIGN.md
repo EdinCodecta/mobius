@@ -39,7 +39,10 @@ Approving, denying and changing keys is refused to apps, shared-browser
 guests and delegated helpers. An edit carries the revision of the key it was
 made from, and the vault refuses it if the key changed since, so a stale page
 cannot write back old grants. App ids can be reused after a purge, so purging
-an app removes it from every grant and request.
+an app removes it from every grant and request. A purge also waits until every
+borrow the app started has been answered: the vault knows the app only by its
+id, so a borrow still on its way could otherwise use the grant of an app that
+reuses the id.
 
 ## Where it lives
 

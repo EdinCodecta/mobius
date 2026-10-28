@@ -259,6 +259,36 @@ async def for_live_app(app_id: int, expected_nonce: str | None = None):
     yield
 
 
+# Borrows each app has on their way through the vault, by app id.
+_borrows_in_flight: dict[int, int] = {}
+
+
+@contextlib.asynccontextmanager
+async def borrowing_for(app_id: int, installation: str | None):
+  """Confirm under ``app_id``'s lock that ``installation`` (the token nonce
+  the app's token names) is still the app, then keep the app from being
+  forgotten until the block ends.
+
+  The vault knows an app only by its reusable id, so a borrow checked here
+  must have its answer before the purge frees the id: otherwise it could
+  arrive after an unrelated app reused the id and be sent with that app's
+  grant. The lock is held only for the check, never across the relay, so
+  borrows run side by side and storage writes do not wait on a third party;
+  ``forget_app`` refuses while any borrow is still out.
+  """
+  if not installation:
+    raise AppGone(app_id)
+  app_id = int(app_id)
+  async with for_live_app(app_id, installation):
+    _borrows_in_flight[app_id] = _borrows_in_flight.get(app_id, 0) + 1
+  try:
+    yield
+  finally:
+    left = _borrows_in_flight.pop(app_id) - 1
+    if left:
+      _borrows_in_flight[app_id] = left
+
+
 @contextlib.asynccontextmanager
 async def for_granted_apps(key_name: str, app_ids: list[int], installations: dict):
   """Hold the lock of every app a save of ``key_name`` grants, and confirm
@@ -453,7 +483,13 @@ async def forget_app(app_id: int) -> None:
   are deleted first. An instance whose vault never stored anything has
   nothing else to forget, so a purge does not depend on a vault that was
   never used.
+
+  The caller holds the app's lock. A borrow the app started before then
+  (``borrowing_for``) may not have reached the vault yet; the purge is
+  refused until it has its answer, and the next sweep retries it.
   """
+  if _borrows_in_flight.get(int(app_id)):
+    raise RuntimeError(f"app {app_id} has a key borrow in flight; purge it later")
   await asyncio.to_thread(_remove_legacy_secrets, app_id)
   if _vault_ever_used():
     await vault_call("DELETE", f"/apps/{int(app_id)}")
