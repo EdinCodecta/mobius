@@ -499,3 +499,59 @@ test('signing out through the shell cleanup erases a queued backlog', async () =
   assert.equal(page.localStorage.getItem('mobius.location.queue.v1'), null)
   assert.equal(controller.getLocationState().queueLength, 0)
 })
+
+test('signing out stops a tracking phone and reports it off before the credential goes', async () => {
+  const page = await loadPage()
+  await page.mod.initLocationTracking()
+  await page.mod.startTracking({ background: true })
+  await settle()
+  assert.equal(page.server.devices[THIS_PHONE].enabled, true)
+
+  await page.mod.stopLocationForSignOut()
+
+  assert.equal(page.calls.stop, 1)
+  assert.equal(page.server.devices[THIS_PHONE].enabled, false)
+  assert.equal(page.mod.getLocationState().enabled, false)
+  assert.equal(page.sessionStorage.getItem(SESSION_ACTIVE_KEY), null)
+
+  // The cleanup that follows has nothing left to stop or report.
+  const reports = page.calls.reports.length
+  await page.mod.endLocationSession()
+  assert.equal(page.calls.stop, 1)
+  assert.equal(page.calls.reports.length, reports)
+})
+
+test('signing out a phone that is not tracking sends nothing', async () => {
+  const page = await loadPage()
+  await page.mod.initLocationTracking()
+  await settle()
+  const reports = page.calls.reports.length
+
+  await page.mod.stopLocationForSignOut()
+
+  assert.equal(page.calls.stop, 0)
+  assert.equal(page.calls.reports.length, reports)
+})
+
+test('a stalled sign-out report gives up at its deadline and is aborted', async () => {
+  const page = await loadPage()
+  await page.mod.initLocationTracking()
+  await page.mod.startTracking({ background: true })
+  await settle()
+  let reportSignal = null
+  setGlobal('fetch', (url, init = {}) => {
+    reportSignal = init.signal || null
+    return new Promise(() => {}) // the connection never answers
+  })
+
+  const started = Date.now()
+  await page.mod.stopLocationForSignOut({ deadlineMs: 30 })
+
+  assert.ok(Date.now() - started < 1000)
+  assert.equal(page.calls.stop, 1)
+  assert.equal(page.mod.getLocationState().enabled, false)
+  assert.ok(reportSignal, 'the report carries an abort signal')
+  // The request's own timer aborts it, releasing the connection.
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(reportSignal.aborted, true)
+})

@@ -134,9 +134,7 @@ let state = {
   // false when the last queue change could not be saved on the device, so a
   // reload now would lose the not-yet-uploaded fixes.
   queuePersisted: true,
-  uploading: false,
   lastError: null,
-  lastUploadAt: null,
 }
 
 let listenerBound = false
@@ -272,7 +270,6 @@ async function drain() {
   drainRequested = true
   if (draining) return
   draining = true
-  setState({ uploading: true })
   try {
     while (drainRequested) {
       drainRequested = false
@@ -300,7 +297,7 @@ async function drain() {
         markDelivered(removeFromQueue(chunk))
         uploadSize = UPLOAD_CHUNK
         clearRetry()
-        setState({ lastError: null, lastUploadAt: Date.now() })
+        setState({ lastError: null })
         drainRequested = true // keep draining any remaining chunks
       } else if (res.status === 422) {
         if (chunk.length > 1) {
@@ -320,7 +317,6 @@ async function drain() {
     }
   } finally {
     draining = false
-    setState({ uploading: false })
   }
 }
 
@@ -330,11 +326,12 @@ async function drain() {
 // the transition that decided it: a turn superseded before it publishes stays
 // silent, and the decision time lets the server ignore a report that a slower
 // network delivers after a newer one.
-async function reportTracking(enabled, options, myTurn) {
+async function reportTracking(enabled, options, myTurn, { timeoutMs } = {}) {
   if (myTurn !== turn) return
   try {
     await apiFetch('/location/tracking', {
       method: 'PUT',
+      timeoutMs,
       body: JSON.stringify({
         device_id: getDeviceId(),
         enabled,
@@ -534,10 +531,11 @@ export async function stopTracking() {
 // and erase everything this phone kept for them — queued precise positions, the
 // delivered ring, the tracking flags and cadence — so none of it is uploaded
 // under, or shown to, whoever signs in next. In-flight native calls and uploads
-// become stale. A recording phone tries to report itself stopped while the
-// credential may still work; if that cannot land, the phone corrects its own
-// report the next time it opens. Returns once the native stop settles, so
-// callers can await it before reloading.
+// become stale. An explicit sign-out has already stopped and reported this
+// phone through `stopLocationForSignOut`; when the credential simply expired,
+// the report below cannot land and the phone corrects its own report the next
+// time it opens. Returns once the native stop settles, so callers can await it
+// before reloading.
 export function endLocationSession() {
   const myTurn = ++turn
   wantTracking = false
@@ -560,9 +558,39 @@ export function endLocationSession() {
     queueLength: 0,
     queuePersisted: true,
     lastError: null,
-    lastUploadAt: null,
   })
   return recording ? stopNativeQuietly() : Promise.resolve()
+}
+
+// Explicit sign-out, while the owner's credential still works: stop recording
+// and report this phone stopped, so other surfaces stop showing it as tracking.
+// `endLocationSession` then erases what the phone kept. Best effort and bounded:
+// a failed, stalled, or slow stop or report never holds up signing out; the
+// report is aborted at the deadline, and the phone corrects its own report the
+// next time it opens.
+const SIGN_OUT_DEADLINE_MS = 5000
+
+export async function stopLocationForSignOut({ deadlineMs = SIGN_OUT_DEADLINE_MS } = {}) {
+  if (!isNativeLocationAvailable()) return
+  if (state.enabled !== true && state.status !== 'started') return
+  const myTurn = ++turn
+  wantTracking = false
+  setSessionActive(false)
+  persistEnabled(false, null)
+  setState({ status: 'stopped' })
+  let timer
+  const deadline = new Promise((resolve) => { timer = setTimeout(resolve, deadlineMs) })
+  try {
+    await Promise.race([
+      Promise.all([
+        stopNativeQuietly(),
+        reportTracking(false, {}, myTurn, { timeoutMs: deadlineMs }),
+      ]),
+      deadline,
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 // ---- boot ---------------------------------------------------------------------
