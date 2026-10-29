@@ -14,6 +14,16 @@ and visible evidence.
 For an already-open page (`--current-page`) or a specific output path, use the
 helper itself: `bash "$SCRIPTS_DIR/agent-screenshot.sh" [--current-page] <route> <out.png>`.
 
+This chat's own `agent-browser` commands and these captures share one browser
+session. The platform launches the turn's browser with the same settings the
+helper uses at the owner's viewport, so you can open a page, interact with it,
+and then capture it with `--current-page`. Do not change `AGENT_BROWSER_*`
+variables or `MOBIUS_SCREENSHOT_REAL_BROWSER` on commands for this chat's
+session: a command with different launch settings restarts that browser on a
+blank page, and the prepared state is lost. A separate named session, like the
+full-Chrome recipe below, is unaffected. A `--current-page` capture of a blank page fails
+immediately with that message.
+
 `preview_app.sh <id>` and `preview_shell.sh [chat_id]` are thin wrappers over it
 for those two common cases. `preview_app.sh` is readiness-gated and uses
 ephemeral content-only mode: it waits for the real post-render frame-mounted
