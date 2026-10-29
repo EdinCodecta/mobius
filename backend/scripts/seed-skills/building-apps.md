@@ -930,9 +930,11 @@ const res = await fetch('/api/location/positions?limit=1000', {
 const { positions } = await res.json() // newest first, at most 5000
 ```
 
-`available` is `true` only inside the phone app. Elsewhere `get` still
-reports the state, and `start`, `stop`, and `set-options` reject with code
-`unavailable`, so show the state read-only there. `status` is the phone's
+`available` is `true` only inside the phone app, where `enabled` and
+`options` describe that phone. Elsewhere `get` reports what the owner's phones
+last told the server (`enabled` when any phone is tracking, with that phone's
+`options`, and `status: null`), and `start`, `stop`, and `set-options` reject
+with code `unavailable`, so show the state read-only there. `status` is the phone's
 answer: `started`, `denied`, `disabled`, `unavailable`, or `stopped`; explain
 `denied` and `disabled` to the owner. If the phone cannot confirm that it
 stopped, `stop` rejects with code `stop_failed` and tracking stays on; say so

@@ -1,4 +1,4 @@
-"""Location-batch ingest and tracking-state preference."""
+"""Location-batch ingest, history, and per-phone tracking state."""
 from __future__ import annotations
 
 
@@ -93,18 +93,54 @@ def test_batch_requires_auth(client):
   }).status_code == 401
 
 
+def _report(client, auth, device_id, enabled, reported_at, **options):
+  return client.put("/api/location/tracking", headers=auth, json={
+    "device_id": device_id, "enabled": enabled, "options": options,
+    "reported_at": reported_at,
+  })
+
+
 def test_tracking_state_round_trips(client, auth):
   assert client.get("/api/location/tracking", headers=auth).json() == {
-    "enabled": False, "options": {},
+    "enabled": False, "options": {}, "devices": [],
   }
-  r = client.put("/api/location/tracking", headers=auth, json={
-    "enabled": True, "options": {"background": True, "interval": 10000, "distance": 0},
-  })
+  r = _report(client, auth, "phone-a", True, 1_000, interval=10000)
   assert r.status_code == 200, r.text
-  assert r.json()["enabled"] is True
   got = client.get("/api/location/tracking", headers=auth).json()
   assert got["enabled"] is True
-  assert got["options"]["interval"] == 10000
+  assert got["options"] == {"interval": 10000}
+  assert got["devices"] == [
+    {"device_id": "phone-a", "enabled": True, "options": {"interval": 10000}},
+  ]
+
+
+def test_one_phone_stopping_leaves_another_phone_tracking(client, auth):
+  _report(client, auth, "phone-a", True, 1_000, interval=10000)
+  _report(client, auth, "phone-b", False, 2_000)
+
+  got = client.get("/api/location/tracking", headers=auth).json()
+  assert got["enabled"] is True
+  assert got["options"] == {"interval": 10000}
+  assert {d["device_id"]: d["enabled"] for d in got["devices"]} == {
+    "phone-a": True, "phone-b": False,
+  }
+
+  _report(client, auth, "phone-a", False, 3_000)
+  assert client.get("/api/location/tracking", headers=auth).json()["enabled"] is False
+
+
+def test_an_older_report_cannot_overwrite_a_newer_one(client, auth):
+  _report(client, auth, "phone-a", True, 2_000, interval=60000)
+  _report(client, auth, "phone-a", True, 1_000, interval=30000)
+
+  got = client.get("/api/location/tracking", headers=auth).json()
+  assert got["options"] == {"interval": 60000}
+
+
+def test_tracking_report_requires_a_device(client, auth):
+  assert client.put("/api/location/tracking", headers=auth, json={
+    "enabled": True, "options": {}, "reported_at": 1,
+  }).status_code == 422
 
 
 def _app_headers(client, auth, *, history_read: bool):
@@ -148,9 +184,7 @@ def test_apps_cannot_write_location_even_with_history_read(client, auth):
   assert client.post("/api/location/batch", headers=granted, json={
     "positions": [_pos(1_700_000_000_000)],
   }).status_code in (401, 403)
-  assert client.put("/api/location/tracking", headers=granted, json={
-    "enabled": True, "options": {},
-  }).status_code in (401, 403)
+  assert _report(client, granted, "phone-a", True, 1_000).status_code in (401, 403)
 
 
 def test_location_tracking_capability_is_reviewable_in_a_manifest():

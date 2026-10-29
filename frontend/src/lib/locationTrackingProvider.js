@@ -1,8 +1,11 @@
 // `location.tracking` capability: lets a visible app start, stop, pace, or
 // read the shell's native location controller (lib/nativeLocation.js). The
 // controller and `window.MobiusNative` live only in the shell's top frame, so
-// this provider is the app's sole route to them. Recorded positions are read
-// from the server under the separate `location_history_read` permission.
+// this provider is the app's sole route to them. On a surface without the phone
+// app (a laptop), `get` reports what the owner's phones last reported instead,
+// read-only: whether any phone is tracking and at what pace. Recorded positions
+// are read from the server under the separate `location_history_read`
+// permission.
 import * as nativeLocation from './nativeLocation.js'
 
 export const LOCATION_TRACKING = 'location.tracking'
@@ -14,6 +17,16 @@ function unavailable() {
   error.name = 'NotSupportedError'
   error.code = 'unavailable'
   return error
+}
+
+async function remoteSnapshot(controller) {
+  const reported = await controller.fetchReportedTracking()
+  return {
+    available: false,
+    enabled: reported?.enabled === true,
+    status: null,
+    options: reported?.options || {},
+  }
 }
 
 function snapshot(controller) {
@@ -34,8 +47,10 @@ export function createLocationTrackingProvider({ controller = nativeLocation } =
       if (!OPERATIONS.has(operation)) {
         throw new TypeError('Unknown location tracking operation.')
       }
-      if (operation !== 'get' && !controller.isNativeLocationAvailable()) {
-        throw unavailable()
+      if (!controller.isNativeLocationAvailable()) {
+        if (operation !== 'get') throw unavailable()
+        channel.result(await remoteSnapshot(controller))
+        return {}
       }
       if (operation === 'start') await controller.startTracking()
       else if (operation === 'stop') await controller.stopTracking()

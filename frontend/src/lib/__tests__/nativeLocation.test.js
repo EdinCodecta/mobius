@@ -10,6 +10,9 @@ import assert from 'node:assert/strict'
 
 const SESSION_ACTIVE_KEY = 'mobius.location.session-active.v1'
 const ENABLED_KEY = 'mobius.location.enabled.v1'
+const DEVICE_KEY = 'mobius.location.device.v1'
+const THIS_PHONE = 'this-phone'
+const OTHER_PHONE = 'other-phone'
 
 class MemoryStorage {
   constructor(entries = {}) { this.map = new Map(Object.entries(entries)) }
@@ -39,6 +42,7 @@ function setGlobal(key, value) {
 async function loadPage({
   serverEnabled = false,
   localEnabled = serverEnabled,
+  otherPhoneTracking = false,
   session = {},
   startResult = 'started',
   stopResult = 'stopped',
@@ -46,8 +50,21 @@ async function loadPage({
   batch = () => new Response('{}', { status: 200 }),
   storage = null,
 } = {}) {
-  const calls = { start: [], stop: 0, puts: [], batches: [] }
-  const server = { enabled: serverEnabled, options: {} }
+  const calls = { start: [], stop: 0, puts: [], reports: [], batches: [] }
+  // The server keeps one tracking report per phone, newest decision wins, and
+  // is "on" when any phone is.
+  const server = {
+    devices: {
+      [THIS_PHONE]: { enabled: serverEnabled, options: {}, reported_at: 0 },
+      ...(otherPhoneTracking
+        ? { [OTHER_PHONE]: { enabled: true, options: { interval: 10000 }, reported_at: 0 } }
+        : {}),
+    },
+    get enabled() { return Object.values(this.devices).some((d) => d.enabled) },
+    get options() {
+      return Object.values(this.devices).find((d) => d.enabled)?.options || {}
+    },
+  }
   const win = new EventTarget()
   if (native) {
     win.MobiusNative = {
@@ -63,8 +80,10 @@ async function loadPage({
     }
   }
   const sessionStorage = new MemoryStorage(session)
-  const localStorage = storage
-    || new MemoryStorage(localEnabled ? { [ENABLED_KEY]: 'true' } : {})
+  const localStorage = storage || new MemoryStorage({
+    [DEVICE_KEY]: THIS_PHONE,
+    ...(localEnabled ? { [ENABLED_KEY]: 'true' } : {}),
+  })
   setGlobal('window', win)
   setGlobal('document', new EventTarget())
   setGlobal('localStorage', localStorage)
@@ -74,8 +93,13 @@ async function loadPage({
     if (path === '/location/tracking' && (init.method || 'GET') === 'PUT') {
       const body = JSON.parse(init.body)
       calls.puts.push(body.enabled)
-      server.enabled = body.enabled
-      server.options = body.options
+      calls.reports.push(body)
+      const stored = server.devices[body.device_id]
+      if (!stored || body.reported_at >= stored.reported_at) {
+        server.devices[body.device_id] = {
+          enabled: body.enabled, options: body.options, reported_at: body.reported_at,
+        }
+      }
       return new Response('{}', { status: 200 })
     }
     if (path === '/location/batch') {
@@ -187,8 +211,8 @@ test('a reload resume that is refused ends stopped and records it', async () => 
 test('regaining focus after a fresh launch does not start tracking', async () => {
   const page = await loadPage({ serverEnabled: true, session: {} })
   await page.mod.initLocationTracking()
-  // Simulate another phone (or a lost write) leaving the server preference on.
-  page.server.enabled = true
+  // Simulate another phone (or a lost write) leaving the server report on.
+  page.server.devices[OTHER_PHONE] = { enabled: true, options: {}, reported_at: Date.now() }
 
   window.dispatchEvent(new Event('focus'))
   await flush()
@@ -212,8 +236,7 @@ test('a device without the phone app cannot stop tracking or change its interval
 test('a phone keeps tracking when the saved setting is changed elsewhere', async () => {
   const page = await loadPage({ serverEnabled: true, session: { [SESSION_ACTIVE_KEY]: '1' } })
   await page.mod.initLocationTracking()
-  page.server.enabled = false
-  page.server.options = { interval: 60_000 }
+  page.server.devices[THIS_PHONE] = { enabled: false, options: { interval: 60_000 }, reported_at: Date.now() }
 
   window.dispatchEvent(new Event('focus'))
   document.dispatchEvent(new Event('visibilitychange'))
@@ -381,15 +404,51 @@ test('a newer Start wins over an older one still waiting for the phone', async (
 })
 
 test('opening another phone never marks the recording phone as stopped', async () => {
-  // The owner-wide record says another phone is tracking; this phone never was.
-  const page = await loadPage({ serverEnabled: true, localEnabled: false, session: {} })
+  // Another phone is tracking; this phone never was.
+  const page = await loadPage({ otherPhoneTracking: true, session: {} })
   await page.mod.initLocationTracking()
   await settle()
 
-  assert.deepEqual(page.calls.puts, [])
+  // This phone reports only itself.
+  assert.deepEqual(page.calls.reports.map((r) => [r.device_id, r.enabled]), [[THIS_PHONE, false]])
+  assert.equal(page.server.devices[OTHER_PHONE].enabled, true)
   assert.equal(page.server.enabled, true)
   assert.equal(page.calls.start.length, 0)
   assert.equal(page.mod.getLocationState().enabled, false)
+})
+
+test('reopening a phone left tracking clears only its own report', async () => {
+  const page = await loadPage({
+    serverEnabled: true, localEnabled: true, otherPhoneTracking: true, session: {},
+  })
+  await page.mod.initLocationTracking()
+  await settle()
+
+  assert.equal(page.server.devices[THIS_PHONE].enabled, false)
+  assert.equal(page.server.devices[OTHER_PHONE].enabled, true)
+  assert.equal(page.server.enabled, true)
+})
+
+test('a pace change the phone answers after a newer Start never reaches the server', async () => {
+  const older = deferred()
+  let n = 0
+  const page = await loadPage({
+    // 1: the initial Start; 2: the slow pace change; 3: the newer Start.
+    startResult: () => (++n === 2 ? older.promise : 'started'),
+  })
+  await page.mod.initLocationTracking()
+  await page.mod.startTracking({ background: true, interval: 10000 })
+  await settle()
+
+  const paceChange = page.mod.setTrackingOptions({ interval: 30000 })
+  await flush()
+  assert.equal(await page.mod.startTracking({ background: true, interval: 60000 }), 'started')
+  older.resolve('started')
+  await paceChange
+  await settle()
+
+  assert.ok(!page.calls.reports.some((r) => r.options.interval === 30000))
+  assert.equal(page.server.devices[THIS_PHONE].options.interval, 60000)
 })
 
 test('ending the session stops recording and erases queued positions and tracking state', async () => {
@@ -408,9 +467,13 @@ test('ending the session stops recording and erases queued positions and trackin
   assert.equal(state.queueLength, 0)
   for (const key of [
     'mobius.location.queue.v1', 'mobius.location.delivered.v1', ENABLED_KEY,
-    'mobius.location.options.v1', 'mobius.location.device.v1',
+    'mobius.location.options.v1',
   ]) assert.equal(page.localStorage.getItem(key), null, key)
   assert.equal(page.sessionStorage.getItem(SESSION_ACTIVE_KEY), null)
+  // The opaque phone id stays, so this phone can still correct its own report;
+  // it tried to report itself stopped on the way out.
+  assert.equal(page.localStorage.getItem(DEVICE_KEY), THIS_PHONE)
+  assert.equal(page.server.devices[THIS_PHONE].enabled, false)
 
   // Fixes the phone still delivers afterwards are not kept for the next owner.
   const before = page.calls.batches.length

@@ -807,9 +807,11 @@ await window.mobius.capabilities.invoke('location.tracking', { operation: 'start
 
 Operations are `get`, `start`, `stop`, and `set-options` (`options.interval`
 in milliseconds, clamped to 1 second–1 hour, and `options.distance` in
-metres). Each returns `{available, enabled, status, options}`. Outside the
-phone app, `get` reports `available: false` and the other operations reject
-with `unavailable`. Requests are `active_frame`: only a visible app can change
+metres). Each returns `{available, enabled, status, options}`. In the phone
+app these describe that phone. Outside it, `get` reports `available: false`
+with the state the owner's phones last reported (each phone reports only its
+own record; `enabled` when any phone is tracking), read-only, and the other
+operations reject with `unavailable`. Requests are `active_frame`: only a visible app can change
 tracking. Once started, recording continues in the background under the
 operating system's location indicator; the phone uploads fixes to the owner's
 server, and an app reads them from `/api/location/positions` only with the

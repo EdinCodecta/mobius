@@ -13,8 +13,8 @@ Writes take the owner session only; reads also accept an app that declares
 Endpoints:
   POST /api/location/batch       store a batch of positions
   GET  /api/location/positions   read stored positions, newest first
-  GET  /api/location/tracking    read whether a phone is tracking
-  PUT  /api/location/tracking    record it (the phone app writes this)
+  GET  /api/location/tracking    read whether any phone is tracking
+  PUT  /api/location/tracking    one phone records its own tracking state
 """
 from __future__ import annotations
 
@@ -199,9 +199,54 @@ def list_positions(
   return {"positions": positions, "count": len(positions), "limit": limit}
 
 
-class TrackingState(BaseModel):
+class TrackingReport(BaseModel):
+  """One phone's report of its own tracking state."""
+
+  device_id: str = Field(min_length=1, max_length=_DEVICE_ID_MAX)
   enabled: bool
   options: dict = Field(default_factory=dict)
+  # The phone's clock (ms) when it decided this change; orders its reports.
+  reported_at: int = Field(ge=0)
+
+
+class DeviceTracking(BaseModel):
+  device_id: str
+  enabled: bool
+  options: dict
+
+
+class TrackingState(BaseModel):
+  """Owner-wide view: on when any phone is tracking.
+
+  ``options`` are those of the most recently reported tracking phone (empty
+  when none is tracking); ``devices`` lists every phone's own report.
+  """
+
+  enabled: bool
+  options: dict = Field(default_factory=dict)
+  devices: list[DeviceTracking] = Field(default_factory=list)
+
+
+def _tracking_state(db: Session, owner_id: int) -> TrackingState:
+  rows = (
+    db.query(models.LocationTrackingDevice)
+    .filter(models.LocationTrackingDevice.owner_id == owner_id)
+    .order_by(models.LocationTrackingDevice.reported_at_ms.desc())
+    .all()
+  )
+  devices = [
+    DeviceTracking(
+      device_id=row.device_id, enabled=bool(row.enabled),
+      options=dict(row.options_json or {}),
+    )
+    for row in rows
+  ]
+  tracking = [device for device in devices if device.enabled]
+  return TrackingState(
+    enabled=bool(tracking),
+    options=dict(tracking[0].options) if tracking else {},
+    devices=devices,
+  )
 
 
 @router.get("/tracking")
@@ -209,31 +254,34 @@ def get_tracking_state(
   owner: models.Owner = Depends(get_owner_or_app_with_location_history_read),
   db: Session = Depends(get_db),
 ) -> TrackingState:
-  """Report whether the owner has tracking on and the options to replay.
+  """Report whether any of the owner's phones is tracking.
 
   Readable by an app holding the ``location_history_read`` grant so a viewer
-  can show the current tracking status; writing it (PUT) stays
-  owner-only.
+  can show the current tracking status; reporting it (PUT) stays owner-only.
   """
-  row = db.get(models.LocationTrackingState, owner.id)
-  if row is None:
-    return TrackingState(enabled=False, options={})
-  return TrackingState(enabled=bool(row.enabled), options=dict(row.options_json or {}))
+  return _tracking_state(db, owner.id)
 
 
 @router.put("/tracking", dependencies=[Depends(reject_cross_site)])
-def set_tracking_state(
-  body: TrackingState,
+def report_tracking_state(
+  body: TrackingReport,
   owner: models.Owner = Depends(get_current_owner),
   db: Session = Depends(get_db),
 ) -> TrackingState:
-  """Record whether the phone is tracking, for other surfaces to display."""
-  row = db.get(models.LocationTrackingState, owner.id)
+  """Record one phone's own tracking state, for other surfaces to display.
+
+  A report older than the one already stored for that phone is ignored, so a
+  delayed request cannot undo a newer start, stop, or pace change.
+  """
+  row = db.get(models.LocationTrackingDevice, (owner.id, body.device_id))
   if row is None:
-    row = models.LocationTrackingState(owner_id=owner.id)
+    row = models.LocationTrackingDevice(owner_id=owner.id, device_id=body.device_id)
     db.add(row)
-  row.enabled = bool(body.enabled)
+  elif body.reported_at < row.reported_at_ms:
+    return _tracking_state(db, owner.id)
+  row.enabled = body.enabled
   row.options_json = dict(body.options or {})
+  row.reported_at_ms = body.reported_at
   row.updated_at = now_naive_utc()
   db.commit()
-  return TrackingState(enabled=bool(row.enabled), options=dict(row.options_json or {}))
+  return _tracking_state(db, owner.id)

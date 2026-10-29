@@ -15,9 +15,10 @@
 //     best-effort copy so a reload or relaunch can still upload a backlog;
 //   - upload the queue to the backend in batches, retrying on failure, and drop
 //     positions from the queue only once the server has accepted them;
-//   - remember (on the server, mirrored in localStorage) whether the owner
-//     turned tracking on, and (in sessionStorage) whether it is running in THIS
-//     app session, so a reload re-arms it but a relaunch does not.
+//   - report this phone's own tracking state to the server (one record per
+//     phone, so other surfaces can show whether any phone is tracking), and
+//     remember in sessionStorage whether it is running in THIS app session, so
+//     a reload re-arms it but a relaunch does not.
 //
 // Resuming is deliberately session-scoped. A reloaded page must call
 // `startLocation` again to keep receiving positions, but after the owner closes
@@ -47,7 +48,8 @@ const DELIVERED_MAX = 6000
 // sessionStorage: present only while tracking was started in this app session.
 const SESSION_ACTIVE_KEY = 'mobius.location.session-active.v1'
 // A stable, opaque id for this phone, so the server keeps each phone's fixes
-// apart.
+// and tracking report apart. It holds no location data and survives sign-out,
+// so the phone can still correct its own tracking report later.
 const DEVICE_KEY = 'mobius.location.device.v1'
 
 const UPLOAD_CHUNK = 500
@@ -322,16 +324,39 @@ async function drain() {
   }
 }
 
-// ---- server-side tracking preference ---------------------------------------
+// ---- server-side tracking report ---------------------------------------------
 
-async function putTrackingState(enabled, options) {
+// Report this phone's own tracking state for other surfaces to display. Part of
+// the transition that decided it: a turn superseded before it publishes stays
+// silent, and the decision time lets the server ignore a report that a slower
+// network delivers after a newer one.
+async function reportTracking(enabled, options, myTurn) {
+  if (myTurn !== turn) return
   try {
     await apiFetch('/location/tracking', {
       method: 'PUT',
-      body: JSON.stringify({ enabled, options: options || {} }),
+      body: JSON.stringify({
+        device_id: getDeviceId(),
+        enabled,
+        options: options || {},
+        reported_at: Date.now(),
+      }),
     })
   } catch {
     // Best-effort record for other surfaces; this phone's own state is local.
+  }
+}
+
+// What the owner's phones last reported: on when any phone is tracking. For
+// surfaces that cannot track themselves (a laptop); it never drives tracking.
+export async function fetchReportedTracking() {
+  try {
+    const res = await apiFetch('/location/tracking')
+    if (!res.ok) return null
+    const body = await res.json()
+    return { enabled: body?.enabled === true, options: body?.options || {} }
+  } catch {
+    return null
   }
 }
 
@@ -387,12 +412,13 @@ export async function setTrackingOptions(options) {
   if (!isNativeLocationAvailable()) return savedOptions()
   const merged = { ...savedOptions(), ...sanitizeOptions(options) }
   writeJSON(OPTIONS_KEY, merged)
-  if (state.status === 'started') {
-    const myTurn = ++turn
-    wantTracking = true
-    await callStartLocation({ ...DEFAULT_OPTIONS, ...merged }, myTurn)
-  }
-  await putTrackingState(state.enabled === true, merged)
+  // A phone that is not tracking has nothing to re-arm or report; its next
+  // start uses the saved cadence.
+  if (state.status !== 'started') return merged
+  const myTurn = ++turn
+  wantTracking = true
+  const status = await callStartLocation({ ...DEFAULT_OPTIONS, ...merged }, myTurn)
+  if (status === 'started') void reportTracking(true, merged, myTurn)
   return merged
 }
 
@@ -437,7 +463,7 @@ async function callStartLocation(opts, myTurn) {
   setState({ status, available: true })
   // If this device was tracking (a reload resume or a cadence re-arm that failed),
   // record that it has stopped so no surface keeps showing it as on.
-  if (wasEnabled) void putTrackingState(false, savedOptions())
+  if (wasEnabled) void reportTracking(false, savedOptions(), myTurn)
   return status
 }
 
@@ -458,7 +484,7 @@ export async function startTracking(options = savedOptions()) {
   if (status === null) return state.status ?? 'stopped'
   if (status === 'started') {
     persistEnabled(true, opts)
-    void putTrackingState(true, opts)
+    void reportTracking(true, opts, myTurn)
     // Positions recorded while the page was gone are delivered right after this
     // call; make sure any still-queued ones from a prior session go out too.
     void drain()
@@ -499,21 +525,21 @@ export async function stopTracking() {
   }
   setSessionActive(false)
   persistEnabled(false, null)
-  void putTrackingState(false, savedOptions())
+  void reportTracking(false, savedOptions(), myTurn)
   setState({ status: status || 'stopped', lastError: null })
   return status || 'stopped'
 }
 
 // The owner's session ended (sign-out or an expired credential): stop recording
 // and erase everything this phone kept for them — queued precise positions, the
-// delivered ring, the tracking flags and cadence, and the device id — so none of
-// it is uploaded under, or shown to, whoever signs in next. In-flight native
-// calls and uploads become stale. The server record is left alone: there is no
-// credential to update it with, and other surfaces may still show this phone's
-// last report until it next starts or stops. Returns once the native stop
-// settles, so callers can await it before reloading.
+// delivered ring, the tracking flags and cadence — so none of it is uploaded
+// under, or shown to, whoever signs in next. In-flight native calls and uploads
+// become stale. A recording phone tries to report itself stopped while the
+// credential may still work; if that cannot land, the phone corrects its own
+// report the next time it opens. Returns once the native stop settles, so
+// callers can await it before reloading.
 export function endLocationSession() {
-  turn += 1
+  const myTurn = ++turn
   wantTracking = false
   sessionEpoch += 1
   signedOut = true
@@ -521,9 +547,10 @@ export function endLocationSession() {
   uploadSize = UPLOAD_CHUNK
   const recording = isNativeLocationAvailable()
     && (state.enabled === true || state.status === 'started')
+  if (recording) void reportTracking(false, {}, myTurn)
   queue = []
   delivered = []
-  for (const key of [QUEUE_KEY, DELIVERED_KEY, ENABLED_KEY, OPTIONS_KEY, DEVICE_KEY]) {
+  for (const key of [QUEUE_KEY, DELIVERED_KEY, ENABLED_KEY, OPTIONS_KEY]) {
     try { localStorage.removeItem(key) } catch { /* ignore */ }
   }
   setSessionActive(false)
@@ -540,13 +567,11 @@ export function endLocationSession() {
 
 // ---- boot ---------------------------------------------------------------------
 //
-// Tracking is controlled only on the phone that tracks. The saved server
-// preference is a record of what that phone last did (other surfaces display
-// it); it never starts, stops, or re-paces a phone. So boot never reads the
-// server — a phone acts only on its owner's taps, its own reload, and its own
-// local record of whether it was the one tracking. The server state is
-// owner-wide, so treating it as this phone's history would let a freshly
-// opened phone mark another, still-recording phone as stopped.
+// Tracking is controlled only on the phone that tracks. Each phone's server
+// report records what that phone last did (other surfaces display it); it
+// never starts, stops, or re-paces a phone. So boot never reads the server — a
+// phone acts only on its owner's taps and its own reload — and it corrects only
+// its own report, never another phone's.
 
 // Called once at shell boot. Registers the listener immediately, flushes any
 // queue left from a prior session, and — if tracking was on in this app session
@@ -581,11 +606,11 @@ export async function initLocationTracking() {
     await startTracking(savedOptions())
     return
   }
-  // Only this phone's own mirror says whether *it* was left tracking.
+  // A relaunch: whatever this phone last reported, it is not tracking now.
+  // Correct its own report (left on if the app was closed or signed out while
+  // tracking, or the stop report never landed); other phones are untouched.
   const storedOn = readJSON(ENABLED_KEY, false) === true
   persistEnabled(false, null)
-  if (storedOn) {
-    setState({ status: 'stopped' })
-    void putTrackingState(false, savedOptions())
-  }
+  if (storedOn) setState({ status: 'stopped' })
+  void reportTracking(false, savedOptions(), turn)
 }

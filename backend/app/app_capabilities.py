@@ -383,7 +383,7 @@ RUNTIME_CAPABILITY_DEFINITIONS: dict[str, dict[str, Any]] = {
     "kind": "invoke",
     "title": "Track your phone's location",
     "description": (
-      "Start, stop, or change location tracking in the M\u00f6bius phone app. "
+      "See, start, stop, or change location tracking in the M\u00f6bius phone app. "
       "Once started, the phone keeps recording in the background until you "
       "stop it."
     ),

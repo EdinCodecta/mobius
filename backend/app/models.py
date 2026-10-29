@@ -2449,24 +2449,28 @@ class LocationPosition(Base):
   received_at = Column(DateTime, nullable=False, default=now_naive_utc)
 
 
-class LocationTrackingState(Base):
-  """Per-owner record of whether a phone is tracking, and its options.
+class LocationTrackingDevice(Base):
+  """Whether one phone is tracking, and its options, as that phone reported.
 
-  The phone writes it when tracking starts, stops, or changes pace, so other
-  surfaces (a viewer on a laptop) can show the current state. It never starts
-  or stops a phone: each phone resumes only its own tracking after a reload in
-  the same app session. One row per owner.
+  Each phone writes only its own row when tracking starts, stops, or changes
+  pace, so other surfaces (a viewer on a laptop) can show the current state:
+  tracking is on when any phone's row says so. A row never starts or stops a
+  phone; each phone resumes only its own tracking after a reload in the same
+  app session. ``reported_at`` is the phone's own clock when it decided the
+  change, so a slower, older report cannot overwrite a newer one.
 
   This is a new table, so ``create_all`` adds it to existing installations.
   """
 
-  __tablename__ = "location_tracking_state"
+  __tablename__ = "location_tracking_devices"
 
   owner_id = Column(Integer, ForeignKey("owner.id"), primary_key=True)
+  # The same opaque phone id the phone stamps on its uploaded fixes.
+  device_id = Column(String(128), primary_key=True)
   enabled = Column(Boolean, nullable=False, default=False, server_default=false())
   # The phone's last startLocation options: {background, interval, distance}.
   # JSON so option shape can grow without a migration.
   options_json = Column(JSON, nullable=False, default=dict)
-  updated_at = Column(
-    DateTime, nullable=False, default=now_naive_utc, onupdate=now_naive_utc
-  )
+  # Milliseconds since the epoch on the phone when it made this change.
+  reported_at_ms = Column(Integer, nullable=False)
+  updated_at = Column(DateTime, nullable=False, default=now_naive_utc)
