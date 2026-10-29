@@ -62,7 +62,7 @@ _SHARE_TEXT = {
 # One flag per row; title and text are the single owner-facing wording.
 _FLAGS = (
   ("filesystem_api", "filesystem_access", "Use your files",
-   "Can use the guarded owner-filesystem API."),
+   "Can read and change files on your Möbius through its guarded file access."),
   ("manage_apps", "manage_apps", "Install and remove apps",
    "Can install and uninstall apps on your behalf."),
   ("manage_skills", "manage_skills", "Install and remove agent skills",
@@ -159,23 +159,23 @@ def rows_from_contract(
   if isinstance(background, dict):
     scheduled = background.get("mode") == "scheduled"
     timing = (
-      f"Runs on schedule {background.get('cron') or ''}".strip()
-      if scheduled else "Runs only on demand"
+      f"Runs by itself {describe_schedule(background.get('cron'))}"
+      if scheduled else "Runs in the background when the app asks"
     )
     initialize = bool(background.get("initialize_on_install"))
     rows.append(_row(
-      "background_job", "Run a background job",
-      f"{timing}{' and starts a run as soon as you allow it' if initialize else ''}. "
-      "It runs as reviewed owner-installed code with Möbius process access and "
-      "receives a short-lived app token for API calls.",
+      "background_job", "Run on a schedule" if scheduled else "Run in the background",
+      f"{timing}{', starting with one run as soon as you allow it' if initialize else ''}. "
+      "Each run executes this app's code directly on your Möbius, with broad "
+      "access to it.",
       rank=2 if scheduled else 1,
       scope=["initialize_on_install"] if initialize else None,
     ))
   if agent.get("embeds_agent"):
     rows.append(_row(
       "agent_start", "Start agent chats on its own",
-      "Can start and drive agent chats that run commands as Möbius, with "
-      "tool calls approved automatically.",
+      "Can open agent chats on its own. Commands in those chats run on your "
+      "Möbius without asking you first.",
     ))
   if agent.get("system_prompt"):
     rows.append(_row(
@@ -225,15 +225,51 @@ def rows_from_contract(
   return rows
 
 
+_LIMIT_NOUNS = {"chars": "characters", "items": "items", "files": "files", "requests": "requests"}
+
+
 def _limit_text(key: str, value: Any) -> str:
+  """One reviewed limit in plain words, e.g. ``up to 50,000 characters``."""
   if key.endswith("_bytes") and isinstance(value, (int, float)) and not isinstance(value, bool):
     size, unit = float(value), "bytes"
     for unit in ("bytes", "KiB", "MiB", "GiB"):
       if size < 1024 or unit == "GiB":
         break
       size /= 1024
-    return f"{round(size, 1):g} {unit}"
-  return str(value)
+    return f"up to {round(size, 1):g} {unit}"
+  amount = f"{value:,}" if isinstance(value, int) and not isinstance(value, bool) else str(value)
+  noun = key.removeprefix("max_")
+  noun = _LIMIT_NOUNS.get(noun.rsplit("_", 1)[-1], noun.replace("_", " "))
+  return f"up to {amount} {noun}"
+
+
+_WEEKDAYS = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+
+
+def describe_schedule(cron: Any) -> str:
+  """A five-field cron schedule as words; anything unusual is quoted as is."""
+  text = str(cron or "").strip()
+  fields = text.split()
+  if len(fields) != 5:
+    return f"on the schedule \u201c{text}\u201d" if text else "on a schedule"
+  minute, hour, day, month, weekday = fields
+  if fields == ["*"] * 5:
+    return "every minute"
+  if minute.startswith("*/") and minute[2:].isdigit() and fields[1:] == ["*"] * 4:
+    return f"every {int(minute[2:])} minutes"
+  if minute.isdigit() and hour == "*" and fields[2:] == ["*"] * 3:
+    return "every hour"
+  if minute.isdigit() and hour.startswith("*/") and hour[2:].isdigit() and fields[2:] == ["*"] * 3:
+    return f"every {int(hour[2:])} hours"
+  if minute.isdigit() and hour.isdigit() and month == "*":
+    at = f"at {int(hour):02d}:{int(minute):02d} UTC"
+    if day == "*" and weekday == "*":
+      return f"every day {at}"
+    if day == "*" and weekday.isdigit() and int(weekday) % 7 < 7:
+      return f"every {_WEEKDAYS[int(weekday) % 7]} {at}"
+    if day.isdigit() and weekday == "*":
+      return f"on day {int(day)} of every month {at}"
+  return f"on the schedule \u201c{text}\u201d"
 
 
 def _runtime_text(capability: str, declaration: dict[str, Any]) -> str:
@@ -246,10 +282,10 @@ def _runtime_text(capability: str, declaration: dict[str, Any]) -> str:
     text += f" for up to {round(duration / 1000, 1):g} seconds per request"
   if limits:
     text += " Limits: " + ", ".join(
-      f"{key} {_limit_text(key, value)}" for key, value in sorted(limits.items())
+      _limit_text(key, value) for key, value in sorted(limits.items())
     ) + "."
   if declaration.get("reason"):
-    text += f" Reason: {declaration['reason']}"
+    text += f" Why: {declaration['reason']}"
   return text
 
 

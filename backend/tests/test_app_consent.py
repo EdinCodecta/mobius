@@ -290,8 +290,9 @@ def test_background_work_is_a_row_with_timing_and_authority():
   }
   (row,) = app_consent.rows_from_contract(contract)
   assert row["id"] == "background_job"
-  assert "0 6 * * *" in row["text"] and "as soon as you allow it" in row["text"]
-  assert "process access" in row["text"]
+  # Timing, the immediate first run and the run's authority stay stated.
+  assert "every day at 06:00 UTC" in row["text"] and "as soon as you allow it" in row["text"]
+  assert "broad access" in row["text"]
 
 
 def test_background_escalation_asks_again(db):
@@ -537,9 +538,9 @@ def test_a_runtime_limit_change_changes_the_row_text():
     return {r["id"]: r["text"] for r in app_consent.rows_from_contract(contract)}
 
   assert rows(256 * 1024 * 1024)["device.asset-cache"] == (
-    "Download verified assets. Limits: max_bytes 256 MiB."
+    "Download verified assets. Limits: up to 256 MiB."
   )
-  assert rows(2 * 1024 ** 3)["device.asset-cache"].endswith("max_bytes 2 GiB.")
+  assert rows(2 * 1024 ** 3)["device.asset-cache"].endswith("up to 2 GiB.")
 
 
 def _runtime_contract(**limits):
@@ -800,3 +801,47 @@ def test_revoking_an_app_that_asks_for_nothing_reports_the_truth(client, owner_t
   response = client.delete(f"/api/apps/{app.id}/consent", headers=_owner_headers(client, owner_token))
   assert response.status_code == 200
   assert response.json()["status"] == "accepted"
+
+
+def test_access_rows_read_in_plain_words():
+  contract = _contract()
+  contract["background"] = {"mode": "scheduled", "cron": "0 10 * * *"}
+  contract["agent"] = {"embeds_agent": True}
+  contract["runtime"] = {"speech.synthesis": {
+    "title": "Generate speech", "description": "Turn text into audio.",
+    "limits": {"max_text_chars": 50_000}, "reason": "Read reports aloud.",
+  }}
+  rows = {r["id"]: r for r in app_consent.rows_from_contract(contract)}
+  job = rows["background_job"]
+  assert job["title"] == "Run on a schedule"
+  assert job["text"].startswith("Runs by itself every day at 10:00 UTC.")
+  assert "token" not in job["text"] and "0 10" not in job["text"]
+  assert rows["agent_start"]["text"] == (
+    "Can open agent chats on its own. Commands in those chats run on your "
+    "Möbius without asking you first."
+  )
+  assert rows["speech.synthesis"]["text"] == (
+    "Turn text into audio. Limits: up to 50,000 characters. Why: Read reports aloud."
+  )
+
+
+def test_schedules_are_described_in_words_and_unusual_ones_quoted():
+  describe = app_consent.describe_schedule
+  assert describe("* * * * *") == "every minute"
+  assert describe("*/15 * * * *") == "every 15 minutes"
+  assert describe("5 * * * *") == "every hour"
+  assert describe("0 */6 * * *") == "every 6 hours"
+  assert describe("30 7 * * 1") == "every Monday at 07:30 UTC"
+  assert describe("0 9 1 * *") == "on day 1 of every month at 09:00 UTC"
+  assert describe("0 9 1-7 * 1") == "on the schedule \u201c0 9 1-7 * 1\u201d"
+  assert describe("") == "on a schedule"
+
+
+def test_rewording_never_changes_what_an_accepted_answer_covers():
+  # The digest pins ids, levels, scopes and limits, not text, so plainer
+  # wording never turns an earlier answer into a new question.
+  contract = _contract()
+  contract["background"] = {"mode": "scheduled", "cron": "0 10 * * *"}
+  rows = app_consent.rows_from_contract(contract)
+  reworded = [{**row, "text": row["text"] + " (reworded)"} for row in rows]
+  assert app_consent.request_digest(rows) == app_consent.request_digest(reworded)
