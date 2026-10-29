@@ -462,6 +462,11 @@ const PINNED_PROXY_IMAGE_PATH =
 // they are served cache-first from their own bounded cache.
 export const PROXY_PINNED_CACHE = 'mobius-proxy-pinned'
 export const PROXY_PINNED_MAX_ENTRIES = 300
+// The server still answers `Vary: Authorization`, but this lane reuses an
+// entry across bearer tokens so a renewed app token does not refetch it. That
+// is safe only here: the bytes are public and immutable, the cache is this
+// origin's private browser cache, and logout deletes it.
+export const PROXY_PINNED_MATCH_OPTIONS = Object.freeze({ ignoreVary: true })
 
 function isCommitPinnedImageUrl(value) {
   let target

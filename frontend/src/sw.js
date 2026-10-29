@@ -76,6 +76,7 @@ import {
   isPinnableProxyResponse,
   PROXY_PINNED_CACHE,
   PROXY_PINNED_MAX_ENTRIES,
+  PROXY_PINNED_MATCH_OPTIONS,
   appCodeCacheKey,
   appCodeRequestMayBeStored,
   appCodeStoreAction,
@@ -376,6 +377,7 @@ registerRoute(
     proxyCacheLane(url, request, self.location.origin) === 'immutable',
   new CacheFirst({
     cacheName: PROXY_PINNED_CACHE,
+    matchOptions: PROXY_PINNED_MATCH_OPTIONS,
     plugins: [
       {
         cacheWillUpdate: async ({ response }) =>

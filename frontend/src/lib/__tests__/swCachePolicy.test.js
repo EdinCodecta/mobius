@@ -17,6 +17,7 @@ import {
   isAppCodeRoute,
   isPinnableProxyResponse,
   PROXY_PINNED_CACHE,
+  PROXY_PINNED_MATCH_OPTIONS,
   proxyCacheLane,
   packagedAssetCacheLane,
   isCacheableAppAssetResponse,
@@ -448,6 +449,12 @@ test('only complete responses the server marked immutable enter the pinned proxy
   assert.equal(isPinnableProxyResponse(response(200)), false)
   assert.equal(isPinnableProxyResponse(response(404, 'private, max-age=31536000, immutable')), false)
   assert.equal(isPinnableProxyResponse(undefined), false)
+})
+
+test('pinned proxy lookups ignore Vary so a renewed bearer token reuses the entry', () => {
+  // Only this lane: the shared mobius-proxy cache keeps per-token matching.
+  assert.deepEqual({ ...PROXY_PINNED_MATCH_OPTIONS }, { ignoreVary: true })
+  assert.ok(Object.isFrozen(PROXY_PINNED_MATCH_OPTIONS))
 })
 
 test('the pinned proxy cache survives activation and is cleared on logout', () => {
