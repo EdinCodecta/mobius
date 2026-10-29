@@ -195,3 +195,32 @@ def test_location_tracking_capability_is_reviewable_in_a_manifest():
   })["location.tracking"]
   assert declared["kind"] == "invoke" and declared["lifecycle"] == "active_frame"
   assert declared["reason"] == "Record walks."
+
+
+def test_owner_can_delete_history_before_a_time_or_for_one_phone(client, auth, db):
+  from app import models
+
+  client.post("/api/location/batch", headers=auth, json={
+    "positions": [_pos(1_700_000_000_000), _pos(1_700_000_010_000)], "device_id": "a",
+  })
+  client.post("/api/location/batch", headers=auth, json={
+    "positions": [_pos(1_700_000_000_000)], "device_id": "b",
+  })
+
+  r = client.delete("/api/location/positions?before=1700000010000&device_id=a", headers=auth)
+  assert r.status_code == 200, r.text
+  assert r.json() == {"deleted": 1}
+  left = {(p.device_id, p.device_timestamp_ms) for p in db.query(models.LocationPosition)}
+  assert left == {("a", 1_700_000_010_000), ("b", 1_700_000_000_000)}
+
+  assert client.delete("/api/location/positions", headers=auth).json() == {"deleted": 2}
+  assert db.query(models.LocationPosition).count() == 0
+
+
+def test_apps_cannot_delete_history_even_with_history_read(client, auth, db):
+  from app import models
+
+  client.post("/api/location/batch", headers=auth, json={"positions": [_pos(1_700_000_000_000)]})
+  granted = _app_headers(client, auth, history_read=True)
+  assert client.delete("/api/location/positions", headers=granted).status_code in (401, 403)
+  assert db.query(models.LocationPosition).count() == 1

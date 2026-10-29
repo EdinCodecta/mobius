@@ -13,6 +13,7 @@ Writes take the owner session only; reads also accept an app that declares
 Endpoints:
   POST /api/location/batch       store a batch of positions
   GET  /api/location/positions   read stored positions, newest first
+  DELETE /api/location/positions delete stored positions (owner only)
   GET  /api/location/tracking    read whether any phone is tracking
   PUT  /api/location/tracking    one phone records its own tracking state
 """
@@ -197,6 +198,32 @@ def list_positions(
     for row in rows
   ]
   return {"positions": positions, "count": len(positions), "limit": limit}
+
+
+@router.delete("/positions", dependencies=[Depends(reject_cross_site)])
+def delete_positions(
+  before: int | None = None,
+  device_id: str | None = None,
+  owner: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+) -> dict:
+  """Delete the owner's stored positions, optionally only some of them.
+
+  ``before`` (ms since the epoch, exclusive) keeps newer fixes; ``device_id``
+  limits deletion to one phone. With neither, the whole history is erased.
+  Owner session only: ``location_history_read`` lets an app read history,
+  never erase it.
+  """
+  query = db.query(models.LocationPosition).filter(
+    models.LocationPosition.owner_id == owner.id
+  )
+  if before is not None:
+    query = query.filter(models.LocationPosition.device_timestamp_ms < before)
+  if device_id is not None:
+    query = query.filter(models.LocationPosition.device_id == device_id)
+  deleted = query.delete(synchronize_session=False)
+  db.commit()
+  return {"deleted": deleted}
 
 
 class TrackingReport(BaseModel):
