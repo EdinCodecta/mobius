@@ -258,7 +258,7 @@ def test_app_listing_forwards_only_known_registry_rankings(monkeypatch):
 
   async def fake_request(method, path, **kwargs):
     forwarded.append((method, path, kwargs["params"]))
-    return {"items": [], "sort": kwargs["params"]["sort"]}
+    return {"items": [], "sort": kwargs["params"]["sort"] or "updated"}
 
   monkeypatch.setattr(community, "_request", fake_request)
   app = FastAPI()
@@ -268,12 +268,15 @@ def test_app_listing_forwards_only_known_registry_rankings(monkeypatch):
 
   assert client.get("/api/community/apps?sort=trending&limit=12").status_code == 200
   assert client.get("/api/community/apps").status_code == 200
+  assert client.get("/api/community/apps?sort=updated").status_code == 200
   assert client.get("/api/community/apps?sort=rating").status_code == 422
   assert forwarded == [
     ("GET", "/v1/community/apps",
      {"q": "", "limit": 12, "offset": 0, "sort": "trending"}),
     ("GET", "/v1/community/apps",
-     {"q": "", "limit": 50, "offset": 0, "sort": "updated"}),
+     {"q": "", "limit": 50, "offset": 0, "sort": None}),
+    ("GET", "/v1/community/apps",
+     {"q": "", "limit": 50, "offset": 0, "sort": None}),
   ]
 
 
