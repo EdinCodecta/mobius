@@ -723,7 +723,8 @@ def list_uninstalled_apps(
   Recover one with ``POST /{app_id}/recover``. A tombstone past the window is
   not listed even before the purge that removes it permanently.
   """
-  cutoff = now_naive_utc() - APP_SOFT_DELETE_TTL
+  now = now_naive_utc()
+  cutoff = now - APP_SOFT_DELETE_TTL
   rows = (
     db.query(models.App)
     .options(defer(models.App.jsx_source), defer(models.App.project_templates_json))
@@ -736,6 +737,7 @@ def list_uninstalled_apps(
       id=row.id, name=row.name, slug=row.slug, version=row.version,
       deleted_at=row.deleted_at.replace(tzinfo=UTC),
       expires_at=(row.deleted_at + APP_SOFT_DELETE_TTL).replace(tzinfo=UTC),
+      seconds_left=(row.deleted_at + APP_SOFT_DELETE_TTL - now).total_seconds(),
       icon_data_url=_icon_data_url(row.effective_icon_png),
       background_color=row.background_color, theme_color=row.theme_color,
       manifest_url=row.manifest_url, package_id=row.package_id,

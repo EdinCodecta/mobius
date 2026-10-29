@@ -2,22 +2,22 @@ const MINUTE = 60 * 1000
 const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
 
-// The last day counts down in rough steps. Each label is an upper bound, so
-// "~6 hrs left" means somewhere between one and six hours remain.
-const LAST_DAY_STEPS = [[HOUR, '~1 hr'], [6 * HOUR, '~6 hrs'], [12 * HOUR, '~12 hrs'], [DAY, '~1 day']]
+// The last day counts down in rough steps: "~12 hrs left" until six hours
+// remain, "~6 hrs left" until one hour remains, then "~1 hr left".
+const LAST_DAY_STEPS = [[HOUR, '~1 hr'], [6 * HOUR, '~6 hrs'], [DAY, '~12 hrs']]
 
 /**
  * How long an uninstalled app can still be recovered, or null once it is gone.
  *
- * `label` is "6 days left" … "1 day left" in whole days, then "~1 day left",
- * "~12 hrs left", "~6 hrs left" and "~1 hr left" on the last day. It is gone at
- * zero, the moment the server stops accepting a recover. `tone` colours the
- * pill: '' | 'soon' (under 3 days) | 'urgent' (the last day). `changesAt` is
- * the moment, in epoch milliseconds, when the label next changes, so a view can
- * wake exactly then instead of polling.
+ * `deadline` is when the recovery window closes, in epoch milliseconds on this
+ * device's clock. `label` is "6 days left" … "1 day left" in whole days, then
+ * the last-day steps. `tone` colours the pill: '' | 'soon' (under 3 days) |
+ * 'urgent' (the last day). `changesAt` is the moment, in epoch milliseconds,
+ * when the label next changes, so a view can wake exactly then instead of
+ * polling.
  */
-export function expiryCountdown(expiresAt, now = Date.now()) {
-  const left = Date.parse(expiresAt) - now
+export function expiryCountdown(deadline, now = Date.now()) {
+  const left = deadline - now
   if (!Number.isFinite(left) || left <= 0) return null
   const tone = left < DAY ? 'urgent' : left < 3 * DAY ? 'soon' : ''
   if (left >= DAY) {

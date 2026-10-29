@@ -11,10 +11,10 @@ import './UninstalledApps.css'
 // when there are none, so it costs nothing until it is needed.
 export default function UninstalledApps() {
   const queryClient = useQueryClient()
-  const { data: rows = [] } = appQueries.uninstalled.useQuery()
+  const { data: rows = [], dataUpdatedAt } = appQueries.uninstalled.useQuery()
   const [busyId, setBusyId] = useState(null)
   const [error, setError] = useState('')
-  const live = useExpiryCountdowns(rows)
+  const live = useExpiryCountdowns(rows, dataUpdatedAt)
 
   if (live.length === 0) return null
 

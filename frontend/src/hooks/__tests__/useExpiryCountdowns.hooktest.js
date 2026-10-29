@@ -8,18 +8,18 @@ const MIN = 60 * 1000
 const HOUR = 60 * MIN
 const DAY = 24 * HOUR
 
-const row = (id, expiresAt) => ({ id, name: `App ${id}`, expires_at: new Date(expiresAt).toISOString() })
+// A row as the server sends it, with `left` milliseconds of its window remaining.
+const row = (id, left) => ({ id, name: `App ${id}`, seconds_left: left / 1000 })
 const labels = hook => hook.result.current.map(({ row: r, countdown }) => `${r.id}:${countdown.label}`)
 
 test('rows that arrive between wakes are timed against the real clock', t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: START })
-  const first = row(1, START + 3 * DAY + 5 * HOUR)
-  const hook = renderHook(rows => useExpiryCountdowns(rows), [first])
+  const hook = renderHook(useExpiryCountdowns, [row(1, 3 * DAY + 5 * HOUR)], START)
   assert.deepEqual(labels(hook), ['1:3 days left'])
 
   // Two hours pass with no wake due, then a refetch brings a row with half an hour left.
   t.mock.timers.tick(2 * HOUR)
-  hook.rerender([first, row(2, Date.now() + 30 * MIN)])
+  hook.rerender([row(1, 3 * DAY + 3 * HOUR), row(2, 30 * MIN)], Date.now())
   t.mock.timers.tick(0)
   assert.deepEqual(labels(hook), ['1:3 days left', '2:~1 hr left'])
 
@@ -32,11 +32,11 @@ test('rows that arrive between wakes are timed against the real clock', t => {
 
 test('a list that starts empty does not keep its mount time for later rows', t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: START })
-  const hook = renderHook(rows => useExpiryCountdowns(rows), [])
+  const hook = renderHook(useExpiryCountdowns, [], START)
   assert.deepEqual(labels(hook), [])
 
   t.mock.timers.tick(3 * HOUR)
-  hook.rerender([row(5, Date.now() + 10 * MIN)])
+  hook.rerender([row(5, 10 * MIN)], Date.now())
   t.mock.timers.tick(0)
   assert.deepEqual(labels(hook), ['5:~1 hr left'])
 
@@ -47,11 +47,13 @@ test('a list that starts empty does not keep its mount time for later rows', t =
 
 test('each label changes exactly at its step', t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: START })
-  const hook = renderHook(rows => useExpiryCountdowns(rows), [row(1, START + 13 * HOUR)])
-  assert.deepEqual(labels(hook), ['1:~1 day left'])
+  const hook = renderHook(useExpiryCountdowns, [row(1, DAY + HOUR)], START)
+  assert.deepEqual(labels(hook), ['1:1 day left'])
   t.mock.timers.tick(HOUR)
+  assert.deepEqual(labels(hook), ['1:1 day left'])
+  t.mock.timers.tick(1)
   assert.deepEqual(labels(hook), ['1:~12 hrs left'])
-  t.mock.timers.tick(6 * HOUR)
+  t.mock.timers.tick(18 * HOUR - 1)
   assert.deepEqual(labels(hook), ['1:~6 hrs left'])
   t.mock.timers.tick(5 * HOUR)
   assert.deepEqual(labels(hook), ['1:~1 hr left'])

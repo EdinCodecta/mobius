@@ -9,20 +9,17 @@ import { expiryCountdown, recoverErrorMessage, removedLabel } from '../../compon
 
 const NOW = Date.parse('2026-10-27T12:00:00Z')
 
-const at = offset => new Date(NOW + offset).toISOString()
 const SEC = 1000
 const MIN = 60 * SEC
 const HOUR = 60 * MIN
 const DAY = 24 * HOUR
-const label = offset => expiryCountdown(at(offset), NOW)?.label
+const label = offset => expiryCountdown(NOW + offset, NOW)?.label
 
 test('the countdown shows whole days, then rough steps on the last day, and is gone at zero', () => {
   assert.equal(label(7 * DAY), '7 days left')
   assert.equal(label(DAY + 5 * HOUR), '1 day left')
   assert.equal(label(DAY), '1 day left')
-  assert.equal(label(DAY - 1), '~1 day left')
-  assert.equal(label(12 * HOUR + 1), '~1 day left')
-  assert.equal(label(12 * HOUR), '~12 hrs left')
+  assert.equal(label(DAY - 1), '~12 hrs left')
   assert.equal(label(6 * HOUR + 1), '~12 hrs left')
   assert.equal(label(6 * HOUR), '~6 hrs left')
   assert.equal(label(HOUR + 1), '~6 hrs left')
@@ -31,18 +28,18 @@ test('the countdown shows whole days, then rough steps on the last day, and is g
   assert.equal(label(1), '~1 hr left')
   assert.equal(label(0), undefined)
   assert.equal(label(-HOUR), undefined)
-  assert.equal(expiryCountdown('nonsense', NOW), null)
+  assert.equal(expiryCountdown(NaN, NOW), null)
 })
 
 test('the pill turns amber under three days and red on the last day', () => {
-  assert.equal(expiryCountdown(at(5 * DAY), NOW).tone, '')
-  assert.equal(expiryCountdown(at(2 * DAY), NOW).tone, 'soon')
-  assert.equal(expiryCountdown(at(8 * HOUR), NOW).tone, 'urgent')
+  assert.equal(expiryCountdown(NOW + 5 * DAY, NOW).tone, '')
+  assert.equal(expiryCountdown(NOW + 2 * DAY, NOW).tone, 'soon')
+  assert.equal(expiryCountdown(NOW + 8 * HOUR, NOW).tone, 'urgent')
 })
 
 test('the next wake lands exactly when the label changes', () => {
   for (const offset of [6 * DAY + 3 * HOUR, DAY, DAY - 1, 20 * HOUR, 12 * HOUR, 8 * HOUR, 6 * HOUR, 5 * HOUR + 7 * MIN, HOUR, 42 * MIN, 400]) {
-    const { label: before, changesAt } = expiryCountdown(at(offset), NOW)
+    const { label: before, changesAt } = expiryCountdown(NOW + offset, NOW)
     const nextChangeIn = changesAt - NOW
     assert.ok(nextChangeIn > 0)
     assert.notEqual(label(offset - nextChangeIn), before)
@@ -78,8 +75,8 @@ function render(rows) {
 test('the section lists each uninstalled app with a Recover button, and is absent when there are none', () => {
   assert.equal(render([]), '')
   const html = render([
-    { id: 7, name: 'News', slug: 'news', version: '1.2.0', icon_data_url: null, background_color: '#336699', theme_color: null, deleted_at: '2026-10-26T12:00:00Z', expires_at: '2026-11-02T12:00:00Z' },
-    { id: 9, name: 'Kanban', slug: 'kanban', version: null, deleted_at: '2026-10-27T08:00:00Z', expires_at: '2026-11-03T08:00:00Z' },
+    { id: 7, name: 'News', slug: 'news', version: '1.2.0', icon_data_url: null, background_color: '#336699', theme_color: null, deleted_at: '2026-10-26T12:00:00Z', expires_at: '2026-11-02T12:00:00Z', seconds_left: 6 * DAY / SEC },
+    { id: 9, name: 'Kanban', slug: 'kanban', version: null, deleted_at: '2026-10-27T08:00:00Z', expires_at: '2026-11-03T08:00:00Z', seconds_left: 7 * DAY / SEC },
   ])
   assert.match(html, /Recently uninstalled/)
   assert.match(html, /News/)
@@ -92,15 +89,25 @@ test('the section lists each uninstalled app with a Recover button, and is absen
   assert.doesNotMatch(html, /for good/)
 })
 
-test('an app whose countdown already reached zero is not listed', () => {
-  const past = new Date(Date.now() - 1000).toISOString()
-  assert.equal(render([{ id: 3, name: 'Gone', slug: 'gone', deleted_at: '2026-10-20T12:00:00Z', expires_at: past }]), '')
+test('an app the server says has no time left is not listed', () => {
+  const gone = { id: 3, name: 'Gone', slug: 'gone', deleted_at: '2026-10-20T12:00:00Z', expires_at: '2026-10-27T12:00:00Z', seconds_left: 0 }
+  assert.equal(render([gone]), '')
   const html = render([
-    { id: 3, name: 'Gone', slug: 'gone', deleted_at: '2026-10-20T12:00:00Z', expires_at: past },
-    { id: 4, name: 'Kept', slug: 'kept', deleted_at: new Date().toISOString(), expires_at: new Date(Date.now() + 2 * 86400000).toISOString() },
+    gone,
+    { id: 4, name: 'Kept', slug: 'kept', deleted_at: '2026-10-25T12:00:00Z', expires_at: '2026-11-01T12:00:00Z', seconds_left: 2 * DAY / SEC + 60 },
   ])
   assert.doesNotMatch(html, /Gone/)
   assert.match(html, /Kept/)
-  assert.match(html, /1 day left|2 days left/)
+  assert.match(html, /2 days left/)
   assert.match(html, /uninstalled-apps__count">1</)
+})
+
+test('a device clock that runs ahead does not hide an app the server would still recover', () => {
+  // By this device's clock the window closed an hour ago; the server says three hours remain.
+  const html = render([
+    { id: 5, name: 'Skewed', slug: 'skewed', deleted_at: new Date(Date.now() - 7 * DAY - HOUR).toISOString(), expires_at: new Date(Date.now() - HOUR).toISOString(), seconds_left: 3 * HOUR / SEC },
+  ])
+  assert.match(html, /Skewed/)
+  assert.match(html, /~6 hrs left/)
+  assert.match(html, /aria-label="Recover Skewed"/)
 })
