@@ -70,6 +70,8 @@ _PROXY_MAX_BROWSER_AGE = 24 * 60 * 60
 # lose a whole second of freshness. Real hop time is far larger than this.
 _FRESHNESS_FLOAT_SLACK = 1e-6
 # A raw.githubusercontent.com path naming a full commit can never change.
+# COMMIT_PINNED_RAW_PATH in frontend/src/sw-cache-policy.js must stay the same
+# pattern, or the service worker caches cache-first what this never pins.
 _COMMIT_PINNED_RAW_PATH = re.compile(r"/[^/]+/[^/]+/([0-9a-f]{40})/")
 _IMMUTABLE_CACHE_CONTROL = "private, max-age=31536000, immutable"
 

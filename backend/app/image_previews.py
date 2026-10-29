@@ -22,9 +22,15 @@ PREVIEW_DIR = ".previews"
 _EXIF_ORIENTATION = 274
 
 # Remote bytes are untrusted and already in memory, so they get a tighter
-# decode budget than stored images: at most 64 MiB once expanded to RGBA.
+# decode budget than stored images. A 16 MP image is 64 MiB of RGBA pixels;
+# decoding, converting and resampling one peaks at about 150 MB, and the shared
+# generation slots below cap how many run at once.
 DOWNSCALE_MAX_PIXELS = 4096 * 4096
 _DOWNSCALE_FORMATS = ("PNG", "JPEG", "WEBP", "GIF")
+# Commit-pinned downscales are cached by browsers as immutable. Changing this
+# or the encoding in downscaled_webp changes those bytes, so bump
+# PROXY_PINNED_CACHE in frontend/src/sw-cache-policy.js with it.
+DOWNSCALE_WEBP_QUALITY = 72
 
 # Pillow expands compressed images in memory. Two concurrent generators keep a
 # transcript moving without letting a screenshot-heavy chat occupy the entire
@@ -60,6 +66,13 @@ def dimensions_cache_path(file_path: Path, base: Path) -> Path:
   return preview_cache_path(file_path, base).with_suffix(".json")
 
 
+def _exif_orientation(source: Image.Image) -> int:
+  try:
+    return source.getexif().get(_EXIF_ORIENTATION, 1)
+  except (AttributeError, OSError, ValueError):
+    return 1
+
+
 def _oriented_dimensions(source: Image.Image) -> tuple[int, int] | None:
   """Read display dimensions from headers, including EXIF rotation.
 
@@ -68,11 +81,7 @@ def _oriented_dimensions(source: Image.Image) -> tuple[int, int] | None:
   cold-read cost out of repeated chat-detail responses.
   """
   width, height = source.size
-  try:
-    orientation = source.getexif().get(_EXIF_ORIENTATION, 1)
-  except (AttributeError, OSError, ValueError):
-    orientation = 1
-  if orientation in {5, 6, 7, 8}:
+  if _exif_orientation(source) in {5, 6, 7, 8}:
     width, height = height, width
   if width <= 0 or height <= 0:
     return None
@@ -246,7 +255,11 @@ def downscaled_webp(data: bytes, max_width: int) -> bytes | None:
         dimensions = _oriented_dimensions(source)
         if dimensions is None or dimensions[0] <= max_width:
           return None
-        image = ImageOps.exif_transpose(source)
+        # exif_transpose returns a full copy even for an upright image.
+        image = (
+          ImageOps.exif_transpose(source)
+          if _exif_orientation(source) in range(2, 9) else source
+        )
         if image.mode not in {"RGB", "RGBA"}:
           image = image.convert("RGBA" if image.has_transparency_data else "RGB")
         image.thumbnail((max_width, image.height), Image.Resampling.LANCZOS)
@@ -256,7 +269,7 @@ def downscaled_webp(data: bytes, max_width: int) -> bytes | None:
         image.save(
           encoded,
           format="WEBP",
-          quality=PREVIEW_WEBP_QUALITY,
+          quality=DOWNSCALE_WEBP_QUALITY,
           method=4,
           icc_profile=source.info.get("icc_profile") if rgb_source else None,
         )

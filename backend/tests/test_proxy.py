@@ -1955,6 +1955,22 @@ def test_downscale_measures_the_displayed_width_of_a_rotated_photo():
     assert thumb.size == (50, 100)
 
 
+@pytest.mark.parametrize("orientation", [None, 1])
+def test_downscale_of_an_upright_image_skips_the_transposed_copy(orientation):
+  from PIL import Image
+  from app.image_previews import downscaled_webp
+  params = {}
+  if orientation is not None:
+    exif = Image.Exif()
+    exif[274] = orientation
+    params["exif"] = exif
+  body = _encoded(_noisy("RGB", (400, 200)), "JPEG", quality=95, **params)
+  # A transposed copy would hold a second full-size image in memory.
+  with patch("app.image_previews.ImageOps.exif_transpose") as transpose:
+    assert downscaled_webp(body, 100) is not None
+  transpose.assert_not_called()
+
+
 def test_downscale_keeps_the_original_when_webp_would_be_larger():
   from PIL import Image
   from app.image_previews import downscaled_webp
@@ -1990,6 +2006,20 @@ def test_unpinned_proxy_reads_keep_bounded_freshness(
   assert r.headers["cache-control"].startswith("private, max-age=")
   assert "immutable" not in r.headers["cache-control"]
   assert int(r.headers["cache-control"].split("=")[1]) <= 300
+
+
+def test_service_worker_predicts_commit_pins_with_the_server_pattern():
+  import re
+  from pathlib import Path
+  from app.routes.proxy import _COMMIT_PINNED_RAW_PATH
+  policy = (
+    Path(__file__).parents[2] / "frontend" / "src" / "sw-cache-policy.js"
+  ).read_text()
+  # The worker anchors at the start, as re.match does here.
+  worker = re.search(r"^const COMMIT_PINNED_RAW_PATH = /\^(.+)/$", policy, re.M)
+  assert worker, "COMMIT_PINNED_RAW_PATH must be an unflagged ^-anchored regex"
+  server = _COMMIT_PINNED_RAW_PATH.pattern.replace("(", "").replace(")", "")
+  assert worker[1].replace("\\/", "/") == server
 
 
 @pytest.mark.parametrize("case", ["redirect_off_commit", "no_store", "error", "truncated"])

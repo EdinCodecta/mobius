@@ -17,7 +17,6 @@ import {
   isAppCodeRoute,
   isPinnableProxyResponse,
   PROXY_PINNED_CACHE,
-  PROXY_PINNED_MATCH_OPTIONS,
   proxyCacheLane,
   packagedAssetCacheLane,
   isCacheableAppAssetResponse,
@@ -425,6 +424,8 @@ test('commit-pinned proxied images are served cache-first; branch-relative ones 
   assert.equal(lane(`${raw}/${commit}/media/banner.JPG`, '&w=1200'), 'immutable')
   assert.equal(lane(`${raw}/main/icon.png`), 'revalidate')
   assert.equal(lane(`${raw}/${commit.slice(1)}/icon.png`), 'revalidate')
+  // The server pins lowercase hex only; predicting more would make it network-only.
+  assert.equal(lane(`${raw}/${commit.toUpperCase()}/icon.png`), 'revalidate')
   assert.equal(lane(`${raw}/${commit}/mobius.json`), null)
   assert.equal(lane(`http://raw.githubusercontent.com/mobius-os/app-voice/${commit}/icon.png`), 'revalidate')
   assert.equal(lane(`https://raw.githubusercontent.com.evil.example/a/b/${commit}/icon.png`), 'revalidate')
@@ -451,14 +452,12 @@ test('only complete responses the server marked immutable enter the pinned proxy
   assert.equal(isPinnableProxyResponse(undefined), false)
 })
 
-test('pinned proxy lookups ignore Vary so a renewed bearer token reuses the entry', () => {
-  // Only this lane: the shared mobius-proxy cache keeps per-token matching.
-  assert.deepEqual({ ...PROXY_PINNED_MATCH_OPTIONS }, { ignoreVary: true })
-  assert.ok(Object.isFrozen(PROXY_PINNED_MATCH_OPTIONS))
-})
-
-test('the pinned proxy cache survives activation and is cleared on logout', () => {
+test('the pinned proxy cache survives activation, a renamed version does not, and logout clears it', () => {
   assert.equal(isStaleRuntimeCache(PROXY_PINNED_CACHE), false)
+  // Bumping the version is how a changed downscaled rendition reaches clients.
+  assert.equal(isStaleRuntimeCache('mobius-proxy-pinned'), true)
+  assert.equal(isStaleRuntimeCache('mobius-proxy-pinned-v0'), true)
+  assert.equal(isStaleRuntimeCache('mobius-proxy'), false)
   assert.deepEqual(cachesToDeleteOnLogout([PROXY_PINNED_CACHE]), [PROXY_PINNED_CACHE])
 })
 

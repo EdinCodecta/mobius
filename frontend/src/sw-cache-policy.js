@@ -92,6 +92,14 @@ export const APP_ASSETS_CACHE = 'mobius-app-assets-v2'
 // legitimately huge app needs more, rather than removing the ceiling.
 export const APP_ASSETS_MAX_ENTRIES = 600
 
+// Proxied images from one raw.githubusercontent.com commit never change, so
+// they are served cache-first from their own bounded cache. The server's
+// downscaled renditions are cached the same way, so bump the version whenever
+// image_previews.downscaled_webp output changes; activation then evicts the
+// old renditions.
+export const PROXY_PINNED_CACHE = 'mobius-proxy-pinned-v1'
+export const PROXY_PINNED_MAX_ENTRIES = 300
+
 const KEEP_RUNTIME_CACHES = new Set([
   VENDOR_CACHE,
   ESM_CACHE,
@@ -99,6 +107,7 @@ const KEEP_RUNTIME_CACHES = new Set([
   OFFLINE_APPS_CACHE,
   STANDALONE_APPS_CACHE,
   APP_ASSETS_CACHE,
+  PROXY_PINNED_CACHE,
 ])
 
 // Logout removes every cache that may contain owner-projected data or private
@@ -180,7 +189,7 @@ export function isStaleRuntimeCache(name) {
   if (KEEP_RUNTIME_CACHES.has(name)) return false
   if (/^mobius-(vendor|assets|app-assets|apps|proxy|esm)-v\d+$/.test(name)) return true
   if (/^mobius-(vendor|esm)/.test(name)) return true
-  if (/^mobius-(offline-apps|standalone)(?:-v\d+)?$/.test(name)) return true
+  if (/^mobius-(offline-apps|standalone|proxy-pinned)(?:-v\d+)?$/.test(name)) return true
   return false
 }
 
@@ -455,18 +464,13 @@ export function isShellListUrl(url) {
 // navigation with one, since it would open as a shell-origin document.
 const CACHEABLE_PROXY_EXT =
   /\.(jpg|jpeg|png|gif|webp|svg|ico|woff2?|ttf|otf|eot|hdr|exr|mp3|mp4|webm|ogg|wav)(\?|$)/i
-const PINNED_PROXY_IMAGE_PATH =
-  /^\/[^/]+\/[^/]+\/[0-9a-f]{40}\/.+\.(jpg|jpeg|png|gif|webp|svg|ico)$/i
-
-// Proxied images from one raw.githubusercontent.com commit never change, so
-// they are served cache-first from their own bounded cache.
-export const PROXY_PINNED_CACHE = 'mobius-proxy-pinned'
-export const PROXY_PINNED_MAX_ENTRIES = 300
-// The server still answers `Vary: Authorization`, but this lane reuses an
-// entry across bearer tokens so a renewed app token does not refetch it. That
-// is safe only here: the bytes are public and immutable, the cache is this
-// origin's private browser cache, and logout deletes it.
-export const PROXY_PINNED_MATCH_OPTIONS = Object.freeze({ ignoreVary: true })
+// The same pattern as _COMMIT_PINNED_RAW_PATH in backend/app/routes/proxy.py,
+// which test_proxy.py compares against this line. Predicting a pin the server
+// does not grant (uppercase hex, say) would make that image network-only.
+const COMMIT_PINNED_RAW_PATH = /^\/[^/]+\/[^/]+\/[0-9a-f]{40}\//
+// The server pins any file at a commit; this lane takes only images, so a
+// pinned manifest or other JSON keeps going to the network.
+const PINNED_PROXY_IMAGE_EXT = /\.(jpg|jpeg|png|gif|webp|svg|ico)$/i
 
 function isCommitPinnedImageUrl(value) {
   let target
@@ -477,7 +481,8 @@ function isCommitPinnedImageUrl(value) {
   }
   return target.protocol === 'https:'
     && target.host === 'raw.githubusercontent.com'
-    && PINNED_PROXY_IMAGE_PATH.test(target.pathname)
+    && COMMIT_PINNED_RAW_PATH.test(target.pathname)
+    && PINNED_PROXY_IMAGE_EXT.test(target.pathname)
 }
 
 // Which /api/proxy route serves this request: 'immutable' (cache-first),

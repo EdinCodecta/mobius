@@ -45,6 +45,7 @@ import {
 } from 'workbox-precaching'
 import { registerRoute, setCatchHandler } from 'workbox-routing'
 import { LiveShellList } from './sw-shell-lists.js'
+import { pinnedProxyImageStrategy, trimCachePlugin } from './sw-cache-strategies.js'
 import {
   CacheFirst, StaleWhileRevalidate, NetworkFirst, NetworkOnly,
 } from 'workbox-strategies'
@@ -73,15 +74,10 @@ import {
   shouldFallBackToCacheOnError,
   isAppCodeRoute,
   proxyCacheLane,
-  isPinnableProxyResponse,
-  PROXY_PINNED_CACHE,
-  PROXY_PINNED_MAX_ENTRIES,
-  PROXY_PINNED_MATCH_OPTIONS,
   appCodeCacheKey,
   appCodeRequestMayBeStored,
   appCodeStoreAction,
   supersededVersionKeys,
-  entriesToTrim,
 } from './sw-cache-policy.js'
 import { RETAINED_RUNTIME_ASSETS } from './sw-precache-assets.js'
 import { isShellNavigationDenied } from './lib/swNavigationPolicy.js'
@@ -288,29 +284,7 @@ registerRoute(
 // (2026-06-12); the request side is the only place the case is visible.
 // packagedAssetCacheLane owns the choice. A page navigation to /app-assets
 // takes neither route: it reaches the server's fresh inert response.
-// Bounded-growth trim for APP_ASSETS_CACHE and the pinned proxy cache. Neither
-// route below carries a Workbox ExpirationPlugin (it's not a dep on these
-// routes), and a single app can be ~19MB of assets, so without a cap the cache
-// grows unbounded across installs and one asset-heavy app could evict the
-// whole origin's quota. cacheDidUpdate fires after each successful write; we
-// then trim the OLDEST entries (cache.keys() is insertion order) down to the
-// cache's cap via the unit-tested entriesToTrim helper. Best-effort: a trim
-// failure never affects the served response. Trimming removes a URL whatever
-// its Vary headers, which proxied responses always carry.
-const trimCachePlugin = maxEntries => ({
-  cacheDidUpdate: async ({ cacheName }) => {
-    try {
-      const cache = await caches.open(cacheName)
-      const keys = (await cache.keys()).map(r => r.url)
-      await Promise.all(
-        entriesToTrim(keys, maxEntries)
-          .map(k => cache.delete(k, { ignoreVary: true })),
-      )
-    } catch {
-      // ignore — the cache is over its soft cap for one extra entry at worst.
-    }
-  },
-})
+// Bounded growth for both routes below; see trimCachePlugin.
 const appAssetsTrimPlugin = trimCachePlugin(APP_ASSETS_MAX_ENTRIES)
 
 const packagedAssetCacheKeyPlugin = {
@@ -375,17 +349,7 @@ registerRoute(
 registerRoute(
   ({ url, request }) =>
     proxyCacheLane(url, request, self.location.origin) === 'immutable',
-  new CacheFirst({
-    cacheName: PROXY_PINNED_CACHE,
-    matchOptions: PROXY_PINNED_MATCH_OPTIONS,
-    plugins: [
-      {
-        cacheWillUpdate: async ({ response }) =>
-          isPinnableProxyResponse(response) ? response : null,
-      },
-      trimCachePlugin(PROXY_PINNED_MAX_ENTRIES),
-    ],
-  }),
+  pinnedProxyImageStrategy(),
 )
 registerRoute(
   ({ url, request }) =>
