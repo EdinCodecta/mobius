@@ -455,11 +455,40 @@ export function isShellListUrl(url) {
 // navigation with one, since it would open as a shell-origin document.
 const CACHEABLE_PROXY_EXT =
   /\.(jpg|jpeg|png|gif|webp|svg|ico|woff2?|ttf|otf|eot|hdr|exr|mp3|mp4|webm|ogg|wav)(\?|$)/i
+const PINNED_PROXY_IMAGE_PATH =
+  /^\/[^/]+\/[^/]+\/[0-9a-f]{40}\/.+\.(jpg|jpeg|png|gif|webp|svg|ico)$/i
 
-export function isCacheableProxyRequest(url, request, origin) {
-  if (url.origin !== origin) return false
-  if (request?.mode === 'navigate') return false
-  if (url.pathname === '/api/proxy/favicon') return true
-  if (url.pathname !== '/api/proxy') return false
-  return CACHEABLE_PROXY_EXT.test(url.searchParams.get('url') || '')
+// Proxied images from one raw.githubusercontent.com commit never change, so
+// they are served cache-first from their own bounded cache.
+export const PROXY_PINNED_CACHE = 'mobius-proxy-pinned'
+export const PROXY_PINNED_MAX_ENTRIES = 300
+
+function isCommitPinnedImageUrl(value) {
+  let target
+  try {
+    target = new URL(value)
+  } catch {
+    return false
+  }
+  return target.protocol === 'https:'
+    && target.host === 'raw.githubusercontent.com'
+    && PINNED_PROXY_IMAGE_PATH.test(target.pathname)
+}
+
+// Which /api/proxy route serves this request: 'immutable' (cache-first),
+// 'revalidate' (stale-while-revalidate) or null (network only).
+export function proxyCacheLane(url, request, origin) {
+  if (url.origin !== origin) return null
+  if (request?.mode === 'navigate') return null
+  if (url.pathname === '/api/proxy/favicon') return 'revalidate'
+  if (url.pathname !== '/api/proxy') return null
+  const target = url.searchParams.get('url') || ''
+  if (isCommitPinnedImageUrl(target)) return 'immutable'
+  return CACHEABLE_PROXY_EXT.test(target) ? 'revalidate' : null
+}
+
+// Only a complete response the server itself marked immutable may be pinned.
+export function isPinnableProxyResponse(response) {
+  return response?.status === 200
+    && /(^|,)\s*immutable\s*(,|$)/i.test(response.headers.get('cache-control') || '')
 }

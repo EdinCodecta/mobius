@@ -1,6 +1,7 @@
 """Bounded previews and intrinsic layout metadata for stored raster images."""
 
 import hashlib
+import io
 import json
 import os
 import tempfile
@@ -19,6 +20,11 @@ PREVIEW_MAX_EDGE = 1024
 PREVIEW_WEBP_QUALITY = 72
 PREVIEW_DIR = ".previews"
 _EXIF_ORIENTATION = 274
+
+# Remote bytes are untrusted and already in memory, so they get a tighter
+# decode budget than stored images: at most 64 MiB once expanded to RGBA.
+DOWNSCALE_MAX_PIXELS = 4096 * 4096
+_DOWNSCALE_FORMATS = ("PNG", "JPEG", "WEBP", "GIF")
 
 # Pillow expands compressed images in memory. Two concurrent generators keep a
 # transcript moving without letting a screenshot-heavy chat occupy the entire
@@ -220,6 +226,46 @@ def display_image_preview(file_path: Path, base: Path) -> Path | None:
           temp_path.unlink(missing_ok=True)
         except OSError:
           pass
+
+
+def downscaled_webp(data: bytes, max_width: int) -> bytes | None:
+  """Return a WebP of `data` at most `max_width` display pixels wide.
+
+  None means the caller should serve the original bytes: they are not a
+  supported raster image, cannot be decoded, exceed the pixel budget, are
+  already narrow enough, or would not get smaller. Never upscales; aspect
+  ratio, alpha, EXIF rotation and the colour profile are kept. Animated
+  sources keep their first frame.
+  """
+  with _GENERATION_SLOTS:
+    try:
+      with Image.open(io.BytesIO(data), formats=_DOWNSCALE_FORMATS) as source:
+        # Check the header size first: reading PNG EXIF may decode the image.
+        if source.width * source.height > DOWNSCALE_MAX_PIXELS:
+          return None
+        dimensions = _oriented_dimensions(source)
+        if dimensions is None or dimensions[0] <= max_width:
+          return None
+        image = ImageOps.exif_transpose(source)
+        if image.mode not in {"RGB", "RGBA"}:
+          image = image.convert("RGBA" if image.has_transparency_data else "RGB")
+        image.thumbnail((max_width, image.height), Image.Resampling.LANCZOS)
+        # A CMYK or grey profile would misdescribe the converted RGB pixels.
+        rgb_source = source.mode in {"RGB", "RGBA", "P", "PA"}
+        encoded = io.BytesIO()
+        image.save(
+          encoded,
+          format="WEBP",
+          quality=PREVIEW_WEBP_QUALITY,
+          method=4,
+          icc_profile=source.info.get("icc_profile") if rgb_source else None,
+        )
+    except Exception:
+      # Arbitrary network bytes can fail inside any decoder; the original
+      # response is always a correct answer.
+      return None
+  result = encoded.getvalue()
+  return result if len(result) < len(data) else None
 
 
 def discard_image_preview(file_path: Path, base: Path) -> None:

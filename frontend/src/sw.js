@@ -72,7 +72,10 @@ import {
   shouldServeCacheFirst,
   shouldFallBackToCacheOnError,
   isAppCodeRoute,
-  isCacheableProxyRequest,
+  proxyCacheLane,
+  isPinnableProxyResponse,
+  PROXY_PINNED_CACHE,
+  PROXY_PINNED_MAX_ENTRIES,
   appCodeCacheKey,
   appCodeRequestMayBeStored,
   appCodeStoreAction,
@@ -284,27 +287,30 @@ registerRoute(
 // (2026-06-12); the request side is the only place the case is visible.
 // packagedAssetCacheLane owns the choice. A page navigation to /app-assets
 // takes neither route: it reaches the server's fresh inert response.
-// Bounded-growth trim for APP_ASSETS_CACHE. Neither route below carries a
-// Workbox ExpirationPlugin (it's not a dep on these routes), and a single app
-// can be ~19MB of assets, so without a cap the cache grows unbounded across
-// installs and one asset-heavy app could evict the whole origin's quota.
-// cacheDidUpdate fires after each successful write; we then trim the OLDEST
-// entries (cache.keys() is insertion order) down to APP_ASSETS_MAX_ENTRIES via
-// the unit-tested entriesToTrim helper. Best-effort: a trim failure never
-// affects the served response.
-const appAssetsTrimPlugin = {
+// Bounded-growth trim for APP_ASSETS_CACHE and the pinned proxy cache. Neither
+// route below carries a Workbox ExpirationPlugin (it's not a dep on these
+// routes), and a single app can be ~19MB of assets, so without a cap the cache
+// grows unbounded across installs and one asset-heavy app could evict the
+// whole origin's quota. cacheDidUpdate fires after each successful write; we
+// then trim the OLDEST entries (cache.keys() is insertion order) down to the
+// cache's cap via the unit-tested entriesToTrim helper. Best-effort: a trim
+// failure never affects the served response. Trimming removes a URL whatever
+// its Vary headers, which proxied responses always carry.
+const trimCachePlugin = maxEntries => ({
   cacheDidUpdate: async ({ cacheName }) => {
     try {
       const cache = await caches.open(cacheName)
       const keys = (await cache.keys()).map(r => r.url)
       await Promise.all(
-        entriesToTrim(keys, APP_ASSETS_MAX_ENTRIES).map(k => cache.delete(k)),
+        entriesToTrim(keys, maxEntries)
+          .map(k => cache.delete(k, { ignoreVary: true })),
       )
     } catch {
       // ignore — the cache is over its soft cap for one extra entry at worst.
     }
   },
-}
+})
+const appAssetsTrimPlugin = trimCachePlugin(APP_ASSETS_MAX_ENTRIES)
 
 const packagedAssetCacheKeyPlugin = {
   cacheKeyWillBeUsed: async ({ request }) => {
@@ -364,9 +370,24 @@ registerRoute(
   }),
 )
 
-// /api/proxy — server-side CORS bypass; see isCacheableProxyRequest.
+// /api/proxy — server-side CORS bypass; see proxyCacheLane.
 registerRoute(
-  ({ url, request }) => isCacheableProxyRequest(url, request, self.location.origin),
+  ({ url, request }) =>
+    proxyCacheLane(url, request, self.location.origin) === 'immutable',
+  new CacheFirst({
+    cacheName: PROXY_PINNED_CACHE,
+    plugins: [
+      {
+        cacheWillUpdate: async ({ response }) =>
+          isPinnableProxyResponse(response) ? response : null,
+      },
+      trimCachePlugin(PROXY_PINNED_MAX_ENTRIES),
+    ],
+  }),
+)
+registerRoute(
+  ({ url, request }) =>
+    proxyCacheLane(url, request, self.location.origin) === 'revalidate',
   new StaleWhileRevalidate({ cacheName: 'mobius-proxy' }),
 )
 

@@ -864,7 +864,9 @@ The proxy is GET-only, requires the bearer in the header (never a query
 parameter), and truncates bodies at 2,097,152 bytes. GET follows up to five
 redirect hops, validating each destination against SSRF rules rather than
 returning upstream 3xx responses as-is. Request small renditions,
-not full-resolution media. A cross-origin `<img src>` cannot attach the bearer,
+not full-resolution media: add `&w=<pixels>` (16–1600; about twice the
+displayed CSS width) and a PNG, JPEG, WebP or GIF wider than that comes back as
+a smaller WebP, while anything else is returned unchanged. A cross-origin `<img src>` cannot attach the bearer,
 so fetch through the proxy and convert the result to a `data:` URL before
 rendering it; the bundled CSP allows `data:` images but not blob object URLs.
 Use `Promise.allSettled` for multi-provider searches and always keep a static
