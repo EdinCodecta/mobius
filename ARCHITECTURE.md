@@ -301,7 +301,7 @@ other cost fields; it never exposes raw billing data. Runtime, CPU, memory,
 volume and network keep their existing exact contracts. An older account
 service may omit cost even when requested; absence is unknown, not zero. The
 managed broker admits only the canonical GET metrics query `cost=1` and rejects
-other, duplicate or noncanonical query forms (route epoch 10).
+other, duplicate or noncanonical query forms (route epoch 11).
 
 ### Recovery boundary
 
