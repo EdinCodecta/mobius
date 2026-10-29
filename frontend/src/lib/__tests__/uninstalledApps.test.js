@@ -5,7 +5,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { appQueries } from '../../hooks/queries.js'
 import UninstalledApps from '../../components/Drawer/UninstalledApps.jsx'
-import { expiryCountdown, recoverErrorMessage } from '../../components/Drawer/uninstalledApps.js'
+import { expiryCountdown, recoverErrorMessage, removedLabel } from '../../components/Drawer/uninstalledApps.js'
 
 const NOW = Date.parse('2026-10-27T12:00:00Z')
 
@@ -51,6 +51,15 @@ test('the next wake lands exactly when the label changes', () => {
   }
 })
 
+test('the removal date is a full phrase with the month written out and the year only when it is not this year', () => {
+  const now = new Date('2026-10-28T12:00:00Z')
+  const thisYear = removedLabel('2026-10-27T12:00:00Z', now)
+  assert.match(thisYear, /^Uninstalled on .*October.*$/)
+  assert.doesNotMatch(thisYear, /2026|\bOct\b/)
+  assert.match(removedLabel('2025-12-30T12:00:00Z', now), /^Uninstalled on .*December.*2025/)
+  assert.equal(removedLabel('nonsense', now), '')
+})
+
 test('a failed recover shows the server reason, or a generic line', async () => {
   const reason = await recoverErrorMessage(new Response(JSON.stringify({ detail: 'Recovery window has expired.' }), { status: 410 }))
   assert.equal(reason, 'Recovery window has expired.')
@@ -78,6 +87,7 @@ test('the section lists each uninstalled app with a Recover button, and is absen
   assert.match(html, /aria-label="Recover News"/)
   assert.match(html, /aria-label="Recover Kanban"/)
   assert.match(html, /recover an uninstalled app, with its data, for 7 days/)
+  assert.match(html, /Uninstalled on /)
   assert.doesNotMatch(html, /permission/)
   assert.doesNotMatch(html, /for good/)
 })
