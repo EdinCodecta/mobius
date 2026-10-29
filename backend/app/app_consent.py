@@ -79,6 +79,8 @@ _FLAGS = (
    "Can manage the mobius.you sign-in link and identity."),
   ("railway_manage", "railway_manage", "Manage Railway deployments",
    "Can manage deployments on your Railway account."),
+  ("location_history_read", "location_history_read", "See your location history",
+   "Can read the locations your phone recorded."),
   ("helper_activity_read", "helper_activity_read", "Read helper activity",
    "Can see every helper agent's chat, status, open questions, working folder "
    "and full final report."),

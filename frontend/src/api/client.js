@@ -314,6 +314,12 @@ function clearOwnerClientState({ preserveChatOutbox }) {
     // owner signing in on the same browser.
     delDatabase('mobius-shared-folders', 'shared folders').catch(() => {}),
     wipeSwCaches().catch(() => {}),
+    // Queued precise positions and this phone's tracking state are owner data:
+    // stop recording and erase them. Loaded lazily — the controller itself
+    // imports this module.
+    import('../lib/nativeLocation.js')
+      .then((m) => m.endLocationSession())
+      .catch(() => {}),
   ])
 }
 

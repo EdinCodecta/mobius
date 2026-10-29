@@ -169,7 +169,7 @@ def test_every_contract_permission_has_a_row():
       "shared_memory": "write", "manage_apps": True, "manage_skills": True,
       "github_access": True, "github_connect": True, "connections_manage": True,
       "connect_manage": True, "identity_manage": True, "railway_manage": True,
-      "job_secret_read": ["TOKEN"],
+      "location_history_read": True, "job_secret_read": ["TOKEN"],
     },
   }
   contract = contract_from_manifest(manifest)
@@ -179,7 +179,8 @@ def test_every_contract_permission_has_a_row():
   assert {"chat_log_access", "shared_memory", "cross_app_access", "share_with_apps",
           "filesystem_access", "manage_apps", "manage_skills", "github_access",
           "github_connect", "connections_manage", "connect_manage",
-          "identity_manage", "railway_manage", "job_secret_read"} <= ids
+          "identity_manage", "railway_manage", "location_history_read",
+          "job_secret_read"} <= ids
 
 
 def test_helper_activity_read_has_a_non_critical_row():
