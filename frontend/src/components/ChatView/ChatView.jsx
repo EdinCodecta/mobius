@@ -6116,7 +6116,7 @@ export default function ChatView({
         {buildPhaseStatus}
       </div>
       {!embedded && showInspector && (
-        <LazySurface label="agent-context-inspector">
+        <LazySurface key={chatId} label="agent-context-inspector" onDismiss={() => setShowInspector(false)}>
           <AgentContextInspector
             chatId={chatId}
             onClose={() => setShowInspector(false)}
@@ -6124,7 +6124,7 @@ export default function ChatView({
         </LazySurface>
       )}
       {showContextPanel && (
-        <LazySurface label="context-panel">
+        <LazySurface key={chatId} label="context-panel" onDismiss={() => setShowContextPanel(false)}>
           <ContextPanel
             chatId={chatId}
             started={!provisionalNewChat}
@@ -6141,7 +6141,7 @@ export default function ChatView({
         </LazySurface>
       )}
       {!embedded && showSummary && (
-        <LazySurface label="chat-summary-viewer">
+        <LazySurface key={chatId} label="chat-summary-viewer" onDismiss={() => setShowSummary(false)}>
           <ChatSummaryViewer
             chatId={chatId}
             onClose={() => setShowSummary(false)}
@@ -6149,7 +6149,7 @@ export default function ChatView({
         </LazySurface>
       )}
       {!embedded && showChanges && (
-        <LazySurface label="chat-diff-viewer">
+        <LazySurface key={chatId} label="chat-diff-viewer" onDismiss={() => setShowChanges(false)}>
           <ChatDiffViewer
             chatId={chatId}
             initialEntries={chatDiffEntries}
@@ -6159,12 +6159,12 @@ export default function ChatView({
         </LazySurface>
       )}
       {!embedded && showNetwork && (
-        <LazySurface key={chatId} label="chat-network-inspector">
+        <LazySurface key={chatId} label="chat-network-inspector" onDismiss={() => setShowNetwork(false)}>
           <ChatNetworkInspector chatId={chatId} onClose={() => setShowNetwork(false)} />
         </LazySurface>
       )}
       {!embedded && showUsage && (
-        <LazySurface label="chat-usage-inspector">
+        <LazySurface key={chatId} label="chat-usage-inspector" onDismiss={() => setShowUsage(false)}>
           <ChatUsageInspector
             chatId={chatId}
             onClose={() => setShowUsage(false)}

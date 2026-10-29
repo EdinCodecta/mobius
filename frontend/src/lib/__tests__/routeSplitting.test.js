@@ -8,6 +8,11 @@ const LOGIN_CSS = readFileSync(
   new URL('../../components/LoginForm/LoginForm.css', import.meta.url),
   'utf8',
 )
+const SHELL = readFileSync(new URL('../../components/Shell/Shell.jsx', import.meta.url), 'utf8')
+const CHAT_VIEW = readFileSync(
+  new URL('../../components/ChatView/ChatView.jsx', import.meta.url),
+  'utf8',
+)
 const INDEX_HTML = readFileSync(new URL('../../../index.html', import.meta.url), 'utf8')
 const STATIC_INDEX_STYLES = [...INDEX_HTML.matchAll(/<style(?:\s[^>]*)?>([\s\S]*?)<\/style>/g)]
   .map(match => match[1])
@@ -48,6 +53,35 @@ test('mutually exclusive top-level flows remain lazy route boundaries', () => {
       new RegExp(`\\.${className.replaceAll('-', '\\-')}(?:[\\s.:,{]|$)`),
       `${className} must keep a stylesheet rule`,
     )
+  }
+})
+
+// tests/app-canvas.spec.mjs finds these chunks by the name Vite gives a lazily
+// imported module (AppCanvas-<hash>.js), so keep each a module of its own.
+test('surfaces a chat-only launch never paints stay out of the shell startup code', () => {
+  const deferred = [
+    [SHELL, [
+      'AppCanvas', 'ProjectsDirectory', 'ProjectWorkspace', 'AppSourceWorkspace',
+      'ArtifactWorkspace', 'ProjectCopyImport',
+    ]],
+    [CHAT_VIEW, [
+      'AgentContextInspector', 'ContextPanel', 'ChatSummaryViewer', 'ChatDiffViewer',
+      'ChatUsageInspector', 'ChatNetworkInspector',
+    ]],
+  ]
+  for (const [source, components] of deferred) {
+    for (const component of components) {
+      assert.match(
+        source,
+        new RegExp(`const ${component} = lazy\\(\\(\\) => import\\('[^']*/${component}\\.jsx'\\)\\)`),
+        `${component} must load on demand`,
+      )
+      assert.doesNotMatch(
+        source,
+        new RegExp(`^import ${component}\\b`, 'm'),
+        `${component} must not return to the shared startup bundle`,
+      )
+    }
   }
 })
 

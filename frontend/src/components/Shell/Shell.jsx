@@ -191,7 +191,7 @@ import {
   shouldFocusComposerAfterPanePointer,
   supportsDesktopPaneComposerFocus,
 } from './paneChatFocus.js'
-import LazySurface from '../ErrorBoundary/LazySurface.jsx'
+import LazySurface, { SurfaceLoading } from '../ErrorBoundary/LazySurface.jsx'
 import {
   deriveContentVisibility, deriveModeSnapshotPlan,
   MODE_MOTION, EMPTY_SINGLE_SURFACE_KEY,
@@ -243,16 +243,9 @@ const SettingsView = lazy(() => import('../SettingsView/SettingsView.jsx'))
 // Surfaces a chat-only launch never paints stay off the startup path: an app
 // pane, the Projects launcher, and per-project workspaces. Each loads on first
 // render; the service worker's precache makes later first opens local. Each
-// render site wraps its surface in LazySurface, so a failed download stays
-// local to that surface.
-// The app pane's loader is shared with the launch readiness effect, which
-// keeps the launch cover up on an app-first launch until this code is here.
-let appCanvasModule = null
-const loadAppCanvas = () => {
-  appCanvasModule ??= import('../AppCanvas/AppCanvas.jsx')
-  return appCanvasModule
-}
-const AppCanvas = lazy(loadAppCanvas)
+// render site wraps its surface in LazySurface, which keeps a failed download
+// local to that surface and holds the launch cover while a visible one loads.
+const AppCanvas = lazy(() => import('../AppCanvas/AppCanvas.jsx'))
 const ProjectsDirectory = lazy(() => import('../Projects/ProjectsDirectory.jsx'))
 const ProjectWorkspace = lazy(() => import('../Projects/ProjectWorkspace.jsx'))
 const AppSourceWorkspace = lazy(() => import('../Projects/AppSourceWorkspace.jsx'))
@@ -867,11 +860,31 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // cannot reveal a chat while its scroll restoration is still deliberately
   // hidden.
   const initialVisualReadyRef = useRef(false)
-  const markInitialVisualReady = useCallback(() => {
+  const initialVisualRequestedRef = useRef(false)
+  const launchCodePendingRef = useRef(0)
+  const publishInitialVisualReady = useCallback(() => {
     if (initialVisualReadyRef.current) return
     initialVisualReadyRef.current = true
     onInitialVisualReady?.()
   }, [onInitialVisualReady])
+  const markInitialVisualReady = useCallback(() => {
+    initialVisualRequestedRef.current = true
+    if (launchCodePendingRef.current === 0) publishInitialVisualReady()
+  }, [publishInitialVisualReady])
+  // A visible surface whose code is still downloading (LazySurface onPending)
+  // holds the cover, whichever view or pane shows it: lifting it earlier would
+  // expose an empty pane. A failed download also releases the hold, so the
+  // pane's own recovery panel shows instead of a cover that never lifts.
+  const holdLaunchCover = useCallback(() => {
+    if (initialVisualReadyRef.current) return undefined
+    launchCodePendingRef.current += 1
+    return () => {
+      launchCodePendingRef.current -= 1
+      if (launchCodePendingRef.current === 0 && initialVisualRequestedRef.current) {
+        requestAnimationFrame(publishInitialVisualReady)
+      }
+    }
+  }, [publishInitialVisualReady])
   const requestComposer = useCallback((chatId, {
     draft,
     focus = false,
@@ -1415,23 +1428,13 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // ChatView display-ready callback. Once the shell knows it is not waiting on
   // a concrete chat, one browser frame is the honest visual boundary. A real
   // chat always takes the callback path above instead.
-  // An app-first launch also waits for the app pane's code: lifting the cover
-  // before it arrives would expose an empty pane. Settling also on failure lets
-  // the pane's own boundary show its recovery panel instead of a held cover.
-  const [appCanvasLoaded, setAppCanvasLoaded] = useState(false)
   useEffect(() => {
     if (initialVisualReadyRef.current) return undefined
     if (activeView === 'chat' && activeChatId) return undefined
     if (activeView === 'chat' && !chatsQuery.isFetched) return undefined
-    if (activeView === 'canvas' && !appCanvasLoaded) {
-      let current = true
-      const settle = () => { if (current) setAppCanvasLoaded(true) }
-      loadAppCanvas().then(settle, settle)
-      return () => { current = false }
-    }
     const frame = requestAnimationFrame(() => markInitialVisualReady())
     return () => cancelAnimationFrame(frame)
-  }, [activeChatId, activeView, appCanvasLoaded, chatsQuery.isFetched, markInitialVisualReady])
+  }, [activeChatId, activeView, chatsQuery.isFetched, markInitialVisualReady])
 
   // Leaving a creation releases only its keyboard lease. Keep its unfinished
   // session so Back/Forward remounts the same provisional composer, never a
@@ -4653,7 +4656,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       unregisterHistoryDismiss={unregisterHistoryDismiss}
     >
     {projectCopyUrl && (
-      <LazySurface key={projectCopyUrl} label="project-copy-import">
+      <LazySurface key={projectCopyUrl} label="project-copy-import" onDismiss={closeProjectCopy}>
         <ProjectCopyImport url={projectCopyUrl} onImported={acceptProjectCopy} onClose={closeProjectCopy} />
       </LazySurface>
     )}
@@ -5025,7 +5028,12 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
             onPointerDownCapture={paned && !modeBeatActive
               ? () => dispatchWorkspace({ type: 'FOCUS', paneId: paned.paneId }) : undefined}
           >
-            <LazySurface key={`ab-${id}`} label="app" recoveryKey={`app:${id}`}>
+            <LazySurface
+              key={`ab-${id}`}
+              label="app"
+              recoveryKey={`app:${id}`}
+              onPending={surfaceVisible ? holdLaunchCover : undefined}
+            >
               <AppCanvas
                 appId={id}
                 // Focused-pane-only: gates safe-area insets + the immersive holder
@@ -5291,7 +5299,10 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 : undefined}
             >
               {projectsDirectoryShown && (
-                <LazySurface label="projects-directory">
+                <LazySurface
+                  label="projects-directory"
+                  onPending={surfaceVisible ? holdLaunchCover : undefined}
+                >
                   <ProjectsDirectory
                     projects={projects}
                     templates={projectTemplates}
@@ -5351,7 +5362,11 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 ? () => dispatchWorkspace({ type: 'FOCUS', paneId: paned.paneId })
                 : undefined}
             >
-              <LazySurface label="project-workspace" recoveryKey={key}>
+              <LazySurface
+                label="project-workspace"
+                recoveryKey={key}
+                onPending={visible ? holdLaunchCover : undefined}
+              >
                 {sourceApp ? (
                   <AppSourceWorkspace
                     app={sourceApp}
@@ -5416,7 +5431,11 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 ? () => dispatchWorkspace({ type: 'FOCUS', paneId: paned.paneId })
                 : undefined}
             >
-              <LazySurface label="artifact-workspace" recoveryKey={key}>
+              <LazySurface
+                label="artifact-workspace"
+                recoveryKey={key}
+                onPending={visible ? holdLaunchCover : undefined}
+              >
                 {sourceApp ? (
                   <AppSourceWorkspace
                     app={sourceApp}
@@ -5477,11 +5496,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
               ? () => dispatchWorkspace({ type: 'FOCUS', paneId: settingsPaned.paneId })
               : undefined}
           >
-            <Suspense fallback={(
-              <div className="shell__settings-loading" role="status" aria-label="Loading settings">
-                <span className="shell__settings-loading-dot" aria-hidden="true" />
-              </div>
-            )}>
+            <Suspense fallback={<SurfaceLoading label="Loading settings" />}>
               <SettingsView
                 onThemeChange={loadTheme}
                 onOpenChat={selectChat}
