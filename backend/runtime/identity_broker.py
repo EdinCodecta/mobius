@@ -116,8 +116,9 @@ MANAGED_USER_AGENT = "mobius-managed-deployment/1"
 # 1 = pre-/managed broker; 2 = /managed upstream-proxy routes present;
 # 3 = standalone web search endpoint; 4 = flat gateway wire for Codex web.run;
 # 5 = account review routes; 6 = shared access; 7 = recipient invitation response;
-# 8 = native push relay routes; 9 = Railway inventory read options.
-BROKER_ROUTE_EPOCH = 9
+# 8 = native push relay routes; 9 = Railway inventory read options;
+# 10 = community listing sort.
+BROKER_ROUTE_EPOCH = 10
 
 # Declarative public forwarding policy. Callers never supply a target URL,
 # audience, or arbitrary upstream path. Contribution and community routes are
@@ -195,6 +196,12 @@ _COMMUNITY_ROUTES = (
 )
 
 
+# The registry's listing rankings (mobius.you `LISTING_SORTS` in
+# services/mobius_launch/community_registry.py). The app route offers the same
+# values; extend all three together.
+COMMUNITY_LISTING_SORTS = frozenset({"updated", "trending", "installs"})
+
+
 def _community_scope(method: str, route_path: str, query: str) -> str | None:
   scope = next(
     (
@@ -213,11 +220,16 @@ def _community_scope(method: str, route_path: str, query: str) -> str | None:
   }:
     return None
   allowed = (
-    {"q", "limit", "offset"}
+    {"q", "limit", "offset", "sort"}
     if route_path == "/v1/community/apps"
     else {"limit", "offset"}
   )
-  return scope if _canonical_query_pairs(query, allowed) is not None else None
+  pairs = _canonical_query_pairs(query, allowed)
+  if pairs is None:
+    return None
+  if any(key == "sort" and value not in COMMUNITY_LISTING_SORTS for key, value in pairs):
+    return None
+  return scope
 
 
 def _canonical_query_pairs(
