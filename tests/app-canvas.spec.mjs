@@ -1464,3 +1464,56 @@ test.describe('AppCanvas location lifecycle', () => {
     await frame.waitForFunction(() => !window.detail)
   })
 })
+
+// The app pane's code is a separate chunk the shell downloads on first render.
+// Matching only the chunk's name keeps these tests independent of its hash.
+const APP_CANVAS_CHUNK = /\/AppCanvas-[\w-]+\.js(?:\?.*)?$/
+
+test.describe('AppCanvas: on-demand code', () => {
+  test('an app-first launch keeps the launch cover until the app pane can render', async ({ page }) => {
+    const appId = 97
+    await setupAppRoutes(page, appId, mockFrameHTML(appId))
+    let chunkRequested = false
+    let releaseChunk
+    const chunkGate = new Promise(resolve => { releaseChunk = resolve })
+    await page.route(APP_CANVAS_CHUNK, async route => {
+      chunkRequested = true
+      await chunkGate
+      return route.continue()
+    })
+
+    await page.goto(`${BASE}/shell/?app=${appId}`, { waitUntil: 'domcontentloaded' })
+    await expect.poll(() => chunkRequested, { timeout: 10000 }).toBe(true)
+    // The shell itself has rendered and is waiting only on the pane's code.
+    // Give it several frames to (wrongly) report itself ready.
+    await expect(page.locator('.shell__content')).toBeAttached()
+    await page.evaluate(() => new Promise(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 300)))
+    }))
+    const splash = page.locator('#splash')
+    await expect(splash).toHaveCount(1)
+    expect(await splash.evaluate(node => node.style.opacity)).not.toBe('0')
+
+    releaseChunk()
+    await expect(page.locator('iframe.canvas')).toBeAttached({ timeout: 10000 })
+    await expect(splash).toHaveCount(0, { timeout: 10000 })
+  })
+
+  test('a failed app-pane download shows recovery in that pane and keeps the shell', async ({ page }) => {
+    const appId = 96
+    await setupAppRoutes(page, appId, mockFrameHTML(appId))
+    // What a deploy that replaced the running build looks like to this page.
+    await page.route(APP_CANVAS_CHUNK, route => route.abort('failed'))
+
+    await page.goto(`${BASE}/shell/?app=${appId}`, { waitUntil: 'domcontentloaded' })
+
+    const paneRecovery = page.locator('.errbound--inline')
+    await expect(paneRecovery).toContainText('Something broke', { timeout: 10000 })
+    await expect(paneRecovery.getByRole('button', { name: 'Refresh screen' })).toBeVisible()
+    // The failure stays in the pane: no shell-wide crash screen, and the
+    // launch cover lifts instead of waiting forever on code that never comes.
+    await expect(page.locator('.errbound:not(.errbound--inline)')).toHaveCount(0)
+    await expect(page.locator('#splash')).toHaveCount(0, { timeout: 10000 })
+    await expect(page.locator('.shell__content')).toBeVisible()
+  })
+})

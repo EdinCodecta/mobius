@@ -13,7 +13,6 @@ import { consumeChatChanges, subscribeChatChanges } from '../../lib/chatChangesN
 import {
   lazy,
   startTransition,
-  Suspense,
   useState,
   useRef,
   useEffect,
@@ -92,6 +91,7 @@ import SharedFolderUploadPrompt from './SharedFolderUploadPrompt.jsx'
 import useSharedFolderUploadGate from './useSharedFolderUploadGate.js'
 import useSideQuestion from './hooks/useSideQuestion.js'
 import ComposerPopover from './ComposerPopover.jsx'
+import LazySurface from '../ErrorBoundary/LazySurface.jsx'
 import BrainUsageButton from './BrainUsageButton.jsx'
 import ConnectionStatus from './ConnectionStatus.jsx'
 import ProgressRail from './ProgressRail.jsx'
@@ -275,7 +275,7 @@ import {
 import './ChatView.css'
 
 // Inspectors and side panels that open only on request stay off the startup
-// path and load on first open.
+// path and load on first open, each inside its own LazySurface.
 const AgentContextInspector = lazy(() => import('./AgentContextInspector.jsx'))
 const ContextPanel = lazy(() => import('./ContextPanel.jsx'))
 const ChatSummaryViewer = lazy(() => import('./ChatSummaryViewer.jsx'))
@@ -6115,50 +6115,62 @@ export default function ChatView({
       >
         {buildPhaseStatus}
       </div>
-      <Suspense fallback={null}>
       {!embedded && showInspector && (
-        <AgentContextInspector
-          chatId={chatId}
-          onClose={() => setShowInspector(false)}
-        />
+        <LazySurface label="agent-context-inspector">
+          <AgentContextInspector
+            chatId={chatId}
+            onClose={() => setShowInspector(false)}
+          />
+        </LazySurface>
       )}
       {showContextPanel && (
-        <ContextPanel
-          chatId={chatId}
-          started={!provisionalNewChat}
-          provider={chatInfo?.provider}
-          providerSessionId={chatInfo?.session_id}
-          model={selectedChatModel(chatInfo)}
-          liveContext={liveContext}
-          onClose={() => setShowContextPanel(false)}
-          onCompact={() => {
-            setShowContextPanel(false)
-            void runCompactCommand('', null)
-          }}
-        />
+        <LazySurface label="context-panel">
+          <ContextPanel
+            chatId={chatId}
+            started={!provisionalNewChat}
+            provider={chatInfo?.provider}
+            providerSessionId={chatInfo?.session_id}
+            model={selectedChatModel(chatInfo)}
+            liveContext={liveContext}
+            onClose={() => setShowContextPanel(false)}
+            onCompact={() => {
+              setShowContextPanel(false)
+              void runCompactCommand('', null)
+            }}
+          />
+        </LazySurface>
       )}
       {!embedded && showSummary && (
-        <ChatSummaryViewer
-          chatId={chatId}
-          onClose={() => setShowSummary(false)}
-        />
+        <LazySurface label="chat-summary-viewer">
+          <ChatSummaryViewer
+            chatId={chatId}
+            onClose={() => setShowSummary(false)}
+          />
+        </LazySurface>
       )}
       {!embedded && showChanges && (
-        <ChatDiffViewer
-          chatId={chatId}
-          initialEntries={chatDiffEntries}
-          onClose={() => setShowChanges(false)}
-          returnFocusRef={changesReturnFocusRef}
-        />
+        <LazySurface label="chat-diff-viewer">
+          <ChatDiffViewer
+            chatId={chatId}
+            initialEntries={chatDiffEntries}
+            onClose={() => setShowChanges(false)}
+            returnFocusRef={changesReturnFocusRef}
+          />
+        </LazySurface>
       )}
-      {!embedded && showNetwork && <ChatNetworkInspector key={chatId} chatId={chatId} onClose={() => setShowNetwork(false)} />}
+      {!embedded && showNetwork && (
+        <LazySurface key={chatId} label="chat-network-inspector">
+          <ChatNetworkInspector chatId={chatId} onClose={() => setShowNetwork(false)} />
+        </LazySurface>
+      )}
       {!embedded && showUsage && (
-        <ChatUsageInspector
-          chatId={chatId}
-          onClose={() => setShowUsage(false)}
-        />
+        <LazySurface label="chat-usage-inspector">
+          <ChatUsageInspector
+            chatId={chatId}
+            onClose={() => setShowUsage(false)}
+          />
+        </LazySurface>
       )}
-      </Suspense>
       {showEmpty && (
         <div className="chat__empty-wrap">
           {embedded ? (

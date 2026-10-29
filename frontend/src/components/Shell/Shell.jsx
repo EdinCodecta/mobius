@@ -27,6 +27,7 @@ import {
 import usePushSubscription from '../../hooks/usePushSubscription.js'
 import useNativePush from '../../hooks/useNativePush.js'
 import useNavigation, { deepLink } from '../../hooks/useNavigation.js'
+import useLatch from '../../hooks/useLatch.js'
 import useContextMenuOutsideDismiss from '../../hooks/useContextMenuOutsideDismiss.js'
 import { placeContextMenu } from '../../lib/contextMenuGeometry.js'
 import { captureLayoutSpace, clientPointToLayout } from '../../lib/layoutSpace.js'
@@ -187,7 +188,7 @@ import {
   shouldFocusComposerAfterPanePointer,
   supportsDesktopPaneComposerFocus,
 } from './paneChatFocus.js'
-import ErrorBoundary from '../ErrorBoundary/ErrorBoundary.jsx'
+import LazySurface from '../ErrorBoundary/LazySurface.jsx'
 import {
   deriveContentVisibility, deriveModeSnapshotPlan,
   MODE_MOTION, EMPTY_SINGLE_SURFACE_KEY,
@@ -238,8 +239,17 @@ const WalkthroughOverlay = lazy(() => import('../Walkthrough/WalkthroughOverlay.
 const SettingsView = lazy(() => import('../SettingsView/SettingsView.jsx'))
 // Surfaces a chat-only launch never paints stay off the startup path: an app
 // pane, the Projects launcher, and per-project workspaces. Each loads on first
-// render; the service worker's precache makes later first opens local.
-const AppCanvas = lazy(() => import('../AppCanvas/AppCanvas.jsx'))
+// render; the service worker's precache makes later first opens local. Each
+// render site wraps its surface in LazySurface, so a failed download stays
+// local to that surface.
+// The app pane's loader is shared with the launch readiness effect, which
+// keeps the launch cover up on an app-first launch until this code is here.
+let appCanvasModule = null
+const loadAppCanvas = () => {
+  appCanvasModule ??= import('../AppCanvas/AppCanvas.jsx')
+  return appCanvasModule
+}
+const AppCanvas = lazy(loadAppCanvas)
 const ProjectsDirectory = lazy(() => import('../Projects/ProjectsDirectory.jsx'))
 const ProjectWorkspace = lazy(() => import('../Projects/ProjectWorkspace.jsx'))
 const AppSourceWorkspace = lazy(() => import('../Projects/AppSourceWorkspace.jsx'))
@@ -1282,10 +1292,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   const projectsFullBleed = !projectsPaned && fullBleedKey === PROJECTS_KEY
   // The launcher is rendered (and so downloaded) only once it is first shown,
   // then stays mounted like before.
-  const [projectsDirectoryMounted, setProjectsDirectoryMounted] = useState(false)
-  if (!projectsDirectoryMounted && (projectsVisibleAsTab || projectsPaned)) {
-    setProjectsDirectoryMounted(true)
-  }
+  const projectsDirectoryShown = useLatch(projectsVisibleAsTab || !!projectsPaned)
   // focusedActiveKey / fullBleedKey / visible ids are derived once by
   // deriveContentVisibility above: focusedActiveKey drives the AppCanvas
   // focused-pane-only `active` prop (insets + immersive holder); fullBleedKey is
@@ -1402,13 +1409,23 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // ChatView display-ready callback. Once the shell knows it is not waiting on
   // a concrete chat, one browser frame is the honest visual boundary. A real
   // chat always takes the callback path above instead.
+  // An app-first launch also waits for the app pane's code: lifting the cover
+  // before it arrives would expose an empty pane. Settling also on failure lets
+  // the pane's own boundary show its recovery panel instead of a held cover.
+  const [appCanvasLoaded, setAppCanvasLoaded] = useState(false)
   useEffect(() => {
     if (initialVisualReadyRef.current) return undefined
     if (activeView === 'chat' && activeChatId) return undefined
     if (activeView === 'chat' && !chatsQuery.isFetched) return undefined
+    if (activeView === 'canvas' && !appCanvasLoaded) {
+      let current = true
+      const settle = () => { if (current) setAppCanvasLoaded(true) }
+      loadAppCanvas().then(settle, settle)
+      return () => { current = false }
+    }
     const frame = requestAnimationFrame(() => markInitialVisualReady())
     return () => cancelAnimationFrame(frame)
-  }, [activeChatId, activeView, chatsQuery.isFetched, markInitialVisualReady])
+  }, [activeChatId, activeView, appCanvasLoaded, chatsQuery.isFetched, markInitialVisualReady])
 
   // Leaving a creation releases only its keyboard lease. Keep its unfinished
   // session so Back/Forward remounts the same provisional composer, never a
@@ -4606,7 +4623,11 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       closeHistoryDismiss={closeHistoryDismiss}
       unregisterHistoryDismiss={unregisterHistoryDismiss}
     >
-    {projectCopyUrl && <Suspense fallback={null}><ProjectCopyImport key={projectCopyUrl} url={projectCopyUrl} onImported={acceptProjectCopy} onClose={closeProjectCopy} /></Suspense>}
+    {projectCopyUrl && (
+      <LazySurface key={projectCopyUrl} label="project-copy-import">
+        <ProjectCopyImport url={projectCopyUrl} onImported={acceptProjectCopy} onClose={closeProjectCopy} />
+      </LazySurface>
+    )}
     <div
       ref={shellRootRef}
       // Stable shell geometry only. Beat-local custom properties live on the header
@@ -4975,59 +4996,52 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
             onPointerDownCapture={paned && !modeBeatActive
               ? () => dispatchWorkspace({ type: 'FOCUS', paneId: paned.paneId }) : undefined}
           >
-            <ErrorBoundary
-              key={`ab-${id}`}
-              variant="inline"
-              label="app"
-              recoveryKey={`app:${id}`}
-            >
-            <Suspense fallback={null}>
-            <AppCanvas
-              appId={id}
-              // Focused-pane-only: gates safe-area insets + the immersive holder
-              // (global last-writer-wins).
-              active={tabKey === focusedActiveKey}
-              // Visible in ANY pane: gates app navigation and capabilities. A
-              // background split's app keeps running and can install sentinels;
-              // Settings/immersive-solo/hidden panes exclude it (visibleAppIds).
-              // Logical ownership controls app navigation and capabilities.
-              visible={appRuntimeVisible}
-              // The cover owns the frame's visual lifetime, independently of
-              // logical app ownership, so its already-painted pixels remain
-              // stable until the chat takes over.
-              frameVisible={appFrameVisible}
-              // Every visible pane remains painted beneath the modal scrim, but
-              // suspend its iframe interaction while the drawer is open OR during any
-              // mode scene (cross-origin app interaction is inert throughout).
-              interactive={appRuntimeVisible
-                && !modalDrawerOpen && !modeBeatActive}
-              version={versionForApp(id)}
-              storageGeneration={app?.storage_generation}
-              appName={app?.name}
-              themeColor={app?.theme_color}
-              appSlug={app?.slug}
-              offlineCapable={!!app?.offline_capable}
-              capabilityContract={app?.capability_contract || null}
-              subscribeManagedAppEvents={subscribeManagedAppEvents}
-              pendingIntent={appIntents[String(id)] || null}
-              immersiveMode={immersiveActive && String(immersiveAppId) === String(id)
-                ? immersiveMode
-                : null}
-              onNavPush={appNavPush}
-              onNavPop={appNavPop}
-              onNavReset={appNavReset}
-              onAppFocus={focusAppPane}
-              onNavForwardResult={appNavForwardResult}
-              onImmersive={handleImmersive}
-              onIntentDelivered={handleAppIntentDelivered}
-              onAppError={handleAppError}
-              onHostRequest={handleAppHostRequest}
-              onMediaSession={handleMediaSession}
-              shellShortcuts={appFrameShortcutBindings(app, shellFrameShortcuts)}
-              onShellShortcut={runShellShortcut}
-            />
-            </Suspense>
-            </ErrorBoundary>
+            <LazySurface key={`ab-${id}`} label="app" recoveryKey={`app:${id}`}>
+              <AppCanvas
+                appId={id}
+                // Focused-pane-only: gates safe-area insets + the immersive holder
+                // (global last-writer-wins).
+                active={tabKey === focusedActiveKey}
+                // Visible in ANY pane: gates app navigation and capabilities. A
+                // background split's app keeps running and can install sentinels;
+                // Settings/immersive-solo/hidden panes exclude it (visibleAppIds).
+                // Logical ownership controls app navigation and capabilities.
+                visible={appRuntimeVisible}
+                // The cover owns the frame's visual lifetime, independently of
+                // logical app ownership, so its already-painted pixels remain
+                // stable until the chat takes over.
+                frameVisible={appFrameVisible}
+                // Every visible pane remains painted beneath the modal scrim, but
+                // suspend its iframe interaction while the drawer is open OR during any
+                // mode scene (cross-origin app interaction is inert throughout).
+                interactive={appRuntimeVisible
+                  && !modalDrawerOpen && !modeBeatActive}
+                version={versionForApp(id)}
+                storageGeneration={app?.storage_generation}
+                appName={app?.name}
+                themeColor={app?.theme_color}
+                appSlug={app?.slug}
+                offlineCapable={!!app?.offline_capable}
+                capabilityContract={app?.capability_contract || null}
+                subscribeManagedAppEvents={subscribeManagedAppEvents}
+                pendingIntent={appIntents[String(id)] || null}
+                immersiveMode={immersiveActive && String(immersiveAppId) === String(id)
+                  ? immersiveMode
+                  : null}
+                onNavPush={appNavPush}
+                onNavPop={appNavPop}
+                onNavReset={appNavReset}
+                onAppFocus={focusAppPane}
+                onNavForwardResult={appNavForwardResult}
+                onImmersive={handleImmersive}
+                onIntentDelivered={handleAppIntentDelivered}
+                onAppError={handleAppError}
+                onHostRequest={handleAppHostRequest}
+                onMediaSession={handleMediaSession}
+                shellShortcuts={appFrameShortcutBindings(app, shellFrameShortcuts)}
+                onShellShortcut={runShellShortcut}
+              />
+            </LazySurface>
           </div>
           )
         })}
@@ -5247,25 +5261,25 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 ? () => dispatchWorkspace({ type: 'FOCUS', paneId: projectsPaned.paneId })
                 : undefined}
             >
-              {projectsDirectoryMounted && (
-              <Suspense fallback={null}>
-              <ProjectsDirectory
-                projects={projects}
-                templates={projectTemplates}
-                status={projectsStatus}
-                onRetry={() => Promise.all([
-                  projectsQuery.refetch(),
-                  projectTemplatesQuery.refetch(),
-                ])}
-                onOpen={openProject}
-                onCreate={createProjectFromTemplate}
-                onImportGithub={importProjectFromGithub}
-                onImportSource={importProjectSource}
-                onRename={renameProject}
-                onColor={setProjectColor}
-                onDelete={deleteProject}
-              />
-              </Suspense>
+              {projectsDirectoryShown && (
+                <LazySurface label="projects-directory">
+                  <ProjectsDirectory
+                    projects={projects}
+                    templates={projectTemplates}
+                    status={projectsStatus}
+                    onRetry={() => Promise.all([
+                      projectsQuery.refetch(),
+                      projectTemplatesQuery.refetch(),
+                    ])}
+                    onOpen={openProject}
+                    onCreate={createProjectFromTemplate}
+                    onImportGithub={importProjectFromGithub}
+                    onImportSource={importProjectSource}
+                    onRename={renameProject}
+                    onColor={setProjectColor}
+                    onDelete={deleteProject}
+                  />
+                </LazySurface>
               )}
             </div>
           )
@@ -5308,27 +5322,27 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 ? () => dispatchWorkspace({ type: 'FOCUS', paneId: paned.paneId })
                 : undefined}
             >
-              <Suspense fallback={null}>
-              {sourceApp ? (
-                <AppSourceWorkspace
-                  app={sourceApp}
-                  requiresApply={linkedProjectAppIds.has(String(sourceApp.id))}
-                  onOpenApp={() => navTo('canvas', { appId: sourceApp.id })}
-                />
-              ) : (
-                <ProjectWorkspace
-                  project={project}
-                  linkedApp={appById.get(linkedProjectAppId(project))}
-                  onOpenApp={() => navTo('canvas', { appId: linkedProjectAppId(project) })}
-                  onOpenChat={chat => openProjectChat(project, chat)}
-                  onCreateChat={options => createProjectChat(project, options)}
-                  onOpenArtifact={artifactId => openArtifact(project, artifactId)}
-                  startRenaming={String(projectRenameId) === String(project.id)}
-                  onRename={name => renameProject(project, name)}
-                  onRenameEnd={() => setProjectRenameId(null)}
-                />
-              )}
-              </Suspense>
+              <LazySurface label="project-workspace" recoveryKey={key}>
+                {sourceApp ? (
+                  <AppSourceWorkspace
+                    app={sourceApp}
+                    requiresApply={linkedProjectAppIds.has(String(sourceApp.id))}
+                    onOpenApp={() => navTo('canvas', { appId: sourceApp.id })}
+                  />
+                ) : (
+                  <ProjectWorkspace
+                    project={project}
+                    linkedApp={appById.get(linkedProjectAppId(project))}
+                    onOpenApp={() => navTo('canvas', { appId: linkedProjectAppId(project) })}
+                    onOpenChat={chat => openProjectChat(project, chat)}
+                    onCreateChat={options => createProjectChat(project, options)}
+                    onOpenArtifact={artifactId => openArtifact(project, artifactId)}
+                    startRenaming={String(projectRenameId) === String(project.id)}
+                    onRename={name => renameProject(project, name)}
+                    onRenameEnd={() => setProjectRenameId(null)}
+                  />
+                )}
+              </LazySurface>
             </div>
           )
         })}
@@ -5370,22 +5384,22 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
                 ? () => dispatchWorkspace({ type: 'FOCUS', paneId: paned.paneId })
                 : undefined}
             >
-              <Suspense fallback={null}>
-              {sourceApp ? (
-                <AppSourceWorkspace
-                  app={sourceApp}
-                  requiresApply={linkedProjectAppIds.has(String(sourceApp.id))}
-                  onOpenApp={() => navTo('canvas', { appId: sourceApp.id })}
-                />
-              ) : (
-                <ArtifactWorkspace
-                  projectId={parsed.projectId}
-                  project={projectById.get(parsed.projectId)}
-                  onOpenApp={appId => navTo('canvas', { appId })}
-                  artifactId={parsed.artifactId}
-                />
-              )}
-              </Suspense>
+              <LazySurface label="artifact-workspace" recoveryKey={key}>
+                {sourceApp ? (
+                  <AppSourceWorkspace
+                    app={sourceApp}
+                    requiresApply={linkedProjectAppIds.has(String(sourceApp.id))}
+                    onOpenApp={() => navTo('canvas', { appId: sourceApp.id })}
+                  />
+                ) : (
+                  <ArtifactWorkspace
+                    projectId={parsed.projectId}
+                    project={projectById.get(parsed.projectId)}
+                    onOpenApp={appId => navTo('canvas', { appId })}
+                    artifactId={parsed.artifactId}
+                  />
+                )}
+              </LazySurface>
             </div>
           )
         })}
