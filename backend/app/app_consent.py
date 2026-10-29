@@ -20,7 +20,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app import models
+from app import cron_tz, models
 
 ROWS_VERSION = 1
 
@@ -225,50 +225,78 @@ def rows_from_contract(
   return rows
 
 
-_LIMIT_NOUNS = {"chars": "characters", "items": "items", "files": "files", "requests": "requests"}
+# Every limit key the runtime catalog declares, in reading order; the first,
+# overall size, stays unqualified so the per-file and per-chunk sizes read as
+# its refinements. Another key is shown by its own words.
+_LIMIT_WORDS = {
+  "max_bytes": "up to {}",
+  "max_asset_bytes": "up to {} per file",
+  "max_chunk_bytes": "up to {} per download chunk",
+  "max_text_chars": "up to {} characters",
+}
 
 
 def _limit_text(key: str, value: Any) -> str:
   """One reviewed limit in plain words, e.g. ``up to 50,000 characters``."""
+  amount = f"{value:,}" if isinstance(value, int) and not isinstance(value, bool) else str(value)
   if key.endswith("_bytes") and isinstance(value, (int, float)) and not isinstance(value, bool):
     size, unit = float(value), "bytes"
     for unit in ("bytes", "KiB", "MiB", "GiB"):
       if size < 1024 or unit == "GiB":
         break
       size /= 1024
-    return f"up to {round(size, 1):g} {unit}"
-  amount = f"{value:,}" if isinstance(value, int) and not isinstance(value, bool) else str(value)
-  noun = key.removeprefix("max_")
-  noun = _LIMIT_NOUNS.get(noun.rsplit("_", 1)[-1], noun.replace("_", " "))
-  return f"up to {amount} {noun}"
+    amount = f"{round(size, 1):g} {unit}"
+  words = _LIMIT_WORDS.get(key)
+  if words is None:
+    return f"{key.removeprefix('max_').replace('_', ' ')} up to {amount}"
+  return words.format(amount)
 
 
 _WEEKDAYS = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
 
 
+def _even_step(field: str, period: int) -> int | None:
+  """N for ``*`` (1) or ``*/N`` when N divides ``period``, so the gaps really
+  are all N; ``*/45`` minutes alternates 45 and 15 and gets no interval wording."""
+  if field == "*":
+    return 1
+  step = field.removeprefix("*/")
+  if field.startswith("*/") and step.isdecimal() and int(step) and period % int(step) == 0:
+    return int(step)
+  return None
+
+
 def describe_schedule(cron: Any) -> str:
-  """A five-field cron schedule as words; anything unusual is quoted as is."""
-  text = str(cron or "").strip()
-  fields = text.split()
-  if len(fields) != 5:
-    return f"on the schedule \u201c{text}\u201d" if text else "on a schedule"
-  minute, hour, day, month, weekday = fields
-  if fields == ["*"] * 5:
-    return "every minute"
-  if minute.startswith("*/") and minute[2:].isdigit() and fields[1:] == ["*"] * 4:
-    return f"every {int(minute[2:])} minutes"
-  if minute.isdigit() and hour == "*" and fields[2:] == ["*"] * 3:
-    return "every hour"
-  if minute.isdigit() and hour.startswith("*/") and hour[2:].isdigit() and fields[2:] == ["*"] * 3:
-    return f"every {int(hour[2:])} hours"
-  if minute.isdigit() and hour.isdigit() and month == "*":
-    at = f"at {int(hour):02d}:{int(minute):02d} UTC"
-    if day == "*" and weekday == "*":
+  """A cron schedule in plain words, or quoted as written when no short
+  wording is exact.
+
+  Clock times name no zone on purpose: a fixed wall time runs in the owner's
+  timezone once Möbius knows it and in server time before that
+  (``install._manifest_default_timezone``), so no single zone is always true.
+  """
+  text = " ".join(str(cron or "").split())
+  if not text:
+    return "on a schedule"
+  fixed = cron_tz.parse_wall_clock_cron(text)
+  if fixed is not None:
+    minute, hour, days = fixed
+    at = f"at {hour:02d}:{minute:02d}"
+    if len(days) == 7:
       return f"every day {at}"
-    if day == "*" and weekday.isdigit() and int(weekday) % 7 < 7:
-      return f"every {_WEEKDAYS[int(weekday) % 7]} {at}"
-    if day.isdigit() and weekday == "*":
-      return f"on day {int(day)} of every month {at}"
+    if days == {1, 2, 3, 4, 5}:
+      return f"every weekday {at}"
+    names = [_WEEKDAYS[day] for day in sorted(days, key=lambda day: (day + 6) % 7)]
+    listed = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+    return f"every {listed} {at}"
+  fields = text.split()
+  if len(fields) == 5 and fields[2:] == ["*", "*", "*"]:
+    minute, hour = fields[:2]
+    minutes = _even_step(minute, 60)
+    if hour == "*" and minutes:
+      return "every minute" if minutes == 1 else f"every {minutes} minutes"
+    hours = _even_step(hour, 24)
+    if minute.isdecimal() and int(minute) < 60 and hours:
+      return "every hour" if hours == 1 else f"every {hours} hours"
   return f"on the schedule \u201c{text}\u201d"
 
 
@@ -279,11 +307,11 @@ def _runtime_text(capability: str, declaration: dict[str, Any]) -> str:
   duration = limits.pop("max_duration_ms", None)
   text = str(declaration.get("description") or capability)
   if isinstance(duration, (int, float)) and not isinstance(duration, bool):
-    text += f" for up to {round(duration / 1000, 1):g} seconds per request"
+    text = f"{text.rstrip('.')} for up to {round(duration / 1000, 1):g} seconds per request."
   if limits:
-    text += " Limits: " + ", ".join(
-      _limit_text(key, value) for key, value in sorted(limits.items())
-    ) + "."
+    ordered = [key for key in _LIMIT_WORDS if key in limits]
+    ordered += sorted(key for key in limits if key not in _LIMIT_WORDS)
+    text += " Limits: " + ", ".join(_limit_text(key, limits[key]) for key in ordered) + "."
   if declaration.get("reason"):
     text += f" Why: {declaration['reason']}"
   return text

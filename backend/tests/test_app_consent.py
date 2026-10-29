@@ -291,7 +291,7 @@ def test_background_work_is_a_row_with_timing_and_authority():
   (row,) = app_consent.rows_from_contract(contract)
   assert row["id"] == "background_job"
   # Timing, the immediate first run and the run's authority stay stated.
-  assert "every day at 06:00 UTC" in row["text"] and "as soon as you allow it" in row["text"]
+  assert "every day at 06:00" in row["text"] and "as soon as you allow it" in row["text"]
   assert "broad access" in row["text"]
 
 
@@ -814,7 +814,7 @@ def test_access_rows_read_in_plain_words():
   rows = {r["id"]: r for r in app_consent.rows_from_contract(contract)}
   job = rows["background_job"]
   assert job["title"] == "Run on a schedule"
-  assert job["text"].startswith("Runs by itself every day at 10:00 UTC.")
+  assert job["text"].startswith("Runs by itself every day at 10:00.")
   assert "token" not in job["text"] and "0 10" not in job["text"]
   assert rows["agent_start"]["text"] == (
     "Can open agent chats on its own. Commands in those chats run on your "
@@ -828,13 +828,62 @@ def test_access_rows_read_in_plain_words():
 def test_schedules_are_described_in_words_and_unusual_ones_quoted():
   describe = app_consent.describe_schedule
   assert describe("* * * * *") == "every minute"
+  assert describe("*/1 * * * *") == "every minute"
   assert describe("*/15 * * * *") == "every 15 minutes"
   assert describe("5 * * * *") == "every hour"
   assert describe("0 */6 * * *") == "every 6 hours"
-  assert describe("30 7 * * 1") == "every Monday at 07:30 UTC"
-  assert describe("0 9 1 * *") == "on day 1 of every month at 09:00 UTC"
-  assert describe("0 9 1-7 * 1") == "on the schedule \u201c0 9 1-7 * 1\u201d"
+  assert describe("0 10 * * *") == "every day at 10:00"
+  assert describe("30 7 * * 1") == "every Monday at 07:30"
+  assert describe("0 10 * * 1-5") == "every weekday at 10:00"
+  assert describe("0 10 * * 0,6") == "every Saturday and Sunday at 10:00"
+  assert describe("0 10 * * 1,3,5") == "every Monday, Wednesday and Friday at 10:00"
+  assert describe("0 9 1 * *") == "on the schedule \u201c0 9 1 * *\u201d"
   assert describe("") == "on a schedule"
+
+
+def test_a_fixed_clock_time_names_no_timezone():
+  # A fixed wall time runs in the owner's zone once known and in server time
+  # before that, so naming any one zone would be false for some owners.
+  for cron in ("0 10 * * *", "0 10 * * 1-5", "30 7 * * 1"):
+    text = app_consent.describe_schedule(cron)
+    assert "UTC" not in text and "your time" not in text and "server" not in text
+
+
+def test_uneven_cron_steps_are_quoted_rather_than_called_intervals():
+  # */45 fires at :00 and :45 (gaps of 45 and 15 minutes); */5 hours leaves a
+  # 4-hour gap across midnight. Only steps that divide the period are intervals.
+  describe = app_consent.describe_schedule
+  for cron in ("*/45 * * * *", "*/7 * * * *", "0 */5 * * *", "0 */7 * * *", "*/0 * * * *"):
+    assert describe(cron) == f"on the schedule \u201c{cron}\u201d"
+
+
+def test_out_of_range_clock_fields_are_quoted_not_read_as_a_time():
+  describe = app_consent.describe_schedule
+  for cron in ("0 25 * * *", "61 10 * * *", "75 * * * *", "0 10 * * 5-1"):
+    assert describe(cron) == f"on the schedule \u201c{cron}\u201d"
+
+
+def test_every_catalog_limit_key_reads_in_plain_words():
+  from app.app_capabilities import RUNTIME_CAPABILITY_DEFINITIONS
+
+  for capability, definition in RUNTIME_CAPABILITY_DEFINITIONS.items():
+    limits = definition["default_limits"]
+    text = app_consent._runtime_text(capability, {"description": "Do it.", "limits": limits})
+    assert "_" not in text and ". for" not in text and text.endswith("."), (capability, text)
+  assert app_consent._runtime_text("device.asset-cache", {
+    "description": "Download verified assets.",
+    "limits": RUNTIME_CAPABILITY_DEFINITIONS["device.asset-cache"]["default_limits"],
+  }) == (
+    "Download verified assets. Limits: up to 256 MiB, up to 256 MiB per file, "
+    "up to 8 MiB per download chunk."
+  )
+  assert app_consent._runtime_text("media.camera.capture", {
+    "description": "Use a device camera while this app is visible.",
+    "limits": {"max_duration_ms": 60_000, "max_bytes": 128 * 1024 * 1024},
+  }) == (
+    "Use a device camera while this app is visible for up to 60 seconds per "
+    "request. Limits: up to 128 MiB."
+  )
 
 
 def test_rewording_never_changes_what_an_accepted_answer_covers():
