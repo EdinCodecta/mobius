@@ -107,7 +107,9 @@ test('mobius.you sign-in stays on the viewed origin and owns a centered action',
 
 // The static boot document runs before React exists. Its inline scripts are
 // executed in a vm against a minimal fake DOM so the timing rules for the
-// boot-failure notice are exercised, not matched.
+// boot notices are exercised, not matched. tests/bootstrap.spec.mjs covers
+// the same rules against a real Chromium build.
+const MAIN_ENTRY = readFileSync(new URL('../../main.jsx', import.meta.url), 'utf8')
 const INDEX_BODY = INDEX_HTML.slice(INDEX_HTML.indexOf('<body'))
 const INLINE_SCRIPTS = [...INDEX_BODY.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1])
 const BOOT_SCRIPT = INLINE_SCRIPTS.find(source => source.includes('function checkBoot'))
@@ -134,7 +136,8 @@ function bootPage() {
   const timers = []
   const settled = new Map()
   const windowListeners = []
-  const alerts = []
+  const rootObservers = []
+  const notices = []
   const root = { mounted: false, hasChildNodes() { return this.mounted } }
   const splash = fakeElement('DIV')
   const entryScript = fakeElement('SCRIPT', { type: 'module', src: ENTRY })
@@ -143,16 +146,27 @@ function bootPage() {
     getElementById: id => (id === 'root' ? root : id === 'splash' && splash.isConnected ? splash : null),
     querySelectorAll: () => [entryScript, preloadLink],
     createElement: tag => fakeElement(tag.toUpperCase()),
-    body: { appendChild: node => alerts.push(node) },
+    body: { appendChild: node => notices.push(node) },
   }
   const window = {
     location: { pathname: '/shell/', href: 'https://mobius.test/shell/', reload() {} },
     addEventListener: (type, fn, capture) => windowListeners.push({ type, fn, capture }),
   }
+  class MutationObserver {
+    constructor(callback) { this.callback = callback; this.active = false }
+    observe(target, options) {
+      assert.equal(target, root)
+      assert.equal(options.childList, true)
+      this.active = true
+      rootObservers.push(this)
+    }
+    disconnect() { this.active = false }
+  }
   const context = {
     window,
     document,
     history: {},
+    MutationObserver,
     performance: {
       now: () => now,
       getEntriesByName: url => (settled.has(url) ? [{ responseEnd: settled.get(url) }] : []),
@@ -171,14 +185,30 @@ function bootPage() {
     }
     now = ms
   }
+  const visibleNotice = () => {
+    const shown = notices.filter(node => node.isConnected)
+    assert.ok(shown.length <= 1, 'at most one boot notice at a time')
+    return shown[0] ? shown[0].children.map(part => (typeof part === 'string' ? part : part.textContent)).join('') : null
+  }
   return {
     advanceTo,
     finishDownload: (url, atMs) => settled.set(url, atMs),
-    mount: () => { root.mounted = true },
+    mount: () => {
+      root.mounted = true
+      for (const observer of rootObservers) if (observer.active) observer.callback([], observer)
+    },
     failEntryFetch: () => windowListeners
       .filter(listener => listener.type === 'error' && listener.capture)
       .forEach(listener => listener.fn({ target: entryScript })),
-    get failureShown() { return alerts.length > 0 },
+    // main.jsx's pre-render session exchange, settled by the returned function.
+    startSessionExchange: () => {
+      let settle
+      const exchange = new Promise(resolve => { settle = resolve })
+      const observed = window.__mobiusBootSessionExchange(exchange)
+      return async () => { settle(); await observed }
+    },
+    get notice() { return visibleNotice() },
+    get failureShown() { return /failed to load/.test(visibleNotice() ?? '') },
     get coverPresent() { return splash.isConnected },
   }
 }
@@ -187,14 +217,14 @@ test('a first visit still downloading its entry modules is not reported as a fai
   const page = bootPage()
   page.finishDownload(PRELOAD, 6_000)
   page.advanceTo(30_000)
-  assert.equal(page.failureShown, false, 'bytes still arriving at 30s')
+  assert.equal(page.notice, null, 'bytes still arriving at 30s')
   assert.equal(page.coverPresent, true)
 
   page.finishDownload(ENTRY, 31_000)
   page.advanceTo(31_200)
   page.mount()
   page.advanceTo(59_000)
-  assert.equal(page.failureShown, false)
+  assert.equal(page.notice, null)
 })
 
 test('entry modules that arrived but mounted nothing surface the reload notice', () => {
@@ -210,8 +240,8 @@ test('modules that just finished downloading get a mount grace before counting a
   const page = bootPage()
   page.finishDownload(PRELOAD, 2_000)
   page.finishDownload(ENTRY, 7_900)
-  page.advanceTo(8_000)
-  assert.equal(page.failureShown, false)
+  page.advanceTo(10_000)
+  assert.equal(page.notice, null)
   page.advanceTo(12_000)
   assert.equal(page.failureShown, true)
 })
@@ -223,10 +253,66 @@ test('a failed entry module fetch surfaces the reload notice without waiting', (
   assert.equal(page.failureShown, true)
 })
 
-test('a download that never completes eventually offers the reload', () => {
+test('a download still running at 60s is called slow, not failed, and keeps the cover', () => {
   const page = bootPage()
   page.advanceTo(58_000)
-  assert.equal(page.failureShown, false)
+  assert.equal(page.notice, null)
   page.advanceTo(62_000)
+  assert.match(page.notice, /still loading on a slow connection\. Try again or keep waiting\./)
+  assert.equal(page.failureShown, false)
+  assert.equal(page.coverPresent, true)
+})
+
+test('a slow notice leaves once the shell mounts after it appeared', () => {
+  const page = bootPage()
+  page.advanceTo(61_000)
+  assert.ok(page.notice)
+  page.finishDownload(ENTRY, 75_000)
+  page.finishDownload(PRELOAD, 75_000)
+  page.advanceTo(76_000)
+  page.mount()
+  assert.equal(page.notice, null)
+  page.advanceTo(120_000)
+  assert.equal(page.notice, null)
+})
+
+test('a slow download that arrives and still mounts nothing becomes a failure', () => {
+  const page = bootPage()
+  page.advanceTo(61_000)
+  page.finishDownload(ENTRY, 70_000)
+  page.finishDownload(PRELOAD, 70_000)
+  page.advanceTo(80_000)
   assert.equal(page.failureShown, true)
+  assert.equal(page.coverPresent, false)
+})
+
+test('a failure notice leaves if the shell mounts after all', () => {
+  const page = bootPage()
+  page.finishDownload(ENTRY, 3_000)
+  page.finishDownload(PRELOAD, 3_000)
+  page.advanceTo(8_000)
+  assert.equal(page.failureShown, true)
+  page.mount()
+  assert.equal(page.notice, null)
+})
+
+test('the installed shell session exchange before first render counts as loading', async () => {
+  assert.match(
+    MAIN_ENTRY,
+    /await window\.__mobiusBootSessionExchange\(redeemInstalledShellSession\(\)\)/,
+    'main.jsx must report its pre-render network wait to the boot check',
+  )
+  const page = bootPage()
+  page.finishDownload(ENTRY, 3_000)
+  page.finishDownload(PRELOAD, 3_000)
+  page.advanceTo(3_100)
+  const settleExchange = page.startSessionExchange()
+  page.advanceTo(30_000)
+  assert.equal(page.notice, null, 'a slow exchange is network time, not a stalled mount')
+
+  await settleExchange()
+  page.advanceTo(32_000)
+  assert.equal(page.notice, null, 'the mount grace restarts when the exchange settles')
+  page.advanceTo(36_000)
+  assert.equal(page.failureShown, true, 'nothing mounted after the exchange is still a failure')
 })

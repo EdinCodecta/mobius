@@ -340,18 +340,34 @@
       // not be fetched, or they arrived and still mounted nothing. A first visit
       // on a slow link can spend well over 8s just downloading them; calling
       // that a failure invites a reload that restarts the download from zero.
+      // The first look stays at 8s because an ordinary launch has mounted well
+      // before then, so only an already-slow boot ever reaches these rules.
       var BOOT_FIRST_CHECK_MS = 8000
       var BOOT_RECHECK_MS = 2000
-      // Downloaded modules get this long to evaluate and mount before the
-      // boot counts as broken.
-      var BOOT_MOUNT_GRACE_MS = 2000
-      // Past this, offer the reload even if bytes are still arriving.
-      var BOOT_GIVE_UP_MS = 60000
-      var bootFailureShown = false
+      // Downloaded modules get this long to evaluate and mount, parse time on a
+      // low-end phone included, before the boot counts as broken.
+      var BOOT_MOUNT_GRACE_MS = 4000
+      // Past this with the network still pending, say the connection is slow
+      // and offer the reload, but keep the cover: the boot may still finish.
+      var BOOT_SLOW_NOTICE_MS = 60000
+      var bootFailed = false
+      var bootNotice = null
+      var sessionExchangePending = false
+      var sessionExchangeSettledAt = 0
       var entryModules = Array.prototype.map.call(
         document.querySelectorAll('script[type="module"][src], link[rel="modulepreload"][href]'),
         function (el) { return el.src || el.href },
       )
+      // main.jsx passes its pre-render session exchange (installed shells only)
+      // through here, so that network wait counts as loading rather than as
+      // downloaded modules that mounted nothing.
+      window.__mobiusBootSessionExchange = function (exchange) {
+        sessionExchangePending = true
+        return exchange.finally(function () {
+          sessionExchangePending = false
+          sessionExchangeSettledAt = performance.now()
+        })
+      }
       // A failed module-graph fetch fires a non-bubbling `error` on the entry
       // script element at execution time (after parsing), so a capturing
       // window listener registered here is always in time to see it.
@@ -359,8 +375,15 @@
         var target = event.target
         if (target && target.tagName === 'SCRIPT' && target.type === 'module') showBootFailure()
       }, true)
-      function entryModulesSettledAt() {
-        var settledAt = 0
+      // When the boot last waited on the network, or null while it still does.
+      // Resource Timing names entries by the absolute URLs el.src/el.href give.
+      // The entry modules are among the page's first resources, so the
+      // 250-entry buffer cannot realistically have dropped them; if one were
+      // missing, this stays null and only the slow notice can appear, never a
+      // failure the page cannot see.
+      function bootNetworkSettledAt() {
+        if (sessionExchangePending) return null
+        var settledAt = sessionExchangeSettledAt
         for (var i = 0; i < entryModules.length; i++) {
           var timing = performance.getEntriesByName(entryModules[i])[0]
           if (!timing) return null
@@ -369,23 +392,44 @@
         return settledAt
       }
       function checkBoot() {
-        if (bootFailureShown || document.getElementById('root').hasChildNodes()) return
-        var settledAt = entryModulesSettledAt()
-        var stalled = settledAt === null
-          ? performance.now() >= BOOT_GIVE_UP_MS
-          : performance.now() - settledAt >= BOOT_MOUNT_GRACE_MS
-        if (stalled) showBootFailure()
-        else setTimeout(checkBoot, BOOT_RECHECK_MS)
+        if (bootFailed || document.getElementById('root').hasChildNodes()) return
+        var settledAt = bootNetworkSettledAt()
+        if (settledAt !== null && performance.now() - settledAt >= BOOT_MOUNT_GRACE_MS) {
+          showBootFailure()
+          return
+        }
+        if (settledAt === null && !bootNotice && performance.now() >= BOOT_SLOW_NOTICE_MS) {
+          showBootNotice('Möbius is still loading on a slow connection. ', ' or keep waiting.')
+        }
+        setTimeout(checkBoot, BOOT_RECHECK_MS)
       }
       setTimeout(checkBoot, BOOT_FIRST_CHECK_MS)
       function showBootFailure() {
-        if (bootFailureShown || document.getElementById('root').hasChildNodes()) return
-        bootFailureShown = true
+        if (bootFailed || document.getElementById('root').hasChildNodes()) return
+        bootFailed = true
         // The normal authenticated handoff intentionally retains the cover.
         // A failed JavaScript boot has no Shell callback to release it, so
         // remove it before exposing the recovery action.
         var splash = document.getElementById('splash')
         if (splash) splash.remove()
+        showBootNotice(
+          'Möbius failed to load. ',
+          '. If it still won’t load, open Recovery from your deployment control panel.',
+        )
+      }
+      // One notice at a time, and it leaves as soon as React mounts: a boot that
+      // finishes after the notice appeared must not keep reporting trouble.
+      function showBootNotice(beforeRetry, afterRetry) {
+        var root = document.getElementById('root')
+        if (bootNotice) {
+          bootNotice.remove()
+        } else {
+          new MutationObserver(function (records, observer) {
+            if (!root.hasChildNodes()) return
+            observer.disconnect()
+            bootNotice.remove()
+          }).observe(root, { childList: true })
+        }
         var d = document.createElement('div')
         var retry = document.createElement('a')
         d.setAttribute('role', 'alert')
@@ -397,10 +441,8 @@
           event.preventDefault()
           window.location.reload()
         })
-        d.append(
-          'Möbius failed to load. ', retry,
-          '. If it still won’t load, open Recovery from your deployment control panel.',
-        )
+        d.append(beforeRetry, retry, afterRetry)
+        bootNotice = d
         document.body.appendChild(d)
         if (window.__mobiusReleaseShellReloadTransition) {
           window.__mobiusReleaseShellReloadTransition()
