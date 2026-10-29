@@ -33,6 +33,15 @@ Do **not** fall back to raw `agent-browser screenshot` for a Möbius comparison;
 that bypasses the real display density, exact-font readiness, freshness, and
 atomic-output checks. Raw capture remains appropriate for non-Möbius pages.
 
+**Capture the "before" first.** Before you edit anything people can see,
+capture the state you are about to change, at the owner's viewport and at
+390 px wide, straight into this chat's media folder. A pull request for a
+visible change needs that before/after pair, and once the edit is live there is
+no cheap way back: the helper captures only the build being served. If the edit
+already landed without a before shot, do not rebuild an older tree, stand up a
+proxy, or upload images yourself. Say in the pull request body that the before
+screenshot is missing, and describe the earlier state in words.
+
 The helper always applies `$VIEWPORT_WIDTH`/`$VIEWPORT_HEIGHT`, including on
 `--current-page`, so a manual `agent-browser set viewport` is overwritten. To
 capture a different width, override the environment variables for that one
