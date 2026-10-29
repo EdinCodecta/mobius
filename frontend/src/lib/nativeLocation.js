@@ -326,11 +326,12 @@ async function drain() {
 // the transition that decided it: a turn superseded before it publishes stays
 // silent, and the decision time lets the server ignore a report that a slower
 // network delivers after a newer one.
-async function reportTracking(enabled, options, myTurn) {
+async function reportTracking(enabled, options, myTurn, { timeoutMs } = {}) {
   if (myTurn !== turn) return
   try {
     await apiFetch('/location/tracking', {
       method: 'PUT',
+      timeoutMs,
       body: JSON.stringify({
         device_id: getDeviceId(),
         enabled,
@@ -563,9 +564,13 @@ export function endLocationSession() {
 
 // Explicit sign-out, while the owner's credential still works: stop recording
 // and report this phone stopped, so other surfaces stop showing it as tracking.
-// `endLocationSession` then erases what the phone kept. Best effort: a failed
-// stop or report never holds up signing out.
-export async function stopLocationForSignOut() {
+// `endLocationSession` then erases what the phone kept. Best effort and bounded:
+// a failed, stalled, or slow stop or report never holds up signing out; the
+// report is aborted at the deadline, and the phone corrects its own report the
+// next time it opens.
+const SIGN_OUT_DEADLINE_MS = 5000
+
+export async function stopLocationForSignOut({ deadlineMs = SIGN_OUT_DEADLINE_MS } = {}) {
   if (!isNativeLocationAvailable()) return
   if (state.enabled !== true && state.status !== 'started') return
   const myTurn = ++turn
@@ -573,7 +578,19 @@ export async function stopLocationForSignOut() {
   setSessionActive(false)
   persistEnabled(false, null)
   setState({ status: 'stopped' })
-  await Promise.all([stopNativeQuietly(), reportTracking(false, {}, myTurn)])
+  let timer
+  const deadline = new Promise((resolve) => { timer = setTimeout(resolve, deadlineMs) })
+  try {
+    await Promise.race([
+      Promise.all([
+        stopNativeQuietly(),
+        reportTracking(false, {}, myTurn, { timeoutMs: deadlineMs }),
+      ]),
+      deadline,
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 // ---- boot ---------------------------------------------------------------------
