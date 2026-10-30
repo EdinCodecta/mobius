@@ -260,8 +260,11 @@ def downscaled_webp(data: bytes, max_width: int) -> bytes | None:
           ImageOps.exif_transpose(source)
           if _exif_orientation(source) in range(2, 9) else source
         )
-        if image.mode not in {"RGB", "RGBA"}:
-          image = image.convert("RGBA" if image.has_transparency_data else "RGB")
+        # Includes RGB with a tRNS colour key, which stays transparent only
+        # once expanded to an alpha channel.
+        target_mode = "RGBA" if image.has_transparency_data else "RGB"
+        if image.mode != target_mode:
+          image = image.convert(target_mode)
         image.thumbnail((max_width, image.height), Image.Resampling.LANCZOS)
         # A CMYK or grey profile would misdescribe the converted RGB pixels.
         rgb_source = source.mode in {"RGB", "RGBA", "P", "PA"}

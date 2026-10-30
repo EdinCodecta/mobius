@@ -1870,6 +1870,25 @@ def test_proxy_downscales_a_wide_raster_image_to_webp(
       assert thumb.convert("RGBA").getpixel((2, 2))[3] == 0
 
 
+@pytest.mark.parametrize("orientation", [1, 6])
+def test_downscale_keeps_the_colour_key_transparency_of_an_rgb_png(orientation):
+  import io
+  from PIL import Image
+  from app.image_previews import downscaled_webp
+  key = (255, 0, 255)
+  image = _noisy("RGB", (400, 200))
+  for left, top in ((0, 0), (360, 0), (0, 160), (360, 160)):
+    image.paste(key, (left, top, left + 40, top + 40))
+  exif = Image.Exif()
+  exif[0x0112] = orientation
+  body = _encoded(image, "PNG", transparency=key, exif=exif)
+
+  with Image.open(io.BytesIO(downscaled_webp(body, 100))) as thumb:
+    rgba = thumb.convert("RGBA")
+    assert rgba.getpixel((2, 2))[3] == 0
+    assert rgba.getpixel((rgba.width // 2, rgba.height // 2))[3] == 255
+
+
 def test_proxy_never_upscales_or_rewrites_a_narrow_image(
   client, owner_token, monkeypatch,
 ):
