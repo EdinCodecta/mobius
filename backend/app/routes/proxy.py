@@ -17,7 +17,7 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from math import ceil, floor
 from time import monotonic
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 from urllib.request import parse_http_list
 
 import httpx
@@ -235,6 +235,10 @@ class _PrivateBrowserCacheHeaders:
 def _pinned_commit(url: str) -> str | None:
   parsed = urlparse(url)
   if parsed.scheme != "https" or parsed.netloc != "raw.githubusercontent.com":
+    return None
+  # A dot segment, literal or percent-encoded, can resolve past the commit
+  # to a mutable branch path, so such a URL is never pinned.
+  if any(unquote(segment) in {".", ".."} for segment in parsed.path.split("/")):
     return None
   match = _COMMIT_PINNED_RAW_PATH.match(parsed.path)
   return match[1] if match else None

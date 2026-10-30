@@ -252,6 +252,9 @@ def downscaled_webp(data: bytes, max_width: int) -> bytes | None:
         # Check the header size first: reading PNG EXIF may decode the image.
         if source.width * source.height > DOWNSCALE_MAX_PIXELS:
           return None
+        # 16-bit and float pixels clip to white in an 8-bit conversion.
+        if source.mode.startswith(("I", "F")):
+          return None
         dimensions = _oriented_dimensions(source)
         if dimensions is None or dimensions[0] <= max_width:
           return None

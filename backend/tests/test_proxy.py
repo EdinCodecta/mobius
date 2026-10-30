@@ -1990,6 +1990,19 @@ def test_downscale_of_an_upright_image_skips_the_transposed_copy(orientation):
   transpose.assert_not_called()
 
 
+def test_downscale_keeps_the_original_of_a_16_bit_greyscale_png():
+  import io
+  import os
+  from PIL import Image
+  from app.image_previews import downscaled_webp
+  # Mid-grey 16-bit samples would clip to white in an 8-bit conversion.
+  image = Image.frombytes("I;16", (400, 200), os.urandom(400 * 200 * 2))
+  body = _encoded(image, "PNG")
+  with Image.open(io.BytesIO(body)) as decoded:
+    assert decoded.mode.startswith("I")
+  assert downscaled_webp(body, 100) is None
+
+
 def test_downscale_keeps_the_original_when_webp_would_be_larger():
   from PIL import Image
   from app.image_previews import downscaled_webp
@@ -2017,6 +2030,9 @@ def test_commit_pinned_github_image_is_cached_as_immutable(
   f"https://raw.githubusercontent.com.example/o/app/{_COMMIT}/icon.png",
   f"https://example.com/o/app/{_COMMIT}/icon.png",
   f"https://raw.githubusercontent.com/o/{_COMMIT}/icon.png",
+  f"https://raw.githubusercontent.com/o/app/{_COMMIT}/../main/icon.png",
+  f"https://raw.githubusercontent.com/o/app/{_COMMIT}/%2e%2E/main/icon.png",
+  f"https://raw.githubusercontent.com/o/app/{_COMMIT}/./icon.png",
 ])
 def test_unpinned_proxy_reads_keep_bounded_freshness(
   client, owner_token, monkeypatch, url,
