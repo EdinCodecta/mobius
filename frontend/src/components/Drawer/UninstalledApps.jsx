@@ -2,19 +2,21 @@ import { useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client.js'
 import { appQueries } from '../../hooks/queries.js'
+import useExpiryCountdowns from '../../hooks/useExpiryCountdowns.js'
 import AppIcon from '../AppIcon.jsx'
-import { expiryLabel, expiryTone, recoverErrorMessage, removedLabel } from './uninstalledApps.js'
+import { recoverErrorMessage, removedLabel } from './uninstalledApps.js'
 import './UninstalledApps.css'
 
 // Apps that were uninstalled but are still in their recovery window. Hidden
 // when there are none, so it costs nothing until it is needed.
 export default function UninstalledApps() {
   const queryClient = useQueryClient()
-  const { data: rows = [] } = appQueries.uninstalled.useQuery()
+  const { data: rows = [], dataUpdatedAt } = appQueries.uninstalled.useQuery()
   const [busyId, setBusyId] = useState(null)
   const [error, setError] = useState('')
+  const live = useExpiryCountdowns(rows, dataUpdatedAt)
 
-  if (rows.length === 0) return null
+  if (live.length === 0) return null
 
   async function recover(row) {
     setBusyId(row.id)
@@ -40,7 +42,7 @@ export default function UninstalledApps() {
     <section className="uninstalled-apps" aria-labelledby="uninstalled-apps-title">
       <div className="uninstalled-apps__head">
         <h2 id="uninstalled-apps-title">
-          Recently uninstalled <span className="uninstalled-apps__count">{rows.length}</span>
+          Recently uninstalled <span className="uninstalled-apps__count">{live.length}</span>
         </h2>
         <p>
           You can recover an uninstalled app, with its data, for 7 days. After that it is
@@ -48,8 +50,8 @@ export default function UninstalledApps() {
         </p>
       </div>
       <ul className="uninstalled-apps__list">
-        {rows.map(row => {
-          const tone = expiryTone(row.expires_at)
+        {live.map(({ row, countdown }) => {
+          const { tone } = countdown
           return (
             <li className="uninstalled-apps__row" key={row.id}>
               <AppIcon
@@ -69,7 +71,7 @@ export default function UninstalledApps() {
                 <span>{removedLabel(row.deleted_at)}</span>
               </div>
               <span className={`uninstalled-apps__expiry${tone ? ` is-${tone}` : ''}`}>
-                {expiryLabel(row.expires_at)}
+                {countdown.label}
               </span>
               <button
                 type="button"

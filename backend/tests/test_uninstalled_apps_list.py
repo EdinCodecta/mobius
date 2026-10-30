@@ -41,6 +41,18 @@ def test_an_app_past_its_window_and_live_apps_are_not_listed(client, auth, db):
   assert _listed(client, auth) == []
 
 
+def test_each_row_says_how_long_is_left_by_the_server_clock(client, auth, db):
+  # The browser counts down from this, not from expires_at, so a device clock
+  # that runs fast cannot hide an app the server would still recover.
+  app = create_local_app(client, auth, name="Nearly gone")
+  assert client.delete(f"/api/apps/{app['id']}", headers=auth).status_code == 204
+  row = db.get(models.App, app["id"])
+  row.deleted_at = now_naive_utc() - SOFT_DELETE_TTL + timedelta(hours=2)
+  db.commit()
+  [listed] = _listed(client, auth)
+  assert 2 * 3600 - 60 < listed["seconds_left"] <= 2 * 3600
+
+
 def test_the_list_needs_a_signed_in_owner_or_an_app_that_manages_apps(client):
   assert client.get("/api/apps/uninstalled").status_code in (401, 403)
 
